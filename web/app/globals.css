@@ -1525,6 +1525,117 @@ h2 {
 
 /* A terminal attached to a running agent. It sits over the studio rather than
    in a separate window so the diagram stays behind it for context. */
+/* The logical timeline: every tag the program passes through.
+
+   Sits under the diagram because it is the same thing on another axis — the
+   drawing is what exists, this is when it happens. */
+.timeline {
+  flex: none;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  padding: 10px 14px;
+}
+
+.timeline-handle {
+  flex: none;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  padding: 6px 14px;
+  text-align: left;
+}
+
+.timeline-handle:hover {
+  color: #d8caff;
+}
+
+.timeline-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.timeline-controls button {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--ink);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1;
+  padding: 4px 9px;
+}
+
+.timeline-controls button:disabled {
+  opacity: 0.35;
+}
+
+.timeline-controls input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--purple);
+}
+
+.timeline-close {
+  font-size: 11px !important;
+}
+
+.timeline-readout {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.timeline-tag {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-bright, #f5f2fa);
+}
+
+.timeline-mode {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+  letter-spacing: 0.04em;
+}
+
+/* Following a run rather than predicting one. */
+.timeline-mode.live {
+  border-color: var(--purple);
+  color: #d8caff;
+}
+
+.timeline-detail,
+.timeline-idle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.timeline-truncated {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* What the tag being shown touches, and what it does not. Dimming the rest is
+   what makes a tag legible on a diagram of any size. */
+.at-tag .omar-port,
+.at-tag .omar-action,
+.at-tag .omar-reaction-body {
+  stroke: var(--purple);
+  stroke-width: 1.6;
+}
+
+.off-tag {
+  opacity: 0.32;
+}
+
 /* Set values for open input ports.
 
    Slides in over the diagram rather than replacing it: the operator picked

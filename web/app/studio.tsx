@@ -4,6 +4,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { ChatMessage as ChatMessageView } from "./chat-message";
 import { AgentTerminal } from "./agent-terminal";
 import { InputPanel } from "./input-panel";
+import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
@@ -25,13 +26,14 @@ import {
   type ProposedDesign,
   type RunRecord,
 } from "./lib/protocol";
+import type { ProjectedStep } from "./lib/runtime-client";
 import {
   ASSISTANT,
   checkServeHealth,
   diagramUrlFor,
   fetchDiagram,
   fetchRun,
-  checkProgram,
+  projectProgram,
   sendRunInputs,
   startRun,
   subscribeToDiagram,
@@ -95,6 +97,15 @@ export function Studio({
   /** What the compiler said about the source as it stands. */
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [checking, setChecking] = useState(false);
+  /** Every tag the program passes through, projected or observed. */
+  const [steps, setSteps] = useState<ProjectedStep[]>([]);
+  const [truncated, setTruncated] = useState(false);
+  const [stepIndex, setStepIndex] = useState(0);
+  const [timelineOpen, setTimelineOpen] = useState(false);
+  /** Following the run rather than being scrubbed by hand. */
+  const [following, setFollowing] = useState(true);
+  /** Ports the operator has set on the live run. */
+  const [supplied, setSupplied] = useState<string[]>([]);
   // Chat gets the whole width until there is a design to look at. The operator
   // can flip back and forth once there is.
   const [tab, setTab] = useState<"source" | "events">("source");
@@ -131,6 +142,46 @@ export function Studio({
     [settable],
   );
 
+  /**
+   * Which inputs the projection should treat as arriving.
+   *
+   * Before there is a run, all of them: the question being asked is what this
+   * program does when it is fed, and the projection uses no values, so there
+   * is nothing to ask the operator for. Once a run exists the question changes
+   * to what *this* run will do, and the answer depends on what has actually
+   * been sent — an unfed run projects nothing, which is the truth about it.
+   */
+  const present = useMemo(
+    () => (run ? supplied : settable.map((port) => port.name)),
+    [run, supplied, settable],
+  );
+
+  /**
+   * What the tag being shown touches: the ports carrying a value and the
+   * reactions firing. Ids, because that is what the drawing is keyed by.
+   */
+  const highlighted = useMemo(() => {
+    const step = steps[stepIndex];
+    if (!step || !snapshot) return new Set<string>();
+    // Looked up rather than built: an id is not its name with a prefix on it —
+    // a reaction's id carries the instance its name may not — and guessing the
+    // shape would light nothing while looking like it worked.
+    const lit = new Set<string>();
+    const mark = (
+      entities: { id: string; name: string }[],
+      names: string[],
+    ) => {
+      for (const name of names) {
+        const found = entities.find((entity) => entity.name === name);
+        if (found) lit.add(found.id);
+      }
+    };
+    mark(snapshot.ports, step.events);
+    mark(snapshot.timers, step.events);
+    mark(snapshot.reactions, step.reactions);
+    return lit;
+  }, [steps, stepIndex, snapshot]);
+
   /** Send what the operator typed, as one batch at one tag. */
   async function pushInputs(values: Record<string, unknown>) {
     if (!run) return;
@@ -138,6 +189,9 @@ export function Studio({
     setError("");
     try {
       await sendRunInputs(serveUrl, run.run_id, values);
+      // The projection was made without these. It is wrong from here on, so it
+      // is recomputed rather than left to disagree with the run.
+      setSupplied((current) => [...new Set([...current, ...Object.keys(values)])]);
       setFocusedInput(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -287,6 +341,21 @@ export function Studio({
         diagramUrl,
         (event) => {
           setEvents((current) => [event, ...current].slice(0, 8));
+          // A live run walks the same list the projection drew. Matched on the
+          // tag rather than counted, so a run that reaches a tag the projection
+          // did not expect leaves the strip where it was rather than lying
+          // about where the run is.
+          if (event.kind === "tag_advanced" && event.tag) {
+            const tag = event.tag;
+            setSteps((current) => {
+              const at = current.findIndex(
+                (step) =>
+                  step.timestamp === tag.timestamp && step.microstep === tag.microstep,
+              );
+              if (at >= 0) setStepIndex(at);
+              return current;
+            });
+          }
           // Apply first, then refetch. The diagram server shuts down with the
           // run, so the fetch that follows the closing events often loses and
           // the picture would otherwise keep a reaction painted as running.
@@ -385,8 +454,17 @@ export function Studio({
         return;
       }
       setChecking(true);
-      checkProgram(serveUrl, source, filename, abort.signal)
-        .then((result) => setSourceErrors(result.ok ? [] : (result.errors ?? [])))
+      // Checking and projecting are the same question asked twice — is this a
+      // program, and what would it do — so they are asked together.
+      projectProgram(serveUrl, source, filename, present, abort.signal)
+        .then((result) => {
+          setSourceErrors(result.ok ? [] : (result.errors ?? []));
+          setSteps(result.steps ?? []);
+          setTruncated(result.truncated ?? false);
+          // A recomputed projection replaces the tail, so a hand-held position
+          // past its end would be pointing at nothing.
+          setStepIndex((current) => Math.min(current, Math.max(0, (result.steps?.length ?? 1) - 1)));
+        })
         .catch((cause) => {
           if (abort.signal.aborted) return;
           setSourceErrors([cause instanceof Error ? cause.message : String(cause)]);
@@ -399,7 +477,7 @@ export function Studio({
       clearTimeout(timer);
       abort.abort();
     };
-  }, [source, filename, serveUrl, canRun]);
+  }, [source, filename, serveUrl, canRun, present]);
 
   const isDeployed = run !== null;
 
@@ -656,12 +734,36 @@ export function Studio({
             onToggleComponent={toggleComponent}
             // Agents outlive the run that spawned them, so a finished run can
             // still be opened; before a run there is nothing behind the node.
+            highlight={timelineOpen ? highlighted : undefined}
             onOpenTerminal={canRun && run ? setTerminalAgent : undefined}
             // Only while a run can actually take them: before deploy there is
             // nothing to send to, and after it ends nothing is listening.
             openInputs={run && !isRunFinished(run.status) ? settableIds : undefined}
             onSetInput={run && !isRunFinished(run.status) ? setFocusedInput : undefined}
           />
+          {timelineOpen ? (
+            <Timeline
+              steps={steps}
+              index={stepIndex}
+              live={following && phase === "observing"}
+              truncated={truncated}
+              onScrub={(next) => {
+                // Scrubbing takes the strip off the run: the operator is
+                // looking at a tag, not at where execution has reached.
+                setFollowing(false);
+                setStepIndex(next);
+              }}
+              onClose={() => setTimelineOpen(false)}
+            />
+          ) : (
+            <button
+              type="button"
+              className="timeline-handle"
+              onClick={() => setTimelineOpen(true)}
+            >
+              ▲ Timeline
+            </button>
+          )}
         </section>
         ) : null}
 
