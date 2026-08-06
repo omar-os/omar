@@ -155,6 +155,39 @@ export async function checkServeHealth(
  * Hand a confirmed design to `omar serve`, which compiles it and starts the
  * run. The returned `diagram_address` is where that run's live topology lives.
  */
+/** What the compiler says about a program nobody has deployed. */
+export type ProgramCheck = {
+  ok: boolean;
+  team?: string;
+  open_inputs?: string[];
+  errors?: string[];
+};
+
+/**
+ * Compile a program without running it.
+ *
+ * The same compiler and verifier a deploy would use, so a program that passes
+ * here is not refused a moment later.
+ */
+export async function checkProgram(
+  serveUrl: string,
+  program: string,
+  filename: string,
+  signal?: AbortSignal,
+): Promise<ProgramCheck> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/programs/check`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ program, filename }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
+  return (await response.json()) as ProgramCheck;
+}
+
 export async function startRun(
   serveUrl: string,
   request: RunRequest,
@@ -171,6 +204,31 @@ export async function startRun(
     throw new Error(await readError(response));
   }
   return assertRunRecord(await response.json());
+}
+
+/**
+ * Send operator-set values into a live run.
+ *
+ * Everything here lands at one tag, which is why the panel batches rather than
+ * sending on each keystroke: a reaction reading two of these ports sees both in
+ * one invocation instead of firing twice.
+ */
+export async function sendRunInputs(
+  serveUrl: string,
+  runId: string,
+  values: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<void> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/inputs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ values }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
 }
 
 export async function fetchRun(
@@ -222,6 +280,9 @@ export function subscribeToDiagram(
   const kinds: DiagramEvent["kind"][] = [
     "run_started",
     "tag_advanced",
+    // Without this a run that stalls waiting for input never reaches the
+    // client, which goes on showing whatever it saw last.
+    "awaiting_input",
     "reaction_started",
     "reaction_completed",
     "run_completed",

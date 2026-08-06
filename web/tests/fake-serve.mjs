@@ -59,6 +59,9 @@ export async function startFakeServe({
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, { status: "ok", protocol_version: 1 });
     }
+    if (request.method === "POST" && url.pathname === "/v1/programs/check") {
+      return readBody(request).then((body) => checkProgram(body, response));
+    }
     if (request.method === "POST" && url.pathname === "/v1/runs") {
       return readBody(request).then((body) => admit(body, response));
     }
@@ -66,6 +69,14 @@ export async function startFakeServe({
       return json(response, 200, {
         runs: [...runs.values()].map((entry) => entry.record),
       });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/inputs")
+    ) {
+      const runId = url.pathname.slice("/v1/runs/".length, -"/inputs".length);
+      return readBody(request).then((body) => sendInputs(runId, body, response));
     }
     if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
       const entry = runs.get(url.pathname.slice("/v1/runs/".length));
@@ -300,6 +311,48 @@ export async function startFakeServe({
     return [...runs.values()].at(-1);
   }
 
+  /**
+   * What the real daemon does with `POST /v1/programs/check`.
+   *
+   * The real one runs omarc; this recognises the same shapes the browser tests
+   * need — a name that is not a program file, and the marker the suite already
+   * uses to mean "omarc rejects this".
+   */
+  function checkProgram(body, response) {
+    let request;
+    try {
+      request = JSON.parse(body);
+    } catch {
+      return json(response, 400, { error: "invalid request: not JSON" });
+    }
+    const filename = request.filename ?? "program.omar";
+    if (!filename.endsWith(".omar") || filename.includes("/")) {
+      return json(response, 200, {
+        ok: false,
+        errors: [
+          `'${filename}' is not a program file name: it must be a plain name ending in .omar`,
+        ],
+      });
+    }
+    if (typeof request.program !== "string" || request.program.trim() === "") {
+      return json(response, 200, { ok: false, errors: [`${filename}: empty program`] });
+    }
+    // Not a compiler: two shapes it recognises, so a test can write source that
+    // reads like source instead of a marker string. Anything else is accepted,
+    // and the conformance suite is what checks the real compiler's verdicts.
+    const opens = (request.program.match(/{/g) ?? []).length;
+    const closes = (request.program.match(/}/g) ?? []).length;
+    if (request.program.includes(INVALID_MARKER) || opens !== closes) {
+      return json(response, 200, {
+        ok: false,
+        errors: [
+          `omarc failed: ${filename}: expected identifier, found some (Omar.Token.sym "{")`,
+        ],
+      });
+    }
+    return json(response, 200, { ok: true, team: "ReviewFlow", open_inputs: [] });
+  }
+
   function admit(body, response) {
     let request;
     try {
@@ -320,7 +373,12 @@ export async function startFakeServe({
     const runId = randomUUID();
     const address = `${host}:${server.address().port}`;
     const snapshot = structuredClone(golden);
-    snapshot.status = "running";
+    // Deploying no longer starts the program: with an open input unset the run
+    // comes up and waits, which is the state the panel exists to resolve.
+    const openInputs = openInputsOf(snapshot);
+    const seeded = request.inputs ?? {};
+    const unset = openInputs.filter((port) => !(port.name in seeded));
+    snapshot.status = unset.length > 0 ? "awaiting_input" : "running";
     const requested = request.inputs?.["flow.request"];
     for (const port of snapshot.ports) {
       if (port.name === "flow.request" && typeof requested === "string") {
@@ -341,6 +399,7 @@ export async function startFakeServe({
       subscribers: new Set(),
       sequence: 0,
       driving: false,
+      unset: new Set(unset.map((port) => port.name)),
     };
     runs.set(runId, entry);
     json(response, 201, entry.record);
@@ -362,10 +421,80 @@ export async function startFakeServe({
     // The real diagram server does not replay history, and a real run lasts far
     // longer than a subscriber takes to attach. Only start driving once someone
     // is listening, so the test can never lose the race and hang.
-    if (!entry.driving) {
-      entry.driving = true;
-      void driveRun(entry);
+    maybeDrive(entry);
+  }
+
+  /**
+   * Start the run once nothing is holding it back.
+   *
+   * Two things hold it: an open input nobody has set, and nobody listening. The
+   * second is not the real daemon's rule — it is here so a test can never lose
+   * the race between subscribing and the first event.
+   */
+  function maybeDrive(entry) {
+    if (entry.driving) return;
+    if (entry.unset.size > 0) return;
+    if (entry.subscribers.size === 0) return;
+    entry.driving = true;
+    void driveRun(entry);
+  }
+
+  /** Inputs nothing in the topology writes to: the operator's to set. */
+  function openInputsOf(snapshot) {
+    const fed = new Set(
+      snapshot.edges.filter((edge) => edge.kind === "connection").map((edge) => edge.target),
+    );
+    return snapshot.ports.filter((port) => port.kind === "input" && !fed.has(port.id));
+  }
+
+  /** What the real daemon does with `POST /v1/runs/{id}/inputs`. */
+  function sendInputs(runId, body, response) {
+    const entry = runs.get(runId);
+    if (!entry) return json(response, 404, { error: "unknown run" });
+    let request;
+    try {
+      request = JSON.parse(body);
+    } catch {
+      return json(response, 400, { error: "invalid request: not JSON" });
     }
+    const values = request.values ?? {};
+    if (Object.keys(values).length === 0) {
+      return json(response, 400, { error: "no values to send" });
+    }
+    const open = new Map(openInputsOf(entry.snapshot).map((port) => [port.name, port]));
+    for (const [name, value] of Object.entries(values)) {
+      const port = open.get(name);
+      if (!port) {
+        return json(response, 400, {
+          error: `'${name}' is not an open input of this run`,
+        });
+      }
+      // The real daemon checks the value against the port's type before it
+      // reaches the run, and the client is expected to have parsed it.
+      if (port.type === "int" && !Number.isInteger(value)) {
+        return json(response, 400, { error: `${name}: expected int, got ${JSON.stringify(value)}` });
+      }
+      if (port.type === "string" && typeof value !== "string") {
+        return json(response, 400, {
+          error: `${name}: expected string, got ${JSON.stringify(value)}`,
+        });
+      }
+    }
+
+    for (const [name, value] of Object.entries(values)) {
+      entry.unset.delete(name);
+      const port = entry.snapshot.ports.find((candidate) => candidate.name === name);
+      if (port) port.value = value;
+    }
+
+    // Fed everything it was waiting for, it runs — as the real loop does when
+    // its queue stops being empty.
+    if (entry.unset.size === 0) {
+      entry.snapshot.status = "running";
+      entry.record.status = "running";
+      maybeDrive(entry);
+    }
+    return json(response, 202, { run_id: runId, sent: Object.keys(values) });
   }
 
   function publish(entry, kind, payload, tag = null) {

@@ -3,9 +3,10 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
 import { AgentTerminal } from "./agent-terminal";
+import { InputPanel } from "./input-panel";
 import { BackendMenu } from "./backend-menu";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
-import { OmarSource } from "./omar-source";
+import { OmarEditor } from "./omar-source";
 import { Resizer } from "./resizer";
 import { Waiting } from "./waiting";
 import {
@@ -17,6 +18,7 @@ import { reviewProgram, reviewWorkflow } from "./lib/fixtures";
 import {
   applyDiagramEvent,
   isRunFinished,
+  openInputs,
   type ChatMessage,
   type DiagramEvent,
   type DiagramSnapshot,
@@ -29,6 +31,8 @@ import {
   diagramUrlFor,
   fetchDiagram,
   fetchRun,
+  checkProgram,
+  sendRunInputs,
   startRun,
   subscribeToDiagram,
 } from "./lib/runtime-client";
@@ -83,6 +87,14 @@ export function Studio({
     isDemo ? reviewWorkflow : null,
   );
   const [source, setSource] = useState(isDemo ? reviewProgram : "");
+  /** What the program is called. Named for the team it declares until the
+      operator says otherwise. */
+  const [filename, setFilename] = useState(
+    isDemo ? `${reviewWorkflow.team}.omar` : "program.omar",
+  );
+  /** What the compiler said about the source as it stands. */
+  const [sourceErrors, setSourceErrors] = useState<string[]>([]);
+  const [checking, setChecking] = useState(false);
   // Chat gets the whole width until there is a design to look at. The operator
   // can flip back and forth once there is.
   const [tab, setTab] = useState<"source" | "events">("source");
@@ -110,6 +122,29 @@ export function Studio({
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
+  /** The open input the operator clicked, which also opens the panel. */
+  const [focusedInput, setFocusedInput] = useState<string | null>(null);
+  const [sendingInputs, setSendingInputs] = useState(false);
+  const settable = useMemo(() => (snapshot ? openInputs(snapshot) : []), [snapshot]);
+  const settableIds = useMemo(
+    () => new Set(settable.map((port) => port.id)),
+    [settable],
+  );
+
+  /** Send what the operator typed, as one batch at one tag. */
+  async function pushInputs(values: Record<string, unknown>) {
+    if (!run) return;
+    setSendingInputs(true);
+    setError("");
+    try {
+      await sendRunInputs(serveUrl, run.run_id, values);
+      setFocusedInput(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSendingInputs(false);
+    }
+  }
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [events, setEvents] = useState<DiagramEvent[]>([]);
   const disconnectRef = useRef<null | (() => void)>(null);
@@ -165,6 +200,8 @@ export function Studio({
         setConfirming(false);
         setDesign(message.design);
         setSource(message.design.program);
+        setSourceErrors([]);
+        setFilename(`${message.design.preview.team}.omar`);
         // Show the proposed topology, not whatever was on screen before.
         setSnapshot(message.design.preview);
         if (!arrangedRef.current) {
@@ -282,10 +319,12 @@ export function Studio({
     setPhase("spawning");
     setError("");
     try {
-      const record = await startRun(serveUrl, {
-        program: design.program,
-        inputs: design.inputs,
-      });
+      // Deployed, not started: the agents come up and the program waits at
+      // its first tag until the operator sets its open inputs. A program with a
+      // timer still moves on its own, which is what a timer is for.
+      // The source, not the design: the operator may have edited it, and what
+      // they are looking at is what they are deploying.
+      const record = await startRun(serveUrl, { program: source });
       setSnapshot((current) => (current ? { ...current, team: record.team } : current));
       setRun(record);
       setPhase("observing");
@@ -316,6 +355,8 @@ export function Studio({
     // Discarding puts the studio back where it was before the proposal —
     // leaving the topology on screen implies a design is still in play.
     setSnapshot(isDemo ? reviewWorkflow : null);
+    setFilename(isDemo ? `${reviewWorkflow.team}.omar` : "program.omar");
+    setSourceErrors([]);
     setSource(isDemo ? reviewProgram : "");
     arrangedRef.current = isDemo;
     setPhase("idle");
@@ -326,6 +367,40 @@ export function Studio({
     ? `${snapshot.current_tag.timestamp}:${snapshot.current_tag.microstep}`
     : "—";
   const canRun = daemon.state === "live";
+
+  /**
+   * Check the edited program, a moment after typing stops.
+   *
+   * Debounced because the compiler runs per request and the operator is
+   * mid-sentence for most of them; aborted on the next keystroke so a slow
+   * check cannot land after a newer one and report on text that is gone.
+   */
+  useEffect(() => {
+    const abort = new AbortController();
+    const timer = setTimeout(() => {
+      // Nothing to check against, or nothing to check: clear rather than leave
+      // an error standing for text that is gone.
+      if (!canRun || source.trim() === "") {
+        setSourceErrors([]);
+        return;
+      }
+      setChecking(true);
+      checkProgram(serveUrl, source, filename, abort.signal)
+        .then((result) => setSourceErrors(result.ok ? [] : (result.errors ?? [])))
+        .catch((cause) => {
+          if (abort.signal.aborted) return;
+          setSourceErrors([cause instanceof Error ? cause.message : String(cause)]);
+        })
+        .finally(() => {
+          if (!abort.signal.aborted) setChecking(false);
+        });
+    }, 400);
+    return () => {
+      clearTimeout(timer);
+      abort.abort();
+    };
+  }, [source, filename, serveUrl, canRun]);
+
   const isDeployed = run !== null;
 
   // Widths are clamped against the workspace so the diagram always keeps a
@@ -582,6 +657,10 @@ export function Studio({
             // Agents outlive the run that spawned them, so a finished run can
             // still be opened; before a run there is nothing behind the node.
             onOpenTerminal={canRun && run ? setTerminalAgent : undefined}
+            // Only while a run can actually take them: before deploy there is
+            // nothing to send to, and after it ends nothing is listening.
+            openInputs={run && !isRunFinished(run.status) ? settableIds : undefined}
+            onSetInput={run && !isRunFinished(run.status) ? setFocusedInput : undefined}
           />
         </section>
         ) : null}
@@ -625,13 +704,15 @@ export function Studio({
           </div>
 
           {tab === "source" ? (
-            <>
-              <div className="source-title">
-                <span>{`${snapshot.team}.omar`}</span>
-                <span>{run ? run.status : "draft"}</span>
-              </div>
-              <OmarSource source={source} />
-            </>
+            <OmarEditor
+              source={source}
+              filename={filename}
+              status={run ? run.status : "draft"}
+              errors={sourceErrors}
+              checking={checking}
+              onSourceChange={setSource}
+              onFilenameChange={setFilename}
+            />
           ) : (
             <div className="event-strip" role="tabpanel">
               {events.length ? (
@@ -649,6 +730,16 @@ export function Studio({
         </aside>
         ) : null}
       </section>
+
+      {focusedInput && snapshot ? (
+        <InputPanel
+          ports={settable}
+          focused={focusedInput}
+          pending={sendingInputs}
+          onClose={() => setFocusedInput(null)}
+          onSend={(values) => void pushInputs(values)}
+        />
+      ) : null}
 
       {terminalAgent ? (
         <AgentTerminal
