@@ -1207,6 +1207,43 @@ test("the program can be edited, and the compiler answers as you type", async ({
   await expect(page.getByRole("alert")).toBeHidden();
 });
 
+test("the diagram follows the program as it is edited", async ({ page }) => {
+  // An editor whose drawing lags the text is showing a program that no longer
+  // exists. The client has no compiler, so the topology comes back with the
+  // check that already runs on every pause in typing.
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+
+  const containers = page.locator(".omar-team-body");
+  await expect(containers).toHaveCount(1);
+
+  // A second instance appears in the drawing, not just in the text.
+  await page
+    .getByLabel("OMAR program")
+    .fill("team T[a : Codex] {}\nmain M { one = T()\n  two = T() }");
+  await expect(containers).toHaveCount(2);
+
+  await page
+    .getByLabel("OMAR program")
+    .fill("team T[a : Codex] {}\nmain M { one = T()\n  two = T()\n  three = T() }");
+  await expect(containers).toHaveCount(3);
+});
+
+test("Tab indents in the editor rather than leaving it", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+
+  const editor = page.getByLabel("OMAR program");
+  await editor.fill("team T[a : Codex] {}");
+  await editor.press("Home");
+  await editor.press("Tab");
+
+  await expect(editor).toHaveValue("    team T[a : Codex] {}");
+  await expect(editor).toBeFocused();
+});
+
 test("what is deployed is what the editor shows", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);

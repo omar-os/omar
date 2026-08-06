@@ -172,6 +172,8 @@ export type Projection = {
   steps?: ProjectedStep[];
   /** The projection stopped early; the program has not. */
   truncated?: boolean;
+  /** The topology as compiled, so the drawing can follow the text. */
+  preview?: DiagramSnapshot;
   errors?: string[];
 };
 
