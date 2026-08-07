@@ -155,6 +155,22 @@ export function Studio({
     () => (run ? supplied : settable.map((port) => port.name)),
     [run, supplied, settable],
   );
+  /**
+   * The same list as a value rather than an identity.
+   *
+   * `present` is derived from the snapshot, and the projection sets the
+   * snapshot — so depending on the array itself means every projection asks
+   * for another one, forever. What matters is which ports are in it.
+   */
+  const presentKey = present.join("\u0000");
+  /**
+   * Which check is the current one.
+   *
+   * Aborting a request tells the network to stop; it does not decide whether a
+   * reply that already arrived is still wanted. A reply is applied when it is
+   * the newest one asked for, which is the actual question.
+   */
+  const checkTokenRef = useRef(0);
 
   /**
    * What the tag being shown touches: the ports carrying a value and the
@@ -446,6 +462,8 @@ export function Studio({
    */
   useEffect(() => {
     const abort = new AbortController();
+    const token = ++checkTokenRef.current;
+    const current = () => checkTokenRef.current === token;
     const timer = setTimeout(() => {
       // Nothing to check against, or nothing to check: clear rather than leave
       // an error standing for text that is gone.
@@ -456,34 +474,29 @@ export function Studio({
       setChecking(true);
       // Checking and projecting are the same question asked twice — is this a
       // program, and what would it do — so they are asked together.
-      projectProgram(serveUrl, source, filename, present, abort.signal)
+      projectProgram(serveUrl, source, filename, presentKey ? presentKey.split("\u0000") : [], abort.signal)
         .then((result) => {
+          if (!current()) return;
           setSourceErrors(result.ok ? [] : (result.errors ?? []));
           setSteps(result.steps ?? []);
           setTruncated(result.truncated ?? false);
-          // The drawing follows the text. Only while nothing is running: a live
-          // run's diagram is a record of what is happening, not of what has
-          // been typed since.
-          if (result.preview && !run) setSnapshot(result.preview);
           // A recomputed projection replaces the tail, so a hand-held position
           // past its end would be pointing at nothing.
           setStepIndex((current) => Math.min(current, Math.max(0, (result.steps?.length ?? 1) - 1)));
         })
         .catch((cause) => {
-          if (abort.signal.aborted) return;
+          if (!current() || abort.signal.aborted) return;
           setSourceErrors([cause instanceof Error ? cause.message : String(cause)]);
         })
         .finally(() => {
-          if (!abort.signal.aborted) setChecking(false);
+          if (current()) setChecking(false);
         });
     }, 400);
     return () => {
       clearTimeout(timer);
       abort.abort();
     };
-    // `run` decides whether the drawing may be replaced, so a run appearing
-    // has to re-run this rather than leave a stale rule in a closure.
-  }, [source, filename, serveUrl, canRun, present, run]);
+  }, [source, filename, serveUrl, canRun, presentKey]);
 
   const isDeployed = run !== null;
 
