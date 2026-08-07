@@ -993,6 +993,7 @@ export function DiagramCanvas({
   onOpenTerminal,
   openInputs,
   onSetInput,
+  highlight,
 }: {
   snapshot: DiagramSnapshot;
   selection?: string[];
@@ -1002,6 +1003,12 @@ export function DiagramCanvas({
   /** Port ids the operator may set: inputs nothing in the topology writes to. */
   openInputs?: ReadonlySet<string>;
   onSetInput?: (portId: string) => void;
+  /**
+   * Ids the timeline is pointing at: what carries a value and what fires at
+   * the tag being shown. Separate from selection, which is what the operator
+   * has picked out to talk about.
+   */
+  highlight?: ReadonlySet<string>;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [layout, setLayout] = useState<Layout | null>(null);
@@ -1024,10 +1031,13 @@ export function DiagramCanvas({
 
   /** Props that make a node selectable, or just its class when selection is off. */
   function selectable(id: string, base: string) {
-    if (!onToggleComponent) return { className: base };
+    // Dimming is a property of the drawing, not of selection, so it applies
+    // whether or not anything is selectable.
+    const lit = highlight ? (highlight.has(id) ? " at-tag" : " off-tag") : "";
+    if (!onToggleComponent) return { className: `${base}${lit}` };
     const component = componentName(id);
     return {
-      className: `${base}${selected.has(component) ? " selected" : ""}`,
+      className: `${base}${lit}${selected.has(component) ? " selected" : ""}`,
       onClick: () => handleNodeClick(component),
       // The canvas resets the view on double click; a node has its own meaning.
       onDoubleClick: (event: { stopPropagation: () => void }) =>

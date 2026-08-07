@@ -155,37 +155,54 @@ export async function checkServeHealth(
  * Hand a confirmed design to `omar serve`, which compiles it and starts the
  * run. The returned `diagram_address` is where that run's live topology lives.
  */
-/** What the compiler says about a program nobody has deployed. */
-export type ProgramCheck = {
+/** One logical tag of a projected run. */
+export type ProjectedStep = {
+  timestamp: number;
+  microstep: number;
+  /** Ports and timers carrying a value at this tag. */
+  events: string[];
+  /** Reactions that fire, in the order they would run. */
+  reactions: string[];
+};
+
+export type Projection = {
   ok: boolean;
   team?: string;
   open_inputs?: string[];
+  steps?: ProjectedStep[];
+  /** The projection stopped early; the program has not. */
+  truncated?: boolean;
+  /** The topology as compiled, so the drawing can follow the text. */
+  preview?: DiagramSnapshot;
   errors?: string[];
 };
 
 /**
- * Compile a program without running it.
+ * What a program would do, worked out without running it.
  *
- * The same compiler and verifier a deploy would use, so a program that passes
- * here is not refused a moment later.
+ * Computed by the runtime rather than here: the rules that decide a tag —
+ * fixed port delays, connection delays, superdense microsteps — belong to the
+ * event loop, and a second implementation in this language would drift from it
+ * silently.
  */
-export async function checkProgram(
+export async function projectProgram(
   serveUrl: string,
   program: string,
   filename: string,
+  present: string[],
   signal?: AbortSignal,
-): Promise<ProgramCheck> {
+): Promise<Projection> {
   const base = normalizeRuntimeUrl(serveUrl);
-  const response = await fetch(`${base}/v1/programs/check`, {
+  const response = await fetch(`${base}/v1/programs/project`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ program, filename }),
+    body: JSON.stringify({ program, filename, present }),
     signal,
   });
   if (!response.ok) {
     throw new Error(await readError(response));
   }
-  return (await response.json()) as ProgramCheck;
+  return (await response.json()) as Projection;
 }
 
 export async function startRun(

@@ -1323,6 +1323,122 @@ impl Tag {
     }
 }
 
+/// One logical tag of a projected run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectedStep {
+    pub timestamp: u64,
+    pub microstep: u64,
+    /// Ports and timers carrying a value at this tag, in name order.
+    pub events: Vec<String>,
+    /// Reactions whose triggers are present, in the order they would run.
+    pub reactions: Vec<String>,
+}
+
+/// What a program would do, worked out without running it.
+///
+/// This is the determinism claim made visible: given which inputs are present,
+/// the tags a program passes through and what fires at each are decided by the
+/// program, not by what the agents happen to say. So they can be shown before
+/// anything is deployed.
+///
+/// Values are not projected, only presence — an agent's answer is the one thing
+/// here that is not determined. Two consequences worth knowing:
+///
+/// - a reaction whose contract offers alternatives (`-> (x|y)`) is projected as
+///   writing *both*, because which one it picks is the agent's to decide. The
+///   projection is an over-approximation, never a missed step;
+/// - it cannot know a value that decides a delay, and nothing in the language
+///   has one, which is why this works at all.
+///
+/// Scheduling is not re-implemented here: `enqueue_event` is the same one the
+/// event loop uses, so port delays and superdense advance cannot drift between
+/// what is shown and what runs.
+pub fn project(
+    state: &VmState,
+    present: &BTreeSet<String>,
+    max_steps: usize,
+) -> (Vec<ProjectedStep>, bool) {
+    let seed: BTreeMap<String, Value> = present
+        .iter()
+        .filter(|name| state.ports.contains_key(*name))
+        .map(|name| (name.clone(), Value::Null))
+        .collect();
+    let mut queue = BTreeMap::from([(Tag::START, seed)]);
+    for (name, timer) in &state.timers {
+        queue
+            .entry(Tag {
+                timestamp: timer.offset,
+                microstep: 0,
+            })
+            .or_default()
+            .insert(name.clone(), Value::Null);
+    }
+
+    let mut steps = Vec::new();
+    while let Some((tag, events)) = queue.pop_first() {
+        if events.is_empty() {
+            continue;
+        }
+        if steps.len() >= max_steps {
+            return (steps, true);
+        }
+
+        for (name, timer) in &state.timers {
+            if timer.period > 0 && events.contains_key(name) {
+                let Some(next) = tag.timestamp.checked_add(timer.period) else {
+                    continue;
+                };
+                queue
+                    .entry(Tag {
+                        timestamp: next,
+                        microstep: 0,
+                    })
+                    .or_default()
+                    .insert(name.clone(), Value::Null);
+            }
+        }
+
+        for connection in &state.connections {
+            if events.contains_key(&connection.source) {
+                let _ = enqueue_event(
+                    state,
+                    &mut queue,
+                    tag,
+                    &connection.target,
+                    Value::Null,
+                    connection.delay,
+                );
+            }
+        }
+
+        let mut enabled: Vec<_> = state
+            .reactions
+            .iter()
+            .filter(|(_, reaction)| {
+                reaction
+                    .triggers
+                    .iter()
+                    .any(|trigger| events.contains_key(trigger))
+            })
+            .collect();
+        enabled.sort_by_key(|(_, reaction)| reaction.order);
+
+        for (_, reaction) in &enabled {
+            for effect in &reaction.effects {
+                let _ = enqueue_event(state, &mut queue, tag, effect, Value::Null, 0);
+            }
+        }
+
+        steps.push(ProjectedStep {
+            timestamp: tag.timestamp,
+            microstep: tag.microstep,
+            events: events.keys().cloned().collect(),
+            reactions: enabled.iter().map(|(name, _)| (*name).clone()).collect(),
+        });
+    }
+    (steps, false)
+}
+
 fn enqueue_event(
     state: &VmState,
     queue: &mut BTreeMap<Tag, BTreeMap<String, Value>>,
@@ -2213,6 +2329,90 @@ mod tests {
         assert!(error.contains("undeclared parent 'b'"), "{error}");
     }
 
+    /// Records the tags a run actually passed through, so a projection can be
+    /// held against the thing it claims to predict.
+    struct RunTags {
+        tags: Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl TopologyObserver for RunTags {
+        fn tag_advanced(&self, timestamp: u64, microstep: u64, _ports: &BTreeMap<String, Value>) {
+            self.tags.lock().unwrap().push((timestamp, microstep));
+        }
+    }
+
+    fn tags_of_a_real_run<E: ReactionExecutor>(
+        state: &VmState,
+        inputs: BTreeMap<String, Value>,
+        executor: &E,
+    ) -> Vec<(u64, u64)> {
+        let observer = RunTags {
+            tags: Mutex::new(Vec::new()),
+        };
+        run_event_loop_fed(state, inputs, executor, &observer, None).unwrap();
+        let tags = observer.tags.lock().unwrap().clone();
+        tags
+    }
+
+    fn projected_tags(state: &VmState, present: &[&str]) -> Vec<(u64, u64)> {
+        let present = present.iter().map(|name| name.to_string()).collect();
+        let (steps, truncated) = project(state, &present, 256);
+        assert!(!truncated, "projection ran out of room");
+        steps
+            .iter()
+            .map(|step| (step.timestamp, step.microstep))
+            .collect()
+    }
+
+    #[test]
+    fn a_program_nobody_has_fed_projects_nothing() {
+        // An open input nobody has set means the program does not move, which
+        // is what the timeline should show before anything is sent.
+        let state = verify(&open_input_bytecode()).unwrap();
+        let (steps, truncated) = project(&state, &BTreeSet::new(), 256);
+        assert!(steps.is_empty(), "{steps:?}");
+        assert!(!truncated);
+
+        // Setting one of the two is enough: the reaction's triggers are an OR,
+        // and the projection has to agree with the loop about that.
+        let one = BTreeSet::from(["topic".to_string()]);
+        let (steps, _) = project(&state, &one, 256);
+        assert_eq!(steps.len(), 2, "{steps:?}");
+        assert_eq!(steps[0].events, vec!["topic".to_string()]);
+        assert_eq!(steps[0].reactions, vec!["reaction.0".to_string()]);
+        assert_eq!(steps[1].events, vec!["memo".to_string()]);
+    }
+
+    #[test]
+    fn a_projection_hits_the_tags_the_run_does() {
+        // The claim the timeline makes: what a program does is decided by the
+        // program. If these disagree, one of them is lying to the operator.
+        let state = verify(&open_input_bytecode()).unwrap();
+        let executor = BatchExecutor {
+            seen: Mutex::new(Vec::new()),
+        };
+        let real = tags_of_a_real_run(
+            &state,
+            BTreeMap::from([
+                ("topic".to_string(), json!("nesting")),
+                ("depth".to_string(), json!(3)),
+            ]),
+            &executor,
+        );
+
+        assert_eq!(projected_tags(&state, &["topic", "depth"]), real);
+    }
+
+    #[test]
+    fn a_periodic_projection_stops_rather_than_running_forever() {
+        // A periodic timer has no end. A preview has to have one.
+        let state = verify(&timer_bytecode(0, 10)).unwrap();
+        let (steps, truncated) = project(&state, &BTreeSet::new(), 8);
+        assert!(truncated);
+        assert_eq!(steps.len(), 8);
+        assert_eq!(steps[0].timestamp, 0);
+    }
+
     /// A two-input program with nothing feeding it: exactly the shape that has
     /// to sit still until the operator sends something.
     fn open_input_bytecode() -> Bytecode {
@@ -2598,6 +2798,19 @@ mod tests {
             *executor.calls.lock().unwrap(),
             vec!["reaction.0", "reaction.1", "reaction.2"]
         );
+
+        // Delays are where a re-implementation would drift first: a fixed port
+        // delay and a connection delay both move a tag, and the projection has
+        // to move it the same way. It shares `enqueue_event` with the loop so
+        // that it cannot, and this is what says so.
+        let real = tags_of_a_real_run(
+            &state,
+            BTreeMap::from([("start".into(), json!(7))]),
+            &SuperdenseExecutor {
+                calls: Mutex::new(Vec::new()),
+            },
+        );
+        assert_eq!(projected_tags(&state, &["start"]), real);
     }
 
     struct OrTriggerExecutor {
