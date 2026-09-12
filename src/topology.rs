@@ -482,6 +482,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 initial,
                 instance,
             } => {
+                require_identifier("state", name)?;
                 check_instance(&state, "state", name, instance)?;
                 if state.ports.contains_key(name) || state.timers.contains_key(name) {
                     bail!("state '{name}' is also a port or timer");
@@ -510,6 +511,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 value,
                 instance,
             } => {
+                require_identifier("parameter", name)?;
                 check_instance(&state, "parameter", name, instance)?;
                 // A body names a parameter the way it names a port, so the
                 // name has to mean one thing.
@@ -672,7 +674,59 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
         }
     }
     reject_causality_loops(&state)?;
+    reject_bodies_that_cannot_be_generated(&state)?;
     Ok(state)
+}
+
+/// What a code body binds, checked here rather than left to rustc.
+///
+/// The generated crate declares a local per trigger, effect, state variable and
+/// parameter, so a type it cannot carry or a name Rust has taken is an error
+/// about the program. Caught at verification, a bad program is refused when it
+/// is read; caught at build time it would be admitted and then fail a run.
+fn reject_bodies_that_cannot_be_generated(state: &VmState) -> Result<()> {
+    for (id, reaction) in &state.reactions {
+        if reaction.body.is_none() {
+            continue;
+        }
+        let mine = |instance: &str| instance == reaction.instance;
+        // A timer trigger carries its timestamp and has no port, so it is an
+        // int by construction and nothing here has to say so.
+        let bound = reaction
+            .triggers
+            .iter()
+            .chain(reaction.effects.iter())
+            .filter_map(|name| state.ports.get(name).map(|port| (name, &port.ty)))
+            .chain(
+                state
+                    .state_vars
+                    .iter()
+                    .filter(|(_, var)| mine(&var.instance))
+                    .map(|(name, var)| (name, &var.ty)),
+            )
+            .chain(
+                state
+                    .params
+                    .iter()
+                    .filter(|(_, param)| mine(&param.instance))
+                    .map(|(name, param)| (name, &param.ty)),
+            );
+        for (name, ty) in bound {
+            if !crate::reaction::supports_type(ty) {
+                bail!(
+                    "reaction '{id}' has a body and reaches '{name}', which is \
+                     {ty}; a body carries int, float, bool, string, path or bytes"
+                );
+            }
+            if crate::reaction::reserved_name(name) {
+                bail!(
+                    "reaction '{id}' has a body and names '{name}', which is a \
+                     Rust keyword; a body could not bind it"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Ports a value written to `port` reaches without any logical delay.
@@ -4874,6 +4928,35 @@ mod tests {
             .expect("the counter declares state")
     }
 
+    /// A body binds a local per name it reaches, so a type the generator
+    /// cannot carry, or a name Rust has taken, is an error about the program.
+    /// Caught here a bad program is refused when it is read; caught by cargo it
+    /// would be admitted and then fail a run.
+    #[test]
+    fn verify_refuses_a_body_naming_what_rust_cannot_bind() {
+        let with_port = |kind: &str, name: &str, ty: &str| {
+            let mut bytecode = counter_bytecode("");
+            let at = declaration_point(&bytecode);
+            bytecode.instructions.insert(
+                at,
+                serde_json::from_str(&format!(
+                    r#"{{"op":"define_port","instance":"c","kind":"{kind}","name":"{name}","type":"{ty}"}}"#
+                ))
+                .unwrap(),
+            );
+            for instruction in &mut bytecode.instructions {
+                if let Instruction::InstallReaction { triggers, .. } = instruction {
+                    triggers.push(name.to_string());
+                }
+            }
+            verify(&bytecode).unwrap_err().to_string()
+        };
+        // An untyped action is a signal, which no Rust local can hold.
+        assert!(with_port("action", "c.go", "signal").contains("a body carries int"));
+        // `type` is a name Rust has taken, and the body did not write `r#type`.
+        assert!(with_port("input", "c.type", "int").contains("Rust keyword"));
+    }
+
     /// A parameter is a constant the instantiation chose, so the VM carries it
     /// per instance rather than letting the compiler paste it into the body.
     #[test]
@@ -5011,6 +5094,54 @@ mod tests {
             }}"#
         ))
         .unwrap()
+    }
+
+    /// A build that fails leaves its source behind, so the next attempt sees a
+    /// source matching what it would generate. What it must not see is the
+    /// binary the *previous* source built, or a broken program would quietly
+    /// run the code it replaced.
+    #[test]
+    #[ignore = "shells out to cargo; run with --ignored"]
+    fn a_failed_build_does_not_leave_the_last_body_runnable() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = |body: &str| {
+            let mut bytecode = counter_bytecode("");
+            for instruction in &mut bytecode.instructions {
+                if let Instruction::InstallReaction {
+                    body: source,
+                    triggers,
+                    effects,
+                    contract,
+                    ..
+                } = instruction
+                {
+                    // The counter triggers and writes `c.again`, and one local
+                    // cannot be both. Only the build matters here.
+                    *source = Some(body.to_string());
+                    *triggers = vec!["c.tick".to_string()];
+                    *effects = vec!["c.total".to_string()];
+                    *contract = "c.total".to_string();
+                }
+            }
+            let state = verify(&bytecode).unwrap();
+            crate::reaction::build(&state, dir.path())
+        };
+
+        // A body that compiles, so there is a binary to go stale.
+        build("self.count += 1;").unwrap().unwrap();
+        let binary = dir
+            .path()
+            .join("target")
+            .join("release")
+            .join("omar_reactions");
+        assert!(binary.exists());
+
+        // A body that does not compile leaves nothing runnable behind.
+        assert!(build("nonexistent_fn();").is_err());
+        assert!(!binary.exists(), "a failed build left the previous binary");
+
+        // And the same broken body still fails rather than hitting a cache.
+        assert!(build("nonexistent_fn();").is_err());
     }
 
     /// An overrunning body is killed with nothing written, and what that means

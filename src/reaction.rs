@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -168,6 +168,30 @@ fn literal(value: &Value, ty: &str) -> Result<String> {
         ),
         other => bail!("reactions do not support parameter type '{other}'"),
     })
+}
+
+/// Rust's keywords, which a body cannot use as the name of a local.
+///
+/// Most could be written `r#type`, but the body names these itself and did not
+/// write the escape — and `self`, `Self`, `crate` and `super` cannot be raw at
+/// all. Refusing the name says so where the program is read, rather than
+/// letting rustc say it about generated code.
+const RESERVED: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while", "abstract", "become", "box", "do", "final", "macro",
+    "override", "priv", "try", "typeof", "unsized", "virtual", "yield",
+];
+
+/// Whether a code reaction can bind a name of this type at all.
+pub fn supports_type(ty: &str) -> bool {
+    rust_type(ty).is_ok()
+}
+
+/// Whether a code reaction can bind this name at all.
+pub fn reserved_name(qualified: &str) -> bool {
+    RESERVED.contains(&local_name(qualified))
 }
 
 fn rust_type(ty: &str) -> Result<(&'static str, &'static str, &'static str)> {
@@ -355,6 +379,17 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
             std::fs::write(&main, &source)?;
         }
 
+        // A failed build leaves the previous binary where it stands, and the
+        // source beside it is already the new one — so the next run would see
+        // a matching source and an existing binary and quietly run the old
+        // body. Drop it first: what survives a build is what that build made.
+        if let Err(error) = std::fs::remove_file(&binary) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error)
+                    .with_context(|| format!("failed to replace {}", binary.display()));
+            }
+        }
+
         let output = Command::new("cargo")
             .arg("build")
             .arg("--release")
@@ -486,21 +521,40 @@ impl Reactions {
             let read = stdout.read_to_end(&mut out);
             done.send(read.map(|_| out)).ok();
         });
+        let started = Instant::now();
         let out = match finished.recv_timeout(deadline) {
             Ok(out) => out?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 child.kill().ok();
                 child.wait().ok();
+                said.join().ok();
                 return Ok(None);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 child.kill().ok();
+                child.wait().ok();
+                said.join().ok();
                 bail!("reaction '{reaction_id}' stopped without answering");
             }
         };
-        let status = child.wait()?;
+        // Stdout reaching its end is not the body reaching its own: a body can
+        // close what it writes to and keep running. The deadline covers this
+        // wait too, or `within` would be a promise the body could opt out of.
+        let status = loop {
+            match child.try_wait()? {
+                Some(status) => break status,
+                None if started.elapsed() >= deadline => {
+                    child.kill().ok();
+                    child.wait().ok();
+                    said.join().ok();
+                    return Ok(None);
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        // Joined on every path, so a thread is not left per invocation.
+        let errors = said.join().unwrap_or_default();
         if !status.success() {
-            let errors = said.join().unwrap_or_default();
             bail!("reaction '{reaction_id}' failed: {}", errors.trim());
         }
 
