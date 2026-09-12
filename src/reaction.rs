@@ -387,7 +387,10 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
     let (source, reactions) = generate(state)?;
 
     let name = "omar_reactions";
-    let binary = dir.join("target").join("release").join(name);
+    let binary = dir
+        .join("target")
+        .join("release")
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     let main = dir.join("src").join("main.rs");
 
     // The generated source is its own cache key. Leaving an unchanged file
