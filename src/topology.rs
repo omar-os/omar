@@ -284,20 +284,27 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
     let generated = generated_dir(source);
     fs::create_dir_all(&generated)
         .with_context(|| format!("failed to create {}", generated.display()))?;
-    let output_path = generated.join(
-        source
-            .file_stem()
-            .map(|stem| PathBuf::from(stem).with_extension("json"))
-            .unwrap_or_else(|| PathBuf::from("program.json")),
-    );
-    let output_path = output_path.as_path();
+    let stem = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "program".to_string());
+    let output_path = generated.join(format!("{stem}.json"));
+    // The generated directory belongs to the program, not to one run of it, so
+    // two runs compiling at once would otherwise interleave in the same file
+    // and one could read what the other half-wrote. Each writes its own, then
+    // renames: a reader sees either the old document or a whole new one.
+    let draft = generated.join(format!(
+        ".{stem}.{}.{}.json",
+        std::process::id(),
+        DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let compiler = compiler
         .map(Path::to_path_buf)
         .unwrap_or_else(resolve_omarc);
 
     let output = Command::new(&compiler)
         .arg(source)
-        .arg(output_path)
+        .arg(&draft)
         .output()
         .with_context(|| {
             format!(
@@ -307,6 +314,7 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
             )
         })?;
     if !output.status.success() {
+        let _ = fs::remove_file(&draft);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let details = if stderr.is_empty() { stdout } else { stderr };
@@ -315,10 +323,19 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
         }
         bail!("omarc failed: {details}");
     }
+    fs::rename(&draft, &output_path).with_context(|| {
+        format!(
+            "failed to move the compiled program into {}",
+            output_path.display()
+        )
+    })?;
 
-    load_bytecode(output_path)
+    load_bytecode(&output_path)
         .with_context(|| format!("omarc failed to compile {}", source.display()))
 }
+
+/// Tells one compile's draft from another's in the same process.
+static DRAFTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn resolve_omarc() -> PathBuf {
     if let Some(path) = std::env::var_os("OMARC_BIN") {
