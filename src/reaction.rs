@@ -143,6 +143,33 @@ pub struct Reactions {
     reactions: BTreeSet<String>,
 }
 
+/// A bound argument written as the Rust literal the generated crate declares.
+fn literal(value: &Value, ty: &str) -> Result<String> {
+    Ok(match ty {
+        "int" => value
+            .as_i64()
+            .with_context(|| format!("expected int, got {value}"))?
+            .to_string(),
+        "float" => {
+            let number = value
+                .as_f64()
+                .with_context(|| format!("expected float, got {value}"))?;
+            format!("{number:?}")
+        }
+        "bool" => value
+            .as_bool()
+            .with_context(|| format!("expected bool, got {value}"))?
+            .to_string(),
+        "string" | "path" | "bytes" => format!(
+            "{:?}.to_string()",
+            value
+                .as_str()
+                .with_context(|| format!("expected string, got {value}"))?
+        ),
+        other => bail!("reactions do not support parameter type '{other}'"),
+    })
+}
+
 fn rust_type(ty: &str) -> Result<(&'static str, &'static str, &'static str)> {
     // (rust type, getter, putter)
     Ok(match ty {
@@ -191,9 +218,32 @@ fn generate(state: &VmState) -> Result<(String, BTreeSet<String>)> {
              fn run(&mut self, t: &In) -> Result<Out, String> {{\n"
         ));
 
+        let mut seen = BTreeSet::new();
+
+        // A parameter is a constant, so it binds to its literal rather than to
+        // anything off the wire, and it binds immutably: an argument is the
+        // instantiation's to choose and not the reaction's to change.
+        for (name, param) in state
+            .params
+            .iter()
+            .filter(|(_, param)| param.instance == reaction.instance)
+        {
+            let (rust, _, _) = rust_type(&param.ty)?;
+            let local = local_name(name);
+            if !seen.insert(local.to_string()) {
+                bail!(
+                    "reaction '{id}' has two names spelled '{local}'; \
+                     a code body cannot tell them apart"
+                );
+            }
+            source.push_str(&format!(
+                "    let {local}: {rust} = {};\n",
+                literal(&param.value, &param.ty)?
+            ));
+        }
+
         // Triggers bind as Option because a reaction fires when any one of
         // them is present, which is what absence means in the language.
-        let mut seen = BTreeSet::new();
         for trigger in &reaction.triggers {
             let ty = match state.ports.get(trigger) {
                 Some(port) => port.ty.clone(),

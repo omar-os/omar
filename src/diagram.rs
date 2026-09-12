@@ -821,6 +821,7 @@ mod tests {
             version: 1,
             team: "Sample".to_string(),
             state_vars: BTreeMap::new(),
+            params: BTreeMap::new(),
             instances: BTreeMap::new(),
             timers: BTreeMap::new(),
             agents: BTreeMap::from([(
@@ -884,6 +885,7 @@ mod tests {
             version: 1,
             team: "SimpleBrief".to_string(),
             state_vars: BTreeMap::new(),
+            params: BTreeMap::new(),
             timers: BTreeMap::new(),
             instances: BTreeMap::from([
                 (

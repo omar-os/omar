@@ -83,7 +83,9 @@ not present in an invocation, its interpolation expands to `<absent>`.
   instead of asking an agent, so it names none. Inside the body each trigger
   is an `Option<T>` local (`None` when absent), each effect an `Option<T>`
   local starting `None`; whatever is `Some` when the body ends is written. A
-  team parameter `$(p)` is substituted before compilation. The bodies of a
+  team parameter binds as an immutable local of its own type, named plainly:
+  a body writes `idx`, not `$(idx)`, and assigning to it does not compile,
+  because the argument is the instantiation's to choose. The bodies of a
   program are compiled once, std only, no dependencies, so running a program
   with one needs cargo; a program of prompts never invokes it. The generated
   crate and the bytecode are written to `src-gen/<program>/` beside the

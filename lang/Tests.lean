@@ -51,10 +51,10 @@ def topologyCases : Array TopologyCase := #[
     reactions := 1, instructions := 8 },
   -- Three instances of one team, so every count is the team's times three.
   { file := "Ring.omar", team := "Ring", agents := 3, ports := 9,
-    connections := 3, reactions := 3, instructions := 23 },
+    connections := 3, reactions := 3, instructions := 26 },
   -- Same shape as Ring with the reaction written as code, so no agent at all.
   { file := "RingCode.omar", team := "RingCode", agents := 0, ports := 9,
-    connections := 3, reactions := 3, instructions := 20 },
+    connections := 3, reactions := 3, instructions := 23 },
   -- The issue's sketch: a counter kept in state rather than carried in the token.
   { file := "RingLeader.omar", team := "RingLeader", agents := 0, ports := 3,
     connections := 1, reactions := 2, states := 1, instructions := 11 },
@@ -338,7 +338,14 @@ def rejectionCases : Array (String × String × String) := #[
   ("state named like a port",
     wireTeam "state src : int = 0", "is also a port"),
   ("state declared twice",
-    wireTeam "state n : int = 0 state n : int = 1", "duplicate state")
+    wireTeam "state n : int = 0 state n : int = 1", "duplicate state"),
+  -- A body names a parameter the way it names a port, so one name, one thing.
+  ("a parameter named like a port",
+    "team Wire(src : int) { input src : int output dst : int }
+     main { w = Wire(1) }", "is also a port"),
+  ("a parameter named like a state variable",
+    "team Wire(n : int) { input src : int output dst : int state n : int = 0 }
+     main { w = Wire(1) }", "is also a port, timer or state")
 ]
 
 /-- Every type state may have has a literal to start from. -/

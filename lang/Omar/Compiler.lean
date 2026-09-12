@@ -212,6 +212,16 @@ structure StateVar where
   instance_ : String := ""
   deriving Repr
 
+/-- A team parameter with the argument its instantiation bound to it. A
+    constant, so it is carried rather than substituted: the generated Rust
+    binds it the way it binds a port, and the body names it plainly. -/
+structure ParamVal where
+  name : String
+  type : String
+  value : Literal
+  instance_ : String := ""
+  deriving Repr
+
 /-- A team as written: a template, which `main` instantiates. A team is never
     the program itself — that is what `main` is for. -/
 structure TeamDecl where
@@ -269,6 +279,7 @@ structure Program where
   connections : Array Connection
   reactions : Array Reaction
   states : Array StateVar
+  params : Array ParamVal
   deriving Repr
 
 abbrev Parser (α : Type) := List Token -> Except String (α × List Token)
@@ -663,6 +674,12 @@ private def validate (program : Program) : Except String Program := do
       throw s!"state '{var.name}' is {var.type}; state is int, bool, or string"
     if literalType var.initial != var.type then
       throw s!"state '{var.name}' is {var.type} but starts as {literalType var.initial}"
+  let stateNames := program.states.map (·.name)
+  for param in program.params do
+    if containsName portNames param.name || containsName timerNames param.name
+        || containsName stateNames param.name then
+      throw s!"parameter '{param.name}' is also a port, timer or state; \
+        a body could not tell them apart"
   for reaction in program.reactions do
     if reaction.body.isNone && !containsName agentNames reaction.agent then
       throw s!"reaction references unknown agent '{reaction.agent}'"
@@ -737,6 +754,13 @@ private def bindArguments (decl : TeamDecl) (inst : Instance) :
       pure (acc.push (param.name, literalText arg)))
     (#[] : Array (String × String))
 
+/-- The same binding as a value the generated code can declare. -/
+private def boundParams (decl : TeamDecl) (inst : Instance) (path : String) :
+    Array ParamVal :=
+  (decl.params.zip inst.args).map fun (param, arg) =>
+    { name := qualify path param.name, type := param.type, value := arg,
+      instance_ := path }
+
 /-- Everything one instantiation contributes, its nested instantiations
     included. -/
 structure Elaborated where
@@ -746,6 +770,7 @@ structure Elaborated where
   connections : Array Connection := #[]
   reactions : Array Reaction := #[]
   states : Array StateVar := #[]
+  params : Array ParamVal := #[]
   instances : Array InstanceDecl := #[]
 
 private def Elaborated.append (a b : Elaborated) : Elaborated :=
@@ -755,6 +780,7 @@ private def Elaborated.append (a b : Elaborated) : Elaborated :=
     connections := a.connections ++ b.connections
     reactions := a.reactions ++ b.reactions
     states := a.states ++ b.states
+    params := a.params ++ b.params
     instances := a.instances ++ b.instances }
 
 /-- How deep teams may nest.
@@ -805,11 +831,13 @@ private partial def elaborateInstance
         prompt :=
           substitute bindings
             (qualifyPrompt path decl.ports decl.timers reaction.triggers reaction.prompt)
-        -- A body names ports by their local names, which the generated Rust
-        -- binds, so only team parameters need substituting.
-        body := reaction.body.map (substitute bindings) }
+        -- A body names both ports and parameters by their local names, and
+        -- the generated Rust binds each. Only a prompt is text to substitute
+        -- into.
+        body := reaction.body }
   let own : Elaborated :=
     { agents, ports, timers, connections, reactions, states
+      params := boundParams decl inst path
       instances := #[{ name := path, team := inst.team, parent }] }
   decl.instances.foldlM
     (fun acc nested => do
@@ -839,6 +867,7 @@ private def elaborate (programName : String) (teams : Array TeamDecl) (main : Ma
     connections := whole.connections ++ wired
     reactions := whole.reactions
     states := whole.states
+    params := whole.params
   }
 
 /-- `programName` is the fallback when `main` is not named: the source file,
@@ -910,6 +939,13 @@ def compile (program : Program) : String :=
       ("type", toJson var.type),
       ("initial", literalJson var.initial)
     ]
+  let params := program.params.map fun param =>
+    instruction "declare_param" [
+      ("instance", toJson param.instance_),
+      ("name", toJson param.name),
+      ("type", toJson param.type),
+      ("value", literalJson param.value)
+    ]
   let connections := program.connections.map fun connection =>
     let fields := [
       ("source", toJson connection.source),
@@ -935,7 +971,7 @@ def compile (program : Program) : String :=
     instruction "install_reaction" fields
   let commit := instruction "commit_plan"
   let instructions :=
-    #[begin] ++ instances ++ agents ++ ports ++ timers ++ states ++ connections ++ reactions ++
+    #[begin] ++ instances ++ agents ++ ports ++ timers ++ states ++ params ++ connections ++ reactions ++
       #[commit]
   let rendered := String.intercalate ",\n    " instructions.toList
   "{\n  \"version\": 1,\n  \"team\": " ++ (toJson program.team).compress ++

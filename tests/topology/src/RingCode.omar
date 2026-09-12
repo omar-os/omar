@@ -8,10 +8,10 @@ team Node(idx : int)
     output done : int
 
     // Triggers arrive as Option because absence is a value in the language.
-    // A team parameter is a compile-time constant, so `$(idx)` is substituted
-    // before the body ever reaches rustc.
+    // A team parameter binds like a port does, so the body just names it. It
+    // binds immutably, because an argument is not the reaction's to change.
     reaction(token) -> (out | done) {=
-        let _node: i64 = $(idx);
+        let _node: i64 = idx;
         if let Some(token) = token {
             if token < 6 {
                 out = Some(token + 1);

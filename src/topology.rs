@@ -69,6 +69,15 @@ pub enum Instruction {
         #[serde(default)]
         instance: String,
     },
+    /// A team parameter and the argument its instantiation bound to it.
+    DeclareParam {
+        name: String,
+        #[serde(rename = "type")]
+        ty: String,
+        value: Value,
+        #[serde(default)]
+        instance: String,
+    },
     /// A trigger the runtime fires itself, from the logical clock.
     DeclareTimer {
         name: String,
@@ -167,6 +176,17 @@ pub struct StateVarState {
     pub instance: String,
 }
 
+/// A team parameter with the argument bound to it, which is constant for the
+/// life of the run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParamState {
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub value: Value,
+    #[serde(default)]
+    pub instance: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionState {
     pub source: String,
@@ -207,6 +227,8 @@ pub struct VmState {
     pub reactions: BTreeMap<String, ReactionState>,
     #[serde(default)]
     pub state_vars: BTreeMap<String, StateVarState>,
+    #[serde(default)]
+    pub params: BTreeMap<String, ParamState>,
 }
 
 pub fn load_bytecode(path: &std::path::Path) -> Result<Bytecode> {
@@ -354,6 +376,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
         connections: Vec::new(),
         reactions: BTreeMap::new(),
         state_vars: BTreeMap::new(),
+        params: BTreeMap::new(),
     };
     let mut committed = false;
 
@@ -479,6 +502,40 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 };
                 if state.state_vars.insert(name.clone(), var).is_some() {
                     bail!("duplicate state '{name}'");
+                }
+            }
+            Instruction::DeclareParam {
+                name,
+                ty,
+                value,
+                instance,
+            } => {
+                check_instance(&state, "parameter", name, instance)?;
+                // A body names a parameter the way it names a port, so the
+                // name has to mean one thing.
+                if state.ports.contains_key(name)
+                    || state.timers.contains_key(name)
+                    || state.state_vars.contains_key(name)
+                {
+                    bail!("parameter '{name}' is also a port, timer or state");
+                }
+                let holds = match ty.as_str() {
+                    "int" => value.is_i64(),
+                    "float" => value.is_f64() || value.is_i64(),
+                    "bool" => value.is_boolean(),
+                    "string" => value.is_string(),
+                    other => bail!("parameter '{name}' has unsupported type '{other}'"),
+                };
+                if !holds {
+                    bail!("parameter '{name}' is {ty} but was given {value}");
+                }
+                let param = ParamState {
+                    ty: ty.clone(),
+                    value: value.clone(),
+                    instance: instance.clone(),
+                };
+                if state.params.insert(name.clone(), param).is_some() {
+                    bail!("duplicate parameter '{name}'");
                 }
             }
             Instruction::DeclareTimer {
@@ -2974,6 +3031,7 @@ mod tests {
             version: 1,
             team: "HR".into(),
             state_vars: BTreeMap::new(),
+            params: BTreeMap::new(),
             instances: BTreeMap::new(),
             timers: BTreeMap::new(),
             agents: BTreeMap::from([
@@ -4803,6 +4861,63 @@ mod tests {
             r#"{"op":"declare_state","instance":"c","name":"c.count","type":"float","initial":0}"#
         )
         .contains("unsupported type"));
+    }
+
+    /// Just after the last state declaration, so an inserted declaration is
+    /// part of the plan rather than trailing its commit.
+    fn declaration_point(bytecode: &Bytecode) -> usize {
+        bytecode
+            .instructions
+            .iter()
+            .rposition(|i| matches!(i, Instruction::DeclareState { .. }))
+            .map(|at| at + 1)
+            .expect("the counter declares state")
+    }
+
+    /// A parameter is a constant the instantiation chose, so the VM carries it
+    /// per instance rather than letting the compiler paste it into the body.
+    #[test]
+    fn a_parameter_belongs_to_the_instance_that_was_given_it() {
+        let mut bytecode = counter_bytecode("");
+        let at = declaration_point(&bytecode);
+        bytecode.instructions.insert(
+            at,
+            serde_json::from_str(
+                r#"{"op":"declare_param","instance":"c","name":"c.idx","type":"int","value":7}"#,
+            )
+            .unwrap(),
+        );
+        let state = verify(&bytecode).unwrap();
+
+        let param = state.params.get("c.idx").expect("the parameter is carried");
+        assert_eq!(param.value, json!(7));
+        assert_eq!(param.instance, "c");
+    }
+
+    #[test]
+    fn verify_checks_a_parameter_declaration() {
+        let broken = |line: &str| {
+            let mut bytecode = counter_bytecode("");
+            let at = declaration_point(&bytecode);
+            bytecode
+                .instructions
+                .insert(at, serde_json::from_str(line).unwrap());
+            verify(&bytecode).unwrap_err().to_string()
+        };
+        // A body names a parameter the way it names a port or its state, so
+        // the name has to mean one thing.
+        assert!(broken(
+            r#"{"op":"declare_param","instance":"c","name":"c.tick","type":"int","value":1}"#
+        )
+        .contains("is also a port"));
+        assert!(broken(
+            r#"{"op":"declare_param","instance":"c","name":"c.count","type":"int","value":1}"#
+        )
+        .contains("is also a port"));
+        assert!(broken(
+            r#"{"op":"declare_param","instance":"c","name":"c.idx","type":"int","value":"one"}"#
+        )
+        .contains("was given"));
     }
 
     /// A body answers for itself, so naming an agent or a prompt beside one
