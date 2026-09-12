@@ -170,6 +170,35 @@ fn literal(value: &Value, ty: &str) -> Result<String> {
     })
 }
 
+/// What one invocation may say on a stream before it is cut off.
+///
+/// A reaction answers in `name<TAB>value` lines, so a whole answer is small.
+/// Without a cap a body could print for its entire deadline and take the run's
+/// memory with it, which is a slow failure disguised as work.
+const CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Reads until the end, or until `limit` bytes have been kept.
+///
+/// Reading continues past the cap and is discarded, so the body is never
+/// blocked on a full pipe — it is bounded by its deadline, as everything else
+/// about it is.
+fn drain(mut stream: impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = match stream.read(&mut chunk) {
+            Ok(0) => return Ok(kept),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if kept.len() < limit {
+            let room = limit - kept.len();
+            kept.extend_from_slice(&chunk[..read.min(room)]);
+        }
+    }
+}
+
 /// Rust's keywords, which a body cannot use as the name of a local.
 ///
 /// Most could be written `r#type`, but the body names these itself and did not
@@ -508,18 +537,15 @@ impl Reactions {
         // Both streams are drained at once. A body that fills one while the
         // other is unread blocks there, and would be reported as slow rather
         // than by whatever it said before it stopped.
-        let mut stdout = child.stdout.take().context("reaction has no stdout")?;
-        let mut stderr = child.stderr.take().context("reaction has no stderr")?;
+        let stdout = child.stdout.take().context("reaction has no stdout")?;
+        let stderr = child.stderr.take().context("reaction has no stderr")?;
         let said = std::thread::spawn(move || {
-            let mut text = String::new();
-            stderr.read_to_string(&mut text).ok();
-            text
+            let out = drain(stderr, CAPTURE_LIMIT).unwrap_or_default();
+            String::from_utf8_lossy(&out).into_owned()
         });
         let (done, finished) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut out = Vec::new();
-            let read = stdout.read_to_end(&mut out);
-            done.send(read.map(|_| out)).ok();
+            done.send(drain(stdout, CAPTURE_LIMIT)).ok();
         });
         let started = Instant::now();
         let out = match finished.recv_timeout(deadline) {

@@ -60,13 +60,89 @@ private partial def readText (acc : List Char) : List Char -> Except String (Str
   | '"' :: rest => pure (String.ofList acc.reverse, rest)
   | c :: rest => readText (c :: acc) rest
 
-/-- Raw source up to `=}`, accumulated reversed. Rust is lexed by rustc,
-    not here. -/
+/-- The `#` count opening a raw string after `r`, and what follows the quote. -/
+private def rawOpen : List Char -> Option (Nat × List Char)
+  | '"' :: rest => some (0, rest)
+  | cs =>
+      let (hashes, tail) := takeWhile (· == '#') cs
+      match tail with
+      | '"' :: rest => if hashes.isEmpty then none else some (hashes.length, rest)
+      | _ => none
+
+/-- Whether the character just taken continues a word, so an `r` after it opens
+    no raw string: `var"x"` is not one, `r"x"` is. -/
+private def wordBefore : List Char -> Bool
+  | c :: _ => isWordRest c
+  | [] => false
+
+mutual
+
+/-- Raw source up to the `=}` that closes the body, accumulated reversed.
+
+    Rust is lexed by rustc and not here, but the terminator still has to be
+    found, and a `=}` inside a string or a comment closes nothing. So exactly
+    enough Rust is recognised to step over those: string, raw string and
+    character literals, and line and block comments. A lifetime opens like a
+    character literal and closes nothing, so only a literal that closes within
+    its own two or three characters is taken for one. -/
 private partial def readCode (acc : List Char) :
     List Char -> Except String (String × List Char)
   | [] => throw "unterminated code block"
   | '=' :: '}' :: rest => pure (String.ofList acc.reverse, rest)
+  | '/' :: '/' :: rest => readLineComment ('/' :: '/' :: acc) rest
+  | '/' :: '*' :: rest => readBlockComment 1 ('*' :: '/' :: acc) rest
+  | '"' :: rest => readString ('"' :: acc) rest
+  | '\'' :: '\\' :: rest => readCharLiteral ('\\' :: '\'' :: acc) rest
+  | '\'' :: c :: '\'' :: rest =>
+      readCode ('\'' :: c :: '\'' :: acc) rest
+  | 'r' :: rest =>
+      match (if wordBefore acc then none else rawOpen rest) with
+      | some (hashes, tail) =>
+          readRawString hashes ('"' :: (List.replicate hashes '#' ++ ('r' :: acc))) tail
+      | none => readCode ('r' :: acc) rest
   | c :: rest => readCode (c :: acc) rest
+
+private partial def readLineComment (acc : List Char) :
+    List Char -> Except String (String × List Char)
+  | [] => throw "unterminated code block"
+  | '\n' :: rest => readCode ('\n' :: acc) rest
+  | c :: rest => readLineComment (c :: acc) rest
+
+private partial def readBlockComment (depth : Nat) (acc : List Char) :
+    List Char -> Except String (String × List Char)
+  | [] => throw "unterminated code block"
+  | '/' :: '*' :: rest => readBlockComment (depth + 1) ('*' :: '/' :: acc) rest
+  | '*' :: '/' :: rest =>
+      if depth == 1 then readCode ('/' :: '*' :: acc) rest
+      else readBlockComment (depth - 1) ('/' :: '*' :: acc) rest
+  | c :: rest => readBlockComment depth (c :: acc) rest
+
+private partial def readString (acc : List Char) :
+    List Char -> Except String (String × List Char)
+  | [] => throw "unterminated code block"
+  | '\\' :: c :: rest => readString (c :: '\\' :: acc) rest
+  | '"' :: rest => readCode ('"' :: acc) rest
+  | c :: rest => readString (c :: acc) rest
+
+/-- A raw string has no escapes, so only the matching `"###` ends it. -/
+private partial def readRawString (hashes : Nat) (acc : List Char) :
+    List Char -> Except String (String × List Char)
+  | [] => throw "unterminated code block"
+  | '"' :: rest =>
+      let (closing, tail) := takeWhile (· == '#') rest
+      if closing.length >= hashes then
+        readCode (List.replicate hashes '#' ++ ('"' :: acc))
+          (List.replicate (closing.length - hashes) '#' ++ tail)
+      else readRawString hashes (closing.reverse ++ ('"' :: acc)) tail
+  | c :: rest => readRawString hashes (c :: acc) rest
+
+private partial def readCharLiteral (acc : List Char) :
+    List Char -> Except String (String × List Char)
+  | [] => throw "unterminated code block"
+  | '\'' :: rest => readCode ('\'' :: acc) rest
+  | c :: rest => readCharLiteral (c :: acc) rest
+
+end
 
 private partial def lexChars : List Char -> Except String (List Token)
   | [] => pure []

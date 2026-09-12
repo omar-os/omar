@@ -702,18 +702,26 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
 /// about the program. Caught at verification, a bad program is refused when it
 /// is read; caught at build time it would be admitted and then fail a run.
 fn reject_bodies_that_cannot_be_generated(state: &VmState) -> Result<()> {
+    let timer_int = "int".to_string();
     for (id, reaction) in &state.reactions {
         if reaction.body.is_none() {
             continue;
         }
         let mine = |instance: &str| instance == reaction.instance;
-        // A timer trigger carries its timestamp and has no port, so it is an
-        // int by construction and nothing here has to say so.
         let bound = reaction
             .triggers
             .iter()
             .chain(reaction.effects.iter())
-            .filter_map(|name| state.ports.get(name).map(|port| (name, &port.ty)))
+            // A timer carries the timestamp it fired at, so it has no port and
+            // is an int — but it is still a local, and still needs a name.
+            .map(|name| {
+                let ty = state
+                    .ports
+                    .get(name)
+                    .map(|port| &port.ty)
+                    .unwrap_or(&timer_int);
+                (name, ty)
+            })
             .chain(
                 state
                     .state_vars
@@ -728,6 +736,7 @@ fn reject_bodies_that_cannot_be_generated(state: &VmState) -> Result<()> {
                     .filter(|(_, param)| mine(&param.instance))
                     .map(|(name, param)| (name, &param.ty)),
             );
+
         for (name, ty) in bound {
             if !crate::reaction::supports_type(ty) {
                 bail!(
@@ -739,6 +748,13 @@ fn reject_bodies_that_cannot_be_generated(state: &VmState) -> Result<()> {
                 bail!(
                     "reaction '{id}' has a body and names '{name}', which is a \
                      Rust keyword; a body could not bind it"
+                );
+            }
+            let local = name.rsplit('.').next().unwrap_or(name);
+            if local == "_" {
+                bail!(
+                    "reaction '{id}' has a body and names '{name}'; '_' discards \
+                     a value rather than naming one, so a body cannot read or write it"
                 );
             }
         }
@@ -4972,6 +4988,33 @@ mod tests {
         assert!(with_port("action", "c.go", "signal").contains("a body carries int"));
         // `type` is a name Rust has taken, and the body did not write `r#type`.
         assert!(with_port("input", "c.type", "int").contains("Rust keyword"));
+        // `_` discards rather than names, so it cannot be read or written.
+        assert!(with_port("input", "c._", "int").contains("discards a value"));
+    }
+
+    /// A timer trigger becomes a local like any other, so its name has to be
+    /// one Rust will take — the type never varies, but the name does.
+    #[test]
+    fn verify_refuses_a_body_triggered_by_a_timer_rust_has_named() {
+        let mut bytecode = counter_bytecode("");
+        let at = declaration_point(&bytecode);
+        bytecode.instructions.insert(
+            at,
+            serde_json::from_str(
+                r#"{"op":"declare_timer","instance":"c","name":"c.match","offset":1,"period":0}"#,
+            )
+            .unwrap(),
+        );
+        for instruction in &mut bytecode.instructions {
+            if let Instruction::InstallReaction { triggers, .. } = instruction {
+                triggers.push("c.match".to_string());
+            }
+        }
+
+        assert!(verify(&bytecode)
+            .unwrap_err()
+            .to_string()
+            .contains("Rust keyword"));
     }
 
     /// A parameter is a constant the instantiation chose, so the VM carries it

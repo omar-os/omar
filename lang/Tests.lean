@@ -360,6 +360,28 @@ def testStateLiterals : IO Unit :=
         (program.states.any (fun v => v.name == "w.name" && v.initial == .str "x")) true
   | .error message => throw (IO.userError s!"state literals: {message}")
 
+/-- `{= ... =}` promises raw Rust, so a `=}` that Rust is holding — in a
+    string, a raw string, a character literal or a comment — closes nothing. -/
+def testCodeTerminator : IO Unit :=
+  let body := "let s = \"=}\";                  // a comment holding =}
+        let r = r#\"raw =} here\"#;    /* a block comment with =} in it */
+        let c = '}';
+        let name: &'static str = \"lifetime, not a character\";
+        let _ = (s, r, c, name);"
+  let source := "team T { input a : int output b : int
+     reaction(a) -> b {= " ++ body ++ " =} }
+   main { t = T() }"
+  match lex source >>= parse "T" with
+  | .ok program =>
+      match program.reactions.findSome? (·.body) with
+      | some kept => do
+          -- Every `=}` Rust was holding is still in the body.
+          assertEqual "terminators kept" (kept.splitOn "=}").length 5
+          assertEqual "lifetime kept" (kept.splitOn "'static").length 2
+          IO.println "code terminator test passed"
+      | none => throw (IO.userError "code terminator: the reaction has no body")
+  | .error message => throw (IO.userError s!"code terminator: {message}")
+
 def testRejection (label : String) (source : String) (expected : String) : IO Unit :=
   match lex source >>= parse "check" with
   | .ok program =>
@@ -398,6 +420,7 @@ def main : IO UInt32 := do
     testWithin
     testDelayUnits
     testStateLiterals
+    testCodeTerminator
     IO.println "compiler rejection tests passed"
     pure 0
   catch error =>
