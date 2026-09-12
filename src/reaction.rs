@@ -218,9 +218,43 @@ pub fn supports_type(ty: &str) -> bool {
     rust_type(ty).is_ok()
 }
 
-/// Whether a code reaction can bind this name at all.
-pub fn reserved_name(qualified: &str) -> bool {
-    RESERVED.contains(&local_name(qualified))
+/// Names the generated crate has already taken in the scope a body runs in:
+/// the wire map and the writes, the helpers, and the prelude variants a body
+/// matches on. A local of the same name would shadow them under the body.
+const TAKEN: &[&str] = &[
+    "t",
+    "w",
+    "enc",
+    "dec",
+    "need",
+    "get_int",
+    "get_float",
+    "get_bool",
+    "get_string",
+    "put_int",
+    "put_float",
+    "put_bool",
+    "put_string",
+    "dispatch",
+    "main",
+    "In",
+    "Out",
+    "Some",
+    "None",
+    "Ok",
+    "Err",
+];
+
+/// Why a code reaction cannot bind this name, or `None` when it can.
+pub fn reserved_name(qualified: &str) -> Option<&'static str> {
+    let local = local_name(qualified);
+    if RESERVED.contains(&local) {
+        Some("a Rust keyword")
+    } else if TAKEN.contains(&local) {
+        Some("a name the generated crate uses")
+    } else {
+        None
+    }
 }
 
 fn rust_type(ty: &str) -> Result<(&'static str, &'static str, &'static str)> {

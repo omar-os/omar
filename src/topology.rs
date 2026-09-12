@@ -744,10 +744,10 @@ fn reject_bodies_that_cannot_be_generated(state: &VmState) -> Result<()> {
                      {ty}; a body carries int, float, bool, string, path or bytes"
                 );
             }
-            if crate::reaction::reserved_name(name) {
+            if let Some(reason) = crate::reaction::reserved_name(name) {
                 bail!(
-                    "reaction '{id}' has a body and names '{name}', which is a \
-                     Rust keyword; a body could not bind it"
+                    "reaction '{id}' has a body and names '{name}', which is \
+                     {reason}; a body could not bind it"
                 );
             }
             let local = name.rsplit('.').next().unwrap_or(name);
@@ -4988,6 +4988,10 @@ mod tests {
         assert!(with_port("action", "c.go", "signal").contains("a body carries int"));
         // `type` is a name Rust has taken, and the body did not write `r#type`.
         assert!(with_port("input", "c.type", "int").contains("Rust keyword"));
+        // `t` is the wire map every getter reads, and `None` is what an effect
+        // starts as; a local of either name would shadow them under the body.
+        assert!(with_port("input", "c.t", "int").contains("generated crate uses"));
+        assert!(with_port("input", "c.None", "int").contains("generated crate uses"));
         // `_` discards rather than names, so it cannot be read or written.
         assert!(with_port("input", "c._", "int").contains("discards a value"));
     }
