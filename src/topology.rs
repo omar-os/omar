@@ -235,10 +235,40 @@ fn load_program_with_compiler(path: &Path, compiler: Option<&Path>) -> Result<By
     compile_source(path, compiler)
 }
 
+/// Where a program's generated artifacts go.
+///
+/// A compiler should leave something behind to look at, so the bytecode and
+/// the reaction crate land beside the source rather than under `~/.omar`.
+/// Lingua Franca's layout: a program in `src/` belongs to the project that
+/// contains it, so `src-gen` is that project's, not `src`'s. A program
+/// anywhere else is its own project.
+pub fn generated_dir(source: &Path) -> PathBuf {
+    let stem = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "program".to_string());
+    let here = source.parent().unwrap_or_else(|| Path::new("."));
+    let root = if here.file_name() == Some(std::ffi::OsStr::new("src")) {
+        here.parent().unwrap_or(here)
+    } else {
+        here
+    };
+    // One directory per program: a `src/` holds many, and they would otherwise
+    // fight over a single Cargo.toml.
+    root.join("src-gen").join(stem)
+}
+
 fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
-    let output_file = crate::paths::create_private_temp_file("omar-compile", "json")
-        .context("failed to create temporary bytecode file")?;
-    let output_path = output_file.path();
+    let generated = generated_dir(source);
+    fs::create_dir_all(&generated)
+        .with_context(|| format!("failed to create {}", generated.display()))?;
+    let output_path = generated.join(
+        source
+            .file_stem()
+            .map(|stem| PathBuf::from(stem).with_extension("json"))
+            .unwrap_or_else(|| PathBuf::from("program.json")),
+    );
+    let output_path = output_path.as_path();
     let compiler = compiler
         .map(Path::to_path_buf)
         .unwrap_or_else(resolve_omarc);
@@ -1478,6 +1508,8 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
 pub struct TopologyRunConfig<'a> {
     pub ea_id: crate::ea::EaId,
     pub omar_dir: &'a Path,
+    /// Where this program's generated artifacts go, from `generated_dir`.
+    pub generated: &'a Path,
     pub base_prefix: &'a str,
     pub default_workdir: &'a str,
     pub health_idle_warning: i64,
@@ -1628,7 +1660,7 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
     let prepared = (|| -> Result<Prepared> {
         // Before anything is spawned: compiling the bodies is the step most
         // likely to fail, and it costs nothing to find out first.
-        let reactions = crate::reaction::build(&state, &config.omar_dir.join("code-cache"))?;
+        let reactions = crate::reaction::build(&state, config.generated)?;
         let invocation_server = InvocationServer::start()?;
         spawn_topology_agents(
             &state,
@@ -2782,6 +2814,33 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn generated_artifacts_belong_to_the_project_that_holds_src() {
+        // Lingua Franca's layout: `src/` is the project's, so `src-gen` is a
+        // sibling of it rather than a child.
+        let dir = generated_dir(Path::new("/work/topology/src/RingCode.omar"));
+
+        assert_eq!(dir, Path::new("/work/topology/src-gen/RingCode"));
+    }
+
+    #[test]
+    fn a_program_outside_a_src_folder_generates_where_it_lives() {
+        let dir = generated_dir(Path::new("/tmp/loose/RingCode.omar"));
+
+        assert_eq!(dir, Path::new("/tmp/loose/src-gen/RingCode"));
+    }
+
+    #[test]
+    fn each_program_in_a_src_folder_gets_its_own_generated_directory() {
+        // One `src/` holds many programs, and a single crate directory would
+        // have them overwrite each other's Cargo.toml.
+        let one = generated_dir(Path::new("/work/topology/src/RingCode.omar"));
+        let two = generated_dir(Path::new("/work/topology/src/RingLeader.omar"));
+
+        assert_ne!(one, two);
+        assert_eq!(one.parent(), two.parent());
     }
 
     #[test]

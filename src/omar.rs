@@ -498,11 +498,13 @@ async fn async_main() -> Result<()> {
         }) => {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
             let bytecode = topology::load_program(&program)?;
+            let generated = topology::generated_dir(&program);
             topology::run_topology(
                 &bytecode,
                 topology::TopologyRunConfig {
                     ea_id: target.id,
                     omar_dir: &omar_dir,
+                    generated: &generated,
                     base_prefix: &config.dashboard.session_prefix,
                     default_workdir: &config.agent.default_workdir,
                     health_idle_warning: config.health.idle_warning,

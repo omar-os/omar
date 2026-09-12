@@ -85,7 +85,10 @@ not present in an invocation, its interpolation expands to `<absent>`.
   local starting `None`; whatever is `Some` when the body ends is written. A
   team parameter `$(p)` is substituted before compilation. The bodies of a
   program are compiled once, std only, no dependencies, so running a program
-  with one needs cargo; a program of prompts never invokes it.
+  with one needs cargo; a program of prompts never invokes it. The generated
+  crate and the bytecode are written to `src-gen/<program>/` beside the
+  program — next to `src/` when the program is in one — and an unchanged
+  program is not rebuilt.
 - `state round : int = 0` declares a value a reaction reads and writes as
   `self.round`. It starts at the literal and keeps its last value from one
   invocation to the next. Types are `int`, `bool`, `string`, so the value a

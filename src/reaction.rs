@@ -1,6 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -279,20 +277,20 @@ fn generate(state: &VmState) -> Result<(String, BTreeSet<String>)> {
 
 /// Generate, build, and return a handle, or `None` when the program has no
 /// reaction and therefore needs no toolchain at all.
-pub fn build(state: &VmState, cache_root: &Path) -> Result<Option<Reactions>> {
+pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
     if state.reactions.values().all(|r| r.body.is_none()) {
         return Ok(None);
     }
     let (source, reactions) = generate(state)?;
 
-    let mut hasher = DefaultHasher::new();
-    source.hash(&mut hasher);
-    let key = format!("{:016x}", hasher.finish());
-    let dir = cache_root.join(&key);
     let name = "omar_reactions";
     let binary = dir.join("target").join("release").join(name);
+    let main = dir.join("src").join("main.rs");
 
-    if !binary.exists() {
+    // The generated source is its own cache key. Leaving an unchanged file
+    // untouched is also what lets cargo skip the work a new mtime would cost.
+    let unchanged = matches!(std::fs::read_to_string(&main), Ok(existing) if existing == source);
+    if !unchanged || !binary.exists() {
         std::fs::create_dir_all(dir.join("src"))
             .with_context(|| format!("failed to create {}", dir.display()))?;
         // An empty [workspace] keeps the crate standalone wherever it lands.
@@ -303,13 +301,15 @@ pub fn build(state: &VmState, cache_root: &Path) -> Result<Option<Reactions>> {
                  [dependencies]\n\n[workspace]\n"
             ),
         )?;
-        std::fs::write(dir.join("src").join("main.rs"), &source)?;
+        if !unchanged {
+            std::fs::write(&main, &source)?;
+        }
 
         let output = Command::new("cargo")
             .arg("build")
             .arg("--release")
             .arg("--offline")
-            .current_dir(&dir)
+            .current_dir(dir)
             .output()
             .context(
                 "failed to invoke cargo; reactions are compiled, so a Rust \

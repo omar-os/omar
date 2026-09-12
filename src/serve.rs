@@ -1149,7 +1149,15 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         .insert(run_id.clone(), record);
 
     let (ready_sender, ready_receiver) = mpsc::channel();
-    spawn_run_thread(context, &run_id, bytecode, inputs, &request, ready_sender);
+    spawn_run_thread(
+        context,
+        &run_id,
+        bytecode,
+        topology::generated_dir(&program_path),
+        inputs,
+        &request,
+        ready_sender,
+    );
 
     match ready_receiver.recv_timeout(DIAGRAM_READY_TIMEOUT) {
         Ok(diagram_address) => {
@@ -1402,6 +1410,7 @@ fn spawn_run_thread(
     context: &Arc<Context_>,
     run_id: &str,
     bytecode: topology::Bytecode,
+    generated: std::path::PathBuf,
     inputs: Vec<String>,
     request: &StartRunRequest,
     ready_sender: mpsc::Sender<SocketAddr>,
@@ -1438,6 +1447,7 @@ fn spawn_run_thread(
             TopologyRunConfig {
                 ea_id: context.ea_id,
                 omar_dir: &context.omar_dir,
+                generated: &generated,
                 base_prefix: &context.session_prefix,
                 default_workdir: &context.default_workdir,
                 health_idle_warning: context.health_idle_warning,
