@@ -464,6 +464,105 @@ jobs:
           fi
           echo "No hardcoded claude references in runtime paths"
 
+  # What an installer hands a user, rather than what the repo can run. Every
+  # other job here reaches the compiler through OMARC_BIN or the source tree,
+  # so all of them keep passing if an installer stops shipping one.
+  install-paths:
+    name: Install Paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # For elan. The Makefile builds omarc itself; this is only the toolchain.
+      - name: Install Lean
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lang
+          build: false
+          test: false
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: make install puts the compiler beside the runtime
+        run: |
+          make install INSTALL_DIR="$RUNNER_TEMP/bin"
+          test -x "$RUNNER_TEMP/bin/omar"
+          test -x "$RUNNER_TEMP/bin/omarc"
+
+      # The reason to install omarc at all: the runtime finds it as a sibling.
+      # The source tree's compiler has to go out of reach first, or the
+      # compile-time CARGO_MANIFEST_DIR fallback answers and this proves
+      # nothing. Called by absolute path and left off PATH, so the sibling is
+      # the only branch of the lookup that can succeed.
+      - name: The installed runtime compiles without the source tree
+        run: |
+          mv lang/.lake "$RUNNER_TEMP/lake-aside"
+          output=$(env -u OMARC_BIN "$RUNNER_TEMP/bin/omar" run \
+            tests/ci/direct_run.omar --input run.request=hello --replace)
+          echo "$output"
+          grep -Fq 'Output run.result = "hello"' <<<"$output"
+          mv "$RUNNER_TEMP/lake-aside" lang/.lake
+
+      - name: make uninstall removes the compiler it installed
+        run: |
+          make uninstall INSTALL_DIR="$RUNNER_TEMP/bin"
+          test ! -e "$RUNNER_TEMP/bin/omarc"
+
+      # web.yml smoke-tests dev.sh by calling it directly, which cannot see the
+      # Makefile. This is the half that would drift: deploying from Mission
+      # Control compiles a program, so the compiler precedes the daemon.
+      - name: make dev builds the compiler first
+        run: make -n dev | grep -Fq 'lake build omarc'
+
+      # elan is a hard dependency of a source build. Failing without it is
+      # intended; failing as `lake: command not found` is not.
+      - name: A missing elan is reported by name
+        run: |
+          if output=$(env PATH=/usr/bin:/bin make omarc 2>&1); then
+            echo "$output"
+            echo "expected 'make omarc' to fail with no lake on PATH"
+            exit 1
+          fi
+          echo "$output"
+          grep -Fq 'omarc is the OMAR compiler' <<<"$output"
+          grep -Fq 'elan-init.sh' <<<"$output"
+
+      # Both sides of install.sh's tarball guard, against the real assets.
+      # Pinned rather than latest: a pinned version needs no releases API call,
+      # which is the rate-limited half of this and the flaky one.
+      - name: install.sh installs a compiler the tarball carries
+        run: |
+          mkdir -p "$RUNNER_TEMP/curl-new"
+          OMAR_VERSION=0.4.1 OMAR_INSTALL_DIR="$RUNNER_TEMP/curl-new" sh install.sh
+          test -x "$RUNNER_TEMP/curl-new/omar"
+          test -x "$RUNNER_TEMP/curl-new/omarc"
+
+      - name: install.sh skips a compiler an older tarball lacks
+        run: |
+          mkdir -p "$RUNNER_TEMP/curl-old"
+          OMAR_VERSION=0.3.3 OMAR_INSTALL_DIR="$RUNNER_TEMP/curl-old" sh install.sh
+          test -x "$RUNNER_TEMP/curl-old/omar"
+          test ! -e "$RUNNER_TEMP/curl-old/omarc"
+
   build:
     name: Build
     runs-on: ${{ matrix.os }}
@@ -503,7 +602,7 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, build]
+    needs: [check, fmt, clippy, test, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: always()
@@ -521,6 +620,7 @@ jobs:
              [[ "${{ needs.ea-zero-selector-integration.result }}" != "success" ]] || \
              [[ "${{ needs.dashboard-relaunch-handoff-integration.result }}" != "success" ]] || \
              [[ "${{ needs.opencode-compat.result }}" != "success" ]] || \
+             [[ "${{ needs.install-paths.result }}" != "success" ]] || \
              [[ "${{ needs.build.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
