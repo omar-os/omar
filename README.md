@@ -44,6 +44,7 @@ Other features include messaging systems integration (e.g., Slack), computer use
 - Rust 1.70+
 - GNU Make
 - Node.js 22.13+ (to build Mission Control, which `make build` embeds)
+- [elan](https://github.com/leanprover/elan) (to build `omarc`, which `make install` installs alongside `omar`)
 - One or more coding agents [listed here](#supported-agent-backends).
 
 ### One-liner (recommended)
@@ -62,7 +63,7 @@ brew install omar-os/omar/omar
 
 ### Build from source
 
-Requires Rust 1.70+ and GNU Make.
+Requires Rust 1.70+, GNU Make, and elan.
 
 ```bash
 git clone https://github.com/omar-os/omar.git

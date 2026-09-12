@@ -55,12 +55,21 @@ $SUDO install -d "$INSTALL_DIR"
 $SUDO install "$TMP/omar" "$INSTALL_DIR/"
 $SUDO install "$TMP/omar-slack" "$INSTALL_DIR/"
 $SUDO install "$TMP/omar-computer" "$INSTALL_DIR/"
+# The compiler every `.omar` program goes through. Tarballs from v0.4.0 on
+# carry it; an older one pinned through OMAR_VERSION does not, and installing
+# the rest is still better than failing.
+if [ -f "$TMP/omarc" ]; then
+  $SUDO install "$TMP/omarc" "$INSTALL_DIR/"
+fi
 
 echo ""
 echo "Done! Installed:"
 echo "  - omar"
 echo "  - omar-slack"
 echo "  - omar-computer"
+if [ -f "$TMP/omarc" ]; then
+  echo "  - omarc"
+fi
 echo ""
 echo "Make sure tmux is installed:"
 echo "  brew install tmux    # macOS"
