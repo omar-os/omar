@@ -288,6 +288,23 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| "program".to_string());
+    // `<project>/foo.omar` and `<project>/src/foo.omar` are different programs
+    // that name the same directory. Neither may quietly overwrite the other's
+    // bytecode and crate, so the first one to arrive claims it.
+    let identity = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let identity = identity.to_string_lossy().into_owned();
+    let claim = generated.join(".source");
+    match fs::read_to_string(&claim) {
+        Ok(held) if held.trim() != identity => bail!(
+            "'{}' and '{}' both generate into {}; rename one of them",
+            held.trim(),
+            identity,
+            generated.display()
+        ),
+        _ => fs::write(&claim, &identity)
+            .with_context(|| format!("failed to write {}", claim.display()))?,
+    }
+
     let output_path = generated.join(format!("{stem}.json"));
     // The generated directory belongs to the program, not to one run of it, so
     // two runs compiling at once would otherwise interleave in the same file
@@ -5191,21 +5208,76 @@ mod tests {
             crate::reaction::build(&state, dir.path())
         };
 
-        // A body that compiles, so there is a binary to go stale.
-        build("self.count += 1;").unwrap().unwrap();
-        let binary = dir
-            .path()
-            .join("target")
-            .join("release")
-            .join("omar_reactions");
-        assert!(binary.exists());
+        // A body that compiles publishes a binary named for its own source.
+        let good = build("self.count += 1;").unwrap().unwrap();
+        assert!(good.binary().exists());
 
-        // A body that does not compile leaves nothing runnable behind.
+        // A body that does not compile publishes nothing, and leaves the
+        // binary an earlier source built alone — another run may be running it.
         assert!(build("nonexistent_fn();").is_err());
-        assert!(!binary.exists(), "a failed build left the previous binary");
+        assert!(
+            good.binary().exists(),
+            "a failed build took an unrelated binary"
+        );
 
         // And the same broken body still fails rather than hitting a cache.
         assert!(build("nonexistent_fn();").is_err());
+    }
+
+    /// A body can leave a descendant behind, and that descendant inherits the
+    /// streams. Waiting for them to end is then a wait with no deadline — so
+    /// the invocation gives the text a moment and gives up, rather than
+    /// outliving the body it was supposed to bound.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "shells out to cargo; run with --ignored"]
+    fn a_descendant_holding_the_streams_does_not_outlast_the_deadline() {
+        struct Unused;
+        impl ReactionExecutor for Unused {
+            fn invoke(&self, _: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+                panic!("the reaction has a body, so no agent is asked");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytecode = slow_bytecode("s.out");
+        for instruction in &mut bytecode.instructions {
+            if let Instruction::InstallReaction { body, .. } = instruction {
+                // Answers at once, but leaves something holding the pipes.
+                *body = Some(
+                    "std::process::Command::new(\"sleep\").arg(\"30\").spawn().ok(); \
+                     out = Some(1);"
+                        .to_string(),
+                );
+            }
+        }
+        let state = verify(&bytecode).unwrap();
+        let code = crate::reaction::build(&state, dir.path()).unwrap().unwrap();
+        let spec = invocation_spec(
+            &state,
+            state.reactions.get_key_value("s.reaction.0").unwrap(),
+            &BTreeMap::from([("s.tick".to_string(), json!(1))]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = DispatchExecutor {
+            state: &state,
+            code: Some(code),
+            timeout: Duration::from_secs(30),
+            agents: Unused,
+        }
+        .invoke(spec);
+
+        // The contract requires an effect and the deadline is 200ms, so this
+        // fails — the point is that it fails promptly rather than waiting for
+        // the descendant.
+        assert!(outcome.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited {:?} for a descendant to let go",
+            started.elapsed()
+        );
     }
 
     /// An overrunning body is killed with nothing written, and what that means

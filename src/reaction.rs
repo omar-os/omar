@@ -1,4 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -169,6 +171,13 @@ fn literal(value: &Value, ty: &str) -> Result<String> {
         other => bail!("reactions do not support parameter type '{other}'"),
     })
 }
+
+/// How long a killed body is given to finish saying what it was saying.
+///
+/// Its own descendants can hold the stream open after it is gone, so this is
+/// bounded rather than waited out: the text is worth having, not worth hanging
+/// for.
+const SPEAK_GRACE: Duration = Duration::from_millis(250);
 
 /// What one invocation may say on a stream before it is cut off.
 ///
@@ -421,16 +430,19 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
     let (source, reactions) = generate(state)?;
 
     let name = "omar_reactions";
-    let binary = dir
-        .join("target")
-        .join("release")
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    let suffix = std::env::consts::EXE_SUFFIX;
     let main = dir.join("src").join("main.rs");
 
-    // The generated source is its own cache key. Leaving an unchanged file
-    // untouched is also what lets cargo skip the work a new mtime would cost.
-    let unchanged = matches!(std::fs::read_to_string(&main), Ok(existing) if existing == source);
-    if !unchanged || !binary.exists() {
+    // The generated source names the binary built from it, so a binary is only
+    // ever used for the source it was made from. A build that fails publishes
+    // nothing and leaves what is already there alone — which matters because
+    // the directory belongs to the program, not to one run of it, and another
+    // run may be executing that binary right now.
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    let published = dir.join(format!("{name}-{:016x}{suffix}", hasher.finish()));
+
+    if !published.exists() {
         std::fs::create_dir_all(dir.join("src"))
             .with_context(|| format!("failed to create {}", dir.display()))?;
         // An empty [workspace] keeps the crate standalone wherever it lands.
@@ -441,19 +453,10 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
                  [dependencies]\n\n[workspace]\n"
             ),
         )?;
-        if !unchanged {
+        // Leaving an unchanged file untouched is what lets cargo skip the work
+        // a new mtime would cost.
+        if !matches!(std::fs::read_to_string(&main), Ok(existing) if existing == source) {
             std::fs::write(&main, &source)?;
-        }
-
-        // A failed build leaves the previous binary where it stands, and the
-        // source beside it is already the new one — so the next run would see
-        // a matching source and an existing binary and quietly run the old
-        // body. Drop it first: what survives a build is what that build made.
-        if let Err(error) = std::fs::remove_file(&binary) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(error)
-                    .with_context(|| format!("failed to replace {}", binary.display()));
-            }
         }
 
         let output = Command::new("cargo")
@@ -472,8 +475,23 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
+
+        // Published under its own name only once it exists, so a reader either
+        // finds a whole binary or none.
+        let built = dir
+            .join("target")
+            .join("release")
+            .join(format!("{name}{suffix}"));
+        let draft = dir.join(format!(".{name}.{}{suffix}", std::process::id()));
+        std::fs::copy(&built, &draft)
+            .with_context(|| format!("failed to read {}", built.display()))?;
+        std::fs::rename(&draft, &published)
+            .with_context(|| format!("failed to publish {}", published.display()))?;
     }
-    Ok(Some(Reactions { binary, reactions }))
+    Ok(Some(Reactions {
+        binary: published,
+        reactions,
+    }))
 }
 
 /// The type a name carries on the wire, which the VM's tables decide. A timer
@@ -537,6 +555,12 @@ fn decode(raw: &str, ty: &str) -> Result<Value> {
 }
 
 impl Reactions {
+    /// Where the built body lives, which a test asserts about.
+    #[cfg(test)]
+    pub fn binary(&self) -> &Path {
+        &self.binary
+    }
+
     pub fn handles(&self, reaction_id: &str) -> bool {
         self.reactions.contains(reaction_id)
     }
@@ -576,10 +600,17 @@ impl Reactions {
         // than by whatever it said before it stopped.
         let stdout = child.stdout.take().context("reaction has no stdout")?;
         let stderr = child.stderr.take().context("reaction has no stderr")?;
-        let said = std::thread::spawn(move || {
+        // Over a channel rather than a join handle: a body can leave a
+        // descendant holding the write end, so the stream may never reach its
+        // end even after the body itself is killed. Waiting on it is then a
+        // wait with no deadline, which is the one thing an invocation may not
+        // do. What it managed to say is worth having, not worth hanging for.
+        let (spoke, said) = mpsc::channel();
+        std::thread::spawn(move || {
             let out = drain(stderr, CAPTURE_LIMIT).unwrap_or_default();
-            String::from_utf8_lossy(&out).into_owned()
+            spoke.send(String::from_utf8_lossy(&out).into_owned()).ok();
         });
+        let said = move || said.recv_timeout(SPEAK_GRACE).unwrap_or_default();
         let (done, finished) = mpsc::channel();
         std::thread::spawn(move || {
             done.send(drain(stdout, CAPTURE_LIMIT)).ok();
@@ -590,13 +621,13 @@ impl Reactions {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 child.kill().ok();
                 child.wait().ok();
-                said.join().ok();
+                said();
                 return Ok(None);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 child.kill().ok();
                 child.wait().ok();
-                said.join().ok();
+                said();
                 bail!("reaction '{reaction_id}' stopped without answering");
             }
         };
@@ -609,14 +640,14 @@ impl Reactions {
                 None if started.elapsed() >= deadline => {
                     child.kill().ok();
                     child.wait().ok();
-                    said.join().ok();
+                    said();
                     return Ok(None);
                 }
                 None => std::thread::sleep(Duration::from_millis(5)),
             }
         };
         // Joined on every path, so a thread is not left per invocation.
-        let errors = said.join().unwrap_or_default();
+        let errors = said();
         if !status.success() {
             bail!("reaction '{reaction_id}' failed: {}", errors.trim());
         }

@@ -365,9 +365,10 @@ def testStateLiterals : IO Unit :=
 def testCodeTerminator : IO Unit :=
   let body := "let s = \"=}\";                  // a comment holding =}
         let r = r#\"raw =} here\"#;    /* a block comment with =} in it */
+        let bytes = br#\"a byte string =} too\"#;
         let c = '}';
         let name: &'static str = \"lifetime, not a character\";
-        let _ = (s, r, c, name);"
+        let _ = (s, r, bytes, c, name);"
   let source := "team T { input a : int output b : int
      reaction(a) -> b {= " ++ body ++ " =} }
    main { t = T() }"
@@ -376,7 +377,7 @@ def testCodeTerminator : IO Unit :=
       match program.reactions.findSome? (·.body) with
       | some kept => do
           -- Every `=}` Rust was holding is still in the body.
-          assertEqual "terminators kept" (kept.splitOn "=}").length 5
+          assertEqual "terminators kept" (kept.splitOn "=}").length 6
           assertEqual "lifetime kept" (kept.splitOn "'static").length 2
           IO.println "code terminator test passed"
       | none => throw (IO.userError "code terminator: the reaction has no body")

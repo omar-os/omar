@@ -95,6 +95,17 @@ private partial def readCode (acc : List Char) :
   | '\'' :: '\\' :: rest => readCharLiteral ('\\' :: '\'' :: acc) rest
   | '\'' :: c :: '\'' :: rest =>
       readCode ('\'' :: c :: '\'' :: acc) rest
+  -- `r"..."`, and the byte and C string forms that wear a prefix before it.
+  | 'b' :: 'r' :: rest =>
+      match (if wordBefore acc then none else rawOpen rest) with
+      | some (hashes, tail) =>
+          readRawString hashes ('"' :: (List.replicate hashes '#' ++ ('r' :: 'b' :: acc))) tail
+      | none => readCode ('b' :: acc) ('r' :: rest)
+  | 'c' :: 'r' :: rest =>
+      match (if wordBefore acc then none else rawOpen rest) with
+      | some (hashes, tail) =>
+          readRawString hashes ('"' :: (List.replicate hashes '#' ++ ('r' :: 'c' :: acc))) tail
+      | none => readCode ('c' :: acc) ('r' :: rest)
   | 'r' :: rest =>
       match (if wordBefore acc then none else rawOpen rest) with
       | some (hashes, tail) =>
