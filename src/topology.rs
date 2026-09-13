@@ -305,9 +305,9 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
             .write_all(identity.as_bytes())
             .with_context(|| format!("failed to write {}", claim.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let held = fs::read_to_string(&claim).unwrap_or_default();
-            let held = held.trim();
-            // An empty claim is one a run made and died before filling in.
+            let held = read_claim(&claim);
+            // Still empty after waiting, so no run is filling it in: one made
+            // it and died before it could.
             if held.is_empty() {
                 fs::write(&claim, &identity)
                     .with_context(|| format!("failed to write {}", claim.display()))?;
@@ -367,6 +367,26 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
 
     load_bytecode(&output_path)
         .with_context(|| format!("omarc failed to compile {}", source.display()))
+}
+
+/// The identity in a claim, waiting for it to be written.
+///
+/// A claim is created and then filled in, so a reader can arrive between the
+/// two and find it empty. That is not an abandoned claim — it is a live one,
+/// mid-write, and taking it over would let both programs compile into the same
+/// directory. Only one that stays empty was left by a run that died.
+fn read_claim(path: &Path) -> String {
+    let waited = std::time::Instant::now();
+    loop {
+        let held = fs::read_to_string(path)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !held.is_empty() || waited.elapsed() > Duration::from_secs(2) {
+            return held;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Tells one compile's draft from another's in the same process.
@@ -726,8 +746,33 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
         }
     }
     reject_causality_loops(&state)?;
+    reject_shared_names(&state)?;
     reject_bodies_that_cannot_be_generated(&state)?;
     Ok(state)
+}
+
+/// One name, one thing — checked across every namespace at once.
+///
+/// Each declaration also checks the namespaces filled in before it, which is
+/// enough for bytecode in the order the compiler emits. It is not enough in
+/// general: `declare_param` before `declare_state` is a collision neither
+/// branch is looking for, and the VM's namespace is flat, so the two would
+/// both be there under one name. Order is not something a verifier may assume.
+fn reject_shared_names(state: &VmState) -> Result<()> {
+    let declared = state
+        .ports
+        .keys()
+        .map(|name| ("port", name))
+        .chain(state.timers.keys().map(|name| ("timer", name)))
+        .chain(state.state_vars.keys().map(|name| ("state", name)))
+        .chain(state.params.keys().map(|name| ("parameter", name)));
+    let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+    for (kind, name) in declared {
+        if let Some(first) = seen.insert(name.as_str(), kind) {
+            bail!("'{name}' is declared as both a {first} and a {kind}; a name means one thing");
+        }
+    }
+    Ok(())
 }
 
 /// What a code body binds, checked here rather than left to rustc.
@@ -5054,6 +5099,56 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Rust keyword"));
+    }
+
+    /// A claim is created and then filled in, so a reader can find it empty
+    /// while the run that made it is still writing. Taking it over then would
+    /// let two programs compile into one directory, which is the thing the
+    /// claim exists to stop.
+    #[test]
+    fn a_claim_still_being_written_is_waited_for_not_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim = dir.path().join(".source");
+        // Created, as the winner creates it, but not yet written.
+        fs::write(&claim, "").unwrap();
+
+        let writing = claim.clone();
+        let winner = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            fs::write(&writing, "/somewhere/else/foo.omar").unwrap();
+        });
+        let held = read_claim(&claim);
+        winner.join().unwrap();
+
+        assert_eq!(held, "/somewhere/else/foo.omar");
+    }
+
+    /// Each declaration checks the namespaces already filled in, which is
+    /// enough only for the order the compiler happens to emit. The VM's
+    /// namespace is flat, so a collision is a collision whichever came first.
+    #[test]
+    fn verify_refuses_one_name_declared_twice_in_any_order() {
+        let collide = |first: &str, second: &str| {
+            let mut bytecode = counter_bytecode("");
+            let at = declaration_point(&bytecode);
+            // Inserted in this order, so each arrives before the other's check.
+            bytecode
+                .instructions
+                .insert(at, serde_json::from_str(second).unwrap());
+            bytecode
+                .instructions
+                .insert(at, serde_json::from_str(first).unwrap());
+            verify(&bytecode).unwrap_err().to_string()
+        };
+        let param =
+            r#"{"op":"declare_param","instance":"c","name":"c.dup","type":"int","value":1}"#;
+        let state =
+            r#"{"op":"declare_state","instance":"c","name":"c.dup","type":"int","initial":0}"#;
+
+        // The order the compiler emits: the parameter checks state and catches it.
+        assert!(collide(state, param).contains("is also a port, timer or state"));
+        // The order it does not: state checks ports and timers, and not params.
+        assert!(collide(param, state).contains("a name means one thing"));
     }
 
     /// A parameter is a constant the instantiation chose, so the VM carries it
