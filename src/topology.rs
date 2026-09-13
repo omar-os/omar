@@ -294,15 +294,33 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
     let identity = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     let identity = identity.to_string_lossy().into_owned();
     let claim = generated.join(".source");
-    match fs::read_to_string(&claim) {
-        Ok(held) if held.trim() != identity => bail!(
-            "'{}' and '{}' both generate into {}; rename one of them",
-            held.trim(),
-            identity,
-            generated.display()
-        ),
-        _ => fs::write(&claim, &identity)
+    // Created rather than written, so two runs arriving together cannot both
+    // decide they were first. Whoever loses the create reads what is there.
+    match fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&claim)
+    {
+        Ok(mut file) => file
+            .write_all(identity.as_bytes())
             .with_context(|| format!("failed to write {}", claim.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let held = fs::read_to_string(&claim).unwrap_or_default();
+            let held = held.trim();
+            // An empty claim is one a run made and died before filling in.
+            if held.is_empty() {
+                fs::write(&claim, &identity)
+                    .with_context(|| format!("failed to write {}", claim.display()))?;
+            } else if held != identity {
+                bail!(
+                    "'{held}' and '{identity}' both generate into {}; rename one of them",
+                    generated.display()
+                );
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create {}", claim.display()))
+        }
     }
 
     let output_path = generated.join(format!("{stem}.json"));
@@ -5175,6 +5193,54 @@ mod tests {
             }}"#
         ))
         .unwrap()
+    }
+
+    /// The generated directory belongs to the program, so two runs of it share
+    /// one `main.rs` and one cargo target. If they build at once, neither may
+    /// end up publishing the other's build under its own source's name.
+    #[test]
+    #[ignore = "shells out to cargo; run with --ignored"]
+    fn two_runs_building_at_once_each_get_their_own_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let bodied = |body: &str| {
+            let mut bytecode = counter_bytecode("");
+            for instruction in &mut bytecode.instructions {
+                if let Instruction::InstallReaction {
+                    body: source,
+                    triggers,
+                    effects,
+                    contract,
+                    ..
+                } = instruction
+                {
+                    *source = Some(body.to_string());
+                    *triggers = vec!["c.tick".to_string()];
+                    *effects = vec!["c.total".to_string()];
+                    *contract = "c.total".to_string();
+                }
+            }
+            verify(&bytecode).unwrap()
+        };
+        // Two different sources, so two different binaries.
+        let one = bodied("total = Some(1);");
+        let two = bodied("total = Some(2);");
+
+        let at = dir.path().to_path_buf();
+        let here = at.clone();
+        let built = std::thread::scope(|scope| {
+            let first = scope.spawn(|| crate::reaction::build(&one, &here).unwrap().unwrap());
+            let second = scope.spawn(|| crate::reaction::build(&two, &at).unwrap().unwrap());
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        let (first, second) = built;
+        assert_ne!(first.binary(), second.binary(), "one source, one name");
+        let read = |handle: &crate::reaction::Reactions| fs::read(handle.binary()).unwrap();
+        assert_ne!(
+            read(&first),
+            read(&second),
+            "a name was published for a build it did not come from"
+        );
     }
 
     /// A build that fails leaves its source behind, so the next attempt sees a

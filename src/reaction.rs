@@ -172,6 +172,65 @@ fn literal(value: &Value, ty: &str) -> Result<String> {
     })
 }
 
+/// Held while one run generates and builds in a directory shared by all runs
+/// of the same program.
+///
+/// Without it two runs can write different sources over one `main.rs`, let
+/// cargo build whichever landed last, and each publish that binary under its
+/// own source's name — so a name would promise a body it was not built from.
+struct BuildLock(PathBuf);
+
+impl BuildLock {
+    /// A lock older than this belonged to a run that is gone.
+    const STALE: Duration = Duration::from_secs(900);
+
+    fn take(dir: &Path) -> Result<Self> {
+        let path = dir.join(".building");
+        let waited = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let _ = write!(file, "{}", std::process::id());
+                    return Ok(BuildLock(path));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let age = std::fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|at| at.elapsed().ok());
+                    if age.is_some_and(|age| age > Self::STALE) {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if waited.elapsed() > Self::STALE {
+                        bail!(
+                            "waited too long for another run to finish building in {}",
+                            dir.display()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("failed to lock {}", dir.display()))
+                }
+            }
+        }
+    }
+}
+
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Tells one run's draft binary from another's in the same process.
+static DRAFTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// How long a killed body is given to finish saying what it was saying.
 ///
 /// Its own descendants can hold the stream open after it is gone, so this is
@@ -191,16 +250,20 @@ const CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
 /// Reading continues past the cap and is discarded, so the body is never
 /// blocked on a full pipe — it is bounded by its deadline, as everything else
 /// about it is.
-fn drain(mut stream: impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
+fn drain(mut stream: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
     let mut kept = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut whole = true;
     loop {
         let read = match stream.read(&mut chunk) {
-            Ok(0) => return Ok(kept),
+            Ok(0) => return Ok((kept, whole)),
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
+        if kept.len() + read > limit {
+            whole = false;
+        }
         if kept.len() < limit {
             let room = limit - kept.len();
             kept.extend_from_slice(&chunk[..read.min(room)]);
@@ -445,6 +508,14 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
     if !published.exists() {
         std::fs::create_dir_all(dir.join("src"))
             .with_context(|| format!("failed to create {}", dir.display()))?;
+        let _lock = BuildLock::take(dir)?;
+        // Another run may have published it while this one waited.
+        if published.exists() {
+            return Ok(Some(Reactions {
+                binary: published,
+                reactions,
+            }));
+        }
         // An empty [workspace] keeps the crate standalone wherever it lands.
         std::fs::write(
             dir.join("Cargo.toml"),
@@ -482,7 +553,11 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
             .join("target")
             .join("release")
             .join(format!("{name}{suffix}"));
-        let draft = dir.join(format!(".{name}.{}{suffix}", std::process::id()));
+        let draft = dir.join(format!(
+            ".{name}.{}.{}{suffix}",
+            std::process::id(),
+            DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::copy(&built, &draft)
             .with_context(|| format!("failed to read {}", built.display()))?;
         std::fs::rename(&draft, &published)
@@ -532,7 +607,17 @@ fn encode(value: &Value, ty: &str) -> Result<String> {
 fn decode(raw: &str, ty: &str) -> Result<Value> {
     Ok(match ty {
         "int" => json!(raw.parse::<i64>()?),
-        "float" => json!(raw.parse::<f64>()?),
+        "float" => {
+            // JSON has no NaN and no infinity, and `json!` turns both into
+            // `null` without a word — a port reading nothing where the body
+            // wrote something.
+            let number = raw.parse::<f64>()?;
+            Value::Number(
+                serde_json::Number::from_f64(number).with_context(|| {
+                    format!("a body wrote '{raw}', which is not a finite number")
+                })?,
+            )
+        }
         "bool" => json!(raw.parse::<bool>()?),
         _ => {
             let mut out = String::new();
@@ -607,7 +692,8 @@ impl Reactions {
         // do. What it managed to say is worth having, not worth hanging for.
         let (spoke, said) = mpsc::channel();
         std::thread::spawn(move || {
-            let out = drain(stderr, CAPTURE_LIMIT).unwrap_or_default();
+            // Diagnostics, so a cut one is still worth reading.
+            let (out, _) = drain(stderr, CAPTURE_LIMIT).unwrap_or_default();
             spoke.send(String::from_utf8_lossy(&out).into_owned()).ok();
         });
         let said = move || said.recv_timeout(SPEAK_GRACE).unwrap_or_default();
@@ -615,9 +701,19 @@ impl Reactions {
         std::thread::spawn(move || {
             done.send(drain(stdout, CAPTURE_LIMIT)).ok();
         });
+
         let started = Instant::now();
         let out = match finished.recv_timeout(deadline) {
-            Ok(out) => out?,
+            Ok(out) => {
+                // The answer is a protocol frame, so half of one is not a
+                // short answer — it is one that cannot be read. A value cut
+                // mid-way would otherwise arrive as a shorter value.
+                let (out, whole) = out?;
+                if !whole {
+                    bail!("reaction '{reaction_id}' answered with more than {CAPTURE_LIMIT} bytes");
+                }
+                out
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 child.kill().ok();
                 child.wait().ok();
