@@ -1,3 +1,4 @@
+mod activity;
 mod app;
 mod backend_probe;
 mod channel;
@@ -502,6 +503,7 @@ async fn async_main() -> Result<()> {
             topology::run_topology(
                 &bytecode,
                 topology::TopologyRunConfig {
+                    activity: None,
                     ea_id: target.id,
                     omar_dir: &omar_dir,
                     generated: &generated,
