@@ -9,7 +9,7 @@ const LABELS: Record<string, string> = {
   codex: "Codex",
   cursor: "Cursor",
   opencode: "opencode",
-  agy: "agy",
+  agy: "Antigravity",
 };
 
 function label(backend: string): string {

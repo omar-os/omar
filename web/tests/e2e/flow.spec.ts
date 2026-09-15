@@ -1055,7 +1055,7 @@ test("the composer says which assistant is answering, and can change it", async 
     "Codex✓",
     "Cursor",
     "opencode",
-    "agy",
+    "Antigravity",
   ]);
 
   // It opens upward: it lives at the bottom of the composer.

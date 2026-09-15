@@ -195,6 +195,7 @@ struct Context_ {
     /// 404 rather than offer an empty panel.
     panels: Panels,
     chat: Arc<Mutex<Chat>>,
+    approvals: crate::approvals::ApprovalHub,
     /// Authenticates the EA's MCP sidecar on the agent-only endpoints.
     agent_token: String,
     /// The command the assistant runs, and where to reach this server when it
@@ -257,6 +258,7 @@ pub struct Serve {
     address: SocketAddr,
     agent_token: String,
     running: Arc<AtomicBool>,
+    approvals: crate::approvals::ApprovalHub,
     thread: Option<thread::JoinHandle<()>>,
     /// The state the request handlers share. Kept only so a test can seed a
     /// run the daemon believes is live, which is otherwise reachable only by
@@ -282,6 +284,28 @@ impl Serve {
             .with_context(|| format!("failed to bind serve at {address}"))?;
         let address = listener.local_addr()?;
         let agent_token = Uuid::new_v4().to_string();
+        let approvals = crate::approvals::ApprovalHub::default();
+        #[cfg(not(test))]
+        {
+            let session = crate::ea::ea_manager_session(ea_id, &config.dashboard.session_prefix);
+            let backend = TmuxClient::new("")
+                .session_backend(&session)
+                .or_else(|| {
+                    crate::manager::command_backend_name(&config.agent.default_command)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            approvals.watch(
+                crate::approvals::ApprovalTarget {
+                    session,
+                    backend,
+                    command: None,
+                },
+                "assistant".into(),
+                "Executive assistant".into(),
+                None,
+            );
+        }
         let context = Arc::new(Context_ {
             omar_dir: omar_dir.to_path_buf(),
             ea_id,
@@ -291,6 +315,7 @@ impl Serve {
             runs: Runs::default(),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat::default())),
+            approvals: approvals.clone(),
             agent_token: agent_token.clone(),
             command: Arc::new(Mutex::new(config.agent.default_command.clone())),
             address,
@@ -320,6 +345,7 @@ impl Serve {
             address,
             agent_token,
             running,
+            approvals,
             thread: Some(thread),
             #[cfg(test)]
             context: shared,
@@ -456,6 +482,7 @@ impl Serve {
 
 impl Drop for Serve {
     fn drop(&mut self) {
+        self.approvals.shutdown();
         self.running.store(false, Ordering::Relaxed);
         let _ = TcpStream::connect(self.address);
         if let Some(thread) = self.thread.take() {
@@ -582,6 +609,9 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
     if method == "GET" && path == "/v1/chat/events" {
         return stream_chat(stream, &context, origin);
     }
+    if method == "GET" && path == "/v1/approvals/events" {
+        return stream_approvals(stream, &context, origin);
+    }
 
     let mut read_body = |length: usize| -> Result<Vec<u8>> {
         let mut raw = vec![0u8; length];
@@ -590,6 +620,7 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
     };
 
     let (status, body) = match (method.as_str(), path.as_str()) {
+        ("GET", "/v1/approvals") => (200, json!(context.approvals.snapshot())),
         ("GET", "/health") => (
             200,
             json!({"status": "ok", "protocol_version": SERVE_PROTOCOL_VERSION}),
@@ -1019,6 +1050,39 @@ fn compile_preview(context: &Arc<Context_>, program: &str) -> Result<VmState> {
     let state = topology::verify(&bytecode)?;
     let _ = fs::remove_file(&path);
     Ok(state)
+}
+
+fn stream_approvals(
+    mut stream: TcpStream,
+    context: &Arc<Context_>,
+    origin: Option<&str>,
+) -> Result<()> {
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n{}Vary: Origin\r\n\r\n", crate::diagram::cors_origin_header(origin))?;
+    let mut previous = None;
+    let mut heartbeat = std::time::Instant::now();
+    loop {
+        if context.approvals.stopped() {
+            return Ok(());
+        }
+        let snapshot = context.approvals.snapshot();
+        if previous != Some(snapshot.sequence) {
+            writeln!(
+                stream,
+                "id: {}\nevent: approvals\ndata: {}\n",
+                snapshot.sequence,
+                serde_json::to_string(&snapshot)?
+            )?;
+            stream.flush()?;
+            previous = Some(snapshot.sequence);
+            heartbeat = std::time::Instant::now();
+        } else if heartbeat.elapsed() >= Duration::from_secs(15) {
+            stream.write_all(b": keepalive\n\n")?;
+            stream.flush()?;
+            heartbeat = std::time::Instant::now();
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&str>) -> Result<()> {
@@ -1458,10 +1522,15 @@ fn spawn_run_thread(
                 diagram_address: Some(diagram_address),
                 diagram_ready: Some(ready_sender),
                 panel_ready: Some(panel_sender),
+                approvals: Some(crate::approvals::ApprovalRun {
+                    hub: context.approvals.clone(),
+                    run_id: run_id.clone(),
+                }),
             },
         );
         // The run is over, so its invocation service is gone with it. Leaving
         // the entry would let a panel offer work nothing can accept.
+        context.approvals.finish_run(&run_id);
         context
             .panels
             .lock()

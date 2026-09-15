@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
 import { AgentTerminal } from "./agent-terminal";
+import { ApprovalBadge, ApprovalPanel, useApprovals } from "./approvals";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
@@ -27,6 +28,7 @@ import {
   type PendingInvocation,
   type ProposedDesign,
   type RunRecord,
+  type PendingApproval,
 } from "./lib/protocol";
 import type { TimelineStep } from "./lib/runtime-client";
 import {
@@ -138,6 +140,20 @@ export function Studio({
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
+  const approvalFeed = useApprovals(serveUrl);
+  const [reviewingApproval, setReviewingApproval] = useState<PendingApproval | null>(null);
+  const approvals = approvalFeed.snapshot.requests;
+  const assistantApproval = approvals.find((r) => r.agent_id === "assistant");
+  const runApprovals = approvals.filter((r) => r.run_id === run?.run_id);
+  const approvalConnectionLost = !approvalFeed.connected || approvalFeed.snapshot.monitors.some((m) => m.state === "disconnected" && approvals.some((r) => r.agent_id === m.agent_id && r.run_id === m.run_id));
+  function reviewApproval(request: PendingApproval) {
+    setReviewingApproval(request);
+    if (request.agent_id === "assistant") setBuilderWidth((width) => width || DEFAULT_BUILDER);
+    else {
+      const reaction = snapshot?.reactions.find((r) => r.agent === request.agent_id && (!request.invocation_id || r.invocation_id === request.invocation_id));
+      if (reaction && request.run_id === run?.run_id) setSelection([reaction.id.replace(/^.*?::/, "")]);
+    }
+  }
   /** The web agent whose port panel is open. A program may declare several,
       each with its own ports and prompts, so this names one rather than
       merging them into a shared view. */
@@ -648,6 +664,12 @@ export function Studio({
           <span className="connection" data-phase={phase}>
             {phase}
           </span>
+          {approvals.length > 0 ? (
+            <button type="button" className="approval-count" onClick={() => reviewApproval(approvals[0])}>
+              <i aria-hidden="true" />{approvals.length} approval{approvals.length === 1 ? "" : "s"} needed
+              {approvalConnectionLost ? " · Connection lost" : ""}
+            </button>
+          ) : null}
         </div>
       </header>
 
@@ -672,6 +694,8 @@ export function Studio({
             <div>
               <span className="eyebrow">WORKFLOW BUILDER</span>
               <h1>What should the team do?</h1>
+              {assistantApproval ? <ApprovalBadge request={assistantApproval} lost={!approvalFeed.connected || approvalFeed.snapshot.monitors.some((m) => m.agent_id === "assistant" && m.state === "disconnected")} onReview={() => reviewApproval(assistantApproval)} /> : null}
+              {!assistantApproval && approvalFeed.snapshot.monitors.some((m) => m.agent_id === "assistant" && m.state === "unsupported") ? <p className="approval-help">Approval status unavailable for this session. <button type="button" className="waiting-inspect" onClick={() => setTerminalAgent(ASSISTANT)}>Open agent terminal</button></p> : null}
             </div>
           </div>
           <div className="messages" ref={threadRef}>
@@ -684,7 +708,7 @@ export function Studio({
             {messages.map((message) => (
               <ChatMessageView key={message.sequence} message={message} />
             ))}
-            {phase === "drafting" ? <Waiting /> : null}
+            {phase === "drafting" && !assistantApproval ? <Waiting /> : null}
             {phase === "spawning" ? <Waiting label="Starting the run" /> : null}
           </div>
 
@@ -849,6 +873,9 @@ export function Studio({
           </div>
           <DiagramCanvas
             snapshot={snapshot}
+            approvals={runApprovals}
+            onReviewApproval={reviewApproval}
+            focusApproval={reviewingApproval?.run_id === run?.run_id ? reviewingApproval : null}
             selection={selection}
             onToggleComponent={toggleComponent}
             // Agents outlive the run that spawned them, so a finished run can
@@ -961,6 +988,11 @@ export function Studio({
           onClose={() => setPanelAgent(null)}
         />
       ) : null}
+
+      {reviewingApproval ? <ApprovalPanel request={reviewingApproval} feed={approvalFeed} onReview={reviewApproval} onClose={() => setReviewingApproval(null)} onTerminal={() => {
+        setTerminalAgent(reviewingApproval.agent_id === "assistant" ? ASSISTANT : reviewingApproval.agent_name);
+        setReviewingApproval(null);
+      }} /> : null}
 
       {terminalAgent ? (
         <AgentTerminal
