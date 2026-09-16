@@ -58,6 +58,11 @@ pub struct ManagerRuntimeOptions {
 // Embed prompt files at compile time so they work regardless of CWD.
 const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
 const PROMPT_AGENT: &str = include_str!("../../prompts/agent.md");
+// The Pi adapter is shipped inside the omar binary so installed binaries do
+// not depend on the source checkout being present at runtime.
+const PI_EXTENSION_INDEX: &str = include_str!("../../bridges/pi/index.js");
+const PI_EXTENSION_MCP: &str = include_str!("../../bridges/pi/omar-mcp.js");
+const PI_EXTENSION_PACKAGE: &str = include_str!("../../bridges/pi/package.json");
 
 // Backend-native wake/reminder tools bypass OMAR's durable, EA-scoped scheduler.
 // Deny these names where a backend exposes per-session tool controls.
@@ -153,6 +158,7 @@ enum BackendKind {
     Codex,
     Cursor,
     Opencode,
+    Pi,
     Stub,
 }
 
@@ -164,6 +170,7 @@ impl BackendKind {
             BackendKind::Codex => "codex",
             BackendKind::Cursor => "cursor",
             BackendKind::Opencode => "opencode",
+            BackendKind::Pi => "pi",
             BackendKind::Stub => "stub",
         }
     }
@@ -184,6 +191,7 @@ fn detect_backend_token(token: &str) -> Option<BackendKind> {
         "codex" => Some(BackendKind::Codex),
         "cursor" => Some(BackendKind::Cursor),
         "opencode" => Some(BackendKind::Opencode),
+        "pi" => Some(BackendKind::Pi),
         // Matched on the subcommand: the executable is `omar` itself.
         "stub-agent" => Some(BackendKind::Stub),
         _ => None,
@@ -224,6 +232,36 @@ fn with_opencode_port(base_command: &str) -> String {
         Some(port) => format!("{} --port {}", base_command, port),
         None => base_command.to_string(),
     }
+}
+
+/// Materialize the embedded Pi adapter and this launch's context in the
+/// private, EA-scoped MCP directory. The extension imports `omar-mcp.js`
+/// relative to its entrypoint and starts OMAR with the exact context file.
+fn materialize_pi_extension(context: &McpLaunchContext) -> Option<(PathBuf, PathBuf)> {
+    let dir = mcp_ea_dir(context)?.join("pi-extension");
+    std::fs::create_dir_all(&dir).ok()?;
+    let index = dir.join("index.js");
+    let mcp = dir.join("omar-mcp.js");
+    let package = dir.join("package.json");
+    write_private_file(&index, PI_EXTENSION_INDEX.as_bytes()).ok()?;
+    write_private_file(&mcp, PI_EXTENSION_MCP.as_bytes()).ok()?;
+    write_private_file(&package, PI_EXTENSION_PACKAGE.as_bytes()).ok()?;
+    let context_file = materialize_mcp_context_file(context)?;
+    Some((index, context_file))
+}
+
+/// Prefix a Pi launch with the environment consumed by the OMAR Pi adapter.
+fn pi_context_environment(context: &McpLaunchContext, context_file: &Path) -> String {
+    let omar_binary = omar_server_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "omar".to_string());
+    format!(
+        "OMAR_BINARY={} OMAR_DIR={} OMAR_EA_ID={} OMAR_MCP_CONTEXT_FILE={} ",
+        shell_single_quote(&omar_binary),
+        shell_single_quote(&context.omar_dir.display().to_string()),
+        context.ea_id,
+        shell_single_quote(&context_file.display().to_string())
+    )
 }
 
 /// `--settings '{"crossSessionInbound":"accept"}'`, as it goes on a launch line.
@@ -1124,6 +1162,7 @@ pub(crate) fn remove_all_omar_antigravity_mcp_configs() -> Result<()> {
 ///     after spawn via tmux because opencode's `--prompt` is treated as the
 ///     first **user** message (not system role) and the LLM responds by
 ///     asking the user to fill in the fields described in the prompt
+///   - pi → `--system-prompt "$(cat '<path>')"`
 ///   - unknown → returns `base_command` unchanged
 pub fn build_agent_command(
     base_command: &str,
@@ -1243,6 +1282,21 @@ pub fn build_agent_command(
                     base_command
                 ),
                 None => base_command,
+            }
+        }
+        Some(BackendKind::Pi) => {
+            // Pi accepts a native system prompt in interactive mode. Keep
+            // substitutions in the shell expression so worker identity and
+            // task text are resolved per launch without mutating the prompt.
+            match materialize_pi_extension(mcp_context) {
+                Some((extension, context_file)) => format!(
+                    "{}{} -e {} --system-prompt \"{}\"",
+                    pi_context_environment(mcp_context, &context_file),
+                    base_command,
+                    shell_single_quote(&extension.display().to_string()),
+                    shell_expr
+                ),
+                None => format!("{} --system-prompt \"{}\"", base_command, shell_expr),
             }
         }
         None => base_command.to_string(),
@@ -1997,6 +2051,38 @@ mod tests {
     }
 
     #[test]
+    fn test_build_agent_command_pi_uses_native_system_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = build_agent_command(
+            "pi",
+            Path::new("/tmp/prompts/agent.md"),
+            &[("{{TASK}}", "ship it")],
+            &test_mcp_context(dir.path()),
+        );
+        assert!(cmd.starts_with("OMAR_BINARY='"));
+        assert!(cmd.contains("OMAR_EA_ID=0 OMAR_MCP_CONTEXT_FILE="));
+        assert!(cmd.contains(" pi -e "));
+        let extension = dir.path().join("mcp/ea-0/pi-extension/index.js");
+        let context = dir.path().join("mcp/ea-0/context.json");
+        assert!(cmd.contains(&format!("-e '{}'", extension.display())));
+        assert!(cmd.contains(&format!("OMAR_MCP_CONTEXT_FILE='{}'", context.display())));
+        assert!(!cmd.contains("CARGO_MANIFEST_DIR"));
+        assert!(extension.is_file());
+        assert!(dir
+            .path()
+            .join("mcp/ea-0/pi-extension/omar-mcp.js")
+            .is_file());
+        assert!(dir
+            .path()
+            .join("mcp/ea-0/pi-extension/package.json")
+            .is_file());
+        assert!(context.is_file());
+        assert!(cmd.ends_with(
+            " --system-prompt \"$(sed 's|{{TASK}}|ship it|g' '/tmp/prompts/agent.md')\""
+        ));
+    }
+
+    #[test]
     fn a_claude_launch_line_is_told_to_accept_peer_messages_once() {
         // Without this the session holds OMAR's messages behind an approval
         // dialog that covers the composer, and no event is ever delivered.
@@ -2556,6 +2642,10 @@ mod tests {
         assert_eq!(
             command_backend_name("env FOO=bar /opt/bin/codex --no-alt-screen"),
             Some("codex")
+        );
+        assert_eq!(
+            command_backend_name("pi --system-prompt prompt.md"),
+            Some("pi")
         );
         assert_eq!(command_backend_name("bash -lc 'echo hi'"), None);
     }

@@ -1,0 +1,8 @@
+{
+  "name": "@omar-os/pi-extension",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.js"]
+  }
+}

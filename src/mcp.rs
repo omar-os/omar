@@ -221,6 +221,7 @@ fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> String {
             "agy" => Some("agy"),
             "claude" | "claude-code" | "claude_code" => Some("claude"),
             "opencode" => Some("opencode"),
+            "pi" => Some("pi"),
             _ => None,
         }
     }
@@ -772,7 +773,7 @@ impl OmarMcpServer {
     }
 
     fn list_backends(&self) -> Result<Value> {
-        let backends = ["claude", "codex", "cursor", "opencode", "agy"];
+        let backends = ["claude", "codex", "cursor", "opencode", "agy", "pi"];
         let infos: Vec<Value> = backends
             .iter()
             .filter_map(|name| {
@@ -2155,7 +2156,7 @@ fn tool_definitions() -> Vec<Value> {
                     "project_id":{"type":"integer","description":"Existing project id from add_project or list_projects. Required — spawn_agent does not auto-create projects."},
                     "task":{"type":"string","description":"Delivered to the agent as their initial task and shown in the dashboard. What to build or do — no [TASK COMPLETE] or parent-wakeup instructions; those are already in every agent's system prompt."},
                     "command":{"type":"string","description":"Raw command to run instead of a backend agent (e.g. 'bash' for a demo window). Mutually exclusive with backend."},
-                    "backend":{"type":"string","enum":["claude","codex","cursor","opencode","agy"],"description":"Backend agent command to launch. Mutually exclusive with command."},
+                    "backend":{"type":"string","enum":["claude","codex","cursor","opencode","agy","pi"],"description":"Backend agent command to launch. Mutually exclusive with command."},
                     "model":{"type":"string","description":"Optional backend model override. Allowed characters are alphanumeric plus '-', '_', '.', '/'."},
                     "reasoning_effort":{"type":"string","enum":["low","medium","high","xhigh"],"description":"Optional Codex reasoning effort override. Supported only with backend='codex'; appends a Codex config override such as -c model_reasoning_effort='\"high\"'."},
                     "workdir":{"type":"string","description":"Working directory for the new session. Defaults to this MCP server's launch workdir."},
@@ -2835,6 +2836,15 @@ mod tests {
     }
 
     #[test]
+    fn infer_backend_name_recognizes_pi() {
+        assert_eq!(infer_backend_name(Some("pi"), "ignored"), "pi");
+        assert_eq!(
+            infer_backend_name(None, "env PI_CODING_AGENT_DIR=/tmp pi"),
+            "pi"
+        );
+    }
+
+    #[test]
     fn list_backends_includes_agy() {
         let server = OmarMcpServer::new(test_context());
         let response = server.list_backends().unwrap();
@@ -2846,6 +2856,21 @@ mod tests {
 
         assert_eq!(agy["command"], "agy --dangerously-skip-permissions");
         assert!(agy["available"].is_boolean());
+    }
+
+    #[test]
+    fn list_backends_includes_pi() {
+        let server = OmarMcpServer::new(test_context());
+        let response = server.list_backends().unwrap();
+        let pi = response["backends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|backend| backend["name"].as_str() == Some("pi"))
+            .expect("pi backend entry");
+
+        assert_eq!(pi["command"], "pi");
+        assert!(pi["available"].is_boolean());
     }
 
     #[test]

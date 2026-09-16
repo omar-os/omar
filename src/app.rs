@@ -1766,7 +1766,7 @@ mod tests {
         let scheduler = Arc::new(Scheduler::new());
         let mut app = App::new(&config, TickerBuffer::new(), scheduler);
 
-        let mut commands: Vec<String> = ["claude", "codex", "cursor", "opencode", "agy"]
+        let mut commands: Vec<String> = ["claude", "codex", "cursor", "opencode", "agy", "pi"]
             .iter()
             .map(|name| crate::config::resolve_backend(name).unwrap())
             .collect();

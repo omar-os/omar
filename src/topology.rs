@@ -3005,6 +3005,7 @@ fn canonical_backend(backend: &str) -> &str {
         "opencode" => "opencode",
         "cursor" => "cursor",
         "agy" => "agy",
+        "pi" => "pi",
         "stub" => "stub",
         _ => backend,
     }
@@ -3772,6 +3773,7 @@ mod tests {
         assert!(is_web_backend("web"));
         assert!(!is_web_backend("ClaudeCode"));
         assert!(!is_web_backend("Stub"));
+        assert_eq!(canonical_backend("Pi"), "pi");
     }
 
     #[test]

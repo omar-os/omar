@@ -33,6 +33,21 @@ pub fn backend_readiness_markers(backend: &str) -> &'static [&'static str] {
         "agy" => &[],
         "claude" => &["Claude Code", "❯"],
         "opencode" => &["tab agents", "ctrl+p commands"],
+        // Pi's startup header is stable across releases and includes the
+        // version in this form (for example, `pi v0.85.1`).
+        "pi" => &["pi v"],
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backend_readiness_markers;
+
+    #[test]
+    fn pi_readiness_uses_its_versioned_startup_header() {
+        let markers = backend_readiness_markers("pi");
+        assert_eq!(markers, &["pi v"]);
+        assert!("pi v0.85.1".contains(markers[0]));
     }
 }
