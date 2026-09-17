@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 import readline from "node:readline";
 
+if (process.env.FAKE_OMAR_IGNORE_SIGTERM === "1") {
+  process.on("SIGTERM", () => {});
+  // Keep the process alive after stdin ends to exercise forced shutdown.
+  setInterval(() => {}, 60_000);
+}
+
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);

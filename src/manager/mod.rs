@@ -177,7 +177,6 @@ impl BackendKind {
 }
 
 fn detect_backend_token(token: &str) -> Option<BackendKind> {
-    let token = token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')'));
     let executable = Path::new(token)
         .file_name()
         .and_then(|name| name.to_str())
@@ -192,16 +191,123 @@ fn detect_backend_token(token: &str) -> Option<BackendKind> {
         "cursor" => Some(BackendKind::Cursor),
         "opencode" => Some(BackendKind::Opencode),
         "pi" => Some(BackendKind::Pi),
-        // Matched on the subcommand: the executable is `omar` itself.
-        "stub-agent" => Some(BackendKind::Stub),
         _ => None,
     }
 }
 
+/// Read a literal shell word without evaluating it. Retain byte offsets so
+/// runtime flags can be inserted after a quoted executable path. Stop at shell
+/// operators or expansions: guessing through those can modify another program.
+fn command_word(command: &str, offset: &mut usize) -> Option<String> {
+    let mut chars = command[*offset..].char_indices().peekable();
+    while chars
+        .peek()
+        .is_some_and(|(_, c)| c.is_whitespace() && *c != '\n')
+    {
+        chars.next();
+    }
+    let start = chars.peek()?.0;
+    if chars.peek()?.1 == '#' {
+        return None;
+    }
+    let mut word = String::new();
+    let mut quote = None;
+    let mut end = start;
+    while let Some((index, c)) = chars.next() {
+        if quote.is_none() && (c.is_whitespace() || ";|&()<>".contains(c)) {
+            break;
+        }
+        end = index + c.len_utf8();
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (None, '\'' | '"') => quote = Some(c),
+            (Some('\''), _) => word.push(c),
+            (_, '$' | '`') => return None,
+            (_, '\\') => {
+                let (index, escaped) = chars.next()?;
+                if quote == Some('"') && !matches!(escaped, '$' | '`' | '"' | '\\' | '\n') {
+                    word.push('\\');
+                }
+                if escaped != '\n' {
+                    word.push(escaped);
+                }
+                end = index + escaped.len_utf8();
+            }
+            _ => word.push(c),
+        }
+    }
+    if quote.is_some() || end == start {
+        return None;
+    }
+    *offset += end;
+    Some(word)
+}
+
+fn is_environment_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+}
+
+/// Only classify the executable, after literal assignments and supported
+/// launch wrappers. Arguments and later pipeline/compound commands are never
+/// searched for backend names.
+fn backend_executable(command: &str) -> Option<(BackendKind, usize)> {
+    let mut offset = 0;
+    let mut word;
+    loop {
+        let start = offset;
+        word = command_word(command, &mut offset)?;
+        if !is_environment_assignment(command[start..offset].trim_start()) {
+            break;
+        }
+    }
+    if matches!(word.as_str(), "exec" | "command") {
+        word = command_word(command, &mut offset)?;
+        if word == "--" {
+            word = command_word(command, &mut offset)?;
+        }
+    }
+    if Path::new(&word).file_name()?.to_str()? == "env" {
+        let mut options = true;
+        loop {
+            word = command_word(command, &mut offset)?;
+            match word.as_str() {
+                "-i" | "--ignore-environment" if options => continue,
+                "-u" | "--unset" | "-C" | "--chdir" if options => {
+                    command_word(command, &mut offset)?;
+                    continue;
+                }
+                "--" if options => {
+                    options = false;
+                    continue;
+                }
+                _ if options && (word.starts_with("--unset=") || word.starts_with("--chdir=")) => {
+                    continue
+                }
+                _ if is_environment_assignment(&word) => {
+                    options = false;
+                    continue;
+                }
+                _ if word.starts_with('-') => return None,
+                _ => break,
+            }
+        }
+    }
+    if Path::new(&word).file_name()?.to_str()? == "omar" {
+        return (command_word(command, &mut offset)? == "stub-agent")
+            .then_some((BackendKind::Stub, offset));
+    }
+    detect_backend_token(&word).map(|backend| (backend, offset))
+}
+
 fn detect_backend(base_command: &str) -> Option<BackendKind> {
-    base_command
-        .split_whitespace()
-        .find_map(detect_backend_token)
+    backend_executable(base_command).map(|(backend, _)| backend)
 }
 
 pub fn command_backend_name(command: &str) -> Option<&'static str> {
@@ -239,7 +345,6 @@ fn with_opencode_port(base_command: &str) -> String {
 /// relative to its entrypoint and starts OMAR with the exact context file.
 fn materialize_pi_extension(context: &McpLaunchContext) -> Option<(PathBuf, PathBuf)> {
     let dir = mcp_ea_dir(context)?.join("pi-extension");
-    std::fs::create_dir_all(&dir).ok()?;
     let index = dir.join("index.js");
     let mcp = dir.join("omar-mcp.js");
     let package = dir.join("package.json");
@@ -294,14 +399,7 @@ pub fn ensure_claude_inbound_settings(command: &str) -> String {
     {
         return command.to_string();
     }
-    let mut end = 0;
-    for token in command.split_whitespace() {
-        let start = end + command[end..].find(token).expect("token was cut from here");
-        end = start + token.len();
-        if detect_backend_token(token) == Some(BackendKind::Claude) {
-            break;
-        }
-    }
+    let (_, end) = backend_executable(command).expect("Claude executable checked above");
     format!(
         "{} {}{}",
         &command[..end],
@@ -1288,6 +1386,11 @@ pub fn build_agent_command(
             // Pi accepts a native system prompt in interactive mode. Keep
             // substitutions in the shell expression so worker identity and
             // task text are resolved per launch without mutating the prompt.
+            // This launch is authorized by OMAR. Pi's per-run trust flag
+            // prevents project resources from opening an unattended dialog.
+            let (_, end) = backend_executable(&base_command).expect("Pi executable checked above");
+            let base_command =
+                format!("{} --approve{}", &base_command[..end], &base_command[end..]);
             match materialize_pi_extension(mcp_context) {
                 Some((extension, context_file)) => format!(
                     "{}{} -e {} --system-prompt \"{}\"",
@@ -1513,7 +1616,7 @@ pub fn ensure_manager_session(
         Some(p) => p.to_string_lossy().into_owned(),
         None => std::env::current_dir()?.to_string_lossy().into_owned(),
     };
-    client.new_session(&session, &cmd, Some(&cwd))?;
+    client.new_session_with_backend(&session, &cmd, Some(&cwd), command_backend_name(command))?;
 
     // Give it time to start
     thread::sleep(Duration::from_secs(2));
@@ -1803,10 +1906,11 @@ fn spawn_worker(
     );
 
     // Create worker session — system prompt set at process start
-    client.new_session(
+    client.new_session_with_backend(
         &session_name,
         &cmd,
         Some(&std::env::current_dir()?.to_string_lossy()),
+        command_backend_name(command),
     )?;
 
     // Wait for backend readiness when possible, then deliver an explicit
@@ -1826,6 +1930,12 @@ fn spawn_worker(
                 Duration::from_millis(250),
             );
             if !detected {
+                if kind == BackendKind::Pi {
+                    anyhow::bail!(
+                        "{} - Pi tool discovery did not complete; initial prompt was not delivered",
+                        agent.name
+                    );
+                }
                 println!(
                     "  {} - readiness markers timed out; attempting delivery anyway",
                     agent.name
@@ -2061,7 +2171,7 @@ mod tests {
         );
         assert!(cmd.starts_with("OMAR_BINARY='"));
         assert!(cmd.contains("OMAR_EA_ID=0 OMAR_MCP_CONTEXT_FILE="));
-        assert!(cmd.contains(" pi -e "));
+        assert!(cmd.contains(" pi --approve -e "));
         let extension = dir.path().join("mcp/ea-0/pi-extension/index.js");
         let context = dir.path().join("mcp/ea-0/context.json");
         assert!(cmd.contains(&format!("-e '{}'", extension.display())));
@@ -2080,6 +2190,118 @@ mod tests {
         assert!(cmd.ends_with(
             " --system-prompt \"$(sed 's|{{TASK}}|ship it|g' '/tmp/prompts/agent.md')\""
         ));
+    }
+
+    #[test]
+    fn pi_launch_passes_approval_and_prompt_as_actual_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = dir.path().join("system prompt.md");
+        std::fs::write(&prompt, "Do {{TASK}}.").unwrap();
+        for fallback in [false, true] {
+            let root = dir.path().join(if fallback { "blocked" } else { "state" });
+            if fallback {
+                std::fs::write(&root, "not a directory").unwrap();
+            }
+            let command = build_agent_command(
+                "pi --model test-model",
+                &prompt,
+                &[("{{TASK}}", "the work")],
+                &test_mcp_context(&root),
+            );
+            // Execute the generated shell line against a fake Pi function so
+            // quoting and argument boundaries are checked without an LLM.
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("pi() {{ printf '%s\\n' \"$@\"; }}\n{command}"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let args: Vec<_> = stdout.lines().collect();
+            assert_eq!(&args[..3], &["--approve", "--model", "test-model"]);
+            assert_eq!(
+                &args[args.len() - 2..],
+                &["--system-prompt", "Do the work."]
+            );
+            assert_eq!(args.contains(&"-e"), !fallback);
+        }
+    }
+
+    #[test]
+    fn unrelated_commands_are_not_rewritten_for_backend_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        for command in [
+            "echo pi",
+            "echo /tmp/pi",
+            "cat '/opt/Pi Agent/pi'",
+            "python script.py pi",
+            "bash -lc 'pi'",
+            "env FOO=pi bash -c pi",
+            "env FOO=/tmp/pi echo hi",
+            "echo claude",
+            "echo /tmp/codex",
+            "echo stub-agent",
+            "echo ok; pi",
+            "echo ok | pi",
+            "echo ok\npi",
+            "env -u pi echo hi",
+            "'FOO=bar' pi",
+            "env --unknown pi",
+            "env command pi",
+            "env exec pi",
+            "env FOO=bar -u OTHER pi",
+            "omar other stub-agent",
+            "# pi",
+            "",
+        ] {
+            assert_eq!(command_backend_name(command), None, "{command}");
+            assert_eq!(
+                build_agent_command(
+                    command,
+                    Path::new("unused"),
+                    &[],
+                    &test_mcp_context(dir.path())
+                ),
+                command
+            );
+            assert_eq!(ensure_claude_inbound_settings(command), command);
+        }
+        assert!(!dir.path().join("mcp").exists());
+    }
+
+    #[test]
+    fn backend_detection_handles_literal_launch_prefixes_and_quoted_paths() {
+        for command in [
+            "pi",
+            "/opt/bin/pi --model test",
+            "'/opt/Pi Agent/pi'",
+            "\"/opt/Pi Agent/pi\"",
+            "PI_CODING_AGENT_DIR='/tmp/pi state' pi",
+            "env 'FOO=pi' /opt/bin/pi",
+            "env -i -u OTHER FOO=bar pi",
+            "env --unset=OTHER -- pi",
+            "exec pi",
+            "exec env FOO=bar pi",
+            "command -- pi",
+        ] {
+            assert_eq!(command_backend_name(command), Some("pi"), "{command}");
+        }
+        assert_eq!(
+            command_backend_name("'/opt/OMAR App/omar' stub-agent"),
+            Some("stub")
+        );
+        let line = "env FOO=pi '/opt/Claude App/claude' --model test";
+        assert_eq!(
+            ensure_claude_inbound_settings(line),
+            format!(
+                "env FOO=pi '/opt/Claude App/claude' {} --model test",
+                claude_inbound_settings()
+            )
+        );
     }
 
     #[test]

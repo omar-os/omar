@@ -3,11 +3,12 @@ import { createInterface } from "node:readline";
 
 const MCP_PROTOCOL_VERSION = "2024-11-05";
 const DEFAULT_TIMEOUT_MS = 20_000;
+const DEFAULT_CLOSE_GRACE_MS = 1_000;
 
 /**
  * Keep the MCP server name in every Pi tool name. Besides making the source of
- * a tool obvious to the model, this avoids collisions with Pi tools and other
- * extensions.
+ * a tool obvious to the model, this keeps the usual Pi built-ins separate.
+ * Sanitization is lossy; discovery must reject collisions before registration.
  */
 export function piToolName(mcpName) {
   const safeName = String(mcpName).replace(/[^A-Za-z0-9_-]/g, "_");
@@ -77,6 +78,7 @@ export class OmarMcpClient {
     env = {},
     cwd,
     timeoutMs = Number(process.env.OMAR_MCP_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS,
+    closeGraceMs = DEFAULT_CLOSE_GRACE_MS,
     spawnProcess = nodeSpawn,
   } = {}) {
     const contextFile = env.OMAR_MCP_CONTEXT_FILE ?? process.env.OMAR_MCP_CONTEXT_FILE;
@@ -90,17 +92,21 @@ export class OmarMcpClient {
     this.env = env;
     this.cwd = cwd;
     this.timeoutMs = timeoutMs;
+    this.closeGraceMs = closeGraceMs;
     this.spawnProcess = spawnProcess;
     this.child = undefined;
     this.lines = undefined;
     this.nextId = 1;
     this.pending = new Map();
     this.startPromise = undefined;
+    this.closePromise = undefined;
+    this.childClosed = undefined;
   }
 
   async start() {
-    if (this.child) return;
+    if (this.closePromise) await this.closePromise;
     if (this.startPromise) return this.startPromise;
+    if (this.child) return;
 
     this.startPromise = (async () => {
       const env = { ...process.env, ...this.env };
@@ -110,16 +116,23 @@ export class OmarMcpClient {
         stdio: ["pipe", "pipe", "inherit"],
       });
       this.child = child;
-      this.lines = createInterface({ input: child.stdout });
-      this.lines.on("line", (line) => this.handleLine(line));
+      const lines = createInterface({ input: child.stdout });
+      this.lines = lines;
+      lines.on("line", (line) => this.handleLine(line));
       child.on("error", (error) => this.failPending(error));
-      child.on("close", (code, signal) => {
+      // stdin can fail asynchronously when the server exits during a write.
+      child.stdin.on?.("error", (error) => this.failPending(error));
+      this.childClosed = new Promise((resolve) => child.once("close", (code, signal) => {
         const suffix = signal ? ` (${signal})` : code == null ? "" : ` (exit ${code})`;
         this.failPending(new Error(`OMAR MCP server exited${suffix}`));
-        this.child = undefined;
-        this.lines?.close();
-        this.lines = undefined;
-      });
+        lines.close();
+        if (this.child === child) {
+          this.child = undefined;
+          this.lines = undefined;
+          this.childClosed = undefined;
+        }
+        resolve();
+      }));
 
       await this.request("initialize", {
         protocolVersion: MCP_PROTOCOL_VERSION,
@@ -132,7 +145,7 @@ export class OmarMcpClient {
     try {
       await this.startPromise;
     } catch (error) {
-      this.close();
+      await this.close();
       throw error;
     } finally {
       this.startPromise = undefined;
@@ -156,11 +169,23 @@ export class OmarMcpClient {
   }
 
   close() {
+    if (this.closePromise) return this.closePromise;
     this.lines?.close();
     this.lines = undefined;
     this.failPending(new Error("OMAR MCP client closed"));
-    if (this.child && !this.child.killed) this.child.kill();
-    this.child = undefined;
+    const child = this.child;
+    if (!child) return Promise.resolve();
+
+    // child.killed only means a signal was sent, not that the process exited.
+    // Retain the child until close, and clear the escalation timer on all exits.
+    const timer = setTimeout(() => child.kill("SIGKILL"), this.closeGraceMs);
+    this.closePromise = this.childClosed.finally(() => {
+      clearTimeout(timer);
+      this.closePromise = undefined;
+    });
+    child.stdin.end?.();
+    child.kill("SIGTERM");
+    return this.closePromise;
   }
 
   async notify(method, params) {
@@ -184,8 +209,9 @@ export class OmarMcpClient {
       if (signal?.aborted) return abort();
 
       timer = setTimeout(() => {
+        const pending = this.pending.get(id);
         this.pending.delete(id);
-        reject(new Error(`OMAR MCP request ${method} timed out`));
+        pending?.reject(new Error(`OMAR MCP request ${method} timed out`));
       }, this.timeoutMs);
       signal?.addEventListener("abort", abort, { once: true });
       this.pending.set(id, {

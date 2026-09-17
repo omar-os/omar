@@ -9,21 +9,36 @@ function messageFor(error) {
  * extension itself never leaks an MCP child into `pi --list-models` or other
  * no-session invocations.
  */
-export default function omarPiExtension(pi) {
+export default function omarPiExtension(pi, { createClient = () => new OmarMcpClient() } = {}) {
   let client;
-  let discovered = new Map();
 
   const discover = async (ctx) => {
     if (client) return;
-    client = new OmarMcpClient();
+    const discoveringClient = createClient();
+    client = discoveringClient;
     try {
-      const tools = await client.listTools();
+      const tools = await discoveringClient.listTools();
+      if (client !== discoveringClient) return;
+      if (tools.length === 0) {
+        throw new Error("OMAR MCP server returned no tools");
+      }
+      // Validate the complete list before registering anything. This map belongs
+      // to this attempt only, so a registration failure cannot poison a retry.
+      const names = new Map();
       for (const tool of tools) {
-        if (!tool?.name || discovered.has(tool.name)) continue;
-        discovered.set(tool.name, tool);
+        if (typeof tool?.name !== "string" || !tool.name) {
+          throw new Error("OMAR MCP server returned an invalid tool name");
+        }
         const name = piToolName(tool.name);
+        if (names.has(name)) {
+          const originals = [names.get(name), tool.name].sort();
+          throw new Error(`OMAR Pi tool name collision: ${originals.map((value) => JSON.stringify(value)).join(" and ")} map to ${name}`);
+        }
+        names.set(name, tool.name);
+      }
+      for (const tool of tools) {
         pi.registerTool({
-          name,
+          name: piToolName(tool.name),
           label: `OMAR ${tool.name}`,
           description: tool.description || `Call OMAR MCP tool ${tool.name}`,
           promptSnippet: `Call OMAR MCP tool ${tool.name}`,
@@ -34,13 +49,10 @@ export default function omarPiExtension(pi) {
           },
         });
       }
-      if (tools.length === 0) {
-        throw new Error("OMAR MCP server returned no tools");
-      }
       ctx?.ui?.notify?.(`OMAR: loaded ${tools.length} MCP tools`, "info");
     } catch (error) {
-      client?.close();
-      client = undefined;
+      if (client === discoveringClient) client = undefined;
+      await discoveringClient.close();
       ctx?.ui?.notify?.(`OMAR MCP unavailable: ${messageFor(error)}`, "error");
     }
   };
@@ -50,9 +62,9 @@ export default function omarPiExtension(pi) {
   });
 
   pi.on("session_shutdown", async () => {
-    client?.close();
+    const closingClient = client;
     client = undefined;
-    discovered = new Map();
+    await closingClient?.close();
   });
 }
 

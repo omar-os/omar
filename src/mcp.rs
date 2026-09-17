@@ -230,21 +230,9 @@ fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> String {
         return name.to_string();
     }
 
-    for token in command.split_whitespace() {
-        let token = token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')' | '[' | ']'));
-        if token.is_empty() {
-            continue;
-        }
-        let executable = Path::new(token)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(token);
-        if let Some(name) = normalize(executable) {
-            return name.to_string();
-        }
-    }
-
-    "unknown".to_string()
+    manager::command_backend_name(command)
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn looks_like_supervisor_name(name: &str) -> bool {
@@ -1154,7 +1142,12 @@ impl OmarMcpServer {
             return Err(anyhow!("Agent '{}' already exists", short_name));
         }
         let tmux_spawn_start = std::time::Instant::now();
-        client.new_session(&session_name, &command, Some(&workdir))?;
+        client.new_session_with_backend(
+            &session_name,
+            &command,
+            Some(&workdir),
+            manager::command_backend_name(&base_command),
+        )?;
         let tmux_spawn_ms = tmux_spawn_start.elapsed().as_millis() as u64;
         metrics::record_backend_bootstrap(&backend_name);
 
@@ -1214,7 +1207,13 @@ impl OmarMcpServer {
                     )
                 };
                 let opts = DeliveryOptions::default();
-                let delivery = client2.deliver_prompt(&session2, &first_message, &opts);
+                let delivery = if backend_name2 == "pi" && readiness.is_err() {
+                    Err(anyhow!(
+                        "Pi tool discovery did not complete; initial prompt was not delivered"
+                    ))
+                } else {
+                    client2.deliver_prompt(&session2, &first_message, &opts)
+                };
                 let delivery_ok = delivery.is_ok();
                 metrics::record_prompt_delivery(
                     ea_id,
@@ -2842,6 +2841,24 @@ mod tests {
             infer_backend_name(None, "env PI_CODING_AGENT_DIR=/tmp pi"),
             "pi"
         );
+    }
+
+    #[test]
+    fn infer_backend_name_ignores_backend_names_in_arguments() {
+        for command in [
+            "echo pi",
+            "cat /tmp/pi",
+            "env FOO=pi bash -c pi",
+            "echo claude",
+            "echo ok; pi",
+        ] {
+            assert_eq!(infer_backend_name(None, command), "unknown", "{command}");
+        }
+        assert_eq!(
+            infer_backend_name(None, "'/opt/Pi Agent/pi' --approve"),
+            "pi"
+        );
+        assert_eq!(infer_backend_name(Some("codex"), "echo pi"), "codex");
     }
 
     #[test]

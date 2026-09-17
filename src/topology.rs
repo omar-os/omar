@@ -2102,7 +2102,12 @@ fn spawn_topology_agents(
             }),
         };
         let command = manager::build_agent_command(&base_command, &prompt_file, &[], &context);
-        client.new_session(&session, &command, Some(config.default_workdir))?;
+        client.new_session_with_backend(
+            &session,
+            &command,
+            Some(config.default_workdir),
+            Some(backend),
+        )?;
         spawned.insert(name.clone(), session);
     }
 
