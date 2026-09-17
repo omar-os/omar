@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter, once, getEventListeners } from "node:events";
-import { chmod } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PassThrough } from "node:stream";
 import { spawn } from "node:child_process";
@@ -338,7 +340,14 @@ test("reaps an actual child that ignores SIGTERM", { timeout: 5000 }, async (t) 
   assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
 });
 
-test("is runnable by Pi 0.85.1 in RPC mode", async (t) => {
+test("is runnable by Pi 0.85.1 with the E2E provider loaded before RPC", async (t) => {
+  const agentDir = await mkdtemp(join(tmpdir(), "omar-pi-rpc-"));
+  t.after(() => rm(agentDir, { recursive: true, force: true }));
+  await writeFile(join(agentDir, "settings.json"), JSON.stringify({
+    defaultProvider: "omar-pi-e2e",
+    defaultModel: "tree",
+    extensions: [fileURLToPath(new URL("./fixtures/deterministic-provider.mjs", import.meta.url))],
+  }));
   const fakeOmar = fakeOmarPath;
   await chmod(fakeOmar, 0o755);
   const pi = spawn(
@@ -347,7 +356,12 @@ test("is runnable by Pi 0.85.1 in RPC mode", async (t) => {
       ? ["--mode", "rpc", "--no-session", "--offline", "-e", extensionPath]
       : ["--yes", "--package=@earendil-works/pi-coding-agent@0.85.1", "--", "pi", "--mode", "rpc", "--no-session", "--offline", "-e", extensionPath],
     {
-      env: { ...process.env, OMAR_BINARY: fakeOmar },
+      env: {
+        ...process.env,
+        OMAR_BINARY: fakeOmar,
+        PI_CODING_AGENT_DIR: agentDir,
+        PI_E2E_BASE_URL: "http://127.0.0.1:9/v1",
+      },
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     },
@@ -377,7 +391,7 @@ test("is runnable by Pi 0.85.1 in RPC mode", async (t) => {
     };
     const onData = (chunk) => {
       output += chunk;
-      if (output.includes('"command":"get_state"')) finish();
+      if (output.split("\n").slice(0, -1).some((line) => line.includes('"command":"get_state"'))) finish();
     };
     const onExit = () => finish(new Error(`Pi RPC exited: ${output}\n${stderr}`));
     const timeout = setTimeout(() => finish(new Error(`Pi RPC startup timed out: ${output}\n${stderr}`)), 30_000);
@@ -386,7 +400,12 @@ test("is runnable by Pi 0.85.1 in RPC mode", async (t) => {
     pi.once("exit", onExit);
     pi.stdin.write('{"id":"state","type":"get_state"}\n');
   });
-  assert.match(output, /"success":true/);
+  const state = output.split("\n").slice(0, -1).filter(Boolean).map((line) => JSON.parse(line))
+    .find((event) => event.type === "response" && event.id === "state");
+  assert.equal(state?.success, true, output);
+  assert.equal(state.data.model.provider, "omar-pi-e2e");
+  assert.equal(state.data.model.id, "tree");
+  assert.match(output, /OMAR: loaded [1-9][0-9]* MCP tools/);
 });
 
 test("registers and calls the discovered omar_spawn_agent Pi tool", async () => {

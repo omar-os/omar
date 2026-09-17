@@ -15,8 +15,8 @@ if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required" >&2
   exit 1
 fi
-if ! command -v npx >/dev/null 2>&1; then
-  echo "npx is required" >&2
+if ! command -v npm >/dev/null 2>&1; then
+  echo "npm is required" >&2
   exit 1
 fi
 if [ ! -x "$OMAR_BIN" ]; then
@@ -67,12 +67,24 @@ settings = {
 Path(sys.argv[1]).write_text(json.dumps(settings), encoding="utf-8")
 PYSETTINGS
 
-# OMAR resolves the leaf backend from PATH. Pin it to the same Pi version as
-# the root so the test also exercises OMAR's normal Pi launch path.
-printf '%s\n' '#!/usr/bin/env bash' \
-  "exec npx --yes --package=@earendil-works/pi-coding-agent@$PI_VERSION -- pi \"\$@\"" \
-  >"$HOME/bin/pi"
+# Install before opening RPC stdin. A cold npx launch mixes package setup with
+# protocol startup and leaves an npm/sh wrapper whose exit is not Pi's exit.
+# Resolve one pinned CLI for both root and leaves, with no runtime npm work.
+npm install --prefix "$test_root/pi-runtime" --no-save --no-package-lock --no-audit --no-fund \
+  "@earendil-works/pi-coding-agent@$PI_VERSION" </dev/null
+export PI_E2E_CLI="$test_root/pi-runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
+python3 - "$HOME/bin/pi" "$(command -v node)" "$PI_E2E_CLI" <<'PYWRAPPER'
+import shlex, sys
+from pathlib import Path
+Path(sys.argv[1]).write_text("#!/usr/bin/env bash\nexec " + shlex.join(sys.argv[2:]) + ' "$@"\n')
+PYWRAPPER
 chmod +x "$HOME/bin/pi"
+if [ "${PI_E2E_LIVE:-0}" != "1" ]; then
+  # Offline disables catalog/version lookups, not the local model HTTP server.
+  # Inherit it in interactive leaves as well as the RPC root.
+  export PI_OFFLINE=1
+fi
+pi --version
 
 # Initialize EA-scoped state, then use the same MCP protocol the extension uses.
 "$OMAR_BIN" list >/dev/null 2>&1 || true
@@ -113,7 +125,7 @@ prompt="You are the root of a binary-tree integration test. You MUST call the to
 # the assertions prove real Pi invoked the dynamically registered tools.
 set +e
 PI_PROMPT="$prompt" PI_PROJECT_ID="$project_id" PI_ROOT_LOG="$root_log" PI_EXTENSION="$REPO_ROOT/bridges/pi/index.js" python3 - <<'PY'
-import json, os, queue, re, subprocess, sys, threading, time
+import json, os, queue, re, signal, subprocess, sys, threading, time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -177,9 +189,9 @@ child_env["PI_E2E_BASE_URL"] = f"http://127.0.0.1:{server.server_port}/v1"
 provider = os.environ.get("PI_E2E_PROVIDER", "openai") if os.environ.get("PI_E2E_LIVE") == "1" else "omar-pi-e2e"
 model = os.environ.get("PI_E2E_MODEL", "gpt-5-mini") if os.environ.get("PI_E2E_LIVE") == "1" else "tree"
 cmd = ["pi", "--mode", "rpc", "--no-session", "--approve", "--provider", provider, "--model", model, "-e", os.environ["PI_EXTENSION"]]
-proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env=child_env)
+proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env=child_env, start_new_session=True)
 assert proc.stdin and proc.stdout and proc.stderr
-proc.stdin.write(json.dumps({"id": "tree", "type": "prompt", "message": os.environ["PI_PROMPT"]}) + "\n")
+proc.stdin.write(json.dumps({"id": "state", "type": "get_state"}) + "\n")
 proc.stdin.flush()
 # A queue drains complete lines, including lines already buffered by Python's
 # text reader. select()+readline() can strand the final agent_settled event.
@@ -189,10 +201,20 @@ def read_stdout():
         output_lines.put(line)
     output_lines.put(None)
 threading.Thread(target=read_stdout, daemon=True).start()
+stderr_lines = []
+def read_stderr():
+    for line in proc.stderr:
+        stderr_lines.append(line)
+stderr_reader = threading.Thread(target=read_stderr, daemon=True)
+stderr_reader.start()
+started = time.monotonic()
 deadline = time.monotonic() + 300
 events = []
 settled = False
 leaf_error = None
+rpc_error = None
+stdout_closed = False
+ready = False
 
 def check_leaves():
     """A session alone can be a dead pane, a shell, or a blocked trust dialog."""
@@ -218,8 +240,23 @@ def check_leaves():
             if ready and loaded and "pi v" in text:
                 screen = subprocess.check_output(tmux + ["capture-pane", "-p", "-t", session], text=True)
                 assert not re.search(r"trust this|trust project folder|trust.*directory|project trust|project is not trusted|OMAR MCP unavailable", screen, re.I), screen
-                assert command not in ("bash", "zsh", "sh", "fish"), pane
-                print(f"PASS: {leaf}: pane alive ({command}), Pi ready, OMAR tools loaded, leaf called update_agent_status", flush=True)
+                # Linux sh -lc may remain the pane's foreground process even
+                # while Pi runs below it. Require a live Pi descendant, rather
+                # than accepting a shell or relying on tmux's process label.
+                processes = subprocess.check_output(["ps", "-axo", "pid=,ppid=,command="], text=True)
+                rows = [row.strip().split(None, 2) for row in processes.splitlines()]
+                descendants = {int(pid)}
+                while True:
+                    found = {int(p) for p, parent, _cmd in rows if int(parent) in descendants}
+                    if found <= descendants:
+                        break
+                    descendants |= found
+                pi_pids = [int(p) for p, _parent, cmd in rows if int(p) in descendants
+                           and (cmd == "pi" or os.environ["PI_E2E_CLI"] in cmd)]
+                assert pi_pids, f"{leaf}: no live Pi process below pane {pane}"
+                for pi_pid in pi_pids:
+                    os.kill(pi_pid, 0)
+                print(f"PASS: {leaf}: pane alive ({command}), Pi PIDs {pi_pids}, Pi ready, OMAR tools loaded, leaf called update_agent_status", flush=True)
                 pending.remove(leaf)
         if pending:
             time.sleep(0.1)
@@ -235,12 +272,26 @@ try:
                 break
             continue
         if line is None:
+            stdout_closed = True
             break
         events.append(line)
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if event.get("type") == "response" and event.get("success") is False:
+            rpc_error = f"Pi RPC rejected command: {event}"
+            break
+        if event.get("type") == "response" and event.get("id") == "state":
+            if os.environ.get("PI_E2E_LIVE") != "1":
+                actual_model = event.get("data", {}).get("model", {})
+                if actual_model.get("provider") != provider or actual_model.get("id") != model:
+                    rpc_error = f"Pi did not load deterministic provider: {event}"
+                    break
+            ready = True
+            print(f"PASS: Pi RPC ready with {provider}/{model}", flush=True)
+            proc.stdin.write(json.dumps({"id": "tree", "type": "prompt", "message": os.environ["PI_PROMPT"]}) + "\n")
+            proc.stdin.flush()
         if event.get("type") == "agent_settled":
             settled = True
             break
@@ -250,13 +301,25 @@ try:
         except (AssertionError, OSError, subprocess.SubprocessError) as error:
             leaf_error = str(error)
 finally:
-    proc.terminate()
+    exit_before_cleanup = proc.poll()
+    # Reap the whole RPC process group, including its MCP subprocess, so no
+    # descendant can keep stdout/stderr open after the root exits.
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=5)
+    stderr_reader.join(timeout=5)
     server.shutdown()
-stderr = proc.stderr.read()
+stderr = "".join(stderr_lines)
 with open(os.environ["PI_ROOT_LOG"], "w", encoding="utf-8") as handle:
     handle.writelines(events)
     if stderr:
@@ -268,9 +331,11 @@ if os.environ.get("PI_E2E_LIVE") == "1" and any(marker in combined.lower() for m
     raise SystemExit(77)
 if leaf_error:
     raise SystemExit(leaf_error)
-if not settled:
+if rpc_error or not settled:
     print(combined[-8000:], file=sys.stderr)
-    raise SystemExit("Pi RPC did not settle within 300 seconds")
+    elapsed = time.monotonic() - started
+    reason = f"exited with code {exit_before_cleanup}" if exit_before_cleanup is not None else ("closed stdout" if stdout_closed else "timed out")
+    raise SystemExit(rpc_error or f"Pi RPC {reason} after {elapsed:.1f}s (ready={ready}, events={len(events)})")
 PY
 rpc_status=$?
 set -e
