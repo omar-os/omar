@@ -286,13 +286,6 @@ fn ensure_codex_runtime_flags(base_command: &str) -> String {
         command.push_str(" --dangerously-bypass-approvals-and-sandbox");
     }
 
-    if !base_command
-        .split_whitespace()
-        .any(|token| token == "--no-alt-screen")
-    {
-        command.push_str(" --no-alt-screen");
-    }
-
     command
 }
 
@@ -537,11 +530,6 @@ const CODEX_NO_ATTACH_FLAGS: &[&str] = &[
     "--dangerously-bypass-hook-trust",
 ];
 
-/// Would this command's codex refuse the app-server?
-///
-/// `spawn_agent` adds `-c model_reasoning_effort=…` for any agent given a
-/// reasoning effort, and an operator may have configured flags of their own,
-/// so this is a real case rather than a defensive one.
 /// Answer codex's directory-trust prompt before it is asked.
 ///
 /// codex blocks on "Do you trust the contents of this directory?" the first
@@ -570,6 +558,42 @@ fn codex_refuses_to_attach(base_command: &str) -> bool {
     })
 }
 
+/// Move the override emitted by `spawn_agent` into the per-pane config.
+/// Only consume that known literal spelling, leaving arbitrary shell/config
+/// expressions on the fallback path. Keep the original command for fallback
+/// so an IO failure never loses the requested effort.
+fn codex_launch_reasoning_effort(base_command: &str) -> (String, Option<String>) {
+    // spawn_agent appends the override; runtime flag normalization may append
+    // the bypass flag after it. Do not search inside arbitrary shell arguments.
+    let runtime_flag = " --dangerously-bypass-approvals-and-sandbox";
+    let (command, suffix) = base_command
+        .strip_suffix(runtime_flag)
+        .map_or((base_command, ""), |command| (command, runtime_flag));
+    for value in ["low", "medium", "high", "xhigh"] {
+        let flag = format!(" -c model_reasoning_effort='\"{value}\"'");
+        if let Some(command) = command.strip_suffix(&flag) {
+            // Multiple overrides or other config flags still trigger the
+            // fallback; do not reorder or reinterpret their precedence.
+            return (format!("{command}{suffix}"), Some(value.to_string()));
+        }
+    }
+    (base_command.to_string(), None)
+}
+
+/// Match Codex's home selection, resolving relative paths before the pane
+/// changes working directory and before using them as symlink targets.
+fn user_codex_home() -> Option<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
+    if home.is_absolute() {
+        Some(home)
+    } else {
+        Some(std::env::current_dir().ok()?.join(home))
+    }
+}
+
 /// A codex home of OMAR's own, one per launched pane.
 ///
 /// codex's TUI only attaches to an app-server when it is started with no
@@ -592,7 +616,11 @@ fn codex_home_dir(context: &McpLaunchContext) -> Option<PathBuf> {
         return None;
     }
     prune_stale_codex_homes(&context.omar_dir.join("codex"));
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(dir.parent()?).ok()?;
+    // State and sockets inherit this directory's protection even when Codex
+    // writes files with a permissive umask. Refuse an existing path entirely.
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).ok()?;
     Some(dir)
 }
 
@@ -675,7 +703,7 @@ pub(crate) const CODEX_HOME_SESSION_FILE: &str = "omar-session";
 
 /// The `config.toml` for a per-pane codex home.
 ///
-/// The operator's own `~/.codex/config.toml` is the base, so their model,
+/// The operator's own `CODEX_HOME/config.toml` is the base, so their model,
 /// plugins and the rest still apply — minus `projects`, whose trust records
 /// the pane appends for its own working directory and which must not appear
 /// twice in one file.
@@ -726,35 +754,77 @@ fn codex_config_toml(
 /// Returns `None` on any IO failure, and the caller then launches codex the
 /// old way — with `-c` overrides and no side channel. A pane that comes up
 /// without a channel still works; one that does not come up at all does not.
-fn codex_home_launch(context: &McpLaunchContext, developer_instructions: &str) -> Option<PathBuf> {
+fn codex_home_launch(
+    context: &McpLaunchContext,
+    developer_instructions: &str,
+    reasoning_effort: Option<&str>,
+) -> Option<PathBuf> {
     let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
-    let user_codex = dirs::home_dir()?.join(".codex");
-    let config = codex_config_toml(
+    let user_codex = user_codex_home()?;
+    let mut config = codex_config_toml(
         &std::fs::read_to_string(user_codex.join("config.toml")).unwrap_or_default(),
         developer_instructions,
         &server_exe,
         &context_file,
     );
+    if let Some(effort) = reasoning_effort {
+        let mut parsed: toml::Table = toml::from_str(&config).ok()?;
+        parsed.insert("model_reasoning_effort".to_string(), effort.into());
+        config = parsed.to_string();
+    }
 
-    // Made last, once everything that can fail has: a home abandoned between
-    // being created and being filled would have no session name to prune it by
-    // and no server to answer for it, so nothing would ever remove it.
+    // Remove a partially seeded home on failure: it has no session name or
+    // server yet, so the regular stale-home cleanup cannot identify it.
     let home = codex_home_dir(context)?;
-    if write_private_file(&home.join("config.toml"), config.as_bytes()).is_err() {
+    if write_private_file(&home.join("config.toml"), config.as_bytes()).is_err()
+        || seed_codex_home(&user_codex, &home).is_err()
+    {
         let _ = std::fs::remove_dir_all(&home);
         return None;
     }
 
-    // Symlinked, not copied: the token is refreshed in place, and a pane
-    // holding a stale copy would be logged out mid-run.
-    let _ = std::os::unix::fs::symlink(user_codex.join("auth.json"), home.join("auth.json"));
-    // A home that has never seen an update check opens the release prompt over
-    // the TUI and waits for a keypress that never comes. Carrying the
-    // operator's own answer across means the pane starts where they left off.
-    let _ = std::fs::copy(user_codex.join("version.json"), home.join("version.json"));
-
     Some(home)
+}
+
+/// Share only durable personal inputs. Never mirror the home wholesale: its
+/// sessions, databases, caches and app-server sockets belong to that process.
+/// Resolve existing links so a child launched with its parent's CODEX_HOME
+/// keeps its personal assets after the parent's home is pruned.
+fn seed_codex_home(source: &Path, home: &Path) -> io::Result<()> {
+    for name in [
+        "auth.json",
+        "skills",
+        "rules",
+        "prompts",
+        "AGENTS.md",
+        "AGENTS.override.md",
+    ] {
+        let source = source.join(name);
+        match std::fs::canonicalize(&source) {
+            Ok(target) => std::os::unix::fs::symlink(target, home.join(name))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // Keep auth live even before the first file-based login.
+                if name == "auth.json" {
+                    let target = std::fs::read_link(&source).unwrap_or(source.clone());
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        source.parent().unwrap().join(target)
+                    };
+                    std::os::unix::fs::symlink(target, home.join(name))?;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    // Avoid an unattended update prompt, but keep per-pane update writes local.
+    match std::fs::read(source.join("version.json")) {
+        Ok(version) => write_private_file(&home.join("version.json"), &version)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
 }
 
 /// Launch codex in a per-pane home, with an app-server the pane owns.
@@ -1180,12 +1250,12 @@ pub fn build_agent_command(
                         body.replace(pattern, replacement)
                     })
             });
-            if !codex_refuses_to_attach(&base_command) {
-                if let Some(home) = instructions
-                    .ok()
-                    .and_then(|instructions| codex_home_launch(mcp_context, &instructions))
-                {
-                    return codex_home_command(&home, &base_command);
+            let (tui_command, reasoning_effort) = codex_launch_reasoning_effort(&base_command);
+            if !codex_refuses_to_attach(&tui_command) {
+                if let Some(home) = instructions.ok().and_then(|instructions| {
+                    codex_home_launch(mcp_context, &instructions, reasoning_effort.as_deref())
+                }) {
+                    return codex_home_command(&home, &tui_command);
                 }
             }
             // No channel here, but codex still refuses to start in a directory
@@ -2036,7 +2106,7 @@ mod tests {
         // The flag is Claude Code's; handing it to another backend would be an
         // unrecognised argument at launch.
         for base in [
-            "codex --no-alt-screen",
+            "codex",
             "opencode",
             "cursor agent --yolo",
             "agy --dangerously-skip-permissions",
@@ -2062,12 +2132,22 @@ mod tests {
     }
 
     #[test]
+    fn codex_uses_its_alternate_screen_unless_explicitly_disabled() {
+        let default = ensure_codex_runtime_flags("codex");
+        assert_eq!(default, "codex --dangerously-bypass-approvals-and-sandbox");
+        assert_eq!(ensure_codex_runtime_flags(&default), default);
+        let explicit = "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox";
+        assert_eq!(ensure_codex_runtime_flags(explicit), explicit);
+        assert_eq!(ensure_codex_runtime_flags("bash"), "bash");
+    }
+
+    #[test]
     fn test_build_agent_command_codex() {
         let dir = short_tempdir();
         let prompt = dir.path().join("ea.md");
         std::fs::write(&prompt, "be helpful, {{EA_NAME}}").unwrap();
         let cmd = build_agent_command(
-            "codex --no-alt-screen",
+            "codex",
             &prompt,
             &[("{{EA_NAME}}", "CapX")],
             &test_mcp_context(dir.path()),
@@ -2076,7 +2156,7 @@ mod tests {
         // Nothing on codex's disqualifier list may reach the TUI, or it
         // refuses to attach to the app-server and there is no side channel.
         assert!(
-            cmd.ends_with("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"),
+            cmd.ends_with("codex --dangerously-bypass-approvals-and-sandbox"),
             "the TUI must be launched bare: {cmd}"
         );
         assert!(
@@ -2126,6 +2206,246 @@ mod tests {
     }
 
     #[test]
+    fn codex_home_bootstrap_preserves_personal_inputs_and_isolates_state() {
+        // HOME/CODEX_HOME are process-global. Run this fixture alone in a
+        // child test process so parallel tests cannot read its temporary home.
+        const CHILD: &str = "OMAR_TEST_CODEX_HOME_BOOTSTRAP";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "manager::tests::codex_home_bootstrap_preserves_personal_inputs_and_isolates_state",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = short_tempdir();
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        std::env::remove_var("CODEX_HOME");
+        assert_eq!(user_codex_home(), Some(dir.path().join(".codex")));
+        std::env::set_var("CODEX_HOME", "");
+        assert_eq!(user_codex_home(), Some(dir.path().join(".codex")));
+        std::env::set_var("CODEX_HOME", "relative-home");
+        assert_eq!(
+            user_codex_home(),
+            Some(std::env::current_dir().unwrap().join("relative-home"))
+        );
+
+        let source = dir.path().join("personal 'home");
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &source);
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        std::fs::write(
+            dir.path().join(".codex/config.toml"),
+            "model = 'wrong-home'",
+        )
+        .unwrap();
+        let source_config = "model = 'personal-model'\nmodel_reasoning_effort = 'low'\n[features]\nscheduled_tasks = true\n[mcp_servers.personal]\ncommand = 'personal-mcp'\n";
+        std::fs::write(source.join("config.toml"), source_config).unwrap();
+        for (name, body) in [
+            ("auth.json", "original-auth"),
+            ("version.json", "update-already-checked"),
+            ("skills/custom/SKILL.md", "personal skill"),
+            ("rules/default.rules", "personal rules"),
+            ("prompts/review.md", "personal prompt"),
+            ("AGENTS.md", "personal instructions"),
+            ("AGENTS.override.md", "personal override"),
+            ("sessions/old.jsonl", "old session"),
+            ("archived_sessions/old.jsonl", "old archived session"),
+            ("history.jsonl", "old history"),
+            ("state_5.sqlite", "old database"),
+            ("state_5.sqlite-wal", "old database journal"),
+            ("log/codex.log", "old log"),
+            ("tmp/old", "old temporary state"),
+            ("models_cache.json", "old cache"),
+            ("omar-session", "old pane"),
+        ] {
+            let path = source.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        std::fs::create_dir_all(source.join("app-server-control")).unwrap();
+        let socket = crate::channel::codex_socket_path(&source);
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let prompt = dir.path().join("agent.md");
+        std::fs::write(&prompt, "instructions for {{AGENT}}").unwrap();
+        let context = test_mcp_context(dir.path());
+        let mut homes = Vec::new();
+        for effort in [
+            None,
+            Some("low"),
+            Some("medium"),
+            Some("high"),
+            Some("xhigh"),
+        ] {
+            let base = match effort {
+                Some(value) => {
+                    format!("codex --model worker-model -c model_reasoning_effort='\"{value}\"'")
+                }
+                None => "codex --model worker-model".to_string(),
+            };
+            let command = build_agent_command(&base, &prompt, &[("{{AGENT}}", "worker")], &context);
+            let home =
+                crate::channel::codex_home(&command).expect("every effort uses a per-pane home");
+            assert!(!homes.contains(&home));
+            assert_ne!(home, source);
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+            assert!(!command.contains(" -c "), "{command}");
+            assert!(command.contains("codex app-server --listen unix://"));
+            assert!(command.ends_with(
+                "codex --model worker-model --dangerously-bypass-approvals-and-sandbox"
+            ));
+            let config: toml::Table =
+                toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap())
+                    .unwrap();
+            assert_eq!(config["model"].as_str(), Some("personal-model"));
+            assert_eq!(
+                config["model_reasoning_effort"].as_str(),
+                Some(effort.unwrap_or("low"))
+            );
+            assert_eq!(
+                config["developer_instructions"].as_str(),
+                Some("instructions for worker")
+            );
+            assert_eq!(config["features"]["scheduled_tasks"].as_bool(), Some(false));
+            assert_eq!(
+                config["mcp_servers"]["personal"]["command"].as_str(),
+                Some("personal-mcp")
+            );
+            assert!(config["mcp_servers"]["omar"]["args"].is_array());
+            assert!(!home.join("config.toml").is_symlink());
+            assert!(!home.join("version.json").is_symlink());
+            // An allowlist check catches newly introduced accidental state sharing too.
+            let mut names: Vec<_> = std::fs::read_dir(&home)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            assert_eq!(
+                names,
+                [
+                    "AGENTS.md",
+                    "AGENTS.override.md",
+                    "auth.json",
+                    "config.toml",
+                    "prompts",
+                    "rules",
+                    "skills",
+                    "version.json"
+                ]
+            );
+            assert!(!crate::channel::codex_socket_path(&home).exists());
+            assert!(crate::channel::codex_socket_path(&home).as_os_str().len() < SUN_PATH_MAX);
+            homes.push(home);
+        }
+
+        // Nested launches inherit the selected personal inputs, without links
+        // depending on an ephemeral parent home that may subsequently vanish.
+        let parent = homes.pop().unwrap();
+        let _inherited = EnvVarGuard::set("CODEX_HOME", &parent);
+        let nested = codex_home_launch(&context, "child instructions", None).unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
+        homes.push(nested);
+        // Atomic replacement models a credential refresh by another pane.
+        std::fs::write(source.join("auth.new"), "refreshed-auth").unwrap();
+        std::fs::rename(source.join("auth.new"), source.join("auth.json")).unwrap();
+        for home in homes {
+            for (name, want) in [
+                ("auth.json", "refreshed-auth"),
+                ("version.json", "update-already-checked"),
+                ("skills/custom/SKILL.md", "personal skill"),
+                ("rules/default.rules", "personal rules"),
+                ("prompts/review.md", "personal prompt"),
+                ("AGENTS.md", "personal instructions"),
+                ("AGENTS.override.md", "personal override"),
+            ] {
+                assert_eq!(std::fs::read_to_string(home.join(name)).unwrap(), want);
+            }
+            std::fs::write(home.join("version.json"), "pane update").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(source.join("config.toml")).unwrap(),
+            source_config
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("version.json")).unwrap(),
+            "update-already-checked"
+        );
+        assert!(socket.exists());
+
+        // Missing optional assets still bootstrap, including file auth that
+        // appears after launch. A real seeding failure must remove its home.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let _empty = EnvVarGuard::set("CODEX_HOME", &empty);
+        let first = codex_home_launch(&context, "first", None).unwrap();
+        let _first = EnvVarGuard::set("CODEX_HOME", &first);
+        let second = codex_home_launch(&context, "second", None).unwrap();
+        std::fs::remove_dir_all(&first).unwrap();
+        std::fs::write(empty.join("auth.json"), "new-login").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(second.join("auth.json")).unwrap(),
+            "new-login"
+        );
+        let _failed = EnvVarGuard::set("CODEX_HOME", &empty);
+        std::fs::create_dir(empty.join("version.json")).unwrap();
+        let count = || std::fs::read_dir(dir.path().join("codex")).unwrap().count();
+        let before = count();
+        assert!(codex_home_launch(&context, "failed", None).is_none());
+        assert_eq!(
+            count(),
+            before,
+            "a failed seed must not leave an unclaimed home"
+        );
+    }
+
+    #[test]
+    fn codex_reasoning_effort_survives_fallbacks_without_reinterpreting_other_flags() {
+        let dir = short_tempdir();
+        let prompt = dir.path().join("agent.md");
+        std::fs::write(&prompt, "be helpful").unwrap();
+        for base in [
+            "codex --search -c model_reasoning_effort='\"high\"'",
+            "codex -c arbitrary_config=true -c model_reasoning_effort='\"high\"'",
+            "codex -c model_reasoning_effort='\"low\"' -c model_reasoning_effort='\"high\"'",
+            "codex -c model_reasoning_effort='\"high\"'suffix",
+        ] {
+            let command = build_agent_command(base, &prompt, &[], &test_mcp_context(dir.path()));
+            assert!(crate::channel::codex_home(&command).is_none());
+            assert!(
+                command.contains(base),
+                "fallback must preserve overrides: {command}"
+            );
+        }
+        let deep = dir.path().join("d".repeat(90));
+        let command = build_agent_command(
+            "codex -c model_reasoning_effort='\"high\"'",
+            &prompt,
+            &[],
+            &test_mcp_context(&deep),
+        );
+        assert!(crate::channel::codex_home(&command).is_none());
+        assert!(command.contains(" -c model_reasoning_effort='\"high\"'"));
+    }
+
+    #[test]
     fn a_launch_without_a_side_channel_still_trusts_its_own_directory() {
         // codex blocks on "Do you trust the contents of this directory?" the
         // first time it runs anywhere new, and no agent ever answers it. The
@@ -2136,7 +2456,7 @@ mod tests {
         std::fs::write(&prompt, "be helpful").unwrap();
         let cmd = build_agent_command(
             // a disqualifying flag forces the fallback
-            "codex --no-alt-screen -c model_reasoning_effort='\"high\"'",
+            "codex --search",
             &prompt,
             &[],
             &test_mcp_context(dir.path()),
@@ -2179,15 +2499,10 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         let prompt = deep.join("ea.md");
         std::fs::write(&prompt, "be helpful").unwrap();
-        let cmd = build_agent_command(
-            "codex --no-alt-screen",
-            &prompt,
-            &[],
-            &test_mcp_context(&deep),
-        );
+        let cmd = build_agent_command("codex", &prompt, &[], &test_mcp_context(&deep));
         assert!(
             cmd.contains(
-                "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox \
+                "codex --dangerously-bypass-approvals-and-sandbox \
                  -c \"developer_instructions='''$(cat '"
             ),
             "unexpected fallback command: {cmd}"
@@ -2255,7 +2570,7 @@ mod tests {
             .expect("sh -n");
         assert!(out.status.success(), "sh cannot syntax-check");
 
-        let cmd = codex_home_command(Path::new("/tmp/omar-home"), "codex --no-alt-screen");
+        let cmd = codex_home_command(Path::new("/tmp/omar-home"), "codex");
         let checked = std::process::Command::new("sh")
             .arg("-n")
             .stdin(std::process::Stdio::piped())
@@ -2283,8 +2598,8 @@ mod tests {
 
     #[test]
     fn a_codex_that_will_not_attach_is_launched_the_old_way() {
-        // `spawn_agent` adds `-c model_reasoning_effort=…` for any agent given
-        // one, and codex then refuses the app-server. Building a home anyway
+        // Arbitrary user config flags can make codex refuse the app-server.
+        // Building a home anyway
         // would start a second codex nobody joins, spend the pane's readiness
         // budget waiting for a socket, and poll it for ninety seconds — to end
         // up on the input box regardless.
@@ -2293,11 +2608,11 @@ mod tests {
         std::fs::write(&prompt, "be helpful").unwrap();
 
         for base in [
-            "codex --no-alt-screen -c model_reasoning_effort='\"high\"'",
-            "codex --no-alt-screen --profile work",
-            "codex --no-alt-screen --search",
-            "codex --no-alt-screen --enable web_search",
-            "codex --no-alt-screen --config model=\"o3\"",
+            "codex -c arbitrary_config=true",
+            "codex --profile work",
+            "codex --search",
+            "codex --enable web_search",
+            "codex --config model=\"o3\"",
         ] {
             let cmd = build_agent_command(base, &prompt, &[], &test_mcp_context(dir.path()));
             assert!(
@@ -2312,8 +2627,8 @@ mod tests {
 
         // The flags OMAR always adds are not on that list.
         for base in [
-            "codex --no-alt-screen",
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox --model gpt-5.6-sol",
+            "codex",
+            "codex --dangerously-bypass-approvals-and-sandbox --model gpt-5.6-sol",
         ] {
             let cmd = build_agent_command(base, &prompt, &[], &test_mcp_context(dir.path()));
             assert!(
@@ -2464,7 +2779,7 @@ mod tests {
         let state_dir = ea::ea_state_dir(3, omar_dir);
         std::fs::create_dir_all(&state_dir).unwrap();
         let (cmd, workspace) = build_ea_command(
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
+            "codex --dangerously-bypass-approvals-and-sandbox",
             3,
             "CapX",
             omar_dir,
@@ -2476,7 +2791,7 @@ mod tests {
         // load the wrong `AGENTS.md` or force the manager to operate outside
         // the user's project.
         assert!(
-            cmd.ends_with("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"),
+            cmd.ends_with("codex --dangerously-bypass-approvals-and-sandbox"),
             "unexpected codex manager command: {cmd}"
         );
         let home = crate::channel::codex_home(&cmd).expect("command names a codex home");
@@ -2554,7 +2869,7 @@ mod tests {
             Some("agy")
         );
         assert_eq!(
-            command_backend_name("env FOO=bar /opt/bin/codex --no-alt-screen"),
+            command_backend_name("env FOO=bar /opt/bin/codex"),
             Some("codex")
         );
         assert_eq!(command_backend_name("bash -lc 'echo hi'"), None);
@@ -2705,7 +3020,7 @@ mod tests {
 
         for backend in [
             "claude",
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
+            "codex --dangerously-bypass-approvals-and-sandbox",
             "opencode",
             "agy --dangerously-skip-permissions",
         ] {
