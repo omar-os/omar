@@ -122,3 +122,118 @@ fn scheduler_delivers_through_channel_without_editing_input() {
     assert_eq!(crate::channel::drain_spool(&spool), ["event"]);
     pane.assert_untouched();
 }
+
+// Exercise startup through the public delivery path, including discovery and
+// the retry boundary. No terminal command is permitted by the Pane fixture.
+fn codex_startup_case(mode: &'static str) -> (bool, usize, usize) {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("app.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let stopped = done.clone();
+    let server = std::thread::spawn(move || {
+        let mut connections = 0;
+        let mut sends = 0;
+        while !stopped.load(Ordering::SeqCst) {
+            let (stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            connections += 1;
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            while let Ok(message) = ws.read() {
+                let tungstenite::Message::Text(body) = message else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "initialize" => serde_json::json!({}),
+                    "initialized" => continue,
+                    "thread/loaded/list" => {
+                        let threads = if mode == "empty" || (mode == "ready" && connections < 3) {
+                            vec![]
+                        } else if mode == "ambiguous" {
+                            vec!["one", "two"]
+                        } else {
+                            vec!["one"]
+                        };
+                        serde_json::json!({"data": threads, "nextCursor": null})
+                    }
+                    "turn/start" => {
+                        sends += 1;
+                        assert_eq!(request["params"]["toolOutput"]["output"], "startup event");
+                        if mode == "disconnect" {
+                            break;
+                        }
+                        if mode == "rejected" {
+                            ws.send(tungstenite::Message::Text(serde_json::json!({
+                                "id": request["id"], "error": {"code": -1, "message": "rejected"}
+                            }).to_string())).unwrap();
+                            break;
+                        }
+                        serde_json::json!({"turn": {"id": "turn1"}})
+                    }
+                    method => panic!("unexpected method {method}"),
+                };
+                ws.send(tungstenite::Message::Text(
+                    serde_json::json!({
+                        "id": request["id"], "result": result
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            }
+        }
+        (connections, sends)
+    });
+    let pane = Pane::new(Some("codex"), Some(&format!("codex:{}", socket.display())));
+    let result = TmuxClient::new("").deliver_prompt(
+        "pane",
+        "startup event",
+        &DeliveryOptions {
+            startup_timeout: if mode == "empty" {
+                Duration::from_millis(300)
+            } else {
+                Duration::from_secs(3)
+            },
+            poll_interval: Duration::from_millis(10),
+        },
+    );
+    done.store(true, Ordering::SeqCst);
+    let (connections, sends) = server.join().unwrap();
+    pane.assert_untouched();
+    (result.is_ok(), connections, sends)
+}
+
+#[test]
+fn codex_waits_for_a_thread_then_sends_exactly_once() {
+    assert_eq!(codex_startup_case("ready"), (true, 3, 1));
+}
+
+#[test]
+fn codex_startup_timeout_never_submits_an_event() {
+    let (ok, connections, sends) = codex_startup_case("empty");
+    assert!(!ok);
+    assert!(connections >= 2);
+    assert_eq!(sends, 0);
+}
+
+#[test]
+fn codex_does_not_retry_ambiguous_threads_or_attempted_sends() {
+    assert_eq!(codex_startup_case("ambiguous"), (false, 1, 0));
+    assert_eq!(codex_startup_case("rejected"), (false, 1, 1));
+    assert_eq!(codex_startup_case("disconnect"), (false, 1, 1));
+}

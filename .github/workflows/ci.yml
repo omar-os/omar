@@ -467,6 +467,9 @@ jobs:
       - name: Run dashboard relaunch handoff integration
         run: bash tests/ci/dashboard_relaunch_handoff.sh
 
+      - name: Verify backend channel setup survives launcher exit
+        run: python3 tests/ci/channel_startup.py
+
   opencode-compat:
     name: Opencode Compatibility
     runs-on: ubuntu-latest

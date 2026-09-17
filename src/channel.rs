@@ -38,6 +38,16 @@ const SPOOL_STALE: Duration = Duration::from_secs(600);
 /// launch command put around it.
 pub const CLAUDE_INBOUND_ACCEPT: &str = r#"{"crossSessionInbound":"accept"}"#;
 
+/// A retryable pre-send condition: no message has been submitted to the backend.
+#[derive(Debug)]
+pub(crate) struct ChannelNotReady;
+impl std::fmt::Display for ChannelNotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the app-server has not loaded a thread yet")
+    }
+}
+impl std::error::Error for ChannelNotReady {}
+
 /// A side channel into a running agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Channel {
@@ -424,8 +434,7 @@ fn write_json_atomically(path: &Path, value: &serde_json::Value) -> bool {
 /// The socket is closed immediately, so this reserves nothing — it only picks
 /// a number the OS was willing to hand out. If something else takes it first
 /// opencode cannot bind; observed behaviour is that it keeps running without a
-/// listener, so provisioning times out and the pane falls back to the input
-/// box, but that is the backend's choice rather than a guarantee.
+/// listener, so provisioning times out and launch reports the channel failure.
 pub fn free_port() -> Option<u16> {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .ok()?
@@ -434,38 +443,28 @@ pub fn free_port() -> Option<u16> {
         .map(|addr| addr.port())
 }
 
-/// Give a freshly launched pane a side channel, once its backend is listening.
-///
-/// Runs in the background: opencode takes seconds to boot, and a launch must
-/// not block on it. Deliveries wait for the stamp or report unavailability;
-/// they never fall back to terminal input.
-pub fn provision_in_background(backend: Option<&str>, session: String, command: String) {
-    // Gate on the backend, not on the flag: plenty of other things are
-    // launched with a `--port`, and polling one of those for 90 seconds — then
-    // stamping whatever answered as a delivery channel — would be worse than
-    // having no channel at all.
-    let stamped: Box<dyn FnOnce() -> Option<String> + Send> = match backend {
-        Some("opencode") => match opencode_port(&command) {
-            Some(port) => Box::new(move || provision_opencode(port)),
-            None => return,
-        },
-        Some("codex") => {
-            // The endpoint is known before startup. Stamp it synchronously so
-            // a CLI exec/exit cannot discard a background provisioning thread.
-            // resolve/deliver still check the socket and loaded thread at use.
-            if let Some(socket) = codex_launch_socket(&command) {
-                let _ = crate::tmux::TmuxClient::new("")
-                    .set_session_delivery(&session, &format!("codex:{}", socket.display()));
+/// Establish the channel before handing the pane to a caller that may exit or
+/// exec tmux. In-process background threads cannot survive that handoff.
+pub fn provision_at_launch(backend: Option<&str>, session: &str, command: &str) -> Result<()> {
+    let stamp =
+        match backend {
+            Some("opencode") => match opencode_port(command) {
+                Some(port) => Some(provision_opencode(port).context(
+                    "OpenCode delivery channel did not become ready before launch timeout",
+                )?),
+                None => None,
+            },
+            Some("codex") => {
+                codex_launch_socket(command).map(|socket| format!("codex:{}", socket.display()))
             }
-            return;
-        }
-        _ => return,
-    };
-    std::thread::spawn(move || {
-        if let Some(stamp) = stamped() {
-            let _ = crate::tmux::TmuxClient::new("").set_session_delivery(&session, &stamp);
-        }
-    });
+            _ => None,
+        };
+    if let Some(stamp) = stamp {
+        crate::tmux::TmuxClient::new("")
+            .set_session_delivery(session, &stamp)
+            .context("record backend delivery channel")?;
+    }
+    Ok(())
 }
 
 /// Read the per-pane endpoint without changing or interpreting CODEX_HOME.
@@ -607,6 +606,13 @@ impl CodexSession {
     /// The thread the pane is showing, when that is unambiguous.
     fn only_thread(&mut self) -> Result<String> {
         let listed = self.call("thread/loaded/list", serde_json::json!({}))?;
+        if listed
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(ChannelNotReady.into());
+        }
         only_thread(&listed).context("the pane has no single loaded thread to inject into")
     }
 
@@ -676,23 +682,21 @@ fn opencode_port(command: &str) -> Option<u16> {
 /// agents share a directory.
 fn provision_opencode(port: u16) -> Option<String> {
     let deadline = std::time::Instant::now() + PROVISION_TIMEOUT;
+    let mut session: Option<String> = None;
     while std::time::Instant::now() < deadline {
-        if let Ok((200, body)) = http_json(port, "POST", "/session", Some("{}")) {
-            let session = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|value| value.get("id")?.as_str().map(str::to_string))?;
-            let select = serde_json::json!({ "sessionID": session }).to_string();
-            // Without this the pane keeps showing a different session and the
-            // user never sees what the agent was told — so a refusal here must
-            // not be stamped as a working channel.
-            match http_json(port, "POST", "/tui/select-session", Some(&select)) {
-                Ok((200, _)) => return Some(format!("opencode:{}:{}", port, session)),
-                _ => return None,
+        if session.is_none() {
+            if let Ok((200, body)) = http_json(port, "POST", "/session", Some("{}")) {
+                session = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| value.get("id")?.as_str().map(str::to_string));
             }
         }
-        // Tight, because this is a race: the pane's first prompt is typed in
-        // once the backend looks ready, and if that lands before the session
-        // swap the first task goes to a session later events do not.
+        if let Some(id) = &session {
+            let select = serde_json::json!({ "sessionID": id }).to_string();
+            if let Ok((200, _)) = http_json(port, "POST", "/tui/select-session", Some(&select)) {
+                return Some(format!("opencode:{}:{}", port, id));
+            }
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
     None
@@ -1657,15 +1661,16 @@ mod tests {
         for backend in [None, Some("claude"), Some("cursor"), Some("agy")] {
             // Nothing is spawned and nothing is stamped: the guard is on the
             // backend, and the flag alone must never be enough.
-            provision_in_background(
+            provision_at_launch(
                 backend,
-                "unused-session".to_string(),
-                "export CODEX_HOME='/somewhere'; tensorboard --port 6006".to_string(),
-            );
+                "unused-session",
+                "export CODEX_HOME='/somewhere'; tensorboard --port 6006",
+            )
+            .unwrap();
         }
         // And a backend that is provisioned still needs its command to say so.
         for backend in [Some("opencode"), Some("codex")] {
-            provision_in_background(backend, "unused-session".to_string(), "bare".to_string());
+            provision_at_launch(backend, "unused-session", "bare").unwrap();
         }
     }
 

@@ -378,12 +378,21 @@ impl TmuxClient {
             let stamp = self.session_delivery(session);
             if let Some(channel) = crate::channel::Channel::resolve(&backend, pid, stamp.as_deref())
             {
-                return channel.deliver(text).with_context(|| {
-                    format!(
-                        "delivery to {session} via {} failed; composer untouched",
-                        channel.describe()
-                    )
-                });
+                match channel.deliver(text) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.is::<crate::channel::ChannelNotReady>() => {
+                        // Discovery proved that nothing was sent. Only this
+                        // readiness condition is safe to retry automatically.
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "delivery to {session} via {} failed; composer untouched",
+                                channel.describe()
+                            )
+                        })
+                    }
+                }
             }
             anyhow::ensure!(
                 Instant::now() < deadline,
@@ -581,9 +590,8 @@ impl TmuxClient {
         if let Some(spool) = &spool {
             let _ = self.set_session_delivery(name, &format!("spool:{}", spool.display()));
         }
-        // Some backends only offer a side channel once they are up and have
-        // been given a session to talk about. That happens off the launch path.
-        crate::channel::provision_in_background(backend, name.to_string(), command.to_string());
+        // Finish channel setup before the launcher can return or exec tmux.
+        crate::channel::provision_at_launch(backend, name, command)?;
         Ok(())
     }
 

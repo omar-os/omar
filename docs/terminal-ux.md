@@ -167,3 +167,9 @@ Custom Codex launch commands that cannot attach to app-server no longer receive
 automated messages through a terminal fallback. Use a supported app-server launch
 or resolve the reported channel error. Multi-thread ambiguity is an error rather
 than permission to guess a conversation or type into its composer.
+
+Channel readiness is part of startup: OpenCode creates and selects its session
+and records the endpoint before the launcher can exit or hand off to tmux.
+Selection retries reuse the same session. Codex delivery waits within its startup
+budget while the app-server has zero loaded threads. Multiple loaded threads,
+rejected messages, and failures after a send are errors, not automatic retries.
