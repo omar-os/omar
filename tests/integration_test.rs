@@ -1069,7 +1069,7 @@ fn test_omar_mcp_server_tools_list_via_cli() {
     );
     assert_eq!(
         props["backend"]["enum"],
-        json!(["claude", "codex", "cursor", "opencode", "agy"]),
+        json!(["claude", "codex", "cursor", "opencode", "agy", "pi"]),
         "spawn_agent schema must advertise supported backend enum: {}",
         spawn_agent["inputSchema"]
     );
@@ -1684,7 +1684,7 @@ fn test_deliver_to_tmux_ea_scoped() {
     let _ = tmux(&["kill-session", "-t", &ea1_session]);
 }
 
-/// Test the full EA-scoped scheduler event delivery cycle.
+/// Test the tmux receiver contract for EA-scoped scheduler event payloads.
 ///
 /// The scheduler's `run_event_loop` calls `deliver_to_tmux(ea_id, receiver, ...)`,
 /// which routes the formatted event payload to the session:
@@ -1693,7 +1693,7 @@ fn test_deliver_to_tmux_ea_scoped() {
 /// This test validates:
 ///   1. Two EAs can have same-named agents without session conflicts.
 ///   2. A formatted event payload (as `format_delivery` produces) is delivered
-///      correctly to each EA-scoped session.
+///      completely to each EA-scoped receiver process.
 ///   3. Events do not leak across EA boundaries (isolation invariant).
 #[test]
 fn test_scheduler_event_delivery_cycle_ea_scoped() {
@@ -1702,94 +1702,92 @@ fn test_scheduler_event_delivery_cycle_ea_scoped() {
         return;
     }
 
-    const BASE_PREFIX: &str = "omar-agent-";
+    // Use a unique namespace even when multiple copies run on the same server.
+    let base_prefix = format!("omar-sched-{}-", Uuid::new_v4());
+    let ea0_session = format!("{base_prefix}0-sched-recv");
+    let ea1_session = format!("{base_prefix}1-sched-recv");
+    let received = tempfile::tempdir().expect("receiver output directory");
 
-    // Both EAs have a same-named agent "sched-recv".
-    // ea_prefix(0, BASE_PREFIX) + "sched-recv" = "omar-agent-0-sched-recv"
-    // ea_prefix(1, BASE_PREFIX) + "sched-recv" = "omar-agent-1-sched-recv"
-    let ea0_session = format!("{}0-sched-recv", BASE_PREFIX);
-    let ea1_session = format!("{}1-sched-recv", BASE_PREFIX);
+    struct Sessions(Vec<String>);
+    impl Drop for Sessions {
+        fn drop(&mut self) {
+            for session in &self.0 {
+                cleanup_session(session);
+            }
+        }
+    }
+    let _sessions = Sessions(vec![ea0_session.clone(), ea1_session.clone()]);
 
-    // Pre-cleanup
-    let _ = tmux(&["kill-session", "-t", &ea0_session]);
-    let _ = tmux(&["kill-session", "-t", &ea1_session]);
+    fn wait_for(mut read: impl FnMut() -> String, expected: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = read();
+            if output.contains(expected) {
+                return output;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "receiver did not produce {expected:?}; last output: {output:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 
-    // Create one session per EA
-    let r0 = tmux(&["new-session", "-d", "-s", &ea0_session]);
-    assert!(
-        r0.is_ok(),
-        "Failed to create EA 0 session '{}': {:?}",
-        ea0_session,
-        r0
-    );
-    let r1 = tmux(&["new-session", "-d", "-s", &ea1_session]);
-    assert!(
-        r1.is_ok(),
-        "Failed to create EA 1 session '{}': {:?}",
-        ea1_session,
-        r1
-    );
+    for (id, session) in [(0, &ea0_session), (1, &ea1_session)] {
+        let output_path = received.path().join(format!("ea{id}.txt"));
+        fs::write(&output_path, "").expect("initialize receiver output");
+        // A shell interprets the first payload line as a command. Its command-
+        // not-found hook can block before readline displays the second line
+        // (the CI failure), and terminal echo alone cannot prove receipt.
+        // Disable echo and use tee as a literal receiver with an observable
+        // readiness marker; verify bytes actually read by the process below.
+        let command = format!(
+            "stty -echo; printf 'SCHED_RECEIVER_READY\\n'; exec tee '{}'",
+            output_path.display()
+        );
+        let output = tmux_command()
+            .args(["new-session", "-d", "-s", session, &command])
+            .output()
+            .expect("start receiver");
+        assert!(output.status.success(), "{output:?}");
+        wait_for(
+            || tmux(&["capture-pane", "-t", session, "-p"]).expect("capture receiver"),
+            "SCHED_RECEIVER_READY",
+        );
+    }
 
-    thread::sleep(Duration::from_millis(200));
-
-    // Simulate format_delivery output for a single event (as run_event_loop would generate):
-    //   "[EVENT at t=<ts>]\nFrom <sender>: <payload>"
     let ts: u64 = 999_000_000_000;
-    let payload_ea0 = format!("[EVENT at t={}]\nFrom ea-test: sched-ea0-only", ts);
-    let payload_ea1 = format!("[EVENT at t={}]\nFrom ea-test: sched-ea1-only", ts);
+    let payload_ea0 = format!("[EVENT at t={ts}]\nFrom ea-test: sched-ea0-only");
+    let payload_ea1 = format!("[EVENT at t={ts}]\nFrom ea-test: sched-ea1-only");
 
-    // Deliver to each session via the same tmux send-keys pattern as deliver_to_tmux
-    let _ = tmux(&["send-keys", "-t", &ea0_session, "-l", &payload_ea0]);
-    let _ = tmux(&["send-keys", "-t", &ea0_session, "Enter"]);
+    for (session, payload) in [(&ea0_session, &payload_ea0), (&ea1_session, &payload_ea1)] {
+        for args in [
+            vec!["send-keys", "-t", session, "-l", payload],
+            vec!["send-keys", "-t", session, "Enter"],
+        ] {
+            let output = tmux_command().args(args).output().expect("send event");
+            assert!(output.status.success(), "{output:?}");
+        }
+    }
 
-    let _ = tmux(&["send-keys", "-t", &ea1_session, "-l", &payload_ea1]);
-    let _ = tmux(&["send-keys", "-t", &ea1_session, "Enter"]);
-
-    thread::sleep(Duration::from_millis(500));
-
-    // Capture pane output
-    let out0 = tmux(&["capture-pane", "-t", &ea0_session, "-p"]).unwrap_or_default();
-    let out1 = tmux(&["capture-pane", "-t", &ea1_session, "-p"]).unwrap_or_default();
-
-    // Each EA's session received its own event payload
-    assert!(
-        out0.contains("sched-ea0-only"),
-        "EA 0 session missing its scheduled event: {}",
-        out0
+    let out0 = wait_for(
+        || fs::read_to_string(received.path().join("ea0.txt")).expect("EA 0 receipt"),
+        &format!("{payload_ea0}\n"),
     );
-    assert!(
-        out1.contains("sched-ea1-only"),
-        "EA 1 session missing its scheduled event: {}",
-        out1
+    let out1 = wait_for(
+        || fs::read_to_string(received.path().join("ea1.txt")).expect("EA 1 receipt"),
+        &format!("{payload_ea1}\n"),
     );
-
-    // EA isolation: events must not cross EA boundaries
+    assert_eq!(out0, format!("{payload_ea0}\n"));
+    assert_eq!(out1, format!("{payload_ea1}\n"));
     assert!(
         !out0.contains("sched-ea1-only"),
-        "EA 0 session must NOT contain EA 1's event: {}",
-        out0
+        "EA 1 event leaked to EA 0"
     );
     assert!(
         !out1.contains("sched-ea0-only"),
-        "EA 1 session must NOT contain EA 0's event: {}",
-        out1
+        "EA 0 event leaked to EA 1"
     );
-
-    // Verify session names match the EA-scoped prefix convention
-    assert_eq!(
-        ea0_session,
-        format!("{}0-sched-recv", BASE_PREFIX),
-        "EA 0 session name must follow ea_prefix(0, ...) + receiver"
-    );
-    assert_eq!(
-        ea1_session,
-        format!("{}1-sched-recv", BASE_PREFIX),
-        "EA 1 session name must follow ea_prefix(1, ...) + receiver"
-    );
-
-    // Cleanup
-    let _ = tmux(&["kill-session", "-t", &ea0_session]);
-    let _ = tmux(&["kill-session", "-t", &ea1_session]);
 }
 
 /// Verifies the EA's manager-notes contract end-to-end without relying on an

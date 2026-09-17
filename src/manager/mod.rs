@@ -1563,20 +1563,13 @@ pub fn ensure_manager_session(
     if client.has_session(&session)? {
         if client.session_has_live_pane(&session)? {
             let requested_backend = command_backend_name(command);
-            let existing_backend = client
-                .get_pane_command(&session)
-                .ok()
-                .and_then(|pane_command| command_backend_name(&pane_command))
-                .or_else(|| {
-                    client
-                        .get_pane_process_command(&session)
-                        .ok()
-                        .and_then(|process_command| command_backend_name(&process_command))
-                });
+            // Worktree launchers can leave bash/sh as the visible pane process.
+            // Prefer the backend stamped at launch, with legacy detection as fallback.
+            let existing_backend = client.session_backend(&session);
 
             if requested_backend.is_some()
                 && existing_backend.is_some()
-                && requested_backend != existing_backend
+                && requested_backend != existing_backend.as_deref()
             {
                 client.kill_session(&session)?;
                 result = ManagerEnsureResult::ReplacedBackend;
@@ -1994,6 +1987,124 @@ fn spawn_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exercise the real manager lifecycle: worktree/backend launchers can keep
+    // a shell visible for the whole session, so process sniffing cannot decide
+    // whether to reuse or replace it.
+    fn check_stamped_pi_manager(shell: &str, replace: bool) {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = format!("omar-test-pi-switch-{}-", Uuid::new_v4());
+        let session = ea::ea_manager_session(0, &prefix);
+        let sibling = ea::ea_manager_session(1, &prefix);
+        let client = TmuxClient::new(&prefix);
+        struct Sessions(Vec<String>);
+        impl Drop for Sessions {
+            fn drop(&mut self) {
+                for session in &self.0 {
+                    let _ = TmuxClient::new("").kill_session(session);
+                }
+            }
+        }
+        let _sessions = Sessions(vec![session.clone(), sibling.clone()]);
+        client
+            .new_session_with_backend(
+                &session,
+                &format!(
+                    "exec {shell} -c 'printf WRAPPER_READY; while IFS= read -r line; do :; done'"
+                ),
+                Some(dir.path().to_str().unwrap()),
+                Some("pi"),
+            )
+            .unwrap();
+        client.new_session(&sibling, "exec cat", None).unwrap();
+        // Wait for the wrapper to start, then prove neither legacy lookup can
+        // identify Pi; the persisted OMAR_BACKEND must be authoritative.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if client
+                .capture_pane_visible(&session)
+                .unwrap()
+                .contains("WRAPPER_READY")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "wrapper did not start");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(matches!(
+            client.get_pane_command(&session).unwrap().as_str(),
+            "bash" | "sh"
+        ));
+        assert_eq!(
+            command_backend_name(&client.get_pane_process_command(&session).unwrap()),
+            None
+        );
+        assert_eq!(client.session_backend(&session).as_deref(), Some("pi"));
+        let pane_id = || {
+            let output = crate::tmux::tmux_command()
+                .args(["display-message", "-p", "-t", &session, "#{pane_id}"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let original_pane = pane_id();
+        // A harmless executable with a recognized backend basename receives
+        // the normal generated launch flags without needing any real backend.
+        let executable = dir.path().join(if replace { "claude" } else { "pi" });
+        std::fs::write(&executable, "#!/bin/sh\nexec cat\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (actual_session, result) = ensure_manager_session(
+            &client,
+            &shell_single_quote(executable.to_str().unwrap()),
+            0,
+            "test",
+            dir.path(),
+            &prefix,
+            &ManagerRuntimeOptions {
+                default_workdir: dir.path().display().to_string(),
+                health_idle_warning: 15,
+                serve: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(actual_session, session);
+        assert!(client.session_has_live_pane(&session).unwrap());
+        assert!(client.session_has_live_pane(&sibling).unwrap());
+        if replace {
+            assert_eq!(result, ManagerEnsureResult::ReplacedBackend);
+            assert_ne!(pane_id(), original_pane);
+            assert_eq!(client.session_backend(&session).as_deref(), Some("claude"));
+        } else {
+            assert_eq!(result, ManagerEnsureResult::AlreadyRunning);
+            assert_eq!(pane_id(), original_pane);
+            assert_eq!(client.session_backend(&session).as_deref(), Some("pi"));
+        }
+    }
+
+    #[test]
+    fn ensure_manager_replaces_stamped_pi_shell_wrappers() {
+        for shell in ["bash", "sh"] {
+            check_stamped_pi_manager(shell, true);
+        }
+    }
+
+    #[test]
+    fn ensure_manager_reuses_stamped_pi_shell_wrappers() {
+        for shell in ["bash", "sh"] {
+            check_stamped_pi_manager(shell, false);
+        }
+    }
 
     #[test]
     fn strip_deleted_suffix_removes_trailing_marker() {
