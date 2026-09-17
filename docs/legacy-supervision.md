@@ -97,7 +97,7 @@ python3 tests/ci/claude_prompt_contract.py
 python3 tests/ci/opencode_wake_contract.py
 ```
 
-CI runs these regressions. Native Claude, Codex, and OpenCode tests pin CLI versions in CI and use local mock
+CI is configured to run these regressions; the integration branch has only been validated locally so far. Native Claude, Codex, and OpenCode tests pin CLI versions in CI and use local mock
 providers, without paid inference. The process regression uses production MCP, scheduler, and isolated
 tmux sessions; it kills every MCP process after notification acceptance and verifies autonomous redelivery
 after restart. Unit regressions cover nested ownership, concurrent completion, stale acknowledgements,
@@ -122,3 +122,8 @@ OMAR MCP; the host wakes a scripted OpenCode-contract parent, which reads, ackno
 retires the result, then completes the project. Antigravity runs with a disposable home and a
 private copy of cached authentication, leaving user plugin registration untouched. These tests
 verify native tool access and the lifecycle across transports; the parent is not an autonomous model.
+
+Local validation also passed formatting, workspace Clippy, the five required shell integration jobs,
+430 OMAR binary tests, the remaining OMAR integration tests, and seven explicitly enabled ignored
+tests. The 19 bridge tests passed with `/opt/X11` removed from PATH; the full workspace attempt
+hung in the existing X11 screenshot test, so real X11 capture was not validated.
