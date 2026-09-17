@@ -82,6 +82,34 @@ struct Engine {
     next_id: u64,
     allow_permissions: bool,
 }
+
+fn protocol_line(mut line: &str) -> &str {
+    // Native Cursor ACP can prefix its initialize reply with ESC M ESC [ K
+    // while clearing a startup spinner. Remove only leading terminal controls;
+    // never search for a JSON object inside arbitrary diagnostic text.
+    loop {
+        line = line.trim_start();
+        let bytes = line.as_bytes();
+        if bytes.first() != Some(&0x1b) {
+            return line;
+        }
+        match bytes.get(1) {
+            Some(b'[') => {
+                let end = bytes
+                    .iter()
+                    .skip(2)
+                    .position(|b| !(0x20..=0x3f).contains(b));
+                match end.map(|n| n + 2) {
+                    Some(n) if (0x40..=0x7e).contains(&bytes[n]) => line = &line[n + 1..],
+                    _ => return line,
+                }
+            }
+            Some(b'M' | b'D' | b'E' | b'7' | b'8') => line = &line[2..],
+            _ => return line,
+        }
+    }
+}
+
 impl Engine {
     async fn write(&mut self, value: Value) -> Result<()> {
         self.input
@@ -97,7 +125,7 @@ impl Engine {
                 .next_line()
                 .await?
                 .context("backend protocol exited")?;
-            match serde_json::from_str(&line) {
+            match serde_json::from_str(protocol_line(&line)) {
                 Ok(value) => return Ok(value),
                 Err(_) => eprintln!("[backend] {line}"),
             }
@@ -398,4 +426,27 @@ pub async fn run(path: &Path) -> Result<()> {
     accepting.abort();
     let _ = std::fs::remove_file(&config.socket);
     result
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_spinner_prefix_does_not_discard_initialize_reply() {
+        let wire =
+            "\u{1b}M\u{1b}[K{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1}}";
+        let reply: Value = serde_json::from_str(protocol_line(wire)).unwrap();
+        assert_eq!(reply["id"], 1);
+        assert_eq!(reply["result"]["protocolVersion"], 1);
+    }
+
+    #[test]
+    fn protocol_prefix_handling_preserves_payload_and_rejects_diagnostics() {
+        let payload = r#"{"text":"literal \\u001b[K and { braces }"}"#;
+        assert_eq!(protocol_line(payload), payload);
+        for line in ["warning: {\"id\":1}", "\u{1b}[", "\u{1b}[31é"] {
+            assert!(serde_json::from_str::<Value>(protocol_line(line)).is_err());
+        }
+    }
 }
