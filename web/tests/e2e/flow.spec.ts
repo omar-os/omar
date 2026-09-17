@@ -1852,7 +1852,30 @@ test("two chats keep live topologies when switching and reloading", async ({ pag
   await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
   await expect(history.getByRole("button", { name: /Topology A/ })).toContainText("Running");
   await expect(history.getByRole("button", { name: /Topology B/ })).toContainText("Running");
+  // Keep the existing shell, sidebar and canvas through the deliberately slow
+  // replay. Remounting any of them flashes an empty chat before the topology.
+  const retained = await page.evaluateHandle(() => [
+    document.querySelector(".studio-shell"),
+    document.querySelector(".chat-history"),
+    document.querySelector(".diagram-canvas"),
+  ]);
+  const width = (await page.locator(".builder-panel").boundingBox())!.width;
   await history.getByRole("button", { name: /Topology A/ }).click();
+  await expect(page.locator(".messages")).toContainText("Topology B");
+  await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "true");
+  await expect(page.locator(".messages")).toContainText("Topology A");
+  await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "false");
+  expect(await retained.evaluate((nodes) => nodes.every((node) => node?.isConnected))).toBe(true);
+  expect((await page.locator(".builder-panel").boundingBox())!.width).toBe(width);
+  await retained.dispose();
+  // A second selection cancels a slow first selection without letting its
+  // replay replace the chat that the operator most recently chose.
+  await history.getByRole("button", { name: /Topology B/ }).click();
+  await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "true");
+  await history.getByRole("button", { name: /Topology A/ }).click();
+  await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "false");
+  await expect(page.locator(".messages")).toContainText("Topology A");
+  await expect(page.locator(".messages")).not.toContainText("Topology B");
   await expect(page.locator(".connection")).toContainText("observing");
   // The state event is delayed: replayed proposals must not expose a deploy
   // gate while the client waits to reconnect the live diagram.
@@ -1888,4 +1911,41 @@ test("an undeployed proposal remains actionable after a finished run and chat sw
   await expect(controls.getByRole("button", { name: "Discard", exact: true })).toBeVisible();
   await page.reload();
   await expect(controls).toBeVisible();
+});
+
+test("a delayed deploy response cannot replace the chat selected afterward", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  let release!: () => void;
+  let admitted!: () => void;
+  let delivered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const admission = new Promise<void>((resolve) => { admitted = resolve; });
+  const delivery = new Promise<void>((resolve) => { delivered = resolve; });
+  await page.route("**/v1/runs", async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    const response = await route.fetch();
+    admitted();
+    await gate;
+    await route.fulfill({ response });
+    delivered();
+  });
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  await page.getByRole("button", { name: "Confirm deploy" }).click();
+  await admission;
+  try {
+    const history = page.getByRole("complementary", { name: "Chat history" });
+    await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+    await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "false");
+    await expect(page.locator(".messages")).not.toContainText("Review the release plan");
+    release();
+    await delivery;
+    await page.getByLabel("Describe a workflow").fill("A separate conversation");
+    await page.getByLabel("Draft workflow").click();
+    await expect(page.locator(".messages")).toContainText("Which agent should own");
+    await expect(page.locator(".diagram-panel")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0);
+  } finally {
+    release();
+  }
 });
