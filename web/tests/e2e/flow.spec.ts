@@ -634,9 +634,10 @@ test("the studio opens on a centred prompt, then settles into a thread", async (
 
   // A compact box, like the one a chat client opens with — a full-width slab
   // five lines deep asks for an essay. Measured against claude.ai at the same
-  // window size: 498x93.
+  // window size, with room for the larger chat text.
   expect(opening.width).toBe(500);
-  expect(opening.height).toBeLessThan(110);
+  expect(opening.height).toBeLessThan(130);
+  await expect(composer.locator("textarea")).toHaveCSS("font-size", "16px");
 
   await composer.getByLabel("Describe a workflow").fill("Review the release plan");
   await page.keyboard.press("Enter");
@@ -644,6 +645,8 @@ test("the studio opens on a centred prompt, then settles into a thread", async (
   // Once there is a conversation it belongs at the bottom, under the thread.
   await expect(page.locator(".messages")).toContainText("Review the release plan");
   await expect(page.locator(".builder-panel")).not.toHaveClass(/opening/);
+  await expect(page.locator(".message-content > p").first()).toHaveCSS("font-size", "16px");
+  await expect(page.locator(".message.assistant:not(.progress) .message-body").first()).toHaveCSS("font-size", "16px");
   const threaded = (await composer.boundingBox())!;
   expect(threaded.y).toBeGreaterThan(opening.y + 100);
   // The compact size belongs to the opening screen only; in a thread the box
