@@ -70,6 +70,17 @@ impl Default for DeliveryOptions {
 /// occurrence of this marker as equivalent proof the paste has ingested.
 const PASTE_PLACEHOLDER_MARKER: &str = "[Pasted ";
 
+/// Codex keeps bracketed-paste input active briefly after the payload renders.
+/// Enter sent during that window is absorbed into the draft instead of submitting it.
+const CODEX_PASTE_SETTLE_DELAY: Duration = Duration::from_secs(5);
+
+fn prompt_submit_delay(backend: Option<&str>) -> Duration {
+    match backend {
+        Some("codex") => CODEX_PASTE_SETTLE_DELAY,
+        _ => Duration::ZERO,
+    }
+}
+
 /// Returns true when `hay` shows that the most recent paste has rendered.
 /// A paste is considered rendered if EITHER the per-delivery end sentinel
 /// appears verbatim, OR a new `[Pasted text ...]` placeholder appeared
@@ -602,6 +613,12 @@ impl TmuxClient {
             let activity_before = self.get_pane_activity(session).unwrap_or(0);
 
             let target = exact_pane_target(session);
+
+            let submit_delay = prompt_submit_delay(self.session_backend(session).as_deref());
+            if !submit_delay.is_zero() {
+                thread::sleep(submit_delay);
+            }
+
             self.run(&["send-keys", "-t", &target, "-H", "0d"])?;
 
             if self.wait_for_change(
@@ -984,6 +1001,13 @@ impl TmuxClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_codex_waits_for_bracketed_paste_to_settle() {
+        assert_eq!(prompt_submit_delay(Some("codex")), CODEX_PASTE_SETTLE_DELAY);
+        assert_eq!(prompt_submit_delay(Some("claude")), Duration::ZERO);
+        assert_eq!(prompt_submit_delay(None), Duration::ZERO);
+    }
 
     #[test]
     fn an_agent_pane_is_created_wider_than_the_tmux_default() {
