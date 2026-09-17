@@ -24,6 +24,8 @@ pub struct McpLaunchContext {
     pub default_workdir: String,
     pub health_idle_warning: i64,
     #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
     pub tmux_server: Option<String>,
     #[serde(default)]
     pub topology: Option<TopologyMcpContext>,
@@ -406,6 +408,74 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Keep caller-supplied settings intact. The durable scheduler and MCP
+/// projections still supervise sessions whose custom settings own their hooks.
+fn with_coordination_hooks(command: &str, context: &McpLaunchContext) -> String {
+    if context.topology.is_some()
+        || command
+            .split_whitespace()
+            .any(|t| t == "--settings" || t.starts_with("--settings="))
+    {
+        return command.to_owned();
+    }
+    let Some(context_file) = materialize_mcp_context_file(context) else {
+        return command.to_owned();
+    };
+    let Some(exe) = omar_server_exe() else {
+        return command.to_owned();
+    };
+    let hook = format!(
+        "{} agent-hook --context-file {}",
+        shell_single_quote(&exe.display().to_string()),
+        shell_single_quote(&context_file.display().to_string())
+    );
+    let handler = serde_json::json!([{"hooks":[{"type":"command","command":hook,"timeout":5}]}]);
+    let settings = serde_json::json!({"crossSessionInbound":"accept","hooks":{
+        "SessionStart":handler,"UserPromptSubmit":handler,"Stop":handler
+    }});
+    format!(
+        "{command} --settings {}",
+        shell_single_quote(&settings.to_string())
+    )
+}
+
+pub(crate) fn scope_agent_command(command: &str, ea_id: EaId, agent: &str, root: &Path) -> String {
+    let context = root
+        .join("mcp")
+        .join(format!("ea-{ea_id}"))
+        .join(actor_file(Some(agent), "context"));
+    format!(
+        "export OMAR_EA_ID={ea_id} OMAR_AGENT_NAME={} OMAR_MCP_CONTEXT_FILE={}; {command}",
+        shell_single_quote(agent),
+        shell_single_quote(&context.display().to_string())
+    )
+}
+
+fn actor_file(actor: Option<&str>, stem: &str) -> String {
+    match actor {
+        None | Some("ea") => format!("{stem}.json"),
+        Some(actor) => {
+            let encoded: String = actor
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("{stem}-agent-{encoded}.json")
+        }
+    }
+}
+
+fn materialize_shared_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
+    // User-global backend configs must not overwrite the EA's private context.
+    // Each launched pane supplies its own full context through the environment.
+    let mut shared = context.clone();
+    shared.agent_name = None;
+    shared.serve = None;
+    let path = mcp_ea_dir(context)?.join("context-shared.json");
+    write_private_file(&path, &serde_json::to_vec(&shared).ok()?).ok()?;
+    Some(path)
+}
+
 pub(crate) fn materialize_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
     let dir = mcp_ea_dir(context)?;
     let path = match &context.topology {
@@ -413,7 +483,7 @@ pub(crate) fn materialize_mcp_context_file(context: &McpLaunchContext) -> Option
             "context-topology-{}-{}.json",
             topology.team, topology.agent
         )),
-        None => dir.join("context.json"),
+        None => dir.join(actor_file(context.agent_name.as_deref(), "context")),
     };
     let json = serde_json::to_vec(context).ok()?;
     write_private_file(&path, &json).ok()?;
@@ -485,7 +555,7 @@ fn materialize_claude_mcp_config(context: &McpLaunchContext) -> Option<PathBuf> 
             "claude-mcp-topology-{}-{}.json",
             topology.team, topology.agent
         )),
-        None => dir.join("claude-mcp.json"),
+        None => dir.join(actor_file(context.agent_name.as_deref(), "claude-mcp")),
     };
     write_private_file(&path, &serde_json::to_vec(&json).ok()?).ok()?;
     Some(path)
@@ -689,7 +759,7 @@ fn ensure_cursor_mcp_config(context: &McpLaunchContext) -> Option<()> {
     // user already has, and write via tmp+rename so partial writes under
     // concurrency can't corrupt the file.
     let server_exe = omar_server_exe()?;
-    let context_file = materialize_mcp_context_file(context)?;
+    let context_file = materialize_shared_mcp_context_file(context)?;
     let home = std::env::var("HOME").ok()?;
     let cursor_dir = PathBuf::from(home).join(".cursor");
     std::fs::create_dir_all(&cursor_dir).ok()?;
@@ -778,7 +848,7 @@ fn ensure_antigravity_mcp_config(context: &McpLaunchContext) -> Option<()> {
     // `agy plugin install` stages active plugins under ~/.gemini/config/plugins
     // and records them in ~/.gemini/config/import_manifest.json.
     let server_exe = omar_server_exe()?;
-    let context_file = materialize_mcp_context_file(context)?;
+    let context_file = materialize_shared_mcp_context_file(context)?;
     let home = std::env::var("HOME").ok()?;
     let config_dir = PathBuf::from(home).join(".gemini").join("config");
     let plugins_dir = config_dir.join("plugins");
@@ -957,7 +1027,7 @@ pub(crate) fn remove_all_omar_antigravity_mcp_configs() -> Result<()> {
 /// - `substitutions`: `(pattern, replacement)` pairs for sed; empty = use `cat`
 ///
 /// Detects backend from `base_command`:
-///   - claude  → `--system-prompt "$(cat '<path>')"` plus native wake-tool denylist
+///   - claude  → `--append-system-prompt "$(cat '<path>')"` plus native wake-tool denylist
 ///   - codex   → `-c "developer_instructions='''$(cat '<path>')'''"` plus scheduled-task disable
 ///   - cursor  → positional arg `"Load the <path> file and follow the instructions."`
 ///   - agy → `-i "$(cat '<path>')"` with an EA-scoped MCP entry in
@@ -973,6 +1043,7 @@ pub fn build_agent_command(
     substitutions: &[(&str, &str)],
     mcp_context: &McpLaunchContext,
 ) -> String {
+    let _ = materialize_mcp_context_file(mcp_context);
     let base_command = ensure_codex_runtime_flags(base_command);
     let path_str = prompt_file.display().to_string();
     let prompt_path = shell_single_quote(&path_str);
@@ -997,16 +1068,19 @@ pub fn build_agent_command(
             let _ = ensure_antigravity_mcp_config(mcp_context);
             format!("TERM=xterm-256color {} -i \"{}\"", base_command, shell_expr)
         }
-        Some(BackendKind::Claude) => match materialize_claude_mcp_config(mcp_context) {
-            Some(mcp_config) => format!(
-                "{} --system-prompt \"{}\" --mcp-config {} --disallowedTools {}",
-                base_command,
-                shell_expr,
-                shell_single_quote(&mcp_config.display().to_string()),
-                shell_single_quote(&backend_native_disallowed_tools_csv()),
-            ),
-            None => format!("{} --system-prompt \"{}\"", base_command, shell_expr),
-        },
+        Some(BackendKind::Claude) => {
+            let base_command = with_coordination_hooks(&base_command, mcp_context);
+            match materialize_claude_mcp_config(mcp_context) {
+                Some(mcp_config) => format!(
+                    "{} --append-system-prompt \"{}\" --mcp-config {} --disallowedTools {}",
+                    base_command,
+                    shell_expr,
+                    shell_single_quote(&mcp_config.display().to_string()),
+                    shell_single_quote(&backend_native_disallowed_tools_csv()),
+                ),
+                None => format!("{} --append-system-prompt \"{}\"", base_command, shell_expr),
+            }
+        }
         Some(BackendKind::Codex) => {
             // Keep conversations in the operator's normal home. The server
             // owns the per-agent overrides and a dedicated socket; the TUI
@@ -1075,7 +1149,7 @@ pub fn build_agent_command(
             }
         }
         Some(BackendKind::Opencode) => {
-            // opencode has no `--system-prompt`; `--prompt` is treated as the
+            // opencode has no `--append-system-prompt`; `--prompt` is treated as the
             // first user message, which makes the LLM read agent.md
             // descriptively and ask back "What is your agent name?" etc.
             // Spawn opencode bare and let `spawn_worker` deliver the prompt
@@ -1104,7 +1178,7 @@ pub fn build_agent_command(
 /// session dying inside `omar manager start` with an opaque "can't find
 /// session" error. Two complementary defenses:
 ///
-/// 1. **claude** uses the native `--system-prompt-file <path>` flag, so
+/// 1. **claude** uses the native `--append-system-prompt-file <path>` flag, so
 ///    the prompt never touches argv at all and is unbounded.
 /// 2. **codex / agy / opencode** keep the legacy inline shell-expansion
 ///    path because their auto-loaded prompt/config files are anchored at the
@@ -1129,6 +1203,7 @@ pub fn build_ea_command(
     omar_dir: &Path,
     mcp_context: &McpLaunchContext,
 ) -> (String, Option<PathBuf>) {
+    let _ = materialize_mcp_context_file(mcp_context);
     let prompt_file = prompts_dir(omar_dir).join("executive-assistant.md");
     let state_dir = ea::ea_state_dir(ea_id, omar_dir);
     let mem = memory::load_memory_from(&state_dir);
@@ -1169,17 +1244,18 @@ pub fn build_ea_command(
                 .replace("{{EA_ID}}", &ea_id.to_string())
                 .replace("{{EA_NAME}}", ea_name);
             std::fs::write(&combined_path, &resolved).ok();
-            let base_command = ensure_codex_runtime_flags(base_command);
+            let base_command =
+                with_coordination_hooks(&ensure_codex_runtime_flags(base_command), mcp_context);
             let cmd = match materialize_claude_mcp_config(mcp_context) {
                 Some(mcp_config) => format!(
-                    "{} --system-prompt-file {} --mcp-config {} --disallowedTools {}",
+                    "{} --append-system-prompt-file {} --mcp-config {} --disallowedTools {}",
                     base_command,
                     shell_single_quote(&combined_path.display().to_string()),
                     shell_single_quote(&mcp_config.display().to_string()),
                     shell_single_quote(&backend_native_disallowed_tools_csv()),
                 ),
                 None => format!(
-                    "{} --system-prompt-file {}",
+                    "{} --append-system-prompt-file {}",
                     base_command,
                     shell_single_quote(&combined_path.display().to_string()),
                 ),
@@ -1292,6 +1368,7 @@ pub fn ensure_manager_session(
             default_command: command.to_string(),
             default_workdir: options.default_workdir.clone(),
             health_idle_warning: options.health_idle_warning,
+            agent_name: None,
             tmux_server: current_tmux_server(),
             topology: None,
             serve: options.serve.clone(),
@@ -1304,7 +1381,11 @@ pub fn ensure_manager_session(
         Some(p) => p.to_string_lossy().into_owned(),
         None => std::env::current_dir()?.to_string_lossy().into_owned(),
     };
-    client.new_session(&session, &cmd, Some(&cwd))?;
+    client.new_session(
+        &session,
+        &scope_agent_command(&cmd, ea_id, "ea", omar_dir),
+        Some(&cwd),
+    )?;
 
     // Give it time to start
     thread::sleep(Duration::from_secs(2));
@@ -1587,6 +1668,7 @@ fn spawn_worker(
             default_command: command.to_string(),
             default_workdir: ".".to_string(),
             health_idle_warning: 15,
+            agent_name: Some(agent.name.clone()),
             tmux_server: current_tmux_server(),
             topology: None,
             serve: None,
@@ -1596,8 +1678,28 @@ fn spawn_worker(
     // Create worker session — system prompt set at process start
     client.new_session(
         &session_name,
-        &cmd,
+        &scope_agent_command(&cmd, ea_id, &agent.name, omar_dir),
         Some(&std::env::current_dir()?.to_string_lossy()),
+    )?;
+
+    crate::supervision::register(
+        omar_dir,
+        crate::supervision::Task {
+            id: String::new(),
+            ea_id,
+            agent: agent.name.clone(),
+            session: session_name.clone(),
+            parent: "ea".into(),
+            parent_task_id: None,
+            project_id: 0,
+            assignment: agent.task.clone(),
+            status: crate::supervision::Status::Running,
+            result: None,
+            result_revision: 0,
+            acknowledged: false,
+            retired: false,
+            next_check_ms: 0,
+        },
     )?;
 
     // Wait for backend readiness when possible, then deliver an explicit
@@ -1665,6 +1767,58 @@ fn spawn_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sibling_contexts_and_global_backend_config_cannot_overwrite_ea_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ea = test_mcp_context(dir.path());
+        ea.serve = Some(ServeMcpContext {
+            endpoint: "127.0.0.1:1".into(),
+            token: "test".into(),
+        });
+        let ea_path = materialize_mcp_context_file(&ea).unwrap();
+        let mut a = ea.clone();
+        a.agent_name = Some("worker/a".into());
+        a.serve = None;
+        let mut b = a.clone();
+        b.agent_name = Some("worker-b".into());
+        let a_path = materialize_mcp_context_file(&a).unwrap();
+        let b_path = materialize_mcp_context_file(&b).unwrap();
+        let shared_path = materialize_shared_mcp_context_file(&a).unwrap();
+        assert_ne!(a_path, b_path);
+        assert_ne!(ea_path, shared_path);
+        assert_eq!(
+            a_path.parent(),
+            ea_path.parent(),
+            "actor names cannot escape their directory"
+        );
+        let read =
+            |p| serde_json::from_slice::<McpLaunchContext>(&std::fs::read(p).unwrap()).unwrap();
+        assert!(read(ea_path).serve.is_some());
+        assert_eq!(read(a_path).agent_name.as_deref(), Some("worker/a"));
+        assert_eq!(read(b_path).agent_name.as_deref(), Some("worker-b"));
+        assert!(read(shared_path).serve.is_none());
+    }
+
+    #[test]
+    fn coordination_hooks_preserve_explicit_settings_and_skip_topology() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_mcp_context(dir.path());
+        let custom = "claude --settings '/tmp/my settings.json'";
+        assert_eq!(with_coordination_hooks(custom, &context), custom);
+        let hooked = with_coordination_hooks("claude", &context);
+        for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+            assert!(hooked.contains(event));
+        }
+        let mut topology = context;
+        topology.topology = Some(TopologyMcpContext {
+            team: "t".into(),
+            agent: "a".into(),
+            endpoint: "localhost:1".into(),
+            token: "t".into(),
+        });
+        assert_eq!(with_coordination_hooks("claude", &topology), "claude");
+    }
 
     #[test]
     fn strip_deleted_suffix_removes_trailing_marker() {
@@ -1744,6 +1898,7 @@ mod tests {
             default_command: "claude".to_string(),
             default_workdir: ".".to_string(),
             health_idle_warning: 15,
+            agent_name: None,
             tmux_server: None,
             topology: None,
             serve: None,
@@ -1795,12 +1950,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_prompts_forbid_backend_native_wake_tools() {
+    fn embedded_prompts_delegate_lifecycle_to_runtime() {
         for prompt in [PROMPT_EA, PROMPT_AGENT] {
-            assert!(prompt.contains("MUST use the OMAR MCP tool `schedule_omar_event`"));
-            assert!(prompt.contains("ScheduleWakeup"));
-            assert!(prompt.contains("scheduled tasks"));
-            assert!(prompt.contains("If a non-OMAR wake/reminder tool is visible, ignore it"));
+            assert!(prompt.contains("Do not create polling timers for child management"));
+            assert!(prompt.contains("acknowledge_task"));
+            assert!(prompt.contains("coordination_state"));
+            assert!(prompt.contains("Do not substitute backend-native schedulers"));
         }
     }
 
@@ -1814,7 +1969,8 @@ mod tests {
             &test_mcp_context(dir.path()),
         );
         assert!(
-            cmd.starts_with("claude --some-flag --system-prompt \"$(cat '/tmp/prompts/ea.md')\""),
+            cmd.starts_with("claude --some-flag ")
+                && cmd.contains("--append-system-prompt \"$(cat '/tmp/prompts/ea.md')\""),
             "unexpected claude command: {cmd}"
         );
         assert!(cmd.contains("--mcp-config"));
@@ -2406,7 +2562,10 @@ mod tests {
             &[],
             &test_mcp_context(dir.path()),
         );
-        assert!(cmd.starts_with("env ANTHROPIC_API_KEY=test claude --yolo --system-prompt"));
+        assert!(
+            cmd.starts_with("env ANTHROPIC_API_KEY=test claude --yolo ")
+                && cmd.contains("--append-system-prompt")
+        );
     }
 
     /// Regression for the codex-EA-manager-won't-start bug. With a very
@@ -2521,7 +2680,7 @@ mod tests {
             omar_dir,
             &test_mcp_context(omar_dir),
         );
-        // claude manager now uses --system-prompt-file (no sed substitution
+        // claude manager now uses --append-system-prompt-file (no sed substitution
         // expression in the command). EA_ID/EA_NAME are pre-substituted on
         // disk in the combined prompt file.
         assert!(
@@ -2529,7 +2688,7 @@ mod tests {
             "claude manager doesn't need workspace cwd"
         );
         assert!(
-            cmd.contains("--system-prompt-file"),
+            cmd.contains("--append-system-prompt-file"),
             "claude must use file flag: {cmd}"
         );
         assert!(
@@ -2568,6 +2727,7 @@ mod tests {
                 default_command: "claude".to_string(),
                 default_workdir: ".".to_string(),
                 health_idle_warning: 15,
+                agent_name: None,
                 tmux_server: None,
                 topology: None,
                 serve: None,

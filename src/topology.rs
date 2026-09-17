@@ -2090,6 +2090,7 @@ fn spawn_topology_agents(
             default_command: base_command.clone(),
             default_workdir: config.default_workdir.to_string(),
             health_idle_warning: config.health_idle_warning,
+            agent_name: None,
             tmux_server: std::env::var("OMAR_TMUX_SERVER").ok(),
             // Topology agents answer invocations; they do not chat with the
             // operator, so they get no serve context.

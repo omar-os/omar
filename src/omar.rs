@@ -23,6 +23,7 @@ mod reaction;
 mod scheduler;
 mod serve;
 mod stub_agent;
+mod supervision;
 mod terminal;
 mod tmux;
 mod topology;
@@ -162,6 +163,12 @@ enum Commands {
     Event {
         #[command(subcommand)]
         action: EventAction,
+    },
+
+    /// Restore authoritative coordination state to a backend lifecycle hook.
+    AgentHook {
+        #[arg(long)]
+        context_file: PathBuf,
     },
 
     /// Start the OMAR MCP server over stdio
@@ -491,6 +498,7 @@ async fn async_main() -> Result<()> {
                 EventAction::Cancel { id } => cancel_cli_event(&scheduler, target.id, &id),
             }
         }
+        Some(Commands::AgentHook { context_file }) => supervision::run_hook(&context_file),
         Some(Commands::McpServer { context_file }) => match context_file {
             Some(path) => mcp::run_server_from_context_file(PathBuf::from(path)),
             None => mcp::run_server_with_default_context(),

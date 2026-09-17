@@ -103,6 +103,11 @@ jobs:
       - name: Run all tests
         run: cargo test -- --test-threads=1
 
+      - name: Verify legacy supervision through MCP and tmux
+        run: |
+          cargo build -p omar
+          python3 tests/ci/legacy_supervision.py
+
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1
 
@@ -128,6 +133,22 @@ jobs:
         run: |
           "$RUNNER_TEMP/codex-test/bin/python" tests/ci/codex_shared_home.py
           "$RUNNER_TEMP/codex-test/bin/python" tests/ci/codex_event_wake.py
+
+  backend-supervision-contracts:
+    name: Backend Supervision Contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned backend CLIs
+        run: npm install -g @anthropic-ai/claude-code@2.1.274 opencode-ai@1.18.31
+      - name: Verify native prompt and wake contracts against local mock providers
+        run: |
+          python3 tests/ci/claude_prompt_contract.py
+          python3 tests/ci/opencode_wake_contract.py
 
   omar-language:
     name: OMAR Language

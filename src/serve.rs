@@ -418,6 +418,7 @@ impl Serve {
             default_command: config.agent.default_command.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
+            agent_name: None,
             tmux_server: None,
             topology: None,
             serve: Some(crate::manager::ServeMcpContext {
