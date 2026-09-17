@@ -281,3 +281,24 @@ test("the fake isolates run discovery, controls and diagram fallbacks by chat", 
     }
   } finally { await fake.close(); }
 });
+
+
+test("scoped agent callbacks stay in their chat after another chat becomes active", async () => {
+  const fake = await startFakeServe();
+  const post = (body) => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const get = async (path, init) => (await fetch(`${fake.url}${path}`, init)).json();
+  try {
+    const first = await get("/v1/chat");
+    await get("/v1/chats", post({}));
+    const base = `/chats/${first.id}`;
+    for (const [endpoint, body] of [
+      ["reply", { text: "Background reply" }],
+      ["proposals", { summary: "Background proposal", program: "fixture" }],
+    ]) {
+      const response = await fetch(`${fake.url}${base}/v1/agent/${endpoint}`, post({ token: fake.agentToken, ...body }));
+      assert.equal(response.status, 202);
+    }
+    assert.deepEqual((await get(`${base}/v1/chat`)).messages.map((message) => message.text), ["Background reply", "Background proposal"]);
+    assert.deepEqual((await get("/v1/chat")).messages, []);
+  } finally { await fake.close(); }
+});

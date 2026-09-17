@@ -194,7 +194,7 @@ export async function startFakeServe({
           return json(response, 403, { error: "forbidden" });
         }
         if (url.pathname === "/v1/agent/reply") {
-          publishChat("assistant", String(payload.text ?? ""), null, payload.progress === true);
+          publishChat("assistant", String(payload.text ?? ""), null, payload.progress === true, [], chat);
         } else if (url.pathname === "/v1/agent/proposals") {
           const preview = structuredClone(golden);
           preview.status = "ready";
@@ -202,7 +202,7 @@ export async function startFakeServe({
             program: String(payload.program ?? ""),
             inputs: payload.inputs ?? {},
             preview,
-          });
+          }, false, [], chat);
         } else {
           return json(response, 404, { error: "not found" });
         }
