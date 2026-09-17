@@ -561,6 +561,62 @@ fn materialize_claude_mcp_config(context: &McpLaunchContext) -> Option<PathBuf> 
     Some(path)
 }
 
+fn user_codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+}
+
+fn append_codex_coordination_hooks(config: &mut toml::Table, server: &Path, context: &Path) {
+    if std::fs::read(context)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<McpLaunchContext>(&raw).ok())
+        .is_some_and(|ctx| ctx.topology.is_some())
+    {
+        return;
+    }
+    let command = format!(
+        "{} agent-hook --format codex --context-file {}",
+        shell_single_quote(&server.display().to_string()),
+        shell_single_quote(&context.display().to_string())
+    );
+    let Some(hooks) = config
+        .entry("hooks")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+    else {
+        return;
+    };
+    for event in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"] {
+        let entry = serde_json::json!({"hooks":[{"type":"command","command":command,"timeout":5}]});
+        if let Some(groups) = hooks
+            .entry(event)
+            .or_insert_with(|| toml::Value::Array(vec![]))
+            .as_array_mut()
+        {
+            // A child may inherit an OMAR-generated home; replace only our handler.
+            for group in groups.iter_mut() {
+                if let Some(handlers) = group.get_mut("hooks").and_then(toml::Value::as_array_mut) {
+                    handlers.retain(|h| {
+                        !h.get("command")
+                            .and_then(toml::Value::as_str)
+                            .is_some_and(|c| {
+                                c.contains(" agent-hook --format codex --context-file ")
+                            })
+                    });
+                }
+            }
+            groups.retain(|group| {
+                !group
+                    .get("hooks")
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(Vec::is_empty)
+            });
+            groups.push(toml::Value::try_from(entry).expect("hook JSON is valid TOML"));
+        }
+    }
+}
+
 fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
     let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
@@ -573,8 +629,29 @@ fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
     .ok()?;
     let command_arg = format!("mcp_servers.omar.command={}", command);
     let args_arg = format!("mcp_servers.omar.args={}", args);
+    let mut config: toml::Table = user_codex_home()
+        .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok())
+        .and_then(|raw| toml::from_str(&raw).ok())
+        .unwrap_or_default();
+    append_codex_coordination_hooks(&mut config, &server_exe, &context_file);
+    let empty = toml::Table::new();
+    let hooks = config
+        .get("hooks")
+        .and_then(toml::Value::as_table)
+        .unwrap_or(&empty)
+        .iter()
+        .filter(|(key, _)| {
+            ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"].contains(&key.as_str())
+        })
+        .map(|(key, value)| {
+            format!(
+                " -c {}",
+                shell_single_quote(&format!("hooks.{key}={value}"))
+            )
+        })
+        .collect::<String>();
     Some(format!(
-        "-c features.scheduled_tasks=false -c {} -c {}",
+        "-c features.scheduled_tasks=false -c {} -c {}{hooks}",
         shell_single_quote(&command_arg),
         shell_single_quote(&args_arg)
     ))
@@ -718,6 +795,35 @@ fn codex_server_command(
     ))
 }
 
+fn materialize_opencode_coordination_plugin(context: &McpLaunchContext) -> Option<String> {
+    if context.topology.is_some() {
+        return None;
+    }
+    let exe = omar_server_exe()?;
+    let context_file = materialize_mcp_context_file(context)?;
+    let path = mcp_ea_dir(context)?
+        .join(actor_file(context.agent_name.as_deref(), "coordination").replace(".json", ".mjs"));
+    let body = format!(
+        "const exe = {};\nconst contextFile = {};\n{}",
+        serde_json::to_string(&exe).ok()?,
+        serde_json::to_string(&context_file).ok()?,
+        include_str!("../backend_hooks/opencode.mjs")
+    );
+    write_private_file(&path, body.as_bytes()).ok()?;
+    let encoded: String = path
+        .to_str()?
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    Some(format!("file://{encoded}"))
+}
+
 fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
     let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
@@ -731,7 +837,7 @@ fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
     {
         tools.insert((*name).to_string(), serde_json::Value::Bool(false));
     }
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "mcp": {
             "omar": {
                 "type": "local",
@@ -749,6 +855,9 @@ fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
             "doom_loop": "deny"
         }
     });
+    if let Some(plugin) = materialize_opencode_coordination_plugin(context) {
+        config["plugin"] = serde_json::json!([plugin]);
+    }
     Some(config.to_string())
 }
 
@@ -1066,7 +1175,18 @@ pub fn build_agent_command(
     match detect_backend(&base_command) {
         Some(BackendKind::Agy) => {
             let _ = ensure_antigravity_mcp_config(mcp_context);
-            format!("TERM=xterm-256color {} -i \"{}\"", base_command, shell_expr)
+            let identity = materialize_mcp_context_file(mcp_context)
+                .map(|p| {
+                    format!(
+                        " OMAR_MCP_CONTEXT_FILE={}",
+                        shell_single_quote(&p.display().to_string())
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "TERM=xterm-256color{identity} {} -i \"{}\"",
+                base_command, shell_expr
+            )
         }
         Some(BackendKind::Claude) => {
             let base_command = with_coordination_hooks(&base_command, mcp_context);
@@ -1769,6 +1889,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn codex_coordination_preserves_user_hooks_and_replaces_parent_identity() {
+        let mut config: toml::Table = toml::from_str(
+            r#"developer_instructions = "personal policy"
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "personal-check"
+"#,
+        )
+        .unwrap();
+        append_codex_coordination_hooks(
+            &mut config,
+            Path::new("/tmp/omar binary"),
+            Path::new("/tmp/parent.json"),
+        );
+        append_codex_coordination_hooks(
+            &mut config,
+            Path::new("/tmp/omar binary"),
+            Path::new("/tmp/child.json"),
+        );
+        let serialized = toml::to_string(&config).unwrap();
+        assert_eq!(
+            config["developer_instructions"].as_str(),
+            Some("personal policy")
+        );
+        assert!(serialized.contains("personal-check"));
+        assert_eq!(serialized.matches("agent-hook --format codex").count(), 4);
+        assert!(!serialized.contains("/tmp/parent.json"));
+        assert_eq!(serialized.matches("/tmp/child.json").count(), 4);
+    }
+
+    #[test]
     fn sibling_contexts_and_global_backend_config_cannot_overwrite_ea_identity() {
         let dir = tempfile::tempdir().unwrap();
         let mut ea = test_mcp_context(dir.path());
@@ -2392,9 +2544,10 @@ mod tests {
             &[],
             &test_mcp_context(dir.path()),
         );
-        assert!(cmd.contains(
-            "TERM=xterm-256color agy --dangerously-skip-permissions -i \"$(cat '/tmp/prompts/ea.md')\""
-        ));
+        assert!(
+            cmd.contains("agy --dangerously-skip-permissions -i \"$(cat '/tmp/prompts/ea.md')\"")
+        );
+        assert!(cmd.contains("TERM=xterm-256color OMAR_MCP_CONTEXT_FILE="));
         let plugin = dir
             .path()
             .join(".gemini/config/plugins/omar-ea-0/plugin.json");

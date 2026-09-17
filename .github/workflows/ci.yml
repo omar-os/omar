@@ -103,10 +103,14 @@ jobs:
       - name: Run all tests
         run: cargo test -- --test-threads=1
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Verify legacy supervision through MCP and tmux
         run: |
           cargo build -p omar
           python3 tests/ci/legacy_supervision.py
+          python3 tests/ci/backend_coordination_contracts.py
 
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1
@@ -144,11 +148,12 @@ jobs:
         with:
           node-version: '22'
       - name: Install pinned backend CLIs
-        run: npm install -g @anthropic-ai/claude-code@2.1.274 opencode-ai@1.18.31
+        run: npm install -g @anthropic-ai/claude-code@2.1.274 opencode-ai@1.18.31 @openai/codex@0.154.0
       - name: Verify native prompt and wake contracts against local mock providers
         run: |
           python3 tests/ci/claude_prompt_contract.py
           python3 tests/ci/opencode_wake_contract.py
+          python3 tests/ci/codex_event_wake.py
 
   omar-language:
     name: OMAR Language
@@ -694,7 +699,7 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, codex-shared-history, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
+    needs: [check, fmt, clippy, test, codex-shared-history, backend-supervision-contracts, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: always()
@@ -706,6 +711,7 @@ jobs:
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
              [[ "${{ needs.codex-shared-history.result }}" != "success" ]] || \
+             [[ "${{ needs.backend-supervision-contracts.result }}" != "success" ]] || \
              [[ "${{ needs.omar-language.result }}" != "success" ]] || \
              [[ "${{ needs.popup-quote-integration.result }}" != "success" ]] || \
              [[ "${{ needs.unresolved-session-integration.result }}" != "success" ]] || \

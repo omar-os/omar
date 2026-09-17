@@ -325,7 +325,11 @@ pub fn install_cursor_hook() -> bool {
         return false;
     }
 
-    let command = format!("{} {}", exe.display(), CURSOR_HOOK_ARGS);
+    let command = format!(
+        "{} {}",
+        crate::manager::shell_single_quote(&exe.display().to_string()),
+        CURSOR_HOOK_ARGS
+    );
     let entry = serde_json::json!({ "command": command });
     let hooks = config
         .as_object_mut()
@@ -336,10 +340,19 @@ pub fn install_cursor_hook() -> bool {
         return false;
     };
 
-    // Two events: one fires while the agent works, the other when the user
-    // next submits. Between them an event is never left waiting on an agent
-    // that has gone quiet.
-    for event in ["postToolUse", "beforeSubmitPrompt"] {
+    // Migrate the old entry: beforeSubmitPrompt has no context-output field.
+    if let Some(list) = hooks
+        .get_mut("beforeSubmitPrompt")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        list.retain(|hook| {
+            !hook["command"]
+                .as_str()
+                .is_some_and(|command| command.ends_with(CURSOR_HOOK_ARGS))
+        });
+    }
+    // Supported injection points plus a bounded stop continuation.
+    for event in ["sessionStart", "postToolUse", "postToolUseFailure", "stop"] {
         let list = hooks
             .entry(event)
             .or_insert_with(|| serde_json::json!([]))
@@ -398,7 +411,7 @@ pub fn install_antigravity_hook() -> bool {
         serde_json::json!({
             "PreInvocation": [{
                 "type": "command",
-                "command": format!("{} hook-drain --format agy", exe.display()),
+                "command": format!("{} hook-drain --format agy", crate::manager::shell_single_quote(&exe.display().to_string())),
             }]
         }),
     );
@@ -1091,7 +1104,7 @@ mod tests {
             .iter()
             .any(|c| c == "their-own-linter"));
         assert_eq!(commands("beforeShellExecution"), vec!["their-audit"]);
-        for event in ["postToolUse", "beforeSubmitPrompt"] {
+        for event in ["sessionStart", "postToolUse", "postToolUseFailure", "stop"] {
             assert!(
                 commands(event).iter().any(|c| c.contains("hook-drain")),
                 "{event} must call OMAR"

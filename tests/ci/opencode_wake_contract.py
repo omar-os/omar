@@ -15,6 +15,7 @@ import time
 import urllib.request
 
 inference = threading.Event()
+requests = []
 
 
 class Mock(http.server.BaseHTTPRequestHandler):
@@ -22,7 +23,7 @@ class Mock(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        requests.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)))))
         inference.set()
         self.send_response(400)
         self.end_headers()
@@ -42,7 +43,9 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="omar-opencode-contract-") as directory:
             root = Path(directory)
-            config = {"enabled_providers": ["omar_mock"], "model": "omar_mock/mock", "plugin": [],
+            plugin = root / "coordination.mjs"
+            plugin.write_text('export const Coordination = async () => ({"experimental.chat.system.transform": async (_, output) => { output.system.push("OMAR_NATIVE_CONTEXT_PROOF"); }});')
+            config = {"enabled_providers": ["omar_mock"], "model": "omar_mock/mock", "plugin": [plugin.as_uri()],
                       "provider": {"omar_mock": {"npm": "@ai-sdk/openai-compatible", "name": "OMAR local test",
                                    "options": {"baseURL": f"http://127.0.0.1:{mock.server_port}/v1", "apiKey": "local-only"},
                                    "models": {"mock": {"name": "Mock", "limit": {"context": 32000, "output": 1000}}}}}}
@@ -84,7 +87,8 @@ def main():
                 if not inference.wait(20):
                     log.seek(0)
                     raise AssertionError("prompt_async never started inference: " + log.read()[-3000:])
-                print("PASS: installed OpenCode noReply stays idle; prompt_async returns 204 and starts local inference", flush=True)
+                assert "OMAR_NATIVE_CONTEXT_PROOF" in json.dumps(requests), "native system transform did not inject context"
+                print("PASS: native plugin injects system context; installed OpenCode noReply stays idle; prompt_async returns 204 and starts local inference", flush=True)
     finally:
         if process is not None:
             process.terminate()

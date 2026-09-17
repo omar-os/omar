@@ -368,13 +368,73 @@ pub fn hook_response(context: &crate::manager::McpLaunchContext, input: &Value) 
             },
         );
     }
-    if !matches!(event, "SessionStart" | "UserPromptSubmit") {
+    if !matches!(event, "SessionStart" | "UserPromptSubmit" | "PostToolUse") {
         return Ok(json!({}));
     }
     let state = self::context(&context.omar_dir, context.ea_id, actor)?;
     Ok(
         json!({"hookSpecificOutput":{"hookEventName":event,"additionalContext":context_message(&state)}}),
     )
+}
+
+/// Backend wire contracts share one authoritative state and stop predicate.
+/// Unsupported notification hooks never pretend that output was injected.
+pub fn backend_hook_response(
+    context: &crate::manager::McpLaunchContext,
+    input: &Value,
+    backend: &str,
+) -> Result<Value> {
+    if context.topology.is_some() {
+        return Ok(json!({}));
+    }
+    let actor = context.agent_name.as_deref().unwrap_or("ea");
+    let event = input["hook_event_name"].as_str().unwrap_or("");
+    match backend {
+        "claude" | "codex" => hook_response(context, input),
+        "cursor" if event == "stop" => {
+            if input["status"] != "completed" || input["loop_count"].as_u64().unwrap_or(0) > 0 {
+                return Ok(json!({}));
+            }
+            Ok(
+                match stop_reason(&context.omar_dir, context.ea_id, actor)? {
+                    Some(reason) => json!({"followup_message":reason}),
+                    None => json!({}),
+                },
+            )
+        }
+        "cursor" if matches!(event, "sessionStart" | "postToolUse" | "postToolUseFailure") => Ok(
+            json!({"additional_context":context_message(&self::context(&context.omar_dir,context.ea_id,actor)?)}),
+        ),
+        "cursor" => Ok(json!({})),
+        "agy" | "antigravity" => Ok(
+            json!({"injectSteps":[{"ephemeralMessage":context_message(&self::context(&context.omar_dir,context.ea_id,actor)?)}]}),
+        ),
+        "opencode" if event == "Stop" => {
+            if stop_reason(&context.omar_dir, context.ea_id, actor)?.is_some() {
+                transaction(&context.omar_dir, |ledger| {
+                    for task in ledger.tasks.values_mut().filter(|t| {
+                        t.ea_id == context.ea_id && (t.agent == actor || t.parent == actor)
+                    }) {
+                        task.next_check_ms = 0;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(json!({}))
+        }
+        "opencode" => Ok(
+            json!({"context":context_message(&self::context(&context.omar_dir,context.ea_id,actor)?)}),
+        ),
+        _ => bail!("unsupported coordination hook backend: {backend}"),
+    }
+}
+
+pub fn inherited_hook_response(input: &Value, backend: &str) -> Result<Value> {
+    let Some(path) = std::env::var_os("OMAR_MCP_CONTEXT_FILE") else {
+        return Ok(json!({}));
+    };
+    let context = serde_json::from_slice(&fs::read(path)?)?;
+    backend_hook_response(&context, input, backend)
 }
 
 /// MCP is also used without a dashboard (including an EA launched by serve).
@@ -405,7 +465,6 @@ pub fn start_fallback_runtime(context: &crate::manager::McpLaunchContext) {
             runtime.block_on(crate::scheduler::run_event_loop(
                 scheduler,
                 crate::scheduler::TickerBuffer::new(),
-                crate::scheduler::new_popup_receiver(),
                 prefix,
             ));
             Ok(())
@@ -416,17 +475,20 @@ pub fn start_fallback_runtime(context: &crate::manager::McpLaunchContext) {
     });
 }
 
-pub fn run_hook(path: &Path) -> Result<()> {
+pub fn run_hook(path: &Path, backend: &str, event: Option<&str>) -> Result<()> {
     use std::io::Read;
     let context = serde_json::from_slice(&fs::read(path)?)?;
-    let mut input = String::new();
-    std::io::stdin()
-        .take(1_048_576)
-        .read_to_string(&mut input)?;
-    println!(
-        "{}",
-        hook_response(&context, &serde_json::from_str(&input)?)?
-    );
+    let mut raw = String::new();
+    let mut input = if let Some(event) = event {
+        json!({"hook_event_name":event})
+    } else {
+        std::io::stdin().take(1_048_576).read_to_string(&mut raw)?;
+        serde_json::from_str(&raw)?
+    };
+    if let Some(event) = event {
+        input["hook_event_name"] = json!(event);
+    }
+    println!("{}", backend_hook_response(&context, &input, backend)?);
     Ok(())
 }
 
@@ -818,5 +880,101 @@ mod tests {
         assert_eq!(reconcile(root, now_ms(), &live).unwrap()[0].1, "ea");
         assert!(acknowledge(root, 0, "pm", &child, 1).is_err());
         acknowledge(root, 0, "ea", &child, 1).unwrap();
+    }
+    #[test]
+    fn all_backend_adapters_restore_live_state_and_preserve_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let context: crate::manager::McpLaunchContext = serde_json::from_value(json!({
+            "omar_dir":root,"ea_id":0,"agent_name":"pm","session_prefix":"s-",
+            "default_command":"cat","default_workdir":".","health_idle_warning":15
+        }))
+        .unwrap();
+        let own = register(root, task("pm", "ea")).unwrap();
+        let child = register(root, task("child", "pm")).unwrap();
+        for (backend, event) in [
+            ("claude", "SessionStart"),
+            ("codex", "SessionStart"),
+            ("cursor", "postToolUse"),
+            ("agy", "PreInvocation"),
+            ("opencode", "PreInvocation"),
+        ] {
+            let before = backend_hook_response(
+                &context,
+                &json!({"hook_event_name":event,"source":"compact"}),
+                backend,
+            )
+            .unwrap()
+            .to_string();
+            assert!(
+                before.contains(&own) && before.contains(&child),
+                "{backend} lost active ownership"
+            );
+        }
+        finish(
+            root,
+            0,
+            "child",
+            &child,
+            Status::Completed,
+            json!("fresh result after compaction"),
+        )
+        .unwrap();
+        for (backend, event) in [
+            ("claude", "UserPromptSubmit"),
+            ("codex", "PostToolUse"),
+            ("cursor", "sessionStart"),
+            ("agy", "PreInvocation"),
+            ("opencode", "PreCompact"),
+        ] {
+            let state = backend_hook_response(&context, &json!({"hook_event_name":event}), backend)
+                .unwrap()
+                .to_string();
+            assert!(
+                state.contains("fresh result after compaction"),
+                "{backend} reused stale context"
+            );
+        }
+        for backend in ["claude", "codex"] {
+            assert_eq!(
+                backend_hook_response(&context, &json!({"hook_event_name":"Stop"}), backend)
+                    .unwrap()["decision"],
+                "block"
+            );
+            assert_eq!(
+                backend_hook_response(
+                    &context,
+                    &json!({"hook_event_name":"Stop","stop_hook_active":true}),
+                    backend
+                )
+                .unwrap(),
+                json!({})
+            );
+        }
+        assert!(backend_hook_response(
+            &context,
+            &json!({"hook_event_name":"stop","status":"completed","loop_count":0}),
+            "cursor"
+        )
+        .unwrap()["followup_message"]
+            .is_string());
+        for input in [
+            json!({"hook_event_name":"stop","status":"aborted"}),
+            json!({"hook_event_name":"stop","status":"completed","loop_count":1}),
+            json!({"hook_event_name":"beforeSubmitPrompt"}),
+        ] {
+            assert_eq!(
+                backend_hook_response(&context, &input, "cursor").unwrap(),
+                json!({})
+            );
+        }
+        backend_hook_response(&context, &json!({"hook_event_name":"Stop"}), "opencode").unwrap();
+        let wakes = reconcile(
+            root,
+            now_ms(),
+            &BTreeSet::from(["s-pm".into(), "s-child".into()]),
+        )
+        .unwrap();
+        assert!(wakes.iter().any(|(_, actor, _)| actor == "pm"));
     }
 }

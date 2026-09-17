@@ -169,6 +169,10 @@ enum Commands {
     AgentHook {
         #[arg(long)]
         context_file: PathBuf,
+        #[arg(long, default_value = "claude")]
+        format: String,
+        #[arg(long)]
+        event: Option<String>,
     },
 
     /// Start the OMAR MCP server over stdio
@@ -498,7 +502,11 @@ async fn async_main() -> Result<()> {
                 EventAction::Cancel { id } => cancel_cli_event(&scheduler, target.id, &id),
             }
         }
-        Some(Commands::AgentHook { context_file }) => supervision::run_hook(&context_file),
+        Some(Commands::AgentHook {
+            context_file,
+            format,
+            event,
+        }) => supervision::run_hook(&context_file, &format, event.as_deref()),
         Some(Commands::McpServer { context_file }) => match context_file {
             Some(path) => mcp::run_server_from_context_file(PathBuf::from(path)),
             None => mcp::run_server_with_default_context(),
@@ -548,11 +556,45 @@ async fn async_main() -> Result<()> {
             // would destroy every queued event on a typo.
             let reply = match channel::HookFormat::parse(&format) {
                 Some(hook) => {
-                    let events = std::env::var("OMAR_EVENT_SPOOL")
-                        .ok()
-                        .map(|spool| channel::drain_spool(std::path::Path::new(&spool)))
-                        .unwrap_or_default();
-                    hook.render(&events)
+                    use std::io::Read;
+                    let mut raw = String::new();
+                    std::io::stdin().take(1_048_576).read_to_string(&mut raw)?;
+                    let input =
+                        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+                    let consumes_spool = format != "cursor"
+                        || matches!(
+                            input["hook_event_name"].as_str(),
+                            None | Some("sessionStart" | "postToolUse" | "postToolUseFailure")
+                        );
+                    let mut events = if consumes_spool {
+                        std::env::var("OMAR_EVENT_SPOOL")
+                            .ok()
+                            .map(|spool| channel::drain_spool(std::path::Path::new(&spool)))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let mut state = supervision::inherited_hook_response(&input, &format)?;
+                    if input["hook_event_name"] == "stop" {
+                        state.to_string()
+                    } else {
+                        // Only hooks with an injection output contract consume context.
+                        if format == "cursor" && input["hook_event_name"] == "beforeSubmitPrompt" {
+                            "{}".to_string()
+                        } else {
+                            if let Some(value) = state["additional_context"].as_str() {
+                                events.push(value.to_owned());
+                            }
+                            if let Some(steps) = state["injectSteps"].as_array_mut() {
+                                for step in steps {
+                                    if let Some(value) = step["ephemeralMessage"].as_str() {
+                                        events.push(value.to_owned());
+                                    }
+                                }
+                            }
+                            hook.render(&events)
+                        }
+                    }
                 }
                 None => "{}".to_string(),
             };
