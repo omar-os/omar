@@ -1761,7 +1761,7 @@ test("chat history keeps tab selections independent and refreshes background cha
     await second.getByLabel("Draft workflow").click();
     await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
     await expect(history.getByRole("listitem").first()).toContainText("Plan the next release");
-    await expect(history.getByRole("listitem").first()).toContainText("3 messages");
+    await expect(history.getByRole("listitem").first()).not.toContainText(/messages|Current/);
     await history.getByLabel("Search chats").fill("nothing matches");
     await expect(history).toContainText("No chats found");
     await history.getByLabel("Search chats").fill("");
@@ -1852,5 +1852,27 @@ test("two chats keep live topologies when switching and reloading", async ({ pag
   await expect(page.locator(".messages")).not.toContainText("Topology A");
   await expect(history.getByRole("button", { name: /Topology A/ })).toContainText("Running");
   await expect(page.locator(".omar-reaction")).not.toHaveCount(0);
+  await expect(history.locator(".chat-running").first()).toHaveCSS("font-weight", "700");
+  await expect(history.locator(".chat-running").first()).toHaveCSS("color", "rgb(196, 181, 253)");
   await page.screenshot({ path: "/tmp/omar-live-chats.png" });
+});
+
+test("an undeployed proposal remains actionable after a finished run and chat switching", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  await page.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("finished");
+  await page.getByLabel("Describe a workflow").fill("Propose a revised workflow");
+  await page.getByLabel("Draft workflow").click();
+  const controls = page.getByRole("group", { name: "Deploy design" });
+  await expect(controls).toBeVisible();
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await history.getByRole("button", { name: /Review the release plan/ }).click();
+  await expect(controls).toBeVisible();
+  await expect(controls.getByRole("button", { name: "Deploy", exact: true })).toBeEnabled();
+  await expect(controls.getByRole("button", { name: "Discard", exact: true })).toBeVisible();
+  await page.reload();
+  await expect(controls).toBeVisible();
 });

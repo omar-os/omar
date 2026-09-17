@@ -2357,3 +2357,5 @@ h2 {
   outline-offset: 2px;
 }
 @media (max-width: 900px) { .history-rail { display: none; } }
+
+.chat-history .chat-running { color: #c4b5fd; font-weight: 700; }

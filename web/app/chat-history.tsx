@@ -24,7 +24,7 @@ export function SidebarIcon({ direction }: { direction: "open" | "close" }) {
   );
 }
 
-export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, onClose, onOpen, onSelect, railButtonRef }: {
+export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, onClose, onOpen, onSelect, onSwitchingChange, railButtonRef }: {
   serveUrl: string;
   activeId: string;
   mobile: boolean;
@@ -33,6 +33,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
   onClose: () => void;
   onOpen: () => void;
   onSelect: (conversation: ConversationSummary) => void;
+  onSwitchingChange: (switching: boolean) => void;
   railButtonRef: RefObject<HTMLButtonElement | null>;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -83,6 +84,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
       return;
     }
     setSwitching(true);
+    onSwitchingChange(true);
     setError("");
     try {
       const conversation = await selectConversation(serveUrl, id);
@@ -93,6 +95,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setSwitching(false);
+      onSwitchingChange(false);
     }
   }
 
@@ -129,7 +132,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
         <li key={chat.id}>
           <button type="button" disabled={switching} aria-current={chat.id === activeId ? "true" : undefined} onClick={() => void select(chat.id)}>
             <span>{chat.title}</span>
-            <small>{chat.message_count} messages · {new Date(chat.updated_at).toLocaleDateString()}{chat.busy ? " · Thinking" : ""}{chat.run && ["starting", "running", "stopping"].includes(chat.run.status) ? " · Running" : ""}{chat.id === activeId ? " · Current" : ""}</small>
+            <small>{new Date(chat.updated_at).toLocaleDateString()}{chat.busy ? " · Thinking" : ""}{chat.run && ["starting", "running", "stopping"].includes(chat.run.status) ? <> · <strong className="chat-running">Running</strong></> : null}</small>
           </button>
         </li>
       ))}

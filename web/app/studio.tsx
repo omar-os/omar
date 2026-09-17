@@ -154,6 +154,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
   );
   const [phase, setPhase] = useState<Phase>("idle");
   const [assistantBusy, setAssistantBusy] = useState(false);
+  const [switchingChat, setSwitchingChat] = useState(false);
   const [design, setDesign] = useState<ProposedDesign | null>(null);
   const [run, setRun] = useState<RunRecord | null>(null);
   const [error, setError] = useState("");
@@ -327,7 +328,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
   async function submitPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const request = prompt.trim();
-    if (!request || assistantBusy || phase === "spawning") return;
+    if (!request || (switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning") return;
     const selected = selection;
     setPrompt("");
     setError("");
@@ -507,6 +508,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
   useEffect(() => {
     let subscribedId: string | undefined;
     let replaying = false;
+    let replayedProposal = false;
     const unsubscribe = agent.subscribe(
       (message) => {
         if (subscribedId && subscribedId !== conversationIdRef.current) return;
@@ -531,6 +533,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
           }
           return;
         }
+        if (replaying) replayedProposal = true;
         // A fresh proposal remains in the transcript while this chat's
         // deployed topology continues to own the live diagram and controls.
         if (!replaying && runRef.current && !isRunFinished(runRef.current.status)) return;
@@ -557,6 +560,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
       (conversation) => {
         subscribedId = conversation.id;
         replaying = true;
+        replayedProposal = false;
         restoreConversation(conversation);
         // The stream announces live state before replaying old proposals.
         // Keep their source visible without offering to deploy an active run.
@@ -580,8 +584,18 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
             void loadPanel(record.run_id);
           }
         }
+        const activeRun = conversation.run && !isRunFinished(conversation.run.status);
         setAssistantBusy(conversation.busy);
-        if (conversation.busy && (!conversation.run || isRunFinished(conversation.run.status))) setPhase("drafting");
+        // A finished run must not override the proposal restored from the
+        // transcript. Only a live topology owns the diagram and its controls.
+        if (replayedProposal && !activeRun) {
+          runRef.current = null;
+          setRun(null);
+          setTab("source");
+          setPhase("review");
+        } else if (conversation.busy && !activeRun) {
+          setPhase("drafting");
+        }
       },
     );
     // Clear on teardown rather than on subscribe: transcripts belong to an
@@ -833,6 +847,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
           <ChatHistory
             serveUrl={historyUrl}
             activeId={conversationId}
+            onSwitchingChange={setSwitchingChat}
             mobile={historyDrawer}
             revision={`${historyRevision}:${messages.length}`}
                         collapsed={!historyDrawer && !historyOpen}
@@ -901,6 +916,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
 
           <form className="prompt-box" onSubmit={(event) => void submitPrompt(event)}>
             <textarea
+              disabled={switchingChat || (!isDemo && !conversationId)}
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
               onKeyDown={(event) => {
@@ -940,7 +956,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
                   className="send-button"
                   type="submit"
                   aria-label="Draft workflow"
-                  disabled={assistantBusy || phase === "spawning"}
+                  disabled={(switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning"}
                 >
                   ↑
                 </button>
