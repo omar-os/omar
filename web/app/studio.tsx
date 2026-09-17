@@ -506,6 +506,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
   // replays history on connect, so a reload rejoins rather than starting over.
   useEffect(() => {
     let subscribedId: string | undefined;
+    let replaying = false;
     const unsubscribe = agent.subscribe(
       (message) => {
         if (subscribedId && subscribedId !== conversationIdRef.current) return;
@@ -532,7 +533,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
         }
         // A fresh proposal remains in the transcript while this chat's
         // deployed topology continues to own the live diagram and controls.
-        if (runRef.current && !isRunFinished(runRef.current.status)) return;
+        if (!replaying && runRef.current && !isRunFinished(runRef.current.status)) return;
         setConfirming(false);
         setDesign(message.design);
         setSource(message.design.program);
@@ -548,22 +549,30 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
           if (available) setBuilderWidth(Math.round(available / 2));
           setInspectorWidth(0);
         }
-        setPhase("review");
+        setPhase(runRef.current && !isRunFinished(runRef.current.status) ? "observing" : "review");
       },
       () => {
         /* daemon health is polled separately */
       },
       (conversation) => {
         subscribedId = conversation.id;
+        replaying = true;
         restoreConversation(conversation);
+        // The stream announces live state before replaying old proposals.
+        // Keep their source visible without offering to deploy an active run.
+        runRef.current = conversation.run ?? null;
+        setRun(conversation.run ?? null);
+        if (conversation.run && !isRunFinished(conversation.run.status)) setPhase("observing");
         if (serveUrl === historyUrl) onSelect(conversation);
       },
       (conversation) => {
         if (conversation.id !== conversationIdRef.current) return;
+        replaying = false;
         if (conversation.run) {
           const record = conversation.run;
           runRef.current = record;
           setRun(record);
+          setConfirming(false);
           setPhase(isRunFinished(record.status) ? (record.status === "failed" ? "failed" : "finished") : "observing");
           setTab("events");
           if (!isRunFinished(record.status) && record.diagram_address) {

@@ -167,6 +167,7 @@ test("a runtime without the bundle refuses --ui and explains itself", { skip: AV
   if (!existsSync(OMAR_BIN)) return;
   const probe = spawnSync(OMAR_BIN, ["serve", "--ui", "--no-ea", "--address", "0.0.0.0:0"], {
     encoding: "utf8",
+    env: testEnv,
     timeout: 20_000,
   });
   const said = `${probe.stdout}${probe.stderr}`;

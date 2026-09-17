@@ -1818,7 +1818,7 @@ test("switching chats while thinking preserves both replies", async ({ page }) =
 
 test("two chats keep live topologies when switching and reloading", async ({ page }) => {
   await fake.close();
-  fake = (await startFakeServe({ stepMs: 2500, port: FAKE_SERVE_PORT })) as FakeServe;
+  fake = (await startFakeServe({ stepMs: 2500, liveChatReplayDelayMs: 1500, port: FAKE_SERVE_PORT })) as FakeServe;
   await useFakeServe(page);
   const history = page.getByRole("complementary", { name: "Chat history" });
   const draft = async (name: string) => {
@@ -1841,6 +1841,8 @@ test("two chats keep live topologies when switching and reloading", async ({ pag
   await expect(history.getByRole("button", { name: /Topology B/ })).toContainText("Running");
   await history.getByRole("button", { name: /Topology A/ }).click();
   await expect(page.locator(".connection")).toContainText("observing");
+  // The state event is delayed: replayed proposals must not expose a deploy
+  // gate while the client waits to reconnect the live diagram.
   await expect(page.getByRole("group", { name: "Deploy design" })).toBeHidden();
   await page.reload();
   await expect(page.locator(".connection")).toContainText("observing");

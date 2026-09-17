@@ -35,6 +35,7 @@ const PROPOSED_PROGRAM = await readFile(
 
 export async function startFakeServe({
   stepMs = 120,
+  liveChatReplayDelayMs = 0,
   host = "127.0.0.1",
   port = 0,
   /** Which captured topology to replay; see tests/fixtures. */
@@ -71,7 +72,7 @@ export async function startFakeServe({
     }
     if (request.method === "GET" && url.pathname === "/v1/runs") {
       return json(response, 200, {
-        runs: [...runs.values()].map((entry) => entry.record),
+        runs: [...chat.runs.values()].map((entry) => entry.record),
       });
     }
     // Before the run-record route, which matches any suffix — the same order
@@ -82,7 +83,7 @@ export async function startFakeServe({
       url.pathname.endsWith("/stop")
     ) {
       const id = url.pathname.slice("/v1/runs/".length, -"/stop".length);
-      const entry = runs.get(id);
+      const entry = chat.runs.get(id);
       if (!entry) return json(response, 404, { error: "unknown run" });
       // A stopping run is still active, as on the daemon: it holds its sessions
       // until the tag closes.
@@ -101,7 +102,7 @@ export async function startFakeServe({
     }
     if (url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/panel")) {
       const id = url.pathname.slice("/v1/runs/".length, -"/panel".length);
-      const entry = runs.get(id);
+      const entry = chat.runs.get(id);
       if (!entry) return json(response, 404, { error: "unknown run" });
       if (request.method === "GET") {
         return json(response, 200, {
@@ -139,20 +140,20 @@ export async function startFakeServe({
       }
     }
     if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
-      const entry = runs.get(url.pathname.slice("/v1/runs/".length));
+      const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length));
       return entry
         ? json(response, 200, entry.record)
         : json(response, 404, { error: "unknown run" });
     }
     // Diagram surface for the single active run, mirroring the per-run server.
     if (request.method === "GET" && url.pathname === "/v1/diagram") {
-      const entry = latest();
+      const entry = latest(chat);
       return entry
         ? json(response, 200, entry.snapshot)
         : json(response, 404, { error: "no run" });
     }
     if (request.method === "GET" && url.pathname === "/v1/events") {
-      return subscribe(response);
+      return subscribe(response, latest(chat));
     }
     // Agent-only endpoints. The stand-in assistant is internal, so these exist
     // to mirror the real daemon's surface rather than to be used.
@@ -277,7 +278,7 @@ export async function startFakeServe({
 
   let backend = "codex";
   function newChat() {
-    return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false };
+    return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map() };
   }
   let activeChat = newChat();
   const chats = new Map([[activeChat.id, activeChat]]);
@@ -323,7 +324,9 @@ export async function startFakeServe({
         `id: ${message.sequence}\nevent: ${kind}\ndata: ${JSON.stringify(message)}\n\n`,
       );
     }
-    response.write(`event: chat_state\ndata: ${JSON.stringify(chatSummary(chat))}\n\n`);
+    const stateFrame = `event: chat_state\ndata: ${JSON.stringify(chatSummary(chat))}\n\n`;
+    if (chat.run && liveChatReplayDelayMs) setTimeout(() => response.write(stateFrame), liveChatReplayDelayMs);
+    else response.write(stateFrame);
     const subscribedChat = chat;
     subscribedChat.subscribers.add(response);
     response.on("close", () => subscribedChat.subscribers.delete(response));
@@ -396,8 +399,8 @@ export async function startFakeServe({
     }, stepMs);
   }
 
-  function latest() {
-    return [...runs.values()].at(-1);
+  function latest(chat = activeChat) {
+    return [...chat.runs.values()].at(-1);
   }
 
   /**
@@ -567,6 +570,7 @@ export async function startFakeServe({
     entry.record.diagram_address = `${host}:${diagramServer.address().port}`;
     entry.diagramServer = diagramServer;
     runs.set(runId, entry);
+    chat.runs.set(runId, entry);
     chat.run = entry.record;
     json(response, 201, entry.record);
   }
