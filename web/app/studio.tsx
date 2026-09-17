@@ -43,6 +43,7 @@ import {
   startRun,
   stopRun,
   subscribeToDiagram,
+  fetchConversations,
 } from "./lib/runtime-client";
 
 /**
@@ -83,12 +84,32 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-export function Studio({
-  serveUrl = "",
-  designAgent,
-}: {
-  serveUrl?: string;
-  designAgent?: DesignAgent;
+type StudioProps = { serveUrl?: string; designAgent?: DesignAgent };
+
+export function Studio({ serveUrl = "", designAgent }: StudioProps) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const select = useCallback((conversation: ConversationSummary) => {
+    setSelected(conversation.id);
+    sessionStorage.setItem(`omar-chat:${serveUrl}`, conversation.id);
+  }, [serveUrl]);
+  useEffect(() => {
+    if (!serveUrl) return;
+    const saved = sessionStorage.getItem(`omar-chat:${serveUrl}`);
+    if (!saved) return;
+    const abort = new AbortController();
+    void fetchConversations(serveUrl, abort.signal).then((history) => {
+      if (!abort.signal.aborted && history.conversations.some((chat) => chat.id === saved)) setSelected(saved);
+    }).catch(() => {});
+    return () => abort.abort();
+  }, [serveUrl]);
+  const scopedUrl = selected ? `${serveUrl.replace(/\/$/, "")}/chats/${encodeURIComponent(selected)}` : serveUrl;
+  return <StudioWorkspace key={scopedUrl} serveUrl={scopedUrl} historyUrl={serveUrl}
+    designAgent={designAgent} onSelect={select} />;
+}
+
+function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: StudioProps & {
+  historyUrl: string;
+  onSelect: (conversation: ConversationSummary) => void;
 }) {
   const isDemo = serveUrl.trim().length === 0;
   const [snapshot, setSnapshot] = useState<DiagramSnapshot | null>(
@@ -132,6 +153,7 @@ export function Studio({
     isDemo ? { state: "demo" } : { state: "checking" },
   );
   const [phase, setPhase] = useState<Phase>("idle");
+  const [assistantBusy, setAssistantBusy] = useState(false);
   const [design, setDesign] = useState<ProposedDesign | null>(null);
   const [run, setRun] = useState<RunRecord | null>(null);
   const [error, setError] = useState("");
@@ -146,6 +168,9 @@ export function Studio({
   const historyButtonRef = useRef<HTMLButtonElement>(null);
     const historyRailButtonRef = useRef<HTMLButtonElement>(null);
   const historyDrawer = useHistoryDrawer();
+  useEffect(() => {
+    if (historyDrawer && serveUrl !== historyUrl) historyButtonRef.current?.focus();
+  }, [historyDrawer, serveUrl, historyUrl]);
   const historyVisible = !isDemo && (historyDrawer ? drawerOpen : historyOpen);
   function closeHistory() {
     if (historyDrawer) setDrawerOpen(false);
@@ -159,8 +184,9 @@ export function Studio({
   useEffect(() => {
     if (!isDemo && !historyDrawer && !historyOpen) historyRailButtonRef.current?.focus();
   }, [historyDrawer, historyOpen, isDemo]);
-const [chatEpoch, setChatEpoch] = useState(0);
+
   const conversationIdRef = useRef<string | null>(null);
+  const [conversationId, setConversationId] = useState("");
   const [conversationTitle, setConversationTitle] = useState("What should the team do?");
   /** The web agent whose port panel is open. A program may declare several,
       each with its own ports and prompts, so this names one rather than
@@ -263,6 +289,7 @@ const [chatEpoch, setChatEpoch] = useState(0);
     setConversationTitle(conversation.message_count ? conversation.title : "What should the team do?");
     if (conversationIdRef.current === conversation.id) return;
     conversationIdRef.current = conversation.id;
+    setConversationId(conversation.id);
     disconnectRef.current?.();
     disconnectRef.current = null;
     checkTokenRef.current += 1;
@@ -292,65 +319,6 @@ const [chatEpoch, setChatEpoch] = useState(0);
     setInspectorWidth(DEFAULT_INSPECTOR);
   }, []);
 
-  // The conversation is owned by the runtime, not this component: the stream
-  // replays history on connect, so a reload rejoins rather than starting over.
-  useEffect(() => {
-    let subscribedId: string | undefined;
-    const unsubscribe = agent.subscribe(
-      (message) => {
-        if (subscribedId && subscribedId !== conversationIdRef.current) return;
-        if (message.role === "operator") {
-          setConversationTitle((title) => title === "What should the team do?" ? message.text.replace(/\s+/g, " ").slice(0, 80) : title);
-        }
-        setMessages((current) =>
-          current.some((seen) => seen.sequence === message.sequence)
-            ? current
-            : [...current, message],
-        );
-        if (!message.design) {
-          // Only an assistant reply ends the wait — the operator's own message
-          // echoes back off the same stream, and commentary while it works is
-          // the opposite of finishing. And a reply must not withdraw a pending
-          // proposal: assistants routinely comment straight after proposing
-          // ("…is in your queue"), which was retracting the gate.
-          if (message.role === "assistant" && !message.progress) {
-            setPhase((current) => (current === "drafting" ? "idle" : current));
-          }
-          return;
-        }
-        setConfirming(false);
-        setDesign(message.design);
-        setSource(message.design.program);
-        setSourceErrors([]);
-        setFilename(`${message.design.preview.team}.omar`);
-        // Show the proposed topology, not whatever was on screen before.
-        setSnapshot(message.design.preview);
-        if (!arrangedRef.current) {
-          arrangedRef.current = true;
-          const available = workspaceRef.current?.clientWidth ?? 0;
-          // Conversation and diagram side by side; the source pane starts
-          // collapsed behind its handle rather than crowding the first look.
-          if (available) setBuilderWidth(Math.round(available / 2));
-          setInspectorWidth(0);
-        }
-        setPhase("review");
-      },
-      () => {
-        /* daemon health is polled separately */
-      },
-      (conversation) => {
-        subscribedId = conversation.id;
-        restoreConversation(conversation);
-      },
-    );
-    // Clear on teardown rather than on subscribe: transcripts belong to an
-    // agent, and setting state synchronously in an effect cascades renders.
-    return () => {
-      unsubscribe();
-      setMessages([]);
-    };
-  }, [agent, chatEpoch, restoreConversation]);
-
   useEffect(() => {
     const thread = threadRef.current;
     if (thread) thread.scrollTop = thread.scrollHeight;
@@ -359,19 +327,21 @@ const [chatEpoch, setChatEpoch] = useState(0);
   async function submitPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const request = prompt.trim();
-    if (!request || phase === "drafting" || phase === "spawning") return;
+    if (!request || assistantBusy || phase === "spawning") return;
     const selected = selection;
     setPrompt("");
     setError("");
     // The selection belonged to the message just sent. Keeping it would
     // silently attach it to the next one too.
     setSelection([]);
-    setPhase("drafting");
+    setAssistantBusy(true);
+    if (!run || isRunFinished(run.status)) setPhase("drafting");
     try {
       await agent.send(request, selected);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
-      setPhase("idle");
+      setAssistantBusy(false);
+      setPhase(run && !isRunFinished(run.status) ? "observing" : "idle");
     }
   }
 
@@ -508,6 +478,110 @@ const [chatEpoch, setChatEpoch] = useState(0);
     },
     [serveUrl, loadPanel],
   );
+
+  // A chat can be reopened during admission, before its diagram binds.
+  useEffect(() => {
+    if (!run || run.diagram_address || isRunFinished(run.status)) return;
+    const abort = new AbortController();
+    const poll = async () => {
+      try {
+        const latest = await fetchRun(serveUrl, run.run_id, abort.signal);
+        if (abort.signal.aborted) return;
+        runRef.current = latest;
+        setRun(latest);
+        if (isRunFinished(latest.status)) {
+          setPhase(latest.status === "failed" ? "failed" : "finished");
+          if (latest.error) setError(latest.error);
+        } else if (latest.diagram_address) {
+          observe(latest);
+          void loadPanel(latest.run_id);
+        }
+      } catch { /* daemon health reports connectivity */ }
+    };
+    const timer = setInterval(() => void poll(), 500);
+    return () => { abort.abort(); clearInterval(timer); };
+  }, [run, serveUrl, observe, loadPanel]);
+
+  // The conversation is owned by the runtime, not this component: the stream
+  // replays history on connect, so a reload rejoins rather than starting over.
+  useEffect(() => {
+    let subscribedId: string | undefined;
+    const unsubscribe = agent.subscribe(
+      (message) => {
+        if (subscribedId && subscribedId !== conversationIdRef.current) return;
+        if (message.role === "operator") {
+          setAssistantBusy(true);
+          setConversationTitle((title) => title === "What should the team do?" ? message.text.replace(/\s+/g, " ").slice(0, 80) : title);
+        }
+        setMessages((current) =>
+          current.some((seen) => seen.sequence === message.sequence)
+            ? current
+            : [...current, message],
+        );
+        if (message.role === "assistant" && !message.progress) setAssistantBusy(false);
+        if (!message.design) {
+          // Only an assistant reply ends the wait — the operator's own message
+          // echoes back off the same stream, and commentary while it works is
+          // the opposite of finishing. And a reply must not withdraw a pending
+          // proposal: assistants routinely comment straight after proposing
+          // ("…is in your queue"), which was retracting the gate.
+          if (message.role === "assistant" && !message.progress) {
+            setPhase((current) => (current === "drafting" ? "idle" : current));
+          }
+          return;
+        }
+        // A fresh proposal remains in the transcript while this chat's
+        // deployed topology continues to own the live diagram and controls.
+        if (runRef.current && !isRunFinished(runRef.current.status)) return;
+        setConfirming(false);
+        setDesign(message.design);
+        setSource(message.design.program);
+        setSourceErrors([]);
+        setFilename(`${message.design.preview.team}.omar`);
+        // Show the proposed topology, not whatever was on screen before.
+        setSnapshot(message.design.preview);
+        if (!arrangedRef.current) {
+          arrangedRef.current = true;
+          const available = workspaceRef.current?.clientWidth ?? 0;
+          // Conversation and diagram side by side; the source pane starts
+          // collapsed behind its handle rather than crowding the first look.
+          if (available) setBuilderWidth(Math.round(available / 2));
+          setInspectorWidth(0);
+        }
+        setPhase("review");
+      },
+      () => {
+        /* daemon health is polled separately */
+      },
+      (conversation) => {
+        subscribedId = conversation.id;
+        restoreConversation(conversation);
+        if (serveUrl === historyUrl) onSelect(conversation);
+      },
+      (conversation) => {
+        if (conversation.id !== conversationIdRef.current) return;
+        if (conversation.run) {
+          const record = conversation.run;
+          runRef.current = record;
+          setRun(record);
+          setPhase(isRunFinished(record.status) ? (record.status === "failed" ? "failed" : "finished") : "observing");
+          setTab("events");
+          if (!isRunFinished(record.status) && record.diagram_address) {
+            observe(record);
+            void loadPanel(record.run_id);
+          }
+        }
+        setAssistantBusy(conversation.busy);
+        if (conversation.busy && (!conversation.run || isRunFinished(conversation.run.status))) setPhase("drafting");
+      },
+    );
+    // Clear on teardown rather than on subscribe: transcripts belong to an
+    // agent, and setting state synchronously in an effect cascades renders.
+    return () => {
+      unsubscribe();
+      setMessages([]);
+    };
+  }, [agent, restoreConversation, observe, loadPanel, serveUrl, historyUrl, onSelect]);
 
   async function confirmDesign() {
     if (!design || phase !== "review") return;
@@ -719,7 +793,7 @@ const [chatEpoch, setChatEpoch] = useState(0);
             title={daemon.state === "offline" ? daemon.reason : undefined}
           >
             <i />
-            {daemon.state === "demo" ? "demo topology" : serveUrl}
+            {daemon.state === "demo" ? "demo topology" : historyUrl}
             {daemon.state === "offline" ? " · unreachable" : null}
           </span>
                     {!isDemo && historyDrawer ? (
@@ -748,8 +822,8 @@ const [chatEpoch, setChatEpoch] = useState(0);
       <div className="studio-content">
                 {!isDemo && (!historyDrawer || drawerOpen) ? (
           <ChatHistory
-            serveUrl={serveUrl}
-            busy={phase === "drafting" || phase === "spawning" || (run !== null && !isRunFinished(run.status))}
+            serveUrl={historyUrl}
+            activeId={conversationId}
             mobile={historyDrawer}
             revision={`${historyRevision}:${messages.length}`}
                         collapsed={!historyDrawer && !historyOpen}
@@ -757,8 +831,7 @@ const [chatEpoch, setChatEpoch] = useState(0);
                         onOpen={openHistory}
             railButtonRef={historyRailButtonRef}
             onSelect={(conversation) => {
-              restoreConversation(conversation);
-              setChatEpoch((current) => current + 1);
+              onSelect(conversation);
               if (historyDrawer) setDrawerOpen(false);
             }}
           />
@@ -796,7 +869,7 @@ const [chatEpoch, setChatEpoch] = useState(0);
             {messages.map((message) => (
               <ChatMessageView key={message.sequence} message={message} />
             ))}
-            {phase === "drafting" ? <Waiting /> : null}
+            {assistantBusy ? <Waiting /> : null}
             {phase === "spawning" ? <Waiting label="Starting the run" /> : null}
           </div>
 
@@ -858,7 +931,7 @@ const [chatEpoch, setChatEpoch] = useState(0);
                   className="send-button"
                   type="submit"
                   aria-label="Draft workflow"
-                  disabled={phase === "drafting" || phase === "spawning"}
+                  disabled={assistantBusy || phase === "spawning"}
                 >
                   ↑
                 </button>

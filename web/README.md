@@ -69,25 +69,33 @@ disabled unless the daemon is live. Both runtime surfaces are loopback-only.
 
 ## Saved conversations
 
-The **Recent chats** sidebar lists this runtime's chats beside the conversation
-and topology. **History** collapses or reopens it; on narrow screens it opens a
-left-side drawer. Titles, message counts and the current selection refresh as
-messages arrive or another tab switches conversations. Start a **New chat**, search by title,
-or reopen an earlier conversation. Messages, commentary, diagram selections,
-and proposed programs (including inputs and topology previews) are saved
-before they are acknowledged, in `~/.omar/ea/<id>/chats.json` under the
-configured OMAR state directory. The file is private to the local user.
+Each chat owns an independent EA workspace using the runtime's multi-EA support.
+**Recent chats** lists saved conversations with **Thinking** and **Running**
+indicators. Switch chats while an assistant replies or a topology runs; returning
+to a chat reconnects its conversation, live diagram, terminals and pending port
+panel. Browser tabs select chats independently. Switching never restarts an EA
+or deploys a proposal.
 
-Reloads and daemon restarts retain the transcript. Continuing a restored chat
-starts a fresh assistant and supplies its saved context. Reopening a proposal
-never deploys it. Wait for the current reply or run to finish before switching;
-all browser tabs connected to this EA follow the same active conversation.
+Messages, selections, proposals and each chat's EA ID are saved atomically in
+`~/.omar/ea/<starting-ea-id>/chats.json` under the configured state directory.
+Existing #245 histories remain readable; additional chats receive their own EAs
+when opened. These EAs also appear in the native EA registry. Each workspace has
+its own sessions, callbacks, runs and panels; identical topology names can run
+in different chats simultaneously.
 
-This saves Mission Control conversation context, not provider-internal model
-state, terminal scrollback, unsent composer text, manual source edits, or live
-run execution state. Chats already lost before this feature was installed
-cannot be recovered from memory. A corrupt or unwritable history file produces
-an error rather than silently replacing saved conversations.
+Reloading the browser reconnects to live work. Restarting the daemon retains
+transcripts and EA assignments, but does not recover live run execution or
+provider-internal sessions. On the next message, a fresh assistant receives the
+saved conversation. Unsent drafts, manual source edits and terminal scrollback
+are not archived. Reopened proposals still require deployment confirmation.
+
+The catalog routes remain `/v1/chats` and `/v1/chats/<id>/activate`. Activation
+only remembers a default selection. Clients pin a workspace by prefixing its
+API and terminal routes with `/chats/<id>` (for example,
+`/chats/<id>/v1/chat/events` and `/chats/<id>/v1/runs`). Unprefixed routes use the
+remembered selection. Agent callbacks are routed by their EA's private token,
+not by the dashboard's selection. Chat streams replay the transcript followed
+by a `chat_state` event containing the current busy state and latest run.
 
 ## Architecture
 

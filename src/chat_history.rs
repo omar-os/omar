@@ -15,6 +15,8 @@ use crate::serve::{ChatMessage, ChatRole};
 pub struct Conversation {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub ea_id: Option<crate::ea::EaId>,
     pub created_at: u64,
     pub updated_at: u64,
     pub messages: Vec<ChatMessage>,
@@ -27,6 +29,9 @@ pub struct ConversationSummary {
     pub created_at: u64,
     pub updated_at: u64,
     pub message_count: usize,
+    pub ea_id: Option<crate::ea::EaId>,
+    pub busy: bool,
+    pub run: Option<crate::serve::RunRecord>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -50,6 +55,7 @@ impl Conversation {
         Self {
             id: Uuid::new_v4().to_string(),
             title: "New chat".into(),
+            ea_id: None,
             created_at: now(),
             updated_at: now(),
             messages: Vec::new(),
@@ -63,6 +69,9 @@ impl Conversation {
             created_at: self.created_at,
             updated_at: self.updated_at,
             message_count: self.messages.len(),
+            ea_id: self.ea_id,
+            busy: false,
+            run: None,
         }
     }
 
@@ -154,12 +163,36 @@ impl History {
         Ok(())
     }
 
-    pub fn append(&mut self, mut message: ChatMessage) -> Result<ChatMessage> {
+    pub fn assign_ea(&mut self, id: &str, ea_id: crate::ea::EaId) -> Result<()> {
+        let mut next = self.clone();
+        next.conversations
+            .iter_mut()
+            .find(|chat| chat.id == id)
+            .context("unknown chat")?
+            .ea_id = Some(ea_id);
+        next.save()?;
+        *self = next;
+        Ok(())
+    }
+
+    pub fn conversation(&self, id: &str) -> &Conversation {
+        self.conversations
+            .iter()
+            .find(|chat| chat.id == id)
+            .expect("chat exists")
+    }
+
+    #[cfg(test)]
+    pub fn append(&mut self, message: ChatMessage) -> Result<ChatMessage> {
+        self.append_to(&self.active_id.clone(), message)
+    }
+
+    pub fn append_to(&mut self, id: &str, mut message: ChatMessage) -> Result<ChatMessage> {
         let mut next = self.clone();
         let chat = next
             .conversations
             .iter_mut()
-            .find(|chat| chat.id == next.active_id)
+            .find(|chat| chat.id == id)
             .expect("active chat exists");
         message.sequence = chat.messages.last().map_or(1, |last| last.sequence + 1);
         if message.role == ChatRole::Operator
@@ -214,6 +247,33 @@ mod tests {
             design: None,
             selection: vec!["flow.planner".into()],
         }
+    }
+
+    #[test]
+    fn workspace_mapping_and_background_messages_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chats.json");
+        let mut history = History::load(path.clone()).unwrap();
+        let first = history.active_id.clone();
+        history.assign_ea(&first, 7).unwrap();
+        history.select(None).unwrap();
+        let second = history.active_id.clone();
+        history.assign_ea(&second, 8).unwrap();
+        history
+            .append_to(&first, message("Background result"))
+            .unwrap();
+        history
+            .append_to(&second, message("Foreground request"))
+            .unwrap();
+        let restored = History::load(path).unwrap();
+        assert_eq!(restored.active_id, second);
+        assert_eq!(restored.conversation(&first).ea_id, Some(7));
+        assert_eq!(restored.conversation(&second).ea_id, Some(8));
+        assert_eq!(
+            restored.conversation(&first).messages[0].text,
+            "Background result"
+        );
+        assert_eq!(restored.conversation(&second).messages[0].sequence, 1);
     }
 
     #[test]

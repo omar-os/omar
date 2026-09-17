@@ -1719,7 +1719,7 @@ test("chat history restores messages and proposals after switching and reloading
   await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
 });
 
-test("chat history reports load failures and prevents switching during a reply", async ({ page }) => {
+test("chat history reports load failures and allows switching during a reply", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await fake.close();
   fake = (await startFakeServe({ stepMs: 3000, port: FAKE_SERVE_PORT })) as FakeServe;
@@ -1728,8 +1728,8 @@ test("chat history reports load failures and prevents switching during a reply",
   await page.getByLabel("Draft workflow").click();
   await page.getByRole("button", { name: "Open chat history" }).click();
   const history = page.getByRole("dialog", { name: "Chat history" });
-  await expect(history.getByRole("button", { name: "New chat" })).toBeDisabled();
-  await expect(history).toContainText("Wait for the current reply");
+  await expect(history.getByRole("button", { name: "New chat" })).toBeEnabled();
+  await expect(history).toContainText("Thinking");
   const bounds = (await history.boundingBox())!;
   expect(bounds.x).toBeGreaterThanOrEqual(0);
   expect(bounds.x + bounds.width).toBeLessThanOrEqual(390);
@@ -1746,7 +1746,7 @@ test("chat history reports load failures and prevents switching during a reply",
 });
 
 
-test("chat history sidebar follows selections in another tab and refreshes recent chats", async ({ page, context }) => {
+test("chat history keeps tab selections independent and refreshes background chats", async ({ page, context }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);
   const history = page.getByRole("complementary", { name: "Chat history" });
@@ -1755,17 +1755,19 @@ test("chat history sidebar follows selections in another tab and refreshes recen
   try {
     await useFakeServe(second);
     await second.getByRole("complementary", { name: "Chat history" }).getByRole("button", { name: "+ New chat", exact: true }).click();
-    await expect(history.locator('[aria-current="true"]')).toContainText("New chat");
-    await expect(page.locator(".messages")).not.toContainText("Review the release plan");
+    await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
+    await expect(page.locator(".messages")).toContainText("Review the release plan");
     await second.getByLabel("Describe a workflow").fill("Plan the next release");
     await second.getByLabel("Draft workflow").click();
-    await expect(history.locator('[aria-current="true"]')).toContainText("Plan the next release");
+    await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
     await expect(history.getByRole("listitem").first()).toContainText("Plan the next release");
-    await expect(history.locator('[aria-current="true"]')).toContainText("3 messages");
+    await expect(history.getByRole("listitem").first()).toContainText("3 messages");
     await history.getByLabel("Search chats").fill("nothing matches");
     await expect(history).toContainText("No chats found");
     await history.getByLabel("Search chats").fill("");
     await expect(history.getByRole("listitem")).toHaveCount(2);
+    await page.reload();
+    await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
   } finally { await second.close(); }
 });
 
@@ -1790,4 +1792,63 @@ test("chat history drawer closes after selecting a chat and responds to viewport
   await expect(page.getByLabel("Describe a workflow")).toBeFocused();
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByRole("dialog", { name: "Chat history" })).toHaveCount(0);
+});
+
+test("switching chats while thinking preserves both replies", async ({ page }) => {
+  await fake.close();
+  fake = (await startFakeServe({ stepMs: 3000, port: FAKE_SERVE_PORT })) as FakeServe;
+  await useFakeServe(page);
+  await page.getByLabel("Describe a workflow").fill("First workspace");
+  await page.getByLabel("Draft workflow").click();
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  await expect(page.locator(".connection")).toContainText("drafting");
+  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await expect(page.locator(".messages")).not.toContainText("First workspace");
+  await page.getByLabel("Describe a workflow").fill("Second workspace");
+  await page.getByLabel("Draft workflow").click();
+  await history.getByRole("button", { name: /First workspace/ }).click();
+  await expect(page.locator(".messages")).toContainText("First workspace");
+  await expect(page.locator(".messages")).toContainText("Which agent should own");
+  await expect(page.locator(".messages")).not.toContainText("Second workspace");
+  await history.getByRole("button", { name: /Second workspace/ }).click();
+  await expect(page.locator(".messages")).toContainText("Second workspace");
+  await expect(page.locator(".messages")).toContainText("Which agent should own");
+  await expect(page.locator(".messages")).not.toContainText("First workspace");
+});
+
+test("two chats keep live topologies when switching and reloading", async ({ page }) => {
+  await fake.close();
+  fake = (await startFakeServe({ stepMs: 2500, port: FAKE_SERVE_PORT })) as FakeServe;
+  await useFakeServe(page);
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  const draft = async (name: string) => {
+    await page.getByLabel("Describe a workflow").fill(name);
+    await page.getByLabel("Draft workflow").click();
+    await expect(page.locator(".messages")).toContainText("Which agent should own");
+    await page.getByLabel("Describe a workflow").fill("The planner");
+    await page.getByLabel("Draft workflow").click();
+    await page.getByRole("button", { name: "Deploy", exact: true }).click();
+    await page.getByRole("button", { name: "Confirm deploy" }).click();
+    await expect(page.locator(".connection")).toContainText("observing");
+  };
+  await draft("Topology A");
+  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await draft("Topology B");
+  await page.getByLabel("Describe a workflow").fill("Continue monitoring B");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
+  await expect(history.getByRole("button", { name: /Topology A/ })).toContainText("Running");
+  await expect(history.getByRole("button", { name: /Topology B/ })).toContainText("Running");
+  await history.getByRole("button", { name: /Topology A/ }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeHidden();
+  await page.reload();
+  await expect(page.locator(".connection")).toContainText("observing");
+  await expect(history.locator('[aria-current="true"]')).toContainText("Topology A");
+  await history.getByRole("button", { name: /Topology B/ }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  await expect(page.locator(".messages")).not.toContainText("Topology A");
+  await expect(history.getByRole("button", { name: /Topology A/ })).toContainText("Running");
+  await expect(page.locator(".omar-reaction")).not.toHaveCount(0);
+  await page.screenshot({ path: "/tmp/omar-live-chats.png" });
 });

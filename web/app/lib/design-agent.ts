@@ -15,6 +15,7 @@ export type DesignAgent = {
     onMessage: (message: ChatMessage) => void,
     onConnectionChange: (connected: boolean) => void,
     onConversation?: (conversation: ConversationSummary) => void,
+    onState?: (conversation: ConversationSummary) => void,
   ): () => void;
 };
 
@@ -23,11 +24,11 @@ export function eaDesignAgent(serveUrl: string): DesignAgent {
   let conversationId: string | undefined;
   return {
     send: (text, selection) => sendChat(serveUrl, text, selection ?? [], undefined, conversationId),
-    subscribe: (onMessage, onConnectionChange, onConversation) =>
+    subscribe: (onMessage, onConnectionChange, onConversation, onState) =>
       subscribeToChat(serveUrl, onMessage, onConnectionChange, (conversation) => {
         conversationId = conversation.id;
         onConversation?.(conversation);
-      }),
+      }, onState),
   };
 }
 

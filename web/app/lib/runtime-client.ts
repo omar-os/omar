@@ -116,10 +116,14 @@ export function subscribeToChat(
   onMessage: (message: ChatMessage) => void,
   onConnectionChange: (connected: boolean) => void,
   onConversation?: (conversation: ConversationSummary) => void,
+  onState?: (conversation: ConversationSummary) => void,
 ): () => void {
   const stream = new EventSource(`${normalizeRuntimeUrl(serveUrl)}/v1/chat/events`);
   stream.addEventListener("conversation", (raw) => {
     onConversation?.(JSON.parse((raw as MessageEvent<string>).data) as ConversationSummary);
+  });
+  stream.addEventListener("chat_state", (raw) => {
+    onState?.(JSON.parse((raw as MessageEvent<string>).data) as ConversationSummary);
   });
   stream.onopen = () => onConnectionChange(true);
   stream.onerror = () => onConnectionChange(false);

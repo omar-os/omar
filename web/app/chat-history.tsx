@@ -24,9 +24,9 @@ export function SidebarIcon({ direction }: { direction: "open" | "close" }) {
   );
 }
 
-export function ChatHistory({ serveUrl, busy, mobile, revision, collapsed, onClose, onOpen, onSelect, railButtonRef }: {
+export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, onClose, onOpen, onSelect, railButtonRef }: {
   serveUrl: string;
-  busy: boolean;
+  activeId: string;
   mobile: boolean;
   revision: string;
   collapsed: boolean;
@@ -37,7 +37,6 @@ export function ChatHistory({ serveUrl, busy, mobile, revision, collapsed, onClo
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [chats, setChats] = useState<ConversationSummary[]>([]);
-  const [activeId, setActiveId] = useState("");
   const [loading, setLoading] = useState(true);
   const [switching, setSwitching] = useState(false);
   const [error, setError] = useState("");
@@ -61,11 +60,10 @@ export function ChatHistory({ serveUrl, busy, mobile, revision, collapsed, onClo
   // after chat-stream changes, including selections made in another tab.
   useEffect(() => {
     const abort = new AbortController();
-    const timer = setTimeout(() => {
+    const refresh = () => {
       void fetchConversations(serveUrl, abort.signal).then((history) => {
         if (abort.signal.aborted) return;
         setChats(history.conversations);
-        setActiveId(history.active_id);
         setError("");
         setLoading(false);
       }).catch((cause) => {
@@ -73,8 +71,10 @@ export function ChatHistory({ serveUrl, busy, mobile, revision, collapsed, onClo
         setError(cause instanceof Error ? cause.message : String(cause));
         setLoading(false);
       });
-    }, 150);
-    return () => { clearTimeout(timer); abort.abort(); };
+    };
+    const timer = setTimeout(refresh, 150);
+    const poll = setInterval(refresh, 2000);
+    return () => { clearTimeout(timer); clearInterval(poll); abort.abort(); };
   }, [serveUrl, revision, retry]);
 
   async function select(id?: string) {
@@ -86,7 +86,6 @@ export function ChatHistory({ serveUrl, busy, mobile, revision, collapsed, onClo
     setError("");
     try {
       const conversation = await selectConversation(serveUrl, id);
-      setActiveId(conversation.id);
       setQuery("");
       setChats((current) => [conversation, ...current.filter((chat) => chat.id !== conversation.id)]);
       onSelect(conversation);
@@ -121,17 +120,16 @@ export function ChatHistory({ serveUrl, busy, mobile, revision, collapsed, onClo
       </button>
     </header>
     <div className="history-actions">
-      <button type="button" disabled={busy || loading || switching} onClick={() => void select()}>+ New chat</button>
+      <button type="button" disabled={loading || switching} onClick={() => void select()}>+ New chat</button>
       <input aria-label="Search chats" placeholder="Search chats…" value={query} onChange={(event) => setQuery(event.target.value)} />
     </div>
-    {busy ? <p role="status">Wait for the current reply or run to finish before switching chats.</p> : null}
     {error ? <div className="history-error"><p role="alert">{error}</p><button type="button" onClick={() => setRetry((current) => current + 1)}>Retry</button></div> : null}
     <ul aria-label="Saved chats" aria-busy={loading || switching}>
       {visible.map((chat) => (
         <li key={chat.id}>
-          <button type="button" disabled={switching || (busy && chat.id !== activeId)} aria-current={chat.id === activeId ? "true" : undefined} onClick={() => void select(chat.id)}>
+          <button type="button" disabled={switching} aria-current={chat.id === activeId ? "true" : undefined} onClick={() => void select(chat.id)}>
             <span>{chat.title}</span>
-            <small>{chat.message_count} messages · {new Date(chat.updated_at).toLocaleDateString()}{chat.id === activeId ? " · Current" : ""}</small>
+            <small>{chat.message_count} messages · {new Date(chat.updated_at).toLocaleDateString()}{chat.busy ? " · Thinking" : ""}{chat.run && ["starting", "running", "stopping"].includes(chat.run.status) ? " · Running" : ""}{chat.id === activeId ? " · Current" : ""}</small>
           </button>
         </li>
       ))}

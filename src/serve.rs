@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use ts_rs::TS;
 use uuid::Uuid;
 
-use crate::chat_history::History;
+use crate::chat_history::{ConversationSummary, History};
 use crate::config::Config;
 use crate::ea::EaId;
 use crate::tmux::{DeliveryOptions, TmuxClient};
@@ -182,14 +182,24 @@ struct ChatRequest {
 }
 
 struct Chat {
-    history: History,
+    latest_run: Option<String>,
     subscribers: Vec<mpsc::SyncSender<ChatMessage>>,
     busy: bool,
     needs_context: bool,
     needs_relaunch: bool,
 }
 
+/// A chat owns one EA; only the durable archive is shared between workspaces.
+struct Workspaces {
+    history: Arc<Mutex<History>>,
+    contexts: Mutex<BTreeMap<String, Arc<Context_>>>,
+    root: Arc<Context_>,
+    selection: Mutex<()>,
+}
+
 struct Context_ {
+    history: Arc<Mutex<History>>,
+    conversation_id: String,
     omar_dir: PathBuf,
     ea_id: EaId,
     session_prefix: String,
@@ -203,7 +213,7 @@ struct Context_ {
     chat: Arc<Mutex<Chat>>,
     /// Authenticates the EA's MCP sidecar on the agent-only endpoints.
     agent_token: Mutex<String>,
-    /// Serialize switches, sends and replies so no response crosses chats.
+    /// Serialize sends, replies and backend changes within this EA.
     chat_operation: Mutex<()>,
     /// The command the assistant runs, and where to reach this server when it
     /// is relaunched on a different backend.
@@ -231,14 +241,17 @@ impl Context_ {
         selection: Vec<String>,
     ) -> Result<ChatMessage> {
         let mut chat = self.chat.lock().expect("serve chat poisoned");
-        let message = chat.history.append(ChatMessage {
-            sequence: 0,
-            role,
-            text,
-            progress,
-            design,
-            selection,
-        })?;
+        let message = self.history.lock().expect("history poisoned").append_to(
+            &self.conversation_id,
+            ChatMessage {
+                sequence: 0,
+                role,
+                text,
+                progress,
+                design,
+                selection,
+            },
+        )?;
         if role == ChatRole::Assistant && !progress {
             chat.busy = false;
         }
@@ -263,6 +276,7 @@ pub enum AttachEa {
 }
 
 pub struct Serve {
+    ea_id: EaId,
     address: SocketAddr,
     agent_token: String,
     running: Arc<AtomicBool>,
@@ -272,6 +286,8 @@ pub struct Serve {
     /// starting one for real.
     #[cfg(test)]
     context: Arc<Context_>,
+    #[cfg(test)]
+    workspaces: Arc<Workspaces>,
 }
 
 impl Serve {
@@ -291,18 +307,42 @@ impl Serve {
             .with_context(|| format!("failed to bind serve at {address}"))?;
         let address = listener.local_addr()?;
         let agent_token = Uuid::new_v4().to_string();
-        let history = History::load(crate::ea::ea_state_dir(ea_id, omar_dir).join("chats.json"))?;
+        let mut history =
+            History::load(crate::ea::ea_state_dir(ea_id, omar_dir).join("chats.json"))?;
         let has_history = !history.active().messages.is_empty();
+        let conversation_id = history.active_id.clone();
+        let workspace_ea = match history.active().ea_id {
+            Some(id) => id,
+            None if !history
+                .conversations
+                .iter()
+                .any(|chat| chat.ea_id == Some(ea_id)) =>
+            {
+                ea_id
+            }
+            None => {
+                crate::ea::ensure_default_ea(omar_dir)?;
+                crate::ea::register_ea(
+                    omar_dir,
+                    &format!("chat-{conversation_id}"),
+                    Some("Mission Control chat"),
+                )?
+            }
+        };
+        history.assign_ea(&conversation_id, workspace_ea)?;
+        let history = Arc::new(Mutex::new(history));
         let context = Arc::new(Context_ {
+            history: history.clone(),
+            conversation_id: conversation_id.clone(),
             omar_dir: omar_dir.to_path_buf(),
-            ea_id,
+            ea_id: workspace_ea,
             session_prefix: config.dashboard.session_prefix.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
             runs: Runs::default(),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
-                history,
+                latest_run: None,
                 subscribers: Vec::new(),
                 busy: false,
                 needs_context: has_history,
@@ -313,6 +353,14 @@ impl Serve {
             command: Arc::new(Mutex::new(config.agent.default_command.clone())),
             address,
         });
+        let workspaces = Arc::new(Workspaces {
+            history,
+            contexts: Mutex::new(BTreeMap::from([(conversation_id, context.clone())])),
+            root: context.clone(),
+            selection: Mutex::new(()),
+        });
+        #[cfg(test)]
+        let shared_workspaces = workspaces.clone();
         // Blocking accept rather than a polling loop: `Drop` wakes it with a
         // self-connection, so there is no need to spin, and no added latency on
         // every connection from a poll interval.
@@ -324,9 +372,9 @@ impl Serve {
             while thread_running.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let context = context.clone();
+                        let workspaces = workspaces.clone();
                         thread::spawn(move || {
-                            let _ = handle_client(stream, context);
+                            let _ = handle_client(stream, workspaces);
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -335,19 +383,22 @@ impl Serve {
             }
         });
         let server = Self {
+            ea_id: workspace_ea,
             address,
             agent_token,
             running,
             thread: Some(thread),
             #[cfg(test)]
             context: shared,
+            #[cfg(test)]
+            workspaces: shared_workspaces,
         };
         // Before this returns, so that everything downstream of "the server
         // started" can rely on the context being there. It names this server,
         // and `attach_ea` — which used to write it — runs after the address is
         // announced, so anything that took the announcement as readiness could
         // read the path before it existed.
-        server.write_mcp_context(config, omar_dir, ea_id);
+        server.write_mcp_context(config, omar_dir, workspace_ea);
         Ok(server)
     }
 
@@ -387,10 +438,11 @@ impl Serve {
         &self,
         config: &Config,
         omar_dir: &Path,
-        ea_id: EaId,
+        _ea_id: EaId,
         restart: bool,
         launch: bool,
     ) -> Result<AttachEa> {
+        let ea_id = self.ea_id;
         let name = crate::ea::load_registry(omar_dir)
             .into_iter()
             .find(|ea| ea.id == ea_id)
@@ -511,7 +563,7 @@ pub fn run(
     server.wait()
 }
 
-fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
+fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -519,7 +571,7 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
     reader.read_line(&mut request_line)?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
+    let mut path = parts.next().unwrap_or("").to_string();
 
     let mut content_length = 0usize;
     let mut origin = None;
@@ -549,6 +601,78 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
         }
     }
     let origin = origin.as_deref();
+
+    if content_length > MAX_BODY_BYTES {
+        return write_json(
+            &mut stream,
+            413,
+            &json!({"error": "request too large"}),
+            origin,
+        );
+    }
+    let mut raw_body = vec![0; content_length];
+    reader.read_exact(&mut raw_body)?;
+    let scoped_id = if let Some(rest) = path.strip_prefix("/chats/") {
+        let Some((id, route)) = rest.split_once('/') else {
+            return write_json(&mut stream, 404, &json!({"error": "not found"}), origin);
+        };
+        let id = id.to_string();
+        path = format!("/{route}");
+        Some(id)
+    } else {
+        None
+    };
+    let context = if path == "/v1/agent/reply" || path == "/v1/agent/proposals" {
+        let body: Value = match serde_json::from_slice(&raw_body) {
+            Ok(body) => body,
+            Err(error) => {
+                return write_json(
+                    &mut stream,
+                    400,
+                    &json!({"error": error.to_string()}),
+                    origin,
+                )
+            }
+        };
+        let contexts = workspaces.contexts.lock().expect("workspaces poisoned");
+        let found = contexts
+            .values()
+            .find(|context| {
+                body.get("token").and_then(Value::as_str)
+                    == Some(context.agent_token.lock().expect("token poisoned").as_str())
+            })
+            .cloned();
+        match found {
+            Some(context)
+                if scoped_id
+                    .as_ref()
+                    .is_none_or(|id| id == &context.conversation_id) =>
+            {
+                context
+            }
+            _ => return write_json(&mut stream, 403, &json!({"error": "forbidden"}), origin),
+        }
+    } else {
+        let id = scoped_id.unwrap_or_else(|| {
+            workspaces
+                .history
+                .lock()
+                .expect("history poisoned")
+                .active_id
+                .clone()
+        });
+        match workspaces.get(&id) {
+            Ok(context) => context,
+            Err(error) => {
+                return write_json(
+                    &mut stream,
+                    404,
+                    &json!({"error": error.to_string()}),
+                    origin,
+                )
+            }
+        }
+    };
 
     // A terminal is the one endpoint where a wrong answer hands an attacker a
     // shell, and CORS does not apply to WebSockets: the browser opens the
@@ -614,11 +738,7 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
         return stream_chat(stream, &context, origin);
     }
 
-    let mut read_body = |length: usize| -> Result<Vec<u8>> {
-        let mut raw = vec![0u8; length];
-        reader.read_exact(&mut raw)?;
-        Ok(raw)
-    };
+    let read_body = |_length: usize| -> Result<Vec<u8>> { Ok(raw_body.clone()) };
 
     if content_length > MAX_BODY_BYTES
         && (path.starts_with("/v1/chats") || path == "/v1/agent/reply")
@@ -644,8 +764,8 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
             }
         }
         ("GET", "/v1/chat") => {
-            let chat = context.chat.lock().expect("serve chat poisoned");
-            (200, json!(chat.history.active()))
+            let history = context.history.lock().expect("history poisoned");
+            (200, json!(history.conversation(&context.conversation_id)))
         }
         ("POST", "/v1/chat") => {
             if content_length > MAX_BODY_BYTES {
@@ -654,23 +774,17 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
                 send_to_ea(&context, &read_body(content_length)?)
             }
         }
-        ("GET", "/v1/chats") => {
-            let chat = context.chat.lock().expect("serve chat poisoned");
-            (
-                200,
-                json!({"active_id": chat.history.active_id, "conversations": chat.history.list()}),
-            )
-        }
+        ("GET", "/v1/chats") => (200, workspaces.list()),
         ("POST", "/v1/chats") => {
             let _ = read_body(content_length)?;
-            select_chat(&context, None)
+            select_chat(&workspaces, None)
         }
         ("POST", rest) if rest.starts_with("/v1/chats/") && rest.ends_with("/activate") => {
             let _ = read_body(content_length)?;
             let id = rest
                 .trim_start_matches("/v1/chats/")
                 .trim_end_matches("/activate");
-            select_chat(&context, Some(id))
+            select_chat(&workspaces, Some(id))
         }
         ("GET", "/v1/agent") => (200, describe_agent(&context)),
         ("POST", "/v1/agent/backend") => switch_backend(&context, &read_body(content_length)?),
@@ -959,49 +1073,118 @@ fn relaunch_ea(context: &Arc<Context_>, command: &str) -> Result<String> {
     Ok(session)
 }
 
-/// Selecting a chat changes only the conversation. A new assistant process
-/// is launched on the next send, with that chat's saved transcript.
-fn select_chat(context: &Arc<Context_>, id: Option<&str>) -> (u16, Value) {
-    let _operation = context
-        .chat_operation
+impl Workspaces {
+    fn get(&self, id: &str) -> Result<Arc<Context_>> {
+        let mut contexts = self.contexts.lock().expect("workspaces poisoned");
+        if let Some(context) = contexts.get(id) {
+            return Ok(context.clone());
+        }
+        let mut history = self.history.lock().expect("history poisoned");
+        let saved = history
+            .conversations
+            .iter()
+            .find(|chat| chat.id == id)
+            .context("unknown chat")?;
+        let has_history = !saved.messages.is_empty();
+        let ea_id = match saved.ea_id {
+            Some(ea_id) => ea_id,
+            None => {
+                crate::ea::ensure_default_ea(&self.root.omar_dir)?;
+                let ea_id = crate::ea::register_ea(
+                    &self.root.omar_dir,
+                    &format!("chat-{id}"),
+                    Some("Mission Control chat"),
+                )?;
+                history.assign_ea(id, ea_id)?;
+                ea_id
+            }
+        };
+        let context = Arc::new(Context_ {
+            history: self.history.clone(),
+            conversation_id: id.to_string(),
+            omar_dir: self.root.omar_dir.clone(),
+            ea_id,
+            session_prefix: self.root.session_prefix.clone(),
+            default_workdir: self.root.default_workdir.clone(),
+            health_idle_warning: self.root.health_idle_warning,
+            runs: Runs::default(),
+            panels: Panels::default(),
+            chat: Arc::new(Mutex::new(Chat {
+                latest_run: None,
+                subscribers: Vec::new(),
+                busy: false,
+                needs_context: has_history,
+                needs_relaunch: true,
+            })),
+            agent_token: Mutex::new(Uuid::new_v4().to_string()),
+            chat_operation: Mutex::new(()),
+            command: Arc::new(Mutex::new(
+                self.root.command.lock().expect("command poisoned").clone(),
+            )),
+            address: self.root.address,
+        });
+        contexts.insert(id.to_string(), context.clone());
+        Ok(context)
+    }
+
+    fn list(&self) -> Value {
+        let contexts = self.contexts.lock().expect("workspaces poisoned").clone();
+        let (active_id, mut conversations) = {
+            let history = self.history.lock().expect("history poisoned");
+            (history.active_id.clone(), history.list())
+        };
+        for conversation in &mut conversations {
+            if let Some(context) = contexts.get(&conversation.id) {
+                context.live_summary(conversation);
+            }
+        }
+        json!({"active_id": active_id, "conversations": conversations})
+    }
+}
+
+impl Context_ {
+    fn live_summary(&self, summary: &mut ConversationSummary) {
+        let chat = self.chat.lock().expect("chat poisoned");
+        summary.busy = chat.busy;
+        let runs = self.runs.lock().expect("runs poisoned");
+        summary.run = chat
+            .latest_run
+            .as_ref()
+            .and_then(|id| runs.get(id))
+            .cloned()
+            .or_else(|| {
+                runs.values()
+                    .max_by_key(|run| (run.status.is_active(), run.started_at))
+                    .cloned()
+            });
+    }
+}
+
+/// Selection remembers where to open next, without touching another EA.
+fn select_chat(workspaces: &Arc<Workspaces>, id: Option<&str>) -> (u16, Value) {
+    let _selection = workspaces.selection.lock().expect("selection poisoned");
+    let selected = {
+        let mut history = workspaces.history.lock().expect("history poisoned");
+        if id.is_some_and(|id| !history.conversations.iter().any(|chat| chat.id == id)) {
+            return (404, json!({"error": "unknown chat"}));
+        }
+        if let Err(error) = history.select(id) {
+            return (500, json!({"error": error.to_string()}));
+        }
+        history.active_id.clone()
+    };
+    let context = match workspaces.get(&selected) {
+        Ok(context) => context,
+        Err(error) => return (500, json!({"error": error.to_string()})),
+    };
+    let mut summary = workspaces
+        .history
         .lock()
-        .expect("chat operation poisoned");
-    let mut chat = context.chat.lock().expect("serve chat poisoned");
-    if id == Some(chat.history.active_id.as_str()) {
-        return (200, json!(chat.history.active().summary()));
-    }
-    if chat.busy {
-        return (
-            409,
-            json!({"error": "The assistant is still replying. Wait for it to finish before switching chats."}),
-        );
-    }
-    if context
-        .runs
-        .lock()
-        .expect("serve runs poisoned")
-        .values()
-        .any(|run| run.status.is_active())
-    {
-        return (
-            409,
-            json!({"error": "Wait for the current run to finish before switching chats."}),
-        );
-    }
-    if id.is_some_and(|id| !chat.history.conversations.iter().any(|c| c.id == id)) {
-        return (404, json!({"error": "unknown chat"}));
-    }
-    if let Err(error) = chat.history.select(id) {
-        return (500, json!({"error": format!("{error:#}")}));
-    }
-    // Reject any late tool calls from the previous assistant, including a
-    // final answer emitted just after a proposal ended its visible wait.
-    *context.agent_token.lock().expect("agent token poisoned") = Uuid::new_v4().to_string();
-    chat.needs_context = true;
-    chat.needs_relaunch = true;
-    // Closing the streams makes every connected tab rejoin the active chat.
-    chat.subscribers.clear();
-    (200, json!(chat.history.active().summary()))
+        .expect("history poisoned")
+        .conversation(&selected)
+        .summary();
+    context.live_summary(&mut summary);
+    (200, json!(summary))
 }
 
 fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
@@ -1039,7 +1222,7 @@ fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         if request
             .conversation_id
             .as_ref()
-            .is_some_and(|id| id != &chat.history.active_id)
+            .is_some_and(|id| id != &context.conversation_id)
         {
             return (
                 409,
@@ -1050,7 +1233,13 @@ fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             return (409, json!({"error": "The assistant is still replying."}));
         }
         let resume = if chat.needs_context {
-            match chat.history.active().resume_context() {
+            match context
+                .history
+                .lock()
+                .expect("history poisoned")
+                .conversation(&context.conversation_id)
+                .resume_context()
+            {
                 Ok(context) => context,
                 Err(error) => return (500, json!({"error": error.to_string()})),
             }
@@ -1228,14 +1417,14 @@ fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&s
         crate::diagram::cors_origin_header(origin)
     )?;
     let (sender, receiver) = mpsc::sync_channel(CHAT_QUEUE);
-    let (conversation, backlog) = {
+    let (mut conversation, backlog) = {
         let mut chat = context.chat.lock().expect("serve chat poisoned");
         chat.subscribers.push(sender);
-        (
-            chat.history.active().summary(),
-            chat.history.active().messages.clone(),
-        )
+        let history = context.history.lock().expect("history poisoned");
+        let saved = history.conversation(&context.conversation_id);
+        (saved.summary(), saved.messages.clone())
     };
+    context.live_summary(&mut conversation);
     writeln!(
         stream,
         "event: conversation\ndata: {}\n",
@@ -1246,6 +1435,11 @@ fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&s
     for message in backlog {
         write_chat_event(&mut stream, &message)?;
     }
+    writeln!(
+        stream,
+        "event: chat_state\ndata: {}\n",
+        serde_json::to_string(&conversation)?
+    )?;
     stream.flush()?;
     loop {
         match receiver.recv_timeout(Duration::from_secs(15)) {
@@ -1298,17 +1492,14 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
 
-    if request.conversation_id.as_ref().is_some_and(|id| {
-        id != &context
-            .chat
-            .lock()
-            .expect("serve chat poisoned")
-            .history
-            .active_id
-    }) {
+    if request
+        .conversation_id
+        .as_ref()
+        .is_some_and(|id| id != &context.conversation_id)
+    {
         return (
             409,
-            json!({"error": "The active chat changed. Reopen the proposal before deploying."}),
+            json!({"error": "The request belongs to another chat."}),
         );
     }
     let run_id = Uuid::new_v4().to_string();
@@ -1373,6 +1564,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         .expect("serve runs poisoned")
         .insert(run_id.clone(), record);
 
+    context.chat.lock().expect("chat poisoned").latest_run = Some(run_id.clone());
     let (ready_sender, ready_receiver) = mpsc::channel();
     spawn_run_thread(
         context,
@@ -1922,14 +2114,7 @@ mod tests {
     #[test]
     fn chat_history_routes_reopen_only_the_selected_conversation() {
         let server = test_server();
-        let first = server
-            .context
-            .chat
-            .lock()
-            .unwrap()
-            .history
-            .active_id
-            .clone();
+        let first = server.context.history.lock().unwrap().active_id.clone();
         server
             .context
             .publish_with_selection(
@@ -1942,14 +2127,7 @@ mod tests {
             .unwrap();
         let created = request(server.address(), "POST", "/v1/chats", Some("{}"));
         assert!(created.contains(" 200 "), "{created}");
-        let second = server
-            .context
-            .chat
-            .lock()
-            .unwrap()
-            .history
-            .active_id
-            .clone();
+        let second = server.context.history.lock().unwrap().active_id.clone();
         assert_ne!(first, second);
         let empty = request(server.address(), "GET", "/v1/chat", None);
         assert!(empty.contains("\"messages\":[]"), "{empty}");
@@ -1990,47 +2168,88 @@ mod tests {
     }
 
     #[test]
-    fn switching_waits_for_replies_and_runs_and_rejects_late_tool_calls() {
+    fn chats_keep_independent_replies_runs_and_ea_workspaces() {
         let server = test_server();
-        server.context.chat.lock().unwrap().busy = true;
-        assert!(request(server.address(), "POST", "/v1/chats", Some("{}")).contains(" 409 "));
-        server
-            .context
-            .publish(ChatRole::Assistant, "Still working".into(), true, None)
-            .unwrap();
-        assert!(request(server.address(), "POST", "/v1/chats", Some("{}")).contains(" 409 "));
-        server
-            .context
-            .publish(ChatRole::Assistant, "Done".into(), false, None)
-            .unwrap();
-        server
-            .context
+        let first = &server.context;
+        first.chat.lock().unwrap().busy = true;
+        first
             .runs
             .lock()
             .unwrap()
             .insert("live".into(), record("Team", RunStatus::Running));
-        assert!(request(server.address(), "POST", "/v1/chats", Some("{}")).contains(" 409 "));
-        server.context.runs.lock().unwrap().clear();
-        assert!(request(server.address(), "POST", "/v1/chats", Some("{}")).contains(" 200 "));
-        let old_reply =
-            json!({"token": server.agent_token, "text": "Late answer from the previous chat"})
-                .to_string();
+        let thinking = first.chat_operation.lock().unwrap();
+        let created = request(server.address(), "POST", "/v1/chats", Some("{}"));
+        assert!(created.contains(" 200 "), "{created}");
+        drop(thinking);
+        let id = server.workspaces.history.lock().unwrap().active_id.clone();
+        let second = server.workspaces.get(&id).unwrap();
+        assert_ne!(first.ea_id, second.ea_id);
+        assert_ne!(first.conversation_id, second.conversation_id);
+        assert!(first.chat.lock().unwrap().busy);
+        assert!(second.runs.lock().unwrap().is_empty());
+        let reply = json!({"token": server.agent_token, "text": "Background answer"}).to_string();
+        assert!(
+            request(server.address(), "POST", "/v1/agent/reply", Some(&reply)).contains(" 202 ")
+        );
+        assert!(!first.chat.lock().unwrap().busy);
+        assert!(request(
+            server.address(),
+            "GET",
+            &format!("/chats/{}/v1/chat", first.conversation_id),
+            None
+        )
+        .contains("Background answer"));
+        assert!(!request(
+            server.address(),
+            "GET",
+            &format!("/chats/{id}/v1/chat"),
+            None
+        )
+        .contains("Background answer"));
+        assert!(request(
+            server.address(),
+            "GET",
+            &format!("/chats/{id}/v1/runs/live"),
+            None
+        )
+        .contains(" 404 "));
         assert!(request(
             server.address(),
             "POST",
-            "/v1/agent/reply",
-            Some(&old_reply)
+            &format!("/chats/{id}/v1/agent/reply"),
+            Some(&reply)
         )
         .contains(" 403 "));
-        assert!(server
-            .context
-            .chat
-            .lock()
-            .unwrap()
-            .history
-            .active()
-            .messages
-            .is_empty());
+        assert!(request(
+            server.address(),
+            "POST",
+            &format!("/v1/chats/{}/activate", first.conversation_id),
+            Some("{}")
+        )
+        .contains(" 200 "));
+        assert_eq!(
+            first.runs.lock().unwrap()["live"].status,
+            RunStatus::Running
+        );
+        let listing = request(server.address(), "GET", "/v1/chats", None);
+        assert!(listing.contains("Team-Running"), "{listing}");
+    }
+
+    #[test]
+    fn reopening_saved_chats_keeps_their_ea_assignments() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let first = server.context.conversation_id.clone();
+        assert!(request(server.address(), "POST", "/v1/chats", Some("{}")).contains(" 200 "));
+        let second = server.workspaces.history.lock().unwrap().active_id.clone();
+        let second_ea = server.workspaces.get(&second).unwrap().ea_id;
+        drop(server);
+        let resumed = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        assert_eq!(resumed.ea_id, second_ea);
+        assert_eq!(resumed.workspaces.get(&first).unwrap().ea_id, 0);
+        assert_eq!(resumed.workspaces.get(&second).unwrap().ea_id, second_ea);
+        assert!(resumed.context.runs.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2044,10 +2263,9 @@ mod tests {
         assert!(response.contains(" 500 "), "{response}");
         assert!(server
             .context
-            .chat
+            .history
             .lock()
             .unwrap()
-            .history
             .active()
             .messages
             .is_empty());
@@ -2126,7 +2344,7 @@ with open(sys.argv[1], 'ab', buffering=0) as output:
                 Some(proposal),
             )
             .unwrap();
-        let first_id = first.context.chat.lock().unwrap().history.active_id.clone();
+        let first_id = first.context.history.lock().unwrap().active_id.clone();
         drop(first);
         let resumed = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
         let body = request(resumed.address(), "GET", "/v1/chat", None);
@@ -2134,10 +2352,7 @@ with open(sys.argv[1], 'ab', buffering=0) as output:
             body.contains("Saved proposal") && body.contains("release evidence"),
             "{body}"
         );
-        assert_eq!(
-            resumed.context.chat.lock().unwrap().history.active_id,
-            first_id
-        );
+        assert_eq!(resumed.context.history.lock().unwrap().active_id, first_id);
         let response = request(
             resumed.address(),
             "POST",
