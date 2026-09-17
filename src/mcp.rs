@@ -221,6 +221,7 @@ fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> String {
             "agy" => Some("agy"),
             "claude" | "claude-code" | "claude_code" => Some("claude"),
             "opencode" => Some("opencode"),
+            "pi" => Some("pi"),
             _ => None,
         }
     }
@@ -229,21 +230,9 @@ fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> String {
         return name.to_string();
     }
 
-    for token in command.split_whitespace() {
-        let token = token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')' | '[' | ']'));
-        if token.is_empty() {
-            continue;
-        }
-        let executable = Path::new(token)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(token);
-        if let Some(name) = normalize(executable) {
-            return name.to_string();
-        }
-    }
-
-    "unknown".to_string()
+    manager::command_backend_name(command)
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn looks_like_supervisor_name(name: &str) -> bool {
@@ -772,7 +761,7 @@ impl OmarMcpServer {
     }
 
     fn list_backends(&self) -> Result<Value> {
-        let backends = ["claude", "codex", "cursor", "opencode", "agy"];
+        let backends = ["claude", "codex", "cursor", "opencode", "agy", "pi"];
         let infos: Vec<Value> = backends
             .iter()
             .filter_map(|name| {
@@ -1153,7 +1142,12 @@ impl OmarMcpServer {
             return Err(anyhow!("Agent '{}' already exists", short_name));
         }
         let tmux_spawn_start = std::time::Instant::now();
-        client.new_session(&session_name, &command, Some(&workdir))?;
+        client.new_session_with_backend(
+            &session_name,
+            &command,
+            Some(&workdir),
+            manager::command_backend_name(&base_command),
+        )?;
         let tmux_spawn_ms = tmux_spawn_start.elapsed().as_millis() as u64;
         metrics::record_backend_bootstrap(&backend_name);
 
@@ -1213,7 +1207,13 @@ impl OmarMcpServer {
                     )
                 };
                 let opts = DeliveryOptions::default();
-                let delivery = client2.deliver_prompt(&session2, &first_message, &opts);
+                let delivery = if backend_name2 == "pi" && readiness.is_err() {
+                    Err(anyhow!(
+                        "Pi tool discovery did not complete; initial prompt was not delivered"
+                    ))
+                } else {
+                    client2.deliver_prompt(&session2, &first_message, &opts)
+                };
                 let delivery_ok = delivery.is_ok();
                 metrics::record_prompt_delivery(
                     ea_id,
@@ -2155,7 +2155,7 @@ fn tool_definitions() -> Vec<Value> {
                     "project_id":{"type":"integer","description":"Existing project id from add_project or list_projects. Required — spawn_agent does not auto-create projects."},
                     "task":{"type":"string","description":"Delivered to the agent as their initial task and shown in the dashboard. What to build or do — no [TASK COMPLETE] or parent-wakeup instructions; those are already in every agent's system prompt."},
                     "command":{"type":"string","description":"Raw command to run instead of a backend agent (e.g. 'bash' for a demo window). Mutually exclusive with backend."},
-                    "backend":{"type":"string","enum":["claude","codex","cursor","opencode","agy"],"description":"Backend agent command to launch. Mutually exclusive with command."},
+                    "backend":{"type":"string","enum":["claude","codex","cursor","opencode","agy","pi"],"description":"Backend agent command to launch. Mutually exclusive with command."},
                     "model":{"type":"string","description":"Optional backend model override. Allowed characters are alphanumeric plus '-', '_', '.', '/'."},
                     "reasoning_effort":{"type":"string","enum":["low","medium","high","xhigh"],"description":"Optional Codex reasoning effort override. Supported only with backend='codex'; appends a Codex config override such as -c model_reasoning_effort='\"high\"'."},
                     "workdir":{"type":"string","description":"Working directory for the new session. Defaults to this MCP server's launch workdir."},
@@ -2835,6 +2835,33 @@ mod tests {
     }
 
     #[test]
+    fn infer_backend_name_recognizes_pi() {
+        assert_eq!(infer_backend_name(Some("pi"), "ignored"), "pi");
+        assert_eq!(
+            infer_backend_name(None, "env PI_CODING_AGENT_DIR=/tmp pi"),
+            "pi"
+        );
+    }
+
+    #[test]
+    fn infer_backend_name_ignores_backend_names_in_arguments() {
+        for command in [
+            "echo pi",
+            "cat /tmp/pi",
+            "env FOO=pi bash -c pi",
+            "echo claude",
+            "echo ok; pi",
+        ] {
+            assert_eq!(infer_backend_name(None, command), "unknown", "{command}");
+        }
+        assert_eq!(
+            infer_backend_name(None, "'/opt/Pi Agent/pi' --approve"),
+            "pi"
+        );
+        assert_eq!(infer_backend_name(Some("codex"), "echo pi"), "codex");
+    }
+
+    #[test]
     fn list_backends_includes_agy() {
         let server = OmarMcpServer::new(test_context());
         let response = server.list_backends().unwrap();
@@ -2846,6 +2873,21 @@ mod tests {
 
         assert_eq!(agy["command"], "agy --dangerously-skip-permissions");
         assert!(agy["available"].is_boolean());
+    }
+
+    #[test]
+    fn list_backends_includes_pi() {
+        let server = OmarMcpServer::new(test_context());
+        let response = server.list_backends().unwrap();
+        let pi = response["backends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|backend| backend["name"].as_str() == Some("pi"))
+            .expect("pi backend entry");
+
+        assert_eq!(pi["command"], "pi");
+        assert!(pi["available"].is_boolean());
     }
 
     #[test]

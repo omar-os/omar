@@ -130,6 +130,7 @@ fn detect_agent_command() -> String {
         ("cursor", "cursor agent --yolo"),
         ("opencode", "opencode"),
         ("agy", "agy --dangerously-skip-permissions"),
+        ("pi", "pi"),
     ])
     .unwrap_or_else(|| "claude --dangerously-skip-permissions".to_string())
 }
@@ -149,7 +150,7 @@ fn default_command() -> String {
 ///
 /// `stub` is deliberately absent: it answers invocations without a model, which
 /// is useful for exercising a run and useless for talking to.
-pub const ASSISTANT_BACKENDS: [&str; 5] = ["claude", "codex", "cursor", "opencode", "agy"];
+pub const ASSISTANT_BACKENDS: [&str; 6] = ["claude", "codex", "cursor", "opencode", "agy", "pi"];
 
 /// The backend a launch command came from, when it came from one of ours.
 ///
@@ -168,6 +169,7 @@ pub fn backend_of_command(command: &str) -> Option<&'static str> {
 /// - `"cursor"` → `"cursor agent --yolo"`
 /// - `"opencode"` → `"opencode"` (opencode has no permission-skip flag)
 /// - `"agy"` → `"agy --dangerously-skip-permissions"`
+/// - `"pi"` → `"pi"`
 /// - `"stub"` → the model-free test agent
 /// - anything else → error
 pub fn resolve_backend(name: &str) -> Result<String, String> {
@@ -179,13 +181,14 @@ pub fn resolve_backend(name: &str) -> Result<String, String> {
         "cursor" => Ok("cursor agent --yolo".to_string()),
         "opencode" => Ok("opencode".to_string()),
         "agy" => Ok("agy --dangerously-skip-permissions".to_string()),
+        "pi" => Ok("pi".to_string()),
         // Answers invocations without a model, so a run can be exercised end to
         // end in a test. Resolved to this binary in `build_agent_command`.
         "stub" => Ok("omar stub-agent".to_string()),
         // `web` never reaches here — nothing is spawned for it, so there is
         // no command to resolve. It is named so a typo is told what it meant.
         other => Err(format!(
-            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, agy, stub, web",
+            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, agy, pi, stub, web",
             other
         )),
     }
@@ -460,7 +463,8 @@ sidebar_right = false
                 || cmd.contains("codex")
                 || cmd.contains("cursor")
                 || cmd.contains("opencode")
-                || cmd.contains("agy"),
+                || cmd.contains("agy")
+                || cmd.contains("pi"),
             "Unexpected default command: {}",
             cmd
         );
@@ -577,6 +581,7 @@ session_prefix = "omar-agent"
             resolve_backend("agy").unwrap(),
             "agy --dangerously-skip-permissions"
         );
+        assert_eq!(resolve_backend("pi").unwrap(), "pi");
     }
 
     #[test]

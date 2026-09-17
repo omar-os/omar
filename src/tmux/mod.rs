@@ -33,6 +33,33 @@ pub fn backend_readiness_markers(backend: &str) -> &'static [&'static str] {
         "agy" => &[],
         "claude" => &["Claude Code", "❯"],
         "opencode" => &["tab agents", "ctrl+p commands"],
+        // The banner is optional (quietStartup) and renders before extension
+        // initialization. Our adapter emits this notification only after its
+        // session_start handler has registered the discovered MCP tools.
+        "pi" => &["OMAR: loaded ", " MCP tools"],
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backend_readiness_markers;
+
+    #[test]
+    fn pi_readiness_requires_successful_tool_discovery() {
+        let markers = backend_readiness_markers("pi");
+        for pane in [
+            "pi v0.85.1",
+            "pi v0.85.1\nProject trust\nTrust this project?",
+            "pi v0.85.1\nOMAR MCP unavailable: connection closed",
+        ] {
+            assert!(
+                !markers.iter().all(|marker| pane.contains(marker)),
+                "{pane}"
+            );
+        }
+        // Quiet startup suppresses the version header but not notifications.
+        let pane = "OMAR: loaded 32 MCP tools\n────────────────────";
+        assert!(markers.iter().all(|marker| pane.contains(marker)));
     }
 }

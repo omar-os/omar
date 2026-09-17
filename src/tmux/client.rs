@@ -735,6 +735,19 @@ impl TmuxClient {
 
     /// Create a new detached session
     pub fn new_session(&self, name: &str, command: &str, workdir: Option<&str>) -> Result<()> {
+        self.new_session_with_backend(name, command, workdir, None)
+    }
+
+    /// Preserve the backend selected before OMAR adds its own shell bootstrap
+    /// (for example Codex's app-server). Raw commands still use conservative
+    /// executable-position detection; they are not searched through for names.
+    pub(crate) fn new_session_with_backend(
+        &self,
+        name: &str,
+        command: &str,
+        workdir: Option<&str>,
+        backend: Option<&str>,
+    ) -> Result<()> {
         let mut args = vec![
             "new-session",
             "-d",
@@ -758,7 +771,7 @@ impl TmuxClient {
         // cursor-agent takes no message from outside, but it runs hooks that
         // can hand context to the model. Point this pane at its own spool so
         // the hook knows whose events to collect.
-        let backend = crate::manager::command_backend_name(command);
+        let backend = backend.or_else(|| crate::manager::command_backend_name(command));
         let hooked = match backend {
             Some("cursor") => crate::channel::install_cursor_hook(),
             Some("agy") => crate::channel::install_antigravity_hook(),
@@ -1389,6 +1402,68 @@ mod tests {
             "wait_for_stable took too long on idle pane: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn test_backend_metadata_survives_generated_bootstrap_without_scanning_raw_arguments() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let client = TmuxClient::new("omar-test-");
+        for backend in [None, Some("codex")] {
+            let session = format!("omar-test-backend-bootstrap-{}", uuid::Uuid::new_v4());
+            let _guard = SessionGuard(session.clone());
+            client
+                .new_session_with_backend(
+                    &session,
+                    "printf 'pi /tmp/codex\\n'; exec cat",
+                    None,
+                    backend,
+                )
+                .unwrap();
+            assert_eq!(client.session_backend(&session).as_deref(), backend);
+        }
+    }
+
+    #[test]
+    fn test_pi_readiness_waits_for_tools_even_with_a_banner() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let session = format!("omar-test-pi-readiness-{}", uuid::Uuid::new_v4());
+        let _guard = SessionGuard(session.clone());
+        let client = TmuxClient::new("omar-test-");
+        client
+            .new_session(
+                &session,
+                "printf 'pi v0.85.1\\nProject trust\\n'; exec cat",
+                None,
+            )
+            .unwrap();
+        assert!(client.wait_for_markers(
+            &session,
+            &["Project trust"],
+            Duration::from_secs(3),
+            Duration::from_millis(25)
+        ));
+        let markers = crate::tmux::backend_readiness_markers("pi");
+        assert!(!client.wait_for_markers(
+            &session,
+            markers,
+            Duration::from_millis(150),
+            Duration::from_millis(25)
+        ));
+        client
+            .send_keys_literal(&session, "OMAR: loaded 32 MCP tools")
+            .unwrap();
+        assert!(client.wait_for_markers(
+            &session,
+            markers,
+            Duration::from_secs(3),
+            Duration::from_millis(25)
+        ));
     }
 
     #[test]

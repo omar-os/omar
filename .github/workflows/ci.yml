@@ -106,6 +106,50 @@ jobs:
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1
 
+  pi-bridge:
+    name: Pi Bridge
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: .github/scripts/install-packages.sh tmux shellcheck
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check Pi E2E shell script
+        run: shellcheck tests/ci/pi_binary_tree.sh
+
+      - name: Test Pi bridge with pinned real Pi
+        run: node --test bridges/pi/test/*.test.mjs
+
+      - name: Build omar
+        run: cargo build --bin omar
+
+      # Real Pi processes and OMAR tools, with a local deterministic provider.
+      # No provider credentials or live model quota are needed on pull requests.
+      - name: Run Pi binary-tree E2E
+        env:
+          PI_E2E_LIVE: '0'
+        run: bash tests/ci/pi_binary_tree.sh
+
   omar-language:
     name: OMAR Language
     runs-on: ubuntu-latest
@@ -637,7 +681,7 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
+    needs: [check, fmt, clippy, test, pi-bridge, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: always()
@@ -648,6 +692,7 @@ jobs:
              [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.pi-bridge.result }}" != "success" ]] || \
              [[ "${{ needs.omar-language.result }}" != "success" ]] || \
              [[ "${{ needs.popup-quote-integration.result }}" != "success" ]] || \
              [[ "${{ needs.unresolved-session-integration.result }}" != "success" ]] || \

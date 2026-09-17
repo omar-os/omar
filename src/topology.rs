@@ -2102,7 +2102,12 @@ fn spawn_topology_agents(
             }),
         };
         let command = manager::build_agent_command(&base_command, &prompt_file, &[], &context);
-        client.new_session(&session, &command, Some(config.default_workdir))?;
+        client.new_session_with_backend(
+            &session,
+            &command,
+            Some(config.default_workdir),
+            Some(backend),
+        )?;
         spawned.insert(name.clone(), session);
     }
 
@@ -3005,6 +3010,7 @@ fn canonical_backend(backend: &str) -> &str {
         "opencode" => "opencode",
         "cursor" => "cursor",
         "agy" => "agy",
+        "pi" => "pi",
         "stub" => "stub",
         _ => backend,
     }
@@ -3772,6 +3778,7 @@ mod tests {
         assert!(is_web_backend("web"));
         assert!(!is_web_backend("ClaudeCode"));
         assert!(!is_web_backend("Stub"));
+        assert_eq!(canonical_backend("Pi"), "pi");
     }
 
     #[test]

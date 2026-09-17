@@ -58,6 +58,11 @@ pub struct ManagerRuntimeOptions {
 // Embed prompt files at compile time so they work regardless of CWD.
 const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
 const PROMPT_AGENT: &str = include_str!("../../prompts/agent.md");
+// The Pi adapter is shipped inside the omar binary so installed binaries do
+// not depend on the source checkout being present at runtime.
+const PI_EXTENSION_INDEX: &str = include_str!("../../bridges/pi/index.js");
+const PI_EXTENSION_MCP: &str = include_str!("../../bridges/pi/omar-mcp.js");
+const PI_EXTENSION_PACKAGE: &str = include_str!("../../bridges/pi/package.json");
 
 // Backend-native wake/reminder tools bypass OMAR's durable, EA-scoped scheduler.
 // Deny these names where a backend exposes per-session tool controls.
@@ -153,6 +158,7 @@ enum BackendKind {
     Codex,
     Cursor,
     Opencode,
+    Pi,
     Stub,
 }
 
@@ -164,13 +170,13 @@ impl BackendKind {
             BackendKind::Codex => "codex",
             BackendKind::Cursor => "cursor",
             BackendKind::Opencode => "opencode",
+            BackendKind::Pi => "pi",
             BackendKind::Stub => "stub",
         }
     }
 }
 
 fn detect_backend_token(token: &str) -> Option<BackendKind> {
-    let token = token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')'));
     let executable = Path::new(token)
         .file_name()
         .and_then(|name| name.to_str())
@@ -184,16 +190,124 @@ fn detect_backend_token(token: &str) -> Option<BackendKind> {
         "codex" => Some(BackendKind::Codex),
         "cursor" => Some(BackendKind::Cursor),
         "opencode" => Some(BackendKind::Opencode),
-        // Matched on the subcommand: the executable is `omar` itself.
-        "stub-agent" => Some(BackendKind::Stub),
+        "pi" => Some(BackendKind::Pi),
         _ => None,
     }
 }
 
+/// Read a literal shell word without evaluating it. Retain byte offsets so
+/// runtime flags can be inserted after a quoted executable path. Stop at shell
+/// operators or expansions: guessing through those can modify another program.
+fn command_word(command: &str, offset: &mut usize) -> Option<String> {
+    let mut chars = command[*offset..].char_indices().peekable();
+    while chars
+        .peek()
+        .is_some_and(|(_, c)| c.is_whitespace() && *c != '\n')
+    {
+        chars.next();
+    }
+    let start = chars.peek()?.0;
+    if chars.peek()?.1 == '#' {
+        return None;
+    }
+    let mut word = String::new();
+    let mut quote = None;
+    let mut end = start;
+    while let Some((index, c)) = chars.next() {
+        if quote.is_none() && (c.is_whitespace() || ";|&()<>".contains(c)) {
+            break;
+        }
+        end = index + c.len_utf8();
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (None, '\'' | '"') => quote = Some(c),
+            (Some('\''), _) => word.push(c),
+            (_, '$' | '`') => return None,
+            (_, '\\') => {
+                let (index, escaped) = chars.next()?;
+                if quote == Some('"') && !matches!(escaped, '$' | '`' | '"' | '\\' | '\n') {
+                    word.push('\\');
+                }
+                if escaped != '\n' {
+                    word.push(escaped);
+                }
+                end = index + escaped.len_utf8();
+            }
+            _ => word.push(c),
+        }
+    }
+    if quote.is_some() || end == start {
+        return None;
+    }
+    *offset += end;
+    Some(word)
+}
+
+fn is_environment_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+}
+
+/// Only classify the executable, after literal assignments and supported
+/// launch wrappers. Arguments and later pipeline/compound commands are never
+/// searched for backend names.
+fn backend_executable(command: &str) -> Option<(BackendKind, usize)> {
+    let mut offset = 0;
+    let mut word;
+    loop {
+        let start = offset;
+        word = command_word(command, &mut offset)?;
+        if !is_environment_assignment(command[start..offset].trim_start()) {
+            break;
+        }
+    }
+    if matches!(word.as_str(), "exec" | "command") {
+        word = command_word(command, &mut offset)?;
+        if word == "--" {
+            word = command_word(command, &mut offset)?;
+        }
+    }
+    if Path::new(&word).file_name()?.to_str()? == "env" {
+        let mut options = true;
+        loop {
+            word = command_word(command, &mut offset)?;
+            match word.as_str() {
+                "-i" | "--ignore-environment" if options => continue,
+                "-u" | "--unset" | "-C" | "--chdir" if options => {
+                    command_word(command, &mut offset)?;
+                    continue;
+                }
+                "--" if options => {
+                    options = false;
+                    continue;
+                }
+                _ if options && (word.starts_with("--unset=") || word.starts_with("--chdir=")) => {
+                    continue
+                }
+                _ if is_environment_assignment(&word) => {
+                    options = false;
+                    continue;
+                }
+                _ if word.starts_with('-') => return None,
+                _ => break,
+            }
+        }
+    }
+    if Path::new(&word).file_name()?.to_str()? == "omar" {
+        return (command_word(command, &mut offset)? == "stub-agent")
+            .then_some((BackendKind::Stub, offset));
+    }
+    detect_backend_token(&word).map(|backend| (backend, offset))
+}
+
 fn detect_backend(base_command: &str) -> Option<BackendKind> {
-    base_command
-        .split_whitespace()
-        .find_map(detect_backend_token)
+    backend_executable(base_command).map(|(backend, _)| backend)
 }
 
 pub fn command_backend_name(command: &str) -> Option<&'static str> {
@@ -226,6 +340,35 @@ fn with_opencode_port(base_command: &str) -> String {
     }
 }
 
+/// Materialize the embedded Pi adapter and this launch's context in the
+/// private, EA-scoped MCP directory. The extension imports `omar-mcp.js`
+/// relative to its entrypoint and starts OMAR with the exact context file.
+fn materialize_pi_extension(context: &McpLaunchContext) -> Option<(PathBuf, PathBuf)> {
+    let dir = mcp_ea_dir(context)?.join("pi-extension");
+    let index = dir.join("index.js");
+    let mcp = dir.join("omar-mcp.js");
+    let package = dir.join("package.json");
+    write_private_file(&index, PI_EXTENSION_INDEX.as_bytes()).ok()?;
+    write_private_file(&mcp, PI_EXTENSION_MCP.as_bytes()).ok()?;
+    write_private_file(&package, PI_EXTENSION_PACKAGE.as_bytes()).ok()?;
+    let context_file = materialize_mcp_context_file(context)?;
+    Some((index, context_file))
+}
+
+/// Prefix a Pi launch with the environment consumed by the OMAR Pi adapter.
+fn pi_context_environment(context: &McpLaunchContext, context_file: &Path) -> String {
+    let omar_binary = omar_server_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "omar".to_string());
+    format!(
+        "OMAR_BINARY={} OMAR_DIR={} OMAR_EA_ID={} OMAR_MCP_CONTEXT_FILE={} ",
+        shell_single_quote(&omar_binary),
+        shell_single_quote(&context.omar_dir.display().to_string()),
+        context.ea_id,
+        shell_single_quote(&context_file.display().to_string())
+    )
+}
+
 /// `--settings '{"crossSessionInbound":"accept"}'`, as it goes on a launch line.
 ///
 /// It lets OMAR deliver events over Claude Code's cross-session peer socket.
@@ -256,14 +399,7 @@ pub fn ensure_claude_inbound_settings(command: &str) -> String {
     {
         return command.to_string();
     }
-    let mut end = 0;
-    for token in command.split_whitespace() {
-        let start = end + command[end..].find(token).expect("token was cut from here");
-        end = start + token.len();
-        if detect_backend_token(token) == Some(BackendKind::Claude) {
-            break;
-        }
-    }
+    let (_, end) = backend_executable(command).expect("Claude executable checked above");
     format!(
         "{} {}{}",
         &command[..end],
@@ -1124,6 +1260,7 @@ pub(crate) fn remove_all_omar_antigravity_mcp_configs() -> Result<()> {
 ///     after spawn via tmux because opencode's `--prompt` is treated as the
 ///     first **user** message (not system role) and the LLM responds by
 ///     asking the user to fill in the fields described in the prompt
+///   - pi → `--system-prompt "$(cat '<path>')"`
 ///   - unknown → returns `base_command` unchanged
 pub fn build_agent_command(
     base_command: &str,
@@ -1243,6 +1380,26 @@ pub fn build_agent_command(
                     base_command
                 ),
                 None => base_command,
+            }
+        }
+        Some(BackendKind::Pi) => {
+            // Pi accepts a native system prompt in interactive mode. Keep
+            // substitutions in the shell expression so worker identity and
+            // task text are resolved per launch without mutating the prompt.
+            // This launch is authorized by OMAR. Pi's per-run trust flag
+            // prevents project resources from opening an unattended dialog.
+            let (_, end) = backend_executable(&base_command).expect("Pi executable checked above");
+            let base_command =
+                format!("{} --approve{}", &base_command[..end], &base_command[end..]);
+            match materialize_pi_extension(mcp_context) {
+                Some((extension, context_file)) => format!(
+                    "{}{} -e {} --system-prompt \"{}\"",
+                    pi_context_environment(mcp_context, &context_file),
+                    base_command,
+                    shell_single_quote(&extension.display().to_string()),
+                    shell_expr
+                ),
+                None => format!("{} --system-prompt \"{}\"", base_command, shell_expr),
             }
         }
         None => base_command.to_string(),
@@ -1406,20 +1563,13 @@ pub fn ensure_manager_session(
     if client.has_session(&session)? {
         if client.session_has_live_pane(&session)? {
             let requested_backend = command_backend_name(command);
-            let existing_backend = client
-                .get_pane_command(&session)
-                .ok()
-                .and_then(|pane_command| command_backend_name(&pane_command))
-                .or_else(|| {
-                    client
-                        .get_pane_process_command(&session)
-                        .ok()
-                        .and_then(|process_command| command_backend_name(&process_command))
-                });
+            // Worktree launchers can leave bash/sh as the visible pane process.
+            // Prefer the backend stamped at launch, with legacy detection as fallback.
+            let existing_backend = client.session_backend(&session);
 
             if requested_backend.is_some()
                 && existing_backend.is_some()
-                && requested_backend != existing_backend
+                && requested_backend != existing_backend.as_deref()
             {
                 client.kill_session(&session)?;
                 result = ManagerEnsureResult::ReplacedBackend;
@@ -1459,7 +1609,7 @@ pub fn ensure_manager_session(
         Some(p) => p.to_string_lossy().into_owned(),
         None => std::env::current_dir()?.to_string_lossy().into_owned(),
     };
-    client.new_session(&session, &cmd, Some(&cwd))?;
+    client.new_session_with_backend(&session, &cmd, Some(&cwd), command_backend_name(command))?;
 
     // Give it time to start
     thread::sleep(Duration::from_secs(2));
@@ -1749,10 +1899,11 @@ fn spawn_worker(
     );
 
     // Create worker session — system prompt set at process start
-    client.new_session(
+    client.new_session_with_backend(
         &session_name,
         &cmd,
         Some(&std::env::current_dir()?.to_string_lossy()),
+        command_backend_name(command),
     )?;
 
     // Wait for backend readiness when possible, then deliver an explicit
@@ -1772,6 +1923,12 @@ fn spawn_worker(
                 Duration::from_millis(250),
             );
             if !detected {
+                if kind == BackendKind::Pi {
+                    anyhow::bail!(
+                        "{} - Pi tool discovery did not complete; initial prompt was not delivered",
+                        agent.name
+                    );
+                }
                 println!(
                     "  {} - readiness markers timed out; attempting delivery anyway",
                     agent.name
@@ -1830,6 +1987,124 @@ fn spawn_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exercise the real manager lifecycle: worktree/backend launchers can keep
+    // a shell visible for the whole session, so process sniffing cannot decide
+    // whether to reuse or replace it.
+    fn check_stamped_pi_manager(shell: &str, replace: bool) {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = format!("omar-test-pi-switch-{}-", Uuid::new_v4());
+        let session = ea::ea_manager_session(0, &prefix);
+        let sibling = ea::ea_manager_session(1, &prefix);
+        let client = TmuxClient::new(&prefix);
+        struct Sessions(Vec<String>);
+        impl Drop for Sessions {
+            fn drop(&mut self) {
+                for session in &self.0 {
+                    let _ = TmuxClient::new("").kill_session(session);
+                }
+            }
+        }
+        let _sessions = Sessions(vec![session.clone(), sibling.clone()]);
+        client
+            .new_session_with_backend(
+                &session,
+                &format!(
+                    "exec {shell} -c 'printf WRAPPER_READY; while IFS= read -r line; do :; done'"
+                ),
+                Some(dir.path().to_str().unwrap()),
+                Some("pi"),
+            )
+            .unwrap();
+        client.new_session(&sibling, "exec cat", None).unwrap();
+        // Wait for the wrapper to start, then prove neither legacy lookup can
+        // identify Pi; the persisted OMAR_BACKEND must be authoritative.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if client
+                .capture_pane_visible(&session)
+                .unwrap()
+                .contains("WRAPPER_READY")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "wrapper did not start");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(matches!(
+            client.get_pane_command(&session).unwrap().as_str(),
+            "bash" | "sh"
+        ));
+        assert_eq!(
+            command_backend_name(&client.get_pane_process_command(&session).unwrap()),
+            None
+        );
+        assert_eq!(client.session_backend(&session).as_deref(), Some("pi"));
+        let pane_id = || {
+            let output = crate::tmux::tmux_command()
+                .args(["display-message", "-p", "-t", &session, "#{pane_id}"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let original_pane = pane_id();
+        // A harmless executable with a recognized backend basename receives
+        // the normal generated launch flags without needing any real backend.
+        let executable = dir.path().join(if replace { "claude" } else { "pi" });
+        std::fs::write(&executable, "#!/bin/sh\nexec cat\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (actual_session, result) = ensure_manager_session(
+            &client,
+            &shell_single_quote(executable.to_str().unwrap()),
+            0,
+            "test",
+            dir.path(),
+            &prefix,
+            &ManagerRuntimeOptions {
+                default_workdir: dir.path().display().to_string(),
+                health_idle_warning: 15,
+                serve: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(actual_session, session);
+        assert!(client.session_has_live_pane(&session).unwrap());
+        assert!(client.session_has_live_pane(&sibling).unwrap());
+        if replace {
+            assert_eq!(result, ManagerEnsureResult::ReplacedBackend);
+            assert_ne!(pane_id(), original_pane);
+            assert_eq!(client.session_backend(&session).as_deref(), Some("claude"));
+        } else {
+            assert_eq!(result, ManagerEnsureResult::AlreadyRunning);
+            assert_eq!(pane_id(), original_pane);
+            assert_eq!(client.session_backend(&session).as_deref(), Some("pi"));
+        }
+    }
+
+    #[test]
+    fn ensure_manager_replaces_stamped_pi_shell_wrappers() {
+        for shell in ["bash", "sh"] {
+            check_stamped_pi_manager(shell, true);
+        }
+    }
+
+    #[test]
+    fn ensure_manager_reuses_stamped_pi_shell_wrappers() {
+        for shell in ["bash", "sh"] {
+            check_stamped_pi_manager(shell, false);
+        }
+    }
 
     #[test]
     fn strip_deleted_suffix_removes_trailing_marker() {
@@ -1994,6 +2269,150 @@ mod tests {
             "claude --disallowedTools must include the built-in Task tool: {cmd}"
         );
         assert!(cmd.contains("dispatch_agent"));
+    }
+
+    #[test]
+    fn test_build_agent_command_pi_uses_native_system_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = build_agent_command(
+            "pi",
+            Path::new("/tmp/prompts/agent.md"),
+            &[("{{TASK}}", "ship it")],
+            &test_mcp_context(dir.path()),
+        );
+        assert!(cmd.starts_with("OMAR_BINARY='"));
+        assert!(cmd.contains("OMAR_EA_ID=0 OMAR_MCP_CONTEXT_FILE="));
+        assert!(cmd.contains(" pi --approve -e "));
+        let extension = dir.path().join("mcp/ea-0/pi-extension/index.js");
+        let context = dir.path().join("mcp/ea-0/context.json");
+        assert!(cmd.contains(&format!("-e '{}'", extension.display())));
+        assert!(cmd.contains(&format!("OMAR_MCP_CONTEXT_FILE='{}'", context.display())));
+        assert!(!cmd.contains("CARGO_MANIFEST_DIR"));
+        assert!(extension.is_file());
+        assert!(dir
+            .path()
+            .join("mcp/ea-0/pi-extension/omar-mcp.js")
+            .is_file());
+        assert!(dir
+            .path()
+            .join("mcp/ea-0/pi-extension/package.json")
+            .is_file());
+        assert!(context.is_file());
+        assert!(cmd.ends_with(
+            " --system-prompt \"$(sed 's|{{TASK}}|ship it|g' '/tmp/prompts/agent.md')\""
+        ));
+    }
+
+    #[test]
+    fn pi_launch_passes_approval_and_prompt_as_actual_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = dir.path().join("system prompt.md");
+        std::fs::write(&prompt, "Do {{TASK}}.").unwrap();
+        for fallback in [false, true] {
+            let root = dir.path().join(if fallback { "blocked" } else { "state" });
+            if fallback {
+                std::fs::write(&root, "not a directory").unwrap();
+            }
+            let command = build_agent_command(
+                "pi --model test-model",
+                &prompt,
+                &[("{{TASK}}", "the work")],
+                &test_mcp_context(&root),
+            );
+            // Execute the generated shell line against a fake Pi function so
+            // quoting and argument boundaries are checked without an LLM.
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("pi() {{ printf '%s\\n' \"$@\"; }}\n{command}"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let args: Vec<_> = stdout.lines().collect();
+            assert_eq!(&args[..3], &["--approve", "--model", "test-model"]);
+            assert_eq!(
+                &args[args.len() - 2..],
+                &["--system-prompt", "Do the work."]
+            );
+            assert_eq!(args.contains(&"-e"), !fallback);
+        }
+    }
+
+    #[test]
+    fn unrelated_commands_are_not_rewritten_for_backend_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        for command in [
+            "echo pi",
+            "echo /tmp/pi",
+            "cat '/opt/Pi Agent/pi'",
+            "python script.py pi",
+            "bash -lc 'pi'",
+            "env FOO=pi bash -c pi",
+            "env FOO=/tmp/pi echo hi",
+            "echo claude",
+            "echo /tmp/codex",
+            "echo stub-agent",
+            "echo ok; pi",
+            "echo ok | pi",
+            "echo ok\npi",
+            "env -u pi echo hi",
+            "'FOO=bar' pi",
+            "env --unknown pi",
+            "env command pi",
+            "env exec pi",
+            "env FOO=bar -u OTHER pi",
+            "omar other stub-agent",
+            "# pi",
+            "",
+        ] {
+            assert_eq!(command_backend_name(command), None, "{command}");
+            assert_eq!(
+                build_agent_command(
+                    command,
+                    Path::new("unused"),
+                    &[],
+                    &test_mcp_context(dir.path())
+                ),
+                command
+            );
+            assert_eq!(ensure_claude_inbound_settings(command), command);
+        }
+        assert!(!dir.path().join("mcp").exists());
+    }
+
+    #[test]
+    fn backend_detection_handles_literal_launch_prefixes_and_quoted_paths() {
+        for command in [
+            "pi",
+            "/opt/bin/pi --model test",
+            "'/opt/Pi Agent/pi'",
+            "\"/opt/Pi Agent/pi\"",
+            "PI_CODING_AGENT_DIR='/tmp/pi state' pi",
+            "env 'FOO=pi' /opt/bin/pi",
+            "env -i -u OTHER FOO=bar pi",
+            "env --unset=OTHER -- pi",
+            "exec pi",
+            "exec env FOO=bar pi",
+            "command -- pi",
+        ] {
+            assert_eq!(command_backend_name(command), Some("pi"), "{command}");
+        }
+        assert_eq!(
+            command_backend_name("'/opt/OMAR App/omar' stub-agent"),
+            Some("stub")
+        );
+        let line = "env FOO=pi '/opt/Claude App/claude' --model test";
+        assert_eq!(
+            ensure_claude_inbound_settings(line),
+            format!(
+                "env FOO=pi '/opt/Claude App/claude' {} --model test",
+                claude_inbound_settings()
+            )
+        );
     }
 
     #[test]
@@ -2556,6 +2975,10 @@ mod tests {
         assert_eq!(
             command_backend_name("env FOO=bar /opt/bin/codex --no-alt-screen"),
             Some("codex")
+        );
+        assert_eq!(
+            command_backend_name("pi --system-prompt prompt.md"),
+            Some("pi")
         );
         assert_eq!(command_backend_name("bash -lc 'echo hi'"), None);
     }
