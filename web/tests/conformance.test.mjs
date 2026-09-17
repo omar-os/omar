@@ -529,7 +529,10 @@ test("two chats run the same topology independently and retain their live panels
     assert.notEqual(a.diagram_address, b.diagram_address);
     const waitPanel = async (base, run) => {
       for (let attempt = 0; attempt < 100; attempt++) {
-        const panel = await request(`${base}/v1/runs/${run.run_id}/panel`);
+        const response = await fetch(`${real.url}${base}/v1/runs/${run.run_id}/panel`);
+        const panel = await response.json();
+        // Admission can return before the run publishes its Web panel.
+        assert.ok(response.ok || (response.status === 404 && panel.error === "run has no panel"), JSON.stringify(panel));
         if (panel.pending?.length) return panel.pending[0];
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
