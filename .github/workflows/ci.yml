@@ -106,6 +106,29 @@ jobs:
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1
 
+  codex-shared-history:
+    name: Codex Shared History
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install terminal and Codex test dependencies
+        run: |
+          .github/scripts/install-packages.sh tmux python3-venv
+          npm install -g @openai/codex@0.154.0
+          python3 -m venv "$RUNNER_TEMP/codex-test"
+          "$RUNNER_TEMP/codex-test/bin/pip" install websocket-client==1.9.0
+      - name: Build OMAR
+        run: cargo build --bin omar
+      - name: Verify shared history, resume, event delivery, and composer rendering
+        run: |
+          "$RUNNER_TEMP/codex-test/bin/python" tests/ci/codex_shared_home.py
+          "$RUNNER_TEMP/codex-test/bin/python" tests/ci/codex_event_wake.py
+
   omar-language:
     name: OMAR Language
     runs-on: ubuntu-latest

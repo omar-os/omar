@@ -450,15 +450,16 @@ pub fn provision_in_background(backend: Option<&str>, session: String, command: 
             Some(port) => Box::new(move || provision_opencode(port)),
             None => return,
         },
-        Some("codex") => match codex_home(&command) {
-            Some(home) => {
-                // Which pane this home belongs to, so a later launch can tell
-                // that it is finished and reclaim the disk.
-                crate::manager::claim_codex_home(&home, &session);
-                Box::new(move || provision_codex(&home))
+        Some("codex") => {
+            // The endpoint is known before startup. Stamp it synchronously so
+            // a CLI exec/exit cannot discard a background provisioning thread.
+            // resolve/deliver still check the socket and loaded thread at use.
+            if let Some(socket) = codex_launch_socket(&command) {
+                let _ = crate::tmux::TmuxClient::new("")
+                    .set_session_delivery(&session, &format!("codex:{}", socket.display()));
             }
-            None => return,
-        },
+            return;
+        }
         _ => return,
     };
     std::thread::spawn(move || {
@@ -468,20 +469,16 @@ pub fn provision_in_background(backend: Option<&str>, session: String, command: 
     });
 }
 
-/// `export CODEX_HOME='<dir>'` as it appears in a launch command.
-///
-/// The launch command is where OMAR records which per-pane codex home this
-/// pane was given, the same way `--port` records opencode's port.
-///
-/// The value is read back through the quoting `shell_single_quote` put on it,
-/// rather than split on whitespace: an operator whose home directory has a
-/// space in it is ordinary, and half a path here is worse than none. A path
-/// that does not come back whole yields `None`, so provisioning is skipped and
-/// the pane falls back to the input box.
-pub(crate) fn codex_home(command: &str) -> Option<PathBuf> {
+/// Read the per-pane endpoint without changing or interpreting CODEX_HOME.
+/// Preserve support for already-running legacy launches during the transition.
+pub(crate) fn codex_launch_socket(command: &str) -> Option<PathBuf> {
+    if let Some((_, assignment)) = command.split_once("export OMAR_CODEX_SOCKET=") {
+        let path = unquote_single(assignment)?;
+        return (!path.is_empty()).then(|| PathBuf::from(path));
+    }
     let assignment = command.split_once("export CODEX_HOME=")?.1;
     let dir = unquote_single(assignment)?;
-    (!dir.is_empty()).then(|| PathBuf::from(dir))
+    (!dir.is_empty()).then(|| codex_socket_path(Path::new(&dir)))
 }
 
 /// Undo `shell_single_quote`: read one `'...'` word, in which a literal quote
@@ -508,27 +505,6 @@ fn unquote_single(text: &str) -> Option<String> {
 pub fn codex_socket_path(home: &Path) -> PathBuf {
     home.join("app-server-control")
         .join("app-server-control.sock")
-}
-
-/// Wait for a pane's app-server to come up with the TUI attached to it.
-///
-/// The socket file appears before the server is answering, and the server
-/// answers before the TUI has opened its thread — an empty thread list is the
-/// signal that the pane is not attached yet, so both are waited out here.
-fn provision_codex(home: &Path) -> Option<String> {
-    let socket = codex_socket_path(home);
-    let deadline = std::time::Instant::now() + PROVISION_TIMEOUT;
-    while std::time::Instant::now() < deadline {
-        if socket.exists()
-            && CodexSession::open(&socket)
-                .and_then(|mut session| session.only_thread())
-                .is_ok()
-        {
-            return Some(format!("codex:{}", socket.display()));
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    None
 }
 
 /// A JSON-RPC conversation with a codex app-server.
@@ -1505,11 +1481,24 @@ mod tests {
     #[test]
     fn a_codex_home_is_read_back_out_of_a_launch_command() {
         assert_eq!(
-            codex_home("export CODEX_HOME='/Users/ke/.omar/codex/ab12'; codex --no-alt-screen"),
-            Some(PathBuf::from("/Users/ke/.omar/codex/ab12"))
+            codex_launch_socket(
+                "export CODEX_HOME='/Users/ke/.omar/codex/ab12'; codex --no-alt-screen"
+            ),
+            Some(codex_socket_path(Path::new("/Users/ke/.omar/codex/ab12")))
         );
-        assert_eq!(codex_home("codex --no-alt-screen"), None);
-        assert_eq!(codex_home("export CODEX_HOME=''; codex"), None);
+        assert_eq!(codex_launch_socket("codex --no-alt-screen"), None);
+        assert_eq!(codex_launch_socket("export CODEX_HOME=''; codex"), None);
+    }
+
+    #[test]
+    fn explicit_codex_socket_wins_over_an_inherited_home() {
+        for path in ["/tmp/my sockets/app.sock", "/tmp/it's mine/app.sock"] {
+            let command = format!(
+                "export CODEX_HOME='/user/home'; export OMAR_CODEX_SOCKET={}; codex",
+                crate::manager::shell_single_quote(path)
+            );
+            assert_eq!(codex_launch_socket(&command), Some(PathBuf::from(path)));
+        }
     }
 
     #[test]
@@ -1528,14 +1517,14 @@ mod tests {
                 crate::manager::shell_single_quote(home)
             );
             assert_eq!(
-                codex_home(&command),
-                Some(PathBuf::from(home)),
+                codex_launch_socket(&command),
+                Some(codex_socket_path(Path::new(home))),
                 "in {command}"
             );
         }
         // A word that never closes is not a path worth guessing at.
         assert_eq!(
-            codex_home("export CODEX_HOME='/Users/ke/unterminated"),
+            codex_launch_socket("export CODEX_HOME='/Users/ke/unterminated"),
             None
         );
     }
@@ -1623,7 +1612,7 @@ mod tests {
         // whatever answered as a delivery channel would send events into it.
         // The same goes for an inherited `CODEX_HOME`.
         assert_eq!(opencode_port("tensorboard --port 6006"), Some(6006));
-        assert!(codex_home("export CODEX_HOME='/somewhere'; jupyter lab").is_some());
+        assert!(codex_launch_socket("export CODEX_HOME='/somewhere'; jupyter lab").is_some());
         for backend in [None, Some("claude"), Some("cursor"), Some("agy")] {
             // Nothing is spawned and nothing is stamped: the guard is on the
             // backend, and the flag alone must never be enough.

@@ -788,6 +788,47 @@ impl TmuxClient {
         // can hand context to the model. Point this pane at its own spool so
         // the hook knows whose events to collect.
         let backend = crate::manager::command_backend_name(command);
+        // Detached panes have no client to answer OSC 10/11 palette queries.
+        // Codex caches that failed probe and suppresses RGB composer effects.
+        // Give its pane the same default palette as our web terminal, while
+        // preserving an operator's explicitly configured window style.
+        let codex_palette = (backend == Some("codex")).then(|| {
+            format!(
+                "set-option -w -t {} window-style 'fg=#d8d5e0,bg=#0b0b0e'",
+                crate::manager::shell_single_quote(name)
+            )
+        });
+        // A long-lived tmux server may retain another launcher's environment.
+        // Select the caller's normal Codex home explicitly, including custom
+        // homes, instead of inheriting a stale per-pane home from that server.
+        let codex_home = (backend == Some("codex"))
+            .then(|| {
+                std::env::var_os("CODEX_HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+            })
+            .flatten()
+            .map(|home| {
+                if home.is_absolute() {
+                    Ok(home)
+                } else {
+                    std::env::current_dir().map(|cwd| cwd.join(home))
+                }
+            })
+            .transpose()?
+            .map(|home| format!("CODEX_HOME={}", home.display()));
+        let no_color = std::env::var_os("NO_COLOR")
+            .map(|value| format!("NO_COLOR={}", value.to_string_lossy()));
+        if codex_palette.is_some() {
+            args.extend(["-e", "COLORTERM=truecolor"]);
+            if let Some(value) = &no_color {
+                args.extend(["-e", value]);
+            }
+        }
+        if let Some(home) = &codex_home {
+            args.extend(["-e", home]);
+        }
         let hooked = match backend {
             Some("cursor") => crate::channel::install_cursor_hook(),
             Some("agy") => crate::channel::install_antigravity_hook(),
@@ -811,7 +852,26 @@ impl TmuxClient {
             ),
             None => command,
         };
+        // Codex treats even NO_COLOR="" as opting out. Unset it in the
+        // pane's shell when absent from the caller, rather than copying a
+        // stale server value or substituting an empty string.
+        let color_command = (backend == Some("codex") && no_color.is_none())
+            .then(|| format!("unset NO_COLOR; {command}"));
+        let command = color_command.as_deref().unwrap_or(command);
         args.extend(["sh", "-lc", command]);
+        if let Some(palette) = &codex_palette {
+            // One tmux command queue establishes the palette before the
+            // server processes the new pane's terminal-probe output.
+            args.extend([
+                ";",
+                "if-shell",
+                "-F",
+                "-t",
+                name,
+                "#{==:#{window-style},default}",
+                palette,
+            ]);
+        }
         self.run(&args)?;
         self.run(&["set-option", "-t", name, "history-limit", "10000"])?;
         // Record which backend this session was launched with. Everything that

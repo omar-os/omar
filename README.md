@@ -127,6 +127,11 @@ Shutdown the test project and its agents.
 | [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode` |
 | [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy` |
 
+Each `omar -a <backend>` launch creates a new EA, named with its new EA number.
+Use `omar -a codex --ea Research` to give the new EA a semantic name. An existing
+name is rejected rather than replacing its manager. Run `omar --ea <id-or-name>`
+without `-a` to open an existing EA.
+
 Codex launch commands no longer disable the alternate screen. OMAR does not
 add `--no-alt-screen`; an explicit flag in a custom command is still respected.
 Remove that flag from an existing `default_command` to try the alternate screen,
