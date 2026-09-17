@@ -542,15 +542,6 @@ fn split_batch_for_quota(
     (batch, deferred)
 }
 
-/// Shared state: the (short name, ea_id) of the agent whose popup is currently open, if any.
-/// Both fields are required so suppression is scoped per-EA and does not affect same-named
-/// agents in other EAs.
-pub type PopupReceiver = Arc<Mutex<Option<(String, ea::EaId)>>>;
-
-pub fn new_popup_receiver() -> PopupReceiver {
-    Arc::new(Mutex::new(None))
-}
-
 /// Delay before retrying a failed channel delivery. The queued batch is retained.
 pub(crate) const DELIVERY_RETRY_NS: u64 = 30_000_000_000;
 
@@ -561,12 +552,7 @@ struct DueDelivery {
     batch: Vec<ScheduledEvent>,
 }
 
-pub async fn run_event_loop(
-    scheduler: Arc<Scheduler>,
-    ticker: TickerBuffer,
-    _popup_receiver: PopupReceiver,
-    base_prefix: String,
-) {
+pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer, base_prefix: String) {
     let external_poll_interval = std::time::Duration::from_millis(500);
     loop {
         let next_ts = scheduler.next_timestamp();
@@ -1003,12 +989,15 @@ mod tests {
         rt.block_on(async {
             let scheduler = Arc::new(Scheduler::new());
             let ticker = TickerBuffer::new();
-            let popup_receiver = new_popup_receiver();
-            *popup_receiver.lock().unwrap() = Some(("popup-target".to_string(), 5));
 
             let due_ts = now_ns().saturating_sub(500_000_000);
             for i in 0..3 {
-                let mut ev = make_event("popup-target", "sender", due_ts, &format!("batch-{}", i));
+                let mut ev = make_event(
+                    "unavailable-target",
+                    "sender",
+                    due_ts,
+                    &format!("batch-{}", i),
+                );
                 ev.ea_id = 5;
                 scheduler.insert(ev);
             }
@@ -1016,7 +1005,6 @@ mod tests {
             let loop_handle = tokio::spawn(run_event_loop(
                 scheduler.clone(),
                 ticker.clone(),
-                popup_receiver.clone(),
                 "omar-agent-".to_string(),
             ));
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1036,23 +1024,16 @@ mod tests {
         });
     }
 
-    // ── Event-loop behaviour with popup state ──
-    //
-    // Regression check: with the popup open for `(receiver, ea_id)`, a
-    // past-due event for the same target must be re-queued ~30s into the
-    // future instead of being delivered. Without the popup it would be
-    // popped and handed to `deliver_to_tmux`.
+    // Failed channels retain queued events for retry.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_loop_retains_event_when_channel_is_unavailable() {
         let scheduler = Arc::new(Scheduler::new());
         let ticker = TickerBuffer::new();
-        let popup_receiver = new_popup_receiver();
-        *popup_receiver.lock().unwrap() = Some(("popup-target".to_string(), 42));
 
         // Past-due event — loop will try to deliver immediately
         let mut ev = make_event(
-            "popup-target",
+            "unavailable-target",
             "sender",
             now_ns().saturating_sub(1_000_000_000),
             "hi",
@@ -1063,7 +1044,6 @@ mod tests {
         let loop_handle = tokio::spawn(run_event_loop(
             scheduler.clone(),
             ticker.clone(),
-            popup_receiver.clone(),
             "omar-agent-".to_string(),
         ));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1084,7 +1064,7 @@ mod tests {
 
         let ticker_text = ticker.render(std::time::Duration::from_secs(60));
         assert!(
-            ticker_text.contains("deferred event(s) for popup-target"),
+            ticker_text.contains("deferred event(s) for unavailable-target"),
             "ticker must note the defer: {}",
             ticker_text
         );
@@ -1095,11 +1075,9 @@ mod tests {
         // Repeated channel failures retain one queued event, without queue growth.
         let scheduler = Arc::new(Scheduler::new());
         let ticker = TickerBuffer::new();
-        let popup_receiver = new_popup_receiver();
-        *popup_receiver.lock().unwrap() = Some(("popup-target".to_string(), 1));
 
         let mut ev = make_event(
-            "popup-target",
+            "unavailable-target",
             "sender",
             now_ns().saturating_sub(500_000_000),
             "hi",
@@ -1110,7 +1088,6 @@ mod tests {
         let loop_handle = tokio::spawn(run_event_loop(
             scheduler.clone(),
             ticker.clone(),
-            popup_receiver.clone(),
             "omar-agent-".to_string(),
         ));
 

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::{anyhow, Context, Result};
 use std::io::Write;
 use std::process::Command;
@@ -263,24 +261,6 @@ impl TmuxClient {
         Ok(tail_pane_lines(output, lines))
     }
 
-    /// How many columns wide the pane is.
-    pub fn pane_width(&self, target: &str) -> Option<usize> {
-        let target = exact_pane_target(target);
-        self.run(&["display-message", "-t", &target, "-p", "#{pane_width}"])
-            .ok()
-            .and_then(|value| value.trim().parse().ok())
-    }
-
-    /// Capture only the rows currently on screen, with ANSI escapes intact.
-    ///
-    /// Scrollback is deliberately excluded: caret coordinates are relative to
-    /// the visible pane, and old prompt rows left in history read exactly like
-    /// live ones.
-    pub fn capture_pane_visible(&self, target: &str) -> Result<String> {
-        let target = exact_pane_target(target);
-        self.run(&["capture-pane", "-e", "-t", &target, "-p", "-S", "0"])
-    }
-
     /// Get the name of the command currently running in a pane.
     ///
     /// Returns the executable name (e.g. "opencode", "claude", "zsh").
@@ -369,57 +349,6 @@ impl TmuxClient {
             self.run(&["load-buffer", path_str])?;
             self.run(&["paste-buffer", "-t", &target])?;
         }
-        Ok(())
-    }
-
-    /// Paste text into a pane via load-buffer + paste-buffer.
-    /// Uses bracketed paste (-p) so the backend receives the entire payload
-    /// as a single paste event. This is more reliable than send-keys for
-    /// multi-line text and backends with custom TUI input widgets.
-    ///
-    /// A unique named buffer (`-b <uuid>`) is used per call so concurrent
-    /// deliveries — e.g. an initial-task spawn racing a scheduler event —
-    /// cannot clobber each other's payload via the shared unnamed buffer.
-    /// `-d` on paste-buffer deletes the buffer after pasting, so buffers
-    /// do not accumulate on error paths either.
-    ///
-    /// `-r` disables tmux's default LF→CR replacement inside the paste.
-    /// Without it, every `\n` in the payload is delivered to the target pane
-    /// as `\r`. TUI backends like Claude Code run the terminal in raw mode
-    /// (ICRNL off), so those CRs are not translated back to LF and each one
-    /// reads as an Enter keypress inside the input widget — turning a single
-    /// multi-line prompt into a cascade of blank submissions. Reproduced on
-    /// tmux 3.2a (Ubuntu 22.04); newer tmux builds on macOS appear to mask
-    /// this but `-r` makes behavior identical across versions.
-    pub fn paste_text(&self, target: &str, text: &str) -> Result<()> {
-        let target = exact_pane_target(target);
-        let buffer_name = format!("omar-paste-{}", uuid::Uuid::new_v4());
-
-        // Owner-only temp file (payloads can carry pasted secrets), removed
-        // when `tmp` drops.
-        let mut tmp = crate::paths::create_private_temp_file("omar-paste", "txt")
-            .context("Failed to create temp file for paste payload")?;
-        tmp.write_all(text.as_bytes())
-            .context("Failed to write paste text to temp file")?;
-        let path_str = tmp
-            .path()
-            .to_str()
-            .context("Temp file path is not valid UTF-8")?;
-        self.run(&["load-buffer", "-b", &buffer_name, path_str])?;
-        // Paste from the named buffer using bracketed paste mode so the
-        // target pane treats it as a single paste operation. `-d` deletes
-        // the buffer after pasting. `-r` preserves LFs verbatim — see the
-        // doc comment above for why this matters for raw-mode TUIs.
-        self.run(&[
-            "paste-buffer",
-            "-b",
-            &buffer_name,
-            "-t",
-            &target,
-            "-d",
-            "-p",
-            "-r",
-        ])?;
         Ok(())
     }
 
@@ -716,26 +645,6 @@ impl TmuxClient {
                     .and_then(|command| crate::manager::command_backend_name(&command))
             })
             .map(|backend| backend.to_string())
-    }
-
-    /// Where the terminal caret sits, and whether the backend leaves it
-    /// visible. A hidden caret means the position is not meaningful.
-    pub fn caret_position(&self, target: &str) -> Option<(usize, usize)> {
-        let target = exact_pane_target(target);
-        let output = self
-            .run(&[
-                "display-message",
-                "-t",
-                &target,
-                "-p",
-                "#{cursor_flag} #{cursor_y} #{cursor_x}",
-            ])
-            .ok()?;
-        let mut fields = output.split_whitespace();
-        let visible = fields.next()? == "1";
-        let row = fields.next()?.parse().ok()?;
-        let col = fields.next()?.parse().ok()?;
-        visible.then_some((row, col))
     }
 
     /// Kill a session
@@ -1058,15 +967,6 @@ mod tests {
         }
     }
 
-    /// Cleanup guard: remove a path on drop (even on panic or early return).
-    /// Best-effort — missing files are fine.
-    struct TempPathGuard(std::path::PathBuf);
-    impl Drop for TempPathGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
     #[test]
     fn test_has_session_uses_exact_target_not_tmux_prefix_match() {
         if !tmux_available() {
@@ -1184,7 +1084,7 @@ mod tests {
     /// Regression: on tmux 3.6a (macOS homebrew) `#{pane_activity}` is empty
     /// unless `monitor-activity` is enabled. `get_pane_activity` used to
     /// swallow this with `unwrap_or(0)`, freezing the "activity timestamp"
-    /// at 0 forever and breaking `wait_for_stable` / `wait_for_change` on
+    /// at 0 forever and breaking `wait_for_stable` on
     /// readiness-gated prompt delivery. This test asserts we get a usable,
     /// advancing timestamp out of the box (no monitor-activity needed).
     #[test]
@@ -1476,131 +1376,5 @@ mod tests {
         // but small enough to catch the ~1-3 KB tasks that silently fail
         const { assert!(TmuxClient::LARGE_PAYLOAD_THRESHOLD >= 512) };
         const { assert!(TmuxClient::LARGE_PAYLOAD_THRESHOLD <= 8192) };
-    }
-
-    /// Regression: on tmux 3.2a (Ubuntu 22.04), `paste-buffer` without `-r`
-    /// replaces every LF in the buffer with CR by default. TUI backends like
-    /// Claude Code run the terminal in raw mode (ICRNL off), so those CRs
-    /// arrive unchanged and each reads as an Enter keypress in the input
-    /// widget — turning a multi-line prompt into a cascade of blank
-    /// submissions. `paste_text` must use `-r` so LFs survive verbatim.
-    ///
-    /// This test reproduces the raw-mode environment that exposes the bug:
-    /// without `stty -icrnl` the TTY driver translates CR→LF on input and
-    /// the test would pass trivially regardless of the flag, masking
-    /// regressions. A naive `cat > file` + `C-d` reader also won't work
-    /// because `-icanon` disables EOF interpretation; we use
-    /// `dd bs=1 count=N` instead so the reader exits deterministically
-    /// after the expected number of bytes.
-    #[test]
-    fn test_paste_text_preserves_lf_in_raw_mode() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let session = "omar-test-paste-preserves-lf";
-        let _ = tmux_command()
-            .args(["kill-session", "-t", session])
-            .output();
-        let _guard = SessionGuard(session.to_string());
-
-        let tmp_path =
-            std::env::temp_dir().join(format!("omar-paste-lf-{}.txt", uuid::Uuid::new_v4()));
-        let tmp_str = match tmp_path.to_str() {
-            Some(s) => s,
-            None => {
-                eprintln!(
-                    "Skipping test: temp path is not valid UTF-8: {:?}",
-                    tmp_path
-                );
-                return;
-            }
-        };
-        // Single-quote-escape the path for the shell command below so a
-        // TMPDIR containing spaces or metacharacters doesn't break the test
-        // (which would mask the regression by spuriously skipping).
-        let quoted_tmp_path = format!("'{}'", tmp_str.replace('\'', r"'\''"));
-        // Clean up the tmp file on every exit path (skip, assert fail, panic).
-        let _tmp_guard = TempPathGuard(tmp_path.clone());
-
-        // Start with an rc-less, non-login shell so users' rc files can't
-        // break session startup on CI runners with unusual setups.
-        let shell_cmd = "/bin/bash --norc --noprofile -i";
-        let ok = tmux_command()
-            .args(["new-session", "-d", "-s", session, shell_cmd])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            eprintln!("Skipping test: failed to create tmux session");
-            return;
-        }
-
-        // Give the shell a moment to draw, then put the pane into the raw-mode
-        // conditions that expose the bug (ICRNL off, non-canonical input) and
-        // start a deterministic N-byte reader.
-        thread::sleep(Duration::from_millis(200));
-        let payload = "line1\nline2\nline3";
-        let reader_cmd = format!(
-            "stty -icrnl -icanon; dd bs=1 count={} of={} 2>/dev/null",
-            payload.len(),
-            quoted_tmp_path,
-        );
-
-        let client = TmuxClient::new("omar-test-");
-        if client.send_keys_literal(session, &reader_cmd).is_err() {
-            eprintln!("Skipping test: send_keys_literal failed (sandbox?)");
-            return;
-        }
-        if client.send_keys(session, "Enter").is_err() {
-            eprintln!("Skipping test: send_keys Enter failed (sandbox?)");
-            return;
-        }
-        thread::sleep(Duration::from_millis(200));
-
-        if client.paste_text(session, payload).is_err() {
-            eprintln!("Skipping test: paste_text failed (sandbox?)");
-            return;
-        }
-
-        // Wait for dd to finish collecting the payload and flush the file.
-        // Poll briefly instead of sleeping blindly so slow runners still pass.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if let Ok(meta) = std::fs::metadata(&tmp_path) {
-                if meta.len() as usize >= payload.len() {
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        let got = match std::fs::read(&tmp_path) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("Skipping test: tmp file not produced: {}", e);
-                return;
-            }
-        };
-
-        // The core assertion: LFs must survive. With the bug, every \n in
-        // the payload arrives as \r, so the file would be "line1\rline2\rline3".
-        assert_eq!(
-            got,
-            payload.as_bytes(),
-            "paste_text must preserve LF (got {:?}, expected {:?}) — \
-             tmux is likely mangling \\n → \\r because `-r` is missing from \
-             the paste-buffer call in paste_text",
-            String::from_utf8_lossy(&got),
-            payload,
-        );
-    }
-
-    fn extract_sentinel_id(hay: &str, prefix: &str) -> Option<String> {
-        let start = hay.find(prefix)? + prefix.len();
-        let rest = &hay[start..];
-        let end = rest.find('>')?;
-        Some(rest[..end].to_string())
     }
 }

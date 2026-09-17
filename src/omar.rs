@@ -581,7 +581,6 @@ async fn async_main() -> Result<()> {
                     scheduler::events_store_path(&omar_dir),
                 )),
                 scheduler::TickerBuffer::new(),
-                scheduler::new_popup_receiver(),
                 config.dashboard.session_prefix.clone(),
             ));
             serve::run(address, &config, &omar_dir, target.id, restart_ea, !no_ea)
@@ -1373,12 +1372,10 @@ async fn run_dashboard(config: Config) -> Result<()> {
     let scheduler = Arc::new(scheduler::Scheduler::with_store(
         scheduler::events_store_path(&omar_dir),
     ));
-    let popup_receiver = scheduler::new_popup_receiver();
     let base_prefix = config.dashboard.session_prefix.clone();
     tokio::spawn(scheduler::run_event_loop(
         scheduler.clone(),
         ticker.clone(),
-        popup_receiver.clone(),
         base_prefix,
     ));
 
@@ -1762,17 +1759,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 continue;
                             }
 
-                            let selected_popup_receiver = app
-                                .selected_popup_receiver_name()
-                                .map(|name| (name, app.active_ea));
                             let popup_info = app
                                 .selected_agent()
                                 .map(|a| (a.session.name.clone(), app.client().clone()));
-
-                            // Tell the scheduler which agent popup is open so it
-                            // defers events for that receiver until the popup closes.
-                            // Include ea_id so suppression is scoped per-EA.
-                            *popup_receiver.lock().unwrap() = selected_popup_receiver;
 
                             // Release App lock before blocking popup call
                             drop(app);
@@ -1842,9 +1831,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                     app.set_status(format!("Error: {}", e));
                                 }
                             }
-
-                            // Popup closed — clear so events resume delivery
-                            *popup_receiver.lock().unwrap() = None;
                         }
                         KeyCode::Char('n') => {
                             if let Err(e) = app.spawn_agent() {

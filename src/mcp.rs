@@ -2603,7 +2603,7 @@ mod tests {
                 .unwrap();
             assert_eq!(crate::channel::drain_spool(&spool), ["FOLLOWUP_SENTINEL"]);
             assert!(!client
-                .capture_pane_visible(&session)
+                .capture_pane(&session, 50)
                 .unwrap()
                 .contains("FOLLOWUP_SENTINEL"));
         }
