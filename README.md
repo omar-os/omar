@@ -127,6 +127,21 @@ Shutdown the test project and its agents.
 | [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode` |
 | [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy` |
 
+Codex launch commands no longer disable the alternate screen. OMAR does not
+add `--no-alt-screen`; an explicit flag in a custom command is still respected.
+Remove that flag from an existing `default_command` to try the alternate screen,
+then launch a new session (running sessions keep their original arguments).
+
+The web terminal forwards Escape to the agent. Close with the **Close** button,
+**Ctrl+Shift+Escape**, or a click on the backdrop. New sessions use the launching
+terminal's dimensions, or 120×40 when headless. Web attachments start at the
+panel's measured size. After the last viewer in a daemon closes, OMAR restores
+the original size and sizing policy if no external client remains and the
+policy has not been changed. Concurrent clients still share tmux's window and
+its sizing policy; a manually sized window stays manual.
+
+Terminal regression reproduction and CI commands: [terminal UX tests](docs/terminal-ux.md).
+
 ## License
 
 BSD 3-Clause

@@ -54,7 +54,7 @@ refresh_interval = 1
 session_prefix = "omar-agent-"
 
 [agent]
-default_command = "$codex_exec --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
+default_command = "$codex_exec --dangerously-bypass-approvals-and-sandbox"
 default_workdir = "."
 EOF
 
@@ -193,6 +193,10 @@ fi
 
 if ! grep -q -- "--dangerously-bypass-approvals-and-sandbox" "$state_file"; then
   fail "startup command did not include the codex bypass flag"
+fi
+
+if grep -q -- "--no-alt-screen" "$state_file"; then
+  fail "startup command unexpectedly disabled the codex alternate screen"
 fi
 
 if capture_dashboard | grep -q "failed to start"; then

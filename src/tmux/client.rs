@@ -100,14 +100,14 @@ fn tail_pane_lines(output: String, lines: i32) -> String {
     capped
 }
 
-/// The size an agent's pane is created at.
-///
-/// A detached session with no size given is 80x24, and the backends are TUIs
-/// that render into whatever they are handed — so without this every agent
-/// works in a pane narrower than its own output. Nothing resizes it afterwards
-/// because nothing attaches, so it has to be right at creation.
-const AGENT_COLUMNS: &str = "200";
-const AGENT_ROWS: &str = "50";
+/// Prefer the launching terminal's geometry; headless launches use a modest
+/// 120x40 pane. A forced 200-column canvas makes the first ordinary attachment
+/// rewrap a large amount of TUI output before the backend can redraw.
+fn agent_dimensions(terminal: Option<(u16, u16)>) -> (u16, u16) {
+    terminal
+        .filter(|(cols, rows)| (2..=1000).contains(cols) && (2..=1000).contains(rows))
+        .unwrap_or((120, 40))
+}
 
 /// Session-environment key holding the backend a session was launched with.
 const SESSION_BACKEND_VAR: &str = "OMAR_BACKEND";
@@ -131,7 +131,16 @@ pub fn flatten_agent_name(agent: &str) -> String {
     agent.replace('.', "_")
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_TMUX: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn tmux_command() -> Command {
+    #[cfg(test)]
+    if let Some(path) = TEST_TMUX.with(|path| path.borrow().clone()) {
+        return Command::new(path);
+    }
     let mut cmd = Command::new("tmux");
     if let Ok(server) = std::env::var("OMAR_TMUX_SERVER") {
         let server = server.trim();
@@ -532,6 +541,32 @@ impl TmuxClient {
         opts: &DeliveryOptions,
         answered: &dyn Fn() -> bool,
     ) -> Result<()> {
+        if answered() {
+            return Ok(());
+        }
+        let mut draft = super::draft::SavedDraft::capture(self, session)?;
+        let delivered = self.deliver_prompt_inner(session, text, opts, answered);
+        let restored = draft.restore();
+        match (delivered, restored) {
+            (Err(delivery), Err(restore)) => Err(delivery.context(format!("{restore:#}"))),
+            (Err(delivery), Ok(())) => Err(delivery),
+            // Delivery succeeded: do not provoke a duplicate invocation just
+            // because restoration failed. The original is saved for recovery.
+            (Ok(()), Err(restore)) => {
+                tracing::error!("{restore:#}");
+                Ok(())
+            }
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn deliver_prompt_inner(
+        &self,
+        session: &str,
+        text: &str,
+        opts: &DeliveryOptions,
+        answered: &dyn Fn() -> bool,
+    ) -> Result<()> {
         // Per-delivery UUID so a stale sentinel from a previous delivery
         // cannot false-positive the end-sentinel poll on retry.
         let delivery_id = uuid::Uuid::new_v4().simple().to_string();
@@ -735,16 +770,10 @@ impl TmuxClient {
 
     /// Create a new detached session
     pub fn new_session(&self, name: &str, command: &str, workdir: Option<&str>) -> Result<()> {
-        let mut args = vec![
-            "new-session",
-            "-d",
-            "-s",
-            name,
-            "-x",
-            AGENT_COLUMNS,
-            "-y",
-            AGENT_ROWS,
-        ];
+        let (cols, rows) = agent_dimensions(crossterm::terminal::size().ok());
+        let cols = cols.to_string();
+        let rows = rows.to_string();
+        let mut args = vec!["new-session", "-d", "-s", name, "-x", &cols, "-y", &rows];
 
         if let Some(dir) = workdir {
             args.extend(["-c", dir]);
@@ -986,11 +1015,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_agent_pane_is_created_wider_than_the_tmux_default() {
-        // A detached session with no size is 80x24. The backends are TUIs, so
-        // that is the width they would draw into, and the terminal viewer
-        // adopts the agent's size rather than imposing one — it reported
-        // 80x24 because that is what the agent really had.
+    fn launch_geometry_uses_the_terminal_or_a_bounded_headless_fallback() {
+        assert_eq!(agent_dimensions(Some((91, 27))), (91, 27));
+        assert_eq!(agent_dimensions(None), (120, 40));
+        for invalid in [(0, 0), (1, 24), (80, 1001)] {
+            assert_eq!(agent_dimensions(Some(invalid)), (120, 40));
+        }
+    }
+
+    #[test]
+    fn an_agent_pane_starts_at_the_launch_geometry() {
+        // Detached launches use the caller's terminal when available, otherwise
+        // the same moderate fallback regardless of tmux's server defaults.
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;
@@ -1016,8 +1052,8 @@ mod tests {
             .output()
             .expect("tmux answers");
         let size = String::from_utf8_lossy(&reported.stdout).trim().to_string();
-        assert_ne!(size, "80x24", "the agent got tmux's default pane");
-        assert_eq!(size, format!("{AGENT_COLUMNS}x{AGENT_ROWS}"));
+        let (cols, rows) = agent_dimensions(crossterm::terminal::size().ok());
+        assert_eq!(size, format!("{cols}x{rows}"));
     }
 
     #[test]

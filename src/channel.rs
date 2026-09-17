@@ -49,10 +49,9 @@ pub enum Channel {
     /// model but not rendered in the transcript, and `noReply` seats it
     /// without starting a turn.
     OpencodeHttp { port: u16, session: String },
-    /// codex's app-server. `thread/inject_items` appends to the thread the
-    /// pane's TUI is showing without starting a turn and without drawing
-    /// anything, so the agent reads the event on its next turn and the
-    /// composer never moves.
+    /// Codex's app-server. `turn/start` with `toolOutput` wakes an idle
+    /// thread or queues the event on its active turn. The event retains tool
+    /// output semantics and the TUI's composer is never touched.
     CodexAppServer { socket: PathBuf },
     /// A file the backend's own hook drains into model context.
     ///
@@ -244,7 +243,7 @@ impl Channel {
             Channel::CodexAppServer { socket } => {
                 let mut session = CodexSession::open(socket)?;
                 let thread = session.only_thread()?;
-                session.inject(&thread, text)
+                session.deliver_event(&thread, text)
             }
             Channel::Spool { path } => {
                 if let Some(parent) = path.parent() {
@@ -636,17 +635,24 @@ impl CodexSession {
         only_thread(&listed).context("the pane has no single loaded thread to inject into")
     }
 
-    /// Append the event to a thread without starting a turn.
-    fn inject(&mut self, thread: &str, text: &str) -> Result<()> {
+    /// Start an idle thread, or queue tool output on its active turn.
+    ///
+    /// App-server owns the idle/active decision atomically. A separate read
+    /// followed by inject_items/start can strand an event when a turn ends,
+    /// or deliver it twice. Tool output also keeps scheduler messages from
+    /// masquerading as user instructions. No thread settings are overridden.
+    /// Protocol: https://learn.chatgpt.com/docs/app-server#start-a-turn
+    fn deliver_event(&mut self, thread: &str, text: &str) -> Result<()> {
         self.call(
-            "thread/inject_items",
+            "turn/start",
             serde_json::json!({
                 "threadId": thread,
-                "items": [{
-                    "type": "message",
-                    "role": "user",
-                    "content": [{ "type": "input_text", "text": text }],
-                }],
+                "input": [],
+                "toolOutput": {
+                    "name": "omar_event",
+                    "namespace": "omar",
+                    "output": text,
+                },
             }),
         )?;
         Ok(())
@@ -1247,6 +1253,20 @@ mod tests {
     /// asked, so the framing is checked against a real socket rather than a
     /// string.
     fn fake_app_server(listener: UnixListener, threads: Vec<&'static str>) -> Vec<String> {
+        fake_app_server_reply(
+            listener,
+            threads,
+            serde_json::json!({
+                "result": { "turn": { "id": "new-turn", "status": "inProgress", "items": [], "error": null } }
+            }),
+        )
+    }
+
+    fn fake_app_server_reply(
+        listener: UnixListener,
+        threads: Vec<&'static str>,
+        turn_reply: serde_json::Value,
+    ) -> Vec<String> {
         let (stream, _) = listener.accept().unwrap();
         // `tungstenite::accept` answers the upgrade, so the test exercises the
         // same handshake the app-server does rather than a hand-made reply.
@@ -1262,7 +1282,11 @@ mod tests {
 
         let mut asked = Vec::new();
         loop {
-            let tungstenite::Message::Text(body) = socket.read().unwrap() else {
+            let message = match socket.read() {
+                Ok(message) => message,
+                Err(_) => return asked,
+            };
+            let tungstenite::Message::Text(body) = message else {
                 continue;
             };
             asked.push(body.clone());
@@ -1291,8 +1315,22 @@ mod tests {
                     &request,
                     serde_json::json!({ "data": threads, "nextCursor": null }),
                 ),
-                "thread/inject_items" => {
-                    answer(&mut socket, &request, serde_json::json!({}));
+                "turn/start" => {
+                    // Notifications can interleave with the acknowledgement,
+                    // including completion of a previously active turn.
+                    socket
+                        .send(tungstenite::Message::Text(
+                            serde_json::json!({
+                                "method": "turn/completed", "params": { "threadId": threads[0] }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+                    let mut reply = turn_reply.clone();
+                    reply["id"] = request["id"].clone();
+                    socket
+                        .send(tungstenite::Message::Text(reply.to_string()))
+                        .unwrap();
                     return asked;
                 }
                 _ => {}
@@ -1301,7 +1339,7 @@ mod tests {
     }
 
     #[test]
-    fn an_event_reaches_codex_as_an_injected_item_over_the_app_server_socket() {
+    fn an_event_wakes_codex_with_tool_output_over_the_app_server_socket() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("app-server-control.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -1331,7 +1369,7 @@ mod tests {
                 "initialize",
                 "initialized",
                 "thread/loaded/list",
-                "thread/inject_items"
+                "turn/start"
             ]
         );
 
@@ -1340,11 +1378,81 @@ mod tests {
             inject["params"]["threadId"], "01a02051-f65b-7260-9afe-13ffe5229bf6",
             "the event belongs in the thread the pane is showing"
         );
-        let item = &inject["params"]["items"][0];
-        assert_eq!(item["role"], "user");
-        assert_eq!(item["content"][0]["text"], "CI went red on main");
+        assert_eq!(inject["params"]["input"], serde_json::json!([]));
+        assert_eq!(
+            inject["params"]["toolOutput"],
+            serde_json::json!({
+                "name": "omar_event", "namespace": "omar", "output": "CI went red on main"
+            })
+        );
+        assert_eq!(
+            inject["params"].as_object().unwrap().len(),
+            3,
+            "delivery must not override the thread's model, permissions or effort"
+        );
         // Every request is JSON-RPC; a notification carries no id.
         assert_eq!(asked[1].get("id"), None);
+    }
+
+    #[test]
+    fn an_active_turn_accepts_one_event_without_injection_or_interrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("active.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            fake_app_server_reply(
+                listener,
+                vec!["thread"],
+                serde_json::json!({"result": {"turn": {"id": "already-active", "status": "inProgress", "items": [], "error": null}}}),
+            )
+        });
+        Channel::CodexAppServer { socket }
+            .deliver("event during a tool call")
+            .unwrap();
+        let requests: Vec<serde_json::Value> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        let writes: Vec<_> = requests
+            .iter()
+            .filter(|request| request["params"].get("threadId").is_some())
+            .collect();
+        assert_eq!(
+            writes.len(),
+            1,
+            "start and inject together would duplicate the event"
+        );
+        assert_eq!(writes[0]["method"], "turn/start");
+        assert_eq!(writes[0]["params"]["input"], serde_json::json!([]));
+        assert_eq!(
+            writes[0]["params"]["toolOutput"]["output"],
+            "event during a tool call"
+        );
+    }
+
+    #[test]
+    fn a_rejected_turn_start_is_not_reported_as_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("rejected.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            fake_app_server_reply(
+                listener,
+                vec!["thread"],
+                serde_json::json!({"error": {"code": -32602, "message": "tool output rejected"}}),
+            )
+        });
+        let error = Channel::CodexAppServer { socket }
+            .deliver("event")
+            .unwrap_err();
+        assert!(error.to_string().contains("turn/start failed"));
+        assert_eq!(
+            server.join().unwrap().len(),
+            4,
+            "do not inject after a rejected wake"
+        );
     }
 
     #[test]
@@ -1483,7 +1591,7 @@ mod tests {
             failure.to_string().contains("no single loaded thread"),
             "unexpected error: {failure}"
         );
-        drop(server);
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 
     #[test]
