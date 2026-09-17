@@ -151,8 +151,11 @@ for retry. Unknown or unstamped agent sessions cannot receive terminal input.
 Codex receives `omar_event` tool output through its app-server. Claude receives
 native peer messages, which Claude distinguishes from operator prompts. OpenCode
 receives synthetic context through its asynchronous prompt API, which also wakes
-an idle session. Cursor and Antigravity use their hook queues: acceptance means
-queued, and an idle agent receives the message only when its next hook runs.
+an idle session. Cursor ACP and Antigravity stream-JSON run behind an OMAR protocol
+console with a durable inbox. A private socket wakes idle turns; messages arriving
+during a turn wait in the inbox. Restarting the same runner config resumes the
+native conversation and replays pending messages. Acceptance means persisted,
+not completed; crash recovery can replay a turn whose effects already occurred.
 The model-free topology stub drains a queue as well.
 
 Agent messages may remain visible as peer messages or tool context in backend
@@ -164,9 +167,16 @@ Existing raw sessions without the new `raw` backend stamp must be recreated to
 receive terminal text through this tool.
 
 Custom Codex launch commands that cannot attach to app-server no longer receive
-automated messages through a terminal fallback. Use a supported app-server launch
-or resolve the reported channel error. Multi-thread ambiguity is an error rather
-than permission to guess a conversation or type into its composer.
+automated messages through a terminal fallback. Compatibility Codex commands with
+profiles, search, or configuration overrides run through native `codex exec` in
+the same protocol console; subsequent turns resume the saved native conversation.
+Default Codex launches retain their app-server and interactive TUI. Use a
+supported launch or resolve the reported channel error. Multi-thread ambiguity is
+an error rather than permission to guess a conversation or type into its
+composer. Long state-directory paths use short private sockets. Old
+Cursor/Antigravity hook-only sessions must be relaunched to gain idle wake;
+delivery reports this requirement instead of silently queuing a message. No
+compatibility path submits terminal input.
 
 Channel readiness is part of startup: OpenCode creates and selects its session
 and records the endpoint before the launcher can exit or hand off to tmux.

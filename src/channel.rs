@@ -63,6 +63,8 @@ pub enum Channel {
     /// thread or queues the event on its active turn. The event retains tool
     /// output semantics and the TUI's composer is never touched.
     CodexAppServer { socket: PathBuf },
+    /// OMAR owns the native protocol process and durably queues each turn.
+    Managed { socket: PathBuf },
     /// A file the backend's own hook drains into model context.
     ///
     /// cursor-agent and antigravity take no message from outside, but both run
@@ -177,7 +179,7 @@ impl Channel {
             // A pane that has exited takes its app-server with it. Answering
             // with a channel whose socket is gone only costs the caller a
             // round trip before delivery reports failure.
-            if let Channel::CodexAppServer { socket } = &channel {
+            if let Channel::CodexAppServer { socket } | Channel::Managed { socket } = &channel {
                 if !socket.exists() {
                     return None;
                 }
@@ -208,6 +210,9 @@ impl Channel {
                     session: session.to_string(),
                 })
             }
+            "managed" => (!rest.is_empty()).then(|| Channel::Managed {
+                socket: PathBuf::from(rest),
+            }),
             "spool" => (!rest.is_empty()).then(|| Channel::Spool {
                 path: PathBuf::from(rest),
             }),
@@ -233,7 +238,6 @@ impl Channel {
             }
             Channel::OpencodeHttp { port, session } => {
                 let body = serde_json::json!({
-                    "noReply": false,
                     "parts": [{ "type": "text", "text": text, "synthetic": true }],
                 })
                 .to_string();
@@ -253,6 +257,21 @@ impl Channel {
                 let mut session = CodexSession::open(socket)?;
                 let thread = session.only_thread()?;
                 session.deliver_event(&thread, text)
+            }
+            Channel::Managed { socket } => {
+                use std::io::BufRead;
+                let mut stream = UnixStream::connect(socket)?;
+                stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+                stream.set_read_timeout(Some(WRITE_TIMEOUT))?;
+                writeln!(stream, "{}", serde_json::json!({"text":text}))?;
+                let mut reply = String::new();
+                std::io::BufReader::new(stream).read_line(&mut reply)?;
+                let reply: serde_json::Value = serde_json::from_str(&reply)?;
+                anyhow::ensure!(
+                    reply["accepted"].is_string(),
+                    "protocol inbox rejected message: {reply}"
+                );
+                Ok(())
             }
             Channel::Spool { path } => {
                 if let Some(parent) = path.parent() {
@@ -275,6 +294,7 @@ impl Channel {
             Channel::ClaudePeer { .. } => "claude peer socket",
             Channel::OpencodeHttp { .. } => "opencode http api",
             Channel::CodexAppServer { .. } => "codex app-server",
+            Channel::Managed { .. } => "managed backend protocol",
             Channel::Spool { .. } => "hook spool",
         }
     }
@@ -459,6 +479,12 @@ pub fn free_port() -> Option<u16> {
 /// Establish the channel before handing the pane to a caller that may exit or
 /// exec tmux. In-process background threads cannot survive that handoff.
 pub fn provision_at_launch(backend: Option<&str>, session: &str, command: &str) -> Result<()> {
+    if let Some(socket) = managed_launch_socket(command) {
+        crate::tmux::TmuxClient::new("")
+            .set_session_delivery(session, &format!("managed:{}", socket.display()))
+            .context("record backend delivery channel")?;
+        return Ok(());
+    }
     let stamp =
         match backend {
             Some("opencode") => match opencode_port(command) {
@@ -482,6 +508,11 @@ pub fn provision_at_launch(backend: Option<&str>, session: &str, command: &str) 
 
 /// Read the per-pane endpoint without changing or interpreting CODEX_HOME.
 /// Preserve support for already-running legacy launches during the transition.
+pub(crate) fn managed_launch_socket(command: &str) -> Option<PathBuf> {
+    let assignment = command.split_once("export OMAR_AGENT_SOCKET=")?.1;
+    unquote_single(assignment).map(PathBuf::from)
+}
+
 pub(crate) fn codex_launch_socket(command: &str) -> Option<PathBuf> {
     if let Some((_, assignment)) = command.split_once("export OMAR_CODEX_SOCKET=") {
         let path = unquote_single(assignment)?;
@@ -819,8 +850,23 @@ fn accepts_peer_messages(pid: u32) -> bool {
 
 /// Was `--settings` with [`CLAUDE_INBOUND_ACCEPT`] on the process's launch line?
 fn launched_to_accept(pid: u32) -> bool {
-    let pair = format!("--settings {}", CLAUDE_INBOUND_ACCEPT);
-    process_argv(pid).is_some_and(|argv| argv.contains(&pair))
+    process_argv(pid).is_some_and(|argv| argv_settings_accept(&argv))
+}
+
+fn argv_settings_accept(argv: &str) -> bool {
+    // OMAR may combine inbound acceptance with lifecycle hooks in one native
+    // settings object. Compare the setting, not one exact JSON serialization.
+    let Some((_, tail)) = argv.rsplit_once("--settings") else {
+        return false;
+    };
+    let Some(settings) = tail.strip_prefix('=').or_else(|| tail.strip_prefix(' ')) else {
+        return false;
+    };
+    serde_json::Deserializer::from_str(settings.trim_start())
+        .into_iter::<serde_json::Value>()
+        .next()
+        .and_then(Result::ok)
+        .is_some_and(|value| value["crossSessionInbound"] == "accept")
 }
 
 /// A process's arguments, space-joined. `/proc` is exact and needs no other
@@ -882,6 +928,24 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     #[test]
+    fn combined_claude_hook_settings_still_allow_peer_delivery() {
+        for separator in [" ", "="] {
+            let argv = format!(
+                "claude --settings{separator}{} --append-system-prompt instructions",
+                serde_json::json!({
+                    "hooks":{"Stop":[{"hooks":[{"type":"command","command":"omar agent-hook --context-file /tmp/a b.json"}]}]},
+                    "crossSessionInbound":"accept"
+                })
+            );
+            assert!(argv_settings_accept(&argv));
+        }
+        assert!(!argv_settings_accept("claude --settings {}"));
+        assert!(!argv_settings_accept(
+            "claude --settings {\"crossSessionInbound\":\"hold\"}"
+        ));
+    }
+
+    #[test]
     fn opencode_wakes_with_synthetic_context_without_a_user_prompt() {
         use std::io::BufRead;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -906,7 +970,7 @@ mod tests {
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["noReply"], false);
+            assert!(body.get("noReply").is_none());
             assert_eq!(body["parts"][0]["synthetic"], true);
             assert_eq!(body["parts"][0]["text"], "agent event");
             stream

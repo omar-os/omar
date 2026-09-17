@@ -1337,11 +1337,14 @@ impl OmarMcpServer {
                 header
             };
             let backend_name2 = backend_name.clone();
+            let managed_protocol = crate::channel::managed_launch_socket(&command).is_some();
             let readiness_markers = crate::tmux::backend_readiness_markers(&backend_name).to_vec();
             let (delivery_tx, delivery_rx) = std::sync::mpsc::channel();
             thread::spawn(move || {
                 let delivery_start = std::time::Instant::now();
-                let readiness = if !readiness_markers.is_empty() {
+                let readiness = if managed_protocol {
+                    Ok(())
+                } else if !readiness_markers.is_empty() {
                     let ready = client2.wait_for_markers(
                         &session2,
                         &readiness_markers,

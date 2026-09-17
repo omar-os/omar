@@ -1,5 +1,6 @@
 mod app;
 mod backend_probe;
+mod backend_runner;
 mod channel;
 mod chat_history;
 mod computer;
@@ -173,6 +174,14 @@ enum Commands {
         format: String,
         #[arg(long)]
         event: Option<String>,
+    },
+
+    /// Run a protocol-backed agent with a durable side-channel inbox.
+    BackendRunner {
+        #[arg(long)]
+        backend: String,
+        #[arg(long)]
+        config_file: PathBuf,
     },
 
     /// Start the OMAR MCP server over stdio
@@ -502,6 +511,10 @@ async fn async_main() -> Result<()> {
                 EventAction::Cancel { id } => cancel_cli_event(&scheduler, target.id, &id),
             }
         }
+        Some(Commands::BackendRunner {
+            backend: _,
+            config_file,
+        }) => backend_runner::run(&config_file).await,
         Some(Commands::AgentHook {
             context_file,
             format,

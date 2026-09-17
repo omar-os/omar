@@ -111,6 +111,7 @@ jobs:
           cargo build -p omar
           python3 tests/ci/legacy_supervision.py
           python3 tests/ci/backend_coordination_contracts.py
+          python3 tests/ci/protocol_runner.py
 
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1
@@ -136,6 +137,7 @@ jobs:
       - name: Verify shared history, resume, event delivery, and composer rendering
         run: |
           "$RUNNER_TEMP/codex-test/bin/python" tests/ci/codex_shared_home.py
+          "$RUNNER_TEMP/codex-test/bin/python" tests/ci/codex_exec_delivery.py
           "$RUNNER_TEMP/codex-test/bin/python" tests/ci/codex_event_wake.py
 
   backend-supervision-contracts:

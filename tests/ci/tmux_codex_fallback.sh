@@ -35,7 +35,7 @@ state_file="__STATE_FILE__"
 prev_attempt=$(cat "${state_file}.count" 2>/dev/null || echo 0)
 attempt=$(( prev_attempt + 1 ))
 printf '%s\n' "$*" >> "$state_file"
-# Confirm the direct fallback does not create an isolated history home.
+# Confirm native exec uses the operator history home.
 printf 'CODEX_HOME=%s\n' "${CODEX_HOME:-}" >> "$state_file"
 echo "$attempt" > "${state_file}.count"
 printf '%s\n' "attempt ${attempt}" >> "$state_file"
@@ -139,6 +139,29 @@ wait_for_session omar-dashboard || fail "dashboard session did not start"
 wait_for_session omar-agent-ea-0 || fail "initial manager session failed to appear"
 wait_for_live_manager omar-agent-ea-0 || fail "manager session never became live"
 
+# The managed console is idle until a side-channel message starts native exec.
+# Never type into the agent's terminal to trigger this test.
+export OMAR_TEST_SERVER="$server"
+python3 - <<'PYTHON'
+import json, os, socket, subprocess, time
+for _ in range(120):
+    stamp = subprocess.run(['tmux', '-L', os.environ['OMAR_TEST_SERVER'], 'show-environment',
+                            '-t', 'omar-agent-ea-0', 'OMAR_DELIVERY'], capture_output=True, text=True).stdout.strip()
+    if stamp.startswith('OMAR_DELIVERY=managed:'):
+        path = stamp.split('managed:', 1)[1]
+        try:
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(path)
+                client.sendall(b'{"text":"startup verification"}\n')
+                assert 'accepted' in json.loads(client.makefile('rb').readline())
+                break
+        except FileNotFoundError:
+            pass
+    time.sleep(.1)
+else:
+    raise AssertionError('manager never exposed a managed side channel')
+PYTHON
+
 if ! wait_for_state_file; then
   fail "fake codex script was never invoked"
 fi
@@ -153,7 +176,7 @@ if ! grep -q "^attempt 1$" "$state_file"; then
   fail "failed to observe first startup attempt"
 fi
 
-# --search explicitly selects the direct compatibility path, independent of
+# --search explicitly selects the native exec protocol runner, independent of
 # the host's temporary-directory path length. The real shared-home/socket path
 # is checked separately by codex_shared_home.py.
 for setting in 'mcp_servers\.omar\.command' 'mcp_servers\.omar\.args' 'features.scheduled_tasks=false'; do

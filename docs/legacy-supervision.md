@@ -10,7 +10,7 @@ models no longer own the timers that keep their children moving.
 | Parent forgets a check-in | Runtime checks every 5 seconds; tracked tasks without OMAR tool activity receive a check-in after 60 seconds, also notifying their parent. |
 | Completion notification gets lost | `finish_task` atomically persists the result and notification obligation. Notifications retry every 60 seconds until consumption and retirement. |
 | Compaction loses child ownership | Every legacy MCP result carries a bounded live projection. Backend hooks restore/check it at the supported lifecycle boundaries below. |
-| Stored message mistaken for wake | OpenCode uses `prompt_async`; passive spools fall back to verified, draft-preserving input. Claude peer and Codex app-server paths stay active. |
+| Stored message mistaken for wake | OpenCode uses `prompt_async`; Cursor/Antigravity use managed native protocol sessions. Custom Codex flags use native `exec`; default Codex uses app-server. No terminal submission. |
 | Terminal activity mistaken for task completion | Structured task status is separate from terminal health. Health checks honor the configured idle interval. |
 | Claude coding policy replaced | OMAR uses `--append-system-prompt` / `--append-system-prompt-file`. |
 
@@ -22,23 +22,37 @@ MCP context projection, and host-owned reminders. Native adapters supplement tha
 | Backend | Fresh context | Stop / idle handling |
 | --- | --- | --- |
 | Claude Code | SessionStart (including compact), UserPromptSubmit | Stop blocks once for actionable obligations. |
-| Codex | SessionStart (including compact), UserPromptSubmit, PostToolUse | Stop blocks once; native hooks require Codex hook trust. |
-| Cursor | sessionStart, postToolUse, postToolUseFailure | Completed stop emits one followup; aborted/error/repeated stops do not. |
-| Antigravity (`agy`) | PreInvocation injects an ephemeral message before model calls | Shared host watchdog handles outstanding obligations. |
+| Codex | Every MCP result and host check-in; managed exec refreshes before each turn | Native app-server tool-output wake or managed exec inbox. |
+| Cursor | Fresh ledger projection before every ACP turn and after each MCP call | Durable runner inbox starts idle turns and serializes active work. |
+| Antigravity (`agy`) | Fresh ledger projection before every stream-JSON turn and after each MCP call | Durable runner inbox starts idle turns and serializes active work. |
 | OpenCode | System transform before model calls; compaction context append | session.idle arms the host watchdog for actionable obligations. |
 
-Codex per-pane homes retain personal developer instructions and user hooks. OMAR does not bypass Codex's hook
-trust checks: review generated hooks through `/hooks` before relying on native lifecycle injection.
-MCP projections and the host watchdog work independently of that approval.
-Cursor's `beforeSubmitPrompt` cannot inject context; old OMAR entries are migrated to supported events.
-Cursor has no immediate post-compaction injection in this adapter; the next supported hook, MCP result,
-or runtime check-in restores state. OpenCode appends to system/compaction context instead of replacing defaults.
-Antigravity uses its `injectSteps[].ephemeralMessage` hook response.
+Codex uses the operator's normal `CODEX_HOME`, with a separate socket per live session.
+OMAR leaves native user hooks untouched. It does not install additional Codex hooks: newly
+generated hooks gate native TUI startup behind a trust review. MCP projections and host check-ins
+restore ownership independently; the `agent-hook --format codex` adapter remains available for
+operators who explicitly configure and trust it. Commands with profiles, search, or arbitrary
+config overrides use native `codex exec` through an OMAR protocol console; Codex itself loads
+its configuration layers. Every subsequent turn resumes the saved native conversation ID.
+Long state-directory paths use a short private socket directory, preserving the native app-server route.
 
-Hook contracts: [Codex](https://learn.chatgpt.com/docs/hooks),
-[Cursor](https://cursor.com/docs/hooks), [OpenCode](https://opencode.ai/docs/plugins).
-Antigravity's adapter follows the hook protobuf exposed by the installed CLI; it lacks equivalent
-public documentation and is tested at the adapter boundary.
+Cursor ACP and Antigravity stream-JSON launches use an OMAR protocol console in the pane.
+These replace their interactive TUI launch paths. The console accepts operator lines; automated
+messages arrive only over its private Unix socket. A receipt means the message is persisted,
+not that the model completed the turn. Accepted work stays queued until native turn completion.
+After a process restart with the same config, the runner resumes the native conversation and
+replays pending messages with their original IDs and freshly read ownership state. Recovery is
+at least once: a crash after tool execution can replay that turn, so receipts do not guarantee
+exactly-once external effects. Cursor permissions are approved only when the launch explicitly
+requests `--yolo`/`--force`; otherwise permission requests are cancelled and reported.
+
+Existing Cursor/Antigravity hook-only sessions cannot wake while idle. Ordinary delivery reports
+a relaunch requirement instead of claiming success; scheduled obligations remain pending.
+The model-free topology stub keeps its actively drained spool.
+
+Native contracts: [Codex hooks](https://learn.chatgpt.com/docs/hooks),
+[Cursor ACP](https://cursor.com/docs/cli/acp), [OpenCode plugins](https://opencode.ai/docs/plugins),
+and [Antigravity headless protocol](https://antigravity.google/docs/cli/headless/).
 
 ## Result protocol
 
@@ -76,6 +90,8 @@ cargo fmt --all -- --check
 cargo build -p omar
 python3 tests/ci/legacy_supervision.py
 python3 tests/ci/backend_coordination_contracts.py
+python3 tests/ci/protocol_runner.py
+python3 tests/ci/codex_exec_delivery.py
 python3 tests/ci/codex_event_wake.py
 python3 tests/ci/claude_prompt_contract.py
 python3 tests/ci/opencode_wake_contract.py
@@ -89,5 +105,18 @@ blocked/resumed tasks, crashes, compaction hooks, bounded context, and lossless 
 These prove runtime/transport invariants, not universal model quality or an LLM success-rate benchmark.
 
 The all-backend contract test exercises production hook output and the generated OpenCode plugin.
-Native Cursor and Antigravity model turns have not been validated end to end; their adapter tests
-do not establish model compliance. The native Codex test validates wake delivery, not hook trust approval.
+`protocol_runner.py` verifies idle wake, active-turn serialization, durable acceptance, process
+crash/replay, native session resume, and fresh ownership against deterministic protocol peers.
+`codex_exec_delivery.py` uses production MCP spawn/delivery and an installed Codex CLI with a local
+provider to check profile/config compatibility and native conversation continuity.
+
+`OMAR_LIVE_BACKENDS=1 python3 tests/ci/native_protocol_agents.py` is an opt-in authenticated test.
+Cursor and Antigravity have each completed two idle-separated live turns with the same conversation
+ID and remembered content; Cursor prompt-recall history remained unchanged. This is a transport
+and continuity check, not a benchmark of autonomous multi-level management or native compaction.
+The native Codex wake test does not establish hook trust approval.
+
+`OMAR_LIVE_BACKENDS=1 python3 tests/ci/native_legacy_workflow.py` additionally checks a live
+Cursor worker using OMAR MCP to finish a tracked task. The host wakes a scripted OpenCode-contract
+parent, which reads, acknowledges and retires the result, then completes the project. This verifies
+native tool access and the lifecycle across transports; the parent is not an autonomous model.
