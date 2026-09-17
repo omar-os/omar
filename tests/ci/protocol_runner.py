@@ -32,6 +32,9 @@ for line in sys.stdin:
         elif method == 'session/new': result = {'sessionId': 'native-session'}
         else: result = {}
         if 'id' in message:
+            # Observed from the real Cursor CLI before its initialize reply.
+            # Losing this reply strands startup even though the peer is ready.
+            if method == 'initialize': sys.stdout.write('\x1bM\x1b[K')
             print(json.dumps({'jsonrpc':'2.0','id':message['id'],'result':result}), flush=True)
     else:
         print(json.dumps({'event':'init','conversation_id':'native-session'}), flush=True)

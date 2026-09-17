@@ -46,7 +46,7 @@ A pass requires a correct combined artifact, worker-attributed execution, no liv
 sessions and an actual PM completion report. The integrated ledger additionally exposes
 result consumption/retirement; baseline results use its native completion notification.
 Missing data is not a pass. Startup/delegation failure is distinct from failure after
-both workers produced results. Completed-child-to-retirement latency is a measurable
+both workers produced results. Worker-output-to-retirement latency is a measurable
 coordination delay, not an inference about model idleness from a quiet terminal.
 
 Raw case directories contain a chronological state trace, assignments, final task ledger,
@@ -82,3 +82,37 @@ OMAR_LIVE_BACKENDS=1 python3 tests/benchmarks/workflow.py \
 This invokes live models and consumes their normal account quota. There are no CI secrets
 or account tokens in the result manifest. The fully offline regression suite remains a
 separate gate; this benchmark adds evidence about model behavior.
+
+## Executable and fixture isolation
+
+The runner snapshots both binaries under the private output directory before launching
+any case. Every subsequent native process and MCP server uses those exact bytes. This
+prevents a concurrent development build from silently changing an ongoing trial. The
+manifest records the source revisions, binary hashes and hashes of the driver and context
+helpers. A nonempty output directory is rejected rather than overwritten.
+
+Cursor's isolated workspace is explicitly trusted for both interactive and ACP launch
+modes. Context-reset commands are decoded back into their original argument vector;
+passing tmux's escaped display string through another shell can change dollar expansion.
+The reset regression test exercises this round trip using a real, disposable tmux server.
+After each trial the driver stops captured pane descendants and Codex app servers using
+that trial's unique home before removing credentials and fixture files.
+
+A respawned worker invalidates any prior retirement timestamp for that name. Reports
+recompute retirement latency from saved state traces, and never use a pre-result exit as
+successful result retirement. Missing result files remain explicit invalid trials in the
+report. Reviewed setup exclusions are stored separately from raw outcomes.
+
+Generate a report with:
+
+```sh
+python3 tests/benchmarks/summarize.py /tmp/omar-workflow-results \
+  --json docs/benchmarks/results.json --markdown docs/benchmarks/results.md
+python3 -m unittest discover -s tests/benchmarks -p 'test_*.py'
+```
+
+The first live results and release limitations are in
+[the September 17 report](benchmarks/2026-09-17-analysis.md). They cover all five parent
+backends on the normal task. Verified native compaction and fresh-conversation tests cover
+Codex and OpenCode; they do not establish context recovery for the other three backends,
+Mission Control, deep hierarchies, arbitrary graphs, or long-running projects.

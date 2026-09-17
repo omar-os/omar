@@ -72,6 +72,12 @@ def native_compact(tmux,backend,model):
     raise NotImplementedError('native compaction is not verified for '+backend)
 
 
+def launch_argv(command):
+    # tmux's args_string escapes dollar signs/backticks in quoted arguments.
+    # shlex preserves those escapes, although a shell would remove them.
+    return [arg.replace('\\$', '$').replace('\\`', '`') for arg in shlex.split(command)]
+
+
 def fresh_conversation(tmux,backend,home):
     """Replace the PM backend process, keep its named pane and task ownership."""
     if backend=='claude':
@@ -88,7 +94,7 @@ def fresh_conversation(tmux,backend,home):
             return None
         old_id=identity(); assert old_id, 'Claude session identity unavailable'
         command=tmux('display-message','-p','-t','bench-0-pm','#{pane_start_command}').strip()
-        tmux('respawn-pane','-k','-t','bench-0-pm',command)
+        tmux('respawn-pane','-k','-t','bench-0-pm',*launch_argv(command))
         deadline=time.monotonic()+50
         while time.monotonic()<deadline:
             new_id=identity()
@@ -109,7 +115,7 @@ def fresh_conversation(tmux,backend,home):
         replacement.write_text(json.dumps(config)); replacement.chmod(0o600)
         command=command.replace(str(config_path),str(replacement)).replace(old_stamp.split(':',1)[1],str(new_socket))
         tmux('set-environment','-t','bench-0-pm','OMAR_DELIVERY','managed:'+str(new_socket))
-        tmux('respawn-pane','-k','-t','bench-0-pm',command)
+        tmux('respawn-pane','-k','-t','bench-0-pm',*launch_argv(command))
         time.sleep(1)
         deadline=time.monotonic()+50
         new_inbox=replacement.with_suffix('.inbox.json')
@@ -128,7 +134,13 @@ def fresh_conversation(tmux,backend,home):
         path=old_stamp.split(':',1)[1]; rpc=Rpc(path)
         try: old_ids=rpc.call('thread/loaded/list',{})['data']; assert len(old_ids)==1; old_id=old_ids[0]
         finally: rpc.close()
-        tmux('respawn-pane','-k','-t','bench-0-pm',command)
+        # A surviving app-server or stale socket can reconnect the TUI to the
+        # old thread. A new endpoint is part of the verified conversation reset.
+        new_path=str(home/'reset-codex.sock')
+        command=command.replace(path,new_path)
+        tmux('set-environment','-t','bench-0-pm','OMAR_DELIVERY','codex:'+new_path)
+        tmux('respawn-pane','-k','-t','bench-0-pm',*launch_argv(command))
+        path=new_path
         time.sleep(1)
         deadline=time.monotonic()+50
         while time.monotonic()<deadline:
@@ -143,7 +155,7 @@ def fresh_conversation(tmux,backend,home):
         raise TimeoutError('Codex did not create a new native conversation')
     if old_stamp.startswith('opencode:'):
         _,port,old_id=old_stamp.split(':',2); port=int(port)
-        tmux('respawn-pane','-k','-t','bench-0-pm',command)
+        tmux('respawn-pane','-k','-t','bench-0-pm',*launch_argv(command))
         time.sleep(1)
         deadline=time.monotonic()+50; created=None
         while time.monotonic()<deadline:

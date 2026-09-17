@@ -10,9 +10,11 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import selectors
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -158,6 +160,36 @@ def task(children):
     ])
 
 
+def fixture_processes(home, roots):
+    rows=subprocess.check_output(['ps','-axo','pid=,ppid=,command='],text=True).splitlines()
+    processes={}
+    for row in rows:
+        parts=row.strip().split(None,2)
+        if len(parts)==3: processes[int(parts[0])]=(int(parts[1]),parts[2])
+    owned=set(roots)
+    for pid,(_,command) in processes.items():
+        if 'codex' in command and ' app-server ' in command and (str(home)+'/' in command or str(home.resolve())+'/' in command):
+            owned.add(pid)
+    while True:
+        expanded=owned|{pid for pid,(parent,_) in processes.items() if parent in owned}
+        if expanded==owned: break
+        owned=expanded
+    owned.discard(os.getpid())
+    return {pid:processes[pid][1] for pid in owned if pid in processes}
+
+
+def stop_fixture_processes(owned):
+    # Native app servers may outlive the pane that launched them. Only terminate
+    # captured descendants or Codex app servers using this case's private home.
+    for sig in [signal.SIGTERM,signal.SIGKILL]:
+        for pid,command in owned.items():
+            current=subprocess.run(['ps','-p',str(pid),'-o','command='],capture_output=True,text=True)
+            if current.stdout.strip()!=command: continue
+            try: os.kill(pid,sig)
+            except ProcessLookupError: pass
+        if sig==signal.SIGTERM: time.sleep(.5)
+
+
 def run_case(binary, revision, variant, parent_backend, scenario, seed, output, budget):
     case_id = f'{variant}-{parent_backend}-{scenario}-{seed}'
     case_dir = output / case_id; case_dir.mkdir(parents=True)
@@ -183,6 +215,12 @@ def run_case(binary, revision, variant, parent_backend, scenario, seed, output, 
         trust = json.loads((home/'.claude.json').read_text())
         trust['projects'] = {str(work.resolve()): {'hasTrustDialogAccepted': True, 'hasCompletedProjectOnboarding': True}}
         write_json(home/'.claude.json',trust)
+        # Cursor's interactive and ACP modes must start from the same trusted workspace.
+        for workspace in {str(work),str(work.resolve())}:
+            key=re.sub(r'[^a-zA-Z0-9]+','-',workspace).strip('-')
+            marker=home/'.cursor/projects'/key/'.workspace-trusted'
+            marker.parent.mkdir(parents=True,exist_ok=True)
+            write_json(marker,{'workspacePath':workspace,'trustMethod':'benchmark-fixture'})
         env = environment(home,server)
         config = '[dashboard]\nsession_prefix="bench-"\n[agent]\ndefault_command="cat"\ndefault_workdir='+json.dumps(str(work))+'\n'
         (state/'config.toml').write_text(config)
@@ -231,16 +269,20 @@ def run_case(binary, revision, variant, parent_backend, scenario, seed, output, 
                         result['intervention']=native_compact(tmux,parent_backend,MODELS[parent_backend])
                     elif scenario == 'restart':
                         result['intervention']=fresh_conversation(tmux,parent_backend,home)
-                    (work/'release').touch(); released=True; result['released_s']=elapsed
+                    (work/'release').touch(); released=True
+                    elapsed=round(time.monotonic()-started,3); result['released_s']=elapsed
                 outputs = {}
                 for role in ['left','right']:
                     try: outputs[role]=json.loads((work/f'{role}.output.json').read_text())
                     except (OSError,json.JSONDecodeError): pass
                 for role in ['left','right']:
                     child_session='bench-0-'+role
-                    if child_session in sessions: seen_children.add(role)
+                    if child_session in sessions:
+                        seen_children.add(role)
+                        retired_times.pop(role,None)
                     if role in outputs: output_times.setdefault(role,elapsed)
-                    if role in seen_children and child_session not in sessions: retired_times.setdefault(role,elapsed)
+                    if role in seen_children and role in outputs and child_session not in sessions:
+                        retired_times.setdefault(role,elapsed)
                 final = None
                 try: final=json.loads((work/'final.json').read_text())
                 except (OSError,json.JSONDecodeError): pass
@@ -275,15 +317,21 @@ def run_case(binary, revision, variant, parent_backend, scenario, seed, output, 
                 result_receipts=len(receipts),terminal_unacknowledged=sum(t['status'] in ['completed','failed'] and not t['acknowledged'] for t in tasks if t['agent']!='pm'))
             if result['outcome']=='timeout' and both_ready is None:
                 result['failure_phase']='startup_or_delegation'
-            elif result['outcome']=='timeout': result['failure_phase']='result_collection_or_retirement'
+            elif result['outcome']=='timeout':
+                result['failure_phase']='result_collection_or_retirement' if len(outputs)==2 else 'delegated_work'
             write_json(case_dir/'ledger.json',ledger)
         except Exception as error:
             result['error']=str(error)
         finally:
             for name in tmux('list-sessions','-F','#{session_name}',check=False).splitlines():
                 (case_dir/(name+'.txt')).write_text(tmux('capture-pane','-p','-S','-500','-t',name,check=False))
+            roots=[int(pid) for pid in tmux('list-panes','-a','-F','#{pane_pid}',check=False).splitlines()]
+            if mcp: roots.append(mcp.process.pid)
+            owned=fixture_processes(home,roots)
             if mcp: mcp.close()
             tmux('kill-server',check=False)
+            stop_fixture_processes(owned)
+            write_json(case_dir/'result.json',result)
             httpd.shutdown(); httpd.server_close(); log.close()
     write_json(case_dir/'result.json',result)
     print(json.dumps({k:result.get(k) for k in ['case_id','outcome','elapsed_s','failure_phase','error']}),flush=True)
@@ -295,8 +343,8 @@ def main():
     parser.add_argument('--baseline',type=Path,required=True)
     parser.add_argument('--candidate',type=Path,default=ROOT/'target/debug/omar')
     parser.add_argument('--output',type=Path,required=True)
-    parser.add_argument('--parents',nargs='+',default=list(CHILDREN))
-    parser.add_argument('--variants',nargs='+',default=['baseline','candidate'])
+    parser.add_argument('--parents',nargs='+',choices=list(CHILDREN),default=list(CHILDREN))
+    parser.add_argument('--variants',nargs='+',choices=['baseline','candidate'],default=['baseline','candidate'])
     parser.add_argument('--scenarios',nargs='+',choices=['normal','compact','restart'],default=['normal'])
     parser.add_argument('--seeds',nargs='+',type=int,default=[314159])
     parser.add_argument('--budget',type=int,default=240)
@@ -307,6 +355,9 @@ def main():
     CLAUDE_OAUTH_TOKEN = cached_claude_oauth()
     CURSOR_ACCESS_TOKEN = cached_cursor_access()
     CURSOR_REFRESH_TOKEN = cached_cursor_access("refresh")
+    if args.output.exists() and any(args.output.iterdir()): parser.error('output must be empty; preserve prior trials')
+    if args.jobs<1 or args.budget<1: parser.error('jobs and budget must be positive')
+    if any(len(v)!=len(set(v)) for v in [args.parents,args.variants,args.scenarios,args.seeds]): parser.error('duplicate cases are not allowed')
     args.output.mkdir(parents=True,exist_ok=True); args.output.chmod(0o700)
     revisions={}
     for variant,binary in [('baseline',args.baseline),('candidate',args.candidate)]:
@@ -323,11 +374,22 @@ def main():
             'launcher_sha256':hashlib.sha256(Path(shutil.which(arguments[0])).resolve().read_bytes()).hexdigest()}
     manifest={'revisions':revisions,'models':MODELS,'cases':jobs,'budget':args.budget,'versions':versions,
         'harness_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),'human_reminders':0,
+        'helper_sha256':{name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in ['worker_fixture.py','context_interventions.py']},
+        'parallel_cases':args.jobs,
         'binary_sha256':{v:hashlib.sha256(p.read_bytes()).hexdigest() for v,p in [('baseline',args.baseline),('candidate',args.candidate)]}}
     write_json(args.output/'manifest.json',manifest)
+    # Keep exact executable bytes for every native child and later MCP launch.
+    # Rebuilding the development tree during a run must not mix revisions.
+    frozen={}
+    for variant,binary in [('baseline',args.baseline),('candidate',args.candidate)]:
+        destination=args.output/'binaries'/variant/'omar'
+        destination.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copy2(binary,destination); destination.chmod(0o700)
+        assert hashlib.sha256(destination.read_bytes()).hexdigest()==manifest['binary_sha256'][variant]
+        frozen[variant]=destination.resolve()
     results=[]
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
-        futures=[executor.submit(run_case,(args.baseline if v=='baseline' else args.candidate).resolve(),
+        futures=[executor.submit(run_case,frozen[v],
             revisions[v],v,p,scenario,seed,args.output,args.budget) for v,p,scenario,seed in jobs]
         for future in concurrent.futures.as_completed(futures):
             results.append(future.result()); write_json(args.output/'results.json',results)
