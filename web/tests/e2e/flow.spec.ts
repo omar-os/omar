@@ -1360,6 +1360,13 @@ test("the assistant terminal remains available before and after a topology opens
   await useFakeServe(page);
   const inspect = page.getByRole("button", { name: "Inspect on terminal" });
   await expect(inspect).toBeEnabled();
+  await expect(page.locator(".composer-tools").getByRole("button", { name: "Inspect on terminal" })).toBeVisible();
+  await expect(page.locator(".topbar, .panel-heading, .history-footnote")).toHaveCount(0);
+  await expect(page.getByRole("img", { name: "Omar", exact: true })).toBeVisible();
+  const backendBounds = (await page.locator(".backend-trigger").boundingBox())!;
+  const submitBounds = (await page.getByLabel("Draft workflow").boundingBox())!;
+  expect(backendBounds.height).toBe(submitBounds.height);
+  await page.screenshot({ path: "/tmp/omar-chat-layout-desktop.png" });
   await inspect.click();
   const terminal = page.getByRole("dialog", { name: "Terminal for the assistant" });
   await expect(terminal).toContainText(/\d+×\d+ · attached/);
@@ -1375,8 +1382,10 @@ test("the assistant terminal remains available before and after a topology opens
   await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
   await expect(page.locator(".messages")).toContainText("The planner");
 
-  // The topbar remains reachable even when the conversation is collapsed.
+  // The terminal belongs to the composer, so folding the chat folds it too.
   await dragDivider(page, "Resize the conversation", -2000);
+  await expect(inspect).toBeHidden();
+  await page.getByRole("button", { name: "Show the conversation" }).click();
   await expect(inspect).toBeVisible();
   await deploy(page);
   await expect(page.locator(".connection")).toContainText("finished", { timeout: 30_000 });
@@ -1384,6 +1393,7 @@ test("the assistant terminal remains available before and after a topology opens
   const bounds = (await inspect.boundingBox())!;
   expect(bounds.x).toBeGreaterThanOrEqual(0);
   expect(bounds.x + bounds.width).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: "/tmp/omar-chat-layout-mobile.png" });
   await inspect.click();
   await expect(terminal).toBeVisible();
 });

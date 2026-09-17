@@ -2,7 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
-import { ChatHistory, useHistoryDrawer } from "./chat-history";
+import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
@@ -790,60 +790,16 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
 
   return (
     <main className="studio-shell">
-      <header className="topbar">
-        <div className="brand">
-          {/* Fixed-size brand mark served straight from /public: next/image
-              would only add a loader round-trip on Workers. */}
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img className="brand-mark" src="/omar-logo.png" alt="" width={40} height={40} />
-          <span>OMAR <b>Mission Control</b></span>
-        </div>
-        <div className="runtime-controls">
-          {!isDemo ? (
-            <button
-              type="button"
-              className="terminal-button"
-              onClick={() => setTerminalAgent(ASSISTANT)}
-              disabled={daemon.state !== "live"}
-              aria-haspopup="dialog"
-            >
-              Inspect on terminal
-            </button>
-          ) : null}
-          <span
-            className={`daemon ${daemon.state}`}
-            aria-label="Runtime mode"
-            title={daemon.state === "offline" ? daemon.reason : undefined}
-          >
-            <i />
-            {daemon.state === "demo" ? "demo topology" : historyUrl}
-            {daemon.state === "offline" ? " · unreachable" : null}
-          </span>
-                    {!isDemo && historyDrawer ? (
-            <button
-              type="button"
-              ref={historyButtonRef}
-              className="history-button"
-              onClick={() => historyDrawer ? setDrawerOpen((open) => !open) : setHistoryOpen((open) => !open)}
-              aria-expanded={historyVisible}
-              aria-controls="chat-history"
-              aria-haspopup={historyDrawer ? "dialog" : undefined}
-                            aria-label="Open chat history"
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
-                <path d="M3 11a9 9 0 1 1 2.6 7M3 4v7h7M12 7v5l3 2" />
-              </svg>
-              History
-            </button>
-          ) : null}
-          <span className="connection" data-phase={phase}>
-            {phase}
-          </span>
-        </div>
-      </header>
+      <div className="visually-hidden" aria-live="polite">
+        <span className={`daemon ${daemon.state}`} aria-label="Runtime mode">
+          {isDemo ? "demo topology" : historyUrl}{daemon.state === "offline" ? " · unreachable" : ""}
+        </span>
+        <span className="connection" data-phase={phase}>{phase}</span>
+      </div>
 
       <div className="studio-content">
-                {!isDemo && (!historyDrawer || drawerOpen) ? (
+        {isDemo ? <aside className="history-rail" aria-label="Omar"><OmarLogo /></aside> : null}
+        {!isDemo && (!historyDrawer || drawerOpen) ? (
           <ChatHistory
             serveUrl={historyUrl}
             activeId={conversationId}
@@ -877,12 +833,23 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
             .filter(Boolean)
             .join(" ")}
         >
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">WORKFLOW BUILDER</span>
-              <h1>{conversationTitle}</h1>
+          <h1 className="visually-hidden">{conversationTitle}</h1>
+          {!isDemo && historyDrawer ? (
+            <div className="chat-mobile-controls">
+              <button
+                type="button"
+                ref={historyButtonRef}
+                className="history-button"
+                onClick={() => setDrawerOpen((open) => !open)}
+                aria-expanded={historyVisible}
+                aria-controls="chat-history"
+                aria-haspopup="dialog"
+                aria-label="Open chat history"
+              >
+                <SidebarIcon direction="open" />
+              </button>
             </div>
-          </div>
+          ) : null}
           <div className="messages" ref={threadRef}>
             {messages.length === 0 && snapshot ? (
               <p className="builder-status">
@@ -898,6 +865,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
           </div>
 
           {error ? <div className="connection-error">{error}</div> : null}
+          {daemon.state === "offline" ? <div className="connection-error" role="status">Cannot reach the runtime at {historyUrl}.</div> : null}
 
           {selection.length > 0 ? (
             <div className="selection-bar">
@@ -931,23 +899,36 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, onSelect }: S
               aria-label="Describe a workflow"
             />
             <div>
-              {phase === "review" && !canRun ? (
-                // Why deploying is unavailable, which is about this composer's
-                // reach rather than about the workflow. The run's own state
-                // left with the buttons: the panel says STATUS beside the
-                // control that changes it, and saying it twice invited the two
-                // to disagree.
-                <span className="composer-status">
-                  {daemon.state === "demo"
-                    ? "Demo topology — relaunch with OMAR_SERVE_URL to deploy"
-                    : `Cannot reach omar serve at ${serveUrl}`}
-                </span>
-              ) : (
-                <BackendMenu
-                  serveUrl={serveUrl}
-                  live={daemon.state === "live"}
-                />
-              )}
+              <div className="composer-tools">
+                {phase === "review" && !canRun ? (
+                  // Why deploying is unavailable, which is about this composer's
+                  // reach rather than about the workflow. The run's own state
+                  // left with the buttons: the panel says STATUS beside the
+                  // control that changes it, and saying it twice invited the two
+                  // to disagree.
+                  <span className="composer-status">
+                    {daemon.state === "demo"
+                      ? "Demo topology — relaunch with OMAR_SERVE_URL to deploy"
+                      : `Cannot reach omar serve at ${serveUrl}`}
+                  </span>
+                ) : (
+                  <BackendMenu
+                    serveUrl={serveUrl}
+                    live={daemon.state === "live"}
+                  />
+                )}
+                {!isDemo ? (
+                  <button
+                    type="button"
+                    className="terminal-button"
+                    onClick={() => setTerminalAgent(ASSISTANT)}
+                    disabled={daemon.state !== "live" || switchingChat || !conversationId}
+                    aria-haspopup="dialog"
+                  >
+                    Inspect on terminal
+                  </button>
+                ) : null}
+              </div>
               {/* Deploying and stopping live on the workflow panel, beside the
                   topology they act on. What is left here acts on the message
                   being written. */}

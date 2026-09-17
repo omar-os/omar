@@ -14,6 +14,12 @@ export function useHistoryDrawer() {
   return useSyncExternalStore(subscribeViewport, () => window.matchMedia(mobileQuery).matches, () => false);
 }
 
+export function OmarLogo() {
+  // Static artwork needs no image loader or remote request.
+  // eslint-disable-next-line @next/next/no-img-element
+  return <img className="brand-mark" src="/omar-logo.png" alt="Omar" width={40} height={40} />;
+}
+
 export function SidebarIcon({ direction }: { direction: "open" | "close" }) {
   return (
     <svg className="sidebar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
@@ -103,6 +109,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
   if (collapsed) {
     return (
       <nav className="history-rail" aria-label="Chat navigation">
+        <OmarLogo />
         <button
           ref={railButtonRef}
           type="button"
@@ -117,11 +124,12 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
   }
   const content = <>
     <header>
-      <h2 id="chat-history-title">Recent chats</h2>
+      <OmarLogo />
       <button type="button" className="history-fold" onClick={onClose} aria-label="Fold chat history" title="Fold sidebar">
         <SidebarIcon direction="close" />
       </button>
     </header>
+    <h2 id="chat-history-title">Recent chats</h2>
     <div className="history-actions">
       <button type="button" disabled={loading || switching} onClick={() => void select()}>+ New chat</button>
       <input aria-label="Search chats" placeholder="Search chats…" value={query} onChange={(event) => setQuery(event.target.value)} />
@@ -138,7 +146,6 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
       ))}
     </ul>
     {loading ? <p role="status">Loading conversations…</p> : visible.length === 0 && !error ? <p>No chats found.</p> : null}
-    <p className="history-footnote">Saved automatically on this runtime.</p>
   </>;
   return mobile ? (
     <dialog id="chat-history" ref={dialogRef} className="chat-history history-drawer" aria-label="Chat history" onCancel={onClose} onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>

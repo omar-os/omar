@@ -58,8 +58,9 @@ cargo run --bin omar -- serve --address 127.0.0.1:7340   # from the repository r
 OMAR_SERVE_URL=http://127.0.0.1:7340 npm run dev         # from web/
 ```
 
-The topbar shows the mode and whether the daemon is reachable, polled every few
-seconds. Describe a workflow, then **Confirm & run**. Mission Control posts the
+The sidebar holds saved chats. The chat composer offers backend selection and
+**Inspect on terminal**; a connection error appears if the runtime is unreachable.
+Describe a workflow, then **Confirm & run**. Mission Control posts the
 program to `/v1/runs`; `omar serve` compiles it, starts the run, and returns
 that run's `diagram_address`, which the client observes over `/v1/diagram` and
 `/v1/events`.
