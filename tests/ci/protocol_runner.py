@@ -28,7 +28,7 @@ for line in sys.stdin:
         method = message.get('method')
         if method == 'session/prompt':
             while (root / 'hold').exists(): time.sleep(.02)
-            result = {'stopReason': 'end_turn'}
+            result = {'stopReason': 'cancelled' if (root / 'cancel').exists() else 'end_turn'}
         elif method == 'session/new': result = {'sessionId': 'native-session'}
         else: result = {}
         if 'id' in message:
@@ -36,7 +36,7 @@ for line in sys.stdin:
     else:
         print(json.dumps({'event':'init','conversation_id':'native-session'}), flush=True)
         while (root / 'hold').exists(): time.sleep(.02)
-        print(json.dumps({'event':'result','result':{'status':'SUCCESS','response':'done','conversation_id':'native-session'}}), flush=True)
+        print(json.dumps({'event':'result','result':{'status': 'FAILED' if (root / 'cancel').exists() else 'SUCCESS','response':'done','conversation_id':'native-session'}}), flush=True)
 '''
 
 def wait(predicate, label, timeout=12):
@@ -120,6 +120,7 @@ def main():
                     assert 'fresh after compaction and restart' in text and 'durable-proof' in text
                     assert 'OMAR coordination event (not operator input)' in text
                 assert first in json.dumps(replay[0]) and second in json.dumps(replay[1])
+                assert text.index('OMAR COORDINATION STATE') > text.index('OMAR coordination event (not operator input)')
                 if backend == 'cursor':
                     assert any(p.get('method') == 'session/load' and p['params']['sessionId'] == 'native-session' for p in requests())
                 if backend == 'agy':
@@ -131,7 +132,16 @@ def main():
                 send('wake again after idle')
                 wait(lambda: len(prompts()) == count + 1, 'second idle wake failed')
                 wait(lambda: not json.loads(inbox.read_text())['pending'], 'final turn did not settle')
-                print(f'PASS: {backend} native protocol idle wake, serial turns, durable acceptance/restart, and fresh ownership', flush=True)
+                (root / 'cancel').touch()
+                rejected = send('retain this cancelled turn')
+                wait(lambda: proc.poll() is not None, 'cancelled turn was silently accepted')
+                assert proc.returncode != 0
+                assert json.loads(inbox.read_text())['pending'][0]['id'] == rejected
+                assert not sock.exists(), 'failed runner still advertises acceptance'
+                (root / 'cancel').unlink()
+                proc = start()
+                wait(lambda: not json.loads(inbox.read_text())['pending'], 'cancelled message was not recovered')
+                print(f'PASS: {backend} native protocol idle wake, serial turns, durable acceptance/restart, fresh ownership, and cancellation recovery', flush=True)
             finally:
                 for proc in processes:
                     if proc.poll() is None:

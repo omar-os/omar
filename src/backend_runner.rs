@@ -361,7 +361,9 @@ pub async fn run(path: &Path) -> Result<()> {
                 crate::supervision::context_message(&crate::supervision::context(&context.omar_dir, context.ea_id, context.agent_name.as_deref().unwrap_or("ea"))?)
             } else { String::new() };
             let origin = if message.operator { "Operator message" } else { "OMAR coordination event (not operator input)" };
-            let prompt = format!("{instructions}\n\n{live}\n\n[{origin}; message {}]\n{}", message.id, message.text);
+            // Queued events may contain an older ownership snapshot. Finish with
+            // the state read immediately before this native turn.
+            let prompt = format!("{instructions}\n\n[{origin}; message {}]\n{}\n\n{live}", message.id, message.text);
             if config.backend == "codex" {
                 codex_turn(&config, &context, &queue, &prompt).await?;
             } else if config.backend == "cursor" {

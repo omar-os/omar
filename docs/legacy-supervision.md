@@ -106,7 +106,7 @@ These prove runtime/transport invariants, not universal model quality or an LLM 
 
 The all-backend contract test exercises production hook output and the generated OpenCode plugin.
 `protocol_runner.py` verifies idle wake, active-turn serialization, durable acceptance, process
-crash/replay, native session resume, and fresh ownership against deterministic protocol peers.
+crash/replay, native session resume, fresh ownership, and cancellation recovery against deterministic protocol peers.
 `codex_exec_delivery.py` uses production MCP spawn/delivery and an installed Codex CLI with a local
 provider to check profile/config compatibility and native conversation continuity.
 
@@ -116,7 +116,9 @@ ID and remembered content; Cursor prompt-recall history remained unchanged. This
 and continuity check, not a benchmark of autonomous multi-level management or native compaction.
 The native Codex wake test does not establish hook trust approval.
 
-`OMAR_LIVE_BACKENDS=1 python3 tests/ci/native_legacy_workflow.py` additionally checks a live
-Cursor worker using OMAR MCP to finish a tracked task. The host wakes a scripted OpenCode-contract
-parent, which reads, acknowledges and retires the result, then completes the project. This verifies
-native tool access and the lifecycle across transports; the parent is not an autonomous model.
+`OMAR_LIVE_BACKENDS=1 python3 tests/ci/native_legacy_workflow.py cursor` and the same
+command with `agy` each passed with the default backend launch. A live worker finishes through
+OMAR MCP; the host wakes a scripted OpenCode-contract parent, which reads, acknowledges and
+retires the result, then completes the project. Antigravity runs with a disposable home and a
+private copy of cached authentication, leaving user plugin registration untouched. These tests
+verify native tool access and the lifecycle across transports; the parent is not an autonomous model.
