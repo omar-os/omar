@@ -10,18 +10,38 @@ Ctrl+Shift+Escape, and the backdrop detach the viewer without killing the agent.
 
 ## Try the local build
 
-From the `fix/codex-ux` checkout (Node 22+, Rust, tmux and Codex installed):
+Build the new binary, then restart the dashboard from a regular terminal so
+it runs the new event-delivery code. The dashboard is a separate tmux session
+from the EAs; this command closes its UI, not the agent sessions:
 
 ```sh
-git switch fix/codex-ux
-(cd web && npm ci && npm run build:spa)
-cargo build --features ui --bin omar
-./target/debug/omar -a codex --ea CodexUXTry serve --ui --address 127.0.0.1:7341
+cargo build --bin omar
+tmux kill-session -t =omar-dashboard
+env -u NO_COLOR ./target/debug/omar -a codex
 ```
 
-This creates a separate test EA and opens its bundled web UI. If that test EA
-already exists, add `--restart-ea` to the last command to replace its session
-with the new build. Existing sessions retain their original launch command.
+Each `-a` launch creates a new numbered EA. Add `--ea CodexUXTry` to name it;
+a duplicate name errors instead of replacing an existing EA. Bare `omar --ea
+<id-or-name>` selects an existing EA.
+
+Codex's Astra starfield requires an empty, fresh Astra composer, animations,
+whimsy, and RGB colors. It fades after about 15 seconds and stops after ordinary
+input. Omar now advertises RGB and gives detached Codex panes a default palette
+matching the web terminal, since no attached terminal can answer their startup
+color queries. New panes also receive the launcher's Codex home and color
+preference instead of stale values retained by a long-running tmux server. An
+explicit tmux window style is preserved. `NO_COLOR` is still respected; the command above removes it for this visual trial.
+
+For the web trial (Node 22+):
+
+```sh
+(cd web && npm ci && npm run build:spa)
+cargo build --features ui --bin omar
+env -u NO_COLOR ./target/debug/omar -a codex --ea CodexWebTry serve --ui --address 127.0.0.1:7341
+```
+
+With `-a`, `serve` also creates a new EA. To serve an existing EA, omit `-a`
+and select it with `--ea`. Existing running sessions retain their original launch command.
 
 Open **Inspect on terminal**, type an unsent draft, and resize the window
 narrow→wide→narrow. Check the right and bottom edges, press Escape to cancel
@@ -29,6 +49,25 @@ inside Codex, then close with the button or Ctrl+Shift+Escape. Open a second
 browser viewer and close them in either order. Ask the test EA to schedule an
 OMAR event, then leave a draft in the terminal while the event arrives: the
 agent should wake without submitting or overwriting the draft.
+
+## Conversation storage and resume
+
+New Codex agents inherit the operator's normal `CODEX_HOME` (usually
+`~/.codex`). Each pane has a dedicated app-server socket under
+`~/.omar/codex-runtime/`, with agent-specific instructions and MCP options on
+that server. Runtime files contain no conversation database. Ordinary
+`codex resume` can reopen Omar conversations after the pane closes.
+
+Inside the Codex TUI, use `/resume` as usual. A configured `codex resume <id>`
+manager command also reconnects a saved conversation to Omar's tools and events.
+Omar does not add a permission override to remote resume, which Codex rejects;
+the saved thread's permissions apply.
+
+Legacy `~/.omar/codex/<id>` directories are retained without pruning. Until their
+histories are imported into the normal home, they can be inspected with
+`CODEX_HOME=~/.omar/codex/<id> codex resume --all`. Do not delete or replace their
+SQLite files while an old agent is using them. Previously deleted histories
+cannot be recovered from EA notes alone.
 
 ## Geometry and concurrent viewers
 
@@ -88,3 +127,14 @@ npx playwright test --grep 'terminal|a drag resizes'
 This verifies the initial geometry handshake, repeated width changes, real
 Escape bytes on the socket, the explicit close chord, and the Close button.
 It runs in the existing browser CI job without tmux or a model.
+
+## Real Codex regression check
+
+`python3 tests/ci/codex_shared_home.py` launches the built Omar binary and real
+Codex 0.154.0 in a disposable home and tmux server. It requires `websocket-client`
+and uses a local mock Responses server without user credentials or model calls.
+It checks two EA identities, independent sockets, working MCP tools, the project
+cwd, rendered Astra starfield characters, draft-safe event wake, ordinary Codex
+resume, and resume back inside Omar with tools and events restored. It also checks the
+real standalone `serve` scheduler with an unsent draft. The dedicated
+Codex Shared History CI job installs the pinned CLI and runs this check.

@@ -93,9 +93,11 @@ start_fake_dashboard() {
   fail "fake dashboard session did not come up"
 }
 
+tmux_cmd new-session -d -s omar-agent-ea-0 "sleep 9999"
+original_pane="$(tmux_cmd display-message -p -t omar-agent-ea-0 '#{pane_id}')"
+
 # Case 1: `omar -a claude` from $work_dir should write a handoff with the
-# new cwd, the claude backend command, and restart_manager=true (because
-# -a was passed). We don't need claude actually installed — relaunch_in_tmux
+# new cwd, the claude backend command, and restart_manager=false (the new EA is already running). We don't need claude actually installed — relaunch_in_tmux
 # only writes the handoff and tries to attach; the attach is expected to fail
 # in this non-interactive subshell, which is fine.
 start_fake_dashboard
@@ -116,17 +118,32 @@ path, work_dir = sys.argv[1], sys.argv[2]
 with open(path) as fh:
     h = json.load(fh)
 errs = []
-if h.get("active_ea") != 0:
-    errs.append(f"active_ea: expected 0, got {h.get('active_ea')!r}")
+if h.get("active_ea") != 1:
+    errs.append(f"active_ea: expected 1, got {h.get('active_ea')!r}")
 if "claude" not in str(h.get("default_command", "")):
     errs.append(f"default_command: expected to mention 'claude', got {h.get('default_command')!r}")
 if h.get("default_workdir") != work_dir:
     errs.append(f"default_workdir: expected {work_dir!r}, got {h.get('default_workdir')!r}")
-if h.get("restart_manager") is not True:
-    errs.append(f"restart_manager: expected True (because -a was passed), got {h.get('restart_manager')!r}")
+if h.get("restart_manager") is not False:
+    errs.append(f"restart_manager: expected False (new EA must survive handoff), got {h.get('restart_manager')!r}")
 if errs:
     raise SystemExit("handoff field mismatch (case: -a claude from new cwd):\n  " + "\n  ".join(errs))
 PY
+
+# A second backend launch allocates another EA and preserves the first tree.
+start_fake_dashboard
+(
+  cd "$work_dir"
+  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" -a claude >/dev/null 2>&1 || true
+)
+python3 - "$home_dir/.omar/eas.json" "$handoff_file" <<'PYTEST'
+import json, sys
+registry = json.load(open(sys.argv[1]))
+handoff = json.load(open(sys.argv[2]))
+assert [(e["id"], e["name"]) for e in registry] == [(0, "Default"), (1, "1"), (2, "2")], registry
+assert handoff["active_ea"] == 2 and not handoff["restart_manager"], handoff
+PYTEST
+[ "$(tmux_cmd display-message -p -t omar-agent-ea-0 '#{pane_id}')" = "$original_pane" ] || fail "existing EA was replaced"
 
 # Case 2: bare `omar` (no -a) should still hand off cwd, but
 # restart_manager must be false so the live manager isn't kicked.
