@@ -7,7 +7,7 @@
 //!
 //! Resolution is deliberately dynamic — nothing is cached at launch. A pane
 //! whose backend has restarted, or whose socket has gone, simply resolves to
-//! `None` and delivery falls back to the input box.
+//! `None`; callers retain pending work or report failure without touching input.
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 /// How long to wait on a socket that has accepted the connection but is not
-/// reading. Short: the fallback is a working delivery path, not an error.
+/// reading. A timeout reports failure; it never enables terminal-input delivery.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Loopback HTTP is either immediate or wedged; nothing in between.
@@ -46,8 +46,8 @@ pub enum Channel {
     /// buffer, so a draft in the composer is untouched.
     ClaudePeer { socket: PathBuf, token: String },
     /// opencode's HTTP server. A `synthetic` message part is shown to the
-    /// model but not rendered in the transcript, and `noReply` seats it
-    /// without starting a turn.
+    /// model but not rendered as operator input. The asynchronous endpoint
+    /// wakes an idle session without waiting for the model response.
     OpencodeHttp { port: u16, session: String },
     /// Codex's app-server. `turn/start` with `toolOutput` wakes an idle
     /// thread or queues the event on its active turn. The event retains tool
@@ -151,15 +151,14 @@ impl Channel {
     /// will land. codex resolves on the socket file existing and only
     /// discovers in [`Channel::deliver`] that the pane has more than one
     /// thread loaded and cannot be addressed. Callers must treat the error
-    /// from `deliver` as the real answer — the scheduler does, by protecting
-    /// the draft again before it falls back to the input box.
+    /// from `deliver` as the real answer and retain pending work on failure.
     pub fn resolve(backend: &str, pane_pid: u32, stamp: Option<&str>) -> Option<Channel> {
         // A stamp is written when the backend needed provisioning at launch;
         // it names the port and session an event must be addressed to.
         if let Some(channel) = stamp.and_then(Channel::from_stamp) {
             // A spool only works if the backend's hook is draining it. If the
             // oldest event has been waiting too long it plainly is not, so
-            // stop feeding it and let delivery fall back to the input box.
+            // stop feeding it and report the unavailable channel.
             if let Channel::Spool { path } = &channel {
                 if spool_is_stale(path) {
                     return None;
@@ -167,7 +166,7 @@ impl Channel {
             }
             // A pane that has exited takes its app-server with it. Answering
             // with a channel whose socket is gone only costs the caller a
-            // round trip before it falls back.
+            // round trip before delivery reports failure.
             if let Channel::CodexAppServer { socket } = &channel {
                 if !socket.exists() {
                     return None;
@@ -209,7 +208,7 @@ impl Channel {
         }
     }
 
-    /// Hand the event to the agent. Errors are the caller's cue to fall back.
+    /// Hand the event to the agent. Errors never authorize terminal input.
     pub fn deliver(&self, text: &str) -> Result<()> {
         match self {
             Channel::ClaudePeer { socket, token } => {
@@ -224,18 +223,18 @@ impl Channel {
             }
             Channel::OpencodeHttp { port, session } => {
                 let body = serde_json::json!({
-                    "noReply": true,
+                    "noReply": false,
                     "parts": [{ "type": "text", "text": text, "synthetic": true }],
                 })
                 .to_string();
                 let (status, _) = http_json(
                     *port,
                     "POST",
-                    &format!("/session/{}/message", session),
+                    &format!("/session/{}/prompt_async", session),
                     Some(&body),
                 )
                 .context("post message to opencode")?;
-                if status != 200 {
+                if status != 204 {
                     anyhow::bail!("opencode answered {}", status);
                 }
                 Ok(())
@@ -298,7 +297,7 @@ const CURSOR_HOOK_ARGS: &str = "hook-drain --format cursor";
 /// reads `$OMAR_EVENT_SPOOL`, so one entry serves them all.
 ///
 /// Returns false if the file cannot be written — the caller must then leave
-/// the pane on the input box, because a spool nothing drains is a black hole.
+/// delivery unavailable, because a spool nothing drains is a black hole.
 pub fn install_cursor_hook() -> bool {
     let Some(exe) = std::env::current_exe().ok() else {
         return false;
@@ -438,8 +437,8 @@ pub fn free_port() -> Option<u16> {
 /// Give a freshly launched pane a side channel, once its backend is listening.
 ///
 /// Runs in the background: opencode takes seconds to boot, and a launch must
-/// not block on it. Until the stamp lands, deliveries fall back to the input
-/// box, so being slow is safe and failing is safe.
+/// not block on it. Deliveries wait for the stamp or report unavailability;
+/// they never fall back to terminal input.
 pub fn provision_in_background(backend: Option<&str>, session: String, command: String) {
     // Gate on the backend, not on the flag: plenty of other things are
     // launched with a `--port`, and polling one of those for 90 seconds — then
@@ -646,8 +645,7 @@ impl CodexSession {
 /// acknowledged, and never read.
 ///
 /// So OMAR only claims a channel it is sure of. More than one loaded thread
-/// means no channel, and delivery goes back through the input box — which
-/// since the draft is protected is a working path, not a failure.
+/// means delivery fails rather than guessing or using the input box.
 fn only_thread(listed: &serde_json::Value) -> Option<String> {
     let threads = listed.get("data")?.as_array()?;
     match threads.as_slice() {
@@ -797,7 +795,7 @@ fn claude_peer(sessions: &Path, pid: u32) -> Option<Channel> {
 /// in the operator's own settings. The socket takes the bytes either way, so
 /// the delivery looks successful while the event sits unread until a human
 /// approves it. A session told neither way — started by an older OMAR, or by
-/// hand — is left to the input box, which is a working path.
+/// hand — has no available channel until configured to accept peer messages.
 fn accepts_peer_messages(pid: u32) -> bool {
     launched_to_accept(pid) || settings_accept(&claude_user_settings())
 }
@@ -865,6 +863,49 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn opencode_wakes_with_synthetic_context_without_a_user_prompt() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "POST /session/session_test/prompt_async HTTP/1.1\r\n");
+            let mut length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["noReply"], false);
+            assert_eq!(body["parts"][0]["synthetic"], true);
+            assert_eq!(body["parts"][0]["text"], "agent event");
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        Channel::OpencodeHttp {
+            port,
+            session: "session_test".into(),
+        }
+        .deliver("agent event")
+        .unwrap();
+        server.join().unwrap();
+    }
 
     #[test]
     fn a_peer_message_is_two_json_frames_and_never_touches_the_composer() {
@@ -1129,7 +1170,7 @@ mod tests {
         );
 
         // An event that has been sitting there far too long means the hook is
-        // not running, so delivery must go back through the input box.
+        // not running, so delivery must report channel unavailability.
         let stale = serde_json::json!({ "at": 1_000, "text": "ancient" });
         std::fs::write(&path, format!("{}\n", stale)).unwrap();
         assert_eq!(
@@ -1542,7 +1583,7 @@ mod tests {
         // the newer id, `/resume` moves it back to the older one while the
         // abandoned new thread stays loaded. Guessing wrong is delivered,
         // acknowledged, and never read — so OMAR declines and the event goes
-        // through the input box instead.
+        // pending instead.
         let ambiguous = serde_json::json!({
             "data": ["01a0204b-f2e8-73e3-b95a-09abf7616b22", "01a02051-f65b-7260-9afe-13ffe5229bf6"],
         });
@@ -1555,7 +1596,7 @@ mod tests {
 
     #[test]
     fn an_ambiguous_pane_reports_a_failure_rather_than_injecting_somewhere() {
-        // The caller's cue to fall back is an error. Returning `Ok` after
+        // The caller's cue to retain pending work is an error. Returning `Ok` after
         // injecting into a thread nobody is reading would lose the event with
         // no sign that anything went wrong.
         let dir = tempfile::tempdir().unwrap();
@@ -1656,7 +1697,7 @@ mod tests {
 
     #[test]
     fn a_backend_without_a_side_channel_resolves_to_nothing() {
-        // The fallback is the input box, so "no channel" must be an ordinary
+        // "No channel" must be an ordinary
         // answer rather than an error.
         for backend in ["codex", "opencode", "cursor", "agy", "stub"] {
             assert_eq!(Channel::resolve(backend, std::process::id(), None), None);

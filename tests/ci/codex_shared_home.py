@@ -205,6 +205,43 @@ supports_websockets=false
         assert 'SERVE_UNSENT_DRAFT' in pane(served), pane(served)
         assert tmux('display-message', '-p', '-t', 'omar-agent-ea-2', '#{pane_id}') == second_pane
         print('PASS: serve creates a named EA and the real scheduler delivers through its socket without consuming the draft', flush=True)
+        # Exercise Mission Control through the same shared delivery path used by
+        # initial tasks and MCP follow-ups, while a native-terminal draft exists.
+        import urllib.request
+        body = json.dumps({'text': 'MISSION_CONTROL_SENTINEL'}).encode()
+        request = urllib.request.Request(f'http://127.0.0.1:{port}/v1/chat', data=body,
+                                         headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            assert response.status == 202
+        until(lambda: 'MISSION_CONTROL_SENTINEL' in json.dumps(requests), 'Mission Control delivery')
+        assert 'SERVE_UNSENT_DRAFT' in pane(served), pane(served)
+        mcp_messages = [
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+                'protocolVersion': '2024-11-05', 'capabilities': {},
+                'clientInfo': {'name': 'channel-regression', 'version': '1'}}},
+            {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
+            {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
+                'name': 'send_input', 'arguments': {'name': served, 'text': 'MCP_FOLLOWUP_SENTINEL', 'enter': True}}},
+        ]
+        mcp = subprocess.run([OMAR, '--ea', '3', 'mcp-server'], cwd=work,
+                             env=dict(env, OMAR_EA_ID='3', OMAR_DIR=str(home/'.omar')),
+                             input=''.join(json.dumps(m)+'\n' for m in mcp_messages),
+                             capture_output=True, text=True, timeout=30, check=True)
+        replies = [json.loads(line) for line in mcp.stdout.splitlines()]
+        reply = next(r for r in replies if r.get('id') == 2)
+        assert 'error' not in reply and not reply.get('result', {}).get('isError'), reply
+        until(lambda: 'MCP_FOLLOWUP_SENTINEL' in json.dumps(requests), 'MCP follow-up delivery')
+        assert 'SERVE_UNSENT_DRAFT' in pane(served), pane(served)
+        history = codex_home/'history.jsonl'
+        history_text = history.read_text() if history.exists() else ''
+        for sentinel in ['EVENT_SENTINEL', 'LIVE_SCHEDULER_SENTINEL', 'MISSION_CONTROL_SENTINEL', 'MCP_FOLLOWUP_SENTINEL']:
+            assert sentinel not in history_text, history_text
+        for request_body in requests:
+            for item in request_body.get('input', []):
+                if item.get('role') == 'user':
+                    assert 'SENTINEL' not in json.dumps(item), item
+        print('PASS: Mission Control, MCP follow-ups, and scheduler messages preserve the draft and stay out of user prompt history', flush=True)
+
 
 
     except Exception:

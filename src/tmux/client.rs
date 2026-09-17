@@ -8,79 +8,20 @@ use std::time::{Duration, Instant};
 
 use super::Session;
 
-/// Options for reliable prompt delivery and related readiness helpers.
-///
-/// Note: `deliver_prompt` itself no longer performs a readiness phase —
-/// callers are expected to gate on `wait_for_markers` first. The fields
-/// labelled *(wait_for_stable only)* are therefore ignored by
-/// `deliver_prompt` and retained only for direct callers of
-/// `TmuxClient::wait_for_stable`.
+/// Bound how long a newly launched backend may take to publish its channel.
 #[derive(Debug, Clone)]
 pub struct DeliveryOptions {
-    /// Max time to wait for the pane to become stable (backend ready).
-    /// *(wait_for_stable only — ignored by `deliver_prompt`.)*
     pub startup_timeout: Duration,
-    /// How long the pane must be quiet to be considered "stable".
-    /// *(wait_for_stable only — ignored by `deliver_prompt`.)*
-    pub stable_quiet: Duration,
-    /// Per-phase timeout inside `deliver_prompt`. Applied TWICE per attempt:
-    /// once waiting for the paste to render (sentinel or new placeholder),
-    /// and once waiting for the post-Enter pane change that confirms
-    /// submission. Worst-case single-attempt wall time is therefore
-    /// approximately `2 * verify_timeout + retry_delay`.
-    pub verify_timeout: Duration,
-    /// How many full delivery attempts to try before giving up.
-    pub max_retries: u32,
-    /// Polling interval for pane capture / activity checks.
     pub poll_interval: Duration,
-    /// Delay between retry attempts (after clearing input with C-u).
-    pub retry_delay: Duration,
-    /// When true, readiness wait requires observing at least one pane change
-    /// (activity timestamp or content) before considering the pane stable.
-    /// Useful for freshly spawned sessions where the initial static shell pane
-    /// is not necessarily backend-ready yet.
-    /// *(wait_for_stable only — ignored by `deliver_prompt`.)*
-    pub require_initial_change: bool,
 }
 
 impl Default for DeliveryOptions {
     fn default() -> Self {
         Self {
             startup_timeout: Duration::from_secs(15),
-            stable_quiet: Duration::from_millis(500),
-            verify_timeout: Duration::from_secs(3),
-            max_retries: 3,
             poll_interval: Duration::from_millis(100),
-            retry_delay: Duration::from_millis(200),
-            require_initial_change: false,
         }
     }
-}
-
-/// Distinctive prefix of collapsed-paste placeholders used by TUI input
-/// widgets when a paste crosses a per-backend size threshold. Observed
-/// formats:
-/// - Claude Code: `[Pasted text #N +M lines]`
-/// - opencode:    `[Pasted ~N lines]`
-///
-/// The common prefix `[Pasted ` (with trailing space) catches both and
-/// any future vendor that follows the same convention. When the widget
-/// collapses the paste into a placeholder the sentinel at the tail of
-/// the payload never renders verbatim, so `deliver_prompt` treats a new
-/// occurrence of this marker as equivalent proof the paste has ingested.
-const PASTE_PLACEHOLDER_MARKER: &str = "[Pasted ";
-
-/// Returns true when `hay` shows that the most recent paste has rendered.
-/// A paste is considered rendered if EITHER the per-delivery end sentinel
-/// appears verbatim, OR a new `[Pasted text ...]` placeholder appeared
-/// relative to `baseline_placeholders` (the count observed just before
-/// the paste was issued). The count-delta avoids false positives from
-/// stale placeholders already visible in prior chat history.
-fn paste_rendered(hay: &str, end_sentinel: &str, baseline_placeholders: usize) -> bool {
-    if hay.contains(end_sentinel) {
-        return true;
-    }
-    hay.matches(PASTE_PLACEHOLDER_MARKER).count() > baseline_placeholders
 }
 
 fn tail_pane_lines(output: String, lines: i32) -> String {
@@ -482,58 +423,13 @@ impl TmuxClient {
         Ok(())
     }
 
-    /// Reliably deliver a prompt to a tmux session.
-    ///
-    /// Backend-agnostic: works for claude, codex, cursor, opencode, or any
-    /// TUI. The caller is responsible for gating on backend readiness
-    /// (e.g. via `wait_for_markers`) before invoking — this function assumes
-    /// the input widget is already live.
-    ///
-    /// Strategy: every load-bearing wait is bounded by an observable
-    /// signal (end sentinel, new placeholder, pane change). The only fixed
-    /// timing is a 50 ms settle after the per-attempt `C-u` clear so the
-    /// widget has committed that state before the subsequent paste.
-    ///
-    /// 1. Wrap the payload in per-delivery UUID sentinels:
-    ///    `<UserPromptBegins:{id}>\n{text}\n<UserPromptEnds:{id}>`.
-    /// 2. Paste the wrapped text via bracketed paste.
-    /// 3. Poll the plain pane capture for either the end sentinel appearing
-    ///    verbatim, OR a new `[Pasted ...]` placeholder (vs the pre-paste
-    ///    baseline count). TUI input widgets (Claude Code, opencode, etc.)
-    ///    collapse pastes that cross their size threshold into a
-    ///    placeholder so the sentinel never renders literally; the
-    ///    placeholder-count delta gives a second proof-of-render that
-    ///    works for both small and large payloads. Stale placeholders
-    ///    already in chat history cannot false-positive because we
-    ///    compare counts, not mere presence.
-    /// 4. On render timeout, retry — DO NOT press Enter. The previous
-    ///    implementation's bug was firing Enter after a failed-render
-    ///    timeout, which submitted a blank widget (or partial payload) and
-    ///    declared success from the resulting pane change.
-    /// 5. Once rendered, snapshot the pane and submit a single literal CR
-    ///    byte (`send-keys -H 0d`). Using `send-keys Enter` can route
-    ///    through tmux's extended-keys encoding when the pane opts in via
-    ///    DECSET 2017 — some TUI input widgets (Claude Code's Ink-based
-    ///    widget included) read any CSI-encoded Enter as a modified
-    ///    keypress and treat it as Shift+Enter (newline insertion) instead
-    ///    of submit. `-H 0d` writes the raw byte and bypasses the
-    ///    encoding layer.
-    /// 6. Verify with `wait_for_change` that Enter caused an observable
-    ///    transition. If not, clear the input and retry.
+    /// Deliver through the backend channel without reading or editing its composer.
+    /// Channel discovery may be retried during startup. A send is attempted only
+    /// once: an ambiguous transport error must not duplicate the message.
     pub fn deliver_prompt(&self, session: &str, text: &str, opts: &DeliveryOptions) -> Result<()> {
         self.deliver_prompt_until(session, text, opts, &|| false)
     }
 
-    /// The same, for a caller that can tell whether the prompt was acted on.
-    ///
-    /// Step 6 assumes the agent does nothing until Enter, which is true of a
-    /// TUI backend but not of one that reads its pane a line at a time: that
-    /// one answers while the paste is still arriving, so its output lands
-    /// *before* the pre-Enter snapshot and Enter changes nothing. The pane
-    /// alone cannot tell "the prompt never arrived" from "the prompt arrived
-    /// and was already handled", and the two need opposite responses — retry,
-    /// or stop. `answered` is the caller's own evidence, which is why it is
-    /// the one signal here that does not come from the terminal.
     pub fn deliver_prompt_until(
         &self,
         session: &str,
@@ -541,125 +437,31 @@ impl TmuxClient {
         opts: &DeliveryOptions,
         answered: &dyn Fn() -> bool,
     ) -> Result<()> {
-        if answered() {
-            return Ok(());
-        }
-        let mut draft = super::draft::SavedDraft::capture(self, session)?;
-        let delivered = self.deliver_prompt_inner(session, text, opts, answered);
-        let restored = draft.restore();
-        match (delivered, restored) {
-            (Err(delivery), Err(restore)) => Err(delivery.context(format!("{restore:#}"))),
-            (Err(delivery), Ok(())) => Err(delivery),
-            // Delivery succeeded: do not provoke a duplicate invocation just
-            // because restoration failed. The original is saved for recovery.
-            (Ok(()), Err(restore)) => {
-                tracing::error!("{restore:#}");
-                Ok(())
-            }
-            (Ok(()), Ok(())) => Ok(()),
-        }
-    }
-
-    fn deliver_prompt_inner(
-        &self,
-        session: &str,
-        text: &str,
-        opts: &DeliveryOptions,
-        answered: &dyn Fn() -> bool,
-    ) -> Result<()> {
-        // Per-delivery UUID so a stale sentinel from a previous delivery
-        // cannot false-positive the end-sentinel poll on retry.
-        let delivery_id = uuid::Uuid::new_v4().simple().to_string();
-        let short_id = &delivery_id[..8];
-        let start_sentinel = format!("<UserPromptBegins:{}>", short_id);
-        let end_sentinel = format!("<UserPromptEnds:{}>", short_id);
-        let wrapped = format!("{}\n{}\n{}", start_sentinel, text, end_sentinel);
-
-        for attempt in 1..=opts.max_retries {
-            // Re-delivering something the agent already answered is not a
-            // harmless retry: the second copy is a second invocation the
-            // runtime has to reject.
+        let deadline = Instant::now() + opts.startup_timeout;
+        loop {
             if answered() {
                 return Ok(());
             }
-            // Clear any leftover input from a prior attempt. No-op on the
-            // first attempt against a fresh widget.
-            let _ = self.send_keys(session, "C-u");
-            thread::sleep(Duration::from_millis(50));
-
-            // Baseline pane BEFORE paste so the long-paste placeholder
-            // detection below can distinguish a new placeholder from a stale
-            // one already visible in chat history.
-            let baseline_placeholders = self
-                .capture_pane_plain(session, 200)
-                .unwrap_or_default()
-                .matches(PASTE_PLACEHOLDER_MARKER)
-                .count();
-
-            self.paste_text(session, &wrapped)?;
-
-            // Wait until we have proof the paste rendered. Two acceptable
-            // signals:
-            //   (a) the end sentinel appears verbatim — the common case for
-            //       prompts that fit under the backend's "show raw text"
-            //       threshold;
-            //   (b) a NEW paste placeholder appears (count increased vs
-            //       baseline) — Claude Code collapses large pastes into
-            //       `[Pasted text #N +M lines]` so the sentinel never
-            //       renders literally. We compare counts rather than mere
-            //       presence so a stale placeholder from prior chat
-            //       history can't false-positive the check.
-            let rendered = {
-                let deadline = Instant::now() + opts.verify_timeout;
-                let mut found = false;
-                while Instant::now() < deadline {
-                    if let Ok(hay) = self.capture_pane_plain(session, 200) {
-                        if paste_rendered(&hay, &end_sentinel, baseline_placeholders) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    thread::sleep(opts.poll_interval);
-                }
-                found
-            };
-
-            if !rendered {
-                if attempt < opts.max_retries {
-                    thread::sleep(opts.retry_delay);
-                }
-                continue;
+            let backend = self
+                .session_backend(session)
+                .context("agent backend is not stamped; refusing terminal input")?;
+            let pid = self.get_pane_pid(session)?;
+            let stamp = self.session_delivery(session);
+            if let Some(channel) = crate::channel::Channel::resolve(&backend, pid, stamp.as_deref())
+            {
+                return channel.deliver(text).with_context(|| {
+                    format!(
+                        "delivery to {session} via {} failed; composer untouched",
+                        channel.describe()
+                    )
+                });
             }
-
-            // Paste fully rendered. Snapshot, then submit with a literal
-            // CR byte that bypasses tmux's extended-keys encoding.
-            let content_before = self.capture_pane(session, 50).unwrap_or_default();
-            let activity_before = self.get_pane_activity(session).unwrap_or(0);
-
-            let target = exact_pane_target(session);
-            self.run(&["send-keys", "-t", &target, "-H", "0d"])?;
-
-            if self.wait_for_change(
-                session,
-                activity_before,
-                &content_before,
-                opts.verify_timeout,
-                opts.poll_interval,
-                answered,
-            ) {
-                return Ok(());
-            }
-
-            if attempt < opts.max_retries {
-                thread::sleep(opts.retry_delay);
-            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "no delivery channel available for {session} ({backend}); composer untouched"
+            );
+            thread::sleep(opts.poll_interval);
         }
-
-        anyhow::bail!(
-            "prompt delivery to '{}' was not verified after {} attempt(s)",
-            session,
-            opts.max_retries
-        )
     }
 
     /// Wait for pane activity to be quiet for `quiet` duration, or until `timeout`.
@@ -696,41 +498,6 @@ impl TmuxClient {
         }
         // Timed out waiting for stability — proceed anyway
         Ok(())
-    }
-
-    /// Poll until either pane activity advances OR pane content changes.
-    /// This catches backends that update content without bumping the
-    /// activity timestamp, and vice versa.
-    fn wait_for_change(
-        &self,
-        session: &str,
-        activity_before: i64,
-        content_before: &str,
-        timeout: Duration,
-        poll_interval: Duration,
-        answered: &dyn Fn() -> bool,
-    ) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < timeout {
-            // An agent that acted on the paste before the submit drew its
-            // output before `content_before` was taken, so there is no change
-            // left for Enter to cause. It answered: the prompt arrived.
-            if answered() {
-                return true;
-            }
-            if let Ok(current) = self.get_pane_activity(session) {
-                if current > activity_before {
-                    return true;
-                }
-            }
-            if let Ok(content) = self.capture_pane(session, 50) {
-                if content != content_before {
-                    return true;
-                }
-            }
-            thread::sleep(poll_interval);
-        }
-        false
     }
 
     /// Wait until pane output contains ALL of the provided markers.
@@ -832,6 +599,7 @@ impl TmuxClient {
         let hooked = match backend {
             Some("cursor") => crate::channel::install_cursor_hook(),
             Some("agy") => crate::channel::install_antigravity_hook(),
+            Some("stub") => true,
             _ => false,
         };
         let spool = hooked.then(|| {
@@ -1169,57 +937,6 @@ mod tests {
         assert_eq!(client.prefix(), "");
     }
 
-    /// Covers the two render-proof branches of `paste_rendered` and the
-    /// count-delta invariant that prevents a stale `[Pasted ...]`
-    /// placeholder (left in chat history from a prior paste) from
-    /// false-positiving the check. Also locks in cross-backend format
-    /// coverage — the same predicate must fire for Claude Code's
-    /// `[Pasted text #N +M lines]` AND opencode's `[Pasted ~N lines]`.
-    #[test]
-    fn test_paste_rendered_matches_sentinel_or_new_placeholder() {
-        let sentinel = "<UserPromptEnds:abc12345>";
-
-        // Direct sentinel match — the normal / short-paste path.
-        assert!(paste_rendered(
-            "prompt body <UserPromptEnds:abc12345> trailing",
-            sentinel,
-            0,
-        ));
-
-        // Claude Code's format — long-paste path, fresh pane.
-        assert!(paste_rendered(
-            "╭──╮\n│ [Pasted text #1 +234 lines] │",
-            sentinel,
-            0,
-        ));
-
-        // opencode's format — same predicate must fire.
-        assert!(paste_rendered("│ [Pasted ~5 lines] │", sentinel, 0));
-
-        // One placeholder already present at baseline; still just one →
-        // no new paste, render not proven.
-        assert!(!paste_rendered(
-            "prior: [Pasted text #1 +10 lines]",
-            sentinel,
-            1,
-        ));
-
-        // Baseline had one; capture shows two → new paste did render.
-        // Mix formats to prove the count is backend-agnostic.
-        assert!(paste_rendered(
-            "prior: [Pasted text #1 +10 lines]\nnew: [Pasted ~42 lines]",
-            sentinel,
-            1,
-        ));
-
-        // Neither signal present.
-        assert!(!paste_rendered(
-            "just some unrelated pane content",
-            sentinel,
-            0
-        ));
-    }
-
     #[test]
     fn test_plain_capture_tail_caps_real_idle_claude_fixture() {
         // Captured locally with:
@@ -1350,63 +1067,6 @@ mod tests {
         }
     }
 
-    /// Deliver a prompt to a shell session and verify the command actually ran.
-    #[test]
-    fn test_deliver_prompt_to_shell_session() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let session = "omar-test-deliver-prompt";
-        let _ = tmux_command()
-            .args(["kill-session", "-t", session])
-            .output();
-        let _guard = SessionGuard(session.to_string());
-
-        let ok = tmux_command()
-            .args(["new-session", "-d", "-s", session])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            eprintln!("Skipping test: failed to create tmux session");
-            return;
-        }
-
-        let client = TmuxClient::new("omar-test-");
-        // Tighter timeouts so the test finishes fast on a shell prompt.
-        let opts = DeliveryOptions {
-            startup_timeout: Duration::from_secs(3),
-            stable_quiet: Duration::from_millis(200),
-            verify_timeout: Duration::from_secs(2),
-            max_retries: 3,
-            poll_interval: Duration::from_millis(50),
-            retry_delay: Duration::from_millis(100),
-            require_initial_change: false,
-        };
-
-        let result = client.deliver_prompt(session, "echo OMAR_DELIVERED", &opts);
-        if let Err(e) = &result {
-            // Some sandboxes block send-keys; skip rather than fail.
-            eprintln!(
-                "Skipping test: deliver_prompt failed (likely sandbox): {}",
-                e
-            );
-            return;
-        }
-
-        // Give the shell a moment to run the command
-        thread::sleep(Duration::from_millis(500));
-
-        let content = client.capture_pane(session, 50).unwrap_or_default();
-        assert!(
-            content.contains("OMAR_DELIVERED"),
-            "Expected delivered command to run. Pane: {:?}",
-            content
-        );
-    }
-
     #[test]
     fn test_has_session_uses_exact_target_not_tmux_prefix_match() {
         if !tmux_available() {
@@ -1519,64 +1179,6 @@ mod tests {
             Duration::from_millis(50),
         );
         assert!(found, "Expected marker not detected in tmux pane");
-    }
-
-    #[test]
-    fn test_deliver_prompt_multiline() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let session = "omar-test-deliver-multiline";
-        let _ = tmux_command()
-            .args(["kill-session", "-t", session])
-            .output();
-        let _guard = SessionGuard(session.to_string());
-
-        let ok = tmux_command()
-            .args(["new-session", "-d", "-s", session])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            return;
-        }
-
-        let client = TmuxClient::new("omar-test-");
-        let opts = DeliveryOptions {
-            startup_timeout: Duration::from_secs(3),
-            stable_quiet: Duration::from_millis(200),
-            verify_timeout: Duration::from_secs(2),
-            max_retries: 3,
-            poll_interval: Duration::from_millis(50),
-            retry_delay: Duration::from_millis(100),
-            require_initial_change: false,
-        };
-
-        // Multi-line input: bash will run both commands. Verification needle
-        // is the first non-empty line ("echo FIRST_LINE_OMAR"); we also
-        // assert the SECOND_LINE actually executed to prove the full payload
-        // was delivered, not just truncated at the first newline.
-        let text = "echo FIRST_LINE_OMAR\necho SECOND_LINE_OMAR";
-        let result = client.deliver_prompt(session, text, &opts);
-        if let Err(e) = &result {
-            eprintln!("Skipping test: deliver_prompt failed: {}", e);
-            return;
-        }
-
-        thread::sleep(Duration::from_millis(500));
-        let content = client.capture_pane(session, 50).unwrap_or_default();
-        assert!(
-            content.contains("FIRST_LINE_OMAR"),
-            "Expected FIRST_LINE_OMAR in pane: {:?}",
-            content
-        );
-        assert!(
-            content.contains("SECOND_LINE_OMAR"),
-            "Expected SECOND_LINE_OMAR in pane (multi-line delivery): {:?}",
-            content
-        );
     }
 
     /// Regression: on tmux 3.6a (macOS homebrew) `#{pane_activity}` is empty
@@ -1746,94 +1348,6 @@ mod tests {
         assert!(
             found,
             "wait_for_markers must detect multi-word marker under ANSI styling"
-        );
-    }
-
-    /// Regression: before the fix, `deliver_prompt` with
-    /// `require_initial_change: true` on a pane that is already at rest
-    /// (e.g. Claude Code's banner has finished drawing) would wait the full
-    /// `startup_timeout` because `wait_for_stable` never observed an
-    /// additional change. The API + manager paths now set
-    /// `require_initial_change: false` once `wait_for_markers` has proven
-    /// readiness, which this test codifies: delivery to a quiet pane whose
-    /// marker is already present must complete quickly, not hit the
-    /// startup timeout.
-    #[test]
-    fn test_deliver_prompt_after_markers_does_not_stall() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let session = "omar-test-deliver-after-markers";
-        let _ = tmux_command()
-            .args(["kill-session", "-t", session])
-            .output();
-        let _guard = SessionGuard(session.to_string());
-
-        let ok = tmux_command()
-            .args(["new-session", "-d", "-s", session])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            return;
-        }
-
-        let client = TmuxClient::new("omar-test-");
-
-        // Print a "banner" and let the pane settle so the marker is visible
-        // and the pane is fully at rest before we attempt delivery.
-        let _ = client.send_keys_literal(session, "echo READY_MARKER_XYZ");
-        let _ = client.send_keys(session, "Enter");
-        let found = client.wait_for_markers(
-            session,
-            &["READY_MARKER_XYZ"],
-            Duration::from_secs(3),
-            Duration::from_millis(50),
-        );
-        if !found {
-            eprintln!("Skipping test: banner echo did not appear (sandbox)");
-            return;
-        }
-        // Ensure the pane is quiet BEFORE delivery, so `require_initial_change:
-        // true` would see no change and stall until startup_timeout.
-        thread::sleep(Duration::from_millis(500));
-
-        let startup_timeout = Duration::from_secs(6);
-        let opts = DeliveryOptions {
-            startup_timeout,
-            stable_quiet: Duration::from_millis(200),
-            verify_timeout: Duration::from_secs(2),
-            max_retries: 2,
-            poll_interval: Duration::from_millis(50),
-            retry_delay: Duration::from_millis(100),
-            // Matches the runtime setting after markers succeed — the bug
-            // was that this was `true`, causing a full-timeout stall.
-            require_initial_change: false,
-        };
-
-        let start = Instant::now();
-        let result = client.deliver_prompt(session, "echo DELIVERED_AFTER_MARKERS", &opts);
-        let elapsed = start.elapsed();
-
-        if let Err(e) = &result {
-            eprintln!("Skipping test: deliver_prompt failed (sandbox?): {}", e);
-            return;
-        }
-        assert!(
-            elapsed < startup_timeout,
-            "delivery should complete well under startup_timeout ({:?}), took {:?}",
-            startup_timeout,
-            elapsed
-        );
-
-        thread::sleep(Duration::from_millis(500));
-        let content = client.capture_pane(session, 80).unwrap_or_default();
-        assert!(
-            content.contains("DELIVERED_AFTER_MARKERS"),
-            "Expected delivered command in pane: {:?}",
-            content
         );
     }
 
@@ -2080,260 +1594,6 @@ mod tests {
              the paste-buffer call in paste_text",
             String::from_utf8_lossy(&got),
             payload,
-        );
-    }
-
-    /// Regression: `deliver_prompt` must wrap the payload with per-delivery
-    /// UUID sentinels and only submit once the end sentinel has rendered
-    /// into the pane. The previous implementation used heuristic needle
-    /// matching with a fall-through on timeout — when the needle failed to
-    /// appear it still pressed Enter, submitting a blank/partial widget and
-    /// declaring success from the resulting pane change.
-    ///
-    /// This test proves (a) the sentinels wrap the payload and (b) the
-    /// full submitted text (sentinels + payload) is exactly what the
-    /// backend receives. Verification reads the submitted bytes
-    /// byte-for-byte via `dd bs=1 count=...` — the file contents are
-    /// exactly what crossed the pty after submit. The render-before-submit
-    /// ordering is enforced by the `paste_rendered` predicate in
-    /// `deliver_prompt` and covered by the separate
-    /// `test_paste_rendered_matches_sentinel_or_new_placeholder` unit
-    /// test; asserting that ordering against a live pane would require a
-    /// deliberately slow-rendering harness, which we don't maintain.
-    #[test]
-    fn test_deliver_prompt_wraps_payload_with_sentinels() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let session = "omar-test-deliver-sentinels";
-        let _ = tmux_command()
-            .args(["kill-session", "-t", session])
-            .output();
-        let _guard = SessionGuard(session.to_string());
-
-        let tmp_path =
-            std::env::temp_dir().join(format!("omar-sentinel-{}.txt", uuid::Uuid::new_v4()));
-        let tmp_str = match tmp_path.to_str() {
-            Some(s) => s,
-            None => {
-                eprintln!("Skipping test: temp path not UTF-8");
-                return;
-            }
-        };
-        let quoted_tmp = format!("'{}'", tmp_str.replace('\'', r"'\''"));
-        let _tmp_guard = TempPathGuard(tmp_path.clone());
-
-        let shell_cmd = "/bin/bash --norc --noprofile -i";
-        let ok = tmux_command()
-            .args(["new-session", "-d", "-s", session, shell_cmd])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            eprintln!("Skipping test: failed to create tmux session");
-            return;
-        }
-        thread::sleep(Duration::from_millis(200));
-
-        // Start a byte-exact reader. dd count is generously sized so it
-        // captures the full sentinel-wrapped payload regardless of the
-        // exact sentinel string lengths.
-        let reader_cmd = format!(
-            "stty -icrnl -icanon; dd bs=1 count=120 of={} 2>/dev/null",
-            quoted_tmp,
-        );
-
-        let client = TmuxClient::new("omar-test-");
-        if client.send_keys_literal(session, &reader_cmd).is_err() {
-            eprintln!("Skipping test: send_keys_literal failed (sandbox?)");
-            return;
-        }
-        if client.send_keys(session, "Enter").is_err() {
-            eprintln!("Skipping test: send_keys Enter failed (sandbox?)");
-            return;
-        }
-        thread::sleep(Duration::from_millis(200));
-
-        let opts = DeliveryOptions {
-            startup_timeout: Duration::from_secs(3),
-            stable_quiet: Duration::from_millis(200),
-            verify_timeout: Duration::from_secs(3),
-            max_retries: 2,
-            poll_interval: Duration::from_millis(50),
-            retry_delay: Duration::from_millis(100),
-            require_initial_change: false,
-        };
-        let payload = "SENTINEL_PAYLOAD_MARKER";
-        let result = client.deliver_prompt(session, payload, &opts);
-        if let Err(e) = &result {
-            eprintln!("Skipping test: deliver_prompt failed (sandbox?): {}", e);
-            return;
-        }
-
-        // Wait for dd to flush enough bytes for the full wrapped payload.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if let Ok(meta) = std::fs::metadata(&tmp_path) {
-                if meta.len() >= 70 {
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        let got = match std::fs::read_to_string(&tmp_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Skipping test: tmp file not produced: {}", e);
-                return;
-            }
-        };
-
-        assert!(
-            got.contains("<UserPromptBegins:"),
-            "submitted bytes must contain start sentinel, got: {:?}",
-            got
-        );
-        assert!(
-            got.contains("<UserPromptEnds:"),
-            "submitted bytes must contain end sentinel, got: {:?}",
-            got
-        );
-        assert!(
-            got.contains("SENTINEL_PAYLOAD_MARKER"),
-            "submitted bytes must contain the actual payload, got: {:?}",
-            got
-        );
-
-        // Sentinels must use the SAME UUID on both sides — extract and
-        // compare. Catches accidental per-line regeneration regressions.
-        let begins_id = extract_sentinel_id(&got, "<UserPromptBegins:").expect("begin id");
-        let ends_id = extract_sentinel_id(&got, "<UserPromptEnds:").expect("end id");
-        assert_eq!(
-            begins_id, ends_id,
-            "start and end sentinel UUIDs must match"
-        );
-    }
-
-    /// An agent that answers during the paste still counts as delivered.
-    ///
-    /// A line-oriented agent acts on the prompt before Enter, so its output is
-    /// already in the pre-Enter snapshot and Enter changes nothing. Judging by
-    /// the pane alone, that is indistinguishable from a prompt that never
-    /// arrived — and the retry it provoked re-delivered an invocation the agent
-    /// had already answered, which the runtime then rejected, failing a run
-    /// whose work was done.
-    #[test]
-    fn an_answered_prompt_is_delivered_even_if_the_pane_does_not_change() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let session = "omar-test-answered-delivery";
-        let _ = tmux_command()
-            .args(["kill-session", "-t", session])
-            .output();
-        let _guard = SessionGuard(session.to_string());
-
-        // The pane must never change, or the delivery could confirm itself and
-        // there would be no blind case to test. `stty -echo` is what makes
-        // that true rather than merely likely: without it the tty echoes the
-        // paste back, the end sentinel appears, and verification succeeds —
-        // which it did, about one run in eight, under parallel load.
-        //
-        // Nothing reaches the screen, so the copies are counted in the file
-        // `cat` writes instead of in the pane.
-        let sink =
-            std::env::temp_dir().join(format!("omar-answered-probe-{}.txt", uuid::Uuid::new_v4()));
-        let sink_str = match sink.to_str() {
-            Some(s) => s,
-            None => {
-                eprintln!("Skipping test: temp path is not valid UTF-8: {:?}", sink);
-                return;
-            }
-        };
-        // Single-quote-escape the path so a TMPDIR holding spaces or shell
-        // metacharacters can't redirect the copies somewhere we never read —
-        // which would mask a real regression as "saw 0 paste(s)".
-        let run = format!("stty -echo; cat > '{}'", sink_str.replace('\'', r"'\''"));
-        // Remove the sink on every exit path, including a failed assertion.
-        let _sink_guard = TempPathGuard(sink.clone());
-        let ok = tmux_command()
-            .args(["new-session", "-d", "-s", session, &run])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            eprintln!("Skipping test: failed to create tmux session");
-            return;
-        }
-
-        let client = TmuxClient::new("omar-test-");
-        let opts = DeliveryOptions {
-            startup_timeout: Duration::from_secs(3),
-            stable_quiet: Duration::from_millis(200),
-            verify_timeout: Duration::from_millis(600),
-            max_retries: 3,
-            poll_interval: Duration::from_millis(50),
-            retry_delay: Duration::from_millis(50),
-            require_initial_change: false,
-        };
-
-        // Nothing to go on but the pane: the delivery cannot be confirmed, and
-        // every attempt pastes the prompt again.
-        let blind = client.deliver_prompt_until(session, "OMAR ANSWERED PROBE", &opts, &|| false);
-        assert!(blind.is_err(), "a pane that never changes cannot confirm");
-        let pasted = std::fs::read_to_string(&sink)
-            .unwrap_or_default()
-            .matches("OMAR ANSWERED PROBE")
-            .count();
-        assert!(
-            pasted > 1,
-            "expected the blind delivery to retry, saw {pasted} paste(s)"
-        );
-
-        // The regression this test is named for lives one level down, in
-        // `wait_for_change`: an agent that answers between the paste and the
-        // submit has already drawn its output, so Enter causes no change and
-        // only `answered` proves the prompt arrived. Exercise it directly —
-        // routing through `deliver_prompt_until` cannot reach it, because the
-        // same `stty -echo` that makes the blind case above deterministic
-        // also keeps the paste from rendering, so every attempt retries
-        // before it ever submits.
-        let content_before = client.capture_pane(session, 50).unwrap_or_default();
-        let activity_before = client.get_pane_activity(session).unwrap_or(0);
-
-        assert!(
-            !client.wait_for_change(
-                session,
-                activity_before,
-                &content_before,
-                Duration::from_millis(300),
-                opts.poll_interval,
-                &|| false,
-            ),
-            "a pane that never changes cannot verify an unanswered prompt"
-        );
-
-        // Same still pane, same snapshot — `answered` is the only difference.
-        let started = Instant::now();
-        assert!(
-            client.wait_for_change(
-                session,
-                activity_before,
-                &content_before,
-                Duration::from_secs(2),
-                opts.poll_interval,
-                &|| true,
-            ),
-            "an answered prompt needs no pane change to count as delivered"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the answered check must short-circuit, not wait out the timeout"
         );
     }
 

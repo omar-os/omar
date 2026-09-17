@@ -1079,7 +1079,7 @@ pub fn build_agent_command(
             // first user message, which makes the LLM read agent.md
             // descriptively and ask back "What is your agent name?" etc.
             // Spawn opencode bare and let `spawn_worker` deliver the prompt
-            // via tmux as a single combined first user message.
+            // through the backend channel as combined synthetic context.
             let base_command = with_opencode_port(&base_command);
             match opencode_config_env(mcp_context) {
                 Some(config) => format!(
@@ -1602,10 +1602,8 @@ fn spawn_worker(
 
     // Wait for backend readiness when possible, then deliver an explicit
     // first task message so workers begin execution deterministically.
-    // If markers succeed, the TUI is proven ready; skip require_initial_change
-    // (a fresh Claude Code banner stays pixel-stable after drawing, so any
-    // extra "wait for a change" would time out).
-    let markers_proved_ready = if let Some(kind) = detect_backend(command) {
+    // Channel delivery independently checks that the backend endpoint exists.
+    let _markers_proved_ready = if let Some(kind) = detect_backend(command) {
         let markers = crate::tmux::backend_readiness_markers(kind.canonical_name());
         if markers.is_empty() {
             false
@@ -1630,7 +1628,7 @@ fn spawn_worker(
 
     // opencode has no system-prompt flag, so build_agent_command spawns it
     // bare. Inline the rendered agent.md content here so the worker receives
-    // its instructions plus the YOUR NAME header in a single user message.
+    // its instructions plus the YOUR NAME header in one side-channel message.
     let header = format!(
         "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
         agent.name, parent_name, agent.task
@@ -1645,15 +1643,7 @@ fn spawn_worker(
     } else {
         header
     };
-    let opts = DeliveryOptions {
-        startup_timeout: Duration::from_secs(45),
-        stable_quiet: Duration::from_millis(800),
-        verify_timeout: Duration::from_secs(6),
-        max_retries: 4,
-        poll_interval: Duration::from_millis(120),
-        retry_delay: Duration::from_millis(250),
-        require_initial_change: !markers_proved_ready,
-    };
+    let opts = DeliveryOptions::default();
     client
         .deliver_prompt(&session_name, &initial_msg, &opts)
         .map_err(|e| anyhow::anyhow!("failed to deliver initial task to {}: {}", agent.name, e))?;

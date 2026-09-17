@@ -191,7 +191,17 @@ jobs:
           echo "$output"
           grep -Fq 'Output run.result = "hello"' <<<"$output"
 
-      # The first program CI runs that has a reaction. Its bodies are code, so
+      - name: Verify agent invocations use side-channel delivery
+        env:
+          OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
+        run: |
+          output=$(cargo run --quiet --bin omar -- run \
+            tests/ci/side_channel_stub.omar --input run.request=go \
+            --timeout-seconds 15 --replace)
+          echo "$output"
+          grep -Fq 'Output run.result = "stub"' <<<"$output"
+
+      # This reaction program has code bodies, so
       # the ring is deterministic and costs no model call.
       - name: Verify a reaction end to end
         env:
@@ -660,7 +670,7 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
+    needs: [check, fmt, clippy, test, codex-shared-history, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: always()
@@ -671,6 +681,7 @@ jobs:
              [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.codex-shared-history.result }}" != "success" ]] || \
              [[ "${{ needs.omar-language.result }}" != "success" ]] || \
              [[ "${{ needs.popup-quote-integration.result }}" != "success" ]] || \
              [[ "${{ needs.unresolved-session-integration.result }}" != "success" ]] || \

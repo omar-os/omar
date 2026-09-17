@@ -2331,30 +2331,34 @@ mod tests {
         let mut config = Config::default();
         config.dashboard.session_prefix = format!("omar-history-test-{}-", Uuid::new_v4());
         config.agent.default_workdir = dir.path().display().to_string();
-        // A recording terminal replaces the LLM; this exercises the real
-        // assistant relaunch and delivery paths without using model credentials.
-        let recorder = dir.path().join("recorder.py");
+        // A recording backend drains its side-channel queue. No TTY input,
+        // real Claude installation, or model credentials are involved.
+        let recorder = dir.path().join("claude");
         fs::write(
             &recorder,
-            r#"import os, sys, tty
-tty.setraw(0)
-buffer = b''
-shown = False
-with open(sys.argv[1], 'ab', buffering=0) as output:
-    while True:
-        chunk = os.read(0, 65536)
-        output.write(chunk)
-        buffer += chunk
-        if b'<UserPromptEnds:' in buffer and buffer.rstrip().endswith(b'>') and not shown:
-            os.write(1, b'[Pasted text #1]')
-            shown = True
-        if shown and b'\r' in chunk:
-            os.write(1, b'\r\nRecorded submission\r\n')
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys, time
+output = pathlib.Path(__file__).with_name('captured.txt')
+spool = output.with_suffix('.queue')
+subprocess.run(['tmux', 'set-environment', '-t', os.environ['TMUX_PANE'],
+                'OMAR_DELIVERY', 'spool:' + str(spool)], check=True)
+while True:
+    claimed = spool.with_suffix('.draining')
+    try:
+        spool.rename(claimed)
+    except FileNotFoundError:
+        time.sleep(0.025)
+        continue
+    with output.open('a') as sink:
+        for line in claimed.read_text().splitlines():
+            sink.write(json.loads(line)['text'] + '\n')
+    claimed.unlink()
 "#,
         )
         .unwrap();
-        config.agent.default_command =
-            format!("python3 '{}' '{}'", recorder.display(), captured.display());
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o700)).unwrap();
+        config.agent.default_command = format!("'{}' '{}'", recorder.display(), captured.display());
         let session = crate::ea::ea_manager_session(0, &config.dashboard.session_prefix);
         struct Cleanup(String);
         impl Drop for Cleanup {

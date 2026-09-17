@@ -138,3 +138,32 @@ cwd, rendered Astra starfield characters, draft-safe event wake, ordinary Codex
 resume, and resume back inside Omar with tools and events restored. It also checks the
 real standalone `serve` scheduler with an unsent draft. The dedicated
 Codex Shared History CI job installs the pinned CLI and runs this check.
+
+## Agent messages never use terminal input
+
+OMAR routes initial worker tasks, MCP `send_input` follow-ups, topology
+invocations, manager messages, Mission Control chat, and scheduled events through
+backend channels. Delivery never reads, clears, pastes into, or submits the
+composer. The old draft capture/restore and paste-and-Enter fallback are removed.
+A missing or failed channel produces an error; scheduled events remain queued
+for retry. Unknown or unstamped agent sessions cannot receive terminal input.
+
+Codex receives `omar_event` tool output through its app-server. Claude receives
+native peer messages, which Claude distinguishes from operator prompts. OpenCode
+receives synthetic context through its asynchronous prompt API, which also wakes
+an idle session. Cursor and Antigravity use their hook queues: acceptance means
+queued, and an idle agent receives the message only when its next hook runs.
+The model-free topology stub drains a queue as well.
+
+Agent messages may remain visible as peer messages or tool context in backend
+transcripts; they must not become entries typed into the user's composer or
+prompt-recall history. Mission Control's own operator chat history is preserved.
+The `enter` option on MCP `send_input` applies only to explicitly created raw demo
+sessions; agent messages are delivered directly regardless of that option.
+Existing raw sessions without the new `raw` backend stamp must be recreated to
+receive terminal text through this tool.
+
+Custom Codex launch commands that cannot attach to app-server no longer receive
+automated messages through a terminal fallback. Use a supported app-server launch
+or resolve the reported channel error. Multi-thread ambiguity is an error rather
+than permission to guess a conversation or type into its composer.
