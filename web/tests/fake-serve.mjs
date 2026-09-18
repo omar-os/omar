@@ -42,6 +42,7 @@ export async function startFakeServe({
   snapshot: snapshotFile = "diagram-snapshot.v1.json",
   /** The geometry a terminal announces, as the daemon reports the agent's. */
   terminal: terminalSize = { cols: 96, rows: 28 },
+  terminalReflow = false,
 } = {}) {
   const golden = JSON.parse(
     await readFile(new URL(`./fixtures/${snapshotFile}`, import.meta.url), "utf8"),
@@ -259,9 +260,21 @@ export async function startFakeServe({
     }
     terminals.handleUpgrade(request, socket, head, (client) => {
       const agent = decodeURIComponent(match[1]);
-      let size = terminalSize;
+      let size = url.searchParams.has("cols")
+        ? { cols: Number(url.searchParams.get("cols")), rows: Number(url.searchParams.get("rows")) }
+        : terminalSize;
+      const draw = () => {
+        if (!terminalReflow) return;
+        // Full-screen fixture: right/bottom edge sentinels expose clipping,
+        // and a cleared redraw exposes duplicate output after a width change.
+        client.send(Buffer.from(`\x1b[2J\x1b[HFRAME ${size.cols}x${size.rows}` +
+          `\x1b[2;1H${"x".repeat(size.cols - 1)}R` +
+          `\x1b[${size.rows};1HBOTTOM`));
+      };
       client.send(JSON.stringify(size));
-      client.send(Buffer.from(`${agent} $ `));
+      if (terminalReflow) client.send(Buffer.from("\x1b[?1049h"));
+      draw();
+      if (!terminalReflow) client.send(Buffer.from(`${agent} $ `));
       client.on("message", (data, isBinary) => {
         // Text is a resize control frame, binary is keystrokes. The daemon
         // reflows the session and answers with the shape it settled on;
@@ -269,6 +282,7 @@ export async function startFakeServe({
         if (!isBinary) {
           size = JSON.parse(data.toString());
           client.send(JSON.stringify(size));
+          draw();
           return;
         }
         client.send(Buffer.from(data));

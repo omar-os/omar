@@ -78,13 +78,17 @@ struct Cli {
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Agent backend to use: claude, codex, cursor, opencode, agy
+    /// Create a new EA with this backend: claude, codex, cursor, opencode, agy
     #[arg(short, long)]
     agent: Option<String>,
 
-    /// EA to target by id or name [default: active EA]
+    /// Name for a new EA with -a; otherwise target an EA by id or name
     #[arg(long, global = true)]
     ea: Option<String>,
+
+    // Preserve the allocated EA across our own cold dashboard exec in tmux.
+    #[arg(long, hide = true)]
+    dashboard_ea: Option<ea::EaId>,
 
     /// Enable global spawn metrics logging sink
     #[arg(long, global = true)]
@@ -359,7 +363,10 @@ async fn async_main() -> Result<()> {
     }
     metrics::configure(config.metrics.spawn_metrics_enabled);
     let omar_dir = omar_dir();
-    let defer_active_ea_save = cli.command.is_none() && cli.agent.is_some();
+    let new_ea_launch = cli.agent.is_some()
+        && (cli.command.is_none()
+            || matches!(&cli.command, Some(Commands::Serve { no_ea: false, .. })));
+    let defer_active_ea_save = new_ea_launch;
 
     if !defer_active_ea_save {
         if let Some(ref selector) = cli.ea {
@@ -554,24 +561,52 @@ async fn async_main() -> Result<()> {
             if ui && !web_assets::is_bundled() {
                 anyhow::bail!(web_assets::MISSING);
             }
-            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            let target = if new_ea_launch {
+                let target = ea::create_launch_ea(&omar_dir, cli.ea.as_deref())?;
+                eprintln!("Created EA '{}' (id={})", target.name, target.id);
+                ea::save_active_ea(&omar_dir, target.id)?;
+                target
+            } else {
+                resolve_cli_ea(&omar_dir, cli.ea.as_deref())?
+            };
             if ui {
                 // `serve::run` blocks, so the browser is opened from a thread
                 // that waits for the listener rather than before it exists.
                 std::thread::spawn(move || open_when_listening(address));
             }
+            // Standalone serve has no terminal dashboard to drive scheduled
+            // events. Run the same persistent event loop for its agent panes.
+            tokio::spawn(scheduler::run_event_loop(
+                Arc::new(scheduler::Scheduler::with_store(
+                    scheduler::events_store_path(&omar_dir),
+                )),
+                scheduler::TickerBuffer::new(),
+                config.dashboard.session_prefix.clone(),
+            ));
             serve::run(address, &config, &omar_dir, target.id, restart_ea, !no_ea)
         }
         None => {
+            let mut launched_ea = None;
             if cli.agent.is_some() {
-                let (target, created) =
-                    ea::resolve_or_create_ea_selector(&omar_dir, cli.ea.as_deref())?;
-                if created {
+                let target = if let Some(id) = cli.dashboard_ea {
+                    anyhow::ensure!(
+                        std::env::var_os("TMUX").is_some(),
+                        "--dashboard-ea is internal to the tmux dashboard launch"
+                    );
+                    ea::resolve_ea_selector(&omar_dir, Some(&id.to_string()))?
+                } else {
+                    let target = ea::create_launch_ea(&omar_dir, cli.ea.as_deref())?;
                     eprintln!("Created EA '{}' (id={})", target.name, target.id);
-                }
+                    target
+                };
                 let client =
                     TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
-                let (_, result) = manager::ensure_manager_session(
+                // Persist the new EA before manager startup. A later launch
+                // failure must not leave the registry updated and the dashboard
+                // still pointing at the previous EA.
+                ea::save_active_ea(&omar_dir, target.id)?;
+                launched_ea = Some(target.id);
+                match manager::ensure_manager_session(
                     &client,
                     &config.agent.default_command,
                     target.id,
@@ -583,21 +618,28 @@ async fn async_main() -> Result<()> {
                         health_idle_warning: config.health.idle_warning,
                         serve: None,
                     },
-                )?;
-                match result {
-                    manager::ManagerEnsureResult::Started => {
+                ) {
+                    Ok((_, manager::ManagerEnsureResult::Started)) => {
                         eprintln!("Started EA '{}' with requested backend", target.name);
                     }
-                    manager::ManagerEnsureResult::ReplacedBackend => {
+                    Ok((_, manager::ManagerEnsureResult::ReplacedBackend)) => {
                         eprintln!("Replaced EA '{}' with requested backend", target.name);
                     }
-                    manager::ManagerEnsureResult::AlreadyRunning => {}
+                    Ok((_, manager::ManagerEnsureResult::AlreadyRunning)) => {}
+                    Err(err) if std::env::var_os("TMUX").is_none() => {
+                        eprintln!("Manager for EA '{}' did not start: {err:#}", target.name);
+                    }
+                    Err(err) => return Err(err),
                 }
-                ea::save_active_ea(&omar_dir, target.id)?;
             }
             if std::env::var("TMUX").is_err() {
-                let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
-                relaunch_in_tmux(&config, &omar_dir, target.id, cli.agent.is_some())
+                // Keep this invocation's identity even if another terminal
+                // changes the persisted active EA before we attach.
+                let target_id = match launched_ea {
+                    Some(id) => id,
+                    None => resolve_cli_ea(&omar_dir, cli.ea.as_deref())?.id,
+                };
+                relaunch_in_tmux(&config, &omar_dir, target_id, false)
             } else {
                 run_dashboard(config).await
             }
@@ -1018,6 +1060,7 @@ fn relaunch_in_tmux(
     cmd.arg(&current_dir);
     cmd.arg(&exe);
     cmd.args(&args);
+    cmd.arg("--dashboard-ea").arg(active_ea.to_string());
 
     // exec() replaces the current process; only returns on error
     let err = cmd.exec();
@@ -1335,12 +1378,10 @@ async fn run_dashboard(config: Config) -> Result<()> {
     let scheduler = Arc::new(scheduler::Scheduler::with_store(
         scheduler::events_store_path(&omar_dir),
     ));
-    let popup_receiver = scheduler::new_popup_receiver();
     let base_prefix = config.dashboard.session_prefix.clone();
     tokio::spawn(scheduler::run_event_loop(
         scheduler.clone(),
         ticker.clone(),
-        popup_receiver.clone(),
         base_prefix,
     ));
 
@@ -1724,17 +1765,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 continue;
                             }
 
-                            let selected_popup_receiver = app
-                                .selected_popup_receiver_name()
-                                .map(|name| (name, app.active_ea));
                             let popup_info = app
                                 .selected_agent()
                                 .map(|a| (a.session.name.clone(), app.client().clone()));
-
-                            // Tell the scheduler which agent popup is open so it
-                            // defers events for that receiver until the popup closes.
-                            // Include ea_id so suppression is scoped per-EA.
-                            *popup_receiver.lock().unwrap() = selected_popup_receiver;
 
                             // Release App lock before blocking popup call
                             drop(app);
@@ -1804,9 +1837,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                     app.set_status(format!("Error: {}", e));
                                 }
                             }
-
-                            // Popup closed — clear so events resume delivery
-                            *popup_receiver.lock().unwrap() = None;
                         }
                         KeyCode::Char('n') => {
                             if let Err(e) = app.spawn_agent() {

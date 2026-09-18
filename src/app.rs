@@ -858,24 +858,6 @@ impl App {
         })
     }
 
-    /// Receiver-side name for the selected agent, suitable for matching the
-    /// `receiver` field of a `ScheduledEvent`.
-    ///
-    /// Workers are addressed by their short name (e.g., "worker1").
-    /// The EA manager is addressed as "ea" — the session name
-    /// `omar-agent-ea-<id>` never appears in scheduled-event payloads.
-    ///
-    /// Used by the dashboard when the user opens an agent popup so the
-    /// scheduler can defer events bound for that pane while it is open.
-    pub fn selected_popup_receiver_name(&self) -> Option<String> {
-        let selected = self.selected_agent()?;
-        Some(popup_receiver_name_for(
-            &selected.session.name,
-            &self.manager_session_name(),
-            self.client.prefix(),
-        ))
-    }
-
     /// Attach to the selected agent via popup
     pub fn attach_selected(&self) -> Result<()> {
         if let Some(agent) = self.selected_agent() {
@@ -1512,27 +1494,6 @@ pub fn build_tree(
     }
 
     nodes
-}
-
-/// Map a selected session name to the canonical receiver name used in
-/// scheduled events. The EA manager's session name collapses to "ea"; worker
-/// sessions drop the EA-scoped prefix.
-///
-/// Kept as a free fn so it can be unit-tested without standing up a full
-/// `App` (which needs a Config + tmux client).
-pub(crate) fn popup_receiver_name_for(
-    selected_session_name: &str,
-    manager_session_name: &str,
-    prefix: &str,
-) -> String {
-    if selected_session_name == manager_session_name {
-        "ea".to_string()
-    } else {
-        selected_session_name
-            .strip_prefix(prefix)
-            .unwrap_or(selected_session_name)
-            .to_string()
-    }
 }
 
 /// Position of the agent named `name` within `focus_child_indices`, so the
@@ -2981,41 +2942,5 @@ default_workdir = "."
             !state_dir.exists(),
             "EA state should be removed after successful delete"
         );
-    }
-
-    // ── popup_receiver_name_for tests ──
-    //
-    // The tmux pane the dashboard opens must be addressed by the same
-    // identifier the scheduler sees in event `receiver` fields, so that the
-    // per-pane 30s defer actually matches. Workers use their short name; the
-    // EA pane normalizes to "ea" (not the session name `omar-agent-ea-N`,
-    // which never appears in event payloads).
-
-    #[test]
-    fn popup_receiver_name_for_worker_strips_prefix() {
-        let name =
-            popup_receiver_name_for("omar-agent-0-worker1", "omar-agent-ea-0", "omar-agent-0-");
-        assert_eq!(name, "worker1");
-    }
-
-    #[test]
-    fn popup_receiver_name_for_ea_manager_normalizes_to_ea() {
-        let name = popup_receiver_name_for("omar-agent-ea-0", "omar-agent-ea-0", "omar-agent-0-");
-        assert_eq!(name, "ea");
-    }
-
-    #[test]
-    fn popup_receiver_name_for_ea_manager_ea1_also_normalizes_to_ea() {
-        // EA 1: prefix is "omar-agent-1-", manager is "omar-agent-ea-1".
-        let name = popup_receiver_name_for("omar-agent-ea-1", "omar-agent-ea-1", "omar-agent-1-");
-        assert_eq!(name, "ea");
-    }
-
-    #[test]
-    fn popup_receiver_name_for_unprefixed_falls_back_to_full_name() {
-        // Safety net: a session that doesn't carry the active EA prefix at
-        // all shouldn't silently become an empty string.
-        let name = popup_receiver_name_for("legacy-session", "omar-agent-ea-0", "omar-agent-0-");
-        assert_eq!(name, "legacy-session");
     }
 }

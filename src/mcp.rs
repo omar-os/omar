@@ -1154,6 +1154,9 @@ impl OmarMcpServer {
         }
         let tmux_spawn_start = std::time::Instant::now();
         client.new_session(&session_name, &command, Some(&workdir))?;
+        if !supports_prompt_delivery {
+            client.set_session_backend(&session_name, "raw")?;
+        }
         let tmux_spawn_ms = tmux_spawn_start.elapsed().as_millis() as u64;
         metrics::record_backend_bootstrap(&backend_name);
 
@@ -1173,7 +1176,7 @@ impl OmarMcpServer {
             // opencode has no system-prompt flag, so build_agent_command
             // spawns it bare. Inline the rendered agent.md content here so
             // the worker receives instructions plus the YOUR NAME header
-            // in a single user message. Other backends already received
+            // in one side-channel message. Other backends already received
             // agent.md via their respective system-prompt flags.
             let first_message = if backend_name == "opencode" {
                 let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
@@ -1367,10 +1370,13 @@ impl OmarMcpServer {
         if !client.has_session(&session_name).unwrap_or(false) {
             return Err(anyhow!("Agent '{}' not found", args.name));
         }
-        client.send_keys_literal(&session_name, &args.text)?;
-        if args.enter {
-            thread::sleep(Duration::from_millis(100));
-            client.send_keys(&session_name, "Enter")?;
+        if client.session_backend(&session_name).as_deref() == Some("raw") {
+            client.send_keys_literal(&session_name, &args.text)?;
+            if args.enter {
+                client.send_keys(&session_name, "Enter")?;
+            }
+        } else {
+            client.deliver_prompt(&session_name, &args.text, &DeliveryOptions::default())?;
         }
         Ok(json!({ "status": "sent" }))
     }
@@ -2177,13 +2183,13 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "send_input",
-            "Send text to a running agent or raw demo session. Use for follow-up instructions, concrete unblocking messages, or demo commands. Side effect: injects text into the target tmux pane and optionally presses Enter. Not generally retry-safe because duplicate input may execute twice. Fails if the target agent is not running.",
+            "Send text to a running agent or raw demo session. Use for follow-up instructions, concrete unblocking messages, or demo commands. Agent messages use the backend side channel and never touch the composer. Explicit raw demo sessions receive terminal text and optionally Enter. Not generally retry-safe because duplicate input may execute twice. Fails if the target agent is not running.",
             json!({
                 "type":"object",
                 "properties":{
                     "name":{"type":"string","description":"Short target agent/session name."},
                     "text":{"type":"string","description":"Literal text to send."},
-                    "enter":{"type":"boolean","description":"Whether to press Enter after text. Defaults to false."}
+                    "enter":{"type":"boolean","description":"Raw demo sessions only: press Enter after text. Ignored for agents, whose messages are delivered directly."}
                 },
                 "required":["name","text"],
                 "additionalProperties":false
@@ -2563,6 +2569,43 @@ mod tests {
                 Some(value) => std::env::set_var(self.key, value),
                 None => std::env::remove_var(self.key),
             }
+        }
+    }
+
+    #[test]
+    fn send_input_routes_agent_followups_away_from_composer() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().to_path_buf();
+        context.session_prefix = format!("omar-channel-test-{}-", Uuid::new_v4());
+        let server = OmarMcpServer::new(context);
+        let client = server.client();
+        let session = server.qualified_session_name("worker").unwrap();
+        client.new_session(&session, "sleep 9999", None).unwrap();
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = TmuxClient::new("").kill_session(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(session.clone());
+        let spool = dir.path().join("events.jsonl");
+        client.set_session_backend(&session, "codex").unwrap();
+        client
+            .set_session_delivery(&session, &format!("spool:{}", spool.display()))
+            .unwrap();
+        for enter in [false, true] {
+            server
+                .send_input(json!({"name": "worker", "text": "FOLLOWUP_SENTINEL", "enter": enter}))
+                .unwrap();
+            assert_eq!(crate::channel::drain_spool(&spool), ["FOLLOWUP_SENTINEL"]);
+            assert!(!client
+                .capture_pane(&session, 50)
+                .unwrap()
+                .contains("FOLLOWUP_SENTINEL"));
         }
     }
 

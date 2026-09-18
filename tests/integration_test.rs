@@ -367,27 +367,27 @@ fn test_capture_pane() {
     let session_name = format!("{}capture", TEST_PREFIX);
     cleanup_session(&session_name);
 
-    // Create a session with a shell
-    let result = tmux(&["new-session", "-d", "-s", &session_name]);
+    // Use a plain shell so personal shell startup and prompt plugins cannot
+    // consume keystrokes or delay the output this test is checking.
+    let result = tmux(&["new-session", "-d", "-s", &session_name, "/bin/sh"]);
     assert!(result.is_ok(), "Failed to create session: {:?}", result);
-
-    // Give it time to start
-    thread::sleep(Duration::from_millis(200));
-
-    // Send echo command
-    let _ = tmux(&[
+    tmux(&[
         "send-keys",
         "-t",
         &session_name,
-        "echo HELLO_OMAR_TEST",
+        "printf 'HELLO_%s_TEST\\n' OMAR",
         "Enter",
-    ]);
+    ])
+    .unwrap();
 
-    // Give it time to execute
-    thread::sleep(Duration::from_millis(500));
-
-    // Capture pane content
-    let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let output = loop {
+        let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
+        if output.contains("HELLO_OMAR_TEST") || std::time::Instant::now() >= deadline {
+            break output;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     assert!(
         output.contains("HELLO_OMAR_TEST"),
         "Expected output not found: {}",

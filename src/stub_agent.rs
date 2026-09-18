@@ -3,7 +3,7 @@
 //! Every other backend is a real assistant, so nothing could exercise a run end
 //! to end without spending model calls — which is exactly the path most worth
 //! testing. This stands in for one: it reads `OMAR INVOCATION` messages from
-//! its pane, writes a type-correct value to each allowed effect, and completes.
+//! its side-channel queue, writes a type-correct value to each allowed effect, and completes.
 //!
 //! Only the thinking is faked. The compiler, VM, scheduler, superdense-time
 //! barrier, invocation server and diagram stream all run for real.
@@ -38,29 +38,31 @@ pub fn run(context_file: &Path) -> Result<()> {
     );
     std::io::stdout().flush().ok();
 
-    let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
-    while let Some(line) = lines.next() {
-        let line = line?;
-        if !line.contains(INVOCATION) {
-            continue;
-        }
-        // Fields arrive on their own lines directly after the marker.
-        let mut fields: BTreeMap<String, String> = BTreeMap::new();
-        for next in lines.by_ref() {
-            let next = next?;
-            if next.trim().is_empty() {
-                break;
+    let spool =
+        std::env::var_os("OMAR_EVENT_SPOOL").context("stub agent requires OMAR_EVENT_SPOOL")?;
+    loop {
+        for message in crate::channel::drain_spool(Path::new(&spool)) {
+            let mut lines = message.lines();
+            while let Some(line) = lines.next() {
+                if !line.contains(INVOCATION) {
+                    continue;
+                }
+                let mut fields = BTreeMap::new();
+                for next in lines.by_ref() {
+                    if next.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((key, value)) = next.split_once(':') {
+                        fields.insert(key.trim().to_string(), value.trim().to_string());
+                    }
+                }
+                if let Err(error) = answer(&topology, &fields) {
+                    eprintln!("stub agent could not answer: {error:#}");
+                }
             }
-            if let Some((key, value)) = next.split_once(':') {
-                fields.insert(key.trim().to_string(), value.trim().to_string());
-            }
         }
-        if let Err(error) = answer(&topology, &fields) {
-            eprintln!("stub agent could not answer: {error:#}");
-        }
+        std::thread::sleep(Duration::from_millis(25));
     }
-    Ok(())
 }
 
 fn answer(topology: &TopologyMcpContext, fields: &BTreeMap<String, String>) -> Result<()> {
