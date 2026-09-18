@@ -57,7 +57,7 @@ fn options() -> DeliveryOptions {
 fn agent_delivery_uses_channel_without_reading_or_editing_composer() {
     let dir = tempfile::tempdir().unwrap();
     let spool = dir.path().join("events");
-    let pane = Pane::new(Some("cursor"), Some(&format!("spool:{}", spool.display())));
+    let pane = Pane::new(Some("stub"), Some(&format!("spool:{}", spool.display())));
     TmuxClient::new("")
         .deliver_prompt("pane", "agent follow-up", &options())
         .unwrap();
@@ -111,7 +111,7 @@ fn scheduler_defers_missing_channel_without_editing_input() {
 fn scheduler_delivers_through_channel_without_editing_input() {
     let dir = tempfile::tempdir().unwrap();
     let spool = dir.path().join("events");
-    let pane = Pane::new(Some("cursor"), Some(&format!("spool:{}", spool.display())));
+    let pane = Pane::new(Some("stub"), Some(&format!("spool:{}", spool.display())));
     assert!(crate::scheduler::deliver_to_tmux(
         0,
         "worker",
@@ -236,4 +236,19 @@ fn codex_does_not_retry_ambiguous_threads_or_attempted_sends() {
     assert_eq!(codex_startup_case("ambiguous"), (false, 1, 0));
     assert_eq!(codex_startup_case("rejected"), (false, 1, 1));
     assert_eq!(codex_startup_case("disconnect"), (false, 1, 1));
+}
+
+#[test]
+fn passive_legacy_hooks_do_not_claim_to_wake_an_idle_agent() {
+    for backend in ["cursor", "agy"] {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("events");
+        let pane = Pane::new(Some(backend), Some(&format!("spool:{}", spool.display())));
+        let error = TmuxClient::new("")
+            .deliver_prompt("pane", "wake", &options())
+            .unwrap_err();
+        assert!(error.to_string().contains("relaunch"));
+        assert!(crate::channel::drain_spool(&spool).is_empty());
+        pane.assert_untouched();
+    }
 }

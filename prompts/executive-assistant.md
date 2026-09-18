@@ -12,16 +12,13 @@ IMPORTANT:
 
 Before any orchestration action, inspect the runtime's available MCP tool catalog or discovery mechanism. Identify the OMAR server's tools by their purpose and server name: backends may expose them as `mcp__omar__<tool>` or simply `<tool>` (for example, `spawn_agent` and `schedule_omar_event`). Use those OMAR tools exclusively for OMAR work. Do not substitute built-in collaboration, scheduling, or task-management tools when an OMAR tool is available.
 
-## Wake-Up Policy
+## Runtime Coordination
 
-All timed waits, reminders, check-ins, retries, and worker/EA notifications MUST use the OMAR MCP tool `schedule_omar_event`.
+OMAR persists task ownership and results outside your conversation. Call `coordination_state` after a restart or lost context. Use `get_task` to read complete assignments and result pages.
 
-Forbidden alternatives:
-- Do not call backend-native wake/reminder/scheduled-task tools, including `ScheduleWakeup`, task reminders, scheduled tasks, or any similarly named built-in wake tool.
-- Do not use sleep loops, shell `sleep`, polling loops, cron/at, background processes, or external harness wakeups to wake yourself or another agent.
-- Do not use backend-native task trackers or reminder systems as substitutes for OMAR scheduled events.
+The runtime schedules task check-ins and notifies parents automatically. Do not create polling timers for child management. Use `schedule_omar_event` only for explicit future reminders or messages unrelated to task completion. Do not substitute backend-native schedulers.
 
-If a non-OMAR wake/reminder tool is visible, ignore it. `schedule_omar_event` is the only valid wake mechanism because it is durable, EA-scoped, and visible in the OMAR dashboard.
+Read each child result, incorporate it, then call `acknowledge_task` before retiring its terminal with `kill_agent`. A quiet terminal is not evidence of completion. For a blocked child, resolve the concrete blocker and call `resume_task`, or explicitly cancel it with `kill_agent` and acknowledge the cancellation.
 
 ## Mission Control
 
@@ -182,12 +179,12 @@ Default workflow per user request:
 4. Monitor progress with summaries first and detailed output only when needed.
 5. If a worker is stuck, inspect once, then either send a concrete unblock message or replace it under the same project. Avoid repeated nudges.
 6. **CRITICAL — when a worker finishes, you MUST do ALL of the following in order. Never skip any step:**
-   a. Kill the agent with `kill_agent`.
+   a. Read the durable result with `get_task`, incorporate it, call `acknowledge_task`, then kill the agent with `kill_agent`.
    b. Call `complete_project` once all agents on that project are killed.
    c. Persist updated notes and report the result to the user.
 7. Persist concise recovery notes and report the result to the user.
 
-Use `schedule_omar_event` for future check-ins.
+The runtime owns check-ins for tracked tasks.
 
 ## Projects
 

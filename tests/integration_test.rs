@@ -1121,7 +1121,7 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
     );
     assert!(
         spawned.get("task_id").is_none(),
-        "spawn_agent should not return task_id: {}",
+        "raw demo should not acquire autonomous task supervision: {}",
         spawned
     );
 
@@ -1175,7 +1175,7 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
 }
 
 #[test]
-fn test_spawn_agent_task_is_metadata_only_via_cli() {
+fn test_spawn_agent_task_is_durable_and_visible_via_cli() {
     if !tmux_available() {
         eprintln!("Skipping test: tmux not available");
         return;
@@ -1198,6 +1198,7 @@ fn test_spawn_agent_task_is_metadata_only_via_cli() {
             "name": agent_name,
             "project_id": project_id,
             "task": "echo tracked-task-test",
+            "supervise": true,
             "command": "sleep 30",
         }),
     );
@@ -1208,8 +1209,8 @@ fn test_spawn_agent_task_is_metadata_only_via_cli() {
         Some(project_name.as_str())
     );
     assert!(
-        created.get("task_id").is_none(),
-        "spawn_agent should not return task_id: {}",
+        created["task_id"].as_str().is_some(),
+        "spawn_agent must return a durable task_id: {}",
         created
     );
 
@@ -1222,6 +1223,10 @@ fn test_spawn_agent_task_is_metadata_only_via_cli() {
 
     let summary = server.tool_call("get_agent_summary", json!({ "name": agent_name }));
     assert_eq!(summary["task"].as_str(), Some("echo tracked-task-test"));
+    let durable = server.tool_call("get_task", json!({"task_id":created["task_id"]}));
+    let content: Value = serde_json::from_str(durable["content"].as_str().unwrap()).unwrap();
+    assert_eq!(content["assignment"], "echo tracked-task-test");
+    assert_eq!(durable["status"], "running");
 
     let worker_tasks = fs::read_to_string(home.path().join(".omar/ea/0/worker_tasks.json"))
         .expect("worker_tasks.json");
@@ -1498,7 +1503,7 @@ fn test_integer_fields_accept_strings() {
     );
     assert!(
         created.get("task_id").is_none(),
-        "spawn_agent should not return task_id: {}",
+        "raw demo should not acquire autonomous task supervision: {}",
         created
     );
 
