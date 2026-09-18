@@ -602,7 +602,12 @@ async fn async_main() -> Result<()> {
                 };
                 let client =
                     TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
-                let (_, result) = manager::ensure_manager_session(
+                // Persist the new EA before manager startup. A later launch
+                // failure must not leave the registry updated and the dashboard
+                // still pointing at the previous EA.
+                ea::save_active_ea(&omar_dir, target.id)?;
+                launched_ea = Some(target.id);
+                match manager::ensure_manager_session(
                     &client,
                     &config.agent.default_command,
                     target.id,
@@ -614,18 +619,19 @@ async fn async_main() -> Result<()> {
                         health_idle_warning: config.health.idle_warning,
                         serve: None,
                     },
-                )?;
-                match result {
-                    manager::ManagerEnsureResult::Started => {
+                ) {
+                    Ok((_, manager::ManagerEnsureResult::Started)) => {
                         eprintln!("Started EA '{}' with requested backend", target.name);
                     }
-                    manager::ManagerEnsureResult::ReplacedBackend => {
+                    Ok((_, manager::ManagerEnsureResult::ReplacedBackend)) => {
                         eprintln!("Replaced EA '{}' with requested backend", target.name);
                     }
-                    manager::ManagerEnsureResult::AlreadyRunning => {}
+                    Ok((_, manager::ManagerEnsureResult::AlreadyRunning)) => {}
+                    Err(err) if std::env::var_os("TMUX").is_none() => {
+                        eprintln!("Manager for EA '{}' did not start: {err:#}", target.name);
+                    }
+                    Err(err) => return Err(err),
                 }
-                ea::save_active_ea(&omar_dir, target.id)?;
-                launched_ea = Some(target.id);
             }
             if std::env::var("TMUX").is_err() {
                 // Keep this invocation's identity even if another terminal

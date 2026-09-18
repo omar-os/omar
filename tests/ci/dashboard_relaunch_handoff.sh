@@ -96,17 +96,32 @@ start_fake_dashboard() {
 tmux_cmd new-session -d -s omar-agent-ea-0 "sleep 9999"
 original_pane="$(tmux_cmd display-message -p -t omar-agent-ea-0 '#{pane_id}')"
 
+# A long-lived fake claude keeps each -a manager pane alive so consecutive
+# launches are a successful startup plus a fresh handoff, not a swallowed
+# command-not-found. relaunch_in_tmux still writes before attach; attach is
+# expected to fail in this non-interactive subshell.
+mkdir -p "$work_dir/bin"
+cat >"$work_dir/bin/claude" <<'EOF'
+#!/bin/sh
+exec sleep 9999
+EOF
+chmod +x "$work_dir/bin/claude"
+PATH="$work_dir/bin:$PATH"
+export PATH
+
+run_omar() {
+  (
+    cd "$work_dir"
+    HOME="$home_dir" OMAR_TMUX_SERVER="$server" PATH="$PATH" "$OMAR_BIN" "$@"
+  )
+}
+
 # Case 1: `omar -a claude` from $work_dir should write a handoff with the
-# new cwd, the claude backend command, and restart_manager=false (the new EA is already running). We don't need claude actually installed — relaunch_in_tmux
-# only writes the handoff and tries to attach; the attach is expected to fail
-# in this non-interactive subshell, which is fine.
+# new cwd, the claude backend command, and restart_manager=false (the new EA is already running).
 start_fake_dashboard
 rm -f "$handoff_file"
 
-(
-  cd "$work_dir"
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" -a claude >/dev/null 2>&1 || true
-)
+run_omar -a claude >/dev/null 2>&1 || true
 
 if [ ! -f "$handoff_file" ]; then
   fail "dashboard_handoff.json was not written by omar -a claude"
@@ -132,10 +147,11 @@ PY
 
 # A second backend launch allocates another EA and preserves the first tree.
 start_fake_dashboard
-(
-  cd "$work_dir"
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" -a claude >/dev/null 2>&1 || true
-)
+rm -f "$handoff_file"
+run_omar -a claude >/dev/null 2>&1 || true
+if [ ! -f "$handoff_file" ]; then
+  fail "dashboard_handoff.json was not rewritten by the second omar -a claude"
+fi
 python3 - "$home_dir/.omar/eas.json" "$handoff_file" <<'PYTEST'
 import json, sys
 registry = json.load(open(sys.argv[1]))
@@ -150,10 +166,7 @@ PYTEST
 start_fake_dashboard
 rm -f "$handoff_file"
 
-(
-  cd "$work_dir"
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" >/dev/null 2>&1 || true
-)
+run_omar >/dev/null 2>&1 || true
 
 if [ ! -f "$handoff_file" ]; then
   fail "dashboard_handoff.json was not written by bare omar relaunch"
@@ -178,10 +191,7 @@ PY
 tmux_cmd kill-session -t "omar-dashboard" 2>/dev/null || true
 rm -f "$handoff_file"
 
-(
-  cd "$work_dir"
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" -a claude >/dev/null 2>&1 || true
-)
+run_omar -a claude >/dev/null 2>&1 || true
 
 if [ -f "$handoff_file" ]; then
   fail "dashboard_handoff.json was written on cold start (no existing dashboard)"
