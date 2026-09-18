@@ -81,7 +81,8 @@ with tempfile.TemporaryDirectory(prefix='omar-cx-', dir='/tmp') as work:
     home = work/'home'
     codex_home = home/'.codex'
     codex_home.mkdir(parents=True)
-    config = f'''model="gpt-6-astra"
+    config = f'''check_for_update_on_startup=false
+model="gpt-6-astra"
 model_provider="probe"
 [model_providers.probe]
 name="probe"
