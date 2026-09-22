@@ -1,0 +1,1986 @@
+{
+  "manifests": [
+    {
+      "batch": "omar-benchmark-scored-1",
+      "binary_sha256": {
+        "baseline": "940542b0318ba5dd083370b3cc81418585a5a430c81cf645f8c945afbf50dcdc",
+        "candidate": "06735382af67f2de5977dbf54901798492f957d3cadd0f6d5c2cb74fbcbdc191"
+      },
+      "budget": 240,
+      "cases": [
+        [
+          "baseline",
+          "cursor",
+          "normal",
+          314159
+        ],
+        [
+          "candidate",
+          "agy",
+          "normal",
+          314159
+        ],
+        [
+          "baseline",
+          "opencode",
+          "normal",
+          314159
+        ],
+        [
+          "baseline",
+          "agy",
+          "normal",
+          314159
+        ],
+        [
+          "candidate",
+          "cursor",
+          "normal",
+          314159
+        ],
+        [
+          "candidate",
+          "claude",
+          "normal",
+          314159
+        ],
+        [
+          "baseline",
+          "codex",
+          "normal",
+          314159
+        ],
+        [
+          "candidate",
+          "opencode",
+          "normal",
+          314159
+        ],
+        [
+          "baseline",
+          "claude",
+          "normal",
+          314159
+        ],
+        [
+          "candidate",
+          "codex",
+          "normal",
+          314159
+        ]
+      ],
+      "harness_sha256": "77d8829eaf6c02be50f21bbeec8eff1781af586c9a827495ef83bfb7688dd012",
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "revisions": {
+        "baseline": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+        "candidate": "50f5df187a750cd6d37d810fd6b819669eede9de"
+      },
+      "versions": {
+        "agy": {
+          "launcher_sha256": "cdf6bcff6840b12184b7ff3210c156a522f9d855ce32f4e27ce34c40091a8409",
+          "version": "1.2.5"
+        },
+        "claude": {
+          "launcher_sha256": "3509913f9d1576316c8845b88837f8fd3bbbcf26625833ac82cfb6b8985da94a",
+          "version": "2.1.274 (Claude Code)"
+        },
+        "codex": {
+          "launcher_sha256": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70",
+          "version": "codex-cli 0.154.0"
+        },
+        "cursor": {
+          "launcher_sha256": "548f4c6948758b82edadb49eee3fc0e5223e967412172a64bc0459fe807f9ddb",
+          "version": "2026.09.10-fd3934a"
+        },
+        "opencode": {
+          "launcher_sha256": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198",
+          "version": "1.18.31"
+        }
+      }
+    },
+    {
+      "batch": "omar-benchmark-context-1",
+      "binary_sha256": {
+        "baseline": "940542b0318ba5dd083370b3cc81418585a5a430c81cf645f8c945afbf50dcdc",
+        "candidate": "06735382af67f2de5977dbf54901798492f957d3cadd0f6d5c2cb74fbcbdc191"
+      },
+      "budget": 300,
+      "cases": [
+        [
+          "candidate",
+          "opencode",
+          "restart",
+          314159
+        ],
+        [
+          "baseline",
+          "opencode",
+          "compact",
+          314159
+        ],
+        [
+          "baseline",
+          "opencode",
+          "restart",
+          314159
+        ],
+        [
+          "candidate",
+          "codex",
+          "compact",
+          314159
+        ],
+        [
+          "candidate",
+          "opencode",
+          "compact",
+          314159
+        ],
+        [
+          "baseline",
+          "codex",
+          "restart",
+          314159
+        ],
+        [
+          "baseline",
+          "codex",
+          "compact",
+          314159
+        ],
+        [
+          "candidate",
+          "codex",
+          "restart",
+          314159
+        ]
+      ],
+      "harness_sha256": "5c7c1af9b8c0e60c04b4487d992b2640461f6b3520da3cdf2e71d82cab0ee264",
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "revisions": {
+        "baseline": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+        "candidate": "50f5df187a750cd6d37d810fd6b819669eede9de"
+      },
+      "versions": {
+        "agy": {
+          "launcher_sha256": "cdf6bcff6840b12184b7ff3210c156a522f9d855ce32f4e27ce34c40091a8409",
+          "version": "1.2.5"
+        },
+        "claude": {
+          "launcher_sha256": "3509913f9d1576316c8845b88837f8fd3bbbcf26625833ac82cfb6b8985da94a",
+          "version": "2.1.274 (Claude Code)"
+        },
+        "codex": {
+          "launcher_sha256": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70",
+          "version": "codex-cli 0.154.0"
+        },
+        "cursor": {
+          "launcher_sha256": "548f4c6948758b82edadb49eee3fc0e5223e967412172a64bc0459fe807f9ddb",
+          "version": "2026.09.10-fd3934a"
+        },
+        "opencode": {
+          "launcher_sha256": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198",
+          "version": "1.18.31"
+        }
+      }
+    },
+    {
+      "batch": "omar-benchmark-cursor-corrected",
+      "binary_sha256": {
+        "baseline": "940542b0318ba5dd083370b3cc81418585a5a430c81cf645f8c945afbf50dcdc",
+        "candidate": "06735382af67f2de5977dbf54901798492f957d3cadd0f6d5c2cb74fbcbdc191"
+      },
+      "budget": 300,
+      "cases": [
+        [
+          "baseline",
+          "agy",
+          "normal",
+          314159
+        ],
+        [
+          "candidate",
+          "agy",
+          "normal",
+          314159
+        ],
+        [
+          "baseline",
+          "cursor",
+          "normal",
+          314159
+        ],
+        [
+          "candidate",
+          "cursor",
+          "normal",
+          314159
+        ]
+      ],
+      "harness_sha256": "3227be2d64fdbb6ccb9942f02b73a5a31e3e12e102ca1a11410ac16ecc4e4b98",
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "revisions": {
+        "baseline": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+        "candidate": "50f5df187a750cd6d37d810fd6b819669eede9de"
+      },
+      "versions": {
+        "agy": {
+          "launcher_sha256": "cdf6bcff6840b12184b7ff3210c156a522f9d855ce32f4e27ce34c40091a8409",
+          "version": "1.2.5"
+        },
+        "claude": {
+          "launcher_sha256": "3509913f9d1576316c8845b88837f8fd3bbbcf26625833ac82cfb6b8985da94a",
+          "version": "2.1.274 (Claude Code)"
+        },
+        "codex": {
+          "launcher_sha256": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70",
+          "version": "codex-cli 0.154.0"
+        },
+        "cursor": {
+          "launcher_sha256": "548f4c6948758b82edadb49eee3fc0e5223e967412172a64bc0459fe807f9ddb",
+          "version": "2026.09.10-fd3934a"
+        },
+        "opencode": {
+          "launcher_sha256": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198",
+          "version": "1.18.31"
+        }
+      }
+    },
+    {
+      "batch": "omar-benchmark-codex-reset-corrected",
+      "binary_sha256": {
+        "baseline": "940542b0318ba5dd083370b3cc81418585a5a430c81cf645f8c945afbf50dcdc",
+        "candidate": "06735382af67f2de5977dbf54901798492f957d3cadd0f6d5c2cb74fbcbdc191"
+      },
+      "budget": 300,
+      "cases": [
+        [
+          "candidate",
+          "codex",
+          "restart",
+          314159
+        ],
+        [
+          "baseline",
+          "codex",
+          "restart",
+          314159
+        ]
+      ],
+      "harness_sha256": "297d0b4d85ce421dd77f8e4c1d68b5437b9fc381c6205ec3cd4ef2a63a256638",
+      "helper_sha256": {
+        "context_interventions.py": "2508d5c39c78baa654cc9cfbfc0a88480e65f4e1c53f8d65b87ac89dd2163726",
+        "worker_fixture.py": "50204871dce1dfb1d3fa35e6eb34833ace0a5d702262c7f4f1883fa95e8a5856"
+      },
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "parallel_cases": 2,
+      "revisions": {
+        "baseline": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+        "candidate": "50f5df187a750cd6d37d810fd6b819669eede9de"
+      },
+      "versions": {
+        "agy": {
+          "launcher_sha256": "cdf6bcff6840b12184b7ff3210c156a522f9d855ce32f4e27ce34c40091a8409",
+          "version": "1.2.5"
+        },
+        "claude": {
+          "launcher_sha256": "3509913f9d1576316c8845b88837f8fd3bbbcf26625833ac82cfb6b8985da94a",
+          "version": "2.1.274 (Claude Code)"
+        },
+        "codex": {
+          "launcher_sha256": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70",
+          "version": "codex-cli 0.154.0"
+        },
+        "cursor": {
+          "launcher_sha256": "548f4c6948758b82edadb49eee3fc0e5223e967412172a64bc0459fe807f9ddb",
+          "version": "2026.09.10-fd3934a"
+        },
+        "opencode": {
+          "launcher_sha256": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198",
+          "version": "1.18.31"
+        }
+      }
+    },
+    {
+      "batch": "omar-benchmark-codex-reset-argv",
+      "binary_sha256": {
+        "baseline": "940542b0318ba5dd083370b3cc81418585a5a430c81cf645f8c945afbf50dcdc",
+        "candidate": "06735382af67f2de5977dbf54901798492f957d3cadd0f6d5c2cb74fbcbdc191"
+      },
+      "budget": 300,
+      "cases": [
+        [
+          "candidate",
+          "codex",
+          "restart",
+          314159
+        ],
+        [
+          "baseline",
+          "codex",
+          "restart",
+          314159
+        ]
+      ],
+      "harness_sha256": "297d0b4d85ce421dd77f8e4c1d68b5437b9fc381c6205ec3cd4ef2a63a256638",
+      "helper_sha256": {
+        "context_interventions.py": "0554ffa9ab313543b9dd8e40f8983331b93f4f86e90e416502f242106e24fe0a",
+        "worker_fixture.py": "50204871dce1dfb1d3fa35e6eb34833ace0a5d702262c7f4f1883fa95e8a5856"
+      },
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "parallel_cases": 2,
+      "revisions": {
+        "baseline": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+        "candidate": "50f5df187a750cd6d37d810fd6b819669eede9de"
+      },
+      "versions": {
+        "agy": {
+          "launcher_sha256": "cdf6bcff6840b12184b7ff3210c156a522f9d855ce32f4e27ce34c40091a8409",
+          "version": "1.2.5"
+        },
+        "claude": {
+          "launcher_sha256": "3509913f9d1576316c8845b88837f8fd3bbbcf26625833ac82cfb6b8985da94a",
+          "version": "2.1.274 (Claude Code)"
+        },
+        "codex": {
+          "launcher_sha256": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70",
+          "version": "codex-cli 0.154.0"
+        },
+        "cursor": {
+          "launcher_sha256": "548f4c6948758b82edadb49eee3fc0e5223e967412172a64bc0459fe807f9ddb",
+          "version": "2026.09.10-fd3934a"
+        },
+        "opencode": {
+          "launcher_sha256": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198",
+          "version": "1.18.31"
+        }
+      }
+    },
+    {
+      "batch": "omar-benchmark-opencode-reset-repeat",
+      "binary_sha256": {
+        "baseline": "940542b0318ba5dd083370b3cc81418585a5a430c81cf645f8c945afbf50dcdc",
+        "candidate": "06735382af67f2de5977dbf54901798492f957d3cadd0f6d5c2cb74fbcbdc191"
+      },
+      "budget": 300,
+      "cases": [
+        [
+          "candidate",
+          "opencode",
+          "restart",
+          271828
+        ],
+        [
+          "baseline",
+          "opencode",
+          "restart",
+          271828
+        ]
+      ],
+      "harness_sha256": "297d0b4d85ce421dd77f8e4c1d68b5437b9fc381c6205ec3cd4ef2a63a256638",
+      "helper_sha256": {
+        "context_interventions.py": "2508d5c39c78baa654cc9cfbfc0a88480e65f4e1c53f8d65b87ac89dd2163726",
+        "worker_fixture.py": "50204871dce1dfb1d3fa35e6eb34833ace0a5d702262c7f4f1883fa95e8a5856"
+      },
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "parallel_cases": 2,
+      "revisions": {
+        "baseline": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+        "candidate": "50f5df187a750cd6d37d810fd6b819669eede9de"
+      },
+      "versions": {
+        "agy": {
+          "launcher_sha256": "cdf6bcff6840b12184b7ff3210c156a522f9d855ce32f4e27ce34c40091a8409",
+          "version": "1.2.5"
+        },
+        "claude": {
+          "launcher_sha256": "3509913f9d1576316c8845b88837f8fd3bbbcf26625833ac82cfb6b8985da94a",
+          "version": "2.1.274 (Claude Code)"
+        },
+        "codex": {
+          "launcher_sha256": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70",
+          "version": "codex-cli 0.154.0"
+        },
+        "cursor": {
+          "launcher_sha256": "548f4c6948758b82edadb49eee3fc0e5223e967412172a64bc0459fe807f9ddb",
+          "version": "2026.09.10-fd3934a"
+        },
+        "opencode": {
+          "launcher_sha256": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198",
+          "version": "1.18.31"
+        }
+      }
+    },
+    {
+      "batch": "omar-benchmark-acp-fixed",
+      "binary_sha256": {
+        "baseline": "940542b0318ba5dd083370b3cc81418585a5a430c81cf645f8c945afbf50dcdc",
+        "candidate": "2266b1852ca0358381c43e30782ffcf219222b80cd9375c01d1727cef559f7ef"
+      },
+      "budget": 300,
+      "cases": [
+        [
+          "baseline",
+          "agy",
+          "normal",
+          314159
+        ],
+        [
+          "candidate",
+          "agy",
+          "normal",
+          314159
+        ],
+        [
+          "baseline",
+          "cursor",
+          "normal",
+          314159
+        ],
+        [
+          "candidate",
+          "cursor",
+          "normal",
+          314159
+        ]
+      ],
+      "harness_sha256": "96091fc43e0fe738ed14e5ceb8f1b6f1c3e85f87f020b598d4ac63b8278bcfbe",
+      "helper_sha256": {
+        "context_interventions.py": "0554ffa9ab313543b9dd8e40f8983331b93f4f86e90e416502f242106e24fe0a",
+        "worker_fixture.py": "50204871dce1dfb1d3fa35e6eb34833ace0a5d702262c7f4f1883fa95e8a5856"
+      },
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "parallel_cases": 2,
+      "revisions": {
+        "baseline": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+        "candidate": "fcd5580a36054776c2e89d5389f2bcfc6fd1c853"
+      },
+      "versions": {
+        "agy": {
+          "launcher_sha256": "cdf6bcff6840b12184b7ff3210c156a522f9d855ce32f4e27ce34c40091a8409",
+          "version": "1.2.5"
+        },
+        "claude": {
+          "launcher_sha256": "3509913f9d1576316c8845b88837f8fd3bbbcf26625833ac82cfb6b8985da94a",
+          "version": "2.1.274 (Claude Code)"
+        },
+        "codex": {
+          "launcher_sha256": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70",
+          "version": "codex-cli 0.154.0"
+        },
+        "cursor": {
+          "launcher_sha256": "548f4c6948758b82edadb49eee3fc0e5223e967412172a64bc0459fe807f9ddb",
+          "version": "2026.09.10-fd3934a"
+        },
+        "opencode": {
+          "launcher_sha256": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198",
+          "version": "1.18.31"
+        }
+      }
+    },
+    {
+      "batch": "omar-benchmark-codex-reset-verified",
+      "binary_sha256": {
+        "baseline": "940542b0318ba5dd083370b3cc81418585a5a430c81cf645f8c945afbf50dcdc",
+        "candidate": "2266b1852ca0358381c43e30782ffcf219222b80cd9375c01d1727cef559f7ef"
+      },
+      "budget": 300,
+      "cases": [
+        [
+          "candidate",
+          "codex",
+          "restart",
+          314159
+        ],
+        [
+          "baseline",
+          "codex",
+          "restart",
+          314159
+        ]
+      ],
+      "harness_sha256": "96091fc43e0fe738ed14e5ceb8f1b6f1c3e85f87f020b598d4ac63b8278bcfbe",
+      "helper_sha256": {
+        "context_interventions.py": "827230a948f2ced987f16d81606b7d755f4ceef8c2fd50b359381d8067793de4",
+        "worker_fixture.py": "50204871dce1dfb1d3fa35e6eb34833ace0a5d702262c7f4f1883fa95e8a5856"
+      },
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "parallel_cases": 2,
+      "revisions": {
+        "baseline": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+        "candidate": "fcd5580a36054776c2e89d5389f2bcfc6fd1c853"
+      },
+      "versions": {
+        "agy": {
+          "launcher_sha256": "cdf6bcff6840b12184b7ff3210c156a522f9d855ce32f4e27ce34c40091a8409",
+          "version": "1.2.5"
+        },
+        "claude": {
+          "launcher_sha256": "3509913f9d1576316c8845b88837f8fd3bbbcf26625833ac82cfb6b8985da94a",
+          "version": "2.1.274 (Claude Code)"
+        },
+        "codex": {
+          "launcher_sha256": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70",
+          "version": "codex-cli 0.154.0"
+        },
+        "cursor": {
+          "launcher_sha256": "548f4c6948758b82edadb49eee3fc0e5223e967412172a64bc0459fe807f9ddb",
+          "version": "2026.09.10-fd3934a"
+        },
+        "opencode": {
+          "launcher_sha256": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198",
+          "version": "1.18.31"
+        }
+      }
+    }
+  ],
+  "paired_outcomes": {
+    "baseline_only": 1,
+    "both_passed": 7,
+    "candidate_only": 4,
+    "invalid_or_unpaired": 5,
+    "neither_passed": 0
+  },
+  "trials": [
+    {
+      "artifact_valid": false,
+      "assessment": {
+        "exclude_comparison": true,
+        "reason": "The initial fixture omitted Cursor workspace trust; this parent uses a Cursor worker. Retained as a setup-confounded trial and rerun as a matched pair."
+      },
+      "batch": "omar-benchmark-scored-1",
+      "both_children_ready_s": 221.334,
+      "budget_seconds": 240,
+      "case_id": "baseline-agy-normal-314159",
+      "children": [
+        "cursor",
+        "opencode"
+      ],
+      "completed_s": null,
+      "elapsed_s": 240.167,
+      "failure_phase": "result_collection_or_retirement",
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": false,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [
+        "bench-0-left",
+        "bench-0-right"
+      ],
+      "outcome": "timeout",
+      "parent": "agy",
+      "released_s": 231.526,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {},
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "36d446b987386d284d54ebb241b9a6bf93b4254e27198f86b85bfdac962d2d81",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {
+        "left": 8.38,
+        "right": 8.38
+      },
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-scored-1",
+      "both_children_ready_s": 27.066,
+      "budget_seconds": 240,
+      "case_id": "baseline-claude-normal-314159",
+      "children": [
+        "codex",
+        "opencode"
+      ],
+      "completed_s": 105.967,
+      "elapsed_s": 105.973,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "claude",
+      "released_s": 37.324,
+      "result_receipts": 3,
+      "result_to_retirement_seconds": {
+        "left": 63.904,
+        "right": 63.904
+      },
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "41250fcd78476463b2a6e6056520b1a6633c5fc57704811d9434a3a6e17ef9ee",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-scored-1",
+      "both_children_ready_s": 27.402,
+      "budget_seconds": 240,
+      "case_id": "baseline-codex-normal-314159",
+      "children": [
+        "opencode",
+        "claude"
+      ],
+      "completed_s": 71.532,
+      "elapsed_s": 71.537,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "codex",
+      "released_s": 37.617,
+      "result_receipts": 1,
+      "result_to_retirement_seconds": {
+        "left": 6.864,
+        "right": 15.499
+      },
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": false,
+      "assessment": {
+        "exclude_comparison": true,
+        "reason": "Native interactive Cursor stopped at workspace trust. This measures fixture setup, not coordination. The corrected pair pre-trusts the same workspace on both branches."
+      },
+      "batch": "omar-benchmark-scored-1",
+      "budget_seconds": 240,
+      "case_id": "baseline-cursor-normal-314159",
+      "children": [
+        "codex",
+        "agy"
+      ],
+      "completed_s": null,
+      "elapsed_s": 240.215,
+      "failure_phase": "startup_or_delegation",
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": false,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "timeout",
+      "parent": "cursor",
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {},
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "c84cd3211a6b7ee03e354b20ba8290682aeec222e6640f07c25b1178db7dd6c4",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "baseline",
+      "worker_execution_attributed": false
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-scored-1",
+      "both_children_ready_s": 39.482,
+      "budget_seconds": 240,
+      "case_id": "baseline-opencode-normal-314159",
+      "children": [
+        "claude",
+        "codex"
+      ],
+      "completed_s": 65.0,
+      "elapsed_s": 65.005,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "opencode",
+      "released_s": 49.483,
+      "result_receipts": 1,
+      "result_to_retirement_seconds": {
+        "left": 12.618,
+        "right": 13.672
+      },
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "45f50b394092f7bb448d220073a9d6f5a800a66cac40b294d97ca07b94f9d5d9",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": false,
+      "assessment": {
+        "reason": "The PM replaced a failed Cursor worker. Both outputs appeared near the 240-second deadline; this is not evidence that completed work was ignored for minutes."
+      },
+      "batch": "omar-benchmark-scored-1",
+      "both_children_ready_s": 228.395,
+      "budget_seconds": 240,
+      "case_id": "candidate-agy-normal-314159",
+      "children": [
+        "cursor",
+        "opencode"
+      ],
+      "completed_s": null,
+      "elapsed_s": 240.227,
+      "failure_phase": "result_collection_or_retirement",
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": false,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [
+        "bench-0-left",
+        "bench-0-right"
+      ],
+      "outcome": "timeout",
+      "parent": "agy",
+      "released_s": 238.405,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {},
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "36d446b987386d284d54ebb241b9a6bf93b4254e27198f86b85bfdac962d2d81",
+      "terminal_unacknowledged": 1,
+      "unretired_result_seconds": {
+        "left": 1.563,
+        "right": 1.563
+      },
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-scored-1",
+      "both_children_ready_s": 28.493,
+      "budget_seconds": 240,
+      "case_id": "candidate-claude-normal-314159",
+      "children": [
+        "codex",
+        "opencode"
+      ],
+      "completed_s": 64.976,
+      "elapsed_s": 64.982,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "claude",
+      "released_s": 38.656,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {
+        "left": 22.106,
+        "right": 22.379
+      },
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "41250fcd78476463b2a6e6056520b1a6633c5fc57704811d9434a3a6e17ef9ee",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-scored-1",
+      "both_children_ready_s": 32.818,
+      "budget_seconds": 240,
+      "case_id": "candidate-codex-normal-314159",
+      "children": [
+        "opencode",
+        "claude"
+      ],
+      "completed_s": 75.302,
+      "elapsed_s": 75.31,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "codex",
+      "released_s": 43.016,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {
+        "left": 24.911,
+        "right": 24.911
+      },
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": false,
+      "assessment": {
+        "reason": "PM session disappeared at 45.339 seconds before delegation. The host marked its task failed. The terminal was gone before final capture; do not infer the exit cause from this trace alone."
+      },
+      "batch": "omar-benchmark-scored-1",
+      "budget_seconds": 240,
+      "case_id": "candidate-cursor-normal-314159",
+      "children": [
+        "codex",
+        "agy"
+      ],
+      "completed_s": null,
+      "elapsed_s": 240.207,
+      "failure_phase": "startup_or_delegation",
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": false,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "timeout",
+      "parent": "cursor",
+      "result_receipts": 4,
+      "result_to_retirement_seconds": {},
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "c84cd3211a6b7ee03e354b20ba8290682aeec222e6640f07c25b1178db7dd6c4",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": false
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-scored-1",
+      "both_children_ready_s": 35.24,
+      "budget_seconds": 240,
+      "case_id": "candidate-opencode-normal-314159",
+      "children": [
+        "claude",
+        "codex"
+      ],
+      "completed_s": 80.94,
+      "elapsed_s": 80.946,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "opencode",
+      "released_s": 45.248,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {
+        "left": 33.078,
+        "right": 33.078
+      },
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "45f50b394092f7bb448d220073a9d6f5a800a66cac40b294d97ca07b94f9d5d9",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-context-1",
+      "both_children_ready_s": 39.004,
+      "budget_seconds": 300,
+      "case_id": "baseline-codex-compact-314159",
+      "children": [
+        "opencode",
+        "claude"
+      ],
+      "completed_s": 102.307,
+      "elapsed_s": 102.311,
+      "harness_error": false,
+      "human_reminders": 0,
+      "intervention": {
+        "kind": "native_compaction",
+        "seconds": 23.479,
+        "verified": true
+      },
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "codex",
+      "released_s": 72.752,
+      "result_receipts": 1,
+      "result_to_retirement_seconds": {
+        "left": 17.004,
+        "right": 17.262
+      },
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "compact",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "assessment": {
+        "exclude_comparison": true,
+        "reason": "Harness did not verify a fresh native conversation. Later terminal capture identified shell quoting errors during respawn. Excluded from recovery comparisons."
+      },
+      "batch": "omar-benchmark-context-1",
+      "both_children_ready_s": 36.118,
+      "budget_seconds": 300,
+      "case_id": "baseline-codex-restart-314159",
+      "children": [
+        "opencode",
+        "claude"
+      ],
+      "harness_error": true,
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "outcome": "harness_error",
+      "parent": "codex",
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "restart",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "variant": "baseline"
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-context-1",
+      "both_children_ready_s": 34.24,
+      "budget_seconds": 300,
+      "case_id": "baseline-opencode-compact-314159",
+      "children": [
+        "claude",
+        "codex"
+      ],
+      "completed_s": 66.913,
+      "elapsed_s": 66.918,
+      "harness_error": false,
+      "human_reminders": 0,
+      "intervention": {
+        "kind": "native_compaction",
+        "seconds": 7.78,
+        "verified": true
+      },
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "opencode",
+      "released_s": 52.24,
+      "result_receipts": 1,
+      "result_to_retirement_seconds": {
+        "left": 11.51,
+        "right": 11.771
+      },
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "compact",
+      "seed": 314159,
+      "task_sha256": "45f50b394092f7bb448d220073a9d6f5a800a66cac40b294d97ca07b94f9d5d9",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": false,
+      "assessment": {},
+      "batch": "omar-benchmark-context-1",
+      "both_children_ready_s": 27.854,
+      "budget_seconds": 300,
+      "case_id": "baseline-opencode-restart-314159",
+      "children": [
+        "claude",
+        "codex"
+      ],
+      "completed_s": null,
+      "elapsed_s": 300.001,
+      "failure_phase": "result_collection_or_retirement",
+      "harness_error": false,
+      "human_reminders": 0,
+      "intervention": {
+        "kind": "fresh_conversation",
+        "verified": true
+      },
+      "manager_reported_completion": false,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [
+        "bench-0-left",
+        "bench-0-right"
+      ],
+      "outcome": "timeout",
+      "parent": "opencode",
+      "released_s": 39.218,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {},
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "restart",
+      "seed": 314159,
+      "task_sha256": "45f50b394092f7bb448d220073a9d6f5a800a66cac40b294d97ca07b94f9d5d9",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {
+        "left": 260.524,
+        "right": 260.524
+      },
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-context-1",
+      "both_children_ready_s": 31.154,
+      "budget_seconds": 300,
+      "case_id": "candidate-codex-compact-314159",
+      "children": [
+        "opencode",
+        "claude"
+      ],
+      "completed_s": 102.96,
+      "elapsed_s": 102.966,
+      "harness_error": false,
+      "human_reminders": 0,
+      "intervention": {
+        "kind": "native_compaction",
+        "seconds": 18.652,
+        "verified": true
+      },
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "codex",
+      "released_s": 60.016,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {
+        "left": 20.432,
+        "right": 20.432
+      },
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "compact",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    },
+    {
+      "assessment": {
+        "exclude_comparison": true,
+        "reason": "Harness did not verify a fresh native conversation. Later terminal capture identified shell quoting errors during respawn. Excluded from recovery comparisons."
+      },
+      "batch": "omar-benchmark-context-1",
+      "both_children_ready_s": 33.72,
+      "budget_seconds": 300,
+      "case_id": "candidate-codex-restart-314159",
+      "children": [
+        "opencode",
+        "claude"
+      ],
+      "harness_error": true,
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "outcome": "harness_error",
+      "parent": "codex",
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "restart",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "variant": "candidate"
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-context-1",
+      "both_children_ready_s": 34.186,
+      "budget_seconds": 300,
+      "case_id": "candidate-opencode-compact-314159",
+      "children": [
+        "claude",
+        "codex"
+      ],
+      "completed_s": 111.938,
+      "elapsed_s": 111.944,
+      "harness_error": false,
+      "human_reminders": 0,
+      "intervention": {
+        "kind": "native_compaction",
+        "seconds": 45.195,
+        "verified": true
+      },
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "opencode",
+      "released_s": 89.604,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {
+        "left": 16.823,
+        "right": 16.823
+      },
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "compact",
+      "seed": 314159,
+      "task_sha256": "45f50b394092f7bb448d220073a9d6f5a800a66cac40b294d97ca07b94f9d5d9",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-context-1",
+      "both_children_ready_s": 26.895,
+      "budget_seconds": 300,
+      "case_id": "candidate-opencode-restart-314159",
+      "children": [
+        "claude",
+        "codex"
+      ],
+      "completed_s": 57.194,
+      "elapsed_s": 57.2,
+      "harness_error": false,
+      "human_reminders": 0,
+      "intervention": {
+        "kind": "fresh_conversation",
+        "verified": true
+      },
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "opencode",
+      "released_s": 38.288,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {
+        "left": 16.296,
+        "right": 16.551
+      },
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "restart",
+      "seed": 314159,
+      "task_sha256": "45f50b394092f7bb448d220073a9d6f5a800a66cac40b294d97ca07b94f9d5d9",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-cursor-corrected",
+      "both_children_ready_s": 83.939,
+      "budget_seconds": 300,
+      "case_id": "baseline-agy-normal-314159",
+      "children": [
+        "cursor",
+        "opencode"
+      ],
+      "completed_s": 119.908,
+      "elapsed_s": 119.913,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "agy",
+      "released_s": 93.944,
+      "result_receipts": 1,
+      "result_to_retirement_seconds": {
+        "left": 11.015,
+        "right": 13.906
+      },
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "36d446b987386d284d54ebb241b9a6bf93b4254e27198f86b85bfdac962d2d81",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-cursor-corrected",
+      "both_children_ready_s": 71.523,
+      "budget_seconds": 300,
+      "case_id": "baseline-cursor-normal-314159",
+      "children": [
+        "codex",
+        "agy"
+      ],
+      "completed_s": 96.727,
+      "elapsed_s": 96.733,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "cursor",
+      "released_s": 81.729,
+      "result_receipts": 1,
+      "result_to_retirement_seconds": {
+        "left": 12.378,
+        "right": 12.644
+      },
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "c84cd3211a6b7ee03e354b20ba8290682aeec222e6640f07c25b1178db7dd6c4",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {
+        "reason": "Passed after replacing a Cursor worker whose captured output was ACP startup timed out. Budget was increased to 300 seconds for both variants in this corrected pair; its timing is not directly comparable to the first batch."
+      },
+      "batch": "omar-benchmark-cursor-corrected",
+      "both_children_ready_s": 216.991,
+      "budget_seconds": 300,
+      "case_id": "candidate-agy-normal-314159",
+      "children": [
+        "cursor",
+        "opencode"
+      ],
+      "completed_s": 266.425,
+      "elapsed_s": 266.431,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "agy",
+      "released_s": 227.043,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {
+        "left": 26.503,
+        "right": 30.716
+      },
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "36d446b987386d284d54ebb241b9a6bf93b4254e27198f86b85bfdac962d2d81",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": false,
+      "assessment": {
+        "reason": "Captured native runner output: ACP startup timed out. PM exited at approximately 45 seconds. The runner wraps initialize, authenticate and session/new in one timeout, so this does not identify which stage stalled."
+      },
+      "batch": "omar-benchmark-cursor-corrected",
+      "budget_seconds": 300,
+      "case_id": "candidate-cursor-normal-314159",
+      "children": [
+        "codex",
+        "agy"
+      ],
+      "completed_s": null,
+      "elapsed_s": 300.199,
+      "failure_phase": "startup_or_delegation",
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": false,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "timeout",
+      "parent": "cursor",
+      "result_receipts": 5,
+      "result_to_retirement_seconds": {},
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "c84cd3211a6b7ee03e354b20ba8290682aeec222e6640f07c25b1178db7dd6c4",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": false
+    },
+    {
+      "assessment": {
+        "exclude_comparison": true,
+        "reason": "Codex reset harness did not establish a verified trial. The tmux launch argument round trip and cleanup were subsequently corrected."
+      },
+      "batch": "omar-benchmark-codex-reset-corrected",
+      "both_children_ready_s": 28.205,
+      "budget_seconds": 300,
+      "case_id": "baseline-codex-restart-314159",
+      "children": [
+        "opencode",
+        "claude"
+      ],
+      "harness_error": true,
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "outcome": "harness_error",
+      "parent": "codex",
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "restart",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "variant": "baseline"
+    },
+    {
+      "assessment": {
+        "exclude_comparison": true,
+        "reason": "Codex reset harness did not establish a verified trial. The tmux launch argument round trip and cleanup were subsequently corrected."
+      },
+      "batch": "omar-benchmark-codex-reset-corrected",
+      "both_children_ready_s": 29.412,
+      "budget_seconds": 300,
+      "case_id": "candidate-codex-restart-314159",
+      "children": [
+        "opencode",
+        "claude"
+      ],
+      "harness_error": true,
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "outcome": "harness_error",
+      "parent": "codex",
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "restart",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "variant": "candidate"
+    },
+    {
+      "assessment": {
+        "exclude_comparison": true,
+        "reason": "Codex reset harness did not establish a verified trial. The tmux launch argument round trip and cleanup were subsequently corrected."
+      },
+      "batch": "omar-benchmark-codex-reset-argv",
+      "both_children_ready_s": 25.183,
+      "budget_seconds": 300,
+      "case_id": "baseline-codex-restart-314159",
+      "children": [
+        "opencode",
+        "claude"
+      ],
+      "harness_error": true,
+      "human_reminders": 0,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "outcome": "harness_error",
+      "parent": "codex",
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "restart",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "variant": "baseline"
+    },
+    {
+      "assessment": {
+        "exclude_comparison": true,
+        "reason": "Cleanup failed before saving a result, and the development executable changed during this trial. No outcome is inferred. Subsequent runs copy immutable executable snapshots and stop fixture-owned native processes before deleting the home."
+      },
+      "batch": "omar-benchmark-codex-reset-argv",
+      "case_id": "candidate-codex-restart-314159",
+      "harness_error": true,
+      "outcome": "missing_result",
+      "parent": "codex",
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "restart",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "variant": "candidate"
+    },
+    {
+      "artifact_valid": false,
+      "assessment": {},
+      "batch": "omar-benchmark-opencode-reset-repeat",
+      "both_children_ready_s": 31.34,
+      "budget_seconds": 300,
+      "case_id": "baseline-opencode-restart-271828",
+      "children": [
+        "claude",
+        "codex"
+      ],
+      "completed_s": null,
+      "elapsed_s": 300.163,
+      "failure_phase": "result_collection_or_retirement",
+      "harness_error": false,
+      "human_reminders": 0,
+      "intervention": {
+        "kind": "fresh_conversation",
+        "verified": true
+      },
+      "manager_reported_completion": false,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [
+        "bench-0-left",
+        "bench-0-right"
+      ],
+      "outcome": "timeout",
+      "parent": "opencode",
+      "released_s": 42.446,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {},
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "restart",
+      "seed": 271828,
+      "task_sha256": "45f50b394092f7bb448d220073a9d6f5a800a66cac40b294d97ca07b94f9d5d9",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {
+        "left": 257.457,
+        "right": 257.457
+      },
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-opencode-reset-repeat",
+      "both_children_ready_s": 24.063,
+      "budget_seconds": 300,
+      "case_id": "candidate-opencode-restart-271828",
+      "children": [
+        "claude",
+        "codex"
+      ],
+      "completed_s": 57.134,
+      "elapsed_s": 57.139,
+      "harness_error": false,
+      "human_reminders": 0,
+      "intervention": {
+        "kind": "fresh_conversation",
+        "verified": true
+      },
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "opencode",
+      "released_s": 35.371,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {
+        "left": 19.41,
+        "right": 19.676
+      },
+      "revision": "50f5df187a750cd6d37d810fd6b819669eede9de",
+      "scenario": "restart",
+      "seed": 271828,
+      "task_sha256": "45f50b394092f7bb448d220073a9d6f5a800a66cac40b294d97ca07b94f9d5d9",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": false,
+      "assessment": {},
+      "batch": "omar-benchmark-acp-fixed",
+      "both_children_ready_s": 61.973,
+      "budget_seconds": 300,
+      "case_id": "baseline-agy-normal-314159",
+      "children": [
+        "cursor",
+        "opencode"
+      ],
+      "completed_s": null,
+      "elapsed_s": 300.03,
+      "failure_phase": "result_collection_or_retirement",
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": false,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [
+        "bench-0-left",
+        "bench-0-right"
+      ],
+      "outcome": "timeout",
+      "parent": "agy",
+      "released_s": 72.225,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {},
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "36d446b987386d284d54ebb241b9a6bf93b4254e27198f86b85bfdac962d2d81",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {
+        "left": 227.551,
+        "right": 227.551
+      },
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-acp-fixed",
+      "both_children_ready_s": 80.26,
+      "budget_seconds": 300,
+      "case_id": "baseline-cursor-normal-314159",
+      "children": [
+        "codex",
+        "agy"
+      ],
+      "completed_s": 124.198,
+      "elapsed_s": 124.202,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "cursor",
+      "released_s": 90.453,
+      "result_receipts": 1,
+      "result_to_retirement_seconds": {
+        "left": 30.113,
+        "right": 30.373
+      },
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "c84cd3211a6b7ee03e354b20ba8290682aeec222e6640f07c25b1178db7dd6c4",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-acp-fixed",
+      "both_children_ready_s": 62.493,
+      "budget_seconds": 300,
+      "case_id": "candidate-agy-normal-314159",
+      "children": [
+        "cursor",
+        "opencode"
+      ],
+      "completed_s": 101.05,
+      "elapsed_s": 101.057,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "agy",
+      "released_s": 72.746,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {
+        "left": 21.234,
+        "right": 22.534
+      },
+      "revision": "fcd5580a36054776c2e89d5389f2bcfc6fd1c853",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "36d446b987386d284d54ebb241b9a6bf93b4254e27198f86b85bfdac962d2d81",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-acp-fixed",
+      "both_children_ready_s": 30.653,
+      "budget_seconds": 300,
+      "case_id": "candidate-cursor-normal-314159",
+      "children": [
+        "codex",
+        "agy"
+      ],
+      "completed_s": 72.943,
+      "elapsed_s": 72.948,
+      "harness_error": false,
+      "human_reminders": 0,
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "cursor",
+      "released_s": 40.897,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {
+        "left": 30.472,
+        "right": 30.472
+      },
+      "revision": "fcd5580a36054776c2e89d5389f2bcfc6fd1c853",
+      "scenario": "normal",
+      "seed": 314159,
+      "task_sha256": "c84cd3211a6b7ee03e354b20ba8290682aeec222e6640f07c25b1178db7dd6c4",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": false,
+      "assessment": {},
+      "batch": "omar-benchmark-codex-reset-verified",
+      "both_children_ready_s": 32.685,
+      "budget_seconds": 300,
+      "case_id": "baseline-codex-restart-314159",
+      "children": [
+        "opencode",
+        "claude"
+      ],
+      "completed_s": null,
+      "elapsed_s": 300.148,
+      "failure_phase": "result_collection_or_retirement",
+      "harness_error": false,
+      "human_reminders": 0,
+      "intervention": {
+        "kind": "fresh_conversation",
+        "verified": true
+      },
+      "manager_reported_completion": false,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [
+        "bench-0-left",
+        "bench-0-right"
+      ],
+      "outcome": "timeout",
+      "parent": "codex",
+      "released_s": 43.926,
+      "result_receipts": 1,
+      "result_to_retirement_seconds": {},
+      "revision": "5a7085e8e51bb0ee3401433c43446248c7a15d26",
+      "scenario": "restart",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {
+        "left": 255.971,
+        "right": 255.971
+      },
+      "variant": "baseline",
+      "worker_execution_attributed": true
+    },
+    {
+      "artifact_valid": true,
+      "assessment": {},
+      "batch": "omar-benchmark-codex-reset-verified",
+      "both_children_ready_s": 36.239,
+      "budget_seconds": 300,
+      "case_id": "candidate-codex-restart-314159",
+      "children": [
+        "opencode",
+        "claude"
+      ],
+      "completed_s": 93.784,
+      "elapsed_s": 93.789,
+      "harness_error": false,
+      "human_reminders": 0,
+      "intervention": {
+        "kind": "fresh_conversation",
+        "verified": true
+      },
+      "manager_reported_completion": true,
+      "models": {
+        "agy": "gemini-3.8-flash-medium",
+        "claude": "claude-sonnet-4-6",
+        "codex": "gpt-5.6-sol",
+        "cursor": "composer-2.5",
+        "opencode": "opencode/big-pickle"
+      },
+      "orphan_sessions": [],
+      "outcome": "passed",
+      "parent": "codex",
+      "released_s": 47.465,
+      "result_receipts": 0,
+      "result_to_retirement_seconds": {
+        "left": 33.74,
+        "right": 33.74
+      },
+      "revision": "fcd5580a36054776c2e89d5389f2bcfc6fd1c853",
+      "scenario": "restart",
+      "seed": 314159,
+      "task_sha256": "a167af28d91134b17f3c58957ce7abb4083aba30f4fe289236416cdf55f0d940",
+      "terminal_unacknowledged": 0,
+      "unretired_result_seconds": {},
+      "variant": "candidate",
+      "worker_execution_attributed": true
+    }
+  ]
+}

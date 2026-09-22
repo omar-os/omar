@@ -378,6 +378,11 @@ impl TmuxClient {
             let stamp = self.session_delivery(session);
             if let Some(channel) = crate::channel::Channel::resolve(&backend, pid, stamp.as_deref())
             {
+                anyhow::ensure!(
+                    !matches!(channel, crate::channel::Channel::Spool { .. })
+                        || !matches!(backend.as_str(), "cursor" | "agy" | "antigravity"),
+                    "{session} has a passive legacy hook channel; relaunch it as an OMAR protocol session to enable idle wake"
+                );
                 match channel.deliver(text) {
                     Ok(()) => return Ok(()),
                     Err(error) if error.is::<crate::channel::ChannelNotReady>() => {
@@ -534,12 +539,14 @@ impl TmuxClient {
         if let Some(home) = &codex_home {
             args.extend(["-e", home]);
         }
-        let hooked = match backend {
-            Some("cursor") => crate::channel::install_cursor_hook(),
-            Some("agy") => crate::channel::install_antigravity_hook(),
-            Some("stub") => true,
-            _ => false,
-        };
+        let managed = crate::channel::managed_launch_socket(command).is_some();
+        let hooked = !managed
+            && match backend {
+                Some("cursor") => crate::channel::install_cursor_hook(),
+                Some("agy") => crate::channel::install_antigravity_hook(),
+                Some("stub") => true,
+                _ => false,
+            };
         let spool = hooked.then(|| {
             crate::channel::reset_spool(name);
             crate::channel::spool_path(name)
