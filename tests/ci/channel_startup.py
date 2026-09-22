@@ -82,7 +82,9 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
         assert sum(r['path'] == '/session' for r in recorded) == 1, recorded
         assert sum(r['path'] == '/tui/select-session' for r in recorded) == 2, recorded
         deliveries = [r['body'] for r in recorded if r['path'].endswith('/prompt_async')]
-        assert deliveries == [{'noReply': False, 'parts': [
+        # No `noReply`: a bare prompt_async is what wakes an idle session, which
+        # tests/ci/opencode_wake_contract.py pins against the installed OpenCode.
+        assert deliveries == [{'parts': [
             {'type': 'text', 'text': 'AFTER_LAUNCHER_EXIT', 'synthetic': True}]}], deliveries
         print('PASS: slow backend setup survives launcher exit, retries TUI selection, and delivers once')
     finally:
