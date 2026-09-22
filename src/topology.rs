@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::config;
 use crate::deploy::{self, DeploymentState};
 use crate::diagram::{DiagramServer, NoopTopologyObserver, TopologyObserver};
 use crate::manager::{self, McpLaunchContext, TopologyMcpContext};
@@ -2082,7 +2081,9 @@ fn spawn_topology_agents(
         let prompt_file = agent_dir.join("system.md");
         fs::write(&prompt_file, protocol)?;
         let backend = canonical_backend(&agent.backend);
-        let base_command = config::resolve_backend(backend).map_err(anyhow::Error::msg)?;
+        let base_command = crate::backend::resolve(backend)
+            .map(|backend| backend.default_command().to_string())
+            .map_err(anyhow::Error::msg)?;
         let context = McpLaunchContext {
             omar_dir: config.omar_dir.to_path_buf(),
             ea_id: config.ea_id,
@@ -2111,7 +2112,9 @@ fn spawn_topology_agents(
         if is_web_backend(&agent.backend) {
             continue;
         }
-        let markers = crate::tmux::backend_readiness_markers(canonical_backend(&agent.backend));
+        let markers = crate::backend::by_name(canonical_backend(&agent.backend))
+            .map(|backend| backend.readiness_markers())
+            .unwrap_or(&[]);
         if !markers.is_empty()
             && !client.wait_for_markers(
                 &client.session_for(name),
@@ -2999,16 +3002,12 @@ fn is_web_backend(backend: &str) -> bool {
 }
 
 fn canonical_backend(backend: &str) -> &str {
-    match backend.to_ascii_lowercase().as_str() {
-        "claude" | "claudecode" => "claude",
-        "web" => "web",
-        "codex" => "codex",
-        "opencode" => "opencode",
-        "cursor" => "cursor",
-        "agy" => "agy",
-        "stub" => "stub",
-        _ => backend,
+    if backend.eq_ignore_ascii_case("web") {
+        return "web";
     }
+    crate::backend::by_name(backend)
+        .map(|backend| backend.kind().name())
+        .unwrap_or(backend)
 }
 
 #[cfg(test)]

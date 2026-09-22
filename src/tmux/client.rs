@@ -491,13 +491,13 @@ impl TmuxClient {
 
         // Every launch passes through here, so this is where a claude pane is
         // told to take OMAR's events over its peer socket.
-        let command = crate::manager::ensure_claude_inbound_settings(command);
+        let command = crate::backend::claude::ensure_claude_inbound_settings(command);
         let command = command.as_str();
 
         // cursor-agent takes no message from outside, but it runs hooks that
         // can hand context to the model. Point this pane at its own spool so
         // the hook knows whose events to collect.
-        let backend = crate::manager::command_backend_name(command);
+        let backend = crate::backend::command_name(command);
         // Detached panes have no client to answer OSC 10/11 palette queries.
         // Codex caches that failed probe and suppresses RGB composer effects.
         // Give its pane the same default palette as our web terminal, while
@@ -653,11 +653,11 @@ impl TmuxClient {
 
         self.get_pane_command(name)
             .ok()
-            .and_then(|command| crate::manager::command_backend_name(&command))
+            .and_then(|command| crate::backend::command_name(&command))
             .or_else(|| {
                 self.get_pane_process_command(name)
                     .ok()
-                    .and_then(|command| crate::manager::command_backend_name(&command))
+                    .and_then(|command| crate::backend::command_name(&command))
             })
             .map(|backend| backend.to_string())
     }

@@ -1,4 +1,5 @@
 mod app;
+mod backend;
 mod backend_probe;
 mod backend_runner;
 mod channel;
@@ -374,8 +375,9 @@ async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(ref agent) = cli.agent {
-        config.agent.default_command =
-            config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
+        config.agent.default_command = crate::backend::resolve(agent)
+            .map(|backend| backend.default_command().to_string())
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
     }
     if cli.spawn_metrics {
         config.metrics.spawn_metrics_enabled = true;
@@ -2074,7 +2076,7 @@ fn purge_persisted_runtime_state_on_quit(omar_dir: &std::path::Path) -> Result<(
 
     remove_dir_if_exists(omar_dir.join("ea"))?;
     remove_dir_if_exists(omar_dir.join("mcp"))?;
-    manager::remove_all_omar_antigravity_mcp_configs()?;
+    crate::backend::antigravity::remove_all_omar_antigravity_mcp_configs()?;
 
     Ok(())
 }

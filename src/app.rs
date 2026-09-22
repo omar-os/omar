@@ -1302,7 +1302,7 @@ impl App {
         if notes_path.exists() {
             std::fs::remove_file(&notes_path)?;
         }
-        crate::manager::remove_omar_antigravity_mcp_config(ea_id)?;
+        crate::backend::antigravity::remove_omar_antigravity_mcp_config(ea_id)?;
 
         let events_cancelled = self.scheduler.cancel_by_ea(ea_id);
 
@@ -1730,7 +1730,12 @@ mod tests {
 
         let mut commands: Vec<String> = ["claude", "codex", "cursor", "opencode", "agy"]
             .iter()
-            .map(|name| crate::config::resolve_backend(name).unwrap())
+            .map(|name| {
+                crate::backend::resolve(name)
+                    .unwrap()
+                    .default_command()
+                    .to_string()
+            })
             .collect();
         commands.push("custom --no-flags".to_string());
 
@@ -1753,7 +1758,10 @@ mod tests {
         let mut app = App::new(&config, TickerBuffer::new(), scheduler);
         let handoff = ea::DashboardLaunchHandoff {
             active_ea: 0,
-            default_command: crate::config::resolve_backend("claude").unwrap(),
+            default_command: crate::backend::resolve("claude")
+                .unwrap()
+                .default_command()
+                .to_string(),
             default_workdir: "/tmp/omar-launch".to_string(),
             restart_manager: false,
         };
@@ -1793,7 +1801,10 @@ mod tests {
         let config = test_config_with_prefix(prefix.clone());
         let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
 
-        let claude = crate::config::resolve_backend("claude").unwrap();
+        let claude = crate::backend::resolve("claude")
+            .unwrap()
+            .default_command()
+            .to_string();
         app.default_command = claude.clone();
         app.config.agent.default_command = claude.clone();
 
@@ -1860,8 +1871,14 @@ mod tests {
         let config = test_config_with_prefix(prefix.clone());
         let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
 
-        let claude = crate::config::resolve_backend("claude").unwrap();
-        let opencode = crate::config::resolve_backend("opencode").unwrap();
+        let claude = crate::backend::resolve("claude")
+            .unwrap()
+            .default_command()
+            .to_string();
+        let opencode = crate::backend::resolve("opencode")
+            .unwrap()
+            .default_command()
+            .to_string();
         assert_ne!(
             claude, opencode,
             "backends must resolve to distinct commands"

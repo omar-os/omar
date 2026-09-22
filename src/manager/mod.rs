@@ -64,7 +64,7 @@ const PROMPT_AGENT: &str = include_str!("../../prompts/agent.md");
 // Backend-native wake/reminder tools bypass OMAR's durable, EA-scoped scheduler.
 // Deny these names where a backend exposes per-session tool controls.
 // (Names are a superset across backends; unrecognized names are no-ops.)
-const BACKEND_NATIVE_WAKE_TOOLS: &[&str] = &[
+pub(crate) const BACKEND_NATIVE_WAKE_TOOLS: &[&str] = &[
     "ScheduleWakeup",
     "TaskReminder",
     "task_reminder",
@@ -76,7 +76,7 @@ const BACKEND_NATIVE_WAKE_TOOLS: &[&str] = &[
 // session, no project tracking, no dashboard visibility, no durable scheduler
 // hooks). Deny them so all delegation flows through OMAR's MCP `spawn_agent`.
 // (Names are a superset across backends; unrecognized names are no-ops.)
-const BACKEND_NATIVE_AGENT_TOOLS: &[&str] = &[
+pub(crate) const BACKEND_NATIVE_AGENT_TOOLS: &[&str] = &[
     "Task", // Claude Code subagent dispatcher
     "task", // lowercase variant used by some opencode/codex builds
     "Agent",
@@ -127,7 +127,7 @@ pub(crate) fn shell_single_quote(s: &str) -> String {
 
 /// CSV of every backend-native tool name OMAR wants denied (wake + subagent
 /// dispatchers). Used by `--disallowedTools` style flags that take a flat list.
-fn backend_native_disallowed_tools_csv() -> String {
+pub(crate) fn backend_native_disallowed_tools_csv() -> String {
     BACKEND_NATIVE_WAKE_TOOLS
         .iter()
         .chain(BACKEND_NATIVE_AGENT_TOOLS.iter())
@@ -144,62 +144,8 @@ fn current_tmux_server() -> Option<String> {
 }
 
 #[cfg(test)]
-fn global_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn global_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
     crate::test_env_lock()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendKind {
-    Agy,
-    Claude,
-    Codex,
-    Cursor,
-    Opencode,
-    Stub,
-}
-
-impl BackendKind {
-    fn canonical_name(self) -> &'static str {
-        match self {
-            BackendKind::Agy => "agy",
-            BackendKind::Claude => "claude",
-            BackendKind::Codex => "codex",
-            BackendKind::Cursor => "cursor",
-            BackendKind::Opencode => "opencode",
-            BackendKind::Stub => "stub",
-        }
-    }
-}
-
-fn detect_backend_token(token: &str) -> Option<BackendKind> {
-    let token = token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')'));
-    let executable = Path::new(token)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(token);
-
-    match executable {
-        "agy" => Some(BackendKind::Agy),
-        // Homebrew ships Claude Code as a single-file executable named
-        // `claude.exe`, which is what the pane reports it is running.
-        "claude" | "claude.exe" => Some(BackendKind::Claude),
-        "codex" => Some(BackendKind::Codex),
-        "cursor" => Some(BackendKind::Cursor),
-        "opencode" => Some(BackendKind::Opencode),
-        // Matched on the subcommand: the executable is `omar` itself.
-        "stub-agent" => Some(BackendKind::Stub),
-        _ => None,
-    }
-}
-
-fn detect_backend(base_command: &str) -> Option<BackendKind> {
-    base_command
-        .split_whitespace()
-        .find_map(detect_backend_token)
-}
-
-pub fn command_backend_name(command: &str) -> Option<&'static str> {
-    detect_backend(command).map(BackendKind::canonical_name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,97 +155,10 @@ pub enum ManagerEnsureResult {
     ReplacedBackend,
 }
 
-/// Give opencode a port so OMAR can reach it without the input box.
-///
-/// opencode only listens when it is told a port: with none it talks to an
-/// in-process worker over a fake hostname, and there is nothing to connect to.
-/// Nothing is broken if the port cannot be claimed — the pane simply launches
-/// without a side channel and events go through the composer.
-fn with_opencode_port(base_command: &str) -> String {
-    if base_command
-        .split_whitespace()
-        .any(|token| token == "--port" || token.starts_with("--port=") || token == "--hostname")
-    {
-        return base_command.to_string();
-    }
-    match crate::channel::free_port() {
-        Some(port) => format!("{} --port {}", base_command, port),
-        None => base_command.to_string(),
-    }
-}
-
-/// `--settings '{"crossSessionInbound":"accept"}'`, as it goes on a launch line.
-///
-/// It lets OMAR deliver events over Claude Code's cross-session peer socket.
-/// Without it the session holds an inbound message behind an approval dialog —
-/// OMAR does not attest a permission mode, and an agent launched with
-/// `--dangerously-skip-permissions` distrusts a sender that has not. The dialog
-/// covers the composer, so the held message is worse than no channel at all.
-/// `channel` looks for the same setting before it uses the socket.
-fn claude_inbound_settings() -> String {
-    format!(
-        "--settings {}",
-        shell_single_quote(crate::channel::CLAUDE_INBOUND_ACCEPT)
-    )
-}
-
-/// Put the inbound-peer setting on a claude launch line that has none.
-///
-/// It goes right after the `claude` token: order means nothing to claude, and
-/// the end of the line may belong to a pipe or to a second command. A line
-/// that already carries `--settings` is the operator's and is left alone —
-/// Claude Code keeps only the last one it is given, so adding another would
-/// replace theirs. Other backends' lines come back unchanged.
-pub fn ensure_claude_inbound_settings(command: &str) -> String {
-    if detect_backend(command) != Some(BackendKind::Claude)
-        || command
-            .split_whitespace()
-            .any(|token| token == "--settings" || token.starts_with("--settings="))
-    {
-        return command.to_string();
-    }
-    let mut end = 0;
-    for token in command.split_whitespace() {
-        let start = end + command[end..].find(token).expect("token was cut from here");
-        end = start + token.len();
-        if detect_backend_token(token) == Some(BackendKind::Claude) {
-            break;
-        }
-    }
-    format!(
-        "{} {}{}",
-        &command[..end],
-        claude_inbound_settings(),
-        &command[end..]
-    )
-}
-
-fn ensure_codex_runtime_flags(base_command: &str) -> String {
-    if detect_backend(base_command) != Some(BackendKind::Codex) {
-        return base_command.to_string();
-    }
-
-    // Remote resume must use the thread's persisted permissions. Codex rejects
-    // permission overrides on this path, including an automatically added YOLO.
-    let mut words = base_command.split_whitespace();
-    if words.any(|word| detect_backend_token(word) == Some(BackendKind::Codex))
-        && matches!(words.next(), Some("resume" | "fork"))
-    {
-        return base_command.to_string();
-    }
-    let mut command = base_command.to_string();
-
-    if !base_command
-        .split_whitespace()
-        .any(|token| token == "--dangerously-bypass-approvals-and-sandbox")
-    {
-        command.push_str(" --dangerously-bypass-approvals-and-sandbox");
-    }
-
-    command
-}
-
-fn materialize_prompt_file(prompt_file: &Path, substitutions: &[(&str, &str)]) -> PathBuf {
+pub(crate) fn materialize_prompt_file(
+    prompt_file: &Path,
+    substitutions: &[(&str, &str)],
+) -> PathBuf {
     if substitutions.is_empty() {
         return prompt_file.to_path_buf();
     }
@@ -349,7 +208,7 @@ pub fn ea_mcp_context_path(omar_dir: &Path, ea_id: EaId) -> PathBuf {
         .join("context.json")
 }
 
-fn mcp_ea_dir(context: &McpLaunchContext) -> Option<PathBuf> {
+pub(crate) fn mcp_ea_dir(context: &McpLaunchContext) -> Option<PathBuf> {
     let dir = context
         .omar_dir
         .join("mcp")
@@ -365,7 +224,7 @@ fn mcp_ea_dir(context: &McpLaunchContext) -> Option<PathBuf> {
 /// accounts on shared hosts. These paths are shared by every worker under an
 /// EA, so publishing through a temp file avoids launch-time MCP readers seeing
 /// a truncated JSON file during rapid multi-agent spawns.
-fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if std::fs::read(path).is_ok_and(|current| current == bytes) {
         return Ok(());
     }
@@ -408,37 +267,6 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Keep caller-supplied settings intact. The durable scheduler and MCP
-/// projections still supervise sessions whose custom settings own their hooks.
-fn with_coordination_hooks(command: &str, context: &McpLaunchContext) -> String {
-    if context.topology.is_some()
-        || command
-            .split_whitespace()
-            .any(|t| t == "--settings" || t.starts_with("--settings="))
-    {
-        return command.to_owned();
-    }
-    let Some(context_file) = materialize_mcp_context_file(context) else {
-        return command.to_owned();
-    };
-    let Some(exe) = omar_server_exe() else {
-        return command.to_owned();
-    };
-    let hook = format!(
-        "{} agent-hook --context-file {}",
-        shell_single_quote(&exe.display().to_string()),
-        shell_single_quote(&context_file.display().to_string())
-    );
-    let handler = serde_json::json!([{"hooks":[{"type":"command","command":hook,"timeout":5}]}]);
-    let settings = serde_json::json!({"crossSessionInbound":"accept","hooks":{
-        "SessionStart":handler,"UserPromptSubmit":handler,"Stop":handler
-    }});
-    format!(
-        "{command} --settings {}",
-        shell_single_quote(&settings.to_string())
-    )
-}
-
 pub(crate) fn scope_agent_command(command: &str, ea_id: EaId, agent: &str, root: &Path) -> String {
     let context = root
         .join("mcp")
@@ -451,7 +279,7 @@ pub(crate) fn scope_agent_command(command: &str, ea_id: EaId, agent: &str, root:
     )
 }
 
-fn actor_file(actor: Option<&str>, stem: &str) -> String {
+pub(crate) fn actor_file(actor: Option<&str>, stem: &str) -> String {
     match actor {
         None | Some("ea") => format!("{stem}.json"),
         Some(actor) => {
@@ -465,7 +293,7 @@ fn actor_file(actor: Option<&str>, stem: &str) -> String {
     }
 }
 
-fn materialize_shared_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
+pub(crate) fn materialize_shared_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
     // User-global backend configs must not overwrite the EA's private context.
     // Each launched pane supplies its own full context through the environment.
     let mut shared = context.clone();
@@ -517,7 +345,7 @@ fn strip_deleted_suffix(path: &Path) -> PathBuf {
 /// disk, fall back to locating the same binary name on `PATH`. Writing an
 /// unrunnable path into a backend MCP config makes the OMAR server silently
 /// fail to launch, so every backend config builder must go through here.
-fn omar_server_exe() -> Option<PathBuf> {
+pub(crate) fn omar_server_exe() -> Option<PathBuf> {
     let raw = std::env::current_exe().ok()?;
     let cleaned = strip_deleted_suffix(&raw);
     if cleaned.exists() {
@@ -536,480 +364,15 @@ fn omar_server_exe() -> Option<PathBuf> {
     Some(cleaned)
 }
 
-fn materialize_claude_mcp_config(context: &McpLaunchContext) -> Option<PathBuf> {
-    let server_exe = omar_server_exe()?;
-    let context_file = materialize_mcp_context_file(context)?;
-    let json = serde_json::json!({
-        "mcpServers": {
-            "omar": {
-                "type": "stdio",
-                "command": server_exe,
-                "args": ["mcp-server", "--context-file", context_file],
-            }
-        }
-    });
-
-    let dir = mcp_ea_dir(context)?;
-    let path = match &context.topology {
-        Some(topology) => dir.join(format!(
-            "claude-mcp-topology-{}-{}.json",
-            topology.team, topology.agent
-        )),
-        None => dir.join(actor_file(context.agent_name.as_deref(), "claude-mcp")),
-    };
-    write_private_file(&path, &serde_json::to_vec(&json).ok()?).ok()?;
-    Some(path)
-}
-
-fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
-    let server_exe = omar_server_exe()?;
-    let context_file = materialize_mcp_context_file(context)?;
-    let command = serde_json::to_string(&server_exe.display().to_string()).ok()?;
-    let args = serde_json::to_string(&vec![
-        "mcp-server".to_string(),
-        "--context-file".to_string(),
-        context_file.display().to_string(),
-    ])
-    .ok()?;
-    let command_arg = format!("mcp_servers.omar.command={}", command);
-    let args_arg = format!("mcp_servers.omar.args={}", args);
-    Some(format!(
-        "-c features.scheduled_tasks=false -c {} -c {}",
-        shell_single_quote(&command_arg),
-        shell_single_quote(&args_arg)
-    ))
-}
-
-/// The longest socket path codex will bind.
-///
-/// Not the operating system's limit — macOS itself accepts 103 bytes — but
-/// codex's own, measured against the shipped 0.147.0 binary: 95 binds and 96
-/// fails with "path must be shorter than SUN_LEN". A path in between passes
-/// the OS and is refused by codex, which loses the channel silently and leaves
-/// a home behind for nothing, so the stricter bound is the useful one. It may
-/// move with the codex version.
-const SUN_PATH_MAX: usize = 96;
-
-/// Flags that make codex refuse to attach to a running app-server.
-///
-/// The refusal is silent, so a pane carrying one of these would start a server
-/// nobody joins, sit out the socket wait, and then have provisioning poll it
-/// for ninety seconds — all to arrive where it started. Better to see the flag
-/// and not build the home at all.
-const CODEX_NO_ATTACH_FLAGS: &[&str] = &[
-    "-c",
-    "--config",
-    "--profile",
-    "-p",
-    "--strict-config",
-    "--search",
-    "--approve-for-me",
-    "--enable",
-    "--disable",
-    "--dangerously-bypass-hook-trust",
-];
-
-/// Flags unsupported by remote TUI attachment run through native `exec` instead.
-/// Keep profile/config semantics in Codex itself; never flatten its config layers.
-fn codex_exec_command(command: &str) -> Result<(String, Option<String>)> {
-    let words = shlex::split(command).context("invalid quoted Codex command")?;
-    let executable = words
-        .iter()
-        .position(|word| detect_backend_token(word) == Some(BackendKind::Codex))
-        .context("missing Codex executable")?;
-    anyhow::ensure!(
-        !words
-            .iter()
-            .any(|word| matches!(word.as_str(), ";" | "&&" | "||" | "|")),
-        "use a wrapper executable for compound Codex commands"
-    );
-    let resume = words
-        .iter()
-        .enumerate()
-        .skip(executable + 1)
-        .find(|(_, word)| word.as_str() == "resume")
-        .map(|(i, _)| i);
-    let initial_session = resume
-        .map(|i| {
-            words
-                .get(i + 1)
-                .filter(|v| !v.starts_with('-'))
-                .cloned()
-                .context("managed Codex resume requires an explicit session ID")
-        })
-        .transpose()?;
-    let mut out = Vec::new();
-    for (i, word) in words.iter().enumerate() {
-        if resume.is_some_and(|r| i == r || i == r + 1) {
-            continue;
-        }
-        if i < executable {
-            if let Some((name, value)) = word.split_once('=') {
-                if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-                    out.push(format!("{name}={}", shell_single_quote(value)));
-                    continue;
-                }
-            }
-        }
-        match word.as_str() {
-            "--search" if i > executable => out.push("-c 'web_search=\"live\"'".into()),
-            "--no-alt-screen" if i > executable => {}
-            _ => out.push(shell_single_quote(word)),
-        }
-        if i == executable {
-            out.push("exec --skip-git-repo-check".into());
-        }
-    }
-    Ok((out.join(" "), initial_session))
-}
-
-fn codex_refuses_to_attach(base_command: &str) -> bool {
-    base_command.split_whitespace().any(|token| {
-        let flag = token.split_once('=').map_or(token, |(flag, _)| flag);
-        CODEX_NO_ATTACH_FLAGS.contains(&flag)
-            || (token.starts_with("-c") && !token.starts_with("--"))
-            || (token.starts_with("-p") && !token.starts_with("--"))
-    })
-}
-
-/// Move the override emitted by `spawn_agent` onto the dedicated app-server.
-/// Only consume that known literal spelling, leaving arbitrary shell/config
-/// expressions on the fallback path. Keep the original command for fallback
-/// so an IO failure never loses the requested effort.
-fn codex_launch_reasoning_effort(base_command: &str) -> (String, Option<String>) {
-    // spawn_agent appends the override; runtime flag normalization may append
-    // the bypass flag after it. Do not search inside arbitrary shell arguments.
-    let runtime_flag = " --dangerously-bypass-approvals-and-sandbox";
-    let (command, suffix) = base_command
-        .strip_suffix(runtime_flag)
-        .map_or((base_command, ""), |command| (command, runtime_flag));
-    for value in ["low", "medium", "high", "xhigh"] {
-        let flag = format!(" -c model_reasoning_effort='\"{value}\"'");
-        if let Some(command) = command.strip_suffix(&flag) {
-            // Multiple overrides or other config flags still trigger the
-            // fallback; do not reorder or reinterpret their precedence.
-            return (format!("{command}{suffix}"), Some(value.to_string()));
-        }
-    }
-    (base_command.to_string(), None)
-}
-
-/// Isolate the live connection, not the user's saved conversations. Both the
-/// server and TUI inherit the operator's CODEX_HOME (or Codex's normal default).
-/// Only transient socket and prompt files live under OMAR's runtime directory.
-fn codex_server_command(
-    context: &McpLaunchContext,
-    instructions: &str,
-    reasoning_effort: Option<&str>,
-    tui_command: &str,
-) -> Option<String> {
-    // The server must come from the same executable and environment wrapper
-    // as the requested TUI, including an explicitly selected Codex install.
-    let executable = tui_command
-        .split_whitespace()
-        .find(|word| detect_backend_token(word) == Some(BackendKind::Codex))?;
-    let executable_end = tui_command.find(executable)? + executable.len();
-    let server_command = &tui_command[..executable_end];
-    let overrides = codex_mcp_overrides(context)?;
-    let id = Uuid::new_v4().simple().to_string();
-    let runtime = context.omar_dir.join("codex-runtime").join(&id[..12]);
-    let socket = if runtime.join("app.sock").as_os_str().len() >= SUN_PATH_MAX {
-        short_protocol_dir().ok()?.join("app.sock")
-    } else {
-        runtime.join("app.sock")
-    };
-    std::fs::create_dir_all(runtime.parent()?).ok()?;
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&runtime)
-        .ok()?;
-    let prompt_file = runtime.join("instructions.json");
-    let encoded = serde_json::to_vec(instructions).ok()?;
-    if write_private_file(&prompt_file, &encoded).is_err() {
-        let _ = std::fs::remove_dir_all(&runtime);
-        return None;
-    }
-    let effort = reasoning_effort
-        .map(|effort| {
-            format!(
-                " -c {}",
-                shell_single_quote(&format!("model_reasoning_effort=\"{effort}\""))
-            )
-        })
-        .unwrap_or_default();
-    let endpoint = shell_single_quote(&format!("unix://{}", socket.display()));
-    Some(format!(
-        "export OMAR_CODEX_SOCKET={socket}; \
-         {server_command} app-server --listen {endpoint} {overrides}{effort} \
-         -c \"developer_instructions=$(cat {prompt_file})\" >{log} 2>&1 & \
-         omar_srv=$!; omar_waited=0; \
-         while [ ! -S \"$OMAR_CODEX_SOCKET\" ] && [ \"$omar_waited\" -lt 100 ] \
-         && kill -0 \"$omar_srv\" 2>/dev/null; \
-         do sleep 0.2; omar_waited=$((omar_waited+1)); done; \
-         if [ ! -S \"$OMAR_CODEX_SOCKET\" ]; then \
-         cat {log} >&2; kill \"$omar_srv\" 2>/dev/null; exit 1; fi; \
-         {tui_command} --remote {endpoint}",
-        socket = shell_single_quote(&socket.display().to_string()),
-        prompt_file = shell_single_quote(&prompt_file.display().to_string()),
-        log = shell_single_quote(&runtime.join("server.log").display().to_string()),
-    ))
-}
-
-fn materialize_opencode_coordination_plugin(context: &McpLaunchContext) -> Option<String> {
-    if context.topology.is_some() {
-        return None;
-    }
-    let exe = omar_server_exe()?;
-    let context_file = materialize_mcp_context_file(context)?;
-    let path = mcp_ea_dir(context)?
-        .join(actor_file(context.agent_name.as_deref(), "coordination").replace(".json", ".mjs"));
-    let body = format!(
-        "const exe = {};\nconst contextFile = {};\n{}",
-        serde_json::to_string(&exe).ok()?,
-        serde_json::to_string(&context_file).ok()?,
-        include_str!("../backend_hooks/opencode.mjs")
-    );
-    write_private_file(&path, body.as_bytes()).ok()?;
-    let encoded: String = path
-        .to_str()?
-        .bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect();
-    Some(format!("file://{encoded}"))
-}
-
-fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
-    let server_exe = omar_server_exe()?;
-    let context_file = materialize_mcp_context_file(context)?;
-    // Disable every backend-native tool that overlaps an OMAR MCP tool so
-    // delegation/scheduling can only flow through OMAR and stays visible in
-    // the dashboard. Names that opencode does not expose are no-ops.
-    let mut tools = serde_json::Map::new();
-    for name in BACKEND_NATIVE_WAKE_TOOLS
-        .iter()
-        .chain(BACKEND_NATIVE_AGENT_TOOLS.iter())
-    {
-        tools.insert((*name).to_string(), serde_json::Value::Bool(false));
-    }
-    let mut config = serde_json::json!({
-        "mcp": {
-            "omar": {
-                "type": "local",
-                "enabled": true,
-                "command": [
-                    server_exe.display().to_string(),
-                    "mcp-server",
-                    "--context-file",
-                    context_file.display().to_string()
-                ]
-            }
-        },
-        "tools": tools,
-        "permission": {
-            "doom_loop": "deny"
-        }
-    });
-    if let Some(plugin) = materialize_opencode_coordination_plugin(context) {
-        config["plugin"] = serde_json::json!([plugin]);
-    }
-    Some(config.to_string())
-}
-
-fn ensure_antigravity_mcp_config(context: &McpLaunchContext) -> Option<()> {
-    // Antigravity CLI loads MCP servers from native plugin bundles. Keep OMAR's
-    // plugin EA-scoped so lifecycle and cleanup do not touch user plugins.
-    // `agy plugin install` stages active plugins under ~/.gemini/config/plugins
-    // and records them in ~/.gemini/config/import_manifest.json.
-    let server_exe = omar_server_exe()?;
-    let context_file = materialize_shared_mcp_context_file(context)?;
-    let home = std::env::var("HOME").ok()?;
-    let config_dir = PathBuf::from(home).join(".gemini").join("config");
-    let plugins_dir = config_dir.join("plugins");
-    std::fs::create_dir_all(&plugins_dir).ok()?;
-    let key = format!("omar-ea-{}", context.ea_id);
-    let plugin_dir = plugins_dir.join(&key);
-    std::fs::create_dir_all(&plugin_dir).ok()?;
-
-    if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path == plugin_dir {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("omar-ea-") {
-                    let ctx_path = path
-                        .join("mcp_config.json")
-                        .canonicalize()
-                        .ok()
-                        .and_then(|config| std::fs::read_to_string(config).ok())
-                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                        .and_then(|v| {
-                            v.get("mcpServers")
-                                .and_then(|servers| servers.get(name))
-                                .and_then(|server| server.get("args"))
-                                .and_then(|args| args.as_array())
-                                .and_then(|args| args.last())
-                                .and_then(|arg| arg.as_str())
-                                .map(PathBuf::from)
-                        });
-                    if ctx_path.map(|p| !p.exists()).unwrap_or(false) {
-                        let _ = std::fs::remove_dir_all(path);
-                    }
-                }
-            }
-        }
-    }
-
-    let plugin = serde_json::json!({
-        "name": key.clone(),
-        "version": "0.0.0",
-        "description": "OMAR MCP server registration for this Executive Assistant"
-    });
-    let mut servers = serde_json::Map::new();
-    servers.insert(
-        key.clone(),
-        serde_json::json!({
-        "command": server_exe.display().to_string(),
-        "args": ["mcp-server", "--context-file", context_file.display().to_string()],
-        }),
-    );
-    let config = serde_json::json!({
-        "mcpServers": servers
-    });
-
-    let plugin_path = plugin_dir.join("plugin.json");
-    let config_path = plugin_dir.join("mcp_config.json");
-    let manifest_path = config_dir.join("import_manifest.json");
-    let plugin_payload = serde_json::to_vec_pretty(&plugin).ok()?;
-    let config_payload = serde_json::to_vec_pretty(&config).ok()?;
-    write_private_file(&plugin_path, &plugin_payload).ok()?;
-    write_private_file(&config_path, &config_payload).ok()?;
-
-    let mut manifest = match std::fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-    {
-        Some(v) if v.is_object() => v,
-        _ => serde_json::json!({}),
-    };
-    let mut imports = manifest
-        .get("imports")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    imports.retain(|entry| {
-        let Some(name) = entry.get("name").and_then(|name| name.as_str()) else {
-            return true;
-        };
-        if name == key {
-            return false;
-        }
-        if let Some(ea) = name.strip_prefix("omar-ea-") {
-            return plugins_dir.join(format!("omar-ea-{ea}")).exists();
-        }
-        true
-    });
-    imports.push(serde_json::json!({
-        "name": key,
-        "source": "local-install",
-        "importedAt": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        "components": ["installed"],
-    }));
-    manifest["imports"] = serde_json::Value::Array(imports);
-    let manifest_payload = serde_json::to_vec_pretty(&manifest).ok()?;
-    write_private_file(&manifest_path, &manifest_payload).ok()?;
-    Some(())
-}
-
-fn antigravity_config_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".gemini").join("config"))
-}
-
-fn rewrite_antigravity_manifest_without<F>(keep_import: F) -> Result<()>
-where
-    F: Fn(&str) -> bool,
-{
-    let Some(config_dir) = antigravity_config_dir() else {
-        return Ok(());
-    };
-    let manifest_path = config_dir.join("import_manifest.json");
-    let Some(mut manifest) = std::fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .filter(|v| v.is_object())
-    else {
-        return Ok(());
-    };
-    let Some(imports) = manifest.get("imports").and_then(|v| v.as_array()) else {
-        return Ok(());
-    };
-    let retained: Vec<_> = imports
-        .iter()
-        .filter(|entry| {
-            entry
-                .get("name")
-                .and_then(|name| name.as_str())
-                .map(&keep_import)
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
-    manifest["imports"] = serde_json::Value::Array(retained);
-    write_private_file(&manifest_path, &serde_json::to_vec_pretty(&manifest)?)?;
-    Ok(())
-}
-
-pub(crate) fn remove_omar_antigravity_mcp_config(ea_id: EaId) -> Result<()> {
-    let Some(config_dir) = antigravity_config_dir() else {
-        return Ok(());
-    };
-    let key = format!("omar-ea-{ea_id}");
-    let plugin_dir = config_dir.join("plugins").join(&key);
-    if plugin_dir.exists() {
-        std::fs::remove_dir_all(&plugin_dir)?;
-    }
-    rewrite_antigravity_manifest_without(|name| name != key)
-}
-
-pub(crate) fn remove_all_omar_antigravity_mcp_configs() -> Result<()> {
-    let Some(config_dir) = antigravity_config_dir() else {
-        return Ok(());
-    };
-    let plugins_dir = config_dir.join("plugins");
-    if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_str()
-                .map(|name| name.starts_with("omar-ea-"))
-                .unwrap_or(false)
-            {
-                std::fs::remove_dir_all(entry.path())?;
-            }
-        }
-    }
-    rewrite_antigravity_manifest_without(|name| !name.starts_with("omar-ea-"))
-}
-
 /// Socket paths must stay short even when the project/state path is deeply nested.
-fn short_protocol_dir() -> std::io::Result<PathBuf> {
+pub(crate) fn short_protocol_dir() -> std::io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
     let path = PathBuf::from("/tmp").join(format!("omar-protocol-{}", Uuid::new_v4().simple()));
     std::fs::DirBuilder::new().mode(0o700).create(&path)?;
     Ok(path)
 }
 
-fn managed_agent_command(
+pub(crate) fn managed_agent_command(
     backend: &str,
     command: &str,
     prompt: &Path,
@@ -1042,10 +405,9 @@ fn managed_agent_command(
     ))
 }
 
-/// Build a native-channel launch with scoped MCP and coordination instructions.
-/// Claude appends system instructions; default Codex uses a dedicated app-server;
-/// custom Codex flags, Cursor and Antigravity use managed protocol consoles.
-/// OpenCode receives synthetic startup context through its HTTP channel.
+/// A worker's launch line: scoped MCP, coordination instructions, and the
+/// prompt, each the way its backend takes them. The backend decides; this
+/// only assembles what every backend is given.
 pub fn build_agent_command(
     base_command: &str,
     prompt_file: &Path,
@@ -1053,7 +415,11 @@ pub fn build_agent_command(
     mcp_context: &McpLaunchContext,
 ) -> String {
     let _ = materialize_mcp_context_file(mcp_context);
-    let base_command = ensure_codex_runtime_flags(base_command);
+    let backend = crate::backend::detect(base_command);
+    let base_command = match backend {
+        Some(backend) => backend.normalize_command(base_command),
+        None => base_command.to_string(),
+    };
     let path_str = prompt_file.display().to_string();
     let prompt_path = shell_single_quote(&path_str);
     let shell_expr = if substitutions.is_empty() {
@@ -1066,109 +432,15 @@ pub fn build_agent_command(
             .join("; ");
         format!("$(sed '{}' {})", sed_script, prompt_path)
     };
-
-    // Each backend owns its native prompt and scoped MCP configuration.
-    match detect_backend(&base_command) {
-        Some(BackendKind::Agy | BackendKind::Cursor) => {
-            let rendered = materialize_prompt_file(prompt_file, substitutions);
-            let backend = detect_backend(&base_command).unwrap().canonical_name();
-            if backend == "agy" && ensure_antigravity_mcp_config(mcp_context).is_none() {
-                return "printf '%s\n' 'OMAR cannot configure Antigravity MCP' >&2; exit 1".into();
-            }
-            managed_agent_command(backend, &base_command, &rendered, mcp_context, None)
-                .unwrap_or_else(|error| {
-                    format!(
-                        "printf '%s\n' {} >&2; exit 1",
-                        shell_single_quote(&format!("OMAR protocol launch failed: {error:#}"))
-                    )
-                })
-        }
-        Some(BackendKind::Claude) => {
-            let base_command = with_coordination_hooks(&base_command, mcp_context);
-            match materialize_claude_mcp_config(mcp_context) {
-                Some(mcp_config) => format!(
-                    "{} --append-system-prompt \"{}\" --mcp-config {} --disallowedTools {}",
-                    base_command,
-                    shell_expr,
-                    shell_single_quote(&mcp_config.display().to_string()),
-                    shell_single_quote(&backend_native_disallowed_tools_csv()),
-                ),
-                None => format!("{} --append-system-prompt \"{}\"", base_command, shell_expr),
-            }
-        }
-        Some(BackendKind::Codex) => {
-            // Keep conversations in the operator's normal home. The server
-            // owns the per-agent overrides and a dedicated socket; the TUI
-            // connects explicitly rather than relying on home-based discovery.
-            // Custom flags use native exec below, preserving Codex config layers.
-            let instructions = std::fs::read_to_string(prompt_file).map(|body| {
-                substitutions
-                    .iter()
-                    .fold(body, |body, (pattern, replacement)| {
-                        body.replace(pattern, replacement)
-                    })
-            });
-            let (tui_command, reasoning_effort) = codex_launch_reasoning_effort(&base_command);
-            if !codex_refuses_to_attach(&tui_command) {
-                if let Some(command) = instructions.ok().and_then(|instructions| {
-                    codex_server_command(
-                        mcp_context,
-                        &instructions,
-                        reasoning_effort.as_deref(),
-                        &tui_command,
-                    )
-                }) {
-                    return command;
-                }
-            }
-            let rendered = materialize_prompt_file(prompt_file, substitutions);
-            let protocol = (|| -> Result<String> {
-                let (mut command, initial_session) = codex_exec_command(&base_command)?;
-                let overrides =
-                    codex_mcp_overrides(mcp_context).context("cannot configure Codex MCP")?;
-                command.push(' ');
-                command.push_str(&overrides);
-                managed_agent_command("codex", &command, &rendered, mcp_context, initial_session)
-            })();
-            protocol.unwrap_or_else(|error| {
-                format!(
-                    "printf '%s\n' {} >&2; exit 1",
-                    shell_single_quote(&format!("OMAR Codex protocol launch failed: {error:#}"))
-                )
-            })
-        }
-        Some(BackendKind::Stub) => {
-            // The stub reads the endpoint and token straight from the topology
-            // context, so it needs no MCP server of its own.
-            let exe = omar_server_exe()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "omar".to_string());
-            match materialize_mcp_context_file(mcp_context) {
-                Some(context_file) => format!(
-                    "{} stub-agent --context-file {}",
-                    shell_single_quote(&exe),
-                    shell_single_quote(&context_file.display().to_string())
-                ),
-                None => format!("{} stub-agent", shell_single_quote(&exe)),
-            }
-        }
-        Some(BackendKind::Opencode) => {
-            // opencode has no `--append-system-prompt`; `--prompt` is treated as the
-            // first user message, which makes the LLM read agent.md
-            // descriptively and ask back "What is your agent name?" etc.
-            // Spawn opencode bare and let `spawn_worker` deliver the prompt
-            // through the backend channel as combined synthetic context.
-            let base_command = with_opencode_port(&base_command);
-            match opencode_config_env(mcp_context) {
-                Some(config) => format!(
-                    "OPENCODE_CONFIG_CONTENT={} {}",
-                    shell_single_quote(&config),
-                    base_command
-                ),
-                None => base_command,
-            }
-        }
-        None => base_command.to_string(),
+    match backend {
+        Some(backend) => backend.launch_command(&crate::backend::Launch {
+            base_command: &base_command,
+            prompt_file,
+            substitutions,
+            shell_expr: &shell_expr,
+            context: mcp_context,
+        }),
+        None => base_command,
     }
 }
 
@@ -1240,45 +512,29 @@ pub fn build_ea_command(
     // placeholders intact for them and write a separate, pre-resolved
     // file for claude.
     std::fs::write(&combined_path, &combined).ok();
-    let backend = detect_backend(base_command);
-
-    match backend {
-        Some(BackendKind::Claude) => {
-            let resolved = combined
-                .replace("{{EA_ID}}", &ea_id.to_string())
-                .replace("{{EA_NAME}}", ea_name);
-            std::fs::write(&combined_path, &resolved).ok();
-            let base_command =
-                with_coordination_hooks(&ensure_codex_runtime_flags(base_command), mcp_context);
-            let cmd = match materialize_claude_mcp_config(mcp_context) {
-                Some(mcp_config) => format!(
-                    "{} --append-system-prompt-file {} --mcp-config {} --disallowedTools {}",
-                    base_command,
-                    shell_single_quote(&combined_path.display().to_string()),
-                    shell_single_quote(&mcp_config.display().to_string()),
-                    shell_single_quote(&backend_native_disallowed_tools_csv()),
-                ),
-                None => format!(
-                    "{} --append-system-prompt-file {}",
-                    base_command,
-                    shell_single_quote(&combined_path.display().to_string()),
-                ),
-            };
-            (cmd, None)
-        }
-        _ => {
-            // Inline path for codex/agy/opencode/cursor/unknown. The
-            // truncation cap in memory.rs keeps the rendered prompt under
-            // `MAX_ARG_STRLEN` even when notes/memory grow large.
-            let cmd = build_agent_command(
-                base_command,
-                &combined_path,
-                &[("{{EA_ID}}", &ea_id.to_string()), ("{{EA_NAME}}", ea_name)],
-                mcp_context,
-            );
-            (cmd, None)
-        }
+    let resolved = combined
+        .replace("{{EA_ID}}", &ea_id.to_string())
+        .replace("{{EA_NAME}}", ea_name);
+    let backend = crate::backend::detect(base_command);
+    let normalized = match backend {
+        Some(backend) => backend.normalize_command(base_command),
+        None => base_command.to_string(),
+    };
+    if let Some(cmd) = backend.and_then(|backend| {
+        backend.ea_launch_command(&normalized, &combined_path, &resolved, mcp_context)
+    }) {
+        return (cmd, None);
     }
+    // Inline path for codex/agy/opencode/cursor/unknown. The truncation cap
+    // in memory.rs keeps the rendered prompt under `MAX_ARG_STRLEN` even
+    // when notes/memory grow large.
+    let cmd = build_agent_command(
+        base_command,
+        &combined_path,
+        &[("{{EA_ID}}", &ea_id.to_string()), ("{{EA_NAME}}", ea_name)],
+        mcp_context,
+    );
+    (cmd, None)
 }
 
 /// Start the manager agent session for a specific EA.
@@ -1330,16 +586,16 @@ pub fn ensure_manager_session(
 
     if client.has_session(&session)? {
         if client.session_has_live_pane(&session)? {
-            let requested_backend = command_backend_name(command);
+            let requested_backend = crate::backend::command_name(command);
             let existing_backend = client
                 .get_pane_command(&session)
                 .ok()
-                .and_then(|pane_command| command_backend_name(&pane_command))
+                .and_then(|pane_command| crate::backend::command_name(&pane_command))
                 .or_else(|| {
                     client
                         .get_pane_process_command(&session)
                         .ok()
-                        .and_then(|process_command| command_backend_name(&process_command))
+                        .and_then(|process_command| crate::backend::command_name(&process_command))
                 });
 
             if requested_backend.is_some()
@@ -1711,8 +967,8 @@ fn spawn_worker(
     // Channel delivery independently checks that the backend endpoint exists.
     let _markers_proved_ready = if crate::channel::managed_launch_socket(&cmd).is_some() {
         false
-    } else if let Some(kind) = detect_backend(command) {
-        let markers = crate::tmux::backend_readiness_markers(kind.canonical_name());
+    } else if let Some(backend) = crate::backend::detect(command) {
+        let markers = backend.readiness_markers();
         if markers.is_empty() {
             false
         } else {
@@ -1741,16 +997,17 @@ fn spawn_worker(
         "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
         agent.name, parent_name, agent.task
     );
-    let initial_msg = if detect_backend(command) == Some(BackendKind::Opencode) {
-        let rendered = materialize_prompt_file(
-            &prompt_file,
-            &[("{{TASK}}", &agent.task), ("{{EA_ID}}", &ea_id.to_string())],
-        );
-        let body = std::fs::read_to_string(&rendered).unwrap_or_default();
-        format!("{}\n\n---\n\n{}", body, header)
-    } else {
-        header
-    };
+    let initial_msg =
+        if crate::backend::detect(command).is_some_and(|b| b.takes_prompt_in_first_message()) {
+            let rendered = materialize_prompt_file(
+                &prompt_file,
+                &[("{{TASK}}", &agent.task), ("{{EA_ID}}", &ea_id.to_string())],
+            );
+            let body = std::fs::read_to_string(&rendered).unwrap_or_default();
+            format!("{}\n\n---\n\n{}", body, header)
+        } else {
+            header
+        };
     let opts = DeliveryOptions::default();
     client
         .deliver_prompt(&session_name, &initial_msg, &opts)
@@ -1771,17 +1028,8 @@ fn spawn_worker(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-
-    #[test]
-    fn codex_launch_does_not_install_untrusted_hooks() {
-        let dir = tempfile::tempdir().unwrap();
-        let overrides = codex_mcp_overrides(&test_mcp_context(dir.path())).unwrap();
-        assert!(overrides.contains("mcp_servers.omar.command"));
-        assert!(!overrides.contains("hooks."));
-        assert!(!overrides.contains("developer_instructions"));
-    }
 
     #[test]
     fn sibling_contexts_and_global_backend_config_cannot_overwrite_ea_identity() {
@@ -1813,26 +1061,6 @@ mod tests {
         assert_eq!(read(a_path).agent_name.as_deref(), Some("worker/a"));
         assert_eq!(read(b_path).agent_name.as_deref(), Some("worker-b"));
         assert!(read(shared_path).serve.is_none());
-    }
-
-    #[test]
-    fn coordination_hooks_preserve_explicit_settings_and_skip_topology() {
-        let dir = tempfile::tempdir().unwrap();
-        let context = test_mcp_context(dir.path());
-        let custom = "claude --settings '/tmp/my settings.json'";
-        assert_eq!(with_coordination_hooks(custom, &context), custom);
-        let hooked = with_coordination_hooks("claude", &context);
-        for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
-            assert!(hooked.contains(event));
-        }
-        let mut topology = context;
-        topology.topology = Some(TopologyMcpContext {
-            team: "t".into(),
-            agent: "a".into(),
-            endpoint: "localhost:1".into(),
-            token: "t".into(),
-        });
-        assert_eq!(with_coordination_hooks("claude", &topology), "claude");
     }
 
     #[test]
@@ -1905,7 +1133,7 @@ mod tests {
         assert!(decoded.serve.is_none());
     }
 
-    fn test_mcp_context(omar_dir: &Path) -> McpLaunchContext {
+    pub(crate) fn test_mcp_context(omar_dir: &Path) -> McpLaunchContext {
         McpLaunchContext {
             omar_dir: omar_dir.to_path_buf(),
             ea_id: 0,
@@ -1920,13 +1148,13 @@ mod tests {
         }
     }
 
-    struct EnvVarGuard {
+    pub(crate) struct EnvVarGuard {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
     }
 
     impl EnvVarGuard {
-        fn set(key: &'static str, value: &Path) -> Self {
+        pub(crate) fn set(key: &'static str, value: &Path) -> Self {
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
             Self { key, previous }
@@ -2002,79 +1230,15 @@ mod tests {
         assert!(cmd.contains("dispatch_agent"));
     }
 
-    #[test]
-    fn a_claude_launch_line_is_told_to_accept_peer_messages_once() {
-        // Without this the session holds OMAR's messages behind an approval
-        // dialog that covers the composer, and no event is ever delivered.
-        let flag = r#"--settings '{"crossSessionInbound":"accept"}'"#;
-        let once = ensure_claude_inbound_settings("claude --dangerously-skip-permissions");
-        assert_eq!(
-            once,
-            format!("claude {flag} --dangerously-skip-permissions")
-        );
-        assert_eq!(ensure_claude_inbound_settings(&once), once);
-        // By the executable: the tail of a line may belong to another program.
-        assert_eq!(
-            ensure_claude_inbound_settings("TERM=xterm claude -p hi 2>&1 | tee run.log"),
-            format!("TERM=xterm claude {flag} -p hi 2>&1 | tee run.log")
-        );
-        // The delivery side looks for exactly this pair in the pane's argv.
-        assert!(once.contains(&format!(
-            "--settings '{}'",
-            crate::channel::CLAUDE_INBOUND_ACCEPT
-        )));
-    }
-
-    #[test]
-    fn an_operators_own_settings_are_not_replaced() {
-        // Claude Code keeps only the last `--settings`; adding ours after the
-        // operator's would silently drop theirs.
-        for line in [
-            "claude --settings ~/team.json",
-            "claude --settings=~/team.json --dangerously-skip-permissions",
-        ] {
-            assert_eq!(ensure_claude_inbound_settings(line), line);
-        }
-    }
-
-    #[test]
-    fn only_claude_is_told_about_inbound_peer_messages() {
-        // The flag is Claude Code's; handing it to another backend would be an
-        // unrecognised argument at launch.
-        for base in [
-            "codex",
-            "opencode",
-            "cursor agent --yolo",
-            "agy --dangerously-skip-permissions",
-            "bash",
-        ] {
-            let cmd = ensure_claude_inbound_settings(base);
-            assert!(
-                !cmd.contains("crossSessionInbound"),
-                "{base} must not receive a Claude-only flag: {cmd}"
-            );
-        }
-    }
-
     /// A tempdir short enough that a codex home under it can still bind a
     /// Unix socket. The default one lives under a long `/var/folders/...`
     /// path on macOS, which is over the `sun_path` limit before codex has
     /// added a single character of its own.
-    fn short_tempdir() -> tempfile::TempDir {
+    pub(crate) fn short_tempdir() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("omar-test-")
             .tempdir_in("/tmp")
             .unwrap()
-    }
-
-    #[test]
-    fn codex_uses_its_alternate_screen_unless_explicitly_disabled() {
-        let default = ensure_codex_runtime_flags("codex");
-        assert_eq!(default, "codex --dangerously-bypass-approvals-and-sandbox");
-        assert_eq!(ensure_codex_runtime_flags(&default), default);
-        let explicit = "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox";
-        assert_eq!(ensure_codex_runtime_flags(explicit), explicit);
-        assert_eq!(ensure_codex_runtime_flags("bash"), "bash");
     }
 
     #[test]
@@ -2122,99 +1286,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_exec_preserves_config_precedence_and_native_resume() {
-        let (command, session) = codex_exec_command(
-            "env TEAM='a b' codex --profile work --search -c model_reasoning_effort='\"low\"' -c model_reasoning_effort='\"high\"' resume saved-session"
-        ).unwrap();
-        assert_eq!(session.as_deref(), Some("saved-session"));
-        assert_eq!(
-            shlex::split(&command).unwrap(),
-            [
-                "env",
-                "TEAM=a b",
-                "codex",
-                "exec",
-                "--skip-git-repo-check",
-                "--profile",
-                "work",
-                "-c",
-                "web_search=\"live\"",
-                "-c",
-                "model_reasoning_effort=\"low\"",
-                "-c",
-                "model_reasoning_effort=\"high\""
-            ]
-        );
-        assert!(codex_exec_command("codex --search resume --last").is_err());
-    }
-
-    #[test]
-    fn the_socket_bound_is_the_one_codex_enforces_not_the_kernel() {
-        // Measured against codex 0.147.0: a 95-byte socket path binds, 96
-        // fails with "path must be shorter than SUN_LEN". macOS itself would
-        // take 103, and a path in that gap is the bad case — it passes the
-        // kernel, codex refuses it, and the channel is lost silently while a
-        // home is left behind for nothing.
-        assert_eq!(
-            SUN_PATH_MAX, 96,
-            "the guard must reject the paths codex rejects, not the ones the OS does"
-        );
-    }
-
-    #[test]
-    fn deep_state_paths_keep_a_short_native_codex_socket() {
-        let dir = short_tempdir();
-        let deep = dir.path().join("d".repeat(90));
-        std::fs::create_dir_all(&deep).unwrap();
-        let prompt = deep.join("ea.md");
-        std::fs::write(&prompt, "be helpful").unwrap();
-        let cmd = build_agent_command("codex", &prompt, &[], &test_mcp_context(&deep));
-        let socket = crate::channel::codex_launch_socket(&cmd).unwrap();
-        assert!(socket.as_os_str().len() < SUN_PATH_MAX);
-        assert!(socket.parent().unwrap().is_dir());
-        assert!(!cmd.contains("CODEX_HOME="));
-        assert!(cmd.contains("mcp_servers.omar.command"));
-    }
-
-    /// The dedup joined two strings; a missing separator is a launch that
-    /// never reaches codex, and no `contains` assertion would notice.
-    #[test]
-    fn a_provisioning_launch_is_valid_shell() {
-        let out = std::process::Command::new("sh")
-            .args(["-n", "-c", ""])
-            .output()
-            .expect("sh -n");
-        assert!(out.status.success(), "sh cannot syntax-check");
-
-        let dir = short_tempdir();
-        let cmd = codex_server_command(&test_mcp_context(dir.path()), "be helpful", None, "codex")
-            .unwrap();
-        let checked = std::process::Command::new("sh")
-            .arg("-n")
-            .stdin(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                child.stdin.take().unwrap().write_all(cmd.as_bytes())?;
-                child.wait_with_output()
-            })
-            .expect("syntax-check the launch command");
-        assert!(
-            checked.status.success(),
-            "generated launch is not valid shell: {}\n{}",
-            String::from_utf8_lossy(&checked.stderr),
-            cmd
-        );
-        // Syntax alone does not catch a lost separator: the append would just
-        // redirect into `config.tomlcodex` and `sh -n` would still be happy.
-        assert!(
-            cmd.contains("; codex app-server"),
-            "the trust fragment must end in a separator: {cmd}"
-        );
-    }
-
-    #[test]
     fn codex_custom_flags_use_a_wake_capable_native_runner() {
         let dir = short_tempdir();
         let prompt = dir.path().join("agent.md");
@@ -2250,19 +1321,6 @@ mod tests {
                 "{base} should still get a home: {cmd}"
             );
         }
-    }
-
-    #[test]
-    fn launching_codex_preserves_legacy_conversation_history() {
-        let dir = short_tempdir();
-        let history = dir.path().join("codex/old/sessions/conversation.jsonl");
-        std::fs::create_dir_all(history.parent().unwrap()).unwrap();
-        std::fs::write(&history, "persistent conversation").unwrap();
-        codex_server_command(&test_mcp_context(dir.path()), "be helpful", None, "codex").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(history).unwrap(),
-            "persistent conversation"
-        );
     }
 
     #[test]
@@ -2350,86 +1408,6 @@ mod tests {
             !cmd.contains("--policy"),
             "agy does not advertise policy CLI flags"
         );
-    }
-
-    #[test]
-    fn command_backend_name_detects_executable_tokens() {
-        assert_eq!(
-            command_backend_name("agy --dangerously-skip-permissions"),
-            Some("agy")
-        );
-        assert_eq!(
-            command_backend_name("env FOO=bar /opt/bin/codex"),
-            Some("codex")
-        );
-        assert_eq!(command_backend_name("bash -lc 'echo hi'"), None);
-    }
-
-    #[test]
-    fn test_remove_omar_antigravity_mcp_config_updates_plugin_and_manifest() {
-        let _env_lock = global_home_env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let _home = EnvVarGuard::set("HOME", dir.path());
-        let plugins_dir = dir.path().join(".gemini/config/plugins");
-        std::fs::create_dir_all(plugins_dir.join("omar-ea-7")).unwrap();
-        std::fs::create_dir_all(plugins_dir.join("other-plugin")).unwrap();
-        let manifest_path = dir.path().join(".gemini/config/import_manifest.json");
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "imports": [
-                    {"name": "omar-ea-7", "source": "local-install"},
-                    {"name": "other-plugin", "source": "local-install"}
-                ]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        remove_omar_antigravity_mcp_config(7).unwrap();
-
-        assert!(!plugins_dir.join("omar-ea-7").exists());
-        assert!(plugins_dir.join("other-plugin").exists());
-        let manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
-        let imports = manifest["imports"].as_array().unwrap();
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0]["name"], "other-plugin");
-    }
-
-    #[test]
-    fn test_remove_all_omar_antigravity_mcp_configs_preserves_user_plugins() {
-        let _env_lock = global_home_env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let _home = EnvVarGuard::set("HOME", dir.path());
-        let plugins_dir = dir.path().join(".gemini/config/plugins");
-        std::fs::create_dir_all(plugins_dir.join("omar-ea-1")).unwrap();
-        std::fs::create_dir_all(plugins_dir.join("omar-ea-2")).unwrap();
-        std::fs::create_dir_all(plugins_dir.join("user-plugin")).unwrap();
-        let manifest_path = dir.path().join(".gemini/config/import_manifest.json");
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "imports": [
-                    {"name": "omar-ea-1", "source": "local-install"},
-                    {"name": "omar-ea-2", "source": "local-install"},
-                    {"name": "user-plugin", "source": "local-install"}
-                ]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        remove_all_omar_antigravity_mcp_configs().unwrap();
-
-        assert!(!plugins_dir.join("omar-ea-1").exists());
-        assert!(!plugins_dir.join("omar-ea-2").exists());
-        assert!(plugins_dir.join("user-plugin").exists());
-        let manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
-        let imports = manifest["imports"].as_array().unwrap();
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0]["name"], "user-plugin");
     }
 
     #[test]
@@ -2730,7 +1708,9 @@ mod tests {
             let line = line.replace(&exe, "<EXE>");
             let line = line.replace(dir.to_str().unwrap(), "<DIR>");
             let line = hex32.replace_all(&line, "<HEX32>").into_owned();
-            hex12.replace_all(&line, "codex-runtime/<HEX12>").into_owned()
+            hex12
+                .replace_all(&line, "codex-runtime/<HEX12>")
+                .into_owned()
         };
         let subs = [("{{TASK}}", "t1"), ("{{EA_ID}}", "0")];
         let mut lines = Vec::new();

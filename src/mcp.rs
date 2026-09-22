@@ -17,7 +17,6 @@ use uuid::Uuid;
 use crate::app::AgentInfo;
 use crate::backend_probe;
 use crate::computer;
-use crate::config;
 use crate::ea::{self, EaId};
 use crate::manager::{self, McpLaunchContext};
 use crate::memory;
@@ -218,14 +217,7 @@ fn now_rfc3339() -> String {
 
 fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> String {
     fn normalize(s: &str) -> Option<&'static str> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "codex" => Some("codex"),
-            "cursor" => Some("cursor"),
-            "agy" => Some("agy"),
-            "claude" | "claude-code" | "claude_code" => Some("claude"),
-            "opencode" => Some("opencode"),
-            _ => None,
-        }
+        crate::backend::by_name(s).map(|backend| backend.kind().name())
     }
 
     if let Some(name) = explicit_backend.and_then(normalize) {
@@ -301,7 +293,10 @@ fn apply_spawn_agent_command_overrides(
 
     if let Some(reasoning_effort) = reasoning_effort {
         validate_reasoning_effort(reasoning_effort)?;
-        if command.is_some() || backend != Some("codex") {
+        if command.is_some()
+            || backend.and_then(crate::backend::by_name).map(|b| b.kind())
+                != Some(crate::backend::Kind::Codex)
+        {
             return Err(anyhow!(
                 "reasoning_effort is only supported when spawn_agent uses backend='codex'."
             ));
@@ -877,17 +872,18 @@ impl OmarMcpServer {
     }
 
     fn list_backends(&self) -> Result<Value> {
-        let backends = ["claude", "codex", "cursor", "opencode", "agy"];
-        let infos: Vec<Value> = backends
+        let infos: Vec<Value> = crate::backend::ASSISTANT
             .iter()
-            .filter_map(|name| {
-                let command = config::resolve_backend(name).ok()?;
+            .map(|kind| crate::backend::of(*kind))
+            .map(|backend| {
+                let name = backend.kind().name();
+                let command = backend.default_command().to_string();
                 let available = backend_available_from_command(&command, name);
-                Some(json!({
+                json!({
                     "name": name,
                     "available": available,
                     "command": command,
-                }))
+                })
             })
             .collect();
         Ok(json!({ "backends": infos }))
@@ -1034,7 +1030,7 @@ impl OmarMcpServer {
             fs::remove_dir_all(&mcp_dir)
                 .map_err(|e| anyhow!("Failed to remove mcp dir {:?}: {}", mcp_dir, e))?;
         }
-        manager::remove_omar_antigravity_mcp_config(args.ea_id)?;
+        crate::backend::antigravity::remove_omar_antigravity_mcp_config(args.ea_id)?;
         let events_cancelled = self.scheduler().cancel_by_ea(args.ea_id);
         ea::unregister_ea(&self.context.omar_dir, args.ea_id)?;
         Ok(json!({
@@ -1220,7 +1216,9 @@ impl OmarMcpServer {
             return Err(anyhow!("Cannot specify both 'backend' and 'command'"));
         }
         let mut base_command = if let Some(backend) = args.backend.as_deref() {
-            config::resolve_backend(backend).map_err(|err| anyhow!(err))?
+            crate::backend::resolve(backend)
+                .map(|backend| backend.default_command().to_string())
+                .map_err(|err| anyhow!(err))?
         } else {
             args.command
                 .clone()
@@ -1320,12 +1318,13 @@ impl OmarMcpServer {
                 "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}\nOMAR TASK ID: {}\nReturn your result using finish_task; the runtime handles parent notification and check-ins.",
                 short_name, prompt_parent, task, task_id.as_deref().unwrap_or("untracked")
             );
-            // opencode has no system-prompt flag, so build_agent_command
-            // spawns it bare. Inline the rendered agent.md content here so
-            // the worker receives instructions plus the YOUR NAME header
-            // in one side-channel message. Other backends already received
-            // agent.md via their respective system-prompt flags.
-            let first_message = if backend_name == "opencode" {
+            // A backend with no way to take the prompt at launch gets the
+            // rendered agent.md inlined here, so the worker receives its
+            // instructions plus the YOUR NAME header in one side-channel
+            // message. The others already received it via a launch flag.
+            let first_message = if crate::backend::by_name(&backend_name)
+                .is_some_and(|backend| backend.takes_prompt_in_first_message())
+            {
                 let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
                 let content = std::fs::read_to_string(&prompt_file)
                     .unwrap_or_default()
@@ -1338,7 +1337,9 @@ impl OmarMcpServer {
             };
             let backend_name2 = backend_name.clone();
             let managed_protocol = crate::channel::managed_launch_socket(&command).is_some();
-            let readiness_markers = crate::tmux::backend_readiness_markers(&backend_name).to_vec();
+            let readiness_markers = crate::backend::by_name(&backend_name)
+                .map(|backend| backend.readiness_markers().to_vec())
+                .unwrap_or_default();
             let (delivery_tx, delivery_rx) = std::sync::mpsc::channel();
             thread::spawn(move || {
                 let delivery_start = std::time::Instant::now();
