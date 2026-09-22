@@ -1390,6 +1390,16 @@ h2 {
   line-height: 1.5;
 }
 
+.suggestions { padding: 16px; overflow: auto; color: var(--muted); }
+.suggestions-heading { display: flex; align-items: center; justify-content: space-between; color: var(--text); }
+.suggestions label { display: grid; gap: 6px; margin: 14px 0 8px; }
+.suggestions select, .suggestions textarea { width: 100%; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
+.suggestions textarea { min-height: 130px; resize: vertical; }
+.suggestion-card { display: grid; gap: 5px; border-top: 1px solid var(--border); margin-top: 14px; padding-top: 12px; color: var(--muted); }
+.suggestion-card b { color: var(--text); text-transform: capitalize; }
+.suggestion-card div { display: flex; gap: 6px; flex-wrap: wrap; }
+.suggestions-message { color: var(--amber); }
+
 .connection-error {
   margin: 10px;
   padding: 10px;

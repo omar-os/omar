@@ -23,6 +23,10 @@ use uuid::Uuid;
 
 use crate::chat_history::{ConversationSummary, History};
 use crate::config::Config;
+#[cfg(feature = "decision-support")]
+use crate::decisions::{
+    DecisionMode, EvaluateRequest, FeedbackRequest, Service as DecisionService,
+};
 use crate::ea::EaId;
 use crate::tmux::{DeliveryOptions, TmuxClient};
 use crate::topology::{self, PortKind, TopologyRunConfig, VmState};
@@ -219,6 +223,8 @@ struct Context_ {
     /// is relaunched on a different backend.
     command: Arc<Mutex<String>>,
     address: SocketAddr,
+    #[cfg(feature = "decision-support")]
+    decisions: Arc<DecisionService>,
 }
 
 impl Context_ {
@@ -352,6 +358,11 @@ impl Serve {
             chat_operation: Mutex::new(()),
             command: Arc::new(Mutex::new(config.agent.default_command.clone())),
             address,
+            #[cfg(feature = "decision-support")]
+            decisions: Arc::new(DecisionService::new(
+                config.decision_support.clone(),
+                omar_dir,
+            )?),
         });
         let workspaces = Arc::new(Workspaces {
             history,
@@ -571,7 +582,15 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
     reader.read_line(&mut request_line)?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
-    let mut path = parts.next().unwrap_or("").to_string();
+    let request_target = parts.next().unwrap_or("");
+    // Assist pagination is query-based. Routing must operate on the pathname
+    // so a cursor cannot accidentally become part of a run id.
+    let (mut path, query) = match request_target.split_once('?') {
+        Some((pathname, query)) => (pathname.to_string(), Some(query)),
+        None => (request_target.to_string(), None),
+    };
+    #[cfg(not(feature = "decision-support"))]
+    let _ = query;
 
     let mut content_length = 0usize;
     let mut origin = None;
@@ -815,6 +834,61 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         ("GET", "/v1/runs") => {
             let runs = context.runs.lock().expect("serve runs poisoned");
             (200, json!({"runs": runs.values().collect::<Vec<_>>()}))
+        }
+        #[cfg(feature = "decision-support")]
+        ("GET", "/v1/assist/capabilities") => (200, json!(context.decisions.capabilities())),
+        // A daemon built from this source without the optional feature still
+        // answers the discovery probe successfully. Older daemons have no
+        // route and return 404, which the browser also treats as unavailable;
+        // 204 avoids a browser console resource error for this known build.
+        #[cfg(not(feature = "decision-support"))]
+        ("GET", "/v1/assist/capabilities") => (204, json!({})),
+        #[cfg(feature = "decision-support")]
+        ("POST", rest) if rest.starts_with("/v1/assist/runs/") && rest.ends_with("/mode") => {
+            if origin_header
+                .as_deref()
+                .is_some_and(|value| crate::diagram::allowed_origin(Some(value)).is_none())
+            {
+                (403, json!({"error": "forbidden origin"}))
+            } else {
+                assist_set_mode(&context, rest, &read_body(content_length)?)
+            }
+        }
+        #[cfg(feature = "decision-support")]
+        ("GET", rest) if rest.starts_with("/v1/assist/runs/") && rest.ends_with("/sources") => {
+            assist_sources(&context, rest, query)
+        }
+        #[cfg(feature = "decision-support")]
+        ("POST", rest)
+            if rest.starts_with("/v1/assist/runs/") && rest.ends_with("/evaluations") =>
+        {
+            if origin_header
+                .as_deref()
+                .is_some_and(|value| crate::diagram::allowed_origin(Some(value)).is_none())
+            {
+                (403, json!({"error": "forbidden origin"}))
+            } else {
+                assist_evaluate(&context, rest, &read_body(content_length)?)
+            }
+        }
+        #[cfg(feature = "decision-support")]
+        ("GET", rest) if rest.starts_with("/v1/assist/runs/") && rest.ends_with("/decisions") => {
+            assist_decisions(&context, rest, query)
+        }
+        #[cfg(feature = "decision-support")]
+        ("POST", rest)
+            if rest.starts_with("/v1/assist/runs/")
+                && rest.contains("/decisions/")
+                && rest.ends_with("/feedback") =>
+        {
+            if origin_header
+                .as_deref()
+                .is_some_and(|value| crate::diagram::allowed_origin(Some(value)).is_none())
+            {
+                (403, json!({"error": "forbidden origin"}))
+            } else {
+                assist_feedback(&context, rest, &read_body(content_length)?)
+            }
         }
         // Before the run-record route, which would otherwise swallow the
         // suffix and answer with a record for a run id that has "/panel" on it.
@@ -1171,6 +1245,8 @@ impl Workspaces {
                 self.root.command.lock().expect("command poisoned").clone(),
             )),
             address: self.root.address,
+            #[cfg(feature = "decision-support")]
+            decisions: self.root.decisions.clone(),
         });
         contexts.insert(id.to_string(), context.clone());
         Ok(context)
@@ -1531,6 +1607,197 @@ fn write_chat_event(stream: &mut TcpStream, message: &ChatMessage) -> Result<()>
     Ok(())
 }
 
+#[cfg(feature = "decision-support")]
+fn assist_run_id<'a>(route: &'a str, suffix: &str) -> Option<&'a str> {
+    route
+        .strip_prefix("/v1/assist/runs/")?
+        .strip_suffix(suffix)?
+        .strip_suffix('/')
+        .or_else(|| route.strip_prefix("/v1/assist/runs/")?.strip_suffix(suffix))
+}
+
+#[cfg(feature = "decision-support")]
+fn assist_set_mode(context: &Arc<Context_>, route: &str, body: &[u8]) -> (u16, Value) {
+    #[derive(Deserialize)]
+    struct Request {
+        mode: DecisionMode,
+        profile_id: String,
+    }
+    let request: Request = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    let Some(run_id) = assist_run_id(route, "/mode") else {
+        return (404, json!({"error": "not found"}));
+    };
+    let diagram = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(run_id) {
+            Some(record) => record.diagram_address.clone(),
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    if let Err(error) =
+        context
+            .decisions
+            .set_mode_for_profile(run_id, request.mode, &request.profile_id)
+    {
+        return assist_error(error.to_string());
+    }
+    if request.mode != DecisionMode::Off {
+        match diagram.and_then(|address| address.parse().ok()) {
+            Some(address) => context
+                .decisions
+                .attach_observer(run_id.to_string(), address),
+            None => context
+                .decisions
+                .mark_coverage(run_id, crate::decisions::DecisionCoverage::Partial),
+        }
+    }
+    (200, json!({"run_id": run_id, "mode": request.mode}))
+}
+
+#[cfg(feature = "decision-support")]
+fn assist_sources(context: &Arc<Context_>, route: &str, query: Option<&str>) -> (u16, Value) {
+    let Some(run_id) = assist_run_id(route, "/sources") else {
+        return (404, json!({"error": "not found"}));
+    };
+    let is_live_run = context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .contains_key(run_id);
+    if !context.decisions.may_read_run(run_id, is_live_run) {
+        return (404, json!({"error": "unknown run"}));
+    }
+    let cursor = match assist_cursor(query) {
+        Ok(cursor) => cursor,
+        Err(error) => return (400, json!({"error": error})),
+    };
+    match context.decisions.sources_page(run_id, cursor.as_deref()) {
+        Ok((sources, coverage, next_cursor)) => (
+            200,
+            json!({"sources": sources, "coverage": coverage, "next_cursor": next_cursor}),
+        ),
+        Err(error) => (400, json!({"error": error.to_string()})),
+    }
+}
+
+#[cfg(feature = "decision-support")]
+fn assist_decisions(context: &Arc<Context_>, route: &str, query: Option<&str>) -> (u16, Value) {
+    let Some(run_id) = assist_run_id(route, "/decisions") else {
+        return (404, json!({"error": "not found"}));
+    };
+    let is_live_run = context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .contains_key(run_id);
+    if !context.decisions.may_read_run(run_id, is_live_run) {
+        return (404, json!({"error": "unknown run"}));
+    }
+    let cursor = match assist_cursor(query) {
+        Ok(cursor) => cursor,
+        Err(error) => return (400, json!({"error": error})),
+    };
+    match context.decisions.decisions_page(run_id, cursor.as_deref()) {
+        Ok((decisions, coverage, next_cursor)) => (
+            200,
+            json!({"decisions": decisions, "coverage": coverage, "next_cursor": next_cursor}),
+        ),
+        Err(error) => (400, json!({"error": error.to_string()})),
+    }
+}
+
+#[cfg(feature = "decision-support")]
+fn assist_cursor(query: Option<&str>) -> Result<Option<String>, &'static str> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let mut cursor = None;
+    for parameter in query.split('&') {
+        let Some(value) = parameter.strip_prefix("cursor=") else {
+            continue;
+        };
+        if value.is_empty() || cursor.replace(value.to_string()).is_some() {
+            return Err("invalid cursor");
+        }
+    }
+    Ok(cursor)
+}
+
+#[cfg(feature = "decision-support")]
+fn assist_evaluate(context: &Arc<Context_>, route: &str, body: &[u8]) -> (u16, Value) {
+    let Some(run_id) = assist_run_id(route, "/evaluations") else {
+        return (404, json!({"error": "not found"}));
+    };
+    if !context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .contains_key(run_id)
+    {
+        return (404, json!({"error": "unknown run"}));
+    }
+    let request: EvaluateRequest = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    match context.decisions.evaluate(run_id, request) {
+        Ok(record) => (202, json!(record)),
+        Err(error) => assist_error(error.to_string()),
+    }
+}
+
+#[cfg(feature = "decision-support")]
+fn assist_feedback(context: &Arc<Context_>, route: &str, body: &[u8]) -> (u16, Value) {
+    let Some(rest) = route
+        .strip_prefix("/v1/assist/runs/")
+        .and_then(|route| route.strip_suffix("/feedback"))
+    else {
+        return (404, json!({"error": "not found"}));
+    };
+    let Some((run_id, decision_id)) = rest.split_once("/decisions/") else {
+        return (404, json!({"error": "not found"}));
+    };
+    let request: FeedbackRequest = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    match context.decisions.feedback(run_id, decision_id, request) {
+        Ok(()) => (202, json!({"run_id": run_id, "decision_id": decision_id})),
+        Err(error) => assist_error(error.to_string()),
+    }
+}
+
+#[cfg(feature = "decision-support")]
+fn assist_error(error: String) -> (u16, Value) {
+    let status = if error.contains("not configured") || error.contains("disabled in config") {
+        503
+    } else if error.contains("queue")
+        || error.contains("request limit")
+        || error.contains("enrolled run limit")
+    {
+        429
+    } else if error.contains("too large") {
+        413
+    } else if error.contains("unknown source")
+        || error.contains("unknown decision")
+        || error.contains("unknown run")
+    {
+        404
+    } else if error.contains("digest")
+        || error.contains("already bound")
+        || error.contains("stale")
+        || error.contains("suggestions are not active")
+    {
+        409
+    } else {
+        400
+    };
+    (status, json!({"error": error}))
+}
+
 fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     let _operation = context
         .chat_operation
@@ -1627,12 +1894,23 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
 
     match ready_receiver.recv_timeout(DIAGRAM_READY_TIMEOUT) {
         Ok(diagram_address) => {
-            let mut runs = context.runs.lock().expect("serve runs poisoned");
-            if let Some(record) = runs.get_mut(&run_id) {
-                record.diagram_address = Some(diagram_address.to_string());
-                if record.status == RunStatus::Starting {
-                    record.status = RunStatus::Running;
+            let record = {
+                let mut runs = context.runs.lock().expect("serve runs poisoned");
+                if let Some(record) = runs.get_mut(&run_id) {
+                    record.diagram_address = Some(diagram_address.to_string());
+                    if record.status == RunStatus::Starting {
+                        record.status = RunStatus::Running;
+                    }
+                    Some(record.clone())
+                } else {
+                    None
                 }
+            };
+            if let Some(record) = record {
+                #[cfg(feature = "decision-support")]
+                context
+                    .decisions
+                    .enable_default_for_run(run_id.clone(), diagram_address);
                 return (201, json!(record));
             }
             (500, json!({"error": "run vanished"}))
@@ -1933,6 +2211,8 @@ fn spawn_run_thread(
             .lock()
             .expect("serve panels poisoned")
             .remove(&run_id);
+        #[cfg(feature = "decision-support")]
+        context.decisions.finish_run(&run_id);
         let mut runs = context.runs.lock().expect("serve runs poisoned");
         if let Some(record) = runs.get_mut(&run_id) {
             record.finished_at = Some(now_unix());

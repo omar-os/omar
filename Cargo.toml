@@ -26,6 +26,8 @@ chrono = { version = "0.4", features = ["serde"] }
 ansi-to-tui = "7"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+sha2 = "0.10"
 tracing = "0.1.44"
 # Terminal attach. `tungstenite` is the sync API, which matches the blocking
 # thread-per-connection model `omar serve` already uses; TLS is off because the
@@ -43,6 +45,7 @@ tempfile = "3"
 # the bundle first with `npm run build:spa` in `web/`.
 [features]
 ui = []
+decision-support = ["dep:reqwest"]
 
 [[bin]]
 name = "omar"

@@ -22,6 +22,11 @@ pub struct Config {
 
     #[serde(default)]
     pub slack_bridge: SlackBridgeConfig,
+
+    /// Optional, advisory-only decision support. Individual runs always begin
+    /// in `off`, even when this local API is enabled.
+    #[serde(default)]
+    pub decision_support: DecisionSupportConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +92,80 @@ pub struct SlackBridgeConfig {
     /// to the first registered EA. Set via the `/ea <name>` Slack command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_ea: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionSupportConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The default applies only to newly admitted runs. `off` is inert;
+    /// `shadow` and `suggest` attach the advisory observer without changing a
+    /// topology run.
+    #[serde(default = "default_decision_mode")]
+    pub default_mode: String,
+    /// Provider name is informational; the v1 service only implements the
+    /// fixed TypeSafe Jev adapter.
+    #[serde(default = "default_decision_provider")]
+    pub provider: String,
+    /// Jev is a wire contract, not a user-selectable model in this pilot.
+    #[serde(default = "default_decision_model")]
+    pub model: String,
+    #[serde(default = "default_decision_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_decision_timeout_ms")]
+    pub request_timeout_ms: u64,
+    #[serde(default = "default_decision_retention")]
+    pub retention_days: u64,
+    #[serde(default = "default_decision_store_bytes")]
+    pub max_store_bytes: u64,
+    /// Fully-qualified reaction IDs enrolled in the `review-owner-v1`
+    /// profile. The service never infers eligibility from a reaction name.
+    #[serde(default)]
+    pub review_owner_reactions: Vec<String>,
+}
+
+fn default_decision_mode() -> String {
+    "off".to_string()
+}
+
+fn default_decision_provider() -> String {
+    "typesafe".to_string()
+}
+
+fn default_decision_model() -> String {
+    "jev-1.13.0".to_string()
+}
+
+fn default_decision_timeout() -> u64 {
+    3
+}
+
+fn default_decision_timeout_ms() -> u64 {
+    3_000
+}
+
+fn default_decision_store_bytes() -> u64 {
+    100 * 1024 * 1024
+}
+
+fn default_decision_retention() -> u64 {
+    14
+}
+
+impl Default for DecisionSupportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_mode: default_decision_mode(),
+            provider: default_decision_provider(),
+            model: default_decision_model(),
+            timeout_seconds: default_decision_timeout(),
+            request_timeout_ms: default_decision_timeout_ms(),
+            retention_days: default_decision_retention(),
+            max_store_bytes: default_decision_store_bytes(),
+            review_owner_reactions: Vec::new(),
+        }
+    }
 }
 
 fn default_true() -> bool {

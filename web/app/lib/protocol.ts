@@ -14,6 +14,12 @@
 export type {
   Conversation,
   ConversationSummary,
+  DecisionCapabilities,
+  DecisionCoverage,
+  DecisionMode,
+  DecisionRecord,
+  DecisionSource,
+  DecisionStatus,
   ChatMessage,
   ChatRole,
   DiagramAgent,
@@ -37,6 +43,9 @@ export type {
 
 export {
   CHAT_ROLES,
+  DECISION_COVERAGE,
+  DECISION_MODES,
+  DECISION_STATUSES,
   DIAGRAM_EVENT_KINDS,
   DIAGRAM_STATUSES,
   EDGE_KINDS,

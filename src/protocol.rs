@@ -26,6 +26,10 @@
 use ts_rs::{Config, TS};
 
 use crate::chat_history::{Conversation, ConversationSummary};
+use crate::decisions::{
+    DecisionCapabilities, DecisionCoverage, DecisionMode, DecisionRecord, DecisionSelection,
+    DecisionSource, DecisionStatus,
+};
 use crate::diagram::{
     wire_name, DiagramAgent, DiagramEdge, DiagramEvent, DiagramEventKind, DiagramInstance,
     DiagramPort, DiagramReaction, DiagramSnapshot, DiagramStatus, DiagramTag, DiagramTimer,
@@ -142,6 +146,34 @@ fn vocabularies() -> Vec<Vocabulary> {
             "Who spoke.",
             &[ChatRole::Operator, ChatRole::Assistant],
         ),
+        vocabulary(
+            "DECISION_MODES",
+            "DecisionMode",
+            "The advisory mode selected for a run.",
+            &[DecisionMode::Off, DecisionMode::Shadow, DecisionMode::Suggest],
+        ),
+        vocabulary(
+            "DECISION_STATUSES",
+            "DecisionStatus",
+            "The local lifecycle of an advisory evaluation.",
+            &[
+                DecisionStatus::Queued,
+                DecisionStatus::Evaluating,
+                DecisionStatus::Suggested,
+                DecisionStatus::NeedsReview,
+                DecisionStatus::Unavailable,
+                DecisionStatus::Cancelled,
+            ],
+        ),
+        vocabulary(
+            "DECISION_COVERAGE",
+            "DecisionCoverage",
+            "Whether the observer saw a complete run event stream.",
+            &[
+                DecisionCoverage::ContinuousSinceAttachment,
+                DecisionCoverage::Partial,
+            ],
+        ),
     ]
 }
 
@@ -189,13 +221,24 @@ pub fn generate() -> String {
         Conversation::decl(&config),
         ConversationSummary::decl(&config),
         RunRecord::decl(&config),
+        DecisionCapabilities::decl(&config),
+        DecisionSource::decl(&config),
+        DecisionSelection::decl(&config),
+        DecisionRecord::decl(&config),
     ];
     for decl in &mut decls {
         out.push_str("export ");
         out.push_str(decl);
         out.push_str("\n\n");
     }
-    out
+    // ts-rs emits a space before a following doc block for a few field shapes.
+    // Normalise lines here so generated protocol changes remain clean diffs.
+    let generated = out
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{}\n", generated.trim_end())
 }
 
 #[cfg(test)]
@@ -218,6 +261,9 @@ mod tests {
             "PortKind",
             "DiagramEventKind",
             "ChatRole",
+            "DecisionMode",
+            "DecisionStatus",
+            "DecisionCoverage",
         ] {
             assert!(
                 generated.contains(&format!("export type {name} = (typeof")),
