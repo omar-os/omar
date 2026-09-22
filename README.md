@@ -145,8 +145,6 @@ the original size and sizing policy if no external client remains and the
 policy has not been changed. Concurrent clients still share tmux's window and
 its sizing policy; a manually sized window stays manual.
 
-Terminal regression reproduction and CI commands: [terminal UX tests](docs/terminal-ux.md).
-
 ## License
 
 BSD 3-Clause

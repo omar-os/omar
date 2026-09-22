@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Paired live legacy-hierarchy benchmark. Opt in: OMAR_LIVE_BACKENDS=1.
-Never sends terminal input or human reminders. See docs/workflow-benchmark.md.
+Never sends terminal input or human reminders.
 """
 import argparse
 import concurrent.futures
