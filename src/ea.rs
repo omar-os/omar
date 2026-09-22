@@ -336,6 +336,7 @@ pub fn unregister_ea(base_dir: &Path, ea_id: EaId) -> anyhow::Result<()> {
     if !eas.iter().any(|e| e.id == ea_id) {
         anyhow::bail!("EA {} not found in registry", ea_id);
     }
+    crate::supervision::remove_ea(base_dir, ea_id)?;
     eas.retain(|e| e.id != ea_id);
     save_registry(base_dir, &eas)
 }
