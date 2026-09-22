@@ -554,7 +554,53 @@ struct DueDelivery {
 
 pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer, base_prefix: String) {
     let external_poll_interval = std::time::Duration::from_millis(500);
+    let mut last_supervision = std::time::Instant::now() - std::time::Duration::from_secs(5);
     loop {
+        if last_supervision.elapsed() >= std::time::Duration::from_secs(5) {
+            last_supervision = std::time::Instant::now();
+            if let Some(root) = scheduler.store_path.as_deref().and_then(Path::parent) {
+                // A failed inventory is not proof that every worker died.
+                if root.join("task-lifecycle.json").exists() {
+                    match crate::tmux::TmuxClient::new("").list_sessions() {
+                        Ok(sessions) => {
+                            let client = crate::tmux::TmuxClient::new("");
+                            let live = sessions
+                                .into_iter()
+                                .filter(|s| client.session_has_live_pane(&s.name).unwrap_or(true))
+                                .map(|s| s.name)
+                                .collect();
+                            match crate::supervision::reconcile(
+                                root,
+                                crate::supervision::now_ms(),
+                                &live,
+                            ) {
+                                Ok(wakes) => {
+                                    for (ea_id, receiver, payload) in wakes {
+                                        let id = format!("supervisor-{ea_id}-{receiver}");
+                                        // Upsert preserves bounded queue size through outages.
+                                        scheduler.transaction(true, |queue| {
+                                            queue.retain(|event| event.id != id);
+                                            queue.push(ScheduledEvent {
+                                                id,
+                                                sender: "omar-runtime".into(),
+                                                receiver,
+                                                timestamp: now_ns(),
+                                                created_at: now_ns(),
+                                                payload,
+                                                recurring_ns: None,
+                                                ea_id,
+                                            });
+                                        });
+                                    }
+                                }
+                                Err(error) => ticker.push(format!("supervision: {error}")),
+                            }
+                        }
+                        Err(error) => ticker.push(format!("supervision inventory: {error}")),
+                    }
+                }
+            }
+        }
         let next_ts = scheduler.next_timestamp();
 
         match next_ts {
@@ -589,8 +635,34 @@ pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer, bas
                         receiver,
                         ea_id,
                         timestamp,
-                        batch,
+                        mut batch,
                     } = delivery;
+                    if let Some(root) = scheduler.store_path.as_deref().and_then(Path::parent) {
+                        // A deferred notification is a pointer to an obligation,
+                        // not a frozen copy of authoritative state.
+                        if batch.iter().any(|e| e.sender == "omar-runtime") {
+                            match crate::supervision::context(root, ea_id, &receiver) {
+                                Ok(state) => {
+                                    batch.retain(|e| {
+                                        e.sender != "omar-runtime"
+                                            || state["tasks"]
+                                                .as_array()
+                                                .is_some_and(|tasks| !tasks.is_empty())
+                                    });
+                                    for event in
+                                        batch.iter_mut().filter(|e| e.sender == "omar-runtime")
+                                    {
+                                        event.payload = crate::supervision::context_message(&state);
+                                    }
+                                }
+                                Err(error) => {
+                                    ticker.push(format!("supervision context: {error}"));
+                                    requeue_batch(&scheduler, batch);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     if batch.is_empty() {
                         continue;
                     }

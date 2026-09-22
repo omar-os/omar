@@ -548,6 +548,7 @@ impl App {
             default_command: default_command.clone(),
             default_workdir: self.default_workdir.clone(),
             health_idle_warning: self.health_threshold,
+            agent_name: None,
             tmux_server: std::env::var("OMAR_TMUX_SERVER")
                 .ok()
                 .map(|server| server.trim().to_string())
