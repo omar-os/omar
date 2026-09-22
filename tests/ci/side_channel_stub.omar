@@ -1,0 +1,17 @@
+// Model-free regression: both invocations reach the stub through its queue.
+team SideChannel[worker : Stub]
+{
+    input request : string
+    action next : string
+    output result : string
+
+    prompt worker(request) -> next
+    "Answer the first invocation."
+
+    prompt worker(next) -> result
+    "Answer the second invocation."
+}
+
+main {
+    run = SideChannel()
+}

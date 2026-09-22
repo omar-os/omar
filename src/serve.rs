@@ -15,7 +15,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ts_rs::TS;
@@ -674,11 +674,17 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         }
     };
 
+    // Geometry is only a terminal handshake parameter; leave other API paths
+    // and their routing unchanged.
+    let (terminal_path, terminal_query) = path.split_once('?').unwrap_or((&path, ""));
     // A terminal is the one endpoint where a wrong answer hands an attacker a
     // shell, and CORS does not apply to WebSockets: the browser opens the
     // socket regardless and only the server can refuse it.
-    if method == "GET" && path.starts_with(TERMINAL_PREFIX) && path.ends_with(TERMINAL_SUFFIX) {
-        let agent = path
+    if method == "GET"
+        && terminal_path.starts_with(TERMINAL_PREFIX)
+        && terminal_path.ends_with(TERMINAL_SUFFIX)
+    {
+        let agent = terminal_path
             .trim_start_matches(TERMINAL_PREFIX)
             .trim_end_matches(TERMINAL_SUFFIX)
             .to_string();
@@ -692,12 +698,13 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
             &session,
             websocket_key.as_deref(),
             origin_header.as_deref(),
+            terminal_query,
         );
     }
     // The assistant is not one of the agents: its session is named
     // `<base>ea-<id>` rather than `<base><id>-<name>`, so no agent name
     // reaches it and it needs a route of its own.
-    if method == "GET" && path == "/v1/agent/terminal" {
+    if method == "GET" && terminal_path == "/v1/agent/terminal" {
         if context
             .chat
             .lock()
@@ -717,6 +724,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
             &session,
             websocket_key.as_deref(),
             origin_header.as_deref(),
+            terminal_query,
         );
     }
 
@@ -870,6 +878,7 @@ fn attach_terminal(
     session: &str,
     websocket_key: Option<&str>,
     origin: Option<&str>,
+    query: &str,
 ) -> Result<()> {
     // Same-origin policy does not cover WebSockets. Without this check any page
     // the operator happens to visit could open a terminal into their agents and
@@ -889,7 +898,17 @@ fn attach_terminal(
         );
     };
 
-    let attachment = match crate::terminal::Attachment::open_session(session) {
+    let dimensions = match terminal_dimensions(query) {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            return write_json(&mut stream, 400, &json!({"error": error.to_string()}), None)
+        }
+    };
+    let attachment = match dimensions {
+        Some(size) => crate::terminal::Attachment::open_session_sized(session, Some(size)),
+        None => crate::terminal::Attachment::open_session(session),
+    };
+    let attachment = match attachment {
         Ok(attachment) => attachment,
         // The socket has not been upgraded yet, so this can still be an
         // ordinary HTTP error the client can read.
@@ -915,6 +934,36 @@ fn attach_terminal(
     relay_terminal(stream, attachment)
 }
 
+/// Optional initial geometry, in client cells including tmux's status lines.
+/// Reject partial/duplicate/out-of-range dimensions before creating a PTY.
+fn terminal_dimensions(query: &str) -> Result<Option<(u16, u16)>> {
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let mut cols = None;
+    let mut rows = None;
+    for field in query.split('&') {
+        let (key, value) = field.split_once('=').context("invalid terminal geometry")?;
+        let slot = match key {
+            "cols" => &mut cols,
+            "rows" => &mut rows,
+            _ => bail!("unknown terminal geometry parameter"),
+        };
+        if slot.is_some() {
+            bail!("duplicate terminal geometry parameter");
+        }
+        let value: u16 = value.parse().context("invalid terminal dimension")?;
+        if !(2..=1000).contains(&value) {
+            bail!("implausible terminal dimension");
+        }
+        *slot = Some(value);
+    }
+    match (cols, rows) {
+        (Some(cols), Some(rows)) => Ok(Some((cols, rows))),
+        _ => bail!("both cols and rows are required"),
+    }
+}
+
 /// What the viewer can fit, in characters.
 #[derive(Deserialize)]
 struct Resize {
@@ -932,11 +981,11 @@ fn relay_terminal(stream: TcpStream, mut attachment: crate::terminal::Attachment
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut socket = WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
 
-    // The viewer must render at the agent's size rather than resize it, so it
-    // is told what that size is before any output arrives.
+    // Report PTY client dimensions, including status rows, before output.
+    // With multiple viewers this is not necessarily the shared window size.
     let size = attachment.size;
     let _ = socket.send(Message::Text(
-        json!({"cols": size.cols, "rows": size.rows}).to_string(),
+        json!({"cols": size.cols, "rows": size.client_rows()}).to_string(),
     ));
 
     loop {
@@ -951,7 +1000,7 @@ fn relay_terminal(stream: TcpStream, mut attachment: crate::terminal::Attachment
                     attachment.resize(resize.cols, resize.rows)?;
                     let size = attachment.size;
                     let _ = socket.send(Message::Text(
-                        json!({"cols": size.cols, "rows": size.rows}).to_string(),
+                        json!({"cols": size.cols, "rows": size.client_rows()}).to_string(),
                     ));
                 }
                 Err(_) => attachment.write(text.as_bytes())?,
@@ -2282,30 +2331,34 @@ mod tests {
         let mut config = Config::default();
         config.dashboard.session_prefix = format!("omar-history-test-{}-", Uuid::new_v4());
         config.agent.default_workdir = dir.path().display().to_string();
-        // A recording terminal replaces the LLM; this exercises the real
-        // assistant relaunch and delivery paths without using model credentials.
-        let recorder = dir.path().join("recorder.py");
+        // A recording backend drains its side-channel queue. No TTY input,
+        // real Claude installation, or model credentials are involved.
+        let recorder = dir.path().join("claude");
         fs::write(
             &recorder,
-            r#"import os, sys, tty
-tty.setraw(0)
-buffer = b''
-shown = False
-with open(sys.argv[1], 'ab', buffering=0) as output:
-    while True:
-        chunk = os.read(0, 65536)
-        output.write(chunk)
-        buffer += chunk
-        if b'<UserPromptEnds:' in buffer and buffer.rstrip().endswith(b'>') and not shown:
-            os.write(1, b'[Pasted text #1]')
-            shown = True
-        if shown and b'\r' in chunk:
-            os.write(1, b'\r\nRecorded submission\r\n')
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys, time
+output = pathlib.Path(__file__).with_name('captured.txt')
+spool = output.with_suffix('.queue')
+subprocess.run(['tmux', 'set-environment', '-t', os.environ['TMUX_PANE'],
+                'OMAR_DELIVERY', 'spool:' + str(spool)], check=True)
+while True:
+    claimed = spool.with_suffix('.draining')
+    try:
+        spool.rename(claimed)
+    except FileNotFoundError:
+        time.sleep(0.025)
+        continue
+    with output.open('a') as sink:
+        for line in claimed.read_text().splitlines():
+            sink.write(json.loads(line)['text'] + '\n')
+    claimed.unlink()
 "#,
         )
         .unwrap();
-        config.agent.default_command =
-            format!("python3 '{}' '{}'", recorder.display(), captured.display());
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o700)).unwrap();
+        config.agent.default_command = format!("'{}' '{}'", recorder.display(), captured.display());
         let session = crate::ea::ea_manager_session(0, &config.dashboard.session_prefix);
         struct Cleanup(String);
         impl Drop for Cleanup {
@@ -2875,6 +2928,26 @@ with open(sys.argv[1], 'ab', buffering=0) as output:
     }
 
     #[test]
+    fn terminal_handshake_geometry_is_validated() {
+        assert_eq!(terminal_dimensions("").unwrap(), None);
+        assert_eq!(
+            terminal_dimensions("cols=96&rows=30").unwrap(),
+            Some((96, 30))
+        );
+        for bad in [
+            "cols=80",
+            "rows=24",
+            "cols=0&rows=24",
+            "cols=80&rows=1001",
+            "cols=80&rows=24&cols=90",
+            "cols=x&rows=24",
+            "other=80&rows=24",
+        ] {
+            assert!(terminal_dimensions(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_terminal_carries_the_agent_screen_and_the_operator_keystrokes() {
         // The whole point is steering, so this drives a real tmux session
         // through a real socket: the agent's output has to arrive, and typing
@@ -2905,11 +2978,13 @@ with open(sys.argv[1], 'ab', buffering=0) as output:
         ]);
 
         let server = test_server();
-        let url = format!("ws://{}/v1/agents/wsprobe/terminal", server.address());
+        let url = format!(
+            "ws://{}/v1/agents/wsprobe/terminal?cols=93&rows=31",
+            server.address()
+        );
         let (mut socket, _) = tungstenite::connect(&url).expect("terminal connects");
 
-        // The viewer is told the agent's size before anything else, so it can
-        // render at that size instead of resizing the agent.
+        // The PTY starts at the viewer's requested size before emitting bytes.
         let size: Value = serde_json::from_str(
             &socket
                 .read()
@@ -2918,8 +2993,8 @@ with open(sys.argv[1], 'ab', buffering=0) as output:
                 .expect("text"),
         )
         .expect("json");
-        assert_eq!(size["cols"], json!(120));
-        assert_eq!(size["rows"], json!(40));
+        assert_eq!(size["cols"], json!(93));
+        assert_eq!(size["rows"], json!(31));
 
         socket
             .send(tungstenite::Message::Binary(b"echo omar-ws-ok\n".to_vec()))
@@ -3001,6 +3076,9 @@ with open(sys.argv[1], 'ab', buffering=0) as output:
         ]);
 
         let server = test_server();
+        let expected_rows = crate::terminal::window_size(&session)
+            .unwrap()
+            .client_rows();
         let url = format!("ws://{}/v1/agent/terminal", server.address());
         let (mut socket, _) = tungstenite::connect(&url).expect("assistant terminal connects");
         let size: Value = serde_json::from_str(
@@ -3014,7 +3092,7 @@ with open(sys.argv[1], 'ab', buffering=0) as output:
 
         tmux(&["kill-session", "-t", &format!("={session}")]);
         assert_eq!(size["cols"], json!(90));
-        assert_eq!(size["rows"], json!(26));
+        assert_eq!(size["rows"], json!(expected_rows));
     }
 
     #[test]

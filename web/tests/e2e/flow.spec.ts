@@ -1433,6 +1433,61 @@ test("dragging the canvas does not select the diagram", async ({ page }) => {
   expect(await scene.getAttribute("transform")).not.toBe(before);
 });
 
+test("Escape reaches the terminal and only the explicit close chord detaches", async ({ page }) => {
+  await useFakeServe(page);
+  const keys: Buffer[] = [];
+  page.on("websocket", (socket) => socket.on("framesent", (frame) => {
+    if (Buffer.isBuffer(frame.payload)) keys.push(frame.payload);
+  }));
+  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("attached");
+  await page.keyboard.press("Escape");
+  await expect.poll(() => Buffer.concat(keys).toString()).toBe("\x1b");
+  await expect(dialog).toBeVisible();
+  await page.keyboard.type("still here");
+  await expect.poll(() => Buffer.concat(keys).toString()).toBe("\x1bstill here");
+  await page.keyboard.press("Control+Shift+Escape");
+  await expect(dialog).toBeHidden();
+  expect(Buffer.concat(keys).toString()).toBe("\x1bstill here");
+  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await expect(dialog).toBeVisible();
+  await page.getByRole("button", { name: "Close terminal" }).click();
+  await expect(dialog).toBeHidden();
+});
+
+test("an alternate-screen terminal draws at the initial and resized geometry without duplicate or cutoff rows", async ({ page }) => {
+  await fake.close();
+  fake = (await startFakeServe({ port: FAKE_SERVE_PORT, terminalReflow: true })) as FakeServe;
+  await useFakeServe(page);
+  let initial = { cols: 0, rows: 0 };
+  page.on("websocket", (socket) => {
+    const url = new URL(socket.url());
+    initial = { cols: Number(url.searchParams.get("cols")), rows: Number(url.searchParams.get("rows")) };
+  });
+  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  const rows = page.locator(".xterm-rows");
+  await expect(rows).toContainText("BOTTOM");
+  expect(initial.cols).toBeGreaterThan(80);
+  await expect(rows).toContainText(`FRAME ${initial.cols}x${initial.rows}`);
+  for (const width of [900, 1400, 850, 1280]) {
+    await page.setViewportSize({ width, height: 720 });
+    await expect.poll(async () => {
+      const lines = await rows.locator(":scope > div").allTextContents();
+      const heading = await page.locator(".terminal-heading").innerText();
+      const size = /(\d+)×(\d+)/.exec(heading);
+      if (!size) return false;
+      const cols = Number(size[1]);
+      const height = Number(size[2]);
+      return lines.length === height &&
+        lines[0].trim() === `FRAME ${cols}x${height}` &&
+        lines[1].trim() === `${"x".repeat(cols - 1)}R` &&
+        lines[height - 1].trim() === "BOTTOM" &&
+        lines.filter((line) => line.includes("FRAME")).length === 1;
+    }).toBe(true);
+  }
+});
+
 test("a drag resizes the view every frame and the session once", async ({
   page,
 }) => {

@@ -14,24 +14,8 @@ import { ASSISTANT, terminalUrlFor } from "./lib/runtime-client";
  */
 const SETTLE_MS = 100;
 
-/**
- * A live terminal attached to one agent's tmux session.
- *
- * The terminal fits the panel and the session reflows to match, which is what
- * a terminal emulator does and why the text is always crisp: nothing is scaled,
- * so nothing can be clipped or blurred.
- *
- * That resizes the agent's tmux window while the viewer is open. The daemon
- * restores it on detach, which is what makes this safe to do at all.
- *
- * Refitting locally and telling the session are separated, because they cost
- * very different amounts. Re-wrapping our own buffer is cheap and happens on
- * every frame of a drag, so the view never lags the panel. Telling the session
- * resizes a tmux window and redraws the whole pane, so it waits for the drag to
- * settle. VS Code splits the same work the same way, and its comment is the
- * reason: "vertical resize is cheap and horizontal resize is expensive due to
- * reflow" — a height change is passed on immediately, a width change is not.
- */
+/** A live, fitted terminal. The daemon restores the original geometry after
+ * the last web viewer detaches, provided no external client owns the window. */
 export function AgentTerminal({
   serveUrl,
   agent,
@@ -61,12 +45,18 @@ export function AgentTerminal({
     terminal.loadAddon(fit);
     terminal.open(screen);
 
-    const socket = new WebSocket(terminalUrlFor(serveUrl, agent));
+    // Fit before any bytes arrive, and start the PTY at this same geometry.
+    // Otherwise the first full redraw wraps in xterm's default 80x24 buffer.
+    fit.fit();
+    const url = new URL(terminalUrlFor(serveUrl, agent));
+    url.searchParams.set("cols", String(terminal.cols));
+    url.searchParams.set("rows", String(terminal.rows));
+    const socket = new WebSocket(url);
     socket.binaryType = "arraybuffer";
 
     // The geometry the session was last asked for, so a drag that crosses no
     // character boundary asks for nothing.
-    let asked = { cols: 0, rows: 0 };
+    let asked = { cols: terminal.cols, rows: terminal.rows };
     let settle: ReturnType<typeof setTimeout> | null = null;
     let frame = 0;
 
@@ -76,8 +66,8 @@ export function AgentTerminal({
       socket.send(JSON.stringify(asked));
     };
 
-    // Ask the session for the shape this panel can hold. The daemon reflows
-    // it and answers with what it settled on.
+    // Ask for the shape this panel can hold. The daemon acknowledges PTY
+    // dimensions; tmux arbitrates the shared window if other viewers exist.
     const claim = (immediate = false) => {
       // Measuring inside the observer that reported the change is what makes a
       // browser complain about undelivered notifications; a frame later the
@@ -107,8 +97,7 @@ export function AgentTerminal({
 
     socket.onopen = () => claim(true);
     socket.onmessage = (event) => {
-      // Text is the geometry the session settled on; everything else is raw
-      // terminal bytes.
+      // Text acknowledges the PTY geometry; everything else is raw bytes.
       if (typeof event.data === "string") {
         setSize(JSON.parse(event.data) as { cols: number; rows: number });
         return;
@@ -151,8 +140,8 @@ export function AgentTerminal({
       cancelAnimationFrame(frame);
       if (settle) clearTimeout(settle);
       typing.dispose();
-      // Closing the socket is the detach; the agent's session carries on, at
-      // the size it had before this viewer arrived.
+      // Closing the socket detaches. The last viewer can restore the window;
+      // the agent's session carries on.
       socket.close();
       terminal.dispose();
     };
@@ -160,10 +149,16 @@ export function AgentTerminal({
 
   useEffect(() => {
     const close = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape" && event.ctrlKey && event.shiftKey) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onClose();
+      }
     };
-    window.addEventListener("keydown", close);
-    return () => window.removeEventListener("keydown", close);
+    // Capture the explicit close chord before xterm can forward it. Plain
+    // Escape belongs to the running application (cancel, back, interrupt).
+    window.addEventListener("keydown", close, true);
+    return () => window.removeEventListener("keydown", close, true);
   }, [onClose]);
 
   return (
@@ -186,7 +181,13 @@ export function AgentTerminal({
                 ? `${size.cols}×${size.rows} · attached`
                 : "attaching…"}
           </span>
-          <button type="button" onClick={onClose} aria-label="Close terminal">
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close terminal"
+            title="Close terminal (Ctrl+Shift+Escape)"
+            aria-keyshortcuts="Control+Shift+Escape"
+          >
             Close
           </button>
         </header>
@@ -194,6 +195,7 @@ export function AgentTerminal({
           <div className="terminal-screen" ref={screenRef} />
         </div>
         <p className="terminal-note">
+          Escape goes to the agent. Close with Ctrl+Shift+Escape or the Close button.{" "}
           {agent === ASSISTANT
             ? // Worth saying: the chat and this terminal drive one pane, so a
               // half-typed line here collides with the next reply delivered.

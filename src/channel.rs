@@ -7,7 +7,7 @@
 //!
 //! Resolution is deliberately dynamic — nothing is cached at launch. A pane
 //! whose backend has restarted, or whose socket has gone, simply resolves to
-//! `None` and delivery falls back to the input box.
+//! `None`; callers retain pending work or report failure without touching input.
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 /// How long to wait on a socket that has accepted the connection but is not
-/// reading. Short: the fallback is a working delivery path, not an error.
+/// reading. A timeout reports failure; it never enables terminal-input delivery.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Loopback HTTP is either immediate or wedged; nothing in between.
@@ -38,6 +38,16 @@ const SPOOL_STALE: Duration = Duration::from_secs(600);
 /// launch command put around it.
 pub const CLAUDE_INBOUND_ACCEPT: &str = r#"{"crossSessionInbound":"accept"}"#;
 
+/// A retryable pre-send condition: no message has been submitted to the backend.
+#[derive(Debug)]
+pub(crate) struct ChannelNotReady;
+impl std::fmt::Display for ChannelNotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the app-server has not loaded a thread yet")
+    }
+}
+impl std::error::Error for ChannelNotReady {}
+
 /// A side channel into a running agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Channel {
@@ -46,13 +56,12 @@ pub enum Channel {
     /// buffer, so a draft in the composer is untouched.
     ClaudePeer { socket: PathBuf, token: String },
     /// opencode's HTTP server. A `synthetic` message part is shown to the
-    /// model but not rendered in the transcript, and `noReply` seats it
-    /// without starting a turn.
+    /// model but not rendered as operator input. The asynchronous endpoint
+    /// wakes an idle session without waiting for the model response.
     OpencodeHttp { port: u16, session: String },
-    /// codex's app-server. `thread/inject_items` appends to the thread the
-    /// pane's TUI is showing without starting a turn and without drawing
-    /// anything, so the agent reads the event on its next turn and the
-    /// composer never moves.
+    /// Codex's app-server. `turn/start` with `toolOutput` wakes an idle
+    /// thread or queues the event on its active turn. The event retains tool
+    /// output semantics and the TUI's composer is never touched.
     CodexAppServer { socket: PathBuf },
     /// A file the backend's own hook drains into model context.
     ///
@@ -152,15 +161,14 @@ impl Channel {
     /// will land. codex resolves on the socket file existing and only
     /// discovers in [`Channel::deliver`] that the pane has more than one
     /// thread loaded and cannot be addressed. Callers must treat the error
-    /// from `deliver` as the real answer — the scheduler does, by protecting
-    /// the draft again before it falls back to the input box.
+    /// from `deliver` as the real answer and retain pending work on failure.
     pub fn resolve(backend: &str, pane_pid: u32, stamp: Option<&str>) -> Option<Channel> {
         // A stamp is written when the backend needed provisioning at launch;
         // it names the port and session an event must be addressed to.
         if let Some(channel) = stamp.and_then(Channel::from_stamp) {
             // A spool only works if the backend's hook is draining it. If the
             // oldest event has been waiting too long it plainly is not, so
-            // stop feeding it and let delivery fall back to the input box.
+            // stop feeding it and report the unavailable channel.
             if let Channel::Spool { path } = &channel {
                 if spool_is_stale(path) {
                     return None;
@@ -168,7 +176,7 @@ impl Channel {
             }
             // A pane that has exited takes its app-server with it. Answering
             // with a channel whose socket is gone only costs the caller a
-            // round trip before it falls back.
+            // round trip before delivery reports failure.
             if let Channel::CodexAppServer { socket } = &channel {
                 if !socket.exists() {
                     return None;
@@ -210,7 +218,7 @@ impl Channel {
         }
     }
 
-    /// Hand the event to the agent. Errors are the caller's cue to fall back.
+    /// Hand the event to the agent. Errors never authorize terminal input.
     pub fn deliver(&self, text: &str) -> Result<()> {
         match self {
             Channel::ClaudePeer { socket, token } => {
@@ -225,18 +233,18 @@ impl Channel {
             }
             Channel::OpencodeHttp { port, session } => {
                 let body = serde_json::json!({
-                    "noReply": true,
+                    "noReply": false,
                     "parts": [{ "type": "text", "text": text, "synthetic": true }],
                 })
                 .to_string();
                 let (status, _) = http_json(
                     *port,
                     "POST",
-                    &format!("/session/{}/message", session),
+                    &format!("/session/{}/prompt_async", session),
                     Some(&body),
                 )
                 .context("post message to opencode")?;
-                if status != 200 {
+                if status != 204 {
                     anyhow::bail!("opencode answered {}", status);
                 }
                 Ok(())
@@ -244,7 +252,7 @@ impl Channel {
             Channel::CodexAppServer { socket } => {
                 let mut session = CodexSession::open(socket)?;
                 let thread = session.only_thread()?;
-                session.inject(&thread, text)
+                session.deliver_event(&thread, text)
             }
             Channel::Spool { path } => {
                 if let Some(parent) = path.parent() {
@@ -299,7 +307,7 @@ const CURSOR_HOOK_ARGS: &str = "hook-drain --format cursor";
 /// reads `$OMAR_EVENT_SPOOL`, so one entry serves them all.
 ///
 /// Returns false if the file cannot be written — the caller must then leave
-/// the pane on the input box, because a spool nothing drains is a black hole.
+/// delivery unavailable, because a spool nothing drains is a black hole.
 pub fn install_cursor_hook() -> bool {
     let Some(exe) = std::env::current_exe().ok() else {
         return false;
@@ -426,8 +434,7 @@ fn write_json_atomically(path: &Path, value: &serde_json::Value) -> bool {
 /// The socket is closed immediately, so this reserves nothing — it only picks
 /// a number the OS was willing to hand out. If something else takes it first
 /// opencode cannot bind; observed behaviour is that it keeps running without a
-/// listener, so provisioning times out and the pane falls back to the input
-/// box, but that is the backend's choice rather than a guarantee.
+/// listener, so provisioning times out and launch reports the channel failure.
 pub fn free_port() -> Option<u16> {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .ok()?
@@ -436,53 +443,40 @@ pub fn free_port() -> Option<u16> {
         .map(|addr| addr.port())
 }
 
-/// Give a freshly launched pane a side channel, once its backend is listening.
-///
-/// Runs in the background: opencode takes seconds to boot, and a launch must
-/// not block on it. Until the stamp lands, deliveries fall back to the input
-/// box, so being slow is safe and failing is safe.
-pub fn provision_in_background(backend: Option<&str>, session: String, command: String) {
-    // Gate on the backend, not on the flag: plenty of other things are
-    // launched with a `--port`, and polling one of those for 90 seconds — then
-    // stamping whatever answered as a delivery channel — would be worse than
-    // having no channel at all.
-    let stamped: Box<dyn FnOnce() -> Option<String> + Send> = match backend {
-        Some("opencode") => match opencode_port(&command) {
-            Some(port) => Box::new(move || provision_opencode(port)),
-            None => return,
-        },
-        Some("codex") => match codex_home(&command) {
-            Some(home) => {
-                // Which pane this home belongs to, so a later launch can tell
-                // that it is finished and reclaim the disk.
-                crate::manager::claim_codex_home(&home, &session);
-                Box::new(move || provision_codex(&home))
+/// Establish the channel before handing the pane to a caller that may exit or
+/// exec tmux. In-process background threads cannot survive that handoff.
+pub fn provision_at_launch(backend: Option<&str>, session: &str, command: &str) -> Result<()> {
+    let stamp =
+        match backend {
+            Some("opencode") => match opencode_port(command) {
+                Some(port) => Some(provision_opencode(port).context(
+                    "OpenCode delivery channel did not become ready before launch timeout",
+                )?),
+                None => None,
+            },
+            Some("codex") => {
+                codex_launch_socket(command).map(|socket| format!("codex:{}", socket.display()))
             }
-            None => return,
-        },
-        _ => return,
-    };
-    std::thread::spawn(move || {
-        if let Some(stamp) = stamped() {
-            let _ = crate::tmux::TmuxClient::new("").set_session_delivery(&session, &stamp);
-        }
-    });
+            _ => None,
+        };
+    if let Some(stamp) = stamp {
+        crate::tmux::TmuxClient::new("")
+            .set_session_delivery(session, &stamp)
+            .context("record backend delivery channel")?;
+    }
+    Ok(())
 }
 
-/// `export CODEX_HOME='<dir>'` as it appears in a launch command.
-///
-/// The launch command is where OMAR records which per-pane codex home this
-/// pane was given, the same way `--port` records opencode's port.
-///
-/// The value is read back through the quoting `shell_single_quote` put on it,
-/// rather than split on whitespace: an operator whose home directory has a
-/// space in it is ordinary, and half a path here is worse than none. A path
-/// that does not come back whole yields `None`, so provisioning is skipped and
-/// the pane falls back to the input box.
-pub(crate) fn codex_home(command: &str) -> Option<PathBuf> {
+/// Read the per-pane endpoint without changing or interpreting CODEX_HOME.
+/// Preserve support for already-running legacy launches during the transition.
+pub(crate) fn codex_launch_socket(command: &str) -> Option<PathBuf> {
+    if let Some((_, assignment)) = command.split_once("export OMAR_CODEX_SOCKET=") {
+        let path = unquote_single(assignment)?;
+        return (!path.is_empty()).then(|| PathBuf::from(path));
+    }
     let assignment = command.split_once("export CODEX_HOME=")?.1;
     let dir = unquote_single(assignment)?;
-    (!dir.is_empty()).then(|| PathBuf::from(dir))
+    (!dir.is_empty()).then(|| codex_socket_path(Path::new(&dir)))
 }
 
 /// Undo `shell_single_quote`: read one `'...'` word, in which a literal quote
@@ -509,27 +503,6 @@ fn unquote_single(text: &str) -> Option<String> {
 pub fn codex_socket_path(home: &Path) -> PathBuf {
     home.join("app-server-control")
         .join("app-server-control.sock")
-}
-
-/// Wait for a pane's app-server to come up with the TUI attached to it.
-///
-/// The socket file appears before the server is answering, and the server
-/// answers before the TUI has opened its thread — an empty thread list is the
-/// signal that the pane is not attached yet, so both are waited out here.
-fn provision_codex(home: &Path) -> Option<String> {
-    let socket = codex_socket_path(home);
-    let deadline = std::time::Instant::now() + PROVISION_TIMEOUT;
-    while std::time::Instant::now() < deadline {
-        if socket.exists()
-            && CodexSession::open(&socket)
-                .and_then(|mut session| session.only_thread())
-                .is_ok()
-        {
-            return Some(format!("codex:{}", socket.display()));
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    None
 }
 
 /// A JSON-RPC conversation with a codex app-server.
@@ -633,20 +606,34 @@ impl CodexSession {
     /// The thread the pane is showing, when that is unambiguous.
     fn only_thread(&mut self) -> Result<String> {
         let listed = self.call("thread/loaded/list", serde_json::json!({}))?;
+        if listed
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(ChannelNotReady.into());
+        }
         only_thread(&listed).context("the pane has no single loaded thread to inject into")
     }
 
-    /// Append the event to a thread without starting a turn.
-    fn inject(&mut self, thread: &str, text: &str) -> Result<()> {
+    /// Start an idle thread, or queue tool output on its active turn.
+    ///
+    /// App-server owns the idle/active decision atomically. A separate read
+    /// followed by inject_items/start can strand an event when a turn ends,
+    /// or deliver it twice. Tool output also keeps scheduler messages from
+    /// masquerading as user instructions. No thread settings are overridden.
+    /// Protocol: https://learn.chatgpt.com/docs/app-server#start-a-turn
+    fn deliver_event(&mut self, thread: &str, text: &str) -> Result<()> {
         self.call(
-            "thread/inject_items",
+            "turn/start",
             serde_json::json!({
                 "threadId": thread,
-                "items": [{
-                    "type": "message",
-                    "role": "user",
-                    "content": [{ "type": "input_text", "text": text }],
-                }],
+                "input": [],
+                "toolOutput": {
+                    "name": "omar_event",
+                    "namespace": "omar",
+                    "output": text,
+                },
             }),
         )?;
         Ok(())
@@ -664,8 +651,7 @@ impl CodexSession {
 /// acknowledged, and never read.
 ///
 /// So OMAR only claims a channel it is sure of. More than one loaded thread
-/// means no channel, and delivery goes back through the input box — which
-/// since the draft is protected is a working path, not a failure.
+/// means delivery fails rather than guessing or using the input box.
 fn only_thread(listed: &serde_json::Value) -> Option<String> {
     let threads = listed.get("data")?.as_array()?;
     match threads.as_slice() {
@@ -696,23 +682,21 @@ fn opencode_port(command: &str) -> Option<u16> {
 /// agents share a directory.
 fn provision_opencode(port: u16) -> Option<String> {
     let deadline = std::time::Instant::now() + PROVISION_TIMEOUT;
+    let mut session: Option<String> = None;
     while std::time::Instant::now() < deadline {
-        if let Ok((200, body)) = http_json(port, "POST", "/session", Some("{}")) {
-            let session = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|value| value.get("id")?.as_str().map(str::to_string))?;
-            let select = serde_json::json!({ "sessionID": session }).to_string();
-            // Without this the pane keeps showing a different session and the
-            // user never sees what the agent was told — so a refusal here must
-            // not be stamped as a working channel.
-            match http_json(port, "POST", "/tui/select-session", Some(&select)) {
-                Ok((200, _)) => return Some(format!("opencode:{}:{}", port, session)),
-                _ => return None,
+        if session.is_none() {
+            if let Ok((200, body)) = http_json(port, "POST", "/session", Some("{}")) {
+                session = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| value.get("id")?.as_str().map(str::to_string));
             }
         }
-        // Tight, because this is a race: the pane's first prompt is typed in
-        // once the backend looks ready, and if that lands before the session
-        // swap the first task goes to a session later events do not.
+        if let Some(id) = &session {
+            let select = serde_json::json!({ "sessionID": id }).to_string();
+            if let Ok((200, _)) = http_json(port, "POST", "/tui/select-session", Some(&select)) {
+                return Some(format!("opencode:{}:{}", port, id));
+            }
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
     None
@@ -815,7 +799,7 @@ fn claude_peer(sessions: &Path, pid: u32) -> Option<Channel> {
 /// in the operator's own settings. The socket takes the bytes either way, so
 /// the delivery looks successful while the event sits unread until a human
 /// approves it. A session told neither way — started by an older OMAR, or by
-/// hand — is left to the input box, which is a working path.
+/// hand — has no available channel until configured to accept peer messages.
 fn accepts_peer_messages(pid: u32) -> bool {
     launched_to_accept(pid) || settings_accept(&claude_user_settings())
 }
@@ -883,6 +867,49 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn opencode_wakes_with_synthetic_context_without_a_user_prompt() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "POST /session/session_test/prompt_async HTTP/1.1\r\n");
+            let mut length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["noReply"], false);
+            assert_eq!(body["parts"][0]["synthetic"], true);
+            assert_eq!(body["parts"][0]["text"], "agent event");
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        Channel::OpencodeHttp {
+            port,
+            session: "session_test".into(),
+        }
+        .deliver("agent event")
+        .unwrap();
+        server.join().unwrap();
+    }
 
     #[test]
     fn a_peer_message_is_two_json_frames_and_never_touches_the_composer() {
@@ -1147,7 +1174,7 @@ mod tests {
         );
 
         // An event that has been sitting there far too long means the hook is
-        // not running, so delivery must go back through the input box.
+        // not running, so delivery must report channel unavailability.
         let stale = serde_json::json!({ "at": 1_000, "text": "ancient" });
         std::fs::write(&path, format!("{}\n", stale)).unwrap();
         assert_eq!(
@@ -1247,6 +1274,20 @@ mod tests {
     /// asked, so the framing is checked against a real socket rather than a
     /// string.
     fn fake_app_server(listener: UnixListener, threads: Vec<&'static str>) -> Vec<String> {
+        fake_app_server_reply(
+            listener,
+            threads,
+            serde_json::json!({
+                "result": { "turn": { "id": "new-turn", "status": "inProgress", "items": [], "error": null } }
+            }),
+        )
+    }
+
+    fn fake_app_server_reply(
+        listener: UnixListener,
+        threads: Vec<&'static str>,
+        turn_reply: serde_json::Value,
+    ) -> Vec<String> {
         let (stream, _) = listener.accept().unwrap();
         // `tungstenite::accept` answers the upgrade, so the test exercises the
         // same handshake the app-server does rather than a hand-made reply.
@@ -1262,7 +1303,11 @@ mod tests {
 
         let mut asked = Vec::new();
         loop {
-            let tungstenite::Message::Text(body) = socket.read().unwrap() else {
+            let message = match socket.read() {
+                Ok(message) => message,
+                Err(_) => return asked,
+            };
+            let tungstenite::Message::Text(body) = message else {
                 continue;
             };
             asked.push(body.clone());
@@ -1291,8 +1336,22 @@ mod tests {
                     &request,
                     serde_json::json!({ "data": threads, "nextCursor": null }),
                 ),
-                "thread/inject_items" => {
-                    answer(&mut socket, &request, serde_json::json!({}));
+                "turn/start" => {
+                    // Notifications can interleave with the acknowledgement,
+                    // including completion of a previously active turn.
+                    socket
+                        .send(tungstenite::Message::Text(
+                            serde_json::json!({
+                                "method": "turn/completed", "params": { "threadId": threads[0] }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+                    let mut reply = turn_reply.clone();
+                    reply["id"] = request["id"].clone();
+                    socket
+                        .send(tungstenite::Message::Text(reply.to_string()))
+                        .unwrap();
                     return asked;
                 }
                 _ => {}
@@ -1301,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn an_event_reaches_codex_as_an_injected_item_over_the_app_server_socket() {
+    fn an_event_wakes_codex_with_tool_output_over_the_app_server_socket() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("app-server-control.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -1331,7 +1390,7 @@ mod tests {
                 "initialize",
                 "initialized",
                 "thread/loaded/list",
-                "thread/inject_items"
+                "turn/start"
             ]
         );
 
@@ -1340,11 +1399,81 @@ mod tests {
             inject["params"]["threadId"], "01a02051-f65b-7260-9afe-13ffe5229bf6",
             "the event belongs in the thread the pane is showing"
         );
-        let item = &inject["params"]["items"][0];
-        assert_eq!(item["role"], "user");
-        assert_eq!(item["content"][0]["text"], "CI went red on main");
+        assert_eq!(inject["params"]["input"], serde_json::json!([]));
+        assert_eq!(
+            inject["params"]["toolOutput"],
+            serde_json::json!({
+                "name": "omar_event", "namespace": "omar", "output": "CI went red on main"
+            })
+        );
+        assert_eq!(
+            inject["params"].as_object().unwrap().len(),
+            3,
+            "delivery must not override the thread's model, permissions or effort"
+        );
         // Every request is JSON-RPC; a notification carries no id.
         assert_eq!(asked[1].get("id"), None);
+    }
+
+    #[test]
+    fn an_active_turn_accepts_one_event_without_injection_or_interrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("active.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            fake_app_server_reply(
+                listener,
+                vec!["thread"],
+                serde_json::json!({"result": {"turn": {"id": "already-active", "status": "inProgress", "items": [], "error": null}}}),
+            )
+        });
+        Channel::CodexAppServer { socket }
+            .deliver("event during a tool call")
+            .unwrap();
+        let requests: Vec<serde_json::Value> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        let writes: Vec<_> = requests
+            .iter()
+            .filter(|request| request["params"].get("threadId").is_some())
+            .collect();
+        assert_eq!(
+            writes.len(),
+            1,
+            "start and inject together would duplicate the event"
+        );
+        assert_eq!(writes[0]["method"], "turn/start");
+        assert_eq!(writes[0]["params"]["input"], serde_json::json!([]));
+        assert_eq!(
+            writes[0]["params"]["toolOutput"]["output"],
+            "event during a tool call"
+        );
+    }
+
+    #[test]
+    fn a_rejected_turn_start_is_not_reported_as_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("rejected.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            fake_app_server_reply(
+                listener,
+                vec!["thread"],
+                serde_json::json!({"error": {"code": -32602, "message": "tool output rejected"}}),
+            )
+        });
+        let error = Channel::CodexAppServer { socket }
+            .deliver("event")
+            .unwrap_err();
+        assert!(error.to_string().contains("turn/start failed"));
+        assert_eq!(
+            server.join().unwrap().len(),
+            4,
+            "do not inject after a rejected wake"
+        );
     }
 
     #[test]
@@ -1397,11 +1526,24 @@ mod tests {
     #[test]
     fn a_codex_home_is_read_back_out_of_a_launch_command() {
         assert_eq!(
-            codex_home("export CODEX_HOME='/Users/ke/.omar/codex/ab12'; codex --no-alt-screen"),
-            Some(PathBuf::from("/Users/ke/.omar/codex/ab12"))
+            codex_launch_socket(
+                "export CODEX_HOME='/Users/ke/.omar/codex/ab12'; codex --no-alt-screen"
+            ),
+            Some(codex_socket_path(Path::new("/Users/ke/.omar/codex/ab12")))
         );
-        assert_eq!(codex_home("codex --no-alt-screen"), None);
-        assert_eq!(codex_home("export CODEX_HOME=''; codex"), None);
+        assert_eq!(codex_launch_socket("codex --no-alt-screen"), None);
+        assert_eq!(codex_launch_socket("export CODEX_HOME=''; codex"), None);
+    }
+
+    #[test]
+    fn explicit_codex_socket_wins_over_an_inherited_home() {
+        for path in ["/tmp/my sockets/app.sock", "/tmp/it's mine/app.sock"] {
+            let command = format!(
+                "export CODEX_HOME='/user/home'; export OMAR_CODEX_SOCKET={}; codex",
+                crate::manager::shell_single_quote(path)
+            );
+            assert_eq!(codex_launch_socket(&command), Some(PathBuf::from(path)));
+        }
     }
 
     #[test]
@@ -1420,14 +1562,14 @@ mod tests {
                 crate::manager::shell_single_quote(home)
             );
             assert_eq!(
-                codex_home(&command),
-                Some(PathBuf::from(home)),
+                codex_launch_socket(&command),
+                Some(codex_socket_path(Path::new(home))),
                 "in {command}"
             );
         }
         // A word that never closes is not a path worth guessing at.
         assert_eq!(
-            codex_home("export CODEX_HOME='/Users/ke/unterminated"),
+            codex_launch_socket("export CODEX_HOME='/Users/ke/unterminated"),
             None
         );
     }
@@ -1445,7 +1587,7 @@ mod tests {
         // the newer id, `/resume` moves it back to the older one while the
         // abandoned new thread stays loaded. Guessing wrong is delivered,
         // acknowledged, and never read — so OMAR declines and the event goes
-        // through the input box instead.
+        // pending instead.
         let ambiguous = serde_json::json!({
             "data": ["01a0204b-f2e8-73e3-b95a-09abf7616b22", "01a02051-f65b-7260-9afe-13ffe5229bf6"],
         });
@@ -1458,7 +1600,7 @@ mod tests {
 
     #[test]
     fn an_ambiguous_pane_reports_a_failure_rather_than_injecting_somewhere() {
-        // The caller's cue to fall back is an error. Returning `Ok` after
+        // The caller's cue to retain pending work is an error. Returning `Ok` after
         // injecting into a thread nobody is reading would lose the event with
         // no sign that anything went wrong.
         let dir = tempfile::tempdir().unwrap();
@@ -1483,7 +1625,7 @@ mod tests {
             failure.to_string().contains("no single loaded thread"),
             "unexpected error: {failure}"
         );
-        drop(server);
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 
     #[test]
@@ -1515,19 +1657,20 @@ mod tests {
         // whatever answered as a delivery channel would send events into it.
         // The same goes for an inherited `CODEX_HOME`.
         assert_eq!(opencode_port("tensorboard --port 6006"), Some(6006));
-        assert!(codex_home("export CODEX_HOME='/somewhere'; jupyter lab").is_some());
+        assert!(codex_launch_socket("export CODEX_HOME='/somewhere'; jupyter lab").is_some());
         for backend in [None, Some("claude"), Some("cursor"), Some("agy")] {
             // Nothing is spawned and nothing is stamped: the guard is on the
             // backend, and the flag alone must never be enough.
-            provision_in_background(
+            provision_at_launch(
                 backend,
-                "unused-session".to_string(),
-                "export CODEX_HOME='/somewhere'; tensorboard --port 6006".to_string(),
-            );
+                "unused-session",
+                "export CODEX_HOME='/somewhere'; tensorboard --port 6006",
+            )
+            .unwrap();
         }
         // And a backend that is provisioned still needs its command to say so.
         for backend in [Some("opencode"), Some("codex")] {
-            provision_in_background(backend, "unused-session".to_string(), "bare".to_string());
+            provision_at_launch(backend, "unused-session", "bare").unwrap();
         }
     }
 
@@ -1559,7 +1702,7 @@ mod tests {
 
     #[test]
     fn a_backend_without_a_side_channel_resolves_to_nothing() {
-        // The fallback is the input box, so "no channel" must be an ordinary
+        // "No channel" must be an ordinary
         // answer rather than an error.
         for backend in ["codex", "opencode", "cursor", "agy", "stub"] {
             assert_eq!(Channel::resolve(backend, std::process::id(), None), None);

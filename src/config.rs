@@ -123,10 +123,7 @@ fn default_error_patterns() -> Vec<String> {
 fn detect_agent_command() -> String {
     detect_agent_command_from(&[
         ("claude", "claude --dangerously-skip-permissions"),
-        (
-            "codex",
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
-        ),
+        ("codex", "codex --dangerously-bypass-approvals-and-sandbox"),
         ("cursor", "cursor agent --yolo"),
         ("opencode", "opencode"),
         ("agy", "agy --dangerously-skip-permissions"),
@@ -164,7 +161,7 @@ pub fn backend_of_command(command: &str) -> Option<&'static str> {
 /// Map shorthand agent names to full commands.
 ///
 /// - `"claude"` → `"claude --dangerously-skip-permissions"`
-/// - `"codex"` → `"codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"`
+/// - `"codex"` → `"codex --dangerously-bypass-approvals-and-sandbox"`
 /// - `"cursor"` → `"cursor agent --yolo"`
 /// - `"opencode"` → `"opencode"` (opencode has no permission-skip flag)
 /// - `"agy"` → `"agy --dangerously-skip-permissions"`
@@ -173,9 +170,7 @@ pub fn backend_of_command(command: &str) -> Option<&'static str> {
 pub fn resolve_backend(name: &str) -> Result<String, String> {
     match name {
         "claude" => Ok("claude --dangerously-skip-permissions".to_string()),
-        "codex" => {
-            Ok("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string())
-        }
+        "codex" => Ok("codex --dangerously-bypass-approvals-and-sandbox".to_string()),
         "cursor" => Ok("cursor agent --yolo".to_string()),
         "opencode" => Ok("opencode".to_string()),
         "agy" => Ok("agy --dangerously-skip-permissions".to_string()),
@@ -569,7 +564,7 @@ session_prefix = "omar-agent"
         );
         assert_eq!(
             resolve_backend("codex").unwrap(),
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
+            "codex --dangerously-bypass-approvals-and-sandbox"
         );
         assert_eq!(resolve_backend("cursor").unwrap(), "cursor agent --yolo");
         assert_eq!(resolve_backend("opencode").unwrap(), "opencode");
