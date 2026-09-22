@@ -531,10 +531,10 @@ jobs:
       - name: Verify no hardcoded claude references in runtime paths
         run: |
           # A ratchet, not a compatibility test. Making OMAR multi-backend
-          # removed this command from everywhere but `config.rs`, where it is
-          # the documented fallback; this keeps one from creeping back, because
-          # a runtime path that spells claude out is a path opencode cannot
-          # take.
+          # removed this command from everywhere but the Claude backend's own
+          # file, which is where a backend's default command belongs; this
+          # keeps one from creeping back, because a runtime path that spells
+          # claude out is a path opencode cannot take.
           #
           # Runtime paths only, which is what the name says. A `#[cfg(test)]`
           # module is compiled out of the binary, so a literal there cannot
@@ -548,7 +548,7 @@ jobs:
           # and the whole point of the check.
           MATCHES=$(
             for file in $(grep -rl '"claude --dangerously-skip-permissions"' src/ --include='*.rs'); do
-              [ "$file" = "src/config.rs" ] && continue
+              [ "$file" = "src/backend/claude.rs" ] && continue
               awk -v f="$file" '
                 previous ~ /^#\[cfg\(test\)\]$/ && /^mod / { exit }
                 /"claude --dangerously-skip-permissions"/ { print f ":" NR ":" $0 }
