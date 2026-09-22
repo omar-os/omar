@@ -1741,6 +1741,7 @@ pub(crate) mod tests {
 
     #[test]
     fn launch_lines_are_unchanged() {
+        let _env_lock = global_home_env_lock();
         let dir = short_tempdir();
         for (name, actual) in masked_launch_lines(dir.path()) {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1759,6 +1760,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore]
     fn zz_regenerate_launch_fixtures() {
+        let _env_lock = global_home_env_lock();
         let dir = short_tempdir();
         for (name, line) in masked_launch_lines(dir.path()) {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))

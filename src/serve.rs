@@ -1068,16 +1068,17 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
-    let command = match crate::backend::resolve(&request.backend) {
-        Ok(backend) => backend.default_command().to_string(),
+    let backend = match crate::backend::resolve(&request.backend) {
+        Ok(backend) => backend,
         Err(reason) => return (400, json!({"error": reason})),
     };
-    if !crate::backend::assistant_names().contains(&request.backend.as_str()) {
+    if !crate::backend::ASSISTANT.contains(&backend.kind()) {
         return (
             400,
             json!({"error": format!("'{}' is not an assistant backend", request.backend)}),
         );
     }
+    let command = backend.default_command().to_string();
 
     match relaunch_ea(context, &command) {
         Ok(session) => {
