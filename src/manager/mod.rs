@@ -2712,4 +2712,79 @@ mod tests {
             assert!(prompt.contains("`schedule_omar_event`"));
         }
     }
+
+    /// The launch lines as they are today, one fixture per backend, with the
+    /// paths and ids that vary from run to run masked out. How a line is
+    /// built may change; the line may not.
+    fn masked_launch_lines(dir: &Path) -> Vec<(&'static str, String)> {
+        let _home = EnvVarGuard::set("HOME", dir);
+        let prompts = dir.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        let prompt = prompts.join("agent.md");
+        std::fs::write(&prompt, "You are {{TASK}} for EA {{EA_ID}}.\n").unwrap();
+        let ctx = test_mcp_context(dir);
+        let exe = omar_server_exe().unwrap().display().to_string();
+        let hex32 = regex::Regex::new(r"[0-9a-f]{32}").unwrap();
+        let hex12 = regex::Regex::new(r"codex-runtime/[0-9a-f]{12}").unwrap();
+        let mask = |line: String| {
+            let line = line.replace(&exe, "<EXE>");
+            let line = line.replace(dir.to_str().unwrap(), "<DIR>");
+            let line = hex32.replace_all(&line, "<HEX32>").into_owned();
+            hex12.replace_all(&line, "codex-runtime/<HEX12>").into_owned()
+        };
+        let subs = [("{{TASK}}", "t1"), ("{{EA_ID}}", "0")];
+        let mut lines = Vec::new();
+        for (name, base) in [
+            ("claude", "claude --some-flag"),
+            ("codex", "codex"),
+            ("codex-custom", "codex -c foo=bar"),
+            ("codex-resume", "codex resume abc123"),
+            ("cursor", "cursor agent --yolo"),
+            ("agy", "agy --dangerously-skip-permissions"),
+            ("opencode", "opencode --port 4444"),
+            ("stub", "omar stub-agent"),
+            ("unknown", "custom-agent --x"),
+            ("env-wrapper", "FOO=bar claude"),
+        ] {
+            lines.push((name, mask(build_agent_command(base, &prompt, &subs, &ctx))));
+        }
+        for (name, base) in [
+            ("ea-claude", "claude"),
+            ("ea-codex", "codex"),
+            ("ea-opencode", "opencode --port 4444"),
+            ("ea-cursor", "cursor agent --yolo"),
+        ] {
+            lines.push((name, mask(build_ea_command(base, 7, "Seven", dir, &ctx).0)));
+        }
+        lines
+    }
+
+    #[test]
+    fn launch_lines_are_unchanged() {
+        let dir = short_tempdir();
+        for (name, actual) in masked_launch_lines(dir.path()) {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/launch")
+                .join(format!("{name}.txt"));
+            let expected = std::fs::read_to_string(&path).unwrap_or_default();
+            assert_eq!(
+                actual.trim_end(),
+                expected.trim_end(),
+                "launch line for {name} changed; regenerate {} only if the change is intended",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn zz_regenerate_launch_fixtures() {
+        let dir = short_tempdir();
+        for (name, line) in masked_launch_lines(dir.path()) {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/launch")
+                .join(format!("{name}.txt"));
+            std::fs::write(path, format!("{line}\n")).unwrap();
+        }
+    }
 }
