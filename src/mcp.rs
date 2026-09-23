@@ -1336,7 +1336,8 @@ impl OmarMcpServer {
                 header
             };
             let backend_name2 = backend_name.clone();
-            let managed_protocol = crate::channel::managed_launch_socket(&command).is_some();
+            let managed_protocol =
+                crate::backend::managed::managed_launch_socket(&command).is_some();
             let readiness_markers = crate::backend::by_name(&backend_name)
                 .map(|backend| backend.readiness_markers().to_vec())
                 .unwrap_or_default();
@@ -2767,7 +2768,10 @@ mod tests {
             server
                 .send_input(json!({"name": "worker", "text": "FOLLOWUP_SENTINEL", "enter": enter}))
                 .unwrap();
-            assert_eq!(crate::channel::drain_spool(&spool), ["FOLLOWUP_SENTINEL"]);
+            assert_eq!(
+                crate::backend::spool::drain_spool(&spool),
+                ["FOLLOWUP_SENTINEL"]
+            );
             assert!(!client
                 .capture_pane(&session, 50)
                 .unwrap()

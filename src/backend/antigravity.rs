@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use super::{managed, spool, PaneSetup};
 use super::{Backend, Kind, Launch};
 use crate::ea::EaId;
 use crate::manager::{
@@ -42,6 +43,42 @@ impl Backend for Antigravity {
                     shell_single_quote(&format!("OMAR protocol launch failed: {error:#}"))
                 )
             })
+    }
+
+    /// Antigravity takes no message from outside its protocol. Under the runner
+    /// nothing else is needed; a legacy launch gets its hook installed and a
+    /// spool the hook drains, pointed at by the pane's environment.
+    fn prepare_pane(&self, session: &str, command: &str) -> Result<PaneSetup> {
+        let mut setup = PaneSetup {
+            command: command.to_string(),
+            ..PaneSetup::default()
+        };
+        if managed::managed_launch_socket(command).is_none() && install_antigravity_hook() {
+            spool::reset_spool(session);
+            let path = spool::spool_path(session);
+            // Quoted: a space anywhere in the path would otherwise split the
+            // assignment and take the rest of the launch line with it.
+            setup.command = format!(
+                "OMAR_EVENT_SPOOL={} {}",
+                shell_single_quote(&path.display().to_string()),
+                command
+            );
+            setup.stamp = Some(spool::stamp(&path));
+        }
+        Ok(setup)
+    }
+    /// The hook only runs once the agent is already working, so a queued
+    /// event cannot wake an idle one.
+    fn spool_wakes_idle(&self) -> bool {
+        false
+    }
+    fn hook_reply(&self, events: &[String]) -> Option<String> {
+        Some(if events.is_empty() {
+            "{}".to_string()
+        } else {
+            serde_json::json!({ "injectSteps": [{ "ephemeralMessage": events.join("\n\n") }] })
+                .to_string()
+        })
     }
 }
 
@@ -223,6 +260,48 @@ pub(crate) fn remove_all_omar_antigravity_mcp_configs() -> Result<()> {
     }
     rewrite_antigravity_manifest_without(|name| !name.starts_with("omar-ea-"))
 }
+
+/// Install OMAR's hook so antigravity will collect events before each turn.
+///
+/// Hooks are a map of named hooks that the CLI merges, so OMAR claims one name
+/// and leaves the rest of the file alone. `PreInvocation` runs just before the
+/// model is called, which is the moment queued events are worth handing over.
+///
+/// The file is the shared one under `~/.gemini/config` rather than the
+/// per-workspace `.agents/hooks.json`. Both are read — the workspace one on a
+/// second load, once the folder is resolved and trusted — but a copy per
+/// workspace would leave an untracked file in the operator's repository, and
+/// one shared entry already serves every pane.
+pub(crate) fn install_antigravity_hook() -> bool {
+    let Some(exe) = std::env::current_exe().ok() else {
+        return false;
+    };
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let path = home.join(".gemini").join("config").join("hooks.json");
+
+    let mut config: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|body| serde_json::from_str(&body).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(hooks) = config.as_object_mut() else {
+        return false;
+    };
+
+    hooks.insert(
+        "omar".to_string(),
+        serde_json::json!({
+            "PreInvocation": [{
+                "type": "command",
+                "command": format!("{} hook-drain --format agy", crate::manager::shell_single_quote(&exe.display().to_string())),
+            }]
+        }),
+    );
+
+    spool::write_json_atomically(&path, &config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +373,47 @@ mod tests {
         let imports = manifest["imports"].as_array().unwrap();
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0]["name"], "user-plugin");
+    }
+
+    #[test]
+    fn installing_the_antigravity_hook_claims_one_name_and_leaves_the_rest() {
+        let _guard = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home.path());
+        let path = home
+            .path()
+            .join(".gemini")
+            .join("config")
+            .join("hooks.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"safety-gate":{"enabled":false,"PreToolUse":[{"matcher":"run_command",
+                "hooks":[{"command":"./scripts/safety-check.sh"}]}]}}"#,
+        )
+        .unwrap();
+
+        assert!(install_antigravity_hook());
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        // Their named hook is untouched — the CLI merges names, so ours sits
+        // alongside rather than replacing the file.
+        assert_eq!(config["safety-gate"]["enabled"], false);
+        assert_eq!(
+            config["safety-gate"]["PreToolUse"][0]["matcher"],
+            "run_command"
+        );
+
+        let ours = &config["omar"]["PreInvocation"][0];
+        assert_eq!(ours["type"], "command");
+        assert!(ours["command"].as_str().unwrap().contains("hook-drain"));
+        assert!(ours["command"].as_str().unwrap().contains("--format agy"));
+
+        match previous {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }

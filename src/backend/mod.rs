@@ -7,6 +7,9 @@
 //! entry in [`ALL`].
 
 use std::path::Path;
+use std::time::Duration;
+
+use anyhow::Result;
 
 use crate::manager::McpLaunchContext;
 
@@ -14,8 +17,105 @@ pub(crate) mod antigravity;
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod cursor;
+pub(crate) mod managed;
 pub(crate) mod opencode;
+pub(crate) mod spool;
 pub(crate) mod stub;
+
+/// How long to wait on a socket that has accepted the connection but is not
+/// reading. A timeout reports failure; it never enables terminal-input delivery.
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// A retryable pre-send condition: nothing has been sent, and the caller may
+/// try again once the backend has come up.
+#[derive(Debug)]
+pub struct NotReady(pub &'static str);
+
+impl std::fmt::Display for NotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for NotReady {}
+
+/// A launched session, as delivery needs to see it.
+pub struct Target<'a> {
+    /// The tmux session.
+    pub name: &'a str,
+    /// The pane's own process. The backend may be a child of it.
+    pub pane_pid: u32,
+    /// What launch recorded about how to reach the backend, if anything.
+    pub stamp: Option<&'a str>,
+}
+
+/// Delivery through the transport a stamp names. The transports are shared:
+/// which one a session has is decided at launch, not by its backend.
+fn deliver_stamped(
+    backend: &(impl Backend + ?Sized),
+    target: &Target<'_>,
+    stamp: &str,
+    text: &str,
+) -> Result<()> {
+    use anyhow::Context;
+    if let Some(socket) = managed::from_stamp(stamp) {
+        // A pane that has exited takes its runner with it.
+        if !socket.exists() {
+            return Err(NotReady("the runner socket is gone").into());
+        }
+        return managed::deliver(&socket, text)
+            .with_context(|| delivery_failed(target, "managed backend protocol"));
+    }
+    if let Some(path) = spool::from_stamp(stamp) {
+        // A spool only works if the hook is draining it. If the oldest event
+        // has been waiting too long it plainly is not.
+        if spool::spool_is_stale(&path) {
+            return Err(NotReady("the hook has stopped draining its spool").into());
+        }
+        anyhow::ensure!(
+            backend.spool_wakes_idle(),
+            "{} has a passive legacy hook channel; relaunch it as an OMAR protocol session to enable idle wake",
+            target.name
+        );
+        return spool::append(&path, text).with_context(|| delivery_failed(target, "hook spool"));
+    }
+    if let Some(socket) = codex::from_stamp(stamp) {
+        // A pane that has exited takes its app-server with it.
+        if !socket.exists() {
+            return Err(NotReady("the app-server socket is gone").into());
+        }
+        return match codex::deliver_via_app_server(&socket, text) {
+            Err(error) if error.is::<NotReady>() => Err(error),
+            result => result.with_context(|| delivery_failed(target, "codex app-server")),
+        };
+    }
+    if let Some((port, session)) = opencode::from_stamp(stamp) {
+        return opencode::deliver_over_http(port, &session, text)
+            .with_context(|| delivery_failed(target, "opencode http api"));
+    }
+    backend.discover_and_deliver(target, text)
+}
+
+/// The context every final delivery error carries.
+pub(crate) fn delivery_failed(target: &Target<'_>, via: &str) -> String {
+    format!(
+        "delivery to {} via {via} failed; composer untouched",
+        target.name
+    )
+}
+
+/// What a pane is launched with, beyond the command an operator gave.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PaneSetup {
+    /// The line the pane runs.
+    pub command: String,
+    /// Environment the pane's shell starts with.
+    pub env: Vec<(String, String)>,
+    /// A window style to apply when the operator has not set one.
+    pub window_style: Option<String>,
+    /// A delivery stamp to record before the pane runs.
+    pub stamp: Option<String>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
@@ -73,6 +173,55 @@ pub trait Backend: Send + Sync {
     }
     /// A worker's launch line.
     fn launch_command(&self, launch: &Launch<'_>) -> String;
+    /// Launch-time pane setup: the line as it will run, environment, and a
+    /// stamp to record before the pane exists. The line is unchanged by
+    /// default.
+    fn prepare_pane(&self, _session: &str, command: &str) -> Result<PaneSetup> {
+        Ok(PaneSetup {
+            command: command.to_string(),
+            ..PaneSetup::default()
+        })
+    }
+    /// Once the pane exists: wait for the side channel and say how to reach
+    /// it. By default that is the runner's socket, when the line names one.
+    fn provision(&self, _session: &str, command: &str) -> Result<Option<String>> {
+        Ok(managed::stamp(command))
+    }
+    /// Hand `text` to the agent without touching its composer. `NotReady`
+    /// means nothing was sent and the caller may try again; any other error
+    /// is final, and never authorizes terminal input.
+    ///
+    /// A stamp recorded at launch names the transport, whatever the backend;
+    /// a session launch recorded nothing about is the backend's to find.
+    fn deliver(&self, target: &Target<'_>, text: &str) -> Result<()> {
+        match target.stamp {
+            Some(stamp) => deliver_stamped(self, target, stamp, text),
+            None => self.discover_and_deliver(target, text),
+        }
+    }
+    /// Delivery to a session whose launch recorded no transport: found from
+    /// the process, or not at all.
+    fn discover_and_deliver(&self, _target: &Target<'_>, _text: &str) -> Result<()> {
+        Err(NotReady("no delivery channel").into())
+    }
+    /// Whether an event queued in a hook spool reaches an idle agent. A
+    /// passive hook only runs once the agent is already working.
+    fn spool_wakes_idle(&self) -> bool {
+        true
+    }
+    /// The reply the backend's hook expects, carrying queued events, or
+    /// `None` when the backend runs no hook of OMAR's.
+    fn hook_reply(&self, _events: &[String]) -> Option<String> {
+        None
+    }
+    /// Whether this hook invocation takes context at all.
+    fn hook_takes_context(&self, _input: &serde_json::Value) -> bool {
+        true
+    }
+    /// Whether this hook invocation should consume the spool.
+    fn hook_consumes_spool(&self, _input: &serde_json::Value) -> bool {
+        true
+    }
     /// An executive assistant's launch line, when it differs from a worker's.
     /// `prompt_file` holds the prompt with its placeholders intact and
     /// `prompt` is the same text with them resolved; a backend that takes the
@@ -257,5 +406,88 @@ mod tests {
         );
         assert_eq!(command_name("env FOO=bar /opt/bin/codex"), Some("codex"));
         assert_eq!(command_name("bash -lc 'echo hi'"), None);
+    }
+
+    #[test]
+    fn a_hook_reply_carries_every_queued_event_in_the_backends_own_shape() {
+        let events = vec!["standup in 5".to_string(), "CI went red".to_string()];
+
+        let cursor: serde_json::Value =
+            serde_json::from_str(&of(Kind::Cursor).hook_reply(&events).unwrap()).unwrap();
+        assert_eq!(cursor["additional_context"], "standup in 5\n\nCI went red");
+
+        let agy: serde_json::Value =
+            serde_json::from_str(&of(Kind::Antigravity).hook_reply(&events).unwrap()).unwrap();
+        assert_eq!(
+            agy["injectSteps"][0]["ephemeralMessage"],
+            "standup in 5\n\nCI went red"
+        );
+    }
+
+    #[test]
+    fn an_empty_spool_still_answers_with_valid_json() {
+        // A hook that prints nothing reads as a failure to the backend.
+        for kind in [Kind::Cursor, Kind::Antigravity] {
+            let reply = of(kind).hook_reply(&[]).unwrap();
+            serde_json::from_str::<serde_json::Value>(&reply)
+                .unwrap_or_else(|_| panic!("{kind:?} must render JSON, got {reply:?}"));
+        }
+        // A backend that runs no hook of OMAR's has no reply to give, and a
+        // name that is no backend at all resolves to nothing.
+        assert!(of(Kind::Claude).hook_reply(&[]).is_none());
+        assert!(by_name("nonsense").is_none());
+    }
+
+    #[test]
+    fn provisioning_is_gated_on_the_backend_not_on_the_command() {
+        // Plenty of things are launched with a `--port` — tunnels, notebook
+        // servers, tensorboard. Polling one of those and then stamping
+        // whatever answered as a delivery channel would send events into it.
+        // The same goes for an inherited `CODEX_HOME`.
+        assert_eq!(
+            opencode::opencode_port("tensorboard --port 6006"),
+            Some(6006)
+        );
+        assert!(
+            codex::codex_launch_socket("export CODEX_HOME='/somewhere'; jupyter lab").is_some()
+        );
+        for kind in [Kind::Claude, Kind::Cursor, Kind::Antigravity] {
+            // Nothing is spawned and nothing is stamped: the guard is on the
+            // backend, and the flag alone must never be enough.
+            assert_eq!(
+                of(kind)
+                    .provision(
+                        "unused-session",
+                        "export CODEX_HOME='/somewhere'; tensorboard --port 6006",
+                    )
+                    .unwrap(),
+                None
+            );
+        }
+        // And a backend that is provisioned still needs its command to say so.
+        for kind in [Kind::Opencode, Kind::Codex] {
+            assert_eq!(of(kind).provision("unused-session", "bare").unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn a_backend_without_a_side_channel_resolves_to_nothing() {
+        // "No channel" must be an ordinary
+        // answer rather than an error.
+        let target = Target {
+            name: "pane",
+            pane_pid: std::process::id(),
+            stamp: None,
+        };
+        for kind in [
+            Kind::Codex,
+            Kind::Opencode,
+            Kind::Cursor,
+            Kind::Antigravity,
+            Kind::Stub,
+        ] {
+            let error = of(kind).deliver(&target, "event").unwrap_err();
+            assert!(error.is::<NotReady>(), "{kind:?}: {error}");
+        }
     }
 }

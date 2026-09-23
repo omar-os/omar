@@ -1,7 +1,9 @@
 //! The model-free backend: answers invocations from the topology context.
 
+use super::{spool, PaneSetup};
 use super::{Backend, Kind, Launch};
 use crate::manager::{materialize_mcp_context_file, omar_server_exe, shell_single_quote};
+use anyhow::Result;
 
 pub struct Stub;
 
@@ -35,5 +37,20 @@ impl Backend for Stub {
             ),
             None => format!("{} stub-agent", shell_single_quote(&exe)),
         }
+    }
+
+    /// The stub reads its invocations from a spool, so every pane gets one.
+    fn prepare_pane(&self, session: &str, command: &str) -> Result<PaneSetup> {
+        spool::reset_spool(session);
+        let path = spool::spool_path(session);
+        Ok(PaneSetup {
+            command: format!(
+                "OMAR_EVENT_SPOOL={} {}",
+                shell_single_quote(&path.display().to_string()),
+                command
+            ),
+            stamp: Some(spool::stamp(&path)),
+            ..PaneSetup::default()
+        })
     }
 }

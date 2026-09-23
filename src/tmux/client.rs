@@ -376,27 +376,19 @@ impl TmuxClient {
                 .context("agent backend is not stamped; refusing terminal input")?;
             let pid = self.get_pane_pid(session)?;
             let stamp = self.session_delivery(session);
-            if let Some(channel) = crate::channel::Channel::resolve(&backend, pid, stamp.as_deref())
-            {
-                anyhow::ensure!(
-                    !matches!(channel, crate::channel::Channel::Spool { .. })
-                        || !matches!(backend.as_str(), "cursor" | "agy" | "antigravity"),
-                    "{session} has a passive legacy hook channel; relaunch it as an OMAR protocol session to enable idle wake"
-                );
-                match channel.deliver(text) {
+            if let Some(backend) = crate::backend::by_name(&backend) {
+                let target = crate::backend::Target {
+                    name: session,
+                    pane_pid: pid,
+                    stamp: stamp.as_deref(),
+                };
+                match backend.deliver(&target, text) {
                     Ok(()) => return Ok(()),
-                    Err(error) if error.is::<crate::channel::ChannelNotReady>() => {
-                        // Discovery proved that nothing was sent. Only this
-                        // readiness condition is safe to retry automatically.
+                    Err(error) if error.is::<crate::backend::NotReady>() => {
+                        // Nothing was sent. Only this condition is safe to
+                        // retry automatically.
                     }
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "delivery to {session} via {} failed; composer untouched",
-                                channel.describe()
-                            )
-                        })
-                    }
+                    Err(error) => return Err(error),
                 }
             }
             anyhow::ensure!(
@@ -489,90 +481,35 @@ impl TmuxClient {
             args.extend(["-c", dir]);
         }
 
-        // Every launch passes through here, so this is where a claude pane is
-        // told to take OMAR's events over its peer socket.
-        let command = crate::backend::claude::ensure_claude_inbound_settings(command);
-        let command = command.as_str();
-
-        // cursor-agent takes no message from outside, but it runs hooks that
-        // can hand context to the model. Point this pane at its own spool so
-        // the hook knows whose events to collect.
-        let backend = crate::backend::command_name(command);
-        // Detached panes have no client to answer OSC 10/11 palette queries.
-        // Codex caches that failed probe and suppresses RGB composer effects.
-        // Give its pane the same default palette as our web terminal, while
-        // preserving an operator's explicitly configured window style.
-        let codex_palette = (backend == Some("codex")).then(|| {
-            format!(
-                "set-option -w -t {} window-style 'fg=#d8d5e0,bg=#0b0b0e'",
-                crate::manager::shell_single_quote(name)
-            )
-        });
-        // A long-lived tmux server may retain another launcher's environment.
-        // Select the caller's normal Codex home explicitly, including custom
-        // homes, instead of inheriting a stale per-pane home from that server.
-        let codex_home = (backend == Some("codex"))
-            .then(|| {
-                std::env::var_os("CODEX_HOME")
-                    .filter(|value| !value.is_empty())
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-            })
-            .flatten()
-            .map(|home| {
-                if home.is_absolute() {
-                    Ok(home)
-                } else {
-                    std::env::current_dir().map(|cwd| cwd.join(home))
-                }
-            })
-            .transpose()?
-            .map(|home| format!("CODEX_HOME={}", home.display()));
-        let no_color = std::env::var_os("NO_COLOR")
-            .map(|value| format!("NO_COLOR={}", value.to_string_lossy()));
-        if codex_palette.is_some() {
-            args.extend(["-e", "COLORTERM=truecolor"]);
-            if let Some(value) = &no_color {
-                args.extend(["-e", value]);
-            }
+        // The backend decides what its pane is launched with; this only
+        // hands tmux what it was given.
+        let backend = crate::backend::detect(command);
+        let setup = match backend {
+            Some(backend) => backend.prepare_pane(name, command)?,
+            None => crate::backend::PaneSetup {
+                command: command.to_string(),
+                ..Default::default()
+            },
+        };
+        let env: Vec<String> = setup
+            .env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        for value in &env {
+            args.extend(["-e", value]);
         }
-        if let Some(home) = &codex_home {
-            args.extend(["-e", home]);
-        }
-        let managed = crate::channel::managed_launch_socket(command).is_some();
-        let hooked = !managed
-            && match backend {
-                Some("cursor") => crate::channel::install_cursor_hook(),
-                Some("agy") => crate::channel::install_antigravity_hook(),
-                Some("stub") => true,
-                _ => false,
-            };
-        let spool = hooked.then(|| {
-            crate::channel::reset_spool(name);
-            crate::channel::spool_path(name)
-        });
-
         // Execute the provided command through a shell so the full string is
         // interpreted consistently (including quoted args and shell metacharacters)
         // instead of relying on tmux's shell-command parser heuristics.
-        let command = match &spool {
-            // Quoted: a space anywhere in the path would otherwise split the
-            // assignment and take the rest of the launch line with it.
-            Some(path) => &format!(
-                "OMAR_EVENT_SPOOL={} {}",
-                crate::manager::shell_single_quote(&path.display().to_string()),
-                command
-            ),
-            None => command,
-        };
-        // Codex treats even NO_COLOR="" as opting out. Unset it in the
-        // pane's shell when absent from the caller, rather than copying a
-        // stale server value or substituting an empty string.
-        let color_command = (backend == Some("codex") && no_color.is_none())
-            .then(|| format!("unset NO_COLOR; {command}"));
-        let command = color_command.as_deref().unwrap_or(command);
-        args.extend(["sh", "-lc", command]);
-        if let Some(palette) = &codex_palette {
+        args.extend(["sh", "-lc", &setup.command]);
+        let palette = setup.window_style.as_ref().map(|style| {
+            format!(
+                "set-option -w -t {} window-style '{style}'",
+                crate::manager::shell_single_quote(name)
+            )
+        });
+        if let Some(palette) = &palette {
             // One tmux command queue establishes the palette before the
             // server processes the new pane's terminal-probe output.
             args.extend([
@@ -592,13 +529,18 @@ impl TmuxClient {
         // which cannot be done reliably: `#{pane_current_command}` is `node`
         // for any npm-installed backend, and banner text scrolls away.
         if let Some(backend) = backend {
-            let _ = self.set_session_backend(name, backend);
+            let _ = self.set_session_backend(name, backend.kind().name());
         }
-        if let Some(spool) = &spool {
-            let _ = self.set_session_delivery(name, &format!("spool:{}", spool.display()));
+        if let Some(stamp) = &setup.stamp {
+            let _ = self.set_session_delivery(name, stamp);
         }
         // Finish channel setup before the launcher can return or exec tmux.
-        crate::channel::provision_at_launch(backend, name, command)?;
+        if let Some(backend) = backend {
+            if let Some(stamp) = backend.provision(name, &setup.command)? {
+                self.set_session_delivery(name, &stamp)
+                    .context("record backend delivery channel")?;
+            }
+        }
         Ok(())
     }
 
@@ -624,7 +566,7 @@ impl TmuxClient {
     }
 
     /// Record how events reach this session's backend without the input box.
-    /// See `crate::channel` for the format.
+    /// Each backend defines its own stamp; see `crate::backend`.
     pub fn set_session_delivery(&self, name: &str, stamp: &str) -> Result<()> {
         let target = exact_session_target(name);
         self.run(&[

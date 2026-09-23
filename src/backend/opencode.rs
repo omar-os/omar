@@ -1,11 +1,15 @@
 //! opencode: launched bare on a port, configured through the environment,
 //! and given its prompt as the first message over HTTP.
 
+use super::managed;
 use super::{Backend, Kind, Launch};
 use crate::manager::{
     actor_file, materialize_mcp_context_file, mcp_ea_dir, omar_server_exe, shell_single_quote,
     write_private_file, McpLaunchContext, BACKEND_NATIVE_AGENT_TOOLS, BACKEND_NATIVE_WAKE_TOOLS,
 };
+use anyhow::{Context, Result};
+use std::io::Write;
+use std::time::Duration;
 
 pub struct Opencode;
 
@@ -46,6 +50,21 @@ impl Backend for Opencode {
             None => base_command,
         }
     }
+
+    /// The HTTP server needs a session created and selected in the TUI before
+    /// an event can be addressed to it. Waited for here, so the launcher
+    /// cannot return with a pane nothing can reach.
+    fn provision(&self, _session: &str, command: &str) -> Result<Option<String>> {
+        if let Some(stamp) = managed::stamp(command) {
+            return Ok(Some(stamp));
+        }
+        match opencode_port(command) {
+            Some(port) => Ok(Some(provision_opencode(port).context(
+                "OpenCode delivery channel did not become ready before launch timeout",
+            )?)),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Give opencode a port so OMAR can reach it without the input box.
@@ -61,7 +80,7 @@ pub(crate) fn with_opencode_port(base_command: &str) -> String {
     {
         return base_command.to_string();
     }
-    match crate::channel::free_port() {
+    match free_port() {
         Some(port) => format!("{} --port {}", base_command, port),
         None => base_command.to_string(),
     }
@@ -133,4 +152,220 @@ pub(crate) fn opencode_config_env(context: &McpLaunchContext) -> Option<String> 
         config["plugin"] = serde_json::json!([plugin]);
     }
     Some(config.to_string())
+}
+
+/// Parse a stamp written at launch, e.g. `opencode:47455:ses_abc`.
+pub(crate) fn from_stamp(stamp: &str) -> Option<(u16, String)> {
+    let rest = stamp.strip_prefix("opencode:")?;
+    let (port, session) = rest.split_once(':')?;
+    (!session.is_empty()).then_some((port.parse().ok()?, session.to_string()))
+}
+
+pub(crate) fn deliver_over_http(port: u16, session: &str, text: &str) -> Result<()> {
+    let body = serde_json::json!({
+        "parts": [{ "type": "text", "text": text, "synthetic": true }],
+    })
+    .to_string();
+    let (status, _) = http_json(
+        port,
+        "POST",
+        &format!("/session/{}/prompt_async", session),
+        Some(&body),
+    )
+    .context("post message to opencode")?;
+    if status != 204 {
+        anyhow::bail!("opencode answered {}", status);
+    }
+    Ok(())
+}
+
+/// Loopback HTTP is either immediate or wedged; nothing in between.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to keep waiting for a freshly launched backend to open its port.
+/// opencode takes several seconds to boot; past this it is not coming up.
+const PROVISION_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Claim a free loopback port for a backend that must be told one at launch.
+///
+/// The socket is closed immediately, so this reserves nothing — it only picks
+/// a number the OS was willing to hand out. If something else takes it first
+/// opencode cannot bind; observed behaviour is that it keeps running without a
+/// listener, so provisioning times out and launch reports the channel failure.
+pub(crate) fn free_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .ok()?
+        .local_addr()
+        .ok()
+        .map(|addr| addr.port())
+}
+
+/// `--port N` as it appears in a launch command.
+pub(crate) fn opencode_port(command: &str) -> Option<u16> {
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "--port" {
+            return tokens.next()?.parse().ok();
+        }
+        if let Some(value) = token.strip_prefix("--port=") {
+            return value.parse().ok();
+        }
+    }
+    None
+}
+
+/// Create a session on a running opencode server and point its TUI at it.
+///
+/// opencode's API cannot say which session a given pane is showing, and a pane
+/// only creates one once the user speaks. So OMAR makes the session itself:
+/// the id it gets back is then unambiguously this pane's, even when several
+/// agents share a directory.
+pub(crate) fn provision_opencode(port: u16) -> Option<String> {
+    let deadline = std::time::Instant::now() + PROVISION_TIMEOUT;
+    let mut session: Option<String> = None;
+    while std::time::Instant::now() < deadline {
+        if session.is_none() {
+            if let Ok((200, body)) = http_json(port, "POST", "/session", Some("{}")) {
+                session = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| value.get("id")?.as_str().map(str::to_string));
+            }
+        }
+        if let Some(id) = &session {
+            let select = serde_json::json!({ "sessionID": id }).to_string();
+            if let Ok((200, _)) = http_json(port, "POST", "/tui/select-session", Some(&select)) {
+                return Some(format!("opencode:{}:{}", port, id));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    None
+}
+
+/// POST JSON to opencode's loopback server and return the status code.
+///
+/// Hand-rolled rather than pulling in an HTTP stack: the server is on
+/// 127.0.0.1, the request shape is fixed, and the response is discarded.
+pub(crate) fn http_json(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<(u16, String)> {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connect to 127.0.0.1:{}", port))?;
+    stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
+    stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
+
+    let body = body.unwrap_or("");
+    let request = format!(
+        "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        method,
+        path,
+        port,
+        body.len(),
+        body
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+
+    let mut response = Vec::new();
+    std::io::Read::read_to_end(&mut stream, &mut response)?;
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let (status, body) = split_response(&response).context("parse opencode response")?;
+    Ok((status, body))
+}
+
+/// Split an HTTP/1.x response into its status code and body.
+pub(crate) fn split_response(response: &str) -> Option<(u16, String)> {
+    let status = response.split_whitespace().nth(1)?.parse().ok()?;
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    Some((status, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn opencode_wakes_with_synthetic_context_without_a_user_prompt() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "POST /session/session_test/prompt_async HTTP/1.1\r\n");
+            let mut length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(body.get("noReply").is_none());
+            assert_eq!(body["parts"][0]["synthetic"], true);
+            assert_eq!(body["parts"][0]["text"], "agent event");
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        deliver_over_http(port, "session_test", "agent event").unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_launch_stamp_names_the_port_and_session_to_address() {
+        assert_eq!(
+            from_stamp("opencode:47455:ses_abc"),
+            Some((47455, "ses_abc".to_string()))
+        );
+        // A stamp wins over backend sniffing, so a malformed one must not be
+        // silently treated as a working channel.
+        for bad in [
+            "opencode:47455:",
+            "opencode:notaport:ses_abc",
+            "opencode:47455",
+            "something-else:1:2",
+            "",
+        ] {
+            assert_eq!(from_stamp(bad), None, "stamp {bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn a_port_is_read_back_out_of_a_launch_command() {
+        assert_eq!(opencode_port("opencode --port 47455"), Some(47455));
+        assert_eq!(opencode_port("FOO=1 opencode --port=47455"), Some(47455));
+        assert_eq!(opencode_port("opencode"), None);
+        assert_eq!(opencode_port("opencode --port bogus"), None);
+    }
+
+    #[test]
+    fn an_http_response_yields_its_status_and_body() {
+        assert_eq!(
+            split_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"),
+            Some((200, "{}".to_string()))
+        );
+        assert_eq!(
+            split_response("HTTP/1.1 404 Not Found\r\n\r\n").map(|(status, _)| status),
+            Some(404)
+        );
+    }
 }

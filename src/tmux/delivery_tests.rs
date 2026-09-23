@@ -61,7 +61,10 @@ fn agent_delivery_uses_channel_without_reading_or_editing_composer() {
     TmuxClient::new("")
         .deliver_prompt("pane", "agent follow-up", &options())
         .unwrap();
-    assert_eq!(crate::channel::drain_spool(&spool), ["agent follow-up"]);
+    assert_eq!(
+        crate::backend::spool::drain_spool(&spool),
+        ["agent follow-up"]
+    );
     pane.assert_untouched();
 }
 #[test]
@@ -119,7 +122,7 @@ fn scheduler_delivers_through_channel_without_editing_input() {
         "omar-",
         &crate::scheduler::TickerBuffer::new()
     ));
-    assert_eq!(crate::channel::drain_spool(&spool), ["event"]);
+    assert_eq!(crate::backend::spool::drain_spool(&spool), ["event"]);
     pane.assert_untouched();
 }
 
@@ -248,7 +251,7 @@ fn passive_legacy_hooks_do_not_claim_to_wake_an_idle_agent() {
             .deliver_prompt("pane", "wake", &options())
             .unwrap_err();
         assert!(error.to_string().contains("relaunch"));
-        assert!(crate::channel::drain_spool(&spool).is_empty());
+        assert!(crate::backend::spool::drain_spool(&spool).is_empty());
         pane.assert_untouched();
     }
 }

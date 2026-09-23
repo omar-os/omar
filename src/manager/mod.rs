@@ -965,7 +965,7 @@ fn spawn_worker(
     // Wait for backend readiness when possible, then deliver an explicit
     // first task message so workers begin execution deterministically.
     // Channel delivery independently checks that the backend endpoint exists.
-    let _markers_proved_ready = if crate::channel::managed_launch_socket(&cmd).is_some() {
+    let _markers_proved_ready = if crate::backend::managed::managed_launch_socket(&cmd).is_some() {
         false
     } else if let Some(backend) = crate::backend::detect(command) {
         let markers = backend.readiness_markers();
@@ -1254,10 +1254,10 @@ pub(crate) mod tests {
         assert!(first.contains("--remote 'unix://"));
         assert!(first.contains("mcp_servers.omar.command"));
         assert!(first.contains("features.scheduled_tasks=false"));
-        let socket = crate::channel::codex_launch_socket(&first).unwrap();
+        let socket = crate::backend::codex::codex_launch_socket(&first).unwrap();
         assert_ne!(
             Some(socket.clone()),
-            crate::channel::codex_launch_socket(&second)
+            crate::backend::codex::codex_launch_socket(&second)
         );
         let instructions =
             std::fs::read_to_string(socket.parent().unwrap().join("instructions.json")).unwrap();
@@ -1273,7 +1273,7 @@ pub(crate) mod tests {
                 &[],
                 &context,
             );
-            assert!(crate::channel::codex_launch_socket(&cmd).is_some());
+            assert!(crate::backend::codex::codex_launch_socket(&cmd).is_some());
             assert!(cmd.contains(&format!("model_reasoning_effort=\"{effort}\"")));
             assert!(!cmd.contains("CODEX_HOME="));
         }
@@ -1304,7 +1304,7 @@ pub(crate) mod tests {
             let cmd = build_agent_command(base, &prompt, &[], &test_mcp_context(dir.path()));
             let config = managed_config(&cmd);
             assert_eq!(config.backend, "codex");
-            assert!(crate::channel::managed_launch_socket(&cmd).is_some());
+            assert!(crate::backend::managed::managed_launch_socket(&cmd).is_some());
             assert!(config.command.contains("exec --skip-git-repo-check"));
             assert!(config.command.contains("mcp_servers.omar.command"));
             assert!(!cmd.contains("CODEX_HOME="));
@@ -1317,7 +1317,7 @@ pub(crate) mod tests {
         ] {
             let cmd = build_agent_command(base, &prompt, &[], &test_mcp_context(dir.path()));
             assert!(
-                crate::channel::codex_launch_socket(&cmd).is_some(),
+                crate::backend::codex::codex_launch_socket(&cmd).is_some(),
                 "{base} should still get a home: {cmd}"
             );
         }
@@ -1341,7 +1341,8 @@ pub(crate) mod tests {
         // (`-C`), not the launch cwd, so a workspace-dir launch would either
         // load the wrong `AGENTS.md` or force the manager to operate outside
         // the user's project.
-        let socket = crate::channel::codex_launch_socket(&cmd).expect("command names its socket");
+        let socket =
+            crate::backend::codex::codex_launch_socket(&cmd).expect("command names its socket");
         let instructions =
             std::fs::read_to_string(socket.parent().unwrap().join("instructions.json")).unwrap();
         assert!(cmd.contains("mcp-server"));
@@ -1366,7 +1367,7 @@ pub(crate) mod tests {
         let config = managed_config(&cmd);
         assert_eq!(config.backend, "cursor");
         assert_eq!(config.command, "cursor agent --yolo");
-        assert!(crate::channel::managed_launch_socket(&cmd).is_some());
+        assert!(crate::backend::managed::managed_launch_socket(&cmd).is_some());
     }
 
     #[test]
@@ -1383,7 +1384,7 @@ pub(crate) mod tests {
         let config = managed_config(&cmd);
         assert_eq!(config.backend, "agy");
         assert_eq!(config.command, "agy --dangerously-skip-permissions");
-        assert!(crate::channel::managed_launch_socket(&cmd).is_some());
+        assert!(crate::backend::managed::managed_launch_socket(&cmd).is_some());
         let plugin = dir
             .path()
             .join(".gemini/config/plugins/omar-ea-0/plugin.json");
