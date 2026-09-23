@@ -190,7 +190,7 @@ jobs:
         run: shellcheck tests/ci/pi_binary_tree.sh
 
       - name: Test Pi bridge with pinned real Pi
-        run: node --test bridges/pi/test/*.test.mjs
+        run: node --test src/backend/pi/test/*.test.mjs
 
       - name: Build omar
         run: cargo build --bin omar

@@ -16,7 +16,7 @@ changing the compatibility declaration.
 Install the checkout for local development:
 
 ```sh
-npx --yes --package=@earendil-works/pi-coding-agent@0.85.1 -- pi install ./bridges/pi
+npx --yes --package=@earendil-works/pi-coding-agent@0.85.1 -- pi install ./src/backend/pi
 ```
 
 The extension starts one session-scoped `omar mcp-server` child on
@@ -40,13 +40,13 @@ extension.
 Run the Node unit tests and pinned Pi RPC smoke test with:
 
 ```sh
-npm --prefix bridges/pi test
+npm --prefix src/backend/pi test
 ```
 
 The RPC test uses `npx` to obtain the pinned host unless `PI_BINARY` points to a
 Pi 0.85.1 executable. First use may require network access.
 
-OMAR's registry implementation lives in `src/backend/pi.rs`. Launched panes use
+The Rust half is `src/backend/pi.rs`, beside this directory. Launched panes use
 `OMAR_PI_SOCKET`, a private per-launch Unix socket published after successful
 tool discovery. Delivery uses `sendMessage` with `triggerTurn` and `followUp`,
 so an idle Pi wakes and a busy Pi queues the event without touching the composer.

@@ -84,12 +84,12 @@ fn launch_command(launch: &Launch<'_>) -> Result<String> {
         .context("Pi extension directory")?
         .join("pi-extension");
     for (name, body) in [
-        ("index.js", include_str!("../../bridges/pi/index.js")),
-        ("omar-mcp.js", include_str!("../../bridges/pi/omar-mcp.js")),
-        ("delivery.js", include_str!("../../bridges/pi/delivery.js")),
+        ("index.js", include_str!("pi/index.js")),
+        ("omar-mcp.js", include_str!("pi/omar-mcp.js")),
+        ("delivery.js", include_str!("pi/delivery.js")),
         (
             "package.json",
-            include_str!("../../bridges/pi/package.json"),
+            include_str!("pi/package.json"),
         ),
     ] {
         write_private_file(&dir.join(name), body.as_bytes())?;

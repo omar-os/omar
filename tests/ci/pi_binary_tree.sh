@@ -62,7 +62,7 @@ from pathlib import Path
 settings = {
     "defaultProvider": "omar-pi-e2e",
     "defaultModel": "tree",
-    "extensions": [str(Path(sys.argv[2]) / "bridges/pi/test/fixtures/deterministic-provider.mjs")],
+    "extensions": [str(Path(sys.argv[2]) / "src/backend/pi/test/fixtures/deterministic-provider.mjs")],
 }
 Path(sys.argv[1]).write_text(json.dumps(settings), encoding="utf-8")
 PYSETTINGS
@@ -124,7 +124,7 @@ prompt="You are the root of a binary-tree integration test. You MUST call the to
 # Drive Pi through its documented JSONL RPC protocol and retain every event so
 # the assertions prove real Pi invoked the dynamically registered tools.
 set +e
-PI_PROMPT="$prompt" PI_PROJECT_ID="$project_id" PI_ROOT_LOG="$root_log" PI_EXTENSION="$REPO_ROOT/bridges/pi/index.js" python3 - <<'PY'
+PI_PROMPT="$prompt" PI_PROJECT_ID="$project_id" PI_ROOT_LOG="$root_log" PI_EXTENSION="$REPO_ROOT/src/backend/pi/index.js" python3 - <<'PY'
 import json, os, queue, re, signal, socket, subprocess, sys, threading, time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

@@ -66,7 +66,7 @@ def main():
 
         plugin = root / 'plugin.mjs'
         plugin.write_text(f'const exe={json.dumps(str(BIN))};\nconst contextFile={json.dumps(str(context))};\n' +
-                          (REPO / 'src/backend_hooks/opencode.mjs').read_text())
+                          (REPO / 'src/backend/opencode/plugin.mjs').read_text())
         harness = root / 'check.mjs'
         harness.write_text('''
 import { OmarCoordination } from './plugin.mjs';
