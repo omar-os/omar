@@ -92,12 +92,7 @@ impl Backend for Codex {
     /// long-lived tmux server may retain another launcher's environment:
     /// select the caller's normal Codex home explicitly.
     fn prepare_pane(&self, _session: &str, command: &str) -> Result<PaneSetup> {
-        let mut env = vec![("COLORTERM".to_string(), "truecolor".to_string())];
-        let no_color =
-            std::env::var_os("NO_COLOR").map(|value| value.to_string_lossy().into_owned());
-        if let Some(value) = &no_color {
-            env.push(("NO_COLOR".to_string(), value.clone()));
-        }
+        let mut setup = PaneSetup::interactive(command);
         let home = std::env::var_os("CODEX_HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -111,23 +106,14 @@ impl Backend for Codex {
             })
             .transpose()?;
         if let Some(home) = home {
-            env.push(("CODEX_HOME".to_string(), home.display().to_string()));
+            setup
+                .env
+                .push(("CODEX_HOME".to_string(), home.display().to_string()));
         }
-        // Codex treats even NO_COLOR="" as opting out. Unset it in the
-        // pane's shell when absent from the caller, rather than copying a
-        // stale server value or substituting an empty string.
-        let command = if no_color.is_none() {
-            format!("unset NO_COLOR; {command}")
-        } else {
-            command.to_string()
-        };
-        Ok(PaneSetup {
-            command,
-            env,
-            window_style: Some("fg=#d8d5e0,bg=#0b0b0e".to_string()),
-            stamp: None,
-        })
+        setup.window_style = Some("fg=#d8d5e0,bg=#0b0b0e".to_string());
+        Ok(setup)
     }
+
     fn provision(&self, _session: &str, command: &str) -> Result<Option<String>> {
         if let Some(stamp) = managed::stamp(command) {
             return Ok(Some(stamp));

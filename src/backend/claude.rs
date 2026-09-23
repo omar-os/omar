@@ -125,10 +125,9 @@ impl Backend for Claude {
     /// Every launch passes through here, so this is where a claude pane is
     /// told to take OMAR's events over its peer socket.
     fn prepare_pane(&self, _session: &str, command: &str) -> Result<PaneSetup> {
-        Ok(PaneSetup {
-            command: ensure_claude_inbound_settings(command),
-            ..PaneSetup::default()
-        })
+        Ok(PaneSetup::interactive(&ensure_claude_inbound_settings(
+            command,
+        )))
     }
     /// The peer socket is found from the process, not from a stamp: a pane
     /// whose backend has restarted has a new registry entry.

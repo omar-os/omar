@@ -128,6 +128,30 @@ pub struct PaneSetup {
     pub stamp: Option<String>,
 }
 
+impl PaneSetup {
+    /// These backends draw a TUI in a real tmux pane, even when their launcher
+    /// has no terminal. Advertise RGB and take NO_COLOR from this launch, not
+    /// from the environment a long-lived tmux server happened to inherit.
+    pub(crate) fn interactive(command: &str) -> Self {
+        let mut env = vec![("COLORTERM".into(), "truecolor".into())];
+        let no_color = std::env::var_os("NO_COLOR");
+        if let Some(value) = &no_color {
+            env.push(("NO_COLOR".into(), value.to_string_lossy().into_owned()));
+        }
+        Self {
+            // An empty value is still an opt-out for some backends. Unset a
+            // stale server value only when the caller did not supply one.
+            command: if no_color.is_none() {
+                format!("unset NO_COLOR; {command}")
+            } else {
+                command.into()
+            },
+            env,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
     Antigravity,
@@ -375,6 +399,49 @@ pub fn command_name(command: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_backends_take_color_preferences_from_the_launcher_not_tmux() {
+        let _lock = crate::test_env_lock();
+        let original = std::env::var_os("NO_COLOR");
+        // All three cases matter: no override, explicit opt-out, and an empty
+        // value (which some backends also treat as an opt-out).
+        for caller in [None, Some("1"), Some("")] {
+            match caller {
+                Some(value) => std::env::set_var("NO_COLOR", value),
+                None => std::env::remove_var("NO_COLOR"),
+            }
+            let setups: Vec<_> = [Kind::Claude, Kind::Codex]
+                .map(|kind| {
+                    of(kind).prepare_pane(
+                        "unused",
+                        r#"printf '%s|%s' "$COLORTERM" "${NO_COLOR-unset}""#,
+                    )
+                })
+                .into_iter()
+                .collect();
+            // Restore before asserting, including on a failed setup.
+            match &original {
+                Some(value) => std::env::set_var("NO_COLOR", value),
+                None => std::env::remove_var("NO_COLOR"),
+            }
+            for setup in setups {
+                let setup = setup.unwrap();
+                let output = std::process::Command::new("sh")
+                    .args(["-c", &setup.command])
+                    .env("NO_COLOR", "stale-server-value")
+                    .env("COLORTERM", "")
+                    .envs(setup.env)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert_eq!(
+                    String::from_utf8(output.stdout).unwrap(),
+                    format!("truecolor|{}", caller.unwrap_or("unset"))
+                );
+            }
+        }
+    }
 
     #[test]
     fn native_resume_is_scoped_to_chat_and_backend_and_preserves_worker_launches() {
