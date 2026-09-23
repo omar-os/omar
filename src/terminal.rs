@@ -217,6 +217,19 @@ impl Attachment {
                 command.args(["-L", &server]);
             }
         }
+        // tmux before 3.6 does not infer RGB support from COLORTERM. Declare
+        // it for this client, without changing the user's server options.
+        // Probe without connecting to a server: tmux 3.0/3.1 lack -T and must
+        // still be able to attach using their indexed-color fallback.
+        static SUPPORTS_FEATURE_FLAG: OnceLock<bool> = OnceLock::new();
+        if *SUPPORTS_FEATURE_FLAG.get_or_init(|| {
+            tmux_command()
+                .args(["-T", "RGB", "-V"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }) {
+            command.args(["-T", "RGB"]);
+        }
         command.args(["attach-session", "-t", target]);
         // A nested tmux would refuse to attach.
         command.env_remove("TMUX");
@@ -226,6 +239,9 @@ impl Attachment {
         // agent that never draws. The far end is xterm.js, so this is not a
         // guess about the environment: it is what the viewer actually is.
         command.env("TERM", "xterm-256color");
+        // The browser supports RGB. Without this, tmux may downgrade the
+        // agent's truecolor sequences to its client's indexed palette.
+        command.env("COLORTERM", "truecolor");
 
         // Acquire handles before spawning: a later failure must not leak an
         // attached client without a Drop owner.
@@ -534,6 +550,36 @@ mod tests {
             settles(session, |size| *size == before),
             before,
             "detaching must leave the window as it was"
+        );
+    }
+
+    #[test]
+    fn the_web_attachment_preserves_truecolor_escape_sequences() {
+        if !tmux_available() {
+            return;
+        }
+        let session = "omar-terminal-rgb";
+        let _guard = test_session(session, None);
+        tmux_text(&[
+            "respawn-pane",
+            "-k",
+            "-t",
+            &exact_target(session),
+            r"printf '\033[38;2;17;83;149mOMAR_RGB\033[0m\n'; sleep 30",
+        ])
+        .unwrap();
+        let attachment = Attachment::open_session(session).unwrap();
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !seen.contains("OMAR_RGB") && std::time::Instant::now() < deadline {
+            if let Some(chunk) = attachment.read(std::time::Duration::from_millis(100)) {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        }
+        assert!(seen.contains("OMAR_RGB"), "terminal did not draw: {seen:?}");
+        assert!(
+            seen.contains("38;2;17;83;149m"),
+            "RGB was lost or reduced to indexed color: {seen:?}"
         );
     }
 

@@ -74,8 +74,8 @@ Each chat owns an independent EA workspace using the runtime's multi-EA support.
 **Recent chats** lists saved conversations with **Thinking** and **Running**
 indicators. Switch chats while an assistant replies or a topology runs; returning
 to a chat reconnects its conversation, live diagram, terminals and pending port
-panel. Browser tabs select chats independently. Switching never restarts an EA
-or deploys a proposal.
+panel. Browser tabs select chats independently. Switching reconnects a live EA or resumes its saved backend session; it never
+deploys a proposal.
 
 Messages, selections, proposals and each chat's EA ID are saved atomically in
 `~/.omar/ea/<starting-ea-id>/chats.json` under the configured state directory.
@@ -84,11 +84,27 @@ when opened. These EAs also appear in the native EA registry. Each workspace has
 its own sessions, callbacks, runs and panels; identical topology names can run
 in different chats simultaneously.
 
-Reloading the browser reconnects to live work. Restarting the daemon retains
-transcripts and EA assignments, but does not recover live run execution or
-provider-internal sessions. On the next message, a fresh assistant receives the
-saved conversation. Unsent drafts, manual source edits and terminal scrollback
-are not archived. Reopened proposals still require deployment confirmation.
+Reloading the browser reconnects to live work. The deploy confirmation opens a
+modal explaining that a running topology keeps the runtime and assistants alive
+after every Mission Control window closes. Reopening the same URL reconnects to
+the live run and saved chat. `omar serve --ui` also reuses an existing runtime.
+
+With no active topologies (including starting or stopping runs) and no connected
+Mission Control windows, a 10-second grace period precedes shutdown of the owned
+EA processes, their child processes, and the runtime. Reconnecting during the
+grace period cancels shutdown. When a background run finishes, the grace period
+starts then. API-only daemons that have never had a chat stream stay running.
+
+After idle shutdown, launch `omar serve --ui` again to start the runtime and
+restore the highlighted chat. Its native backend session is resumed when an ID
+is available: Claude and Codex use native resume, Cursor loads its ACP session,
+Antigravity restores its conversation, and OpenCode reselects its saved session.
+IDs and the selected backend are scoped to each chat's EA, never the provider's
+global "last" conversation. OMAR's durable transcript remains available as
+context when native history is unavailable. Restarting the runtime does not
+recover topology execution; running topologies prevent automatic shutdown.
+Unsent drafts, manual source edits and terminal scrollback are not archived.
+Reopened proposals still require deployment confirmation.
 
 The catalog routes remain `/v1/chats` and `/v1/chats/<id>/activate`. Activation
 only remembers a default selection. Clients pin a workspace by prefixing its

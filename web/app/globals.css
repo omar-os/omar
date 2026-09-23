@@ -2202,3 +2202,22 @@ h2 {
 @media (max-width: 900px) {
   .builder-panel { padding-top: 56px; }
 }
+
+
+.deploy-confirmation {
+  margin: auto;
+  inset: 0;
+  width: min(520px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px);
+  overflow: auto;
+  padding: 28px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 24px 80px #0006;
+}
+.deploy-confirmation::backdrop { background: #080b12aa; }
+.deploy-confirmation h2 { margin: 12px 0 20px; font-size: 22px; }
+.deploy-confirmation p { margin: 12px 0; line-height: 1.6; font-size: 14px; }
+.deploy-confirmation-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px; }

@@ -28,6 +28,10 @@ impl Backend for Codex {
     fn default_command(&self) -> &'static str {
         "codex --dangerously-bypass-approvals-and-sandbox"
     }
+    fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
+        let socket = from_stamp(target.stamp?)?;
+        CodexSession::open(&socket).ok()?.only_thread().ok()
+    }
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["OpenAI Codex"]
     }
@@ -39,7 +43,9 @@ impl Backend for Codex {
     /// to explicitly; custom flags that the TUI refuses to attach with use a
     /// native exec runner instead, preserving Codex config layers.
     fn launch_command(&self, launch: &Launch<'_>) -> String {
-        let base_command = launch.base_command;
+        let resumed = super::saved_conversation(launch.context, "codex")
+            .map(|id| resume_command(launch.base_command, &id));
+        let base_command = resumed.as_deref().unwrap_or(launch.base_command);
         let mcp_context = launch.context;
         let instructions = std::fs::read_to_string(launch.prompt_file).map(|body| {
             launch
@@ -64,7 +70,7 @@ impl Backend for Codex {
         }
         let rendered = materialize_prompt_file(launch.prompt_file, launch.substitutions);
         let protocol = (|| -> Result<String> {
-            let (mut command, initial_session) = codex_exec_command(base_command)?;
+            let (mut command, initial_session) = codex_exec_command(launch.base_command)?;
             let overrides =
                 codex_mcp_overrides(mcp_context).context("cannot configure Codex MCP")?;
             command.push(' ');
@@ -86,12 +92,7 @@ impl Backend for Codex {
     /// long-lived tmux server may retain another launcher's environment:
     /// select the caller's normal Codex home explicitly.
     fn prepare_pane(&self, _session: &str, command: &str) -> Result<PaneSetup> {
-        let mut env = vec![("COLORTERM".to_string(), "truecolor".to_string())];
-        let no_color =
-            std::env::var_os("NO_COLOR").map(|value| value.to_string_lossy().into_owned());
-        if let Some(value) = &no_color {
-            env.push(("NO_COLOR".to_string(), value.clone()));
-        }
+        let mut setup = PaneSetup::interactive(command);
         let home = std::env::var_os("CODEX_HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -105,29 +106,40 @@ impl Backend for Codex {
             })
             .transpose()?;
         if let Some(home) = home {
-            env.push(("CODEX_HOME".to_string(), home.display().to_string()));
+            setup
+                .env
+                .push(("CODEX_HOME".to_string(), home.display().to_string()));
         }
-        // Codex treats even NO_COLOR="" as opting out. Unset it in the
-        // pane's shell when absent from the caller, rather than copying a
-        // stale server value or substituting an empty string.
-        let command = if no_color.is_none() {
-            format!("unset NO_COLOR; {command}")
-        } else {
-            command.to_string()
-        };
-        Ok(PaneSetup {
-            command,
-            env,
-            window_style: Some("fg=#d8d5e0,bg=#0b0b0e".to_string()),
-            stamp: None,
-        })
+        setup.window_style = Some("fg=#d8d5e0,bg=#0b0b0e".to_string());
+        Ok(setup)
     }
+
     fn provision(&self, _session: &str, command: &str) -> Result<Option<String>> {
         if let Some(stamp) = managed::stamp(command) {
             return Ok(Some(stamp));
         }
         Ok(codex_launch_socket(command).map(|socket| format!("codex:{}", socket.display())))
     }
+}
+
+fn resume_command(command: &str, id: &str) -> String {
+    let words = shlex::split(command).unwrap_or_default();
+    let mut resumed = Vec::new();
+    for word in words {
+        if word == "--dangerously-bypass-approvals-and-sandbox" {
+            continue;
+        }
+        resumed.push(
+            shlex::try_quote(&word)
+                .expect("command contains no NUL")
+                .into_owned(),
+        );
+        if detect_token(&word).is_some_and(|b| b.kind() == Kind::Codex) {
+            resumed.push("resume".into());
+            resumed.push(shell_single_quote(id));
+        }
+    }
+    resumed.join(" ")
 }
 
 pub(crate) fn ensure_codex_runtime_flags(base_command: &str) -> String {
@@ -333,6 +345,28 @@ pub(crate) fn codex_server_command(
         })
         .unwrap_or_default();
     let endpoint = shell_single_quote(&format!("unix://{}", socket.display()));
+    let mut tui = format!("{tui_command} --remote {endpoint}");
+    if let Some(words) =
+        super::saved_conversation(context, "codex").and_then(|_| shlex::split(tui_command))
+    {
+        if let Some(index) = words.iter().position(|word| word == "resume") {
+            let fresh = words
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != index && *i != index + 1)
+                .map(|(_, word)| {
+                    shlex::try_quote(word)
+                        .expect("command contains no NUL")
+                        .into_owned()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            tui.push_str(&format!(
+                " || {} --remote {endpoint}",
+                ensure_codex_runtime_flags(&fresh)
+            ));
+        }
+    }
     Some(format!(
         "export OMAR_CODEX_SOCKET={socket}; \
          {server_command} app-server --listen {endpoint} {overrides}{effort} \
@@ -343,7 +377,7 @@ pub(crate) fn codex_server_command(
          do sleep 0.2; omar_waited=$((omar_waited+1)); done; \
          if [ ! -S \"$OMAR_CODEX_SOCKET\" ]; then \
          cat {log} >&2; kill \"$omar_srv\" 2>/dev/null; exit 1; fi; \
-         {tui_command} --remote {endpoint}",
+         {tui}",
         socket = shell_single_quote(&socket.display().to_string()),
         prompt_file = shell_single_quote(&prompt_file.display().to_string()),
         log = shell_single_quote(&runtime.join("server.log").display().to_string()),

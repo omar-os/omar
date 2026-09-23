@@ -58,6 +58,22 @@ async function useFakeServe(page: import("@playwright/test").Page) {
   await expect(page.locator(".daemon")).toContainText(FAKE_SERVE_URL);
 }
 
+test("deployment confirmation is a modal with lifecycle guidance and keyboard cancellation", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const deployButton = page.getByRole("button", { name: "Deploy", exact: true });
+  await deployButton.click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("closing Mission Control keeps the topology, assistant, and runtime running");
+  await expect(dialog).toContainText("Reopen Mission Control to reconnect");
+  await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(deployButton).toBeFocused();
+  await expect(page.locator(".connection")).toContainText("review");
+});
+
 test("prompt to finished run, gated on an explicit confirmation", async ({ page }) => {
   await useFakeServe(page);
   const phase = page.locator(".connection");

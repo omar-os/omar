@@ -241,6 +241,7 @@ async fn codex_turn(
                     .as_str()
                     .context("Codex omitted thread_id")?;
                 let mut state = queue.state.lock().await;
+                crate::backend::remember_conversation(context, "codex", session)?;
                 state.session = Some(session.into());
                 save(&queue.path, &state)?;
             }
@@ -343,10 +344,20 @@ pub async fn run(path: &Path) -> Result<()> {
             engine.rpc("authenticate", json!({"methodId":"cursor_login"})).await?;
             let previous = queue.state.lock().await.session.clone();
             let mut params = json!({"cwd":std::env::current_dir()?,"mcpServers":[{"name":"omar","command":std::env::current_exe()?,"args":["mcp-server","--context-file",config.context_file],"env":[]}]});
-            let method = if let Some(session) = previous { params["sessionId"] = session.into(); "session/load" } else { "session/new" };
-            let result = engine.rpc(method, params.clone()).await?;
+            let mut method = if let Some(session) = previous { params["sessionId"] = session.into(); "session/load" } else { "session/new" };
+            let result = match engine.rpc(method, params.clone()).await {
+                Ok(result) => result,
+                Err(error) if method == "session/load" => {
+                    eprintln!("Could not resume Cursor session: {error:#}; restoring saved chat context.");
+                    method = "session/new";
+                    params.as_object_mut().unwrap().remove("sessionId");
+                    engine.rpc(method, params.clone()).await?
+                }
+                Err(error) => return Err(error),
+            };
             let session = if method == "session/load" { params["sessionId"].as_str() } else { result["sessionId"].as_str() }.context("ACP omitted sessionId")?;
             let mut state = queue.state.lock().await;
+            crate::backend::remember_conversation(&context, "cursor", session)?;
             state.session = Some(session.to_owned());
             save(&queue.path, &state)?;
             Ok::<_, anyhow::Error>(())
@@ -407,6 +418,7 @@ pub async fn run(path: &Path) -> Result<()> {
                     if event["event"] == "init" {
                         if let Some(session) = event["conversation_id"].as_str() {
                             let mut state = queue.state.lock().await;
+                            crate::backend::remember_conversation(&context, "agy", session)?;
                             state.session = Some(session.to_owned()); save(&queue.path, &state)?;
                         }
                     }

@@ -27,6 +27,9 @@ impl Backend for Opencode {
         // opencode has no permission-skip flag.
         "opencode"
     }
+    fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
+        from_stamp(target.stamp?).map(|(_, session)| session)
+    }
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["tab agents", "ctrl+p commands"]
     }
@@ -40,7 +43,14 @@ impl Backend for Opencode {
     /// Spawned bare, with a port so OMAR can reach it without the input box;
     /// the prompt arrives through that channel as synthetic context.
     fn launch_command(&self, launch: &Launch<'_>) -> String {
-        let base_command = with_opencode_port(launch.base_command);
+        let resumed = super::saved_conversation(launch.context, "opencode").map(|id| {
+            format!(
+                "{} --session {}",
+                launch.base_command,
+                shell_single_quote(&id)
+            )
+        });
+        let base_command = with_opencode_port(resumed.as_deref().unwrap_or(launch.base_command));
         match opencode_config_env(launch.context) {
             Some(config) => format!(
                 "OPENCODE_CONFIG_CONTENT={} {}",
@@ -59,9 +69,18 @@ impl Backend for Opencode {
             return Ok(Some(stamp));
         }
         match opencode_port(command) {
-            Some(port) => Ok(Some(provision_opencode(port).context(
-                "OpenCode delivery channel did not become ready before launch timeout",
-            )?)),
+            Some(port) => Ok(Some(
+                provision_opencode_session(
+                    port,
+                    shlex::split(command).and_then(|words| {
+                        words
+                            .windows(2)
+                            .find(|pair| pair[0] == "--session")
+                            .map(|pair| pair[1].clone())
+                    }),
+                )
+                .context("OpenCode delivery channel did not become ready before launch timeout")?,
+            )),
             None => Ok(None),
         }
     }
@@ -220,10 +239,26 @@ pub(crate) fn opencode_port(command: &str) -> Option<u16> {
 /// only creates one once the user speaks. So OMAR makes the session itself:
 /// the id it gets back is then unambiguously this pane's, even when several
 /// agents share a directory.
-pub(crate) fn provision_opencode(port: u16) -> Option<String> {
+fn provision_opencode_session(port: u16, previous: Option<String>) -> Option<String> {
     let deadline = std::time::Instant::now() + PROVISION_TIMEOUT;
-    let mut session: Option<String> = None;
+    let mut session = previous;
+    let mut verified = session.is_none();
     while std::time::Instant::now() < deadline {
+        if !verified {
+            let id = session.as_ref()?;
+            match http_json(port, "GET", &format!("/session/{id}"), None) {
+                Ok((200, _)) => verified = true,
+                Ok((404, _)) => {
+                    session = None;
+                    verified = true;
+                }
+                _ => {
+                    // A server still booting is not a missing conversation.
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+            }
+        }
         if session.is_none() {
             if let Ok((200, body)) = http_json(port, "POST", "/session", Some("{}")) {
                 session = serde_json::from_str::<serde_json::Value>(&body)
@@ -291,6 +326,64 @@ pub(crate) fn split_response(response: &str) -> Option<(u16, String)> {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn native_resume_waits_for_startup_and_only_creates_when_history_is_missing() {
+        use std::io::{BufRead, BufReader};
+        for missing in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let script = if missing {
+                    vec![
+                        ("GET /session/saved ", 404, "{}"),
+                        ("POST /session ", 200, r#"{"id":"fresh"}"#),
+                        ("POST /tui/select-session ", 200, "{}"),
+                    ]
+                } else {
+                    vec![
+                        ("GET /session/saved ", 503, "{}"),
+                        ("GET /session/saved ", 200, r#"{"id":"saved"}"#),
+                        ("POST /tui/select-session ", 200, "{}"),
+                    ]
+                };
+                for (expected, status, body) in script {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    assert!(first.starts_with(expected), "{first}");
+                    let mut length = 0;
+                    loop {
+                        let mut header = String::new();
+                        reader.read_line(&mut header).unwrap();
+                        if header == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) = header.strip_prefix("Content-Length:") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut request_body = vec![0; length];
+                    reader.read_exact(&mut request_body).unwrap();
+                    if expected.starts_with("POST /tui") {
+                        let value: serde_json::Value =
+                            serde_json::from_slice(&request_body).unwrap();
+                        assert_eq!(value["sessionID"], if missing { "fresh" } else { "saved" });
+                    }
+                    write!(stream, "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            assert_eq!(
+                provision_opencode_session(port, Some("saved".into())),
+                Some(format!(
+                    "opencode:{port}:{}",
+                    if missing { "fresh" } else { "saved" }
+                ))
+            );
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn opencode_wakes_with_synthetic_context_without_a_user_prompt() {
