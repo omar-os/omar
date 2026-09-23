@@ -384,9 +384,9 @@ async fn async_main() -> Result<()> {
     }
     metrics::configure(config.metrics.spawn_metrics_enabled);
     let omar_dir = omar_dir();
-    let new_ea_launch = cli.agent.is_some()
-        && (cli.command.is_none()
-            || matches!(&cli.command, Some(Commands::Serve { no_ea: false, .. })));
+    // Mission Control reopens its selected chat; only a new terminal dashboard
+    // explicitly allocates an EA on an agent launch.
+    let new_ea_launch = cli.agent.is_some() && cli.command.is_none();
     let defer_active_ea_save = new_ea_launch;
 
     if !defer_active_ea_save {
@@ -621,14 +621,11 @@ async fn async_main() -> Result<()> {
             if ui && !web_assets::is_bundled() {
                 anyhow::bail!(web_assets::MISSING);
             }
-            let target = if new_ea_launch {
-                let target = ea::create_launch_ea(&omar_dir, cli.ea.as_deref())?;
-                eprintln!("Created EA '{}' (id={})", target.name, target.id);
-                ea::save_active_ea(&omar_dir, target.id)?;
-                target
-            } else {
-                resolve_cli_ea(&omar_dir, cli.ea.as_deref())?
-            };
+            if ui && serve::is_running(address) {
+                open_browser(&format!("http://{address}"));
+                return Ok(());
+            }
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
             if ui {
                 // `serve::run` blocks, so the browser is opened from a thread
                 // that waits for the listener rather than before it exists.
@@ -643,7 +640,15 @@ async fn async_main() -> Result<()> {
                 scheduler::TickerBuffer::new(),
                 config.dashboard.session_prefix.clone(),
             ));
-            serve::run(address, &config, &omar_dir, target.id, restart_ea, !no_ea)
+            serve::run(
+                address,
+                &config,
+                &omar_dir,
+                target.id,
+                restart_ea,
+                !no_ea,
+                cli.agent.is_some(),
+            )
         }
         None => {
             let mut launched_ea = None;

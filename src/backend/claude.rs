@@ -30,6 +30,18 @@ impl Backend for Claude {
     fn default_command(&self) -> &'static str {
         "claude --dangerously-skip-permissions"
     }
+    fn conversation_id(&self, target: &Target<'_>) -> Option<String> {
+        let directory = claude_sessions_dir()?;
+        std::iter::once(target.pane_pid)
+            .chain(child_pids(target.pane_pid))
+            .find_map(|pid| {
+                let value: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(directory.join(format!("{pid}.json"))).ok()?,
+                )
+                .ok()?;
+                value["sessionId"].as_str().map(str::to_owned)
+            })
+    }
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["Claude Code", "❯"]
     }
@@ -61,7 +73,31 @@ impl Backend for Claude {
     ) -> Option<String> {
         std::fs::write(prompt_file, prompt).ok();
         let base_command = with_coordination_hooks(base_command, context);
-        Some(match materialize_claude_mcp_config(context) {
+        // Use a known ID from the first launch, so even an interrupted first
+        // turn can be resumed without guessing from the operator's global history.
+        let saved = super::saved_conversation(context, "claude");
+        let native = saved
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let managed = context.serve.is_some();
+        if managed {
+            let _ = super::remember_conversation(context, "claude", &native);
+        }
+        let launch_base = if managed {
+            format!(
+                "{base_command} {} {}",
+                if saved.is_some() {
+                    "--resume"
+                } else {
+                    "--session-id"
+                },
+                shell_single_quote(&native)
+            )
+        } else {
+            base_command.to_owned()
+        };
+        let base_command = launch_base.as_str();
+        let launch = match materialize_claude_mcp_config(context) {
             Some(mcp_config) => format!(
                 "{} --append-system-prompt-file {} --mcp-config {} --disallowedTools {}",
                 base_command,
@@ -74,6 +110,15 @@ impl Backend for Claude {
                 base_command,
                 shell_single_quote(&prompt_file.display().to_string()),
             ),
+        };
+        Some(if saved.is_some() {
+            let fresh = launch.replace(
+                &format!("--resume {}", shell_single_quote(&native)),
+                &format!("--session-id {}", shell_single_quote(&native)),
+            );
+            format!("{launch} || {fresh}")
+        } else {
+            launch
         })
     }
 

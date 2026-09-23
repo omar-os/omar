@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
 import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
+import { DeployConfirmation } from "./deploy-confirmation";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
@@ -1035,44 +1036,18 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             <div className="workflow-actions">
               {phase === "review" && design ? (
                 <span role="group" aria-label="Deploy design">
-                  {confirming ? (
-                    <>
-                      <button
-                        className="secondary-button"
-                        onClick={() => setConfirming(false)}
-                        type="button"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        className="primary-button"
-                        onClick={() => void confirmDesign()}
-                        type="button"
-                        disabled={!canRun}
-                        title="This starts real agents"
-                      >
-                        Confirm deploy
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <button
-                        className="secondary-button"
-                        onClick={discardDesign}
-                        type="button"
-                      >
-                        Discard
-                      </button>
-                      <button
-                        className="primary-button"
-                        onClick={() => setConfirming(true)}
-                        type="button"
-                        disabled={!canRun}
-                      >
-                        Deploy
-                      </button>
-                    </>
-                  )}
+                  <button className="secondary-button" onClick={discardDesign} type="button">
+                    Discard
+                  </button>
+                  <button
+                    className="primary-button"
+                    onClick={() => setConfirming(true)}
+                    type="button"
+                    disabled={!canRun}
+                    aria-haspopup="dialog"
+                  >
+                    Deploy
+                  </button>
                 </span>
               ) : null}
               {phase === "observing" && run ? (
@@ -1197,6 +1172,15 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         ) : null}
       </section>
       </div>
+
+      {confirming && phase === "review" && design ? (
+        <DeployConfirmation
+          team={snapshot?.team ?? "this topology"}
+          disabled={!canRun}
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => void confirmDesign()}
+        />
+      ) : null}
 
       {panelAgent && snapshot ? (
         <PortPanel

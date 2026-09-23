@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,46 @@ const MAX_SELECTION: usize = 64;
 const MAX_SELECTION_NAME: usize = 128;
 /// Messages a stalled chat subscriber may fall behind by before it is dropped.
 const CHAT_QUEUE: usize = 256;
+
+/// Only an observed Mission Control connection arms automatic shutdown.
+/// API-only daemons remain available until explicitly stopped.
+const WINDOW_GRACE: Duration = Duration::from_secs(10);
+const WINDOW_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct Presence {
+    clients: usize,
+    seen: bool,
+    idle_since: Option<Instant>,
+    stopping: bool,
+}
+
+impl Presence {
+    fn connect(&mut self) -> Result<()> {
+        anyhow::ensure!(!self.stopping, "runtime is shutting down");
+        self.clients += 1;
+        self.seen = true;
+        self.idle_since = None;
+        Ok(())
+    }
+
+    fn shutdown_due(&mut self, now: Instant, active_runs: bool) -> bool {
+        if !self.seen || self.clients > 0 || active_runs {
+            self.idle_since = None;
+            return false;
+        }
+        now.duration_since(*self.idle_since.get_or_insert(now)) >= WINDOW_GRACE
+    }
+}
+
+/// Removes presence on every exit, including a failed initial replay.
+struct WindowConnection(Arc<Workspaces>);
+impl Drop for WindowConnection {
+    fn drop(&mut self) {
+        let mut presence = self.0.presence.lock().expect("presence poisoned");
+        presence.clients -= 1;
+    }
+}
 
 #[derive(Debug, Clone, Serialize, TS)]
 pub struct RunRecord {
@@ -187,6 +227,7 @@ struct Chat {
     busy: bool,
     needs_context: bool,
     needs_relaunch: bool,
+    owned: bool,
 }
 
 /// A chat owns one EA; only the durable archive is shared between workspaces.
@@ -195,6 +236,9 @@ struct Workspaces {
     contexts: Mutex<BTreeMap<String, Arc<Context_>>>,
     root: Arc<Context_>,
     selection: Mutex<()>,
+    presence: Mutex<Presence>,
+    launch_ea: AtomicBool,
+    shutdown: Arc<AtomicBool>,
 }
 
 struct Context_ {
@@ -219,6 +263,7 @@ struct Context_ {
     /// is relaunched on a different backend.
     command: Arc<Mutex<String>>,
     address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Context_ {
@@ -286,7 +331,6 @@ pub struct Serve {
     /// starting one for real.
     #[cfg(test)]
     context: Arc<Context_>,
-    #[cfg(test)]
     workspaces: Arc<Workspaces>,
 }
 
@@ -331,6 +375,7 @@ impl Serve {
         };
         history.assign_ea(&conversation_id, workspace_ea)?;
         let history = Arc::new(Mutex::new(history));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let context = Arc::new(Context_ {
             history: history.clone(),
             conversation_id: conversation_id.clone(),
@@ -347,23 +392,29 @@ impl Serve {
                 busy: false,
                 needs_context: has_history,
                 needs_relaunch: has_history,
+                owned: false,
             })),
             agent_token: Mutex::new(agent_token.clone()),
             chat_operation: Mutex::new(()),
-            command: Arc::new(Mutex::new(config.agent.default_command.clone())),
+            command: Arc::new(Mutex::new(assistant_command(
+                omar_dir,
+                workspace_ea,
+                &config.agent.default_command,
+            ))),
             address,
+            shutdown: shutdown.clone(),
         });
         let workspaces = Arc::new(Workspaces {
             history,
             contexts: Mutex::new(BTreeMap::from([(conversation_id, context.clone())])),
             root: context.clone(),
             selection: Mutex::new(()),
+            presence: Mutex::new(Presence::default()),
+            launch_ea: AtomicBool::new(false),
+            shutdown,
         });
-        #[cfg(test)]
         let shared_workspaces = workspaces.clone();
-        // Blocking accept rather than a polling loop: `Drop` wakes it with a
-        // self-connection, so there is no need to spin, and no added latency on
-        // every connection from a poll interval.
+        listener.set_nonblocking(true)?;
         let running = Arc::new(AtomicBool::new(true));
         let thread_running = running.clone();
         #[cfg(test)]
@@ -376,6 +427,13 @@ impl Serve {
                         thread::spawn(move || {
                             let _ = handle_client(stream, workspaces);
                         });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if workspaces.shutdown_if_idle() {
+                            thread_running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        thread::sleep(WINDOW_POLL);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
@@ -390,7 +448,6 @@ impl Serve {
             thread: Some(thread),
             #[cfg(test)]
             context: shared,
-            #[cfg(test)]
             workspaces: shared_workspaces,
         };
         // Before this returns, so that everything downstream of "the server
@@ -433,8 +490,9 @@ impl Serve {
     /// with the operator and propose designs.
     ///
     /// The context is baked into the EA's MCP config at launch, so an already
-    /// running EA cannot gain these tools without being restarted. Restarting
-    /// discards its session, so that is opt-in and reported rather than silent.
+    /// running EA cannot gain these tools without being restarted. A saved
+    /// Mission Control chat resumes its native conversation with the new MCP
+    /// context. An unrelated terminal EA still requires explicit replacement.
     pub fn attach_ea(
         &self,
         config: &Config,
@@ -443,6 +501,12 @@ impl Serve {
         restart: bool,
         launch: bool,
     ) -> Result<AttachEa> {
+        self.workspaces.launch_ea.store(launch, Ordering::Relaxed);
+        let context = &self.workspaces.root;
+        let _operation = context
+            .chat_operation
+            .lock()
+            .expect("chat operation poisoned");
         let ea_id = self.ea_id;
         let name = crate::ea::load_registry(omar_dir)
             .into_iter()
@@ -461,18 +525,19 @@ impl Serve {
 
         let existing = crate::ea::ea_manager_session(ea_id, &config.dashboard.session_prefix);
         if client.has_session(&existing)? {
-            if !restart {
+            if !restart && !context.chat.lock().expect("chat poisoned").needs_context {
                 return Ok(AttachEa::AlreadyRunningWithoutServe(existing));
             }
             // Not `ensure_session_not_attached`: that resolves through the
             // prefix-filtered session list, and the manager session is named
             // `<prefix>ea-<id>`, which never matches the agent prefix. Kill it
             // directly, as `ensure_manager_session` itself does.
-            client.kill_session(&existing)?;
+            stop_assistant(context)?;
         }
+        context.chat.lock().expect("chat poisoned").owned = true;
         let (session, _) = crate::manager::ensure_manager_session(
             &client,
-            &config.agent.default_command,
+            &context.command.lock().expect("command poisoned").clone(),
             ea_id,
             &name,
             omar_dir,
@@ -486,6 +551,10 @@ impl Serve {
                 }),
             },
         )?;
+        {
+            let mut chat = context.chat.lock().expect("chat poisoned");
+            chat.needs_relaunch = false;
+        }
         match self.verify_ea_context(omar_dir, ea_id) {
             Ok(()) => Ok(AttachEa::Attached(session)),
             Err(reason) => Ok(AttachEa::LaunchedWithoutServe {
@@ -516,7 +585,7 @@ impl Serve {
         }
     }
 
-    /// Block until the accept loop stops, which for the CLI means forever.
+    /// Block until shutdown, including the last-window idle timeout.
     pub fn wait(mut self) -> Result<()> {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -527,12 +596,40 @@ impl Serve {
 
 impl Drop for Serve {
     fn drop(&mut self) {
+        self.workspaces.shutdown.store(true, Ordering::SeqCst);
         self.running.store(false, Ordering::Relaxed);
         let _ = TcpStream::connect(self.address);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
+}
+
+/// Reopening the launcher should reuse a live runtime, not replace its runs.
+pub fn is_running(address: SocketAddr) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+    if write!(
+        stream,
+        "GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut response = String::new();
+    if stream.take(8192).read_to_string(&mut response).is_err() {
+        return false;
+    }
+    response
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str::<Value>(body).ok())
+        .is_some_and(|body| {
+            body["status"] == "ok" && body["protocol_version"] == SERVE_PROTOCOL_VERSION
+        })
 }
 
 pub fn run(
@@ -542,8 +639,17 @@ pub fn run(
     ea_id: EaId,
     restart_ea: bool,
     launch_ea: bool,
+    override_backend: bool,
 ) -> Result<()> {
     let server = Serve::start(address, config, omar_dir, ea_id)?;
+    if override_backend {
+        *server
+            .workspaces
+            .root
+            .command
+            .lock()
+            .expect("command poisoned") = config.agent.default_command.clone();
+    }
     println!("OMAR serve: http://{}", server.address());
     match server.attach_ea(config, omar_dir, ea_id, restart_ea, launch_ea) {
         Ok(AttachEa::Attached(session)) => println!("Executive assistant: {session}"),
@@ -744,6 +850,30 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
 
     // Streams for as long as the operator keeps Mission Control open.
     if method == "GET" && path == "/v1/chat/events" {
+        {
+            workspaces
+                .presence
+                .lock()
+                .expect("presence poisoned")
+                .connect()?;
+        }
+        let _connection = WindowConnection(workspaces.clone());
+        if workspaces.launch_ea.load(Ordering::Relaxed) {
+            let context = context.clone();
+            thread::spawn(move || {
+                let _operation = context
+                    .chat_operation
+                    .lock()
+                    .expect("chat operation poisoned");
+                if context.chat.lock().expect("chat poisoned").needs_relaunch {
+                    let command = context.command.lock().expect("command poisoned").clone();
+                    match relaunch_ea(&context, &command) {
+                        Ok(_) => context.chat.lock().expect("chat poisoned").needs_relaunch = false,
+                        Err(error) => eprintln!("Could not resume assistant: {error:#}"),
+                    }
+                }
+            });
+        }
         return stream_chat(stream, &context, origin);
     }
 
@@ -769,7 +899,14 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
             if content_length > MAX_BODY_BYTES {
                 (413, json!({"error": "program too large"}))
             } else {
-                start_run(&context, &read_body(content_length)?)
+                // The idle check and run admission must be indivisible: a
+                // closing window cannot stop a deployment being admitted.
+                let presence = workspaces.presence.lock().expect("presence poisoned");
+                if presence.stopping {
+                    (503, json!({"error": "runtime is shutting down"}))
+                } else {
+                    start_run(&context, &read_body(content_length)?)
+                }
             }
         }
         ("GET", "/v1/chat") => {
@@ -1052,9 +1189,8 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
 /// Relaunch the assistant on a different backend.
 ///
 /// A backend is chosen when the process starts, so changing it means a new
-/// process: the assistant's current session does not survive. That is the
-/// operator's call to make, which is why this is an explicit request rather
-/// than something inferred.
+/// process. Each backend resumes its own saved conversation when available;
+/// the durable OMAR transcript supplies context across backend changes.
 fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     let _operation = context
         .chat_operation
@@ -1093,17 +1229,74 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     }
 }
 
+fn assistant_command(root: &Path, ea_id: EaId, fallback: &str) -> String {
+    fs::read_to_string(crate::ea::ea_state_dir(ea_id, root).join("assistant-command"))
+        .ok()
+        .filter(|command| !command.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn remember_assistant(context: &Context_) -> Result<()> {
+    let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
+    let session = crate::ea::ea_manager_session(context.ea_id, &context.session_prefix);
+    let command = context.command.lock().expect("command poisoned").clone();
+    crate::manager::write_private_file(
+        &crate::ea::ea_state_dir(context.ea_id, &context.omar_dir).join("assistant-command"),
+        command.as_bytes(),
+    )?;
+    if client.has_session(&session)? {
+        let backend_name = client.session_backend(&session);
+        if let Some(backend) = backend_name
+            .as_deref()
+            .and_then(crate::backend::by_name)
+            .or_else(|| crate::backend::detect(&command))
+        {
+            let stamp = client.session_delivery(&session);
+            let target = crate::backend::Target {
+                name: &session,
+                pane_pid: client.get_pane_pid(&session)?,
+                stamp: stamp.as_deref(),
+            };
+            if let Some(id) = backend.conversation_id(&target) {
+                crate::manager::write_private_file(
+                    &crate::backend::conversation_path(
+                        &context.omar_dir,
+                        context.ea_id,
+                        backend.kind().name(),
+                    ),
+                    id.as_bytes(),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stop_assistant(context: &Context_) -> Result<()> {
+    remember_assistant(context)?;
+    let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
+    client.kill_session_tree(&crate::ea::ea_manager_session(
+        context.ea_id,
+        &context.session_prefix,
+    ))
+}
+
 fn relaunch_ea(context: &Arc<Context_>, command: &str) -> Result<String> {
+    anyhow::ensure!(
+        !context.shutdown.load(Ordering::SeqCst),
+        "runtime is shutting down"
+    );
     let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
     let existing = crate::ea::ea_manager_session(context.ea_id, &context.session_prefix);
     if client.has_session(&existing)? {
-        client.kill_session(&existing)?;
+        stop_assistant(context)?;
     }
     let name = crate::ea::load_registry(&context.omar_dir)
         .into_iter()
         .find(|ea| ea.id == context.ea_id)
         .map(|ea| ea.name)
         .unwrap_or_else(|| format!("ea-{}", context.ea_id));
+    context.chat.lock().expect("chat poisoned").owned = true;
     let (session, _) = crate::manager::ensure_manager_session(
         &client,
         command,
@@ -1129,6 +1322,52 @@ fn relaunch_ea(context: &Arc<Context_>, command: &str) -> Result<String> {
 }
 
 impl Workspaces {
+    fn shutdown_if_idle(&self) -> bool {
+        let mut presence = self.presence.lock().expect("presence poisoned");
+        let contexts: Vec<_> = self
+            .contexts
+            .lock()
+            .expect("workspaces poisoned")
+            .values()
+            .cloned()
+            .collect();
+        let active = contexts.iter().any(|context| {
+            context
+                .runs
+                .lock()
+                .expect("runs poisoned")
+                .values()
+                .any(|run| run.status.is_active())
+        });
+        if !presence.shutdown_due(Instant::now(), active) {
+            return false;
+        }
+        presence.stopping = true;
+        self.shutdown.store(true, Ordering::SeqCst);
+        for context in contexts {
+            let _operation = context
+                .chat_operation
+                .lock()
+                .expect("chat operation poisoned");
+            if !context.chat.lock().expect("chat poisoned").owned {
+                continue;
+            }
+            if let Err(error) = stop_assistant(&context) {
+                eprintln!("Could not stop assistant: {error:#}");
+                presence.stopping = false;
+                self.shutdown.store(false, Ordering::SeqCst);
+                return false;
+            }
+            let mut chat = context.chat.lock().expect("chat poisoned");
+            chat.busy = false;
+            chat.needs_context = true;
+            chat.needs_relaunch = true;
+            chat.owned = false;
+        }
+        eprintln!("Mission Control closed; no active topologies. Runtime stopped.");
+        true
+    }
+
     fn get(&self, id: &str) -> Result<Arc<Context_>> {
         let mut contexts = self.contexts.lock().expect("workspaces poisoned");
         if let Some(context) = contexts.get(id) {
@@ -1170,13 +1409,17 @@ impl Workspaces {
                 busy: false,
                 needs_context: has_history,
                 needs_relaunch: true,
+                owned: false,
             })),
             agent_token: Mutex::new(Uuid::new_v4().to_string()),
             chat_operation: Mutex::new(()),
-            command: Arc::new(Mutex::new(
-                self.root.command.lock().expect("command poisoned").clone(),
-            )),
+            command: Arc::new(Mutex::new(assistant_command(
+                &self.root.omar_dir,
+                ea_id,
+                &self.root.command.lock().expect("command poisoned"),
+            ))),
             address: self.root.address,
+            shutdown: self.shutdown.clone(),
         });
         contexts.insert(id.to_string(), context.clone());
         Ok(context)
@@ -1247,6 +1490,9 @@ fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         .chat_operation
         .lock()
         .expect("chat operation poisoned");
+    if context.shutdown.load(Ordering::SeqCst) {
+        return (503, json!({"error": "runtime is shutting down"}));
+    }
     let request: ChatRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
@@ -1496,8 +1742,22 @@ fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&s
         serde_json::to_string(&conversation)?
     )?;
     stream.flush()?;
+    // A read-side EOF notices a browser close immediately; write-side
+    // keepalives alone can miss the FIN until a subsequent write.
+    stream.set_read_timeout(Some(Duration::from_millis(1)))?;
+    let mut heartbeat = Instant::now();
     loop {
-        match receiver.recv_timeout(Duration::from_secs(15)) {
+        match stream.peek(&mut [0; 1]) {
+            Ok(0) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+            Ok(_) => {}
+        }
+        match receiver.recv_timeout(WINDOW_POLL) {
             Ok(message) => {
                 if write_chat_event(&mut stream, &message)
                     .and_then(|_| stream.flush().map_err(Into::into))
@@ -1507,6 +1767,10 @@ fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&s
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if heartbeat.elapsed() < Duration::from_secs(15) {
+                    continue;
+                }
+                heartbeat = Instant::now();
                 if stream
                     .write_all(b": keepalive\n\n")
                     .and_then(|_| stream.flush())
@@ -2164,6 +2428,103 @@ mod tests {
             0,
         )
         .expect("server starts")
+    }
+
+    #[test]
+    fn window_grace_requires_last_disconnect_and_resets_on_reconnect_or_run() {
+        let now = Instant::now();
+        let mut presence = Presence::default();
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE, false));
+        presence.connect().unwrap();
+        presence.connect().unwrap();
+        presence.clients -= 1;
+        assert!(!presence.shutdown_due(now, false));
+        presence.clients -= 1;
+        assert!(!presence.shutdown_due(now, false));
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE - Duration::from_millis(1), false));
+        assert!(presence.shutdown_due(now + WINDOW_GRACE, false));
+        presence.connect().unwrap();
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE, false));
+        presence.clients -= 1;
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE, true));
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE * 2, false));
+        assert!(presence.shutdown_due(now + WINDOW_GRACE * 3, false));
+        presence.stopping = true;
+        assert!(presence.connect().is_err());
+    }
+
+    #[test]
+    fn runs_in_other_chats_keep_the_runtime_alive_through_teardown() {
+        let server = test_server();
+        server
+            .workspaces
+            .history
+            .lock()
+            .unwrap()
+            .select(None)
+            .unwrap();
+        let id = server.workspaces.history.lock().unwrap().active_id.clone();
+        let other = server.workspaces.get(&id).unwrap();
+        for status in [RunStatus::Starting, RunStatus::Running, RunStatus::Stopping] {
+            other
+                .runs
+                .lock()
+                .unwrap()
+                .insert("run".into(), record("background", status));
+            {
+                let mut presence = server.workspaces.presence.lock().unwrap();
+                presence.seen = true;
+                presence.idle_since = Some(Instant::now() - WINDOW_GRACE);
+            }
+            assert!(!server.workspaces.shutdown_if_idle());
+            assert!(server
+                .workspaces
+                .presence
+                .lock()
+                .unwrap()
+                .idle_since
+                .is_none());
+        }
+        other.runs.lock().unwrap().get_mut("run").unwrap().status = RunStatus::Completed;
+        assert!(!server.workspaces.shutdown_if_idle());
+        server.workspaces.presence.lock().unwrap().idle_since = Some(Instant::now() - WINDOW_GRACE);
+        assert!(server.workspaces.shutdown_if_idle());
+    }
+
+    #[test]
+    fn sse_disconnect_releases_presence_and_stops_the_listener_after_grace() {
+        let server = test_server();
+        assert!(is_running(server.address()));
+        let mut browser = TcpStream::connect(server.address()).unwrap();
+        browser
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            browser,
+            "GET /v1/chat/events HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        .unwrap();
+        let mut buffer = [0; 1024];
+        assert!(browser.read(&mut buffer).unwrap() > 0);
+        // Wait for the server to have registered the stream, not merely sent headers.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.workspaces.presence.lock().unwrap().clients == 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        browser.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(browser);
+        while server.workspaces.presence.lock().unwrap().clients != 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(server.running.load(Ordering::Relaxed));
+        server.workspaces.presence.lock().unwrap().idle_since = Some(Instant::now() - WINDOW_GRACE);
+        while server.running.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!is_running(server.address()));
     }
 
     #[test]

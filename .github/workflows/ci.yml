@@ -112,6 +112,7 @@ jobs:
           python3 tests/ci/legacy_supervision.py
           python3 tests/ci/backend_coordination_contracts.py
           python3 tests/ci/protocol_runner.py
+          python3 tests/ci/mission_control_lifecycle.py
 
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1

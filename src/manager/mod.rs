@@ -390,7 +390,8 @@ pub(crate) fn managed_agent_command(
         context_file,
         prompt_file: prompt.to_path_buf(),
         socket: socket.clone(),
-        initial_session,
+        initial_session: initial_session
+            .or_else(|| crate::backend::saved_conversation(context, backend)),
     };
     let config_path = mcp_ea_dir(context)
         .context("missing EA context directory")?

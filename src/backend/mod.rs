@@ -246,6 +246,11 @@ pub trait Backend: Send + Sync {
     fn hook_consumes_spool(&self, _input: &serde_json::Value) -> bool {
         true
     }
+    /// Native conversation currently displayed by this pane, if unambiguous.
+    fn conversation_id(&self, _target: &Target<'_>) -> Option<String> {
+        None
+    }
+
     /// An executive assistant's launch line, when it differs from a worker's.
     /// `prompt_file` holds the prompt with its placeholders intact and
     /// `prompt` is the same text with them resolved; a backend that takes the
@@ -260,6 +265,39 @@ pub trait Backend: Send + Sync {
     ) -> Option<String> {
         None
     }
+}
+
+/// Native IDs are scoped to both the EA (one per chat) and backend. Never use
+/// a backend's global "last session", which may belong to another window.
+pub(crate) fn saved_conversation(context: &McpLaunchContext, backend: &str) -> Option<String> {
+    if context.serve.is_none() || context.agent_name.is_some() || context.topology.is_some() {
+        return None;
+    }
+    std::fs::read_to_string(conversation_path(&context.omar_dir, context.ea_id, backend))
+        .ok()
+        .filter(|id| !id.trim().is_empty())
+}
+
+pub(crate) fn conversation_path(
+    root: &Path,
+    ea_id: crate::ea::EaId,
+    backend: &str,
+) -> std::path::PathBuf {
+    crate::ea::ea_state_dir(ea_id, root).join(format!("native-{backend}-session"))
+}
+
+pub(crate) fn remember_conversation(
+    context: &McpLaunchContext,
+    backend: &str,
+    id: &str,
+) -> Result<()> {
+    if context.serve.is_some() && context.agent_name.is_none() && context.topology.is_none() {
+        crate::manager::write_private_file(
+            &conversation_path(&context.omar_dir, context.ea_id, backend),
+            id.as_bytes(),
+        )?;
+    }
+    Ok(())
 }
 
 pub const ALL: [&dyn Backend; 6] = [
@@ -337,6 +375,84 @@ pub fn command_name(command: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_resume_is_scoped_to_chat_and_backend_and_preserves_worker_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = crate::manager::tests::test_mcp_context(dir.path());
+        context.serve = Some(crate::manager::ServeMcpContext {
+            endpoint: "127.0.0.1:7340".into(),
+            token: "test".into(),
+        });
+        std::fs::create_dir_all(crate::ea::ea_state_dir(0, dir.path())).unwrap();
+        remember_conversation(&context, "claude", "11111111-1111-4111-8111-111111111111").unwrap();
+        remember_conversation(&context, "codex", "saved-codex").unwrap();
+        let (claude, _) =
+            crate::manager::build_ea_command("claude", 0, "test", dir.path(), &context);
+        assert!(claude.contains("--resume '11111111-1111-4111-8111-111111111111'"));
+        assert!(claude.contains("||"));
+        assert!(claude.contains("--session-id '11111111-1111-4111-8111-111111111111'"));
+        let (codex, _) = crate::manager::build_ea_command("codex", 0, "test", dir.path(), &context);
+        assert!(
+            codex.contains("codex resume 'saved-codex' --remote"),
+            "{codex}"
+        );
+        assert!(!codex.contains("codex resume 'saved-codex' --dangerously"));
+        assert!(codex.contains("|| codex --dangerously-bypass-approvals-and-sandbox --remote"));
+        let (managed, _) = crate::manager::build_ea_command(
+            "codex --profile work",
+            0,
+            "test",
+            dir.path(),
+            &context,
+        );
+        assert!(
+            managed.contains("backend-runner --backend codex"),
+            "{managed}"
+        );
+        context.ea_id = 1;
+        assert!(saved_conversation(&context, "claude").is_none());
+        context.ea_id = 0;
+        assert!(saved_conversation(&context, "cursor").is_none());
+        context.agent_name = Some("worker".into());
+        assert!(saved_conversation(&context, "claude").is_none());
+        context.agent_name = None;
+        context.serve = None;
+        assert!(saved_conversation(&context, "claude").is_none());
+    }
+
+    #[test]
+    fn managed_resume_passes_the_saved_native_id_to_the_new_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = crate::manager::tests::test_mcp_context(dir.path());
+        context.serve = Some(crate::manager::ServeMcpContext {
+            endpoint: "127.0.0.1:7340".into(),
+            token: "test".into(),
+        });
+        std::fs::create_dir_all(crate::ea::ea_state_dir(0, dir.path())).unwrap();
+        remember_conversation(&context, "cursor", "cursor-thread").unwrap();
+        crate::manager::managed_agent_command(
+            "cursor",
+            "cursor agent --yolo",
+            &dir.path().join("prompt"),
+            &context,
+            None,
+        )
+        .unwrap();
+        let config = std::fs::read_dir(dir.path().join("mcp/ea-0"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("protocol-")
+            })
+            .unwrap();
+        let config: crate::backend_runner::Config =
+            serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+        assert_eq!(config.initial_session.as_deref(), Some("cursor-thread"));
+    }
 
     #[test]
     fn every_kind_is_registered_once_under_its_canonical_name() {

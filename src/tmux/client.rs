@@ -611,6 +611,22 @@ impl TmuxClient {
         Ok(())
     }
 
+    /// Stop the assistant and its sidecars, including background children
+    /// which may ignore the terminal hangup sent by `kill-session` alone.
+    pub fn kill_session_tree(&self, name: &str) -> Result<()> {
+        if !self.has_session(name)? {
+            return Ok(());
+        }
+        let tree = crate::process::process_tree(self.get_pane_pid(name)?);
+        crate::process::signal_tree(&tree, "-TERM");
+        if self.has_session(name)? {
+            self.kill_session(name)?;
+        }
+        thread::sleep(Duration::from_millis(500));
+        crate::process::signal_tree(&tree, "-KILL");
+        Ok(())
+    }
+
     /// Check if a session exists
     pub fn has_session(&self, name: &str) -> Result<bool> {
         let target = exact_session_target(name);
