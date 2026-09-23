@@ -2328,7 +2328,7 @@ fn tool_definitions() -> Vec<Value> {
                     "task":{"type":"string","description":"The concrete assignment. Known agent backends receive a durable task_id and automatic supervision."},
                     "supervise":{"type":"boolean","description":"Defaults true for supported agent backends and false for raw demo commands. Opt in custom agent commands that implement finish_task; opt out passive raw sessions."},
                     "command":{"type":"string","description":"Raw command to run instead of a backend agent (e.g. 'bash' for a demo window). Mutually exclusive with backend."},
-                    "backend":{"type":"string","enum":["claude","codex","cursor","opencode","agy"],"description":"Backend agent command to launch. Mutually exclusive with command."},
+                    "backend":{"type":"string","enum":crate::backend::assistant_names(),"description":"Backend agent command to launch. Mutually exclusive with command."},
                     "model":{"type":"string","description":"Optional backend model override. Allowed characters are alphanumeric plus '-', '_', '.', '/'."},
                     "reasoning_effort":{"type":"string","enum":["low","medium","high","xhigh"],"description":"Optional Codex reasoning effort override. Supported only with backend='codex'; appends a Codex config override such as -c model_reasoning_effort='\"high\"'."},
                     "workdir":{"type":"string","description":"Working directory for the new session. Defaults to this MCP server's launch workdir."},
