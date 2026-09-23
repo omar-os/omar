@@ -1336,36 +1336,34 @@ impl OmarMcpServer {
                 header
             };
             let backend_name2 = backend_name.clone();
-            let managed_protocol =
-                crate::backend::managed::managed_launch_socket(&command).is_some();
-            let readiness_markers = crate::backend::by_name(&backend_name)
-                .map(|backend| backend.readiness_markers().to_vec())
-                .unwrap_or_default();
+            let readiness = crate::backend::by_name(&backend_name)
+                .map(|backend| backend.readiness(&command))
+                .unwrap_or(crate::backend::Readiness::Settle);
             let (delivery_tx, delivery_rx) = std::sync::mpsc::channel();
             thread::spawn(move || {
                 let delivery_start = std::time::Instant::now();
-                let readiness = if managed_protocol {
-                    Ok(())
-                } else if !readiness_markers.is_empty() {
-                    let ready = client2.wait_for_markers(
-                        &session2,
-                        &readiness_markers,
-                        Duration::from_secs(45),
-                        Duration::from_millis(250),
-                    );
-                    if ready {
-                        Ok(())
-                    } else {
-                        Err(anyhow!("backend readiness markers timed out"))
+                let readiness = match readiness {
+                    crate::backend::Readiness::Channel => Ok(()),
+                    crate::backend::Readiness::Banner(markers) => {
+                        let ready = client2.wait_for_markers(
+                            &session2,
+                            markers,
+                            Duration::from_secs(45),
+                            Duration::from_millis(250),
+                        );
+                        if ready {
+                            Ok(())
+                        } else {
+                            Err(anyhow!("backend readiness markers timed out"))
+                        }
                     }
-                } else {
-                    client2.wait_for_stable(
+                    crate::backend::Readiness::Settle => client2.wait_for_stable(
                         &session2,
                         Duration::from_millis(500),
                         Duration::from_secs(8),
                         Duration::from_millis(120),
                         false,
-                    )
+                    ),
                 };
                 let opts = DeliveryOptions::default();
                 let delivery = client2.deliver_prompt(&session2, &first_message, &opts);

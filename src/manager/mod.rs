@@ -965,13 +965,8 @@ fn spawn_worker(
     // Wait for backend readiness when possible, then deliver an explicit
     // first task message so workers begin execution deterministically.
     // Channel delivery independently checks that the backend endpoint exists.
-    let _markers_proved_ready = if crate::backend::managed::managed_launch_socket(&cmd).is_some() {
-        false
-    } else if let Some(backend) = crate::backend::detect(command) {
-        let markers = backend.readiness_markers();
-        if markers.is_empty() {
-            false
-        } else {
+    let _markers_proved_ready = match crate::backend::detect(command).map(|b| b.readiness(&cmd)) {
+        Some(crate::backend::Readiness::Banner(markers)) => {
             let detected = client.wait_for_markers(
                 &session_name,
                 markers,
@@ -986,8 +981,7 @@ fn spawn_worker(
             }
             detected
         }
-    } else {
-        false
+        _ => false,
     };
 
     // opencode has no system-prompt flag, so build_agent_command spawns it

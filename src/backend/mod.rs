@@ -104,6 +104,17 @@ pub(crate) fn delivery_failed(target: &Target<'_>, via: &str) -> String {
     )
 }
 
+/// What proves a launched pane is ready for its first message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    /// A side channel the launch provisioned; delivery waits on it.
+    Channel,
+    /// Banner text the TUI paints once its input widget is live.
+    Banner(&'static [&'static str]),
+    /// Nothing is known; a caller may wait for the pane to stop changing.
+    Settle,
+}
+
 /// What a pane is launched with, beyond the command an operator gave.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PaneSetup {
@@ -160,6 +171,19 @@ pub trait Backend: Send + Sync {
     /// the backend's channel and never types into the widget these describe.
     fn readiness_markers(&self) -> &'static [&'static str] {
         &[]
+    }
+    /// How a caller learns that a launched pane can take work. A launch under
+    /// OMAR's protocol runner has no banner: the runner's socket is the proof,
+    /// and delivery waits on it. Otherwise the backend's banner, or nothing
+    /// to wait for at all.
+    fn readiness(&self, command: &str) -> Readiness {
+        if managed::managed_launch_socket(command).is_some() {
+            return Readiness::Channel;
+        }
+        match self.readiness_markers() {
+            [] => Readiness::Settle,
+            markers => Readiness::Banner(markers),
+        }
     }
     /// Flags a command line must carry before this backend runs under OMAR.
     /// A line that already carries them, or that must not, comes back as is.

@@ -252,6 +252,14 @@ jobs:
           grep -Fq 'Output leader.done = true' <<<"$output"
           grep -Fq 'State leader.round = 10' <<<"$output"
 
+      # Cursor and Antigravity run under OMAR's protocol runner, which paints
+      # no banner, so `omar run` must take the runner's socket as readiness.
+      # Deterministic peers stand in for the CLIs; no model call is made.
+      - name: Verify a topology completes on the runner-backed backends
+        env:
+          OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
+        run: python3 tests/ci/topology_runner_backends.py
+
       - name: Check bytecode layout and declared agent backends
         run: |
           python3 - <<'PY'

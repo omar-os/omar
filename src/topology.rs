@@ -2057,6 +2057,9 @@ fn spawn_topology_agents(
     config: &TopologyRunConfig<'_>,
     spawned: &mut BTreeMap<String, String>,
 ) -> Result<()> {
+    // The line each agent was launched with, which is what says how it
+    // proves readiness.
+    let mut launched: BTreeMap<String, String> = BTreeMap::new();
     let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, use only omar_set_port to set allowed effects and omar_complete to finish. Port writes are buffered and repeated writes use last-writer-wins semantics.";
     for (name, agent) in &state.agents {
         // A web agent is not spawned. There is no command to resolve, no pane
@@ -2106,24 +2109,26 @@ fn spawn_topology_agents(
         let command = manager::build_agent_command(&base_command, &prompt_file, &[], &context);
         client.new_session(&session, &command, Some(config.default_workdir))?;
         spawned.insert(name.clone(), session);
+        launched.insert(name.clone(), command);
     }
 
     for (name, agent) in &state.agents {
         if is_web_backend(&agent.backend) {
             continue;
         }
-        let markers = crate::backend::by_name(canonical_backend(&agent.backend))
-            .map(|backend| backend.readiness_markers())
-            .unwrap_or(&[]);
-        if !markers.is_empty()
-            && !client.wait_for_markers(
+        let Some(backend) = crate::backend::by_name(canonical_backend(&agent.backend)) else {
+            continue;
+        };
+        let command = launched.get(name).map(String::as_str).unwrap_or_default();
+        if let crate::backend::Readiness::Banner(markers) = backend.readiness(command) {
+            if !client.wait_for_markers(
                 &client.session_for(name),
                 markers,
                 Duration::from_secs(60),
                 Duration::from_millis(250),
-            )
-        {
-            bail!("agent '{}' did not become ready", name);
+            ) {
+                bail!("agent '{}' did not become ready", name);
+            }
         }
     }
     Ok(())
