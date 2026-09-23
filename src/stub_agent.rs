@@ -41,7 +41,7 @@ pub fn run(context_file: &Path) -> Result<()> {
     let spool =
         std::env::var_os("OMAR_EVENT_SPOOL").context("stub agent requires OMAR_EVENT_SPOOL")?;
     loop {
-        for message in crate::channel::drain_spool(Path::new(&spool)) {
+        for message in crate::backend::spool::drain_spool(Path::new(&spool)) {
             let mut lines = message.lines();
             while let Some(line) = lines.next() {
                 if !line.contains(INVOCATION) {

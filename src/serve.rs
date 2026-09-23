@@ -1040,8 +1040,12 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
         .expect("serve command poisoned")
         .clone();
     json!({
-        "backend": crate::config::backend_of_command(&command),
-        "available": crate::config::ASSISTANT_BACKENDS,
+        "backend": crate::backend::ASSISTANT
+            .iter()
+            .copied()
+            .find(|kind| crate::backend::of(*kind).default_command() == command)
+            .map(crate::backend::Kind::name),
+        "available": crate::backend::assistant_names(),
     })
 }
 
@@ -1064,16 +1068,17 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
-    let command = match crate::config::resolve_backend(&request.backend) {
-        Ok(command) => command,
+    let backend = match crate::backend::resolve(&request.backend) {
+        Ok(backend) => backend,
         Err(reason) => return (400, json!({"error": reason})),
     };
-    if !crate::config::ASSISTANT_BACKENDS.contains(&request.backend.as_str()) {
+    if !crate::backend::ASSISTANT.contains(&backend.kind()) {
         return (
             400,
             json!({"error": format!("'{}' is not an assistant backend", request.backend)}),
         );
     }
+    let command = backend.default_command().to_string();
 
     match relaunch_ea(context, &command) {
         Ok(session) => {
@@ -2724,7 +2729,7 @@ while True:
         // Whatever this machine defaults to, the choices are the ones an
         // operator can actually pick.
         assert!(response.contains("\"available\""), "{response}");
-        for backend in crate::config::ASSISTANT_BACKENDS {
+        for backend in crate::backend::assistant_names() {
             assert!(
                 response.contains(backend),
                 "{backend} missing from {response}"

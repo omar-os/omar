@@ -1,7 +1,7 @@
 mod app;
+mod backend;
 mod backend_probe;
 mod backend_runner;
-mod channel;
 mod chat_history;
 mod computer;
 mod config;
@@ -374,8 +374,9 @@ async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(ref agent) = cli.agent {
-        config.agent.default_command =
-            config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
+        config.agent.default_command = crate::backend::resolve(agent)
+            .map(|backend| backend.default_command().to_string())
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
     }
     if cli.spawn_metrics {
         config.metrics.spawn_metrics_enabled = true;
@@ -567,22 +568,19 @@ async fn async_main() -> Result<()> {
             // writes nothing reads as a failure to the backend.
             // Check the format before touching the spool: draining first
             // would destroy every queued event on a typo.
-            let reply = match channel::HookFormat::parse(&format) {
-                Some(hook) => {
+            let reply = match crate::backend::by_name(&format) {
+                Some(backend) if backend.hook_reply(&[]).is_some() => {
                     use std::io::Read;
                     let mut raw = String::new();
                     std::io::stdin().take(1_048_576).read_to_string(&mut raw)?;
                     let input =
                         serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
-                    let consumes_spool = format != "cursor"
-                        || matches!(
-                            input["hook_event_name"].as_str(),
-                            None | Some("sessionStart" | "postToolUse" | "postToolUseFailure")
-                        );
-                    let mut events = if consumes_spool {
+                    let mut events = if backend.hook_consumes_spool(&input) {
                         std::env::var("OMAR_EVENT_SPOOL")
                             .ok()
-                            .map(|spool| channel::drain_spool(std::path::Path::new(&spool)))
+                            .map(|spool| {
+                                crate::backend::spool::drain_spool(std::path::Path::new(&spool))
+                            })
                             .unwrap_or_default()
                     } else {
                         Vec::new()
@@ -590,26 +588,25 @@ async fn async_main() -> Result<()> {
                     let mut state = supervision::inherited_hook_response(&input, &format)?;
                     if input["hook_event_name"] == "stop" {
                         state.to_string()
+                    } else if !backend.hook_takes_context(&input) {
+                        "{}".to_string()
                     } else {
-                        // Only hooks with an injection output contract consume context.
-                        if format == "cursor" && input["hook_event_name"] == "beforeSubmitPrompt" {
-                            "{}".to_string()
-                        } else {
-                            if let Some(value) = state["additional_context"].as_str() {
-                                events.push(value.to_owned());
-                            }
-                            if let Some(steps) = state["injectSteps"].as_array_mut() {
-                                for step in steps {
-                                    if let Some(value) = step["ephemeralMessage"].as_str() {
-                                        events.push(value.to_owned());
-                                    }
+                        if let Some(value) = state["additional_context"].as_str() {
+                            events.push(value.to_owned());
+                        }
+                        if let Some(steps) = state["injectSteps"].as_array_mut() {
+                            for step in steps {
+                                if let Some(value) = step["ephemeralMessage"].as_str() {
+                                    events.push(value.to_owned());
                                 }
                             }
-                            hook.render(&events)
                         }
+                        backend
+                            .hook_reply(&events)
+                            .unwrap_or_else(|| "{}".to_string())
                     }
                 }
-                None => "{}".to_string(),
+                _ => "{}".to_string(),
             };
             println!("{}", reply);
             Ok(())
@@ -2074,7 +2071,7 @@ fn purge_persisted_runtime_state_on_quit(omar_dir: &std::path::Path) -> Result<(
 
     remove_dir_if_exists(omar_dir.join("ea"))?;
     remove_dir_if_exists(omar_dir.join("mcp"))?;
-    manager::remove_all_omar_antigravity_mcp_configs()?;
+    crate::backend::antigravity::remove_all_omar_antigravity_mcp_configs()?;
 
     Ok(())
 }
