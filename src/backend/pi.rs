@@ -87,10 +87,7 @@ fn launch_command(launch: &Launch<'_>) -> Result<String> {
         ("index.js", include_str!("pi/index.js")),
         ("omar-mcp.js", include_str!("pi/omar-mcp.js")),
         ("delivery.js", include_str!("pi/delivery.js")),
-        (
-            "package.json",
-            include_str!("pi/package.json"),
-        ),
+        ("package.json", include_str!("pi/package.json")),
     ] {
         write_private_file(&dir.join(name), body.as_bytes())?;
     }
