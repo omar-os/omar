@@ -1284,19 +1284,29 @@ test("an edge into a reaction actually reaches it", async ({ page }) => {
 
   const reactions = await page.locator(".omar-reaction").all();
   expect(reactions.length).toBeGreaterThan(5);
-  for (const reaction of reactions) {
-    const id = await reaction.locator(".omar-reaction-name").textContent();
-    const box = (await reaction.boundingBox())!;
-    const edges = page.locator(`[data-id$="${id}"]`);
-    expect(await edges.count()).toBeGreaterThan(0);
-    for (const edge of await edges.all()) {
-      const line = (await edge.boundingBox())!;
-      // The edge has to arrive within the chevron's own band, not above or
-      // below it.
-      expect(line.y + line.height).toBeGreaterThanOrEqual(box.y - 2);
-      expect(line.y).toBeLessThanOrEqual(box.y + box.height + 2);
+  // Shapes are placed by a transform that transitions, so a chevron and the
+  // edges into it can be sampled mid-flight and read as a few pixels apart.
+  // Poll until they agree: the transition is 320ms, and a real regression
+  // never converges.
+  const strays = async () => {
+    const found: string[] = [];
+    for (const reaction of reactions) {
+      const id = await reaction.locator(".omar-reaction-name").textContent();
+      const box = (await reaction.boundingBox())!;
+      const edges = page.locator(`[data-id$="${id}"]`);
+      if ((await edges.count()) === 0) found.push(`${id}: no edge`);
+      for (const edge of await edges.all()) {
+        const line = (await edge.boundingBox())!;
+        // The edge has to arrive within the chevron's own band, not above or
+        // below it.
+        const above = line.y + line.height < box.y - 2;
+        const below = line.y > box.y + box.height + 2;
+        if (above || below) found.push(`${id}: edge at ${line.y.toFixed(1)} misses band ${box.y.toFixed(1)}..${(box.y + box.height).toFixed(1)}`);
+      }
     }
-  }
+    return found;
+  };
+  await expect.poll(strays, { timeout: 4000 }).toEqual([]);
 });
 
 test("the timeline projects a program before anything is deployed", async ({
