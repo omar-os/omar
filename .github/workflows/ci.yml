@@ -582,6 +582,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check installer syntax and terminal behavior
+        run: |
+          sh -n install.sh
+          python3 tests/ci/installer_ui.py
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
