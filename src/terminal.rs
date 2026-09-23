@@ -217,6 +217,19 @@ impl Attachment {
                 command.args(["-L", &server]);
             }
         }
+        // tmux before 3.6 does not infer RGB support from COLORTERM. Declare
+        // it for this client, without changing the user's server options.
+        // Probe without connecting to a server: tmux 3.0/3.1 lack -T and must
+        // still be able to attach using their indexed-color fallback.
+        static SUPPORTS_FEATURE_FLAG: OnceLock<bool> = OnceLock::new();
+        if *SUPPORTS_FEATURE_FLAG.get_or_init(|| {
+            tmux_command()
+                .args(["-T", "RGB", "-V"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }) {
+            command.args(["-T", "RGB"]);
+        }
         command.args(["attach-session", "-t", target]);
         // A nested tmux would refuse to attach.
         command.env_remove("TMUX");
