@@ -67,7 +67,6 @@ test("deployment confirmation is a modal with lifecycle guidance and keyboard ca
   await expect(dialog).toBeVisible();
   await expect(dialog).toContainText("closing Mission Control keeps the topology, assistant, and runtime running");
   await expect(dialog).toContainText("Reopen Mission Control to reconnect");
-  await expect(dialog).toContainText("after 10 seconds");
   await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();

@@ -33,7 +33,6 @@ export function DeployConfirmation({ team, disabled, onCancel, onConfirm }: {
       <div id="deploy-details">
         <p>This starts real agents. While a topology is running, closing Mission Control keeps the topology, assistant, and runtime running.</p>
         <p>Reopen Mission Control to reconnect to the runtime and pick up your saved chat.</p>
-        <p>When no topologies are running and all Mission Control windows are closed, the assistant and runtime shut down after 10 seconds. Your chat history is saved.</p>
       </div>
       <div className="deploy-confirmation-actions">
         <button type="button" className="secondary-button" onClick={onCancel} autoFocus>Cancel</button>
