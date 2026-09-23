@@ -90,7 +90,12 @@ base_url="http://127.0.0.1:{http.server_port}/v1"
 wire_api="responses"
 requires_openai_auth=false
 supports_websockets=false
+[projects.{json.dumps(str(work))}]
+trust_level="trusted"
 '''
+    # This fixture tests saved-history resume, not interactive onboarding.
+    # Trust only its disposable workspace before launching Codex: observing
+    # the trust prompt does not guarantee its input handler is ready yet.
     (codex_home/'config.toml').write_text(config)
     (work/'.git').mkdir()
     server = 'omar-shared-home-'+str(os.getpid())
@@ -162,9 +167,6 @@ supports_websockets=false
         tmux('kill-session', '-t', first_session)
         command = shlex.join(['env', 'CODEX_HOME='+str(codex_home), 'codex', 'resume', first_thread, '--dangerously-bypass-approvals-and-sandbox', '-C', str(work)])
         tmux('new-session', '-d', '-s', 'plain-resume', '-x', '110', '-y', '35', '-c', str(work), command)
-        until(lambda: ('Do you trust' in pane('plain-resume')) or ('PROBE_ACK' in pane('plain-resume')), 'ordinary Codex startup')
-        if 'Do you trust' in pane('plain-resume'):
-            tmux('send-keys', '-t', 'plain-resume', 'Enter')
         until(lambda: 'PROBE_ACK' in pane('plain-resume'), 'ordinary Codex resume')
         assert 'No saved chat' not in pane('plain-resume')
         assert not (home/'.omar/codex').exists()
