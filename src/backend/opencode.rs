@@ -119,7 +119,7 @@ pub(crate) fn materialize_opencode_coordination_plugin(
         "const exe = {};\nconst contextFile = {};\n{}",
         serde_json::to_string(&exe).ok()?,
         serde_json::to_string(&context_file).ok()?,
-        include_str!("../backend_hooks/opencode.mjs")
+        include_str!("opencode/plugin.mjs")
     );
     write_private_file(&path, body.as_bytes()).ok()?;
     let encoded: String = path

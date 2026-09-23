@@ -1263,10 +1263,11 @@ impl OmarMcpServer {
             return Err(anyhow!("Agent '{}' already exists", short_name));
         }
         let tmux_spawn_start = std::time::Instant::now();
-        client.new_session(
+        client.new_session_with_backend(
             &session_name,
             &manager::scope_agent_command(&command, ea_id, &short_name, &self.context.omar_dir),
             Some(&workdir),
+            Some(&backend_name),
         )?;
         let task_id = if args.supervise.unwrap_or(supports_prompt_delivery) {
             Some(

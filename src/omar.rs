@@ -80,7 +80,7 @@ struct Cli {
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Create a new EA with this backend: claude, codex, cursor, opencode, agy
+    /// Create a new EA with this backend: claude, codex, cursor, opencode, pi, agy
     #[arg(short, long)]
     agent: Option<String>,
 

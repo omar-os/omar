@@ -579,7 +579,12 @@ impl App {
             .unwrap_or(workdir);
 
         self.client
-            .new_session(&manager_session, &cmd, Some(&launch_cwd))
+            .new_session_with_backend(
+                &manager_session,
+                &cmd,
+                Some(&launch_cwd),
+                crate::backend::command_name(&default_command),
+            )
             .map_err(|err| {
                 let msg = format!(
                     "tmux failed to start manager '{}' (cwd '{}') with command '{}': {}",
@@ -1728,7 +1733,7 @@ mod tests {
         let scheduler = Arc::new(Scheduler::new());
         let mut app = App::new(&config, TickerBuffer::new(), scheduler);
 
-        let mut commands: Vec<String> = ["claude", "codex", "cursor", "opencode", "agy"]
+        let mut commands: Vec<String> = ["claude", "codex", "cursor", "opencode", "agy", "pi"]
             .iter()
             .map(|name| {
                 crate::backend::resolve(name)

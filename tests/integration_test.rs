@@ -1089,7 +1089,7 @@ fn test_omar_mcp_server_tools_list_via_cli() {
     );
     assert_eq!(
         props["backend"]["enum"],
-        json!(["claude", "codex", "cursor", "opencode", "agy"]),
+        json!(["claude", "codex", "cursor", "opencode", "pi", "agy"]),
         "spawn_agent schema must advertise supported backend enum: {}",
         spawn_agent["inputSchema"]
     );

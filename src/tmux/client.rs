@@ -472,6 +472,18 @@ impl TmuxClient {
 
     /// Create a new detached session
     pub fn new_session(&self, name: &str, command: &str, workdir: Option<&str>) -> Result<()> {
+        self.new_session_with_backend(name, command, workdir, None)
+    }
+
+    /// Keep the selected backend through generated shell bootstraps. Raw
+    /// commands are classified only by executable position.
+    pub(crate) fn new_session_with_backend(
+        &self,
+        name: &str,
+        command: &str,
+        workdir: Option<&str>,
+        backend: Option<&str>,
+    ) -> Result<()> {
         let (cols, rows) = agent_dimensions(crossterm::terminal::size().ok());
         let cols = cols.to_string();
         let rows = rows.to_string();
@@ -483,7 +495,9 @@ impl TmuxClient {
 
         // The backend decides what its pane is launched with; this only
         // hands tmux what it was given.
-        let backend = crate::backend::detect(command);
+        let backend = backend
+            .and_then(crate::backend::by_name)
+            .or_else(|| crate::backend::detect(command));
         let setup = match backend {
             Some(backend) => backend.prepare_pane(name, command)?,
             None => crate::backend::PaneSetup {

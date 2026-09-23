@@ -19,6 +19,7 @@ pub(crate) mod codex;
 pub(crate) mod cursor;
 pub(crate) mod managed;
 pub(crate) mod opencode;
+pub(crate) mod pi;
 pub(crate) mod spool;
 pub(crate) mod stub;
 
@@ -159,6 +160,7 @@ pub enum Kind {
     Codex,
     Cursor,
     Opencode,
+    Pi,
     Stub,
 }
 
@@ -324,11 +326,12 @@ pub(crate) fn remember_conversation(
     Ok(())
 }
 
-pub const ALL: [&dyn Backend; 6] = [
+pub const ALL: [&dyn Backend; 7] = [
     &claude::Claude,
     &codex::Codex,
     &cursor::Cursor,
     &opencode::Opencode,
+    &pi::Pi,
     &antigravity::Antigravity,
     &stub::Stub,
 ];
@@ -337,11 +340,12 @@ pub const ALL: [&dyn Backend; 6] = [
 ///
 /// The stub is deliberately absent: it answers invocations without a model,
 /// which is useful for exercising a run and useless for talking to.
-pub const ASSISTANT: [Kind; 5] = [
+pub const ASSISTANT: [Kind; 6] = [
     Kind::Claude,
     Kind::Codex,
     Kind::Cursor,
     Kind::Opencode,
+    Kind::Pi,
     Kind::Antigravity,
 ];
 
@@ -351,7 +355,7 @@ pub fn of(kind: Kind) -> &'static dyn Backend {
         .expect("every kind is registered")
 }
 
-pub fn assistant_names() -> [&'static str; 5] {
+pub fn assistant_names() -> [&'static str; 6] {
     ASSISTANT.map(Kind::name)
 }
 
@@ -368,7 +372,7 @@ pub fn resolve(name: &str) -> Result<&'static dyn Backend, String> {
     // command to resolve. It is named so a typo is told what it meant.
     by_name(name).ok_or_else(|| {
         format!(
-            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, agy, stub, web",
+            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, pi, agy, stub, web",
             name
         )
     })
@@ -385,10 +389,119 @@ pub fn detect_token(token: &str) -> Option<&'static dyn Backend> {
         .find(|backend| backend.executables().contains(&executable))
 }
 
-/// The backend a command line runs: the first token that is one of ours, so
-/// an `env` wrapper or a variable assignment before it does not hide it.
+/// Read a literal shell word without evaluating it. Retain byte offsets so
+/// runtime flags can be inserted after a quoted executable path. Stop at shell
+/// operators or expansions: guessing through those can modify another program.
+fn command_word(command: &str, offset: &mut usize) -> Option<String> {
+    let mut chars = command[*offset..].char_indices().peekable();
+    while chars
+        .peek()
+        .is_some_and(|(_, c)| c.is_whitespace() && *c != '\n')
+    {
+        chars.next();
+    }
+    let start = chars.peek()?.0;
+    if chars.peek()?.1 == '#' {
+        return None;
+    }
+    let mut word = String::new();
+    let mut quote = None;
+    let mut end = start;
+    while let Some((index, c)) = chars.next() {
+        if quote.is_none() && (c.is_whitespace() || ";|&()<>".contains(c)) {
+            break;
+        }
+        end = index + c.len_utf8();
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (None, '\'' | '"') => quote = Some(c),
+            (Some('\''), _) => word.push(c),
+            (_, '$' | '`') => return None,
+            (_, '\\') => {
+                let (index, escaped) = chars.next()?;
+                if quote == Some('"') && !matches!(escaped, '$' | '`' | '"' | '\\' | '\n') {
+                    word.push('\\');
+                }
+                if escaped != '\n' {
+                    word.push(escaped);
+                }
+                end = index + escaped.len_utf8();
+            }
+            _ => word.push(c),
+        }
+    }
+    if quote.is_some() || end == start {
+        return None;
+    }
+    *offset += end;
+    Some(word)
+}
+
+fn is_environment_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+}
+
+/// Only classify the executable, after literal assignments and supported
+/// launch wrappers. Arguments and later pipeline/compound commands are never
+/// searched for backend names.
+pub(crate) fn executable(command: &str) -> Option<(Kind, usize)> {
+    let mut offset = 0;
+    let mut word;
+    loop {
+        let start = offset;
+        word = command_word(command, &mut offset)?;
+        if !is_environment_assignment(command[start..offset].trim_start()) {
+            break;
+        }
+    }
+    if matches!(word.as_str(), "exec" | "command") {
+        word = command_word(command, &mut offset)?;
+        if word == "--" {
+            word = command_word(command, &mut offset)?;
+        }
+    }
+    if Path::new(&word).file_name()?.to_str()? == "env" {
+        let mut options = true;
+        loop {
+            word = command_word(command, &mut offset)?;
+            match word.as_str() {
+                "-i" | "--ignore-environment" if options => continue,
+                "-u" | "--unset" | "-C" | "--chdir" if options => {
+                    command_word(command, &mut offset)?;
+                    continue;
+                }
+                "--" if options => {
+                    options = false;
+                    continue;
+                }
+                _ if options && (word.starts_with("--unset=") || word.starts_with("--chdir=")) => {
+                    continue
+                }
+                _ if is_environment_assignment(&word) => {
+                    options = false;
+                    continue;
+                }
+                _ if word.starts_with('-') => return None,
+                _ => break,
+            }
+        }
+    }
+    if Path::new(&word).file_name()?.to_str()? == "omar" {
+        return (command_word(command, &mut offset)? == "stub-agent")
+            .then_some((Kind::Stub, offset));
+    }
+    detect_token(&word).map(|backend| (backend.kind(), offset))
+}
+
 pub fn detect(command: &str) -> Option<&'static dyn Backend> {
-    command.split_whitespace().find_map(detect_token)
+    executable(command).map(|(kind, _)| of(kind))
 }
 
 /// The canonical name of the backend a command line runs.
@@ -529,6 +642,7 @@ mod tests {
             Kind::Codex,
             Kind::Cursor,
             Kind::Opencode,
+            Kind::Pi,
             Kind::Stub,
         ] {
             assert_eq!(of(kind).kind(), kind);
@@ -541,7 +655,7 @@ mod tests {
         }
         assert_eq!(
             assistant_names(),
-            ["claude", "codex", "cursor", "opencode", "agy"]
+            ["claude", "codex", "cursor", "opencode", "pi", "agy"]
         );
     }
 
@@ -689,6 +803,7 @@ mod tests {
         for kind in [
             Kind::Codex,
             Kind::Opencode,
+            Kind::Pi,
             Kind::Cursor,
             Kind::Antigravity,
             Kind::Stub,

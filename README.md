@@ -126,6 +126,7 @@ Shutdown the test project and its agents.
 | [Cursor CLI](https://cursor.com/cli) | `omar -a cursor` |
 | [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode` |
 | [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy` |
+| [Pi](https://pi.dev) | `omar -a pi` |
 
 Each `omar -a <backend>` launch creates a new EA, named with its new EA number.
 Use `omar -a codex --ea Research` to give the new EA a semantic name. An existing
