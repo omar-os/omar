@@ -35,12 +35,14 @@ const PROPOSED_PROGRAM = await readFile(
 
 export async function startFakeServe({
   stepMs = 120,
+  liveChatReplayDelayMs = 0,
   host = "127.0.0.1",
   port = 0,
   /** Which captured topology to replay; see tests/fixtures. */
   snapshot: snapshotFile = "diagram-snapshot.v1.json",
   /** The geometry a terminal announces, as the daemon reports the agent's. */
   terminal: terminalSize = { cols: 96, rows: 28 },
+  terminalReflow = false,
 } = {}) {
   const golden = JSON.parse(
     await readFile(new URL(`./fixtures/${snapshotFile}`, import.meta.url), "utf8"),
@@ -49,8 +51,12 @@ export async function startFakeServe({
   /** @type {Map<string, {record: object, snapshot: object, subscribers: Set<import("node:http").ServerResponse>, sequence: number}>} */
   const runs = new Map();
 
-  const server = createServer((request, response) => {
+  const server = createServer(async (request, response) => {
     const url = new URL(request.url, `http://${request.headers.host}`);
+    const scoped = /^\/chats\/([^/]+)(\/.*)$/.exec(url.pathname);
+    const chat = scoped ? chats.get(scoped[1]) : activeChat;
+    if (!chat) return json(response, 404, { error: "unknown chat" });
+    if (scoped) url.pathname = scoped[2];
 
     if (request.method === "OPTIONS") {
       response.writeHead(204, CORS).end();
@@ -63,11 +69,11 @@ export async function startFakeServe({
       return readBody(request).then((body) => checkProgram(body, response));
     }
     if (request.method === "POST" && url.pathname === "/v1/runs") {
-      return readBody(request).then((body) => admit(body, response));
+      return readBody(request).then((body) => admit(body, response, chat));
     }
     if (request.method === "GET" && url.pathname === "/v1/runs") {
       return json(response, 200, {
-        runs: [...runs.values()].map((entry) => entry.record),
+        runs: [...chat.runs.values()].map((entry) => entry.record),
       });
     }
     // Before the run-record route, which matches any suffix — the same order
@@ -78,7 +84,7 @@ export async function startFakeServe({
       url.pathname.endsWith("/stop")
     ) {
       const id = url.pathname.slice("/v1/runs/".length, -"/stop".length);
-      const entry = runs.get(id);
+      const entry = chat.runs.get(id);
       if (!entry) return json(response, 404, { error: "unknown run" });
       // A stopping run is still active, as on the daemon: it holds its sessions
       // until the tag closes.
@@ -97,7 +103,7 @@ export async function startFakeServe({
     }
     if (url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/panel")) {
       const id = url.pathname.slice("/v1/runs/".length, -"/panel".length);
-      const entry = runs.get(id);
+      const entry = chat.runs.get(id);
       if (!entry) return json(response, 404, { error: "unknown run" });
       if (request.method === "GET") {
         return json(response, 200, {
@@ -135,20 +141,20 @@ export async function startFakeServe({
       }
     }
     if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
-      const entry = runs.get(url.pathname.slice("/v1/runs/".length));
+      const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length));
       return entry
         ? json(response, 200, entry.record)
         : json(response, 404, { error: "unknown run" });
     }
     // Diagram surface for the single active run, mirroring the per-run server.
     if (request.method === "GET" && url.pathname === "/v1/diagram") {
-      const entry = latest();
+      const entry = latest(chat);
       return entry
         ? json(response, 200, entry.snapshot)
         : json(response, 404, { error: "no run" });
     }
     if (request.method === "GET" && url.pathname === "/v1/events") {
-      return subscribe(response);
+      return subscribe(response, latest(chat));
     }
     // Agent-only endpoints. The stand-in assistant is internal, so these exist
     // to mirror the real daemon's surface rather than to be used.
@@ -189,7 +195,7 @@ export async function startFakeServe({
           return json(response, 403, { error: "forbidden" });
         }
         if (url.pathname === "/v1/agent/reply") {
-          publishChat("assistant", String(payload.text ?? ""), null, payload.progress === true);
+          publishChat("assistant", String(payload.text ?? ""), null, payload.progress === true, [], chat);
         } else if (url.pathname === "/v1/agent/proposals") {
           const preview = structuredClone(golden);
           preview.status = "ready";
@@ -197,7 +203,7 @@ export async function startFakeServe({
             program: String(payload.program ?? ""),
             inputs: payload.inputs ?? {},
             preview,
-          });
+          }, false, [], chat);
         } else {
           return json(response, 404, { error: "not found" });
         }
@@ -205,14 +211,26 @@ export async function startFakeServe({
       });
     }
     // Operator/EA conversation.
+    if (request.method === "GET" && url.pathname === "/v1/chats") {
+      return json(response, 200, { active_id: activeChat.id, conversations: [...chats.values()].map(chatSummary).sort((a, b) => b.updated_at - a.updated_at) });
+    }
+    if (request.method === "POST" && (url.pathname === "/v1/chats" || /^\/v1\/chats\/[^/]+\/activate$/.test(url.pathname))) {
+      await readBody(request);
+      const id = url.pathname === "/v1/chats" ? null : url.pathname.split("/")[3];
+      const next = id ? chats.get(id) : newChat();
+      if (!next) return json(response, 404, { error: "unknown chat" });
+      activeChat = next;
+      chats.set(next.id, next);
+      return json(response, 200, chatSummary(next));
+    }
     if (request.method === "GET" && url.pathname === "/v1/chat") {
-      return json(response, 200, { messages: chat.messages });
+      return json(response, 200, { ...chatSummary(chat), messages: chat.messages });
     }
     if (request.method === "POST" && url.pathname === "/v1/chat") {
-      return readBody(request).then((body) => converse(body, response));
+      return readBody(request).then((body) => converse(body, response, chat));
     }
     if (request.method === "GET" && url.pathname === "/v1/chat/events") {
-      return subscribeChat(response);
+      return subscribeChat(response, chat);
     }
     json(response, 404, { error: "not found" });
   });
@@ -223,6 +241,7 @@ export async function startFakeServe({
   const terminals = new WebSocketServer({ noServer: true });
   server.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url, "http://127.0.0.1");
+    url.pathname = url.pathname.replace(/^\/chats\/[^/]+/, "");
     // The assistant has a route of its own: its tmux session is not named
     // like an agent's, so no agent name reaches it.
     const assistant = url.pathname === "/v1/agent/terminal";
@@ -241,9 +260,21 @@ export async function startFakeServe({
     }
     terminals.handleUpgrade(request, socket, head, (client) => {
       const agent = decodeURIComponent(match[1]);
-      let size = terminalSize;
+      let size = url.searchParams.has("cols")
+        ? { cols: Number(url.searchParams.get("cols")), rows: Number(url.searchParams.get("rows")) }
+        : terminalSize;
+      const draw = () => {
+        if (!terminalReflow) return;
+        // Full-screen fixture: right/bottom edge sentinels expose clipping,
+        // and a cleared redraw exposes duplicate output after a width change.
+        client.send(Buffer.from(`\x1b[2J\x1b[HFRAME ${size.cols}x${size.rows}` +
+          `\x1b[2;1H${"x".repeat(size.cols - 1)}R` +
+          `\x1b[${size.rows};1HBOTTOM`));
+      };
       client.send(JSON.stringify(size));
-      client.send(Buffer.from(`${agent} $ `));
+      if (terminalReflow) client.send(Buffer.from("\x1b[?1049h"));
+      draw();
+      if (!terminalReflow) client.send(Buffer.from(`${agent} $ `));
       client.on("message", (data, isBinary) => {
         // Text is a resize control frame, binary is keystrokes. The daemon
         // reflows the session and answers with the shape it settled on;
@@ -251,6 +282,7 @@ export async function startFakeServe({
         if (!isBinary) {
           size = JSON.parse(data.toString());
           client.send(JSON.stringify(size));
+          draw();
           return;
         }
         client.send(Buffer.from(data));
@@ -259,10 +291,17 @@ export async function startFakeServe({
   });
 
   let backend = "codex";
-  const chat = { messages: [], subscribers: new Set(), sequence: 0 };
+  function newChat() {
+    return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map() };
+  }
+  let activeChat = newChat();
+  const chats = new Map([[activeChat.id, activeChat]]);
+  function chatSummary(value = activeChat) {
+    return { id: value.id, title: value.title, created_at: value.created_at, updated_at: value.updated_at, message_count: value.messages.length, ea_id: [...chats.keys()].indexOf(value.id), busy: value.busy, run: value.run ?? null };
+  }
   const agentToken = randomUUID();
 
-  function publishChat(role, text, design, progress = false, selection = []) {
+  function publishChat(role, text, design, progress = false, selection = [], chat = activeChat) {
     chat.sequence += 1;
     const message = {
       sequence: chat.sequence,
@@ -272,20 +311,25 @@ export async function startFakeServe({
       design: design ?? null,
       selection,
     };
+    if (role === "operator" && !chat.messages.some((m) => m.role === "operator")) chat.title = text.slice(0, 80);
     chat.messages.push(message);
+    chat.updated_at = Date.now();
+    if (role === "operator") chat.busy = true;
+    else if (!progress) chat.busy = false;
     const kind = design ? "design_proposed" : "message";
     const frame = `id: ${message.sequence}\nevent: ${kind}\ndata: ${JSON.stringify(message)}\n\n`;
     for (const subscriber of chat.subscribers) subscriber.write(frame);
     return message;
   }
 
-  function subscribeChat(response) {
+  function subscribeChat(response, chat) {
     response.writeHead(200, {
       ...CORS,
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
       connection: "keep-alive",
     });
+    response.write(`event: conversation\ndata: ${JSON.stringify(chatSummary(chat))}\n\n`);
     response.write(": connected\n\n");
     // Replay, matching the real server, so a reload rejoins the conversation.
     for (const message of chat.messages) {
@@ -294,15 +338,19 @@ export async function startFakeServe({
         `id: ${message.sequence}\nevent: ${kind}\ndata: ${JSON.stringify(message)}\n\n`,
       );
     }
-    chat.subscribers.add(response);
-    response.on("close", () => chat.subscribers.delete(response));
+    const stateFrame = `event: chat_state\ndata: ${JSON.stringify(chatSummary(chat))}\n\n`;
+    if (chat.run && liveChatReplayDelayMs) setTimeout(() => response.write(stateFrame), liveChatReplayDelayMs);
+    else response.write(stateFrame);
+    const subscribedChat = chat;
+    subscribedChat.subscribers.add(response);
+    response.on("close", () => subscribedChat.subscribers.delete(response));
   }
 
   /**
    * Stands in for the EA. Asks one clarifying question first, so the studio's
    * multi-turn handling is exercised, then proposes on the next message.
    */
-  function converse(body, response) {
+  function converse(body, response, chat) {
     let request;
     try {
       request = JSON.parse(body);
@@ -318,7 +366,9 @@ export async function startFakeServe({
         error: `selection names more than ${MAX_SELECTION} components`,
       });
     }
-    const operator = publishChat("operator", request.text, null, false, selection);
+    if (request.conversation_id && request.conversation_id !== chat.id) return json(response, 409, { error: "The active chat changed." });
+    const publish = (role, text, design, progress = false) => publishChat(role, text, design, progress, [], chat);
+    const operator = publishChat("operator", request.text, null, false, selection, chat);
     json(response, 202, operator);
 
     const asked = chat.messages.some(
@@ -326,12 +376,12 @@ export async function startFakeServe({
     );
     // Real assistants narrate while they work; that must not end the wait.
     setTimeout(
-      () => publishChat("assistant", "Reading the ports and reactions…", null, true),
+      () => publish("assistant", "Reading the ports and reactions…", null, true),
       Math.max(10, stepMs / 3),
     );
     setTimeout(() => {
       if (!asked) {
-        publishChat(
+        publish(
           "assistant",
           "Which agent should own the final write, the planner or the reviewer?",
         );
@@ -342,7 +392,7 @@ export async function startFakeServe({
       const preview = structuredClone(golden);
       preview.status = "ready";
       // Markdown, because that is what the EA actually writes.
-      publishChat(
+      publish(
         "assistant",
         "Drafted a **three-reaction** review loop.\n\n" +
           "- `planner` drafts the plan\n" +
@@ -357,14 +407,14 @@ export async function startFakeServe({
       // Real assistants comment straight after proposing. That must not look
       // like a withdrawal of the proposal.
       setTimeout(
-        () => publishChat("assistant", "It is in your queue for approval."),
+        () => publish("assistant", "It is in your queue for approval."),
         stepMs,
       );
     }, stepMs);
   }
 
-  function latest() {
-    return [...runs.values()].at(-1);
+  function latest(chat = activeChat) {
+    return [...chat.runs.values()].at(-1);
   }
 
   /**
@@ -476,7 +526,7 @@ export async function startFakeServe({
       }));
   }
 
-  function admit(body, response) {
+  async function admit(body, response, chat) {
     let request;
     try {
       request = JSON.parse(body);
@@ -524,12 +574,22 @@ export async function startFakeServe({
       pending: webPending(snapshot),
       answered: null,
     };
+    // Each live run has an independent diagram server, just like the runtime.
+    const diagramServer = createServer((request, response) => {
+      if (request.url === "/v1/diagram") return json(response, 200, entry.snapshot);
+      if (request.url === "/v1/events") return subscribe(response, entry);
+      return json(response, 404, { error: "not found" });
+    });
+    await new Promise((resolve) => diagramServer.listen(0, host, resolve));
+    entry.record.diagram_address = `${host}:${diagramServer.address().port}`;
+    entry.diagramServer = diagramServer;
     runs.set(runId, entry);
+    chat.runs.set(runId, entry);
+    chat.run = entry.record;
     json(response, 201, entry.record);
   }
 
-  function subscribe(response) {
-    const entry = latest();
+  function subscribe(response, entry = latest()) {
     if (!entry) return json(response, 404, { error: "no run" });
     response.writeHead(200, {
       ...CORS,
@@ -621,8 +681,10 @@ export async function startFakeServe({
       terminals.close();
       for (const entry of runs.values()) {
         for (const subscriber of entry.subscribers) subscriber.end();
+        entry.diagramServer.closeAllConnections();
+        await new Promise((resolve) => entry.diagramServer.close(resolve));
       }
-      for (const subscriber of chat.subscribers) subscriber.end();
+      for (const chat of chats.values()) for (const subscriber of chat.subscribers) subscriber.end();
       // Pooled keep-alive sockets would otherwise hold `close` open until they
       // idle out, adding seconds to every test.
       server.closeAllConnections();

@@ -30,7 +30,9 @@ test("renders the OMAR Mission Control application shell", async () => {
 
   const html = await response.text();
   assert.match(html, /<title>OMAR Mission Control<\/title>/i);
-  assert.match(html, /WORKFLOW BUILDER/);
+  assert.doesNotMatch(html, /WORKFLOW BUILDER/);
+  assert.doesNotMatch(html, /class="topbar"/);
+  assert.match(html, /alt="Omar"/);
   assert.match(html, /LIVE TOPOLOGY/);
   assert.match(html, /ReviewFlow\.omar/);
   // Mode is a launch flag, so with OMAR_SERVE_URL unset the shell renders the

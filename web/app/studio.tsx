@@ -2,6 +2,8 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
+import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
+import { DeployConfirmation } from "./deploy-confirmation";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
@@ -22,6 +24,7 @@ import {
   isRunFinished,
   openInputs,
   type ChatMessage,
+  type ConversationSummary,
   type DiagramEvent,
   type DiagramSnapshot,
   type PendingInvocation,
@@ -41,6 +44,7 @@ import {
   startRun,
   stopRun,
   subscribeToDiagram,
+  fetchConversations,
 } from "./lib/runtime-client";
 
 /**
@@ -81,14 +85,41 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-export function Studio({
-  serveUrl = "",
-  designAgent,
-}: {
-  serveUrl?: string;
-  designAgent?: DesignAgent;
+type StudioProps = { serveUrl?: string; designAgent?: DesignAgent };
+
+export function Studio({ serveUrl = "", designAgent }: StudioProps) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const select = useCallback((conversation: ConversationSummary) => {
+    setSelected(conversation.id);
+    sessionStorage.setItem(`omar-chat:${serveUrl}`, conversation.id);
+  }, [serveUrl]);
+  useEffect(() => {
+    if (!serveUrl) return;
+    const saved = sessionStorage.getItem(`omar-chat:${serveUrl}`);
+    if (!saved) return;
+    const abort = new AbortController();
+    void fetchConversations(serveUrl, abort.signal).then((history) => {
+      if (!abort.signal.aborted && history.conversations.some((chat) => chat.id === saved)) setSelected(saved);
+    }).catch(() => {});
+    return () => abort.abort();
+  }, [serveUrl]);
+  const scopedUrl = selected ? `${serveUrl.replace(/\/$/, "")}/chats/${encodeURIComponent(selected)}` : serveUrl;
+  return <StudioWorkspace serveUrl={scopedUrl} historyUrl={serveUrl}
+    designAgent={designAgent} selectedId={selected} onSelect={select} />;
+}
+
+function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, onSelect }: StudioProps & {
+  historyUrl: string;
+  selectedId: string | null;
+  onSelect: (conversation: ConversationSummary) => void;
 }) {
   const isDemo = serveUrl.trim().length === 0;
+  // Requests from a previous selection must not update the retained workspace.
+  const scopeRef = useRef(0);
+  useEffect(() => {
+    scopeRef.current += 1;
+    return () => { scopeRef.current += 1; };
+  }, [serveUrl]);
   const [snapshot, setSnapshot] = useState<DiagramSnapshot | null>(
     isDemo ? reviewWorkflow : null,
   );
@@ -130,6 +161,10 @@ export function Studio({
     isDemo ? { state: "demo" } : { state: "checking" },
   );
   const [phase, setPhase] = useState<Phase>("idle");
+  const [assistantBusy, setAssistantBusy] = useState(false);
+  const [selectingChat, setSelectingChat] = useState(false);
+  const [hydratedUrl, setHydratedUrl] = useState(isDemo ? serveUrl : null);
+  const switchingChat = selectingChat || hydratedUrl !== serveUrl;
   const [design, setDesign] = useState<ProposedDesign | null>(null);
   const [run, setRun] = useState<RunRecord | null>(null);
   const [error, setError] = useState("");
@@ -138,6 +173,32 @@ export function Studio({
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(true);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [historyRevision, setHistoryRevision] = useState(0);
+  const historyButtonRef = useRef<HTMLButtonElement>(null);
+    const historyRailButtonRef = useRef<HTMLButtonElement>(null);
+  const historyDrawer = useHistoryDrawer();
+  useEffect(() => {
+    if (historyDrawer && !switchingChat && serveUrl !== historyUrl) historyButtonRef.current?.focus();
+  }, [historyDrawer, serveUrl, historyUrl, switchingChat]);
+  const historyVisible = !isDemo && (historyDrawer ? drawerOpen : historyOpen);
+  function closeHistory() {
+    if (historyDrawer) setDrawerOpen(false);
+    else setHistoryOpen(false);
+    historyButtonRef.current?.focus();
+  }
+    function openHistory() {
+    if (historyDrawer) setDrawerOpen(true);
+    else setHistoryOpen(true);
+  }
+  useEffect(() => {
+    if (!isDemo && !historyDrawer && !historyOpen) historyRailButtonRef.current?.focus();
+  }, [historyDrawer, historyOpen, isDemo]);
+
+  const conversationIdRef = useRef<string | null>(null);
+  const [conversationId, setConversationId] = useState("");
+  const [conversationTitle, setConversationTitle] = useState("What should the team do?");
   /** The web agent whose port panel is open. A program may declare several,
       each with its own ports and prompts, so this names one rather than
       merging them into a shared view. */
@@ -234,55 +295,40 @@ export function Studio({
     [designAgent, isDemo, serveUrl],
   );
 
-  // The conversation is owned by the runtime, not this component: the stream
-  // replays history on connect, so a reload rejoins rather than starting over.
-  useEffect(() => {
-    const unsubscribe = agent.subscribe(
-      (message) => {
-        setMessages((current) =>
-          current.some((seen) => seen.sequence === message.sequence)
-            ? current
-            : [...current, message],
-        );
-        if (!message.design) {
-          // Only an assistant reply ends the wait — the operator's own message
-          // echoes back off the same stream, and commentary while it works is
-          // the opposite of finishing. And a reply must not withdraw a pending
-          // proposal: assistants routinely comment straight after proposing
-          // ("…is in your queue"), which was retracting the gate.
-          if (message.role === "assistant" && !message.progress) {
-            setPhase((current) => (current === "drafting" ? "idle" : current));
-          }
-          return;
-        }
-        setConfirming(false);
-        setDesign(message.design);
-        setSource(message.design.program);
-        setSourceErrors([]);
-        setFilename(`${message.design.preview.team}.omar`);
-        // Show the proposed topology, not whatever was on screen before.
-        setSnapshot(message.design.preview);
-        if (!arrangedRef.current) {
-          arrangedRef.current = true;
-          const available = workspaceRef.current?.clientWidth ?? 0;
-          // Conversation and diagram side by side; the source pane starts
-          // collapsed behind its handle rather than crowding the first look.
-          if (available) setBuilderWidth(Math.round(available / 2));
-          setInspectorWidth(0);
-        }
-        setPhase("review");
-      },
-      () => {
-        /* daemon health is polled separately */
-      },
-    );
-    // Clear on teardown rather than on subscribe: transcripts belong to an
-    // agent, and setting state synchronously in an effect cascades renders.
-    return () => {
-      unsubscribe();
-      setMessages([]);
-    };
-  }, [agent]);
+  const restoreConversation = useCallback((conversation: ConversationSummary) => {
+    setHistoryRevision((current) => current + 1);
+    setConversationTitle(conversation.message_count ? conversation.title : "What should the team do?");
+    if (conversationIdRef.current === conversation.id) return;
+    conversationIdRef.current = conversation.id;
+    setConversationId(conversation.id);
+    disconnectRef.current?.();
+    disconnectRef.current = null;
+    checkTokenRef.current += 1;
+    runRef.current = null;
+    setMessages([]);
+    setRun(null);
+    setAnswering(false);
+    setChecking(false);
+    setEvents([]);
+    setPending([]);
+    setDesign(null);
+    setSnapshot(null);
+    setSource("");
+    setFilename("program.omar");
+    setSourceErrors([]);
+    setSelection([]);
+    setConfirming(false);
+    setPhase("idle");
+    setPrompt("");
+    setError("");
+    setTerminalAgent(null);
+    setPanelAgent(null);
+    setSteps([]);
+    setStepIndex(0);
+    setTimelineOpen(false);
+    setTab("source");
+    // Keep the operator's split widths when replacing one topology with another.
+  }, []);
 
   useEffect(() => {
     const thread = threadRef.current;
@@ -292,19 +338,23 @@ export function Studio({
   async function submitPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const request = prompt.trim();
-    if (!request || phase === "drafting" || phase === "spawning") return;
+    if (!request || (switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning") return;
     const selected = selection;
     setPrompt("");
+    const scope = scopeRef.current;
     setError("");
     // The selection belonged to the message just sent. Keeping it would
     // silently attach it to the next one too.
     setSelection([]);
-    setPhase("drafting");
+    setAssistantBusy(true);
+    if (!run || isRunFinished(run.status)) setPhase("drafting");
     try {
       await agent.send(request, selected);
     } catch (cause) {
+      if (scope !== scopeRef.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
-      setPhase("idle");
+      setAssistantBusy(false);
+      setPhase(run && !isRunFinished(run.status) ? "observing" : "idle");
     }
   }
 
@@ -312,7 +362,8 @@ export function Studio({
   const loadPanel = useCallback(
     async (runId: string) => {
       try {
-        setPending(await fetchPanel(serveUrl, runId));
+        const next = await fetchPanel(serveUrl, runId);
+        if (runRef.current?.run_id === runId) setPending(next);
       } catch {
         // A panel that cannot be read is not a run that has failed. The next
         // event asks again.
@@ -328,6 +379,7 @@ export function Studio({
   ) {
     if (!run) return;
     setAnswering(true);
+    const scope = scopeRef.current;
     setError("");
     try {
       await answerPanel(serveUrl, run.run_id, {
@@ -335,11 +387,13 @@ export function Studio({
         agent: invocation.agent,
         values,
       });
+      if (scope !== scopeRef.current) return;
       await loadPanel(run.run_id);
     } catch (cause) {
+      if (scope !== scopeRef.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setAnswering(false);
+      if (scope === scopeRef.current) setAnswering(false);
     }
   }
 
@@ -348,9 +402,11 @@ export function Studio({
     (record: RunRecord) => {
       const diagramUrl = diagramUrlFor(record);
       disconnectRef.current?.();
+      let connected = true;
 
       const refresh = async () => {
-        setSnapshot(await fetchDiagram(diagramUrl));
+        const next = await fetchDiagram(diagramUrl);
+        if (connected) setSnapshot(next);
       };
       void refresh().catch(() => {
         /* the SSE stream reports connection loss */
@@ -364,6 +420,7 @@ export function Studio({
       const settle = async () => {
         for (let attempt = 0; attempt < 10; attempt += 1) {
           const latest = await fetchRun(serveUrl, record.run_id).catch(() => null);
+          if (!connected) return;
           if (latest) {
             setRun(latest);
             if (isRunFinished(latest.status)) {
@@ -378,9 +435,10 @@ export function Studio({
         }
       };
 
-      disconnectRef.current = subscribeToDiagram(
+      const unsubscribe = subscribeToDiagram(
         diagramUrl,
         (event) => {
+          if (!connected) return;
           setEvents((current) => [event, ...current].slice(0, 8));
           // A live run walks the same list the projection drew. Matched on the
           // tag rather than counted, so a run that reaches a tag the projection
@@ -429,14 +487,176 @@ export function Studio({
         // expected at the end rather than an error. Ask serve what happened.
         () => void settle(),
       );
+      disconnectRef.current = () => {
+        connected = false;
+        unsubscribe();
+      };
     },
     [serveUrl, loadPanel],
   );
+
+  // A chat can be reopened during admission, before its diagram binds.
+  useEffect(() => {
+    if (switchingChat || !run || run.diagram_address || isRunFinished(run.status)) return;
+    const abort = new AbortController();
+    const poll = async () => {
+      try {
+        const latest = await fetchRun(serveUrl, run.run_id, abort.signal);
+        if (abort.signal.aborted) return;
+        runRef.current = latest;
+        setRun(latest);
+        if (isRunFinished(latest.status)) {
+          setPhase(latest.status === "failed" ? "failed" : "finished");
+          if (latest.error) setError(latest.error);
+        } else if (latest.diagram_address) {
+          observe(latest);
+          void loadPanel(latest.run_id);
+        }
+      } catch { /* daemon health reports connectivity */ }
+    };
+    const timer = setInterval(() => void poll(), 500);
+    return () => { abort.abort(); clearInterval(timer); };
+  }, [run, serveUrl, observe, loadPanel, switchingChat]);
+
+  // The conversation is owned by the runtime, not this component: the stream
+  // replays history on connect, so a reload rejoins rather than starting over.
+  useEffect(() => {
+    let connected = true;
+    let revision = 0;
+    const abort = new AbortController();
+    let subscribedId: string | undefined;
+    let replaying = false;
+    let replayedProposal = false;
+    let restoring = false;
+    let buffered: ChatMessage[] = [];
+    const applyMessage = (message: ChatMessage) => {
+      if (message.role === "operator") {
+        setAssistantBusy(true);
+        setConversationTitle((title) => title === "What should the team do?" ? message.text.replace(/\s+/g, " ").slice(0, 80) : title);
+      }
+      setMessages((current) =>
+        current.some((seen) => seen.sequence === message.sequence)
+          ? current
+          : [...current, message],
+      );
+      if (message.role === "assistant" && !message.progress) setAssistantBusy(false);
+      if (!message.design) {
+        // Only an assistant reply ends the wait — the operator's own message
+        // echoes back off the same stream, and commentary while it works is
+        // the opposite of finishing. And a reply must not withdraw a pending
+        // proposal: assistants routinely comment straight after proposing
+        // ("…is in your queue"), which was retracting the gate.
+        if (message.role === "assistant" && !message.progress) {
+          setPhase((current) => (current === "drafting" ? "idle" : current));
+        }
+        return;
+      }
+      if (replaying) replayedProposal = true;
+      // A fresh proposal remains in the transcript while this chat's
+      // deployed topology continues to own the live diagram and controls.
+      if (!replaying && runRef.current && !isRunFinished(runRef.current.status)) return;
+      setConfirming(false);
+      setDesign(message.design);
+      setSource(message.design.program);
+      setSourceErrors([]);
+      setFilename(`${message.design.preview.team}.omar`);
+      // Show the proposed topology, not whatever was on screen before.
+      setSnapshot(message.design.preview);
+      if (!arrangedRef.current) {
+        arrangedRef.current = true;
+        const available = workspaceRef.current?.clientWidth ?? 0;
+        // Conversation and diagram side by side; the source pane starts
+        // collapsed behind its handle rather than crowding the first look.
+        if (available) setBuilderWidth(Math.round(available / 2));
+        setInspectorWidth(0);
+      }
+      setPhase(runRef.current && !isRunFinished(runRef.current.status) ? "observing" : "review");
+    };
+    const unsubscribe = agent.subscribe(
+      (message) => {
+        if (!connected) return;
+        if (restoring) buffered.push(message);
+        else if (!subscribedId || subscribedId === conversationIdRef.current) applyMessage(message);
+      },
+      () => {
+        /* daemon health is polled separately */
+      },
+      (conversation) => {
+        revision += 1;
+        subscribedId = conversation.id;
+        restoring = true;
+        buffered = [];
+      },
+      (conversation) => {
+        if (!connected || conversation.id !== subscribedId) return;
+        const currentRevision = ++revision;
+        const replay = buffered;
+        buffered = [];
+        const restore = async () => {
+          const activeRun = conversation.run && !isRunFinished(conversation.run.status);
+          // Keep the current chat on screen while its replacement is replayed
+          // and its live snapshot is fetched. Commit them in one React batch.
+          const liveSnapshot = activeRun && conversation.run?.diagram_address
+            ? await fetchDiagram(diagramUrlFor(conversation.run), abort.signal).catch(() => null)
+            : null;
+          if (!connected || currentRevision !== revision || conversation.id !== subscribedId) return;
+          restoreConversation(conversation);
+          runRef.current = conversation.run ?? null;
+          setRun(conversation.run ?? null);
+          replaying = true;
+          replayedProposal = false;
+          for (const message of replay) applyMessage(message);
+          replaying = false;
+          if (liveSnapshot) setSnapshot(liveSnapshot);
+          setHydratedUrl(serveUrl);
+          if (serveUrl === historyUrl) onSelect(conversation);
+          if (conversation.run) {
+            const record = conversation.run;
+            runRef.current = record;
+            setRun(record);
+            setConfirming(false);
+            setPhase(isRunFinished(record.status) ? (record.status === "failed" ? "failed" : "finished") : "observing");
+            setTab("events");
+            if (!isRunFinished(record.status) && record.diagram_address) {
+              observe(record);
+              void loadPanel(record.run_id);
+            }
+          }
+          setAssistantBusy(conversation.busy);
+          // A finished run must not override the proposal restored from the
+          // transcript. Only a live topology owns the diagram and its controls.
+          if (replayedProposal && !activeRun) {
+            runRef.current = null;
+            setRun(null);
+            setTab("source");
+            setPhase("review");
+          } else if (conversation.busy && !activeRun) {
+            setPhase("drafting");
+          }
+          // Replies received during the snapshot fetch are newer than the
+          // replay's state marker; apply them last so busy/proposals stay fresh.
+          const liveMessages = buffered;
+          buffered = [];
+          restoring = false;
+          for (const message of liveMessages) applyMessage(message);
+        };
+        void restore();
+      },
+    );
+    return () => {
+      connected = false;
+      abort.abort();
+      unsubscribe();
+      disconnectRef.current?.();
+      disconnectRef.current = null;
+    };
+  }, [agent, restoreConversation, observe, loadPanel, serveUrl, historyUrl, onSelect]);
 
   async function confirmDesign() {
     if (!design || phase !== "review") return;
     setConfirming(false);
     setPhase("spawning");
+    const scope = scopeRef.current;
     setError("");
     try {
       // The source, not the design: the operator may have edited it, and what
@@ -444,7 +664,9 @@ export function Studio({
       const record = await startRun(serveUrl, {
         program: source,
         inputs: design.inputs,
+        conversation_id: conversationIdRef.current ?? undefined,
       });
+      if (scope !== scopeRef.current) return;
       setSnapshot((current) => (current ? { ...current, team: record.team } : current));
       setRun(record);
       setPhase("observing");
@@ -452,6 +674,7 @@ export function Studio({
 
       observe(record);
     } catch (cause) {
+      if (scope !== scopeRef.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
       setPhase("review");
     }
@@ -471,10 +694,13 @@ export function Studio({
    */
   async function requestStop() {
     if (!run || isStopping) return;
+    const scope = scopeRef.current;
     setError("");
     try {
-      setRun(await stopRun(serveUrl, run.run_id));
+      const record = await stopRun(serveUrl, run.run_id);
+      if (scope === scopeRef.current) setRun(record);
     } catch (cause) {
+      if (scope !== scopeRef.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
     }
   }
@@ -520,6 +746,7 @@ export function Studio({
   useEffect(() => {
     const abort = new AbortController();
     const token = ++checkTokenRef.current;
+    if (switchingChat) return;
     const current = () => checkTokenRef.current === token;
     const timer = setTimeout(() => {
       // Nothing to check against, or nothing to check: clear rather than leave
@@ -573,7 +800,7 @@ export function Studio({
       clearTimeout(timer);
       abort.abort();
     };
-  }, [source, filename, serveUrl, canRun, presentKey]);
+  }, [source, filename, serveUrl, canRun, presentKey, switchingChat]);
 
   const isDeployed = run !== null;
   // The daemon's own word for it. Every terminal status replaces it, so the
@@ -616,50 +843,43 @@ export function Studio({
 
   return (
     <main className="studio-shell">
-      <header className="topbar">
-        <div className="brand">
-          {/* Fixed-size brand mark served straight from /public: next/image
-              would only add a loader round-trip on Workers. */}
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img className="brand-mark" src="/omar-logo.png" alt="" width={40} height={40} />
-          <span>OMAR <b>Mission Control</b></span>
-        </div>
-        <div className="runtime-controls">
-          {!isDemo ? (
-            <button
-              type="button"
-              className="terminal-button"
-              onClick={() => setTerminalAgent(ASSISTANT)}
-              disabled={daemon.state !== "live"}
-              aria-haspopup="dialog"
-            >
-              Inspect on terminal
-            </button>
-          ) : null}
-          <span
-            className={`daemon ${daemon.state}`}
-            aria-label="Runtime mode"
-            title={daemon.state === "offline" ? daemon.reason : undefined}
-          >
-            <i />
-            {daemon.state === "demo" ? "demo topology" : serveUrl}
-            {daemon.state === "offline" ? " · unreachable" : null}
-          </span>
-          <span className="connection" data-phase={phase}>
-            {phase}
-          </span>
-        </div>
-      </header>
+      <div className="visually-hidden" aria-live="polite">
+        <span className={`daemon ${daemon.state}`} aria-label="Runtime mode">
+          {isDemo ? "demo topology" : historyUrl}{daemon.state === "offline" ? " · unreachable" : ""}
+        </span>
+        <span className="connection" data-phase={phase}>{phase}</span>
+      </div>
 
+      <div className="studio-content">
+        {isDemo ? <aside className="history-rail" aria-label="Omar"><OmarLogo /></aside> : null}
+        {!isDemo && (!historyDrawer || drawerOpen) ? (
+          <ChatHistory
+            serveUrl={historyUrl}
+            activeId={selectedId ?? conversationId}
+            onSwitchingChange={setSelectingChat}
+            mobile={historyDrawer}
+            revision={`${historyRevision}:${messages.length}`}
+                        collapsed={!historyDrawer && !historyOpen}
+            onClose={closeHistory}
+                        onOpen={openHistory}
+            railButtonRef={historyRailButtonRef}
+            onSelect={(conversation) => {
+              onSelect(conversation);
+              if (historyDrawer) setDrawerOpen(false);
+            }}
+          />
+        ) : null}
       <section
         ref={workspaceRef}
         className="workspace"
+        inert={switchingChat}
+        aria-busy={switchingChat}
         style={{ gridTemplateColumns: columns }}
       >
         <aside
           className={[
             "builder-panel",
-            builderWidth === 0 ? "collapsed" : "",
+            snapshot && builderWidth === 0 ? "collapsed" : "",
             // Alone in the window, so the thread is read as a column rather
             // than stretched across it.
             snapshot ? "" : "solo",
@@ -668,12 +888,23 @@ export function Studio({
             .filter(Boolean)
             .join(" ")}
         >
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">WORKFLOW BUILDER</span>
-              <h1>What should the team do?</h1>
+          <h1 className="visually-hidden">{conversationTitle}</h1>
+          {!isDemo && historyDrawer ? (
+            <div className="chat-mobile-controls">
+              <button
+                type="button"
+                ref={historyButtonRef}
+                className="history-button"
+                onClick={() => setDrawerOpen((open) => !open)}
+                aria-expanded={historyVisible}
+                aria-controls="chat-history"
+                aria-haspopup="dialog"
+                aria-label="Open chat history"
+              >
+                <SidebarIcon direction="open" />
+              </button>
             </div>
-          </div>
+          ) : null}
           <div className="messages" ref={threadRef}>
             {messages.length === 0 && snapshot ? (
               <p className="builder-status">
@@ -684,11 +915,12 @@ export function Studio({
             {messages.map((message) => (
               <ChatMessageView key={message.sequence} message={message} />
             ))}
-            {phase === "drafting" ? <Waiting /> : null}
+            {assistantBusy ? <Waiting /> : null}
             {phase === "spawning" ? <Waiting label="Starting the run" /> : null}
           </div>
 
           {error ? <div className="connection-error">{error}</div> : null}
+          {daemon.state === "offline" ? <div className="connection-error" role="status">Cannot reach the runtime at {historyUrl}.</div> : null}
 
           {selection.length > 0 ? (
             <div className="selection-bar">
@@ -707,6 +939,7 @@ export function Studio({
 
           <form className="prompt-box" onSubmit={(event) => void submitPrompt(event)}>
             <textarea
+              disabled={switchingChat || (!isDemo && !conversationId)}
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
               onKeyDown={(event) => {
@@ -721,23 +954,37 @@ export function Studio({
               aria-label="Describe a workflow"
             />
             <div>
-              {phase === "review" && !canRun ? (
-                // Why deploying is unavailable, which is about this composer's
-                // reach rather than about the workflow. The run's own state
-                // left with the buttons: the panel says STATUS beside the
-                // control that changes it, and saying it twice invited the two
-                // to disagree.
-                <span className="composer-status">
-                  {daemon.state === "demo"
-                    ? "Demo topology — relaunch with OMAR_SERVE_URL to deploy"
-                    : `Cannot reach omar serve at ${serveUrl}`}
-                </span>
-              ) : (
-                <BackendMenu
-                  serveUrl={serveUrl}
-                  live={daemon.state === "live"}
-                />
-              )}
+              <div className="composer-tools">
+                {phase === "review" && !canRun ? (
+                  // Why deploying is unavailable, which is about this composer's
+                  // reach rather than about the workflow. The run's own state
+                  // left with the buttons: the panel says STATUS beside the
+                  // control that changes it, and saying it twice invited the two
+                  // to disagree.
+                  <span className="composer-status">
+                    {daemon.state === "demo"
+                      ? "Demo topology — relaunch with OMAR_SERVE_URL to deploy"
+                      : `Cannot reach omar serve at ${serveUrl}`}
+                  </span>
+                ) : (
+                  <BackendMenu
+                    key={conversationId}
+                    serveUrl={hydratedUrl ?? serveUrl}
+                    live={daemon.state === "live"}
+                  />
+                )}
+                {!isDemo ? (
+                  <button
+                    type="button"
+                    className="terminal-button"
+                    onClick={() => setTerminalAgent(ASSISTANT)}
+                    disabled={daemon.state !== "live" || switchingChat || !conversationId}
+                    aria-haspopup="dialog"
+                  >
+                    Inspect on terminal
+                  </button>
+                ) : null}
+              </div>
               {/* Deploying and stopping live on the workflow panel, beside the
                   topology they act on. What is left here acts on the message
                   being written. */}
@@ -746,7 +993,7 @@ export function Studio({
                   className="send-button"
                   type="submit"
                   aria-label="Draft workflow"
-                  disabled={phase === "drafting" || phase === "spawning"}
+                  disabled={(switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning"}
                 >
                   ↑
                 </button>
@@ -789,44 +1036,18 @@ export function Studio({
             <div className="workflow-actions">
               {phase === "review" && design ? (
                 <span role="group" aria-label="Deploy design">
-                  {confirming ? (
-                    <>
-                      <button
-                        className="secondary-button"
-                        onClick={() => setConfirming(false)}
-                        type="button"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        className="primary-button"
-                        onClick={() => void confirmDesign()}
-                        type="button"
-                        disabled={!canRun}
-                        title="This starts real agents"
-                      >
-                        Confirm deploy
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <button
-                        className="secondary-button"
-                        onClick={discardDesign}
-                        type="button"
-                      >
-                        Discard
-                      </button>
-                      <button
-                        className="primary-button"
-                        onClick={() => setConfirming(true)}
-                        type="button"
-                        disabled={!canRun}
-                      >
-                        Deploy
-                      </button>
-                    </>
-                  )}
+                  <button className="secondary-button" onClick={discardDesign} type="button">
+                    Discard
+                  </button>
+                  <button
+                    className="primary-button"
+                    onClick={() => setConfirming(true)}
+                    type="button"
+                    disabled={!canRun}
+                    aria-haspopup="dialog"
+                  >
+                    Deploy
+                  </button>
                 </span>
               ) : null}
               {phase === "observing" && run ? (
@@ -950,6 +1171,16 @@ export function Studio({
         </aside>
         ) : null}
       </section>
+      </div>
+
+      {confirming && phase === "review" && design ? (
+        <DeployConfirmation
+          team={snapshot?.team ?? "this topology"}
+          disabled={!canRun}
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => void confirmDesign()}
+        />
+      ) : null}
 
       {panelAgent && snapshot ? (
         <PortPanel

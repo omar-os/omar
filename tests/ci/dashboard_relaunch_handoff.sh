@@ -50,7 +50,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$home_dir/.omar"
+mkdir -p "$home_dir/.omar" "$home_dir/bin"
+# Keep the real backend and user shell profiles out of this test. Omar starts
+# panes with `sh -lc`; the fixture shell skips login profiles so they cannot
+# reset PATH and select an installed Claude instead of our long-lived fake.
+cat >"$home_dir/bin/sh" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "-lc" ]; then
+  shift
+  exec /bin/sh -c "$@"
+fi
+exec /bin/sh "$@"
+EOF
+cat >"$home_dir/bin/claude" <<'EOF'
+#!/bin/sh
+printf 'handoff backend fixture ready\n'
+exec sleep 9999
+EOF
+chmod +x "$home_dir/bin/sh" "$home_dir/bin/claude"
+export PATH="$home_dir/bin:$PATH"
+# Exercise the outside-tmux path even when the test itself runs in a pane.
+unset TMUX TMUX_PANE
+
 cat >"$home_dir/.omar/config.toml" <<'EOF'
 [dashboard]
 refresh_interval = 1
@@ -76,6 +97,10 @@ tmux_cmd() {
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
+  if [ -f "$home_dir/launch.log" ]; then
+    cat "$home_dir/launch.log" >&2
+  fi
+  tmux_cmd list-panes -a -F '#{session_name}: dead=#{pane_dead} command=#{pane_current_command}' >&2 || true
   exit 1
 }
 
@@ -93,22 +118,37 @@ start_fake_dashboard() {
   fail "fake dashboard session did not come up"
 }
 
-# Case 1: `omar -a claude` from $work_dir should write a handoff with the
-# new cwd, the claude backend command, and restart_manager=true (because
-# -a was passed). We don't need claude actually installed — relaunch_in_tmux
-# only writes the handoff and tries to attach; the attach is expected to fail
-# in this non-interactive subshell, which is fine.
+tmux_cmd new-session -d -s omar-agent-ea-0 "sleep 9999"
+original_pane="$(tmux_cmd display-message -p -t omar-agent-ea-0 '#{pane_id}')"
+
+# A non-TTY attach may fail after a successful launch. Require a freshly
+# written handoff instead of accepting the process status or an old file.
+launch_handoff() {
+  rm -f "$handoff_file"
+  (
+    cd "$work_dir"
+    HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" "$@" </dev/null >"$home_dir/launch.log" 2>&1
+  ) || true
+  [ -f "$handoff_file" ] || fail "fresh dashboard_handoff.json was not written for: $*"
+}
+
+assert_backend_alive() {
+  local session="omar-agent-ea-$1"
+  for _ in $(seq 1 50); do
+    if tmux_cmd capture-pane -p -t "$session" 2>/dev/null | grep -q 'handoff backend fixture ready'; then
+      [ "$(tmux_cmd display-message -p -t "$session" '#{pane_dead}')" = 0 ] || fail "$session backend exited"
+      return
+    fi
+    sleep 0.1
+  done
+  fail "$session did not start the backend fixture"
+}
+
+# Case 1: backend selection creates a live new EA before writing its handoff.
 start_fake_dashboard
-rm -f "$handoff_file"
-
-(
-  cd "$work_dir"
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" -a claude >/dev/null 2>&1 || true
-)
-
-if [ ! -f "$handoff_file" ]; then
-  fail "dashboard_handoff.json was not written by omar -a claude"
-fi
+launch_handoff -a claude
+assert_backend_alive 1
+first_pane="$(tmux_cmd display-message -p -t omar-agent-ea-1 '#{pane_id}')"
 
 python3 - "$handoff_file" "$work_dir" <<'PY'
 import json, sys
@@ -116,31 +156,37 @@ path, work_dir = sys.argv[1], sys.argv[2]
 with open(path) as fh:
     h = json.load(fh)
 errs = []
-if h.get("active_ea") != 0:
-    errs.append(f"active_ea: expected 0, got {h.get('active_ea')!r}")
+if h.get("active_ea") != 1:
+    errs.append(f"active_ea: expected 1, got {h.get('active_ea')!r}")
 if "claude" not in str(h.get("default_command", "")):
     errs.append(f"default_command: expected to mention 'claude', got {h.get('default_command')!r}")
 if h.get("default_workdir") != work_dir:
     errs.append(f"default_workdir: expected {work_dir!r}, got {h.get('default_workdir')!r}")
-if h.get("restart_manager") is not True:
-    errs.append(f"restart_manager: expected True (because -a was passed), got {h.get('restart_manager')!r}")
+if h.get("restart_manager") is not False:
+    errs.append(f"restart_manager: expected False (new EA must survive handoff), got {h.get('restart_manager')!r}")
 if errs:
     raise SystemExit("handoff field mismatch (case: -a claude from new cwd):\n  " + "\n  ".join(errs))
 PY
 
+# A second backend launch allocates another EA and preserves the first tree.
+start_fake_dashboard
+launch_handoff -a claude
+assert_backend_alive 2
+assert_backend_alive 1
+[ "$(tmux_cmd display-message -p -t omar-agent-ea-1 '#{pane_id}')" = "$first_pane" ] || fail "first launched EA was replaced"
+python3 - "$home_dir/.omar/eas.json" "$handoff_file" <<'PYTEST'
+import json, sys
+registry = json.load(open(sys.argv[1]))
+handoff = json.load(open(sys.argv[2]))
+assert [(e["id"], e["name"]) for e in registry] == [(0, "Default"), (1, "1"), (2, "2")], registry
+assert handoff["active_ea"] == 2 and not handoff["restart_manager"], handoff
+PYTEST
+[ "$(tmux_cmd display-message -p -t omar-agent-ea-0 '#{pane_id}')" = "$original_pane" ] || fail "existing EA was replaced"
+
 # Case 2: bare `omar` (no -a) should still hand off cwd, but
 # restart_manager must be false so the live manager isn't kicked.
 start_fake_dashboard
-rm -f "$handoff_file"
-
-(
-  cd "$work_dir"
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" >/dev/null 2>&1 || true
-)
-
-if [ ! -f "$handoff_file" ]; then
-  fail "dashboard_handoff.json was not written by bare omar relaunch"
-fi
+launch_handoff
 
 python3 - "$handoff_file" "$work_dir" <<'PY'
 import json, sys
@@ -163,8 +209,10 @@ rm -f "$handoff_file"
 
 (
   cd "$work_dir"
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" -a claude >/dev/null 2>&1 || true
+  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" -a claude </dev/null >"$home_dir/launch.log" 2>&1 || true
 )
+
+assert_backend_alive 3
 
 if [ -f "$handoff_file" ]; then
   fail "dashboard_handoff.json was written on cold start (no existing dashboard)"

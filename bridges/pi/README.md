@@ -45,3 +45,14 @@ npm --prefix bridges/pi test
 
 The RPC test uses `npx` to obtain the pinned host unless `PI_BINARY` points to a
 Pi 0.85.1 executable. First use may require network access.
+
+OMAR's registry implementation lives in `src/backend/pi.rs`. Launched panes use
+`OMAR_PI_SOCKET`, a private per-launch Unix socket published after successful
+tool discovery. Delivery uses `sendMessage` with `triggerTurn` and `followUp`,
+so an idle Pi wakes and a busy Pi queues the event without touching the composer.
+Discovery failure leaves delivery unavailable; there is no terminal-input fallback.
+Shutdown closes the socket and its clients before stopping the MCP child.
+
+Mission Control saves Pi's native session file per chat. Reopening the chat uses
+`--session` when that file still exists; otherwise Pi starts a new conversation
+with OMAR's saved transcript. Explicit session flags take precedence.

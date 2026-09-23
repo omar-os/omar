@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::config;
 use crate::deploy::{self, DeploymentState};
 use crate::diagram::{DiagramServer, NoopTopologyObserver, TopologyObserver};
 use crate::manager::{self, McpLaunchContext, TopologyMcpContext};
@@ -2058,6 +2057,9 @@ fn spawn_topology_agents(
     config: &TopologyRunConfig<'_>,
     spawned: &mut BTreeMap<String, String>,
 ) -> Result<()> {
+    // The line each agent was launched with, which is what says how it
+    // proves readiness.
+    let mut launched: BTreeMap<String, String> = BTreeMap::new();
     let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, use only omar_set_port to set allowed effects and omar_complete to finish. Port writes are buffered and repeated writes use last-writer-wins semantics.";
     for (name, agent) in &state.agents {
         // A web agent is not spawned. There is no command to resolve, no pane
@@ -2082,7 +2084,9 @@ fn spawn_topology_agents(
         let prompt_file = agent_dir.join("system.md");
         fs::write(&prompt_file, protocol)?;
         let backend = canonical_backend(&agent.backend);
-        let base_command = config::resolve_backend(backend).map_err(anyhow::Error::msg)?;
+        let base_command = crate::backend::resolve(backend)
+            .map(|backend| backend.default_command().to_string())
+            .map_err(anyhow::Error::msg)?;
         let context = McpLaunchContext {
             omar_dir: config.omar_dir.to_path_buf(),
             ea_id: config.ea_id,
@@ -2090,6 +2094,7 @@ fn spawn_topology_agents(
             default_command: base_command.clone(),
             default_workdir: config.default_workdir.to_string(),
             health_idle_warning: config.health_idle_warning,
+            agent_name: None,
             tmux_server: std::env::var("OMAR_TMUX_SERVER").ok(),
             // Topology agents answer invocations; they do not chat with the
             // operator, so they get no serve context.
@@ -2109,22 +2114,26 @@ fn spawn_topology_agents(
             Some(backend),
         )?;
         spawned.insert(name.clone(), session);
+        launched.insert(name.clone(), command);
     }
 
     for (name, agent) in &state.agents {
         if is_web_backend(&agent.backend) {
             continue;
         }
-        let markers = crate::tmux::backend_readiness_markers(canonical_backend(&agent.backend));
-        if !markers.is_empty()
-            && !client.wait_for_markers(
+        let Some(backend) = crate::backend::by_name(canonical_backend(&agent.backend)) else {
+            continue;
+        };
+        let command = launched.get(name).map(String::as_str).unwrap_or_default();
+        if let crate::backend::Readiness::Banner(markers) = backend.readiness(command) {
+            if !client.wait_for_markers(
                 &client.session_for(name),
                 markers,
                 Duration::from_secs(60),
                 Duration::from_millis(250),
-            )
-        {
-            bail!("agent '{}' did not become ready", name);
+            ) {
+                bail!("agent '{}' did not become ready", name);
+            }
         }
     }
     Ok(())
@@ -3003,17 +3012,12 @@ fn is_web_backend(backend: &str) -> bool {
 }
 
 fn canonical_backend(backend: &str) -> &str {
-    match backend.to_ascii_lowercase().as_str() {
-        "claude" | "claudecode" => "claude",
-        "web" => "web",
-        "codex" => "codex",
-        "opencode" => "opencode",
-        "cursor" => "cursor",
-        "agy" => "agy",
-        "pi" => "pi",
-        "stub" => "stub",
-        _ => backend,
+    if backend.eq_ignore_ascii_case("web") {
+        return "web";
     }
+    crate::backend::by_name(backend)
+        .map(|backend| backend.kind().name())
+        .unwrap_or(backend)
 }
 
 #[cfg(test)]
@@ -3778,7 +3782,6 @@ mod tests {
         assert!(is_web_backend("web"));
         assert!(!is_web_backend("ClaudeCode"));
         assert!(!is_web_backend("Stub"));
-        assert_eq!(canonical_backend("Pi"), "pi");
     }
 
     #[test]

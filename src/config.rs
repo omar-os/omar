@@ -121,18 +121,16 @@ fn default_error_patterns() -> Vec<String> {
 /// Detect which agent command is available on the system.
 /// Checks PATH for the supported first-class backends, falling back to `claude`.
 fn detect_agent_command() -> String {
-    detect_agent_command_from(&[
-        ("claude", "claude --dangerously-skip-permissions"),
-        (
-            "codex",
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
-        ),
-        ("cursor", "cursor agent --yolo"),
-        ("opencode", "opencode"),
-        ("agy", "agy --dangerously-skip-permissions"),
-        ("pi", "pi"),
-    ])
-    .unwrap_or_else(|| "claude --dangerously-skip-permissions".to_string())
+    let candidates: Vec<(&str, &str)> = crate::backend::ASSISTANT
+        .iter()
+        .map(|kind| crate::backend::of(*kind))
+        .map(|backend| (backend.executables()[0], backend.default_command()))
+        .collect();
+    detect_agent_command_from(&candidates).unwrap_or_else(|| {
+        crate::backend::of(crate::backend::Kind::Claude)
+            .default_command()
+            .to_string()
+    })
 }
 
 fn detect_agent_command_from(candidates: &[(&str, &str)]) -> Option<String> {
@@ -144,54 +142,6 @@ fn detect_agent_command_from(candidates: &[(&str, &str)]) -> Option<String> {
 
 fn default_command() -> String {
     detect_agent_command()
-}
-
-/// Backends an operator can run an assistant on.
-///
-/// `stub` is deliberately absent: it answers invocations without a model, which
-/// is useful for exercising a run and useless for talking to.
-pub const ASSISTANT_BACKENDS: [&str; 6] = ["claude", "codex", "cursor", "opencode", "agy", "pi"];
-
-/// The backend a launch command came from, when it came from one of ours.
-///
-/// The config stores a command rather than a name, so this is how the daemon
-/// reports which backend an assistant is currently running.
-pub fn backend_of_command(command: &str) -> Option<&'static str> {
-    ASSISTANT_BACKENDS
-        .into_iter()
-        .find(|name| resolve_backend(name).is_ok_and(|resolved| resolved == command))
-}
-
-/// Map shorthand agent names to full commands.
-///
-/// - `"claude"` → `"claude --dangerously-skip-permissions"`
-/// - `"codex"` → `"codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"`
-/// - `"cursor"` → `"cursor agent --yolo"`
-/// - `"opencode"` → `"opencode"` (opencode has no permission-skip flag)
-/// - `"agy"` → `"agy --dangerously-skip-permissions"`
-/// - `"pi"` → `"pi"`
-/// - `"stub"` → the model-free test agent
-/// - anything else → error
-pub fn resolve_backend(name: &str) -> Result<String, String> {
-    match name {
-        "claude" => Ok("claude --dangerously-skip-permissions".to_string()),
-        "codex" => {
-            Ok("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string())
-        }
-        "cursor" => Ok("cursor agent --yolo".to_string()),
-        "opencode" => Ok("opencode".to_string()),
-        "agy" => Ok("agy --dangerously-skip-permissions".to_string()),
-        "pi" => Ok("pi".to_string()),
-        // Answers invocations without a model, so a run can be exercised end to
-        // end in a test. Resolved to this binary in `build_agent_command`.
-        "stub" => Ok("omar stub-agent".to_string()),
-        // `web` never reaches here — nothing is spawned for it, so there is
-        // no command to resolve. It is named so a typo is told what it meant.
-        other => Err(format!(
-            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, agy, pi, stub, web",
-            other
-        )),
-    }
 }
 
 fn default_workdir() -> String {
@@ -463,8 +413,7 @@ sidebar_right = false
                 || cmd.contains("codex")
                 || cmd.contains("cursor")
                 || cmd.contains("opencode")
-                || cmd.contains("agy")
-                || cmd.contains("pi"),
+                || cmd.contains("agy"),
             "Unexpected default command: {}",
             cmd
         );
@@ -563,31 +512,6 @@ session_prefix = "omar-agent"
 
         let config = Config::load(Some(config_path.to_str().unwrap())).unwrap();
         assert_eq!(config.dashboard.session_prefix, "omar-agent-");
-    }
-
-    #[test]
-    fn test_resolve_backend_known_names() {
-        assert_eq!(
-            resolve_backend("claude").unwrap(),
-            "claude --dangerously-skip-permissions"
-        );
-        assert_eq!(
-            resolve_backend("codex").unwrap(),
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
-        );
-        assert_eq!(resolve_backend("cursor").unwrap(), "cursor agent --yolo");
-        assert_eq!(resolve_backend("opencode").unwrap(), "opencode");
-        assert_eq!(
-            resolve_backend("agy").unwrap(),
-            "agy --dangerously-skip-permissions"
-        );
-        assert_eq!(resolve_backend("pi").unwrap(), "pi");
-    }
-
-    #[test]
-    fn test_resolve_backend_unknown_errors() {
-        assert!(resolve_backend("aider --yes").is_err());
-        assert!(resolve_backend("custom-agent").is_err());
     }
 
     #[test]

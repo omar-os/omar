@@ -51,35 +51,20 @@ button {
     var(--ink);
 }
 
-.topbar {
-  flex: none;
-  height: 64px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  border-bottom: 1px solid var(--line);
-  padding: 0 20px;
-  background: rgba(8, 8, 10, 0.9);
-  backdrop-filter: blur(16px);
-}
-
 .terminal-button {
-  padding: 7px 10px;
+  height: 36px;
+  padding: 0 8px;
   color: var(--text);
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
-  font-size: 12px;
+  font-size: 14px;
   white-space: nowrap;
 }
 
 .terminal-button:hover:not(:disabled) { border-color: var(--purple); }
 .terminal-button:disabled { opacity: 0.5; cursor: default; }
 
-.brand,
-.runtime-controls,
-.runtime-controls label,
-.connection,
 .diagram-heading,
 .run-stats,
 .prompt-box > div,
@@ -88,23 +73,11 @@ button {
   align-items: center;
 }
 
-.brand {
-  gap: 10px;
-  font-size: 15px;
-  letter-spacing: 0.06em;
-}
-
-.brand b {
-  color: var(--purple);
-  font-weight: 650;
-}
-
 /* The logo artwork carries its own padding, so it is set larger than the
    optical size to make the mark itself read at ~28px. */
 .brand-mark {
   width: 40px;
   height: 40px;
-  margin: -5px;
   display: block;
   object-fit: contain;
 }
@@ -113,39 +86,6 @@ button {
   font-size: 10px;
   letter-spacing: 0.14em;
   color: var(--muted);
-}
-
-.runtime-controls {
-  gap: 8px;
-}
-
-.runtime-controls label {
-  height: 34px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  overflow: hidden;
-  background: #0c0c0f;
-}
-
-.runtime-controls label span {
-  padding: 0 10px;
-  color: var(--muted);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-.runtime-controls input {
-  width: 220px;
-  height: 100%;
-  border: 0;
-  border-left: 1px solid var(--line);
-  outline: 0;
-  padding: 0 10px;
-  color: #d7d3dd;
-  background: #111115;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
 }
 
 .primary-button,
@@ -169,89 +109,6 @@ button {
   color: #bbb7c3;
 }
 
-/* Two independent signals: where the runtime is, and where the operator is. */
-.daemon {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  height: 34px;
-  padding: 0 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #0c0c0f;
-  color: #b6b2bf;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-}
-
-.daemon i {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #6e6b74;
-}
-
-.daemon.live i {
-  background: #6ee7aa;
-  box-shadow: 0 0 8px #6ee7aa;
-}
-
-.daemon.checking i {
-  background: #e3c26b;
-}
-
-.daemon.offline {
-  border-color: rgba(248, 113, 113, 0.35);
-  color: #e5a6a6;
-}
-
-.daemon.offline i {
-  background: #f87171;
-}
-
-.daemon.demo i {
-  background: #8c63f2;
-}
-
-.connection {
-  min-width: 72px;
-  gap: 6px;
-  padding-left: 5px;
-  color: var(--muted);
-  font-size: 11px;
-  text-transform: capitalize;
-}
-
-.connection i {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #6e6b74;
-}
-
-.connection.live i {
-  background: #6ee7aa;
-  box-shadow: 0 0 8px #6ee7aa;
-}
-
-.connection.done i {
-  background: #4f9d76;
-}
-
-.connection.error i {
-  background: #f87171;
-}
-
-
-
-
-
-
-
-
-
-
-
 .primary-button:disabled {
   opacity: 0.45;
   cursor: default;
@@ -260,7 +117,7 @@ button {
 .builder-status {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .waiting {
@@ -270,7 +127,7 @@ button {
   margin: 0 0 22px;
   padding-left: 38px;
   color: var(--muted);
-  font-size: 12.5px;
+  font-size: 14px;
 }
 
 /* The wait, and the way into the session doing the waiting. */
@@ -424,7 +281,6 @@ button {
   background: rgba(12, 12, 15, 0.86);
 }
 
-.panel-heading,
 .diagram-heading {
   min-height: 82px;
   border-bottom: 1px solid var(--line);
@@ -508,16 +364,16 @@ h2 {
 .message p {
   margin: 2px 0 0;
   color: #cbc7d2;
-  font-size: 13px;
-  line-height: 1.55;
+  font-size: 16px;
+  line-height: 1.75;
 }
 
 /* Assistant messages are rendered markdown. */
 .message-body {
   min-width: 0;
   color: #cbc7d2;
-  font-size: 13px;
-  line-height: 1.6;
+  font-size: 16px;
+  line-height: 1.75;
 }
 
 .message-body > *:first-child {
@@ -574,7 +430,7 @@ h2 {
   border-radius: 5px;
   background: #201f26;
   color: #d9cffb;
-  font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 14px ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .message-body pre {
@@ -590,7 +446,7 @@ h2 {
   padding: 0;
   background: none;
   color: #bfb8cd;
-  font-size: 11px;
+  font-size: 14px;
   line-height: 1.6;
 }
 
@@ -605,7 +461,7 @@ h2 {
 .message-body h2,
 .message-body h3 {
   margin: 12px 0 6px;
-  font-size: 13.5px;
+  font-size: 18px;
   font-weight: 650;
   letter-spacing: 0;
 }
@@ -613,7 +469,7 @@ h2 {
 .message-body table {
   margin-bottom: 10px;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .message-body th,
@@ -650,8 +506,8 @@ h2 {
   padding: 14px;
   background: transparent;
   color: var(--text);
-  font-size: 13px;
-  line-height: 1.45;
+  font-size: 16px;
+  line-height: 1.5;
 }
 
 .prompt-box > div {
@@ -662,8 +518,8 @@ h2 {
 }
 
 .send-button {
-  width: 30px;
-  height: 30px;
+  width: 36px;
+  height: 36px;
   border: 0;
   border-radius: 8px;
   background: var(--purple);
@@ -1143,7 +999,7 @@ h2 {
   color: #fecaca;
   background: rgba(127, 29, 29, 0.25);
   border: 1px solid rgba(248, 113, 113, 0.3);
-  font-size: 11px;
+  font-size: 14px;
 }
 
 .diagram-error {
@@ -1551,23 +1407,6 @@ h2 {
 }
 
 @media (max-width: 760px) {
-  .topbar {
-    height: auto;
-    align-items: flex-start;
-    flex-wrap: wrap;
-    gap: 12px;
-    padding: 12px;
-  }
-
-  .runtime-controls {
-    flex-wrap: wrap;
-    max-width: 100%;
-  }
-
-  .runtime-controls label {
-    display: none;
-  }
-
   /* Still fills the viewport exactly — stacked rows rather than columns. */
   .workspace {
     grid-template-columns: 1fr;
@@ -1579,9 +1418,6 @@ h2 {
     border-bottom: 1px solid var(--line);
   }
 
-  .connection {
-    display: none;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1647,7 +1483,6 @@ h2 {
 
 /* With the window to itself the panel would stretch a conversation across the
    full width, which reads badly. Hold everything to a column instead. */
-.builder-panel.solo .panel-heading > div,
 .builder-panel.solo .messages > *,
 .builder-panel.solo .prompt-box,
 .builder-panel.solo .connection-error {
@@ -1663,19 +1498,6 @@ h2 {
   justify-content: center;
 }
 
-.builder-panel.opening .panel-heading {
-  min-height: auto;
-  border-bottom: 0;
-  padding-bottom: 4px;
-  text-align: center;
-}
-
-.builder-panel.opening .panel-heading h1 {
-  font-size: 26px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-}
-
 .builder-panel.opening .messages {
   flex: none;
   padding: 0;
@@ -1684,7 +1506,7 @@ h2 {
 
 /* A home-screen composer is a prompt, not a document editor: full width and
    five lines tall invites an essay. Claude.ai holds its opening box to roughly
-   500x93 in a 1000pt window; match that and let it grow as the operator types.
+   500px wide; keep that width with room for two lines at the chat font size.
    Only the opening screen is affected — inside a conversation the box still
    spans the thread. */
 .builder-panel.opening .prompt-box {
@@ -1697,7 +1519,7 @@ h2 {
 .builder-panel.opening .prompt-box textarea {
   display: block;
   min-height: 0;
-  height: 53px;
+  height: 76px;
 }
 
 /* Nothing has happened yet, so the status line has nothing to report. */
@@ -1719,7 +1541,7 @@ h2 {
 
 .message.progress .message-body {
   color: #8b8695;
-  font-size: 12px;
+  font-size: 14px;
 }
 
 /* The operator names components by clicking them, so the message can say
@@ -2164,13 +1986,13 @@ h2 {
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 22px;
+  height: 36px;
   padding: 0 8px;
   border: 1px solid #302d39;
   border-radius: 7px;
   background: transparent;
   color: #9d97a8;
-  font-size: 11px;
+  font-size: 14px;
 }
 
 .backend-trigger:hover,
@@ -2202,7 +2024,7 @@ h2 {
   border: 0;
   background: transparent;
   color: #cbc6d6;
-  font-size: 11.5px;
+  font-size: 14px;
   text-align: left;
 }
 
@@ -2219,7 +2041,7 @@ h2 {
   width: 230px;
   padding: 10px 11px;
   color: #cbc6d6;
-  font-size: 11.5px;
+  font-size: 14px;
 }
 
 .backend-confirm p {
@@ -2233,13 +2055,13 @@ h2 {
 }
 
 .backend-confirm button {
-  height: 24px;
+  height: 32px;
   padding: 0 10px;
   border: 1px solid #3b3844;
   border-radius: 7px;
   background: transparent;
   color: #cbc6d6;
-  font-size: 11px;
+  font-size: 14px;
 }
 
 .backend-confirm button:first-child {
@@ -2253,5 +2075,149 @@ h2 {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: #e0777f;
-  font-size: 10.5px;
+  font-size: 14px;
 }
+
+/* Saved conversations share the runtime's scope, including across reloads. */
+.history-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.studio-content { display: flex; flex: 1; min-height: 0; }
+.studio-content > .workspace { min-width: 0; }
+.chat-history {
+  flex: 0 0 260px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 18px 12px 12px;
+  color: var(--text);
+  background: var(--panel);
+  border: 0;
+  border-right: 1px solid var(--line);
+}
+.chat-history header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+.chat-history h2 { margin: 0 0 16px; font-size: 16px; }
+.chat-history p, .chat-history small { color: var(--muted); font-size: 13px; }
+.chat-history button, .chat-history input {
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.chat-history header button { padding: 4px 10px; font-size: 18px; }
+.chat-history button:disabled { opacity: 0.5; cursor: default; }
+.chat-history button:hover:not(:disabled), .history-button:hover { border-color: var(--purple); }
+.history-actions { display: grid; gap: 10px; }
+.history-actions input { width: 100%; min-width: 0; font-size: 14px; }
+.history-actions button { text-align: left; font-size: 14px; }
+.chat-history ul { flex: 1; min-height: 0; overflow-y: auto; list-style: none; padding: 0; margin: 18px 0 0; }
+.chat-history li + li { margin-top: 6px; }
+.chat-history li button { width: 100%; text-align: left; display: grid; gap: 6px; background: transparent; border-color: transparent; }
+.chat-history li span { overflow-wrap: anywhere; font-size: 14px; }
+.chat-history [aria-current="true"] { border-color: var(--purple); background: var(--purple-soft); }
+.chat-history .history-error p { color: #ffb4b4; }
+.history-drawer {
+  position: fixed;
+  inset: 0 auto 0 0;
+  margin: 0;
+  padding: 0;
+  width: min(320px, calc(100vw - 44px));
+  max-width: none;
+  height: 100dvh;
+  max-height: none;
+}
+.history-drawer:not([open]) { display: none; }
+.history-drawer::backdrop { background: rgba(0, 0, 0, 0.65); }
+.history-content { display: flex; flex-direction: column; height: 100%; padding: 18px 12px 12px; }
+
+@media (max-width: 900px) {
+  .chat-history:not(.history-drawer) { display: none; }
+}
+
+/* Compact rail keeps chat navigation reachable when folded. */
+.history-rail {
+  flex: 0 0 64px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 12px;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+}
+.history-rail button,
+.chat-history header .history-fold {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.sidebar-icon { width: 21px; height: 21px; }
+.history-rail button:hover,
+.chat-history header .history-fold:hover {
+  border-color: var(--purple);
+  background: var(--purple-soft);
+}
+.history-rail button:focus-visible,
+.chat-history header .history-fold:focus-visible {
+  outline: 2px solid var(--purple);
+  outline-offset: 2px;
+}
+@media (max-width: 900px) { .history-rail { display: none; } }
+
+.chat-history .chat-running { color: #c4b5fd; font-weight: 700; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+.builder-panel { position: relative; }
+.composer-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.prompt-box > div { gap: 8px; align-items: flex-end; }
+.composer-actions { flex-shrink: 0; }
+.chat-mobile-controls { position: absolute; top: 12px; left: 12px; z-index: 5; }
+@media (max-width: 900px) {
+  .builder-panel { padding-top: 56px; }
+}
+
+
+.deploy-confirmation {
+  margin: auto;
+  inset: 0;
+  width: min(520px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px);
+  overflow: auto;
+  padding: 28px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 24px 80px #0006;
+}
+.deploy-confirmation::backdrop { background: #080b12aa; }
+.deploy-confirmation h2 { margin: 12px 0 20px; font-size: 22px; }
+.deploy-confirmation p { margin: 12px 0; line-height: 1.6; font-size: 14px; }
+.deploy-confirmation-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px; }

@@ -125,7 +125,7 @@ prompt="You are the root of a binary-tree integration test. You MUST call the to
 # the assertions prove real Pi invoked the dynamically registered tools.
 set +e
 PI_PROMPT="$prompt" PI_PROJECT_ID="$project_id" PI_ROOT_LOG="$root_log" PI_EXTENSION="$REPO_ROOT/bridges/pi/index.js" python3 - <<'PY'
-import json, os, queue, re, signal, subprocess, sys, threading, time
+import json, os, queue, re, signal, socket, subprocess, sys, threading, time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -137,6 +137,8 @@ calls = [
     ("call_leaf2", "fc_leaf2", {"name": "leaf2", "project_id": project_id, "parent": "ea", "backend": "pi", "task": "Pi binary tree leaf two"}),
 ]
 
+provider_requests = []
+
 class DeterministicResponses(BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):
         pass
@@ -144,6 +146,7 @@ class DeterministicResponses(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("content-length", "0"))
         request = json.loads(self.rfile.read(length) or b"{}")
+        provider_requests.append(request)
         has_results = any(item.get("type") == "function_call_output" for item in request.get("input", []) if isinstance(item, dict))
         # Leaf identity is supplied by OMAR's delivered task, not the root's
         # prompt (which also mentions both leaf names).
@@ -262,6 +265,47 @@ def check_leaves():
             time.sleep(0.1)
     if pending:
         raise AssertionError("Leaves did not pass trust/readiness/tool execution: " + ", ".join(sorted(pending)) + "\n" + "\n".join(snapshots.values()))
+
+    if os.environ.get("PI_E2E_LIVE") == "1":
+        return
+    session = "omar-agent-0-leaf1"
+    draft = "UNSENT_PI_DRAFT"
+    subprocess.run(tmux + ["send-keys", "-t", session, "-l", draft], check=True)
+    def screen():
+        return subprocess.check_output(tmux + ["capture-pane", "-p", "-t", session], text=True)
+    deadline = time.monotonic() + 10
+    while draft not in screen() and time.monotonic() < deadline:
+        time.sleep(.1)
+    assert draft in screen(), screen()
+    sentinel = "PI_IDLE_WAKE_SENTINEL"
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "pi-wake", "version": "1"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "send_input", "arguments": {"name": session, "text": sentinel, "enter": True}}},
+    ]
+    result = subprocess.run([os.environ["OMAR_BINARY"], "mcp-server"],
+        input="".join(json.dumps(message) + "\n" for message in messages), text=True,
+        capture_output=True, check=True, timeout=30)
+    reply = next(json.loads(line) for line in result.stdout.splitlines() if json.loads(line).get("id") == 2)
+    assert "error" not in reply and not reply.get("result", {}).get("isError"), reply
+    deadline = time.monotonic() + 20
+    while not any(sentinel in json.dumps(request.get("input")) for request in provider_requests) and time.monotonic() < deadline:
+        time.sleep(.1)
+    assert any(sentinel in json.dumps(request.get("input")) for request in provider_requests), provider_requests
+    assert draft in screen(), screen()
+    assert all(draft not in json.dumps(request) for request in provider_requests)
+    stamp = subprocess.check_output(tmux + ["show-environment", "-t", session, "OMAR_DELIVERY"], text=True).strip()
+    assert stamp.startswith("OMAR_DELIVERY=pi:"), stamp
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(3)
+        client.connect(stamp.split("=pi:", 1)[1])
+        client.sendall(b'{"session":true}\n')
+        native = json.loads(client.makefile().readline())["session"]
+    assert Path(native).is_file(), native
+    saved = Path(native).read_text()
+    assert sentinel in saved and draft not in saved, saved
+    print("PASS: idle Pi receives an OMAR event without submitting its draft; native session is persisted", flush=True)
+
 
 try:
     while time.monotonic() < deadline:

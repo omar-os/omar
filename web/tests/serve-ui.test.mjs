@@ -16,7 +16,8 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { request as httpRequest } from "node:http";
 import { gunzipSync } from "node:zlib";
 import { resolve } from "node:path";
@@ -27,6 +28,10 @@ import { chromium } from "@playwright/test";
 const OMAR_BIN = process.env.OMAR_BIN ?? resolve("../target/debug/omar");
 const PORT = Number(process.env.SERVE_UI_PORT ?? 7356);
 const ORIGIN = `http://127.0.0.1:${PORT}`;
+// Serving owns durable chat/EA metadata: never write the operator's state.
+const testHome = mkdtempSync(resolve(tmpdir(), "omar-serve-ui-"));
+const testEnv = { ...process.env, HOME: testHome };
+after(() => rmSync(testHome, { recursive: true, force: true }));
 
 /**
  * A binary without the feature refuses `--ui` by design, and that refusal is
@@ -35,8 +40,9 @@ const ORIGIN = `http://127.0.0.1:${PORT}`;
  */
 function bundled() {
   if (!existsSync(OMAR_BIN)) return false;
-  const probe = spawnSync(OMAR_BIN, ["serve", "--ui", "--address", "127.0.0.1:1"], {
+  const probe = spawnSync(OMAR_BIN, ["serve", "--ui", "--no-ea", "--address", "0.0.0.0:0"], {
     encoding: "utf8",
+    env: testEnv,
     timeout: 20_000,
   });
   return !`${probe.stdout}${probe.stderr}`.includes("no UI in it");
@@ -74,6 +80,7 @@ describe("omar serve --ui", { skip: AVAILABLE ? false : "no bundled runtime" }, 
     // what is under test, not the agent.
     daemon = spawn(OMAR_BIN, ["serve", "--address", `127.0.0.1:${PORT}`, "--no-ea"], {
       stdio: "ignore",
+      env: testEnv,
     });
     for (let attempt = 0; attempt < 100; attempt += 1) {
       try {
@@ -158,8 +165,9 @@ describe("omar serve --ui", { skip: AVAILABLE ? false : "no bundled runtime" }, 
 /** Guards the other half: a build without the feature must say so. */
 test("a runtime without the bundle refuses --ui and explains itself", { skip: AVAILABLE }, () => {
   if (!existsSync(OMAR_BIN)) return;
-  const probe = spawnSync(OMAR_BIN, ["serve", "--ui", "--address", "127.0.0.1:1"], {
+  const probe = spawnSync(OMAR_BIN, ["serve", "--ui", "--no-ea", "--address", "0.0.0.0:0"], {
     encoding: "utf8",
+    env: testEnv,
     timeout: 20_000,
   });
   const said = `${probe.stdout}${probe.stderr}`;

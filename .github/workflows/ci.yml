@@ -103,8 +103,60 @@ jobs:
       - name: Run all tests
         run: cargo test -- --test-threads=1
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify legacy supervision through MCP and tmux
+        run: |
+          cargo build -p omar
+          python3 tests/ci/legacy_supervision.py
+          python3 tests/ci/backend_coordination_contracts.py
+          python3 tests/ci/protocol_runner.py
+          python3 tests/ci/mission_control_lifecycle.py
+
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1
+
+  codex-shared-history:
+    name: Codex Shared History
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install terminal and Codex test dependencies
+        run: |
+          .github/scripts/install-packages.sh tmux python3-venv
+          npm install -g @openai/codex@0.154.0
+          python3 -m venv "$RUNNER_TEMP/codex-test"
+          "$RUNNER_TEMP/codex-test/bin/pip" install websocket-client==1.9.0
+      - name: Build OMAR
+        run: cargo build --bin omar
+      - name: Verify shared history, resume, event delivery, and composer rendering
+        run: |
+          "$RUNNER_TEMP/codex-test/bin/python" tests/ci/codex_shared_home.py
+          "$RUNNER_TEMP/codex-test/bin/python" tests/ci/codex_exec_delivery.py
+          "$RUNNER_TEMP/codex-test/bin/python" tests/ci/codex_event_wake.py
+
+  backend-supervision-contracts:
+    name: Backend Supervision Contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned backend CLIs
+        run: npm install -g @anthropic-ai/claude-code@2.1.274 opencode-ai@1.18.31 @openai/codex@0.154.0
+      - name: Verify native prompt and wake contracts against local mock providers
+        run: |
+          python3 tests/ci/claude_prompt_contract.py
+          python3 tests/ci/opencode_wake_contract.py
+          python3 tests/ci/codex_event_wake.py
 
   pi-bridge:
     name: Pi Bridge
@@ -212,7 +264,17 @@ jobs:
           echo "$output"
           grep -Fq 'Output run.result = "hello"' <<<"$output"
 
-      # The first program CI runs that has a reaction. Its bodies are code, so
+      - name: Verify agent invocations use side-channel delivery
+        env:
+          OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
+        run: |
+          output=$(cargo run --quiet --bin omar -- run \
+            tests/ci/side_channel_stub.omar --input run.request=go \
+            --timeout-seconds 15 --replace)
+          echo "$output"
+          grep -Fq 'Output run.result = "stub"' <<<"$output"
+
+      # This reaction program has code bodies, so
       # the ring is deterministic and costs no model call.
       - name: Verify a reaction end to end
         env:
@@ -234,6 +296,14 @@ jobs:
           echo "$output"
           grep -Fq 'Output leader.done = true' <<<"$output"
           grep -Fq 'State leader.round = 10' <<<"$output"
+
+      # Cursor and Antigravity run under OMAR's protocol runner, which paints
+      # no banner, so `omar run` must take the runner's socket as readiness.
+      # Deterministic peers stand in for the CLIs; no model call is made.
+      - name: Verify a topology completes on the runner-backed backends
+        env:
+          OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
+        run: python3 tests/ci/topology_runner_backends.py
 
       - name: Check bytecode layout and declared agent backends
         run: |
@@ -478,6 +548,9 @@ jobs:
       - name: Run dashboard relaunch handoff integration
         run: bash tests/ci/dashboard_relaunch_handoff.sh
 
+      - name: Verify backend channel setup survives launcher exit
+        run: python3 tests/ci/channel_startup.py
+
   opencode-compat:
     name: Opencode Compatibility
     runs-on: ubuntu-latest
@@ -511,10 +584,10 @@ jobs:
       - name: Verify no hardcoded claude references in runtime paths
         run: |
           # A ratchet, not a compatibility test. Making OMAR multi-backend
-          # removed this command from everywhere but `config.rs`, where it is
-          # the documented fallback; this keeps one from creeping back, because
-          # a runtime path that spells claude out is a path opencode cannot
-          # take.
+          # removed this command from everywhere but the Claude backend's own
+          # file, which is where a backend's default command belongs; this
+          # keeps one from creeping back, because a runtime path that spells
+          # claude out is a path opencode cannot take.
           #
           # Runtime paths only, which is what the name says. A `#[cfg(test)]`
           # module is compiled out of the binary, so a literal there cannot
@@ -528,7 +601,7 @@ jobs:
           # and the whole point of the check.
           MATCHES=$(
             for file in $(grep -rl '"claude --dangerously-skip-permissions"' src/ --include='*.rs'); do
-              [ "$file" = "src/config.rs" ] && continue
+              [ "$file" = "src/backend/claude.rs" ] && continue
               awk -v f="$file" '
                 previous ~ /^#\[cfg\(test\)\]$/ && /^mod / { exit }
                 /"claude --dangerously-skip-permissions"/ { print f ":" NR ":" $0 }
@@ -681,18 +754,20 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [check, fmt, clippy, test, pi-bridge, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
+    needs: [pi-bridge, check, fmt, clippy, test, codex-shared-history, backend-supervision-contracts, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: always()
     steps:
       - name: Check all jobs passed
         run: |
-          if [[ "${{ needs.check.result }}" != "success" ]] || \
+          if [[ "${{ needs.pi-bridge.result }}" != "success" ]] || \
+             [[ "${{ needs.check.result }}" != "success" ]] || \
              [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
-             [[ "${{ needs.pi-bridge.result }}" != "success" ]] || \
+             [[ "${{ needs.codex-shared-history.result }}" != "success" ]] || \
+             [[ "${{ needs.backend-supervision-contracts.result }}" != "success" ]] || \
              [[ "${{ needs.omar-language.result }}" != "success" ]] || \
              [[ "${{ needs.popup-quote-integration.result }}" != "success" ]] || \
              [[ "${{ needs.unresolved-session-integration.result }}" != "success" ]] || \

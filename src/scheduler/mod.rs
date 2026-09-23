@@ -1,5 +1,4 @@
 pub mod event;
-mod pane_input;
 
 pub use event::ScheduledEvent;
 
@@ -378,7 +377,7 @@ impl Scheduler {
     fn next_timestamp(&self) -> Option<u64> {
         self.transaction(false, |queue| queue.peek().map(|event| event.timestamp))
     }
-    fn take_due_deliveries(&self, popup_receiver: &PopupReceiver) -> Vec<DueDelivery> {
+    fn take_due_deliveries(&self) -> Vec<DueDelivery> {
         self.transaction(true, |queue| {
             let Some(earliest_ts) = queue.peek().map(|event| event.timestamp) else {
                 return Vec::new();
@@ -417,14 +416,6 @@ impl Scheduler {
                     continue;
                 }
 
-                // Reading a pane means several tmux subprocesses, and emptying
-                // one can take seconds of polling. This runs inside the store
-                // transaction, which holds a cross-process lock that other
-                // writers give up on after 500ms — so decide here, and do it
-                // in the caller once the lock is gone.
-                let needs_draft_protection =
-                    should_defer_for_popup(popup_receiver, &receiver, ea_id);
-
                 let remaining_quota = MAX_EVENTS_PER_EA_PER_TICK - delivered_so_far;
                 let (batch, deferred_batch) = split_batch_for_quota(batch, remaining_quota);
                 for event in deferred_batch {
@@ -455,7 +446,6 @@ impl Scheduler {
                     ea_id,
                     timestamp: earliest_ts,
                     batch,
-                    needs_draft_protection,
                 });
             }
 
@@ -467,10 +457,9 @@ impl Scheduler {
 
 /// Put a batch back on the queue to be retried after the popup delay.
 ///
-/// Used whenever the pane cannot be read or cannot be cleared: a late event is
-/// recoverable, a destroyed draft is not.
+/// A failed backend channel must not discard pending work or trigger terminal input.
 fn requeue_batch(scheduler: &Scheduler, batch: Vec<ScheduledEvent>) {
-    let retry_at = now_ns() + POPUP_DEFER_NS;
+    let retry_at = now_ns() + DELIVERY_RETRY_NS;
     for mut event in batch {
         event.timestamp = retry_at;
         scheduler.insert(event);
@@ -486,262 +475,32 @@ fn pane_target_name(receiver: &str, ea_id: ea::EaId, base_prefix: &str) -> Strin
     }
 }
 
-/// Capture the user's in-progress draft from an agent pane.
-///
-/// The backend is read from the session stamp written at launch rather than
-/// sniffed from the pane, and the capture is the visible pane only, so
-/// scrollback cannot contribute stale prompt rows.
-fn get_pane_input(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> pane_input::PaneInput {
-    let target = pane_target_name(receiver, ea_id, base_prefix);
-    let client = crate::tmux::TmuxClient::new("");
-
-    let Some(backend) = client.session_backend(&target) else {
-        return pane_input::PaneInput::Unknown("backend not identified");
-    };
-    let Some(shape) = pane_input::Shape::for_backend(&backend) else {
-        return pane_input::PaneInput::Unknown("backend has no known input shape");
-    };
-    let Ok(capture) = client.capture_pane_visible(&target) else {
-        return pane_input::PaneInput::Unknown("pane capture failed");
-    };
-
-    let caret = client
-        .caret_position(&target)
-        .map(|(row, col)| pane_input::Caret { row, col });
-    let width = client.pane_width(&target);
-    pane_input::extract(shape, &capture, caret, width)
-}
-
-/// Empty the input box, confirming it by re-reading the pane.
-///
-/// `C-u` kills one line at a time — a visual line on some backends, a logical
-/// one on others — so the count needed varies with the draft. Rather than
-/// guess, press and re-check until the box reads empty. Returns `false` if it
-/// never does, so the caller can put the draft back and defer.
-/// What emptying the input box achieved.
-#[derive(Debug, PartialEq, Eq)]
-enum Cleared {
-    /// The box is empty.
-    Empty,
-    /// Nothing was sent, so whatever was there is untouched.
-    Untouched,
-    /// Keys were sent and the box still holds text — it is damaged now.
-    Partial,
-}
-
-/// A key that empties the whole composer at once, for backends that have one.
-///
-/// Only opencode is listed, and only because its binding was checked against a
-/// live pane: `ctrl+c` is registered as "clear input" while the composer holds
-/// text and as "quit" while it does not, so it is safe exactly when we use it —
-/// straight after a read that said there was a draft — and catastrophic
-/// otherwise. Everything else empties the box a line at a time, which is slower
-/// but has no way to kill the agent.
-fn whole_buffer_clear_key(backend: &str) -> Option<&'static str> {
-    match backend {
-        "opencode" => Some("C-c"),
-        _ => None,
-    }
-}
-
-fn clear_pane_input(base_prefix: &str, receiver: &str, ea_id: ea::EaId, target: &str) -> Cleared {
-    const MAX_CLEAR_ROUNDS: usize = 40;
-    let client = crate::tmux::TmuxClient::new("");
-    let clear_key = client
-        .session_backend(target)
-        .and_then(|backend| whole_buffer_clear_key(&backend));
-    let mut last: Option<String> = None;
-    let mut removed = false;
-    let mut stalls = 0;
-
-    for _ in 0..MAX_CLEAR_ROUNDS {
-        let current = match get_pane_input(base_prefix, receiver, ea_id) {
-            pane_input::PaneInput::Empty => return Cleared::Empty,
-            // Never keep hammering a pane we cannot read. Whether the draft is
-            // still whole depends on how far we got, and the caller needs to
-            // know: putting it back on top of an intact draft duplicates it.
-            pane_input::PaneInput::Unknown(_) => {
-                return if removed {
-                    Cleared::Partial
-                } else {
-                    Cleared::Untouched
-                };
-            }
-            pane_input::PaneInput::Draft(draft) => draft,
-        };
-
-        // Stop when the keys stop achieving anything, rather than pressing
-        // forty times and then reporting a box we damaged as merely stubborn.
-        if last.as_deref() == Some(current.as_str()) {
-            stalls += 1;
-            if stalls >= 2 {
-                return if removed {
-                    Cleared::Partial
-                } else {
-                    Cleared::Untouched
-                };
-            }
-        } else {
-            if last.is_some() {
-                removed = true;
-            }
-            stalls = 0;
-        }
-        last = Some(current);
-
-        // The read above said there is a draft, which is the condition that
-        // makes this key mean "clear" rather than "quit".
-        if let Some(key) = clear_key {
-            let _ = client.send_keys(target, key);
-            std::thread::sleep(std::time::Duration::from_millis(60));
-            continue;
-        }
-
-        // `C-u` kills back to the start of the line. At the start of the
-        // buffer it does nothing, forever, which leaves a draft the user is
-        // editing from the top permanently unclearable — so when a press
-        // achieves nothing, add `C-k`, which kills forward and takes the
-        // newline with it.
-        //
-        // `C-k` is held back until then on purpose: antigravity binds it to
-        // approving a waiting subagent, and approving one on the user's behalf
-        // to tidy an input box is not a trade worth making routinely.
-        let _ = client.send_keys(target, "C-u");
-        if stalls > 0 {
-            let _ = client.send_keys(target, "C-k");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-
-    match get_pane_input(base_prefix, receiver, ea_id) {
-        pane_input::PaneInput::Empty => Cleared::Empty,
-        _ if removed => Cleared::Partial,
-        _ => Cleared::Untouched,
-    }
-}
-
-/// Empty the input box, handing back whatever was in it so it can be put
-/// back afterwards. `None` means the pane could not be read or could not be
-/// cleared, and must not be typed into.
-fn protect_draft(base_prefix: &str, receiver: &str, ea_id: ea::EaId) -> Option<Option<String>> {
-    let draft = match get_pane_input(base_prefix, receiver, ea_id) {
-        pane_input::PaneInput::Empty => None,
-        pane_input::PaneInput::Draft(draft) => Some(draft),
-        // Unreadable: clearing what we cannot put back destroys the draft.
-        pane_input::PaneInput::Unknown(_) => return None,
-    };
-
-    let target = pane_target_name(receiver, ea_id, base_prefix);
-    match clear_pane_input(base_prefix, receiver, ea_id, &target) {
-        Cleared::Empty => Some(draft.filter(|draft| !draft.trim().is_empty())),
-        // Nothing was sent, so the draft is still whole. Pasting it back here
-        // would leave the user with two copies of what they were writing.
-        Cleared::Untouched => None,
-        Cleared::Partial => {
-            // Keys landed and the box still holds part of the draft. Put back
-            // what was taken, or the clearing itself is the damage.
-            if let Some(draft) = &draft {
-                let _ = crate::tmux::TmuxClient::new("").paste_text(&target, draft);
-            }
-            None
-        }
-    }
-}
-
-/// The side channel for a receiver's pane, if its backend offers one.
-fn side_channel(
-    receiver: &str,
-    ea_id: ea::EaId,
-    base_prefix: &str,
-) -> Option<crate::channel::Channel> {
-    let target = pane_target_name(receiver, ea_id, base_prefix);
-    let client = crate::tmux::TmuxClient::new("");
-    let backend = client.session_backend(&target)?;
-    let pane_pid = client.get_pane_pid(&target).ok()?;
-    let stamp = client.session_delivery(&target);
-    crate::channel::Channel::resolve(&backend, pane_pid, stamp.as_deref())
-}
-
 pub(crate) fn deliver_to_tmux(
     ea_id: u32,
     receiver: &str,
     message: &str,
     base_prefix: &str,
     ticker: &TickerBuffer,
-    restore_input: Option<&str>,
 ) -> bool {
-    // Set when the input box had to be emptied on the fallback path.
-    let mut rescued = None;
-
-    // Prefer handing the event to the backend directly. It reaches the model
-    // without going through the input box, so a draft the user is typing is
-    // never touched and the event does not read as something they said.
-    if let Some(channel) = side_channel(receiver, ea_id, base_prefix) {
-        match channel.deliver(message) {
-            Ok(()) => {
-                // A channel can appear between capture and delivery — a spool
-                // drained, a port finished provisioning — in which case the
-                // caller has already emptied the box and is holding the draft.
-                // Returning without putting it back would destroy it.
-                if let Some(draft) = restore_input.filter(|draft| !draft.is_empty()) {
-                    let target = pane_target_name(receiver, ea_id, base_prefix);
-                    if crate::tmux::TmuxClient::new("")
-                        .paste_text(&target, draft)
-                        .is_err()
-                    {
-                        ticker.push(format!("tmux input restore failed for {}", receiver));
-                    }
-                }
-                ticker.push(format!(
-                    "delivered event(s) to {} via {}",
-                    receiver,
-                    channel.describe()
-                ));
-                return true;
-            }
-            Err(e) => {
-                ticker.push(format!(
-                    "side channel for {} failed ({}); using the input box",
-                    receiver, e
-                ));
-                // The caller skipped its capture because a channel looked
-                // available, so anything the user was typing is still in the
-                // box and nothing has been cleared. Do that here, or typing
-                // the event would land on top of their draft.
-                match protect_draft(base_prefix, receiver, ea_id) {
-                    Some(draft) => rescued = draft,
-                    None => {
-                        // Unreadable or unclearable: leave the pane alone.
-                        // Losing one event beats destroying a draft.
-                        ticker.push(format!(
-                            "could not clear the input box for {}; retrying later",
-                            receiver
-                        ));
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-
     let target = pane_target_name(receiver, ea_id, base_prefix);
     let client = crate::tmux::TmuxClient::new("");
-    let opts = DeliveryOptions::default();
-    if let Err(e) = client.deliver_prompt(&target, message, &opts) {
-        ticker.push(format!("tmux prompt delivery failed for {}: {}", target, e));
-        return false;
-    }
-    let restore_input = restore_input.or(rescued.as_deref());
-    if let Some(input) = restore_input.filter(|input| !input.is_empty()) {
-        if let Err(e) = client.paste_text(&target, input) {
-            ticker.push(format!("tmux input restore failed for {}: {}", target, e));
-            // The event itself did land; only putting the draft back failed.
-            return true;
+    match client.deliver_prompt(
+        &target,
+        message,
+        &DeliveryOptions {
+            startup_timeout: std::time::Duration::ZERO,
+            ..Default::default()
+        },
+    ) {
+        Ok(()) => {
+            ticker.push(format!("delivered event(s) to {}", receiver));
+            true
         }
-        ticker.push(format!("restored draft input for {}", receiver));
+        Err(e) => {
+            ticker.push(format!("deferred event(s) for {}: {:#}", receiver, e));
+            false
+        }
     }
-    ticker.push(format!("delivered event(s) to {}", receiver));
-    true
 }
 
 fn format_delivery(events: &[ScheduledEvent], timestamp: u64) -> String {
@@ -783,70 +542,65 @@ fn split_batch_for_quota(
     (batch, deferred)
 }
 
-/// Shared state: the (short name, ea_id) of the agent whose popup is currently open, if any.
-/// Both fields are required so suppression is scoped per-EA and does not affect same-named
-/// agents in other EAs.
-pub type PopupReceiver = Arc<Mutex<Option<(String, ea::EaId)>>>;
-
-pub fn new_popup_receiver() -> PopupReceiver {
-    Arc::new(Mutex::new(None))
-}
-
-/// How long to push delivery out while the user's popup is open.
-/// If the popup stays open past this, the loop simply defers again —
-/// no unbounded fan-out, one event stays one event.
-pub(crate) const POPUP_DEFER_NS: u64 = 30_000_000_000;
+/// Delay before retrying a failed channel delivery. The queued batch is retained.
+pub(crate) const DELIVERY_RETRY_NS: u64 = 30_000_000_000;
 
 struct DueDelivery {
     receiver: String,
     ea_id: u32,
     timestamp: u64,
     batch: Vec<ScheduledEvent>,
-    /// The user has this pane's popup open, so the input box may hold a draft
-    /// that must be taken out of the way — done by the caller, off the lock.
-    needs_draft_protection: bool,
 }
 
-/// Decide whether to defer an event for `(receiver, ea_id)` because the user
-/// has an agent popup open on that exact pane. Scoped per-EA so same-named
-/// workers in other EAs deliver as normal.
-///
-/// `deliver_to_tmux` treats the EA pane as either `"ea"` or `"omar"`, so both
-/// forms are accepted as aliases: if the popup is on the EA pane, any event
-/// addressed to that EA manager (via either alias) is deferred.
-pub(crate) fn should_defer_for_popup(
-    popup_receiver: &PopupReceiver,
-    receiver: &str,
-    ea_id: ea::EaId,
-) -> bool {
-    popup_receiver
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|(r, eid)| *eid == ea_id && receivers_match(r, receiver))
-}
-
-/// True when `popup` (the identifier stored when the popup opened) refers to
-/// the same receiver pane as `event_receiver`.
-///
-/// `deliver_to_tmux` treats both `"ea"` and `"omar"` as names for the EA
-/// manager pane. `selected_popup_receiver_name` only ever stores `"ea"` for
-/// that pane (never `"omar"`), so the alias is intentionally *one-way*:
-/// a popup on the EA pane (`"ea"`) must cover events addressed as either
-/// `"ea"` or `"omar"`, but a worker short name that happens to be `"omar"`
-/// must NOT defer events addressed to the EA.
-fn receivers_match(popup: &str, event_receiver: &str) -> bool {
-    popup == event_receiver || (popup == "ea" && event_receiver == "omar")
-}
-
-pub async fn run_event_loop(
-    scheduler: Arc<Scheduler>,
-    ticker: TickerBuffer,
-    popup_receiver: PopupReceiver,
-    base_prefix: String,
-) {
+pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer, base_prefix: String) {
     let external_poll_interval = std::time::Duration::from_millis(500);
+    let mut last_supervision = std::time::Instant::now() - std::time::Duration::from_secs(5);
     loop {
+        if last_supervision.elapsed() >= std::time::Duration::from_secs(5) {
+            last_supervision = std::time::Instant::now();
+            if let Some(root) = scheduler.store_path.as_deref().and_then(Path::parent) {
+                // A failed inventory is not proof that every worker died.
+                if root.join("task-lifecycle.json").exists() {
+                    match crate::tmux::TmuxClient::new("").list_sessions() {
+                        Ok(sessions) => {
+                            let client = crate::tmux::TmuxClient::new("");
+                            let live = sessions
+                                .into_iter()
+                                .filter(|s| client.session_has_live_pane(&s.name).unwrap_or(true))
+                                .map(|s| s.name)
+                                .collect();
+                            match crate::supervision::reconcile(
+                                root,
+                                crate::supervision::now_ms(),
+                                &live,
+                            ) {
+                                Ok(wakes) => {
+                                    for (ea_id, receiver, payload) in wakes {
+                                        let id = format!("supervisor-{ea_id}-{receiver}");
+                                        // Upsert preserves bounded queue size through outages.
+                                        scheduler.transaction(true, |queue| {
+                                            queue.retain(|event| event.id != id);
+                                            queue.push(ScheduledEvent {
+                                                id,
+                                                sender: "omar-runtime".into(),
+                                                receiver,
+                                                timestamp: now_ns(),
+                                                created_at: now_ns(),
+                                                payload,
+                                                recurring_ns: None,
+                                                ea_id,
+                                            });
+                                        });
+                                    }
+                                }
+                                Err(error) => ticker.push(format!("supervision: {error}")),
+                            }
+                        }
+                        Err(error) => ticker.push(format!("supervision inventory: {error}")),
+                    }
+                }
+            }
+        }
         let next_ts = scheduler.next_timestamp();
 
         match next_ts {
@@ -876,45 +630,45 @@ pub async fn run_event_loop(
                     }
                 }
 
-                for delivery in scheduler.take_due_deliveries(&popup_receiver) {
+                for delivery in scheduler.take_due_deliveries() {
                     let DueDelivery {
                         receiver,
                         ea_id,
                         timestamp,
-                        batch,
-                        needs_draft_protection,
+                        mut batch,
                     } = delivery;
+                    if let Some(root) = scheduler.store_path.as_deref().and_then(Path::parent) {
+                        // A deferred notification is a pointer to an obligation,
+                        // not a frozen copy of authoritative state.
+                        if batch.iter().any(|e| e.sender == "omar-runtime") {
+                            match crate::supervision::context(root, ea_id, &receiver) {
+                                Ok(state) => {
+                                    batch.retain(|e| {
+                                        e.sender != "omar-runtime"
+                                            || state["tasks"]
+                                                .as_array()
+                                                .is_some_and(|tasks| !tasks.is_empty())
+                                    });
+                                    for event in
+                                        batch.iter_mut().filter(|e| e.sender == "omar-runtime")
+                                    {
+                                        event.payload = crate::supervision::context_message(&state);
+                                    }
+                                }
+                                Err(error) => {
+                                    ticker.push(format!("supervision context: {error}"));
+                                    requeue_batch(&scheduler, batch);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     if batch.is_empty() {
                         continue;
                     }
 
-                    // Off the store lock now, so this may take its time. A
-                    // side channel bypasses the input box entirely, so there
-                    // is nothing to protect in that case.
-                    let mut restore_input = None;
-                    if needs_draft_protection {
-                        let receiver_name = receiver.clone();
-                        let base_prefix_clone = base_prefix.clone();
-                        let protected = tokio::task::spawn_blocking(move || {
-                            if side_channel(&receiver_name, ea_id, &base_prefix_clone).is_some() {
-                                return Some(None);
-                            }
-                            protect_draft(&base_prefix_clone, &receiver_name, ea_id)
-                        })
-                        .await;
-                        match protected {
-                            Ok(Some(draft)) => restore_input = draft,
-                            _ => {
-                                ticker.push(format!(
-                                    "deferred event(s) for {} (popup open)",
-                                    receiver
-                                ));
-                                requeue_batch(&scheduler, batch);
-                                continue;
-                            }
-                        }
-                    }
-
+                    // Socket and HTTP delivery run off the async event loop.
+                    // No terminal input is read or modified.
                     let message = format_delivery(&batch, timestamp);
                     let receiver_name = receiver.clone();
                     let base_prefix_clone = base_prefix.clone();
@@ -926,21 +680,17 @@ pub async fn run_event_loop(
                             &message,
                             &base_prefix_clone,
                             &ticker_clone,
-                            restore_input.as_deref(),
                         )
                     })
                     .await;
                     // The batch has already left the queue. If it never
                     // reached the agent, put it back rather than lose it.
-                    if matches!(delivery_result, Ok(false)) {
+                    if !matches!(delivery_result, Ok(true)) {
+                        if let Err(e) = &delivery_result {
+                            ticker.push(format!("delivery task failed for {}: {}", receiver, e));
+                        }
                         requeue_batch(&scheduler, batch);
                         continue;
-                    }
-                    if let Err(e) = delivery_result {
-                        ticker.push(format!(
-                            "delivery task failed for {} (ea {}): {}",
-                            receiver, ea_id, e
-                        ));
                     }
 
                     let lag_ns = now_ns().saturating_sub(timestamp);
@@ -960,23 +710,6 @@ pub async fn run_event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_a_verified_clear_key_is_ever_sent() {
-        // `ctrl+c` means "clear the input" while opencode's composer holds
-        // text and "quit" while it does not, so it is only ever sent straight
-        // after a read that found a draft. No other backend gets one until its
-        // binding has been checked the same way against a live pane — a wrong
-        // guess here kills the user's agent.
-        assert_eq!(whole_buffer_clear_key("opencode"), Some("C-c"));
-        for backend in ["claude", "codex", "cursor", "agy", "stub", ""] {
-            assert_eq!(
-                whole_buffer_clear_key(backend),
-                None,
-                "{backend} must fall back to clearing a line at a time"
-            );
-        }
-    }
 
     fn make_event(receiver: &str, sender: &str, timestamp: u64, payload: &str) -> ScheduledEvent {
         ScheduledEvent {
@@ -1318,82 +1051,6 @@ mod tests {
         assert_eq!(buf.front().unwrap().text, "msg10");
     }
 
-    // ── input preservation threshold — pure heuristic ──
-
-    // ── opencode TUI extraction helpers ──
-
-    // ── Popup-defer decision (pure helper) ──
-    //
-    // When the user opens the tmux popup for an agent pane, the scheduler
-    // must defer events bound for that pane so injected [EVENT]/[CRON]/
-    // [SLACK MESSAGE] lines don't corrupt input the user is typing.
-    //
-    // `should_defer_for_popup` makes the decision based only on the popup
-    // state; the surrounding loop then picks the defer window.
-
-    #[test]
-    fn popup_decision_defer_when_receiver_and_ea_match() {
-        let popup = new_popup_receiver();
-        *popup.lock().unwrap() = Some(("worker".to_string(), 7));
-        assert!(should_defer_for_popup(&popup, "worker", 7));
-    }
-
-    #[test]
-    fn popup_decision_no_defer_when_receiver_differs() {
-        let popup = new_popup_receiver();
-        *popup.lock().unwrap() = Some(("worker".to_string(), 7));
-        assert!(!should_defer_for_popup(&popup, "other", 7));
-    }
-
-    #[test]
-    fn popup_decision_no_defer_when_ea_differs() {
-        // Fix V5 style per-EA scoping: same-named worker in a different EA
-        // must NOT be deferred.
-        let popup = new_popup_receiver();
-        *popup.lock().unwrap() = Some(("worker".to_string(), 7));
-        assert!(!should_defer_for_popup(&popup, "worker", 8));
-    }
-
-    #[test]
-    fn popup_decision_no_defer_when_no_popup_open() {
-        let popup = new_popup_receiver();
-        assert!(!should_defer_for_popup(&popup, "worker", 7));
-    }
-
-    #[test]
-    fn popup_decision_defer_ea_alias_matches_omar() {
-        // Popup opened on the EA pane (stored as "ea") must defer events
-        // addressed either as "ea" or as "omar" — both route to the manager
-        // session in `deliver_to_tmux`.
-        let popup = new_popup_receiver();
-        *popup.lock().unwrap() = Some(("ea".to_string(), 3));
-        assert!(should_defer_for_popup(&popup, "ea", 3));
-        assert!(should_defer_for_popup(&popup, "omar", 3));
-        // Sanity: worker in the same EA still delivers normally
-        assert!(!should_defer_for_popup(&popup, "worker", 3));
-    }
-
-    #[test]
-    fn popup_decision_ea_alias_still_scoped_per_ea() {
-        let popup = new_popup_receiver();
-        *popup.lock().unwrap() = Some(("ea".to_string(), 3));
-        // Events for the EA in a different EA namespace are NOT deferred.
-        assert!(!should_defer_for_popup(&popup, "ea", 4));
-        assert!(!should_defer_for_popup(&popup, "omar", 4));
-    }
-
-    #[test]
-    fn popup_decision_alias_is_one_way() {
-        // A worker legitimately named "omar" (an unfortunate but legal short
-        // name — the receiver field is free-form) must not hijack the EA
-        // defer path. Only a popup stored as the canonical "ea" covers the
-        // "omar" alias; a popup on worker "omar" covers only "omar".
-        let popup = new_popup_receiver();
-        *popup.lock().unwrap() = Some(("omar".to_string(), 2));
-        assert!(should_defer_for_popup(&popup, "omar", 2));
-        assert!(!should_defer_for_popup(&popup, "ea", 2));
-    }
-
     #[test]
     fn event_loop_defers_entire_batch_as_a_batch() {
         // Multiple events sharing the same (receiver, ea_id, timestamp) are
@@ -1404,12 +1061,15 @@ mod tests {
         rt.block_on(async {
             let scheduler = Arc::new(Scheduler::new());
             let ticker = TickerBuffer::new();
-            let popup_receiver = new_popup_receiver();
-            *popup_receiver.lock().unwrap() = Some(("popup-target".to_string(), 5));
 
             let due_ts = now_ns().saturating_sub(500_000_000);
             for i in 0..3 {
-                let mut ev = make_event("popup-target", "sender", due_ts, &format!("batch-{}", i));
+                let mut ev = make_event(
+                    "unavailable-target",
+                    "sender",
+                    due_ts,
+                    &format!("batch-{}", i),
+                );
                 ev.ea_id = 5;
                 scheduler.insert(ev);
             }
@@ -1417,7 +1077,6 @@ mod tests {
             let loop_handle = tokio::spawn(run_event_loop(
                 scheduler.clone(),
                 ticker.clone(),
-                popup_receiver.clone(),
                 "omar-agent-".to_string(),
             ));
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1437,23 +1096,16 @@ mod tests {
         });
     }
 
-    // ── Event-loop behaviour with popup state ──
-    //
-    // Regression check: with the popup open for `(receiver, ea_id)`, a
-    // past-due event for the same target must be re-queued ~30s into the
-    // future instead of being delivered. Without the popup it would be
-    // popped and handed to `deliver_to_tmux`.
+    // Failed channels retain queued events for retry.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn event_loop_defers_event_while_popup_open() {
+    async fn event_loop_retains_event_when_channel_is_unavailable() {
         let scheduler = Arc::new(Scheduler::new());
         let ticker = TickerBuffer::new();
-        let popup_receiver = new_popup_receiver();
-        *popup_receiver.lock().unwrap() = Some(("popup-target".to_string(), 42));
 
         // Past-due event — loop will try to deliver immediately
         let mut ev = make_event(
-            "popup-target",
+            "unavailable-target",
             "sender",
             now_ns().saturating_sub(1_000_000_000),
             "hi",
@@ -1464,7 +1116,6 @@ mod tests {
         let loop_handle = tokio::spawn(run_event_loop(
             scheduler.clone(),
             ticker.clone(),
-            popup_receiver.clone(),
             "omar-agent-".to_string(),
         ));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1474,7 +1125,7 @@ mod tests {
         assert_eq!(
             events.len(),
             1,
-            "event must stay queued while popup is open"
+            "event must stay queued while its channel is unavailable"
         );
         let delta_secs = (events[0].timestamp as i128 - now_ns() as i128) / 1_000_000_000;
         assert!(
@@ -1485,24 +1136,20 @@ mod tests {
 
         let ticker_text = ticker.render(std::time::Duration::from_secs(60));
         assert!(
-            ticker_text.contains("deferred event(s) for popup-target"),
+            ticker_text.contains("deferred event(s) for unavailable-target"),
             "ticker must note the defer: {}",
             ticker_text
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn event_loop_keeps_deferring_while_popup_stays_open() {
-        // The popup can stay open longer than 30s. Each delivery attempt
-        // must re-defer another 30s — no eventual delivery, no unbounded
-        // queue growth.
+    async fn event_loop_keeps_retrying_unavailable_channel() {
+        // Repeated channel failures retain one queued event, without queue growth.
         let scheduler = Arc::new(Scheduler::new());
         let ticker = TickerBuffer::new();
-        let popup_receiver = new_popup_receiver();
-        *popup_receiver.lock().unwrap() = Some(("popup-target".to_string(), 1));
 
         let mut ev = make_event(
-            "popup-target",
+            "unavailable-target",
             "sender",
             now_ns().saturating_sub(500_000_000),
             "hi",
@@ -1513,7 +1160,6 @@ mod tests {
         let loop_handle = tokio::spawn(run_event_loop(
             scheduler.clone(),
             ticker.clone(),
-            popup_receiver.clone(),
             "omar-agent-".to_string(),
         ));
 

@@ -58,6 +58,22 @@ async function useFakeServe(page: import("@playwright/test").Page) {
   await expect(page.locator(".daemon")).toContainText(FAKE_SERVE_URL);
 }
 
+test("deployment confirmation is a modal with lifecycle guidance and keyboard cancellation", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const deployButton = page.getByRole("button", { name: "Deploy", exact: true });
+  await deployButton.click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("closing Mission Control keeps the topology, assistant, and runtime running");
+  await expect(dialog).toContainText("Reopen Mission Control to reconnect");
+  await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(deployButton).toBeFocused();
+  await expect(page.locator(".connection")).toContainText("review");
+});
+
 test("prompt to finished run, gated on an explicit confirmation", async ({ page }) => {
   await useFakeServe(page);
   const phase = page.locator(".connection");
@@ -505,6 +521,8 @@ test("the source view highlights OMAR, and its pane can be hidden", async ({
 });
 
 test("the columns can be resized from either divider", async ({ page }) => {
+  // Leave room for history plus all three resizable workspace panes.
+  await page.setViewportSize({ width: 1440, height: 900 });
   await useFakeServe(page);
   await draftUntilProposed(page);
 
@@ -589,25 +607,25 @@ test("dragging a panel away collapses it, and its divider brings it back", async
   expect((await conversation.boundingBox())!.width).toBeGreaterThan(200);
 });
 
-test("the conversation owns the window until a design splits it", async ({
+test("the conversation owns the workspace until a design splits it", async ({
   page,
 }) => {
   await useFakeServe(page);
 
   // Nothing to show beside the conversation yet.
   const conversation = page.locator(".builder-panel");
-  const viewport = page.viewportSize()!;
+  const workspace = (await page.locator(".workspace").boundingBox())!;
   expect((await conversation.boundingBox())!.width).toBeGreaterThan(
-    viewport.width - 40,
+    workspace.width - 40,
   );
   await expect(page.locator(".diagram-panel")).toHaveCount(0);
 
   await draftUntilProposed(page);
 
-  // The first design splits the window down the middle, diagram on the right.
+  // The first design splits the workspace down the middle, diagram on the right.
   const conversationBox = (await conversation.boundingBox())!;
   const diagramBox = (await page.locator(".diagram-panel").boundingBox())!;
-  expect(Math.abs(conversationBox.width - viewport.width / 2)).toBeLessThan(60);
+  expect(Math.abs(conversationBox.width - workspace.width / 2)).toBeLessThan(60);
   expect(diagramBox.x).toBeGreaterThan(conversationBox.x);
   // And it is a pure diagram: the source pane waits behind its handle.
   await expect(page.locator(".inspector-panel")).toBeHidden();
@@ -632,9 +650,10 @@ test("the studio opens on a centred prompt, then settles into a thread", async (
 
   // A compact box, like the one a chat client opens with — a full-width slab
   // five lines deep asks for an essay. Measured against claude.ai at the same
-  // window size: 498x93.
+  // window size, with room for the larger chat text.
   expect(opening.width).toBe(500);
-  expect(opening.height).toBeLessThan(110);
+  expect(opening.height).toBeLessThan(130);
+  await expect(composer.locator("textarea")).toHaveCSS("font-size", "16px");
 
   await composer.getByLabel("Describe a workflow").fill("Review the release plan");
   await page.keyboard.press("Enter");
@@ -642,6 +661,8 @@ test("the studio opens on a centred prompt, then settles into a thread", async (
   // Once there is a conversation it belongs at the bottom, under the thread.
   await expect(page.locator(".messages")).toContainText("Review the release plan");
   await expect(page.locator(".builder-panel")).not.toHaveClass(/opening/);
+  await expect(page.locator(".message-content > p").first()).toHaveCSS("font-size", "16px");
+  await expect(page.locator(".message.assistant:not(.progress) .message-body").first()).toHaveCSS("font-size", "16px");
   const threaded = (await composer.boundingBox())!;
   expect(threaded.y).toBeGreaterThan(opening.y + 100);
   // The compact size belongs to the opening screen only; in a thread the box
@@ -653,7 +674,8 @@ test("the studio opens on a centred prompt, then settles into a thread", async (
   const message = (await page.locator(".message").first().boundingBox())!;
   expect(message.width).toBeLessThan(viewport.width * 0.6);
   const messageCentre = message.x + message.width / 2;
-  expect(Math.abs(messageCentre - viewport.width / 2)).toBeLessThan(40);
+  const workspace = (await page.locator(".workspace").boundingBox())!;
+  expect(Math.abs(messageCentre - (workspace.x + workspace.width / 2))).toBeLessThan(40);
 });
 
 test("the workflow's buttons sit with the workflow", async ({ page }) => {
@@ -1357,6 +1379,13 @@ test("the assistant terminal remains available before and after a topology opens
   await useFakeServe(page);
   const inspect = page.getByRole("button", { name: "Inspect on terminal" });
   await expect(inspect).toBeEnabled();
+  await expect(page.locator(".composer-tools").getByRole("button", { name: "Inspect on terminal" })).toBeVisible();
+  await expect(page.locator(".topbar, .panel-heading, .history-footnote")).toHaveCount(0);
+  await expect(page.getByRole("img", { name: "Omar", exact: true })).toBeVisible();
+  const backendBounds = (await page.locator(".backend-trigger").boundingBox())!;
+  const submitBounds = (await page.getByLabel("Draft workflow").boundingBox())!;
+  expect(backendBounds.height).toBe(submitBounds.height);
+  await page.screenshot({ path: "/tmp/omar-chat-layout-desktop.png" });
   await inspect.click();
   const terminal = page.getByRole("dialog", { name: "Terminal for the assistant" });
   await expect(terminal).toContainText(/\d+×\d+ · attached/);
@@ -1372,8 +1401,10 @@ test("the assistant terminal remains available before and after a topology opens
   await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
   await expect(page.locator(".messages")).toContainText("The planner");
 
-  // The topbar remains reachable even when the conversation is collapsed.
+  // The terminal belongs to the composer, so folding the chat folds it too.
   await dragDivider(page, "Resize the conversation", -2000);
+  await expect(inspect).toBeHidden();
+  await page.getByRole("button", { name: "Show the conversation" }).click();
   await expect(inspect).toBeVisible();
   await deploy(page);
   await expect(page.locator(".connection")).toContainText("finished", { timeout: 30_000 });
@@ -1381,6 +1412,7 @@ test("the assistant terminal remains available before and after a topology opens
   const bounds = (await inspect.boundingBox())!;
   expect(bounds.x).toBeGreaterThanOrEqual(0);
   expect(bounds.x + bounds.width).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: "/tmp/omar-chat-layout-mobile.png" });
   await inspect.click();
   await expect(terminal).toBeVisible();
 });
@@ -1415,6 +1447,61 @@ test("dragging the canvas does not select the diagram", async ({ page }) => {
   await page.mouse.move(canvas.x + 220, canvas.y + canvas.height / 2, { steps: 12 });
   await page.mouse.up();
   expect(await scene.getAttribute("transform")).not.toBe(before);
+});
+
+test("Escape reaches the terminal and only the explicit close chord detaches", async ({ page }) => {
+  await useFakeServe(page);
+  const keys: Buffer[] = [];
+  page.on("websocket", (socket) => socket.on("framesent", (frame) => {
+    if (Buffer.isBuffer(frame.payload)) keys.push(frame.payload);
+  }));
+  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("attached");
+  await page.keyboard.press("Escape");
+  await expect.poll(() => Buffer.concat(keys).toString()).toBe("\x1b");
+  await expect(dialog).toBeVisible();
+  await page.keyboard.type("still here");
+  await expect.poll(() => Buffer.concat(keys).toString()).toBe("\x1bstill here");
+  await page.keyboard.press("Control+Shift+Escape");
+  await expect(dialog).toBeHidden();
+  expect(Buffer.concat(keys).toString()).toBe("\x1bstill here");
+  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await expect(dialog).toBeVisible();
+  await page.getByRole("button", { name: "Close terminal" }).click();
+  await expect(dialog).toBeHidden();
+});
+
+test("an alternate-screen terminal draws at the initial and resized geometry without duplicate or cutoff rows", async ({ page }) => {
+  await fake.close();
+  fake = (await startFakeServe({ port: FAKE_SERVE_PORT, terminalReflow: true })) as FakeServe;
+  await useFakeServe(page);
+  let initial = { cols: 0, rows: 0 };
+  page.on("websocket", (socket) => {
+    const url = new URL(socket.url());
+    initial = { cols: Number(url.searchParams.get("cols")), rows: Number(url.searchParams.get("rows")) };
+  });
+  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  const rows = page.locator(".xterm-rows");
+  await expect(rows).toContainText("BOTTOM");
+  expect(initial.cols).toBeGreaterThan(80);
+  await expect(rows).toContainText(`FRAME ${initial.cols}x${initial.rows}`);
+  for (const width of [900, 1400, 850, 1280]) {
+    await page.setViewportSize({ width, height: 720 });
+    await expect.poll(async () => {
+      const lines = await rows.locator(":scope > div").allTextContents();
+      const heading = await page.locator(".terminal-heading").innerText();
+      const size = /(\d+)×(\d+)/.exec(heading);
+      if (!size) return false;
+      const cols = Number(size[1]);
+      const height = Number(size[2]);
+      return lines.length === height &&
+        lines[0].trim() === `FRAME ${cols}x${height}` &&
+        lines[1].trim() === `${"x".repeat(cols - 1)}R` &&
+        lines[height - 1].trim() === "BOTTOM" &&
+        lines.filter((line) => line.includes("FRAME")).length === 1;
+    }).toBe(true);
+  }
 });
 
 test("a drag resizes the view every frame and the session once", async ({
@@ -1663,4 +1750,273 @@ test("a team inside a team is drawn as a box inside a box", async ({ page }) => 
   const wide = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
   const tall = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
   expect(wide > 1 && tall > 1).toBe(false);
+});
+
+test("chat history restores messages and proposals after switching and reloading", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  await expect(history).toBeVisible();
+  const sidebarBounds = (await history.boundingBox())!;
+  const workspaceBounds = (await page.locator(".workspace").boundingBox())!;
+  expect(sidebarBounds.x + sidebarBounds.width).toBeLessThanOrEqual(workspaceBounds.x);
+  await expect(page.getByRole("dialog", { name: "Chat history" })).toHaveCount(0);
+  await expect(history.getByRole("list", { name: "Saved chats" })).toContainText("Review the release plan");
+  await history.getByRole("button", { name: "New chat" }).click();
+  await expect(history).toBeVisible();
+  await expect(page.locator(".messages")).not.toContainText("Review the release plan");
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeHidden();
+  await page.getByLabel("Describe a workflow").fill("Prepare a product launch");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.locator(".messages")).toContainText("Which agent should own");
+  await page.reload();
+  await expect(page.locator(".messages")).toContainText("Prepare a product launch");
+  await expect(page.locator(".messages")).not.toContainText("Review the release plan");
+
+  await history.getByLabel("Search chats").fill("release");
+  await expect(history.getByRole("listitem")).toHaveCount(1);
+  await history.getByRole("button", { name: /Review the release plan/ }).click();
+  await expect(page.locator(".messages")).toContainText("The planner");
+  await expect(page.locator(".messages")).not.toContainText("Prepare a product launch");
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+  await expect(page.locator(".source-code")).toContainText("team ReviewFlow[");
+  await expect(page.locator(".connection")).toHaveText("review");
+  await page.screenshot({ path: "/tmp/omar-history-sidebar-desktop.png" });
+  expect(errors).toEqual([]);
+  // Merely reopening history must never deploy a saved proposal.
+  const runs = await page.request.get(`${FAKE_SERVE_URL}/v1/runs`);
+  expect((await runs.json()).runs).toHaveLength(0);
+  await page.getByLabel("Describe a workflow").fill("Keep the same requirements and add a final review");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.locator(".messages")).toContainText("Keep the same requirements");
+  await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
+      await history.getByRole("button", { name: "Fold chat history" }).click();
+  const rail = page.getByRole("navigation", { name: "Chat navigation" });
+    await expect(history).toHaveCount(0);
+  await expect(rail).toBeVisible();
+    await expect(rail.getByRole("button", { name: "Open chat history" })).toBeFocused();
+    await rail.getByRole("button", { name: "Open chat history" }).click();
+  await expect(history).toBeVisible();
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
+});
+
+test("chat history reports load failures and allows switching during a reply", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await fake.close();
+  fake = (await startFakeServe({ stepMs: 3000, port: FAKE_SERVE_PORT })) as FakeServe;
+  await useFakeServe(page);
+  await page.getByLabel("Describe a workflow").fill("Review the release plan");
+  await page.getByLabel("Draft workflow").click();
+  await page.getByRole("button", { name: "Open chat history" }).click();
+  const history = page.getByRole("dialog", { name: "Chat history" });
+  await expect(history.getByRole("button", { name: "New chat" })).toBeEnabled();
+  await expect(history).toContainText("Thinking");
+  const bounds = (await history.boundingBox())!;
+  expect(bounds.x).toBeGreaterThanOrEqual(0);
+  expect(bounds.x + bounds.width).toBeLessThanOrEqual(390);
+  await page.keyboard.press("Escape");
+  await expect(history).toBeHidden();
+  await expect(page.getByRole("button", { name: "Open chat history" })).toBeFocused();
+  await page.route("**/v1/chats", (route) => route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Cannot read saved chats" }) }));
+  await page.getByRole("button", { name: "Open chat history" }).click();
+  await expect(history.getByRole("alert")).toContainText("Cannot read saved chats");
+  await page.unroute("**/v1/chats");
+  await history.getByRole("button", { name: "Retry", exact: true }).click();
+  await expect(history.getByRole("alert")).toBeHidden();
+  await expect(history.getByRole("list", { name: "Saved chats" })).toContainText("Review the release plan");
+});
+
+
+test("chat history keeps tab selections independent and refreshes background chats", async ({ page, context }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
+  const second = await context.newPage();
+  try {
+    await useFakeServe(second);
+    await second.getByRole("complementary", { name: "Chat history" }).getByRole("button", { name: "+ New chat", exact: true }).click();
+    await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
+    await expect(page.locator(".messages")).toContainText("Review the release plan");
+    await second.getByLabel("Describe a workflow").fill("Plan the next release");
+    await second.getByLabel("Draft workflow").click();
+    await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
+    await expect(history.getByRole("listitem").first()).toContainText("Plan the next release");
+    await expect(history.getByRole("listitem").first()).not.toContainText(/messages|Current/);
+    await history.getByLabel("Search chats").fill("nothing matches");
+    await expect(history).toContainText("No chats found");
+    await history.getByLabel("Search chats").fill("");
+    await expect(history.getByRole("listitem")).toHaveCount(2);
+    await page.reload();
+    await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
+  } finally { await second.close(); }
+});
+
+test("chat history drawer closes after selecting a chat and responds to viewport changes", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await useFakeServe(page);
+  await expect(page.getByRole("dialog", { name: "Chat history" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Open chat history" }).click();
+  const drawer = page.getByRole("dialog", { name: "Chat history" });
+  await expect(drawer).toBeVisible();
+  const bounds = (await drawer.boundingBox())!;
+  expect(bounds.x).toBe(0);
+  expect(bounds.width).toBeLessThan(390);
+  await expect(drawer.getByRole("list", { name: "Saved chats" })).not.toBeEmpty();
+  await page.screenshot({ path: "/tmp/omar-history-sidebar-mobile.png" });
+  await drawer.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await expect(drawer).toBeHidden();
+  await expect(page.getByRole("button", { name: "Open chat history" })).toBeFocused();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expect(page.getByRole("complementary", { name: "Chat history" })).toBeVisible();
+  await page.getByLabel("Describe a workflow").fill("Composer remains usable beside history");
+  await expect(page.getByLabel("Describe a workflow")).toBeFocused();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByRole("dialog", { name: "Chat history" })).toHaveCount(0);
+});
+
+test("switching chats while thinking preserves both replies", async ({ page }) => {
+  await fake.close();
+  fake = (await startFakeServe({ stepMs: 3000, port: FAKE_SERVE_PORT })) as FakeServe;
+  await useFakeServe(page);
+  await page.getByLabel("Describe a workflow").fill("First workspace");
+  await page.getByLabel("Draft workflow").click();
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  await expect(page.locator(".connection")).toContainText("drafting");
+  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await expect(page.locator(".messages")).not.toContainText("First workspace");
+  await page.getByLabel("Describe a workflow").fill("Second workspace");
+  await page.getByLabel("Draft workflow").click();
+  await history.getByRole("button", { name: /First workspace/ }).click();
+  await expect(page.locator(".messages")).toContainText("First workspace");
+  await expect(page.locator(".messages")).toContainText("Which agent should own");
+  await expect(page.locator(".messages")).not.toContainText("Second workspace");
+  await history.getByRole("button", { name: /Second workspace/ }).click();
+  await expect(page.locator(".messages")).toContainText("Second workspace");
+  await expect(page.locator(".messages")).toContainText("Which agent should own");
+  await expect(page.locator(".messages")).not.toContainText("First workspace");
+});
+
+test("two chats keep live topologies when switching and reloading", async ({ page }) => {
+  await fake.close();
+  fake = (await startFakeServe({ stepMs: 2500, liveChatReplayDelayMs: 1500, port: FAKE_SERVE_PORT })) as FakeServe;
+  await useFakeServe(page);
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  const draft = async (name: string) => {
+    await page.getByLabel("Describe a workflow").fill(name);
+    await page.getByLabel("Draft workflow").click();
+    await expect(page.locator(".messages")).toContainText("Which agent should own");
+    await page.getByLabel("Describe a workflow").fill("The planner");
+    await page.getByLabel("Draft workflow").click();
+    await page.getByRole("button", { name: "Deploy", exact: true }).click();
+    await page.getByRole("button", { name: "Confirm deploy" }).click();
+    await expect(page.locator(".connection")).toContainText("observing");
+  };
+  await draft("Topology A");
+  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await draft("Topology B");
+  await page.getByLabel("Describe a workflow").fill("Continue monitoring B");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible();
+  await expect(history.getByRole("button", { name: /Topology A/ })).toContainText("Running");
+  await expect(history.getByRole("button", { name: /Topology B/ })).toContainText("Running");
+  // Keep the existing shell, sidebar and canvas through the deliberately slow
+  // replay. Remounting any of them flashes an empty chat before the topology.
+  const retained = await page.evaluateHandle(() => [
+    document.querySelector(".studio-shell"),
+    document.querySelector(".chat-history"),
+    document.querySelector(".diagram-canvas"),
+  ]);
+  const width = (await page.locator(".builder-panel").boundingBox())!.width;
+  await history.getByRole("button", { name: /Topology A/ }).click();
+  await expect(page.locator(".messages")).toContainText("Topology B");
+  await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "true");
+  await expect(page.locator(".messages")).toContainText("Topology A");
+  await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "false");
+  expect(await retained.evaluate((nodes) => nodes.every((node) => node?.isConnected))).toBe(true);
+  expect((await page.locator(".builder-panel").boundingBox())!.width).toBe(width);
+  await retained.dispose();
+  // A second selection cancels a slow first selection without letting its
+  // replay replace the chat that the operator most recently chose.
+  await history.getByRole("button", { name: /Topology B/ }).click();
+  await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "true");
+  await history.getByRole("button", { name: /Topology A/ }).click();
+  await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "false");
+  await expect(page.locator(".messages")).toContainText("Topology A");
+  await expect(page.locator(".messages")).not.toContainText("Topology B");
+  await expect(page.locator(".connection")).toContainText("observing");
+  // The state event is delayed: replayed proposals must not expose a deploy
+  // gate while the client waits to reconnect the live diagram.
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeHidden();
+  await page.reload();
+  await expect(page.locator(".connection")).toContainText("observing");
+  await expect(history.locator('[aria-current="true"]')).toContainText("Topology A");
+  await history.getByRole("button", { name: /Topology B/ }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  await expect(page.locator(".messages")).not.toContainText("Topology A");
+  await expect(history.getByRole("button", { name: /Topology A/ })).toContainText("Running");
+  await expect(page.locator(".omar-reaction")).not.toHaveCount(0);
+  await expect(history.locator(".chat-running").first()).toHaveCSS("font-weight", "700");
+  await expect(history.locator(".chat-running").first()).toHaveCSS("color", "rgb(196, 181, 253)");
+  await page.screenshot({ path: "/tmp/omar-live-chats.png" });
+});
+
+test("an undeployed proposal remains actionable after a finished run and chat switching", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  await page.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("finished");
+  await page.getByLabel("Describe a workflow").fill("Propose a revised workflow");
+  await page.getByLabel("Draft workflow").click();
+  const controls = page.getByRole("group", { name: "Deploy design" });
+  await expect(controls).toBeVisible();
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await history.getByRole("button", { name: /Review the release plan/ }).click();
+  await expect(controls).toBeVisible();
+  await expect(controls.getByRole("button", { name: "Deploy", exact: true })).toBeEnabled();
+  await expect(controls.getByRole("button", { name: "Discard", exact: true })).toBeVisible();
+  await page.reload();
+  await expect(controls).toBeVisible();
+});
+
+test("a delayed deploy response cannot replace the chat selected afterward", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  let release!: () => void;
+  let admitted!: () => void;
+  let delivered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const admission = new Promise<void>((resolve) => { admitted = resolve; });
+  const delivery = new Promise<void>((resolve) => { delivered = resolve; });
+  await page.route("**/v1/runs", async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    const response = await route.fetch();
+    admitted();
+    await gate;
+    await route.fulfill({ response });
+    delivered();
+  });
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  await page.getByRole("button", { name: "Confirm deploy" }).click();
+  await admission;
+  try {
+    const history = page.getByRole("complementary", { name: "Chat history" });
+    await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+    await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "false");
+    await expect(page.locator(".messages")).not.toContainText("Review the release plan");
+    release();
+    await delivery;
+    await page.getByLabel("Describe a workflow").fill("A separate conversation");
+    await page.getByLabel("Draft workflow").click();
+    await expect(page.locator(".messages")).toContainText("Which agent should own");
+    await expect(page.locator(".diagram-panel")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0);
+  } finally {
+    release();
+  }
 });

@@ -13,14 +13,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ts_rs::TS;
 use uuid::Uuid;
 
+use crate::chat_history::{ConversationSummary, History};
 use crate::config::Config;
 use crate::ea::EaId;
 use crate::tmux::{DeliveryOptions, TmuxClient};
@@ -44,6 +45,46 @@ const MAX_SELECTION_NAME: usize = 128;
 /// Messages a stalled chat subscriber may fall behind by before it is dropped.
 const CHAT_QUEUE: usize = 256;
 
+/// Only an observed Mission Control connection arms automatic shutdown.
+/// API-only daemons remain available until explicitly stopped.
+const WINDOW_GRACE: Duration = Duration::from_secs(10);
+const WINDOW_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct Presence {
+    clients: usize,
+    seen: bool,
+    idle_since: Option<Instant>,
+    stopping: bool,
+}
+
+impl Presence {
+    fn connect(&mut self) -> Result<()> {
+        anyhow::ensure!(!self.stopping, "runtime is shutting down");
+        self.clients += 1;
+        self.seen = true;
+        self.idle_since = None;
+        Ok(())
+    }
+
+    fn shutdown_due(&mut self, now: Instant, active_runs: bool) -> bool {
+        if !self.seen || self.clients > 0 || active_runs {
+            self.idle_since = None;
+            return false;
+        }
+        now.duration_since(*self.idle_since.get_or_insert(now)) >= WINDOW_GRACE
+    }
+}
+
+/// Removes presence on every exit, including a failed initial replay.
+struct WindowConnection(Arc<Workspaces>);
+impl Drop for WindowConnection {
+    fn drop(&mut self) {
+        let mut presence = self.0.presence.lock().expect("presence poisoned");
+        presence.clients -= 1;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, TS)]
 pub struct RunRecord {
     pub run_id: String,
@@ -58,6 +99,8 @@ pub struct RunRecord {
 #[derive(Debug, Deserialize)]
 struct StartRunRequest {
     program: String,
+    #[serde(default)]
+    conversation_id: Option<String>,
     #[serde(default)]
     inputs: BTreeMap<String, Value>,
     /// A daemon re-runs the same team repeatedly, so stale agent sessions are
@@ -127,7 +170,7 @@ impl RunStatus {
 
 /// One entry in the operator/EA conversation. `design` is set only on
 /// proposals, and carries a program the operator has *not* yet approved.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct ChatMessage {
     pub sequence: u64,
     pub role: ChatRole,
@@ -171,19 +214,36 @@ struct AgentProposal {
 
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
+    #[serde(default)]
+    conversation_id: Option<String>,
     text: String,
     #[serde(default)]
     selection: Vec<String>,
 }
 
-#[derive(Default)]
 struct Chat {
-    messages: Vec<ChatMessage>,
+    latest_run: Option<String>,
     subscribers: Vec<mpsc::SyncSender<ChatMessage>>,
-    sequence: u64,
+    busy: bool,
+    needs_context: bool,
+    needs_relaunch: bool,
+    owned: bool,
+}
+
+/// A chat owns one EA; only the durable archive is shared between workspaces.
+struct Workspaces {
+    history: Arc<Mutex<History>>,
+    contexts: Mutex<BTreeMap<String, Arc<Context_>>>,
+    root: Arc<Context_>,
+    selection: Mutex<()>,
+    presence: Mutex<Presence>,
+    launch_ea: AtomicBool,
+    shutdown: Arc<AtomicBool>,
 }
 
 struct Context_ {
+    history: Arc<Mutex<History>>,
+    conversation_id: String,
     omar_dir: PathBuf,
     ea_id: EaId,
     session_prefix: String,
@@ -196,11 +256,14 @@ struct Context_ {
     panels: Panels,
     chat: Arc<Mutex<Chat>>,
     /// Authenticates the EA's MCP sidecar on the agent-only endpoints.
-    agent_token: String,
+    agent_token: Mutex<String>,
+    /// Serialize sends, replies and backend changes within this EA.
+    chat_operation: Mutex<()>,
     /// The command the assistant runs, and where to reach this server when it
     /// is relaunched on a different backend.
     command: Arc<Mutex<String>>,
     address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Context_ {
@@ -210,7 +273,7 @@ impl Context_ {
         text: String,
         progress: bool,
         design: Option<ProposedDesign>,
-    ) -> ChatMessage {
+    ) -> Result<ChatMessage> {
         self.publish_with_selection(role, text, progress, design, Vec::new())
     }
 
@@ -221,21 +284,25 @@ impl Context_ {
         progress: bool,
         design: Option<ProposedDesign>,
         selection: Vec<String>,
-    ) -> ChatMessage {
+    ) -> Result<ChatMessage> {
         let mut chat = self.chat.lock().expect("serve chat poisoned");
-        chat.sequence += 1;
-        let message = ChatMessage {
-            sequence: chat.sequence,
-            role,
-            text,
-            progress,
-            design,
-            selection,
-        };
-        chat.messages.push(message.clone());
+        let message = self.history.lock().expect("history poisoned").append_to(
+            &self.conversation_id,
+            ChatMessage {
+                sequence: 0,
+                role,
+                text,
+                progress,
+                design,
+                selection,
+            },
+        )?;
+        if role == ChatRole::Assistant && !progress {
+            chat.busy = false;
+        }
         chat.subscribers
             .retain(|subscriber| subscriber.try_send(message.clone()).is_ok());
-        message
+        Ok(message)
     }
 }
 
@@ -254,6 +321,7 @@ pub enum AttachEa {
 }
 
 pub struct Serve {
+    ea_id: EaId,
     address: SocketAddr,
     agent_token: String,
     running: Arc<AtomicBool>,
@@ -263,6 +331,7 @@ pub struct Serve {
     /// starting one for real.
     #[cfg(test)]
     context: Arc<Context_>,
+    workspaces: Arc<Workspaces>,
 }
 
 impl Serve {
@@ -282,22 +351,70 @@ impl Serve {
             .with_context(|| format!("failed to bind serve at {address}"))?;
         let address = listener.local_addr()?;
         let agent_token = Uuid::new_v4().to_string();
+        let mut history =
+            History::load(crate::ea::ea_state_dir(ea_id, omar_dir).join("chats.json"))?;
+        let has_history = !history.active().messages.is_empty();
+        let conversation_id = history.active_id.clone();
+        let workspace_ea = match history.active().ea_id {
+            Some(id) => id,
+            None if !history
+                .conversations
+                .iter()
+                .any(|chat| chat.ea_id == Some(ea_id)) =>
+            {
+                ea_id
+            }
+            None => {
+                crate::ea::ensure_default_ea(omar_dir)?;
+                crate::ea::register_ea(
+                    omar_dir,
+                    &format!("chat-{conversation_id}"),
+                    Some("Mission Control chat"),
+                )?
+            }
+        };
+        history.assign_ea(&conversation_id, workspace_ea)?;
+        let history = Arc::new(Mutex::new(history));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let context = Arc::new(Context_ {
+            history: history.clone(),
+            conversation_id: conversation_id.clone(),
             omar_dir: omar_dir.to_path_buf(),
-            ea_id,
+            ea_id: workspace_ea,
             session_prefix: config.dashboard.session_prefix.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
             runs: Runs::default(),
             panels: Panels::default(),
-            chat: Arc::new(Mutex::new(Chat::default())),
-            agent_token: agent_token.clone(),
-            command: Arc::new(Mutex::new(config.agent.default_command.clone())),
+            chat: Arc::new(Mutex::new(Chat {
+                latest_run: None,
+                subscribers: Vec::new(),
+                busy: false,
+                needs_context: has_history,
+                needs_relaunch: has_history,
+                owned: false,
+            })),
+            agent_token: Mutex::new(agent_token.clone()),
+            chat_operation: Mutex::new(()),
+            command: Arc::new(Mutex::new(assistant_command(
+                omar_dir,
+                workspace_ea,
+                &config.agent.default_command,
+            ))),
             address,
+            shutdown: shutdown.clone(),
         });
-        // Blocking accept rather than a polling loop: `Drop` wakes it with a
-        // self-connection, so there is no need to spin, and no added latency on
-        // every connection from a poll interval.
+        let workspaces = Arc::new(Workspaces {
+            history,
+            contexts: Mutex::new(BTreeMap::from([(conversation_id, context.clone())])),
+            root: context.clone(),
+            selection: Mutex::new(()),
+            presence: Mutex::new(Presence::default()),
+            launch_ea: AtomicBool::new(false),
+            shutdown,
+        });
+        let shared_workspaces = workspaces.clone();
+        listener.set_nonblocking(true)?;
         let running = Arc::new(AtomicBool::new(true));
         let thread_running = running.clone();
         #[cfg(test)]
@@ -306,10 +423,17 @@ impl Serve {
             while thread_running.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let context = context.clone();
+                        let workspaces = workspaces.clone();
                         thread::spawn(move || {
-                            let _ = handle_client(stream, context);
+                            let _ = handle_client(stream, workspaces);
                         });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if workspaces.shutdown_if_idle() {
+                            thread_running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        thread::sleep(WINDOW_POLL);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
@@ -317,19 +441,21 @@ impl Serve {
             }
         });
         let server = Self {
+            ea_id: workspace_ea,
             address,
             agent_token,
             running,
             thread: Some(thread),
             #[cfg(test)]
             context: shared,
+            workspaces: shared_workspaces,
         };
         // Before this returns, so that everything downstream of "the server
         // started" can rely on the context being there. It names this server,
         // and `attach_ea` — which used to write it — runs after the address is
         // announced, so anything that took the announcement as readiness could
         // read the path before it existed.
-        server.write_mcp_context(config, omar_dir, ea_id);
+        server.write_mcp_context(config, omar_dir, workspace_ea);
         Ok(server)
     }
 
@@ -349,6 +475,7 @@ impl Serve {
             default_command: config.agent.default_command.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
+            agent_name: None,
             tmux_server: None,
             topology: None,
             serve: Some(crate::manager::ServeMcpContext {
@@ -363,16 +490,24 @@ impl Serve {
     /// with the operator and propose designs.
     ///
     /// The context is baked into the EA's MCP config at launch, so an already
-    /// running EA cannot gain these tools without being restarted. Restarting
-    /// discards its session, so that is opt-in and reported rather than silent.
+    /// running EA cannot gain these tools without being restarted. A saved
+    /// Mission Control chat resumes its native conversation with the new MCP
+    /// context. An unrelated terminal EA still requires explicit replacement.
     pub fn attach_ea(
         &self,
         config: &Config,
         omar_dir: &Path,
-        ea_id: EaId,
+        _ea_id: EaId,
         restart: bool,
         launch: bool,
     ) -> Result<AttachEa> {
+        self.workspaces.launch_ea.store(launch, Ordering::Relaxed);
+        let context = &self.workspaces.root;
+        let _operation = context
+            .chat_operation
+            .lock()
+            .expect("chat operation poisoned");
+        let ea_id = self.ea_id;
         let name = crate::ea::load_registry(omar_dir)
             .into_iter()
             .find(|ea| ea.id == ea_id)
@@ -390,18 +525,19 @@ impl Serve {
 
         let existing = crate::ea::ea_manager_session(ea_id, &config.dashboard.session_prefix);
         if client.has_session(&existing)? {
-            if !restart {
+            if !restart && !context.chat.lock().expect("chat poisoned").needs_context {
                 return Ok(AttachEa::AlreadyRunningWithoutServe(existing));
             }
             // Not `ensure_session_not_attached`: that resolves through the
             // prefix-filtered session list, and the manager session is named
             // `<prefix>ea-<id>`, which never matches the agent prefix. Kill it
             // directly, as `ensure_manager_session` itself does.
-            client.kill_session(&existing)?;
+            stop_assistant(context)?;
         }
+        context.chat.lock().expect("chat poisoned").owned = true;
         let (session, _) = crate::manager::ensure_manager_session(
             &client,
-            &config.agent.default_command,
+            &context.command.lock().expect("command poisoned").clone(),
             ea_id,
             &name,
             omar_dir,
@@ -415,6 +551,10 @@ impl Serve {
                 }),
             },
         )?;
+        {
+            let mut chat = context.chat.lock().expect("chat poisoned");
+            chat.needs_relaunch = false;
+        }
         match self.verify_ea_context(omar_dir, ea_id) {
             Ok(()) => Ok(AttachEa::Attached(session)),
             Err(reason) => Ok(AttachEa::LaunchedWithoutServe {
@@ -445,7 +585,7 @@ impl Serve {
         }
     }
 
-    /// Block until the accept loop stops, which for the CLI means forever.
+    /// Block until shutdown, including the last-window idle timeout.
     pub fn wait(mut self) -> Result<()> {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -456,12 +596,40 @@ impl Serve {
 
 impl Drop for Serve {
     fn drop(&mut self) {
+        self.workspaces.shutdown.store(true, Ordering::SeqCst);
         self.running.store(false, Ordering::Relaxed);
         let _ = TcpStream::connect(self.address);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
+}
+
+/// Reopening the launcher should reuse a live runtime, not replace its runs.
+pub fn is_running(address: SocketAddr) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+    if write!(
+        stream,
+        "GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut response = String::new();
+    if stream.take(8192).read_to_string(&mut response).is_err() {
+        return false;
+    }
+    response
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str::<Value>(body).ok())
+        .is_some_and(|body| {
+            body["status"] == "ok" && body["protocol_version"] == SERVE_PROTOCOL_VERSION
+        })
 }
 
 pub fn run(
@@ -471,8 +639,17 @@ pub fn run(
     ea_id: EaId,
     restart_ea: bool,
     launch_ea: bool,
+    override_backend: bool,
 ) -> Result<()> {
     let server = Serve::start(address, config, omar_dir, ea_id)?;
+    if override_backend {
+        *server
+            .workspaces
+            .root
+            .command
+            .lock()
+            .expect("command poisoned") = config.agent.default_command.clone();
+    }
     println!("OMAR serve: http://{}", server.address());
     match server.attach_ea(config, omar_dir, ea_id, restart_ea, launch_ea) {
         Ok(AttachEa::Attached(session)) => println!("Executive assistant: {session}"),
@@ -493,7 +670,7 @@ pub fn run(
     server.wait()
 }
 
-fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
+fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -501,7 +678,7 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
     reader.read_line(&mut request_line)?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
+    let mut path = parts.next().unwrap_or("").to_string();
 
     let mut content_length = 0usize;
     let mut origin = None;
@@ -532,11 +709,89 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
     }
     let origin = origin.as_deref();
 
+    if content_length > MAX_BODY_BYTES {
+        return write_json(
+            &mut stream,
+            413,
+            &json!({"error": "request too large"}),
+            origin,
+        );
+    }
+    let mut raw_body = vec![0; content_length];
+    reader.read_exact(&mut raw_body)?;
+    let scoped_id = if let Some(rest) = path.strip_prefix("/chats/") {
+        let Some((id, route)) = rest.split_once('/') else {
+            return write_json(&mut stream, 404, &json!({"error": "not found"}), origin);
+        };
+        let id = id.to_string();
+        path = format!("/{route}");
+        Some(id)
+    } else {
+        None
+    };
+    let context = if path == "/v1/agent/reply" || path == "/v1/agent/proposals" {
+        let body: Value = match serde_json::from_slice(&raw_body) {
+            Ok(body) => body,
+            Err(error) => {
+                return write_json(
+                    &mut stream,
+                    400,
+                    &json!({"error": error.to_string()}),
+                    origin,
+                )
+            }
+        };
+        let contexts = workspaces.contexts.lock().expect("workspaces poisoned");
+        let found = contexts
+            .values()
+            .find(|context| {
+                body.get("token").and_then(Value::as_str)
+                    == Some(context.agent_token.lock().expect("token poisoned").as_str())
+            })
+            .cloned();
+        match found {
+            Some(context)
+                if scoped_id
+                    .as_ref()
+                    .is_none_or(|id| id == &context.conversation_id) =>
+            {
+                context
+            }
+            _ => return write_json(&mut stream, 403, &json!({"error": "forbidden"}), origin),
+        }
+    } else {
+        let id = scoped_id.unwrap_or_else(|| {
+            workspaces
+                .history
+                .lock()
+                .expect("history poisoned")
+                .active_id
+                .clone()
+        });
+        match workspaces.get(&id) {
+            Ok(context) => context,
+            Err(error) => {
+                return write_json(
+                    &mut stream,
+                    404,
+                    &json!({"error": error.to_string()}),
+                    origin,
+                )
+            }
+        }
+    };
+
+    // Geometry is only a terminal handshake parameter; leave other API paths
+    // and their routing unchanged.
+    let (terminal_path, terminal_query) = path.split_once('?').unwrap_or((&path, ""));
     // A terminal is the one endpoint where a wrong answer hands an attacker a
     // shell, and CORS does not apply to WebSockets: the browser opens the
     // socket regardless and only the server can refuse it.
-    if method == "GET" && path.starts_with(TERMINAL_PREFIX) && path.ends_with(TERMINAL_SUFFIX) {
-        let agent = path
+    if method == "GET"
+        && terminal_path.starts_with(TERMINAL_PREFIX)
+        && terminal_path.ends_with(TERMINAL_SUFFIX)
+    {
+        let agent = terminal_path
             .trim_start_matches(TERMINAL_PREFIX)
             .trim_end_matches(TERMINAL_SUFFIX)
             .to_string();
@@ -550,18 +805,33 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
             &session,
             websocket_key.as_deref(),
             origin_header.as_deref(),
+            terminal_query,
         );
     }
     // The assistant is not one of the agents: its session is named
     // `<base>ea-<id>` rather than `<base><id>-<name>`, so no agent name
     // reaches it and it needs a route of its own.
-    if method == "GET" && path == "/v1/agent/terminal" {
+    if method == "GET" && terminal_path == "/v1/agent/terminal" {
+        if context
+            .chat
+            .lock()
+            .expect("serve chat poisoned")
+            .needs_relaunch
+        {
+            return write_json(
+                &mut stream,
+                409,
+                &json!({"error": "Send a message to resume this chat's assistant terminal."}),
+                origin_header.as_deref(),
+            );
+        }
         let session = crate::ea::ea_manager_session(context.ea_id, &context.session_prefix);
         return attach_terminal(
             stream,
             &session,
             websocket_key.as_deref(),
             origin_header.as_deref(),
+            terminal_query,
         );
     }
 
@@ -580,14 +850,45 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
 
     // Streams for as long as the operator keeps Mission Control open.
     if method == "GET" && path == "/v1/chat/events" {
+        {
+            workspaces
+                .presence
+                .lock()
+                .expect("presence poisoned")
+                .connect()?;
+        }
+        let _connection = WindowConnection(workspaces.clone());
+        if workspaces.launch_ea.load(Ordering::Relaxed) {
+            let context = context.clone();
+            thread::spawn(move || {
+                let _operation = context
+                    .chat_operation
+                    .lock()
+                    .expect("chat operation poisoned");
+                if context.chat.lock().expect("chat poisoned").needs_relaunch {
+                    let command = context.command.lock().expect("command poisoned").clone();
+                    match relaunch_ea(&context, &command) {
+                        Ok(_) => context.chat.lock().expect("chat poisoned").needs_relaunch = false,
+                        Err(error) => eprintln!("Could not resume assistant: {error:#}"),
+                    }
+                }
+            });
+        }
         return stream_chat(stream, &context, origin);
     }
 
-    let mut read_body = |length: usize| -> Result<Vec<u8>> {
-        let mut raw = vec![0u8; length];
-        reader.read_exact(&mut raw)?;
-        Ok(raw)
-    };
+    let read_body = |_length: usize| -> Result<Vec<u8>> { Ok(raw_body.clone()) };
+
+    if content_length > MAX_BODY_BYTES
+        && (path.starts_with("/v1/chats") || path == "/v1/agent/reply")
+    {
+        return write_json(
+            &mut stream,
+            413,
+            &json!({"error": "request too large"}),
+            origin,
+        );
+    }
 
     let (status, body) = match (method.as_str(), path.as_str()) {
         ("GET", "/health") => (
@@ -598,14 +899,39 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
             if content_length > MAX_BODY_BYTES {
                 (413, json!({"error": "program too large"}))
             } else {
-                start_run(&context, &read_body(content_length)?)
+                // The idle check and run admission must be indivisible: a
+                // closing window cannot stop a deployment being admitted.
+                let presence = workspaces.presence.lock().expect("presence poisoned");
+                if presence.stopping {
+                    (503, json!({"error": "runtime is shutting down"}))
+                } else {
+                    start_run(&context, &read_body(content_length)?)
+                }
             }
         }
         ("GET", "/v1/chat") => {
-            let chat = context.chat.lock().expect("serve chat poisoned");
-            (200, json!({"messages": chat.messages}))
+            let history = context.history.lock().expect("history poisoned");
+            (200, json!(history.conversation(&context.conversation_id)))
         }
-        ("POST", "/v1/chat") => send_to_ea(&context, &read_body(content_length)?),
+        ("POST", "/v1/chat") => {
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "message too large"}))
+            } else {
+                send_to_ea(&context, &read_body(content_length)?)
+            }
+        }
+        ("GET", "/v1/chats") => (200, workspaces.list()),
+        ("POST", "/v1/chats") => {
+            let _ = read_body(content_length)?;
+            select_chat(&workspaces, None)
+        }
+        ("POST", rest) if rest.starts_with("/v1/chats/") && rest.ends_with("/activate") => {
+            let _ = read_body(content_length)?;
+            let id = rest
+                .trim_start_matches("/v1/chats/")
+                .trim_end_matches("/activate");
+            select_chat(&workspaces, Some(id))
+        }
         ("GET", "/v1/agent") => (200, describe_agent(&context)),
         ("POST", "/v1/agent/backend") => switch_backend(&context, &read_body(content_length)?),
         // EA-only, authenticated with the token handed to its MCP sidecar.
@@ -690,6 +1016,7 @@ fn attach_terminal(
     session: &str,
     websocket_key: Option<&str>,
     origin: Option<&str>,
+    query: &str,
 ) -> Result<()> {
     // Same-origin policy does not cover WebSockets. Without this check any page
     // the operator happens to visit could open a terminal into their agents and
@@ -709,7 +1036,17 @@ fn attach_terminal(
         );
     };
 
-    let attachment = match crate::terminal::Attachment::open_session(session) {
+    let dimensions = match terminal_dimensions(query) {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            return write_json(&mut stream, 400, &json!({"error": error.to_string()}), None)
+        }
+    };
+    let attachment = match dimensions {
+        Some(size) => crate::terminal::Attachment::open_session_sized(session, Some(size)),
+        None => crate::terminal::Attachment::open_session(session),
+    };
+    let attachment = match attachment {
         Ok(attachment) => attachment,
         // The socket has not been upgraded yet, so this can still be an
         // ordinary HTTP error the client can read.
@@ -735,6 +1072,36 @@ fn attach_terminal(
     relay_terminal(stream, attachment)
 }
 
+/// Optional initial geometry, in client cells including tmux's status lines.
+/// Reject partial/duplicate/out-of-range dimensions before creating a PTY.
+fn terminal_dimensions(query: &str) -> Result<Option<(u16, u16)>> {
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let mut cols = None;
+    let mut rows = None;
+    for field in query.split('&') {
+        let (key, value) = field.split_once('=').context("invalid terminal geometry")?;
+        let slot = match key {
+            "cols" => &mut cols,
+            "rows" => &mut rows,
+            _ => bail!("unknown terminal geometry parameter"),
+        };
+        if slot.is_some() {
+            bail!("duplicate terminal geometry parameter");
+        }
+        let value: u16 = value.parse().context("invalid terminal dimension")?;
+        if !(2..=1000).contains(&value) {
+            bail!("implausible terminal dimension");
+        }
+        *slot = Some(value);
+    }
+    match (cols, rows) {
+        (Some(cols), Some(rows)) => Ok(Some((cols, rows))),
+        _ => bail!("both cols and rows are required"),
+    }
+}
+
 /// What the viewer can fit, in characters.
 #[derive(Deserialize)]
 struct Resize {
@@ -752,11 +1119,11 @@ fn relay_terminal(stream: TcpStream, mut attachment: crate::terminal::Attachment
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut socket = WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
 
-    // The viewer must render at the agent's size rather than resize it, so it
-    // is told what that size is before any output arrives.
+    // Report PTY client dimensions, including status rows, before output.
+    // With multiple viewers this is not necessarily the shared window size.
     let size = attachment.size;
     let _ = socket.send(Message::Text(
-        json!({"cols": size.cols, "rows": size.rows}).to_string(),
+        json!({"cols": size.cols, "rows": size.client_rows()}).to_string(),
     ));
 
     loop {
@@ -771,7 +1138,7 @@ fn relay_terminal(stream: TcpStream, mut attachment: crate::terminal::Attachment
                     attachment.resize(resize.cols, resize.rows)?;
                     let size = attachment.size;
                     let _ = socket.send(Message::Text(
-                        json!({"cols": size.cols, "rows": size.rows}).to_string(),
+                        json!({"cols": size.cols, "rows": size.client_rows()}).to_string(),
                     ));
                 }
                 Err(_) => attachment.write(text.as_bytes())?,
@@ -810,18 +1177,25 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
         .expect("serve command poisoned")
         .clone();
     json!({
-        "backend": crate::config::backend_of_command(&command),
-        "available": crate::config::ASSISTANT_BACKENDS,
+        "backend": crate::backend::ASSISTANT
+            .iter()
+            .copied()
+            .find(|kind| crate::backend::of(*kind).default_command() == command)
+            .map(crate::backend::Kind::name),
+        "available": crate::backend::assistant_names(),
     })
 }
 
 /// Relaunch the assistant on a different backend.
 ///
 /// A backend is chosen when the process starts, so changing it means a new
-/// process: the assistant's current session does not survive. That is the
-/// operator's call to make, which is why this is an explicit request rather
-/// than something inferred.
+/// process. Each backend resumes its own saved conversation when available;
+/// the durable OMAR transcript supplies context across backend changes.
 fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     #[derive(Deserialize)]
     struct Request {
         backend: String,
@@ -830,37 +1204,99 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
-    let command = match crate::config::resolve_backend(&request.backend) {
-        Ok(command) => command,
+    let backend = match crate::backend::resolve(&request.backend) {
+        Ok(backend) => backend,
         Err(reason) => return (400, json!({"error": reason})),
     };
-    if !crate::config::ASSISTANT_BACKENDS.contains(&request.backend.as_str()) {
+    if !crate::backend::ASSISTANT.contains(&backend.kind()) {
         return (
             400,
             json!({"error": format!("'{}' is not an assistant backend", request.backend)}),
         );
     }
+    let command = backend.default_command().to_string();
 
     match relaunch_ea(context, &command) {
         Ok(session) => {
             *context.command.lock().expect("serve command poisoned") = command;
+            let mut chat = context.chat.lock().expect("serve chat poisoned");
+            chat.needs_context = true;
+            chat.needs_relaunch = false;
+            chat.busy = false;
             (200, json!({"backend": request.backend, "session": session}))
         }
         Err(error) => (502, json!({"error": format!("{error:#}")})),
     }
 }
 
+fn assistant_command(root: &Path, ea_id: EaId, fallback: &str) -> String {
+    fs::read_to_string(crate::ea::ea_state_dir(ea_id, root).join("assistant-command"))
+        .ok()
+        .filter(|command| !command.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn remember_assistant(context: &Context_) -> Result<()> {
+    let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
+    let session = crate::ea::ea_manager_session(context.ea_id, &context.session_prefix);
+    let command = context.command.lock().expect("command poisoned").clone();
+    crate::manager::write_private_file(
+        &crate::ea::ea_state_dir(context.ea_id, &context.omar_dir).join("assistant-command"),
+        command.as_bytes(),
+    )?;
+    if client.has_session(&session)? {
+        let backend_name = client.session_backend(&session);
+        if let Some(backend) = backend_name
+            .as_deref()
+            .and_then(crate::backend::by_name)
+            .or_else(|| crate::backend::detect(&command))
+        {
+            let stamp = client.session_delivery(&session);
+            let target = crate::backend::Target {
+                name: &session,
+                pane_pid: client.get_pane_pid(&session)?,
+                stamp: stamp.as_deref(),
+            };
+            if let Some(id) = backend.conversation_id(&target) {
+                crate::manager::write_private_file(
+                    &crate::backend::conversation_path(
+                        &context.omar_dir,
+                        context.ea_id,
+                        backend.kind().name(),
+                    ),
+                    id.as_bytes(),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stop_assistant(context: &Context_) -> Result<()> {
+    remember_assistant(context)?;
+    let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
+    client.kill_session_tree(&crate::ea::ea_manager_session(
+        context.ea_id,
+        &context.session_prefix,
+    ))
+}
+
 fn relaunch_ea(context: &Arc<Context_>, command: &str) -> Result<String> {
+    anyhow::ensure!(
+        !context.shutdown.load(Ordering::SeqCst),
+        "runtime is shutting down"
+    );
     let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
     let existing = crate::ea::ea_manager_session(context.ea_id, &context.session_prefix);
     if client.has_session(&existing)? {
-        client.kill_session(&existing)?;
+        stop_assistant(context)?;
     }
     let name = crate::ea::load_registry(&context.omar_dir)
         .into_iter()
         .find(|ea| ea.id == context.ea_id)
         .map(|ea| ea.name)
         .unwrap_or_else(|| format!("ea-{}", context.ea_id));
+    context.chat.lock().expect("chat poisoned").owned = true;
     let (session, _) = crate::manager::ensure_manager_session(
         &client,
         command,
@@ -874,14 +1310,189 @@ fn relaunch_ea(context: &Arc<Context_>, command: &str) -> Result<String> {
             // Without this the new process has no way to answer the operator.
             serve: Some(crate::manager::ServeMcpContext {
                 endpoint: context.address.to_string(),
-                token: context.agent_token.clone(),
+                token: context
+                    .agent_token
+                    .lock()
+                    .expect("agent token poisoned")
+                    .clone(),
             }),
         },
     )?;
     Ok(session)
 }
 
+impl Workspaces {
+    fn shutdown_if_idle(&self) -> bool {
+        let mut presence = self.presence.lock().expect("presence poisoned");
+        let contexts: Vec<_> = self
+            .contexts
+            .lock()
+            .expect("workspaces poisoned")
+            .values()
+            .cloned()
+            .collect();
+        let active = contexts.iter().any(|context| {
+            context
+                .runs
+                .lock()
+                .expect("runs poisoned")
+                .values()
+                .any(|run| run.status.is_active())
+        });
+        if !presence.shutdown_due(Instant::now(), active) {
+            return false;
+        }
+        presence.stopping = true;
+        self.shutdown.store(true, Ordering::SeqCst);
+        for context in contexts {
+            let _operation = context
+                .chat_operation
+                .lock()
+                .expect("chat operation poisoned");
+            if !context.chat.lock().expect("chat poisoned").owned {
+                continue;
+            }
+            if let Err(error) = stop_assistant(&context) {
+                eprintln!("Could not stop assistant: {error:#}");
+                presence.stopping = false;
+                self.shutdown.store(false, Ordering::SeqCst);
+                return false;
+            }
+            let mut chat = context.chat.lock().expect("chat poisoned");
+            chat.busy = false;
+            chat.needs_context = true;
+            chat.needs_relaunch = true;
+            chat.owned = false;
+        }
+        eprintln!("Mission Control closed; no active topologies. Runtime stopped.");
+        true
+    }
+
+    fn get(&self, id: &str) -> Result<Arc<Context_>> {
+        let mut contexts = self.contexts.lock().expect("workspaces poisoned");
+        if let Some(context) = contexts.get(id) {
+            return Ok(context.clone());
+        }
+        let mut history = self.history.lock().expect("history poisoned");
+        let saved = history
+            .conversations
+            .iter()
+            .find(|chat| chat.id == id)
+            .context("unknown chat")?;
+        let has_history = !saved.messages.is_empty();
+        let ea_id = match saved.ea_id {
+            Some(ea_id) => ea_id,
+            None => {
+                crate::ea::ensure_default_ea(&self.root.omar_dir)?;
+                let ea_id = crate::ea::register_ea(
+                    &self.root.omar_dir,
+                    &format!("chat-{id}"),
+                    Some("Mission Control chat"),
+                )?;
+                history.assign_ea(id, ea_id)?;
+                ea_id
+            }
+        };
+        let context = Arc::new(Context_ {
+            history: self.history.clone(),
+            conversation_id: id.to_string(),
+            omar_dir: self.root.omar_dir.clone(),
+            ea_id,
+            session_prefix: self.root.session_prefix.clone(),
+            default_workdir: self.root.default_workdir.clone(),
+            health_idle_warning: self.root.health_idle_warning,
+            runs: Runs::default(),
+            panels: Panels::default(),
+            chat: Arc::new(Mutex::new(Chat {
+                latest_run: None,
+                subscribers: Vec::new(),
+                busy: false,
+                needs_context: has_history,
+                needs_relaunch: true,
+                owned: false,
+            })),
+            agent_token: Mutex::new(Uuid::new_v4().to_string()),
+            chat_operation: Mutex::new(()),
+            command: Arc::new(Mutex::new(assistant_command(
+                &self.root.omar_dir,
+                ea_id,
+                &self.root.command.lock().expect("command poisoned"),
+            ))),
+            address: self.root.address,
+            shutdown: self.shutdown.clone(),
+        });
+        contexts.insert(id.to_string(), context.clone());
+        Ok(context)
+    }
+
+    fn list(&self) -> Value {
+        let contexts = self.contexts.lock().expect("workspaces poisoned").clone();
+        let (active_id, mut conversations) = {
+            let history = self.history.lock().expect("history poisoned");
+            (history.active_id.clone(), history.list())
+        };
+        for conversation in &mut conversations {
+            if let Some(context) = contexts.get(&conversation.id) {
+                context.live_summary(conversation);
+            }
+        }
+        json!({"active_id": active_id, "conversations": conversations})
+    }
+}
+
+impl Context_ {
+    fn live_summary(&self, summary: &mut ConversationSummary) {
+        let chat = self.chat.lock().expect("chat poisoned");
+        summary.busy = chat.busy;
+        let runs = self.runs.lock().expect("runs poisoned");
+        summary.run = chat
+            .latest_run
+            .as_ref()
+            .and_then(|id| runs.get(id))
+            .cloned()
+            .or_else(|| {
+                runs.values()
+                    .max_by_key(|run| (run.status.is_active(), run.started_at))
+                    .cloned()
+            });
+    }
+}
+
+/// Selection remembers where to open next, without touching another EA.
+fn select_chat(workspaces: &Arc<Workspaces>, id: Option<&str>) -> (u16, Value) {
+    let _selection = workspaces.selection.lock().expect("selection poisoned");
+    let selected = {
+        let mut history = workspaces.history.lock().expect("history poisoned");
+        if id.is_some_and(|id| !history.conversations.iter().any(|chat| chat.id == id)) {
+            return (404, json!({"error": "unknown chat"}));
+        }
+        if let Err(error) = history.select(id) {
+            return (500, json!({"error": error.to_string()}));
+        }
+        history.active_id.clone()
+    };
+    let context = match workspaces.get(&selected) {
+        Ok(context) => context,
+        Err(error) => return (500, json!({"error": error.to_string()})),
+    };
+    let mut summary = workspaces
+        .history
+        .lock()
+        .expect("history poisoned")
+        .conversation(&selected)
+        .summary();
+    context.live_summary(&mut summary);
+    (200, json!(summary))
+}
+
 fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
+    if context.shutdown.load(Ordering::SeqCst) {
+        return (503, json!({"error": "runtime is shutting down"}));
+    }
     let request: ChatRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
@@ -907,16 +1518,83 @@ fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": format!("selected component name is empty or too long: '{name}'")}),
         );
     }
-    let message = context.publish_with_selection(
+    let (resume, relaunch) = {
+        let chat = context.chat.lock().expect("serve chat poisoned");
+        if request
+            .conversation_id
+            .as_ref()
+            .is_some_and(|id| id != &context.conversation_id)
+        {
+            return (
+                409,
+                json!({"error": "The active chat changed. Reopen it before sending."}),
+            );
+        }
+        if chat.busy {
+            return (409, json!({"error": "The assistant is still replying."}));
+        }
+        let resume = if chat.needs_context {
+            match context
+                .history
+                .lock()
+                .expect("history poisoned")
+                .conversation(&context.conversation_id)
+                .resume_context()
+            {
+                Ok(context) => context,
+                Err(error) => return (500, json!({"error": error.to_string()})),
+            }
+        } else {
+            String::new()
+        };
+        (resume, chat.needs_relaunch)
+    };
+    if relaunch {
+        let command = context
+            .command
+            .lock()
+            .expect("serve command poisoned")
+            .clone();
+        if let Err(error) = relaunch_ea(context, &command) {
+            return (
+                502,
+                json!({"error": format!("could not resume assistant: {error:#}")}),
+            );
+        }
+        context
+            .chat
+            .lock()
+            .expect("serve chat poisoned")
+            .needs_relaunch = false;
+    }
+    let message = match context.publish_with_selection(
         ChatRole::Operator,
         request.text.clone(),
         false,
         None,
         request.selection.clone(),
-    );
-    match deliver_to_ea(context, &request.text, &request.selection) {
-        Ok(()) => (202, json!(message)),
-        Err(error) => (502, json!({"error": format!("{error:#}")})),
+    ) {
+        Ok(message) => message,
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    context.chat.lock().expect("serve chat poisoned").busy = true;
+    match deliver_to_ea(
+        context,
+        &format!("{resume}{}", request.text),
+        &request.selection,
+    ) {
+        Ok(()) => {
+            context
+                .chat
+                .lock()
+                .expect("serve chat poisoned")
+                .needs_context = false;
+            (202, json!(message))
+        }
+        Err(error) => {
+            context.chat.lock().expect("serve chat poisoned").busy = false;
+            (502, json!({"error": format!("{error:#}")}))
+        }
     }
 }
 
@@ -969,25 +1647,35 @@ fn deliver_to_ea(context: &Arc<Context_>, text: &str, selection: &[String]) -> R
 }
 
 fn agent_reply(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     let reply: AgentReply = match serde_json::from_slice(body) {
         Ok(reply) => reply,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
-    if reply.token != context.agent_token {
+    if reply.token != *context.agent_token.lock().expect("agent token poisoned") {
         return (403, json!({"error": "forbidden"}));
     }
-    context.publish(ChatRole::Assistant, reply.text, reply.progress, None);
-    (202, json!({"status": "delivered"}))
+    match context.publish(ChatRole::Assistant, reply.text, reply.progress, None) {
+        Ok(_) => (202, json!({"status": "delivered"})),
+        Err(error) => (500, json!({"error": format!("{error:#}")})),
+    }
 }
 
 /// A proposal is a program the operator has not approved. It is published to
 /// the conversation and nothing more — only the operator can start a run.
 fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     let proposal: AgentProposal = match serde_json::from_slice(body) {
         Ok(proposal) => proposal,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
-    if proposal.token != context.agent_token {
+    if proposal.token != *context.agent_token.lock().expect("agent token poisoned") {
         return (403, json!({"error": "forbidden"}));
     }
     // Compile before publishing. The operator never sees an unbuildable
@@ -997,7 +1685,7 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
-    context.publish(
+    if let Err(error) = context.publish(
         ChatRole::Assistant,
         proposal.summary,
         false,
@@ -1006,7 +1694,9 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             inputs: proposal.inputs,
             preview: crate::diagram::DiagramSnapshot::from_vm_state(&state),
         }),
-    );
+    ) {
+        return (500, json!({"error": format!("{error:#}")}));
+    }
     (202, json!({"status": "proposed"}))
 }
 
@@ -1028,19 +1718,46 @@ fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&s
         crate::diagram::cors_origin_header(origin)
     )?;
     let (sender, receiver) = mpsc::sync_channel(CHAT_QUEUE);
-    let backlog = {
+    let (mut conversation, backlog) = {
         let mut chat = context.chat.lock().expect("serve chat poisoned");
         chat.subscribers.push(sender);
-        chat.messages.clone()
+        let history = context.history.lock().expect("history poisoned");
+        let saved = history.conversation(&context.conversation_id);
+        (saved.summary(), saved.messages.clone())
     };
+    context.live_summary(&mut conversation);
+    writeln!(
+        stream,
+        "event: conversation\ndata: {}\n",
+        serde_json::to_string(&conversation)?
+    )?;
     // Replay so a reload does not lose the conversation.
     stream.write_all(b": connected\n\n")?;
     for message in backlog {
         write_chat_event(&mut stream, &message)?;
     }
+    writeln!(
+        stream,
+        "event: chat_state\ndata: {}\n",
+        serde_json::to_string(&conversation)?
+    )?;
     stream.flush()?;
+    // A read-side EOF notices a browser close immediately; write-side
+    // keepalives alone can miss the FIN until a subsequent write.
+    stream.set_read_timeout(Some(Duration::from_millis(1)))?;
+    let mut heartbeat = Instant::now();
     loop {
-        match receiver.recv_timeout(Duration::from_secs(15)) {
+        match stream.peek(&mut [0; 1]) {
+            Ok(0) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+            Ok(_) => {}
+        }
+        match receiver.recv_timeout(WINDOW_POLL) {
             Ok(message) => {
                 if write_chat_event(&mut stream, &message)
                     .and_then(|_| stream.flush().map_err(Into::into))
@@ -1050,6 +1767,10 @@ fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&s
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if heartbeat.elapsed() < Duration::from_secs(15) {
+                    continue;
+                }
+                heartbeat = Instant::now();
                 if stream
                     .write_all(b": keepalive\n\n")
                     .and_then(|_| stream.flush())
@@ -1081,11 +1802,25 @@ fn write_chat_event(stream: &mut TcpStream, message: &ChatMessage) -> Result<()>
 }
 
 fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     let request: StartRunRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
 
+    if request
+        .conversation_id
+        .as_ref()
+        .is_some_and(|id| id != &context.conversation_id)
+    {
+        return (
+            409,
+            json!({"error": "The request belongs to another chat."}),
+        );
+    }
     let run_id = Uuid::new_v4().to_string();
     let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
         .join("serve")
@@ -1148,6 +1883,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         .expect("serve runs poisoned")
         .insert(run_id.clone(), record);
 
+    context.chat.lock().expect("chat poisoned").latest_run = Some(run_id.clone());
     let (ready_sender, ready_receiver) = mpsc::channel();
     spawn_run_thread(
         context,
@@ -1694,6 +2430,384 @@ mod tests {
         .expect("server starts")
     }
 
+    #[test]
+    fn window_grace_requires_last_disconnect_and_resets_on_reconnect_or_run() {
+        let now = Instant::now();
+        let mut presence = Presence::default();
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE, false));
+        presence.connect().unwrap();
+        presence.connect().unwrap();
+        presence.clients -= 1;
+        assert!(!presence.shutdown_due(now, false));
+        presence.clients -= 1;
+        assert!(!presence.shutdown_due(now, false));
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE - Duration::from_millis(1), false));
+        assert!(presence.shutdown_due(now + WINDOW_GRACE, false));
+        presence.connect().unwrap();
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE, false));
+        presence.clients -= 1;
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE, true));
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE * 2, false));
+        assert!(presence.shutdown_due(now + WINDOW_GRACE * 3, false));
+        presence.stopping = true;
+        assert!(presence.connect().is_err());
+    }
+
+    #[test]
+    fn runs_in_other_chats_keep_the_runtime_alive_through_teardown() {
+        let server = test_server();
+        server
+            .workspaces
+            .history
+            .lock()
+            .unwrap()
+            .select(None)
+            .unwrap();
+        let id = server.workspaces.history.lock().unwrap().active_id.clone();
+        let other = server.workspaces.get(&id).unwrap();
+        for status in [RunStatus::Starting, RunStatus::Running, RunStatus::Stopping] {
+            other
+                .runs
+                .lock()
+                .unwrap()
+                .insert("run".into(), record("background", status));
+            {
+                let mut presence = server.workspaces.presence.lock().unwrap();
+                presence.seen = true;
+                presence.idle_since = Some(Instant::now() - WINDOW_GRACE);
+            }
+            assert!(!server.workspaces.shutdown_if_idle());
+            assert!(server
+                .workspaces
+                .presence
+                .lock()
+                .unwrap()
+                .idle_since
+                .is_none());
+        }
+        other.runs.lock().unwrap().get_mut("run").unwrap().status = RunStatus::Completed;
+        assert!(!server.workspaces.shutdown_if_idle());
+        server.workspaces.presence.lock().unwrap().idle_since = Some(Instant::now() - WINDOW_GRACE);
+        assert!(server.workspaces.shutdown_if_idle());
+    }
+
+    #[test]
+    fn sse_disconnect_releases_presence_and_stops_the_listener_after_grace() {
+        let server = test_server();
+        assert!(is_running(server.address()));
+        let mut browser = TcpStream::connect(server.address()).unwrap();
+        browser
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            browser,
+            "GET /v1/chat/events HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        .unwrap();
+        let mut buffer = [0; 1024];
+        assert!(browser.read(&mut buffer).unwrap() > 0);
+        // Wait for the server to have registered the stream, not merely sent headers.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.workspaces.presence.lock().unwrap().clients == 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        browser.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(browser);
+        while server.workspaces.presence.lock().unwrap().clients != 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(server.running.load(Ordering::Relaxed));
+        server.workspaces.presence.lock().unwrap().idle_since = Some(Instant::now() - WINDOW_GRACE);
+        while server.running.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!is_running(server.address()));
+    }
+
+    #[test]
+    fn chat_history_routes_reopen_only_the_selected_conversation() {
+        let server = test_server();
+        let first = server.context.history.lock().unwrap().active_id.clone();
+        server
+            .context
+            .publish_with_selection(
+                ChatRole::Operator,
+                "Release planning".into(),
+                false,
+                None,
+                vec!["flow.planner".into()],
+            )
+            .unwrap();
+        let created = request(server.address(), "POST", "/v1/chats", Some("{}"));
+        assert!(created.contains(" 200 "), "{created}");
+        let second = server.context.history.lock().unwrap().active_id.clone();
+        assert_ne!(first, second);
+        let empty = request(server.address(), "GET", "/v1/chat", None);
+        assert!(empty.contains("\"messages\":[]"), "{empty}");
+        let list = request(server.address(), "GET", "/v1/chats", None);
+        assert!(
+            list.contains("Release planning") && list.contains(&second),
+            "{list}"
+        );
+        let reopened = request(
+            server.address(),
+            "POST",
+            &format!("/v1/chats/{first}/activate"),
+            Some("{}"),
+        );
+        assert!(reopened.contains(" 200 "), "{reopened}");
+        let chat = request(server.address(), "GET", "/v1/chat", None);
+        assert!(
+            chat.contains("Release planning") && chat.contains("flow.planner"),
+            "{chat}"
+        );
+        assert!(request(
+            server.address(),
+            "POST",
+            "/v1/chats/unknown/activate",
+            Some("{}")
+        )
+        .contains(" 404 "));
+        let stale_run =
+            json!({"conversation_id": second, "program": "must not be compiled"}).to_string();
+        assert!(request(server.address(), "POST", "/v1/runs", Some(&stale_run)).contains(" 409 "));
+        let stale =
+            json!({"conversation_id": second, "text": "This belongs elsewhere"}).to_string();
+        assert!(request(server.address(), "POST", "/v1/chat", Some(&stale)).contains(" 409 "));
+        assert!(
+            !request(server.address(), "GET", "/v1/chat", None).contains("This belongs elsewhere")
+        );
+        assert_eq!(server.context.runs.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn chats_keep_independent_replies_runs_and_ea_workspaces() {
+        let server = test_server();
+        let first = &server.context;
+        first.chat.lock().unwrap().busy = true;
+        first
+            .runs
+            .lock()
+            .unwrap()
+            .insert("live".into(), record("Team", RunStatus::Running));
+        let thinking = first.chat_operation.lock().unwrap();
+        let created = request(server.address(), "POST", "/v1/chats", Some("{}"));
+        assert!(created.contains(" 200 "), "{created}");
+        drop(thinking);
+        let id = server.workspaces.history.lock().unwrap().active_id.clone();
+        let second = server.workspaces.get(&id).unwrap();
+        assert_ne!(first.ea_id, second.ea_id);
+        assert_ne!(first.conversation_id, second.conversation_id);
+        assert!(first.chat.lock().unwrap().busy);
+        assert!(second.runs.lock().unwrap().is_empty());
+        let reply = json!({"token": server.agent_token, "text": "Background answer"}).to_string();
+        assert!(
+            request(server.address(), "POST", "/v1/agent/reply", Some(&reply)).contains(" 202 ")
+        );
+        assert!(!first.chat.lock().unwrap().busy);
+        assert!(request(
+            server.address(),
+            "GET",
+            &format!("/chats/{}/v1/chat", first.conversation_id),
+            None
+        )
+        .contains("Background answer"));
+        assert!(!request(
+            server.address(),
+            "GET",
+            &format!("/chats/{id}/v1/chat"),
+            None
+        )
+        .contains("Background answer"));
+        assert!(request(
+            server.address(),
+            "GET",
+            &format!("/chats/{id}/v1/runs/live"),
+            None
+        )
+        .contains(" 404 "));
+        assert!(request(
+            server.address(),
+            "POST",
+            &format!("/chats/{id}/v1/agent/reply"),
+            Some(&reply)
+        )
+        .contains(" 403 "));
+        assert!(request(
+            server.address(),
+            "POST",
+            &format!("/v1/chats/{}/activate", first.conversation_id),
+            Some("{}")
+        )
+        .contains(" 200 "));
+        assert_eq!(
+            first.runs.lock().unwrap()["live"].status,
+            RunStatus::Running
+        );
+        let listing = request(server.address(), "GET", "/v1/chats", None);
+        assert!(listing.contains("Team-Running"), "{listing}");
+    }
+
+    #[test]
+    fn reopening_saved_chats_keeps_their_ea_assignments() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let first = server.context.conversation_id.clone();
+        assert!(request(server.address(), "POST", "/v1/chats", Some("{}")).contains(" 200 "));
+        let second = server.workspaces.history.lock().unwrap().active_id.clone();
+        let second_ea = server.workspaces.get(&second).unwrap().ea_id;
+        drop(server);
+        let resumed = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        assert_eq!(resumed.ea_id, second_ea);
+        assert_eq!(resumed.workspaces.get(&first).unwrap().ea_id, 0);
+        assert_eq!(resumed.workspaces.get(&second).unwrap().ea_id, second_ea);
+        assert!(resumed.context.runs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_save_errors_are_returned_before_a_reply_is_published() {
+        let server = test_server();
+        let path = crate::ea::ea_state_dir(0, &server.context.omar_dir).join("chats.json");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let body = json!({"token": server.agent_token, "text": "Cannot persist this"}).to_string();
+        let response = request(server.address(), "POST", "/v1/agent/reply", Some(&body));
+        assert!(response.contains(" 500 "), "{response}");
+        assert!(server
+            .context
+            .history
+            .lock()
+            .unwrap()
+            .active()
+            .messages
+            .is_empty());
+    }
+
+    #[test]
+    fn restarting_restores_proposals_and_supplies_context_to_a_fresh_assistant() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let captured = dir.path().join("captured.txt");
+        let mut config = Config::default();
+        config.dashboard.session_prefix = format!("omar-history-test-{}-", Uuid::new_v4());
+        config.agent.default_workdir = dir.path().display().to_string();
+        // A recording backend drains its side-channel queue. No TTY input,
+        // real Claude installation, or model credentials are involved.
+        let recorder = dir.path().join("claude");
+        fs::write(
+            &recorder,
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys, time
+output = pathlib.Path(__file__).with_name('captured.txt')
+spool = output.with_suffix('.queue')
+subprocess.run(['tmux', 'set-environment', '-t', os.environ['TMUX_PANE'],
+                'OMAR_DELIVERY', 'spool:' + str(spool)], check=True)
+while True:
+    claimed = spool.with_suffix('.draining')
+    try:
+        spool.rename(claimed)
+    except FileNotFoundError:
+        time.sleep(0.025)
+        continue
+    with output.open('a') as sink:
+        for line in claimed.read_text().splitlines():
+            sink.write(json.loads(line)['text'] + '\n')
+    claimed.unlink()
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o700)).unwrap();
+        config.agent.default_command = format!("'{}' '{}'", recorder.display(), captured.display());
+        let session = crate::ea::ea_manager_session(0, &config.dashboard.session_prefix);
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = crate::tmux::tmux_command()
+                    .args(["kill-session", "-t", &format!("={}", self.0)])
+                    .output();
+            }
+        }
+        let _cleanup = Cleanup(session);
+        let first = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        first
+            .context
+            .publish_with_selection(
+                ChatRole::Operator,
+                "Preserve the launch requirements".into(),
+                false,
+                None,
+                vec!["flow.planner".into()],
+            )
+            .unwrap();
+        let proposal = ProposedDesign {
+            program: include_str!("../web/tests/fixtures/review-flow.omar").into(),
+            inputs: BTreeMap::from([("flow.request".into(), json!("release evidence"))]),
+            preview: serde_json::from_str(include_str!(
+                "../web/tests/fixtures/diagram-snapshot.v1.json"
+            ))
+            .unwrap(),
+        };
+        first
+            .context
+            .publish(
+                ChatRole::Assistant,
+                "Saved proposal".into(),
+                false,
+                Some(proposal),
+            )
+            .unwrap();
+        let first_id = first.context.history.lock().unwrap().active_id.clone();
+        drop(first);
+        let resumed = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let body = request(resumed.address(), "GET", "/v1/chat", None);
+        assert!(
+            body.contains("Saved proposal") && body.contains("release evidence"),
+            "{body}"
+        );
+        assert_eq!(resumed.context.history.lock().unwrap().active_id, first_id);
+        let response = request(
+            resumed.address(),
+            "POST",
+            "/v1/chat",
+            Some(r#"{"text":"Continue with a final review"}"#),
+        );
+        assert!(response.contains(" 202 "), "{response}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let text = loop {
+            let text = fs::read_to_string(&captured).unwrap_or_default();
+            if text.contains("Continue with a final review")
+                || std::time::Instant::now() >= deadline
+            {
+                break text;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        for expected in [
+            "Preserve the launch requirements",
+            "flow.planner",
+            "release evidence",
+            "Saved proposal",
+            "Continue with a final review",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing {expected} in delivered context: {text}"
+            );
+        }
+        assert!(
+            resumed.context.runs.lock().unwrap().is_empty(),
+            "restoring a proposal never deploys it"
+        );
+    }
+
     /// Stopping is a request the runner reads, not a kill.
     ///
     /// The route's whole job is to leave the same control file `omar stop`
@@ -1976,7 +3090,7 @@ mod tests {
         // Whatever this machine defaults to, the choices are the ones an
         // operator can actually pick.
         assert!(response.contains("\"available\""), "{response}");
-        for backend in crate::config::ASSISTANT_BACKENDS {
+        for backend in crate::backend::assistant_names() {
             assert!(
                 response.contains(backend),
                 "{backend} missing from {response}"
@@ -2181,6 +3295,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_handshake_geometry_is_validated() {
+        assert_eq!(terminal_dimensions("").unwrap(), None);
+        assert_eq!(
+            terminal_dimensions("cols=96&rows=30").unwrap(),
+            Some((96, 30))
+        );
+        for bad in [
+            "cols=80",
+            "rows=24",
+            "cols=0&rows=24",
+            "cols=80&rows=1001",
+            "cols=80&rows=24&cols=90",
+            "cols=x&rows=24",
+            "other=80&rows=24",
+        ] {
+            assert!(terminal_dimensions(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_terminal_carries_the_agent_screen_and_the_operator_keystrokes() {
         // The whole point is steering, so this drives a real tmux session
         // through a real socket: the agent's output has to arrive, and typing
@@ -2211,11 +3345,13 @@ mod tests {
         ]);
 
         let server = test_server();
-        let url = format!("ws://{}/v1/agents/wsprobe/terminal", server.address());
+        let url = format!(
+            "ws://{}/v1/agents/wsprobe/terminal?cols=93&rows=31",
+            server.address()
+        );
         let (mut socket, _) = tungstenite::connect(&url).expect("terminal connects");
 
-        // The viewer is told the agent's size before anything else, so it can
-        // render at that size instead of resizing the agent.
+        // The PTY starts at the viewer's requested size before emitting bytes.
         let size: Value = serde_json::from_str(
             &socket
                 .read()
@@ -2224,8 +3360,8 @@ mod tests {
                 .expect("text"),
         )
         .expect("json");
-        assert_eq!(size["cols"], json!(120));
-        assert_eq!(size["rows"], json!(40));
+        assert_eq!(size["cols"], json!(93));
+        assert_eq!(size["rows"], json!(31));
 
         socket
             .send(tungstenite::Message::Binary(b"echo omar-ws-ok\n".to_vec()))
@@ -2307,6 +3443,9 @@ mod tests {
         ]);
 
         let server = test_server();
+        let expected_rows = crate::terminal::window_size(&session)
+            .unwrap()
+            .client_rows();
         let url = format!("ws://{}/v1/agent/terminal", server.address());
         let (mut socket, _) = tungstenite::connect(&url).expect("assistant terminal connects");
         let size: Value = serde_json::from_str(
@@ -2320,7 +3459,7 @@ mod tests {
 
         tmux(&["kill-session", "-t", &format!("={session}")]);
         assert_eq!(size["cols"], json!(90));
-        assert_eq!(size["rows"], json!(26));
+        assert_eq!(size["rows"], json!(expected_rows));
     }
 
     #[test]

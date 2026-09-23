@@ -1,3 +1,4 @@
+import { startDelivery } from "./delivery.js";
 import { jsonSchemaForPi, OmarMcpClient, piToolName } from "./omar-mcp.js";
 
 function messageFor(error) {
@@ -11,6 +12,7 @@ function messageFor(error) {
  */
 export default function omarPiExtension(pi, { createClient = () => new OmarMcpClient() } = {}) {
   let client;
+  let closeDelivery;
 
   const discover = async (ctx) => {
     if (client) return;
@@ -49,6 +51,7 @@ export default function omarPiExtension(pi, { createClient = () => new OmarMcpCl
           },
         });
       }
+      closeDelivery = await startDelivery(process.env.OMAR_PI_SOCKET, pi, ctx);
       ctx?.ui?.notify?.(`OMAR: loaded ${tools.length} MCP tools`, "info");
     } catch (error) {
       if (client === discoveringClient) client = undefined;
@@ -64,7 +67,12 @@ export default function omarPiExtension(pi, { createClient = () => new OmarMcpCl
   pi.on("session_shutdown", async () => {
     const closingClient = client;
     client = undefined;
-    await closingClient?.close();
+    try {
+      await closeDelivery?.();
+    } finally {
+      closeDelivery = undefined;
+      await closingClient?.close();
+    }
   });
 }
 

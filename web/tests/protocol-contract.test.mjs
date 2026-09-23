@@ -258,3 +258,47 @@ test("a selection rides with the message and is bounded", async () => {
     await fake.close();
   }
 });
+
+test("the fake isolates run discovery, controls and diagram fallbacks by chat", async () => {
+  const fake = await startFakeServe();
+  const post = (body) => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const get = async (path, init) => (await fetch(`${fake.url}${path}`, init)).json();
+  try {
+    const first = await get("/v1/chat");
+    const second = await get("/v1/chats", post({}));
+    const bases = [first, second].map((chat) => `/chats/${chat.id}`);
+    const records = await Promise.all(bases.map((base, i) => get(`${base}/v1/runs`, post({ program: "fixture", inputs: { "flow.request": `Workspace ${i}` } }))));
+    for (const [i, base] of bases.entries()) {
+      const own = records[i];
+      const other = records[1 - i];
+      assert.deepEqual((await get(`${base}/v1/runs`)).runs.map((run) => run.run_id), [own.run_id]);
+      for (const suffix of ["", "/panel", "/stop"]) {
+        const response = await fetch(`${fake.url}${base}/v1/runs/${other.run_id}${suffix}`, suffix === "/stop" ? post({}) : undefined);
+        assert.equal(response.status, 404);
+      }
+      const snapshot = await get(`${base}/v1/diagram`);
+      assert.equal(snapshot.ports.find((port) => port.name === "flow.request").value, `Workspace ${i}`);
+    }
+  } finally { await fake.close(); }
+});
+
+
+test("scoped agent callbacks stay in their chat after another chat becomes active", async () => {
+  const fake = await startFakeServe();
+  const post = (body) => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const get = async (path, init) => (await fetch(`${fake.url}${path}`, init)).json();
+  try {
+    const first = await get("/v1/chat");
+    await get("/v1/chats", post({}));
+    const base = `/chats/${first.id}`;
+    for (const [endpoint, body] of [
+      ["reply", { text: "Background reply" }],
+      ["proposals", { summary: "Background proposal", program: "fixture" }],
+    ]) {
+      const response = await fetch(`${fake.url}${base}/v1/agent/${endpoint}`, post({ token: fake.agentToken, ...body }));
+      assert.equal(response.status, 202);
+    }
+    assert.deepEqual((await get(`${base}/v1/chat`)).messages.map((message) => message.text), ["Background reply", "Background proposal"]);
+    assert.deepEqual((await get("/v1/chat")).messages, []);
+  } finally { await fake.close(); }
+});

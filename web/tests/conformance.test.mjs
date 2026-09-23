@@ -500,3 +500,59 @@ async function collectEvents(url, timeoutMs) {
   await reader.cancel();
   return kinds;
 }
+
+test("two chats run the same topology independently and retain their live panels", { skip: WIRE_SKIP, timeout: 60_000 }, async () => {
+  const real = await startRealServe();
+  const post = (body) => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const request = async (path, init) => {
+    const response = await fetch(`${real.url}${path}`, init);
+    const body = await response.json();
+    assert.ok(response.ok, JSON.stringify(body));
+    return body;
+  };
+  const program = `team Concurrent[panel : Web] {
+    input question : string
+    output answer : string
+    prompt panel(question) -> answer within(1min) "Answer $(question)."
+  }
+  main Concurrent { flow = Concurrent() }`;
+  try {
+    const first = await request("/v1/chat");
+    const second = await request("/v1/chats", post({}));
+    assert.notEqual(first.ea_id, second.ea_id);
+    const firstBase = `/chats/${first.id}`;
+    const secondBase = `/chats/${second.id}`;
+    const [a, b] = await Promise.all([
+      request(`${firstBase}/v1/runs`, post({ conversation_id: first.id, program, inputs: { "flow.question": "First" } })),
+      request(`${secondBase}/v1/runs`, post({ conversation_id: second.id, program, inputs: { "flow.question": "Second" } })),
+    ]);
+    assert.notEqual(a.diagram_address, b.diagram_address);
+    const waitPanel = async (base, run) => {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const response = await fetch(`${real.url}${base}/v1/runs/${run.run_id}/panel`);
+        const panel = await response.json();
+        // Admission can return before the run publishes its Web panel.
+        assert.ok(response.ok || (response.status === 404 && panel.error === "run has no panel"), JSON.stringify(panel));
+        if (panel.pending?.length) return panel.pending[0];
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.fail("live panel never became ready");
+    };
+    const [pa, pb] = await Promise.all([waitPanel(firstBase, a), waitPanel(secondBase, b)]);
+    assert.notEqual(pa.invocation_id, pb.invocation_id);
+    await request(`/v1/chats/${first.id}/activate`, post({}));
+    const listing = await request("/v1/chats");
+    for (const chat of listing.conversations) assert.equal(chat.run.status, "running");
+    assert.equal((await fetch(`${real.url}${secondBase}/v1/runs/${a.run_id}`)).status, 404);
+    const answer = (base, run, panel, value) => request(`${base}/v1/runs/${run.run_id}/panel`, post({ invocation_id: panel.invocation_id, agent: panel.agent, values: { "flow.answer": value } }));
+    await answer(firstBase, a, pa, "First result");
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const status = await request(`${firstBase}/v1/runs/${a.run_id}`);
+      if (status.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal((await request(`${firstBase}/v1/runs/${a.run_id}`)).status, "completed");
+    assert.equal((await request(`${secondBase}/v1/runs/${b.run_id}`)).status, "running");
+    await answer(secondBase, b, pb, "Second result");
+  } finally { await real.close(); }
+});

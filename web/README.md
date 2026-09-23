@@ -58,14 +58,61 @@ cargo run --bin omar -- serve --address 127.0.0.1:7340   # from the repository r
 OMAR_SERVE_URL=http://127.0.0.1:7340 npm run dev         # from web/
 ```
 
-The topbar shows the mode and whether the daemon is reachable, polled every few
-seconds. Describe a workflow, then **Confirm & run**. Mission Control posts the
+The sidebar holds saved chats. The chat composer offers backend selection and
+**Inspect on terminal**; a connection error appears if the runtime is unreachable.
+Describe a workflow, then **Confirm & run**. Mission Control posts the
 program to `/v1/runs`; `omar serve` compiles it, starts the run, and returns
 that run's `diagram_address`, which the client observes over `/v1/diagram` and
 `/v1/events`.
 
 Nothing executes before the confirmation step, and the confirm button stays
 disabled unless the daemon is live. Both runtime surfaces are loopback-only.
+
+## Saved conversations
+
+Each chat owns an independent EA workspace using the runtime's multi-EA support.
+**Recent chats** lists saved conversations with **Thinking** and **Running**
+indicators. Switch chats while an assistant replies or a topology runs; returning
+to a chat reconnects its conversation, live diagram, terminals and pending port
+panel. Browser tabs select chats independently. Switching reconnects a live EA or resumes its saved backend session; it never
+deploys a proposal.
+
+Messages, selections, proposals and each chat's EA ID are saved atomically in
+`~/.omar/ea/<starting-ea-id>/chats.json` under the configured state directory.
+Existing #245 histories remain readable; additional chats receive their own EAs
+when opened. These EAs also appear in the native EA registry. Each workspace has
+its own sessions, callbacks, runs and panels; identical topology names can run
+in different chats simultaneously.
+
+Reloading the browser reconnects to live work. The deploy confirmation opens a
+modal explaining that a running topology keeps the runtime and assistants alive
+after every Mission Control window closes. Reopening the same URL reconnects to
+the live run and saved chat. `omar serve --ui` also reuses an existing runtime.
+
+With no active topologies (including starting or stopping runs) and no connected
+Mission Control windows, a 10-second grace period precedes shutdown of the owned
+EA processes, their child processes, and the runtime. Reconnecting during the
+grace period cancels shutdown. When a background run finishes, the grace period
+starts then. API-only daemons that have never had a chat stream stay running.
+
+After idle shutdown, launch `omar serve --ui` again to start the runtime and
+restore the highlighted chat. Its native backend session is resumed when an ID
+is available: Claude and Codex use native resume, Cursor loads its ACP session,
+Antigravity restores its conversation, and OpenCode reselects its saved session.
+IDs and the selected backend are scoped to each chat's EA, never the provider's
+global "last" conversation. OMAR's durable transcript remains available as
+context when native history is unavailable. Restarting the runtime does not
+recover topology execution; running topologies prevent automatic shutdown.
+Unsent drafts, manual source edits and terminal scrollback are not archived.
+Reopened proposals still require deployment confirmation.
+
+The catalog routes remain `/v1/chats` and `/v1/chats/<id>/activate`. Activation
+only remembers a default selection. Clients pin a workspace by prefixing its
+API and terminal routes with `/chats/<id>` (for example,
+`/chats/<id>/v1/chat/events` and `/chats/<id>/v1/runs`). Unprefixed routes use the
+remembered selection. Agent callbacks are routed by their EA's private token,
+not by the dashboard's selection. Chat streams replay the transcript followed
+by a `chat_state` event containing the current busy state and latest run.
 
 ## Architecture
 
