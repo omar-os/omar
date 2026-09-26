@@ -66,6 +66,11 @@ std::fs::write("artifact.bin", b"\\0\\xff\\r\\n").unwrap();
 let temp = std::env::var("OMAR_TEMP").unwrap();
 assert_eq!(std::env::var("TMPDIR").unwrap(), temp);
 std::fs::write(std::path::Path::new(&temp).join("discard"), "temporary").unwrap();
+std::process::Command::new("sh").args(["-c", r#"trap '' TERM HUP; while :; do printf x >> "$OMAR_TEMP/reaction-heartbeat"; sleep 0.02; done"#])
+    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+let heartbeat = std::path::Path::new(&temp).join("reaction-heartbeat");
+while !heartbeat.exists() { std::thread::sleep(std::time::Duration::from_millis(10)); }
+
 let cwd = std::env::current_dir().unwrap();
 assert_eq!(cwd, std::path::PathBuf::from(std::env::var("OMAR_WORKTREE").unwrap()).canonicalize().unwrap());
 out = Some(cwd.display().to_string());
@@ -97,8 +102,12 @@ out = Some(cwd.display().to_string());
             heartbeats = {p: p.read_bytes() for tree in paths.values()
                           for p in (tree.parent / "temp").glob("sidecar-*")}
             assert len(heartbeats) == 3, heartbeats
+            reaction_heartbeats = {tree.parent / "temp" / "reaction-heartbeat":
+                                   (tree.parent / "temp" / "reaction-heartbeat").read_bytes()
+                                   for tree in paths.values()}
             time.sleep(0.2)
             assert all(p.read_bytes() == value for p, value in heartbeats.items()), "sidecar survived teardown"
+            assert all(p.read_bytes() == value for p, value in reaction_heartbeats.items()), "reaction descendant survived final snapshot"
             spawned = [json.loads(line) for line in launches.read_text().splitlines() if "new-session" in json.loads(line)]
             assert len(spawned) == 3, spawned
             cwd_counts = {}

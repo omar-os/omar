@@ -91,3 +91,11 @@ Manage Codex updates separately. An update dialog can prevent the TUI from
 loading a thread before OMAR's delivery deadline. OMAR does not change this
 user-wide setting or dismiss dialogs automatically. Passing `-c` to the remote
 TUI is not equivalent: config overrides select OMAR's native exec path instead.
+
+Reaction commands run in a dedicated process group. OMAR kills remaining group
+members on return, timeout, or failure and verifies that no running members
+remain before allowing file versions. An outstanding cleanup marker under
+`~/.omar/workspaces/<id>/reactions/` blocks both manual and automatic snapshots,
+including after a runner crash. Remove such a marker only after independently
+confirming its writers have stopped. Reactions must not detach children into
+other process groups/sessions; host process groups are not container isolation.
