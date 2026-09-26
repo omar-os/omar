@@ -57,6 +57,7 @@ const SESSION_DELIVERY_VAR: &str = "OMAR_DELIVERY";
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
     prefix: String,
+    server: Option<Option<String>>,
 }
 
 /// An agent name as tmux will store it.
@@ -76,12 +77,16 @@ thread_local! {
 }
 
 pub fn tmux_command() -> Command {
+    tmux_command_for_server(std::env::var("OMAR_TMUX_SERVER").ok().as_deref())
+}
+
+fn tmux_command_for_server(server: Option<&str>) -> Command {
     #[cfg(test)]
     if let Some(path) = TEST_TMUX.with(|path| path.borrow().clone()) {
         return Command::new(path);
     }
     let mut cmd = Command::new("tmux");
-    if let Ok(server) = std::env::var("OMAR_TMUX_SERVER") {
+    if let Some(server) = server {
         let server = server.trim();
         if !server.is_empty() {
             cmd.args(["-L", server]);
@@ -132,6 +137,22 @@ impl TmuxClient {
     pub fn new(prefix: impl Into<String>) -> Self {
         Self {
             prefix: prefix.into(),
+            server: None,
+        }
+    }
+
+    /// Pin commands to a recorded server; None explicitly means the default server.
+    pub fn on_server(prefix: impl Into<String>, server: Option<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            server: Some(server),
+        }
+    }
+
+    fn command(&self) -> Command {
+        match &self.server {
+            Some(server) => tmux_command_for_server(server.as_deref()),
+            None => tmux_command(),
         }
     }
 
@@ -145,7 +166,8 @@ impl TmuxClient {
     }
 
     fn run(&self, args: &[&str]) -> Result<String> {
-        let output = tmux_command()
+        let output = self
+            .command()
             .args(args)
             .output()
             .context("Failed to execute tmux - is tmux installed?")?;
@@ -484,6 +506,17 @@ impl TmuxClient {
         workdir: Option<&str>,
         backend: Option<&str>,
     ) -> Result<()> {
+        self.new_session_with_backend_env(name, command, workdir, backend, &[])
+    }
+
+    pub(crate) fn new_session_with_backend_env(
+        &self,
+        name: &str,
+        command: &str,
+        workdir: Option<&str>,
+        backend: Option<&str>,
+        environment: &[(String, String)],
+    ) -> Result<()> {
         let (cols, rows) = agent_dimensions(crossterm::terminal::size().ok());
         let cols = cols.to_string();
         let rows = rows.to_string();
@@ -508,6 +541,7 @@ impl TmuxClient {
         let env: Vec<String> = setup
             .env
             .iter()
+            .chain(environment)
             .map(|(key, value)| format!("{key}={value}"))
             .collect();
         for value in &env {
@@ -644,7 +678,8 @@ impl TmuxClient {
     /// Check if a session exists
     pub fn has_session(&self, name: &str) -> Result<bool> {
         let target = exact_session_target(name);
-        let result = tmux_command()
+        let result = self
+            .command()
             .args(["has-session", "-t", &target])
             .output()
             .context("Failed to execute tmux")?;
@@ -658,8 +693,23 @@ impl TmuxClient {
     /// around with `remain-on-exit`. `has-session` is still true in that state,
     /// but the session cannot accept input or be attached as a running agent.
     pub fn session_has_live_pane(&self, name: &str) -> Result<bool> {
+        self.session_has_live_pane_on_server(
+            name,
+            self.server
+                .clone()
+                .unwrap_or_else(|| std::env::var("OMAR_TMUX_SERVER").ok())
+                .as_deref(),
+        )
+    }
+
+    /// Inspect the server recorded at launch, independently of this caller's environment.
+    pub fn session_has_live_pane_on_server(
+        &self,
+        name: &str,
+        server: Option<&str>,
+    ) -> Result<bool> {
         let target = exact_session_target(name);
-        let result = tmux_command()
+        let result = tmux_command_for_server(server)
             .args(["list-panes", "-t", &target, "-F", "#{pane_dead}"])
             .output()
             .context("Failed to execute tmux")?;
@@ -712,7 +762,7 @@ impl TmuxClient {
     /// Attach to a session (blocks until detached)
     pub fn attach_session(&self, session: &str) -> Result<()> {
         let target = exact_session_target(session);
-        tmux_command()
+        self.command()
             .args(["attach-session", "-t", &target])
             .status()
             .context("Failed to attach to tmux session")?;
@@ -723,7 +773,8 @@ impl TmuxClient {
     pub fn attach_popup(&self, session: &str, width: &str, height: &str) -> Result<()> {
         let target = exact_session_target(session);
         let command = popup_attach_command(&target);
-        let status = tmux_command()
+        let status = self
+            .command()
             .args(["display-popup", "-E", "-w", width, "-h", height, &command])
             .status()
             .context("Failed to open tmux popup")?;

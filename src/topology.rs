@@ -1694,6 +1694,7 @@ struct DispatchExecutor<'a, E: ReactionExecutor> {
     /// The run-wide timeout, which bounds a body that set no deadline.
     timeout: Duration,
     agents: E,
+    workspace_dirs: BTreeMap<String, (PathBuf, PathBuf)>,
 }
 
 impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
@@ -1701,12 +1702,14 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
         if let Some(code) = &self.code {
             if code.handles(&invocation.reaction_id) {
                 let deadline = invocation.within.unwrap_or(self.timeout);
-                let Some(writes) = code.invoke(
+                let Some(writes) = code.invoke_in(
                     self.state,
                     &invocation.reaction_id,
                     &invocation.trigger_values,
                     &invocation.state_values,
                     deadline,
+                    self.workspace_dirs
+                        .get(&self.state.reactions[&invocation.reaction_id].instance),
                 )?
                 else {
                     // Killed with nothing written, so its instance keeps the
@@ -1879,11 +1882,34 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         InvocationServer,
         BTreeMap<String, Value>,
         Option<crate::reaction::Reactions>,
+        BTreeMap<String, crate::workspace::Workspace>,
     );
     let prepared = (|| -> Result<Prepared> {
         // Before anything is spawned: compiling the bodies is the step most
         // likely to fail, and it costs nothing to find out first.
         let reactions = crate::reaction::build(&state, config.generated)?;
+        let deployment_id = record
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
+            .deployment_id
+            .clone();
+        let workspaces = crate::workspace::for_topology(
+            config.omar_dir,
+            config.ea_id,
+            &deployment_id,
+            &state,
+            Path::new(config.default_workdir),
+        )?;
+        {
+            let mut guard = record
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
+            guard.workspaces = workspaces
+                .iter()
+                .map(|(name, ws)| (name.clone(), ws.id.clone()))
+                .collect();
+            guard.save(&runtime_dir)?;
+        }
         let invocation_server = InvocationServer::start()?;
         spawn_topology_agents(
             &state,
@@ -1891,12 +1917,13 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             &runtime_dir,
             &invocation_server,
             &config,
+            &workspaces,
             &mut spawned,
         )?;
         let inputs = parse_inputs(&state, config.inputs)?;
-        Ok((invocation_server, inputs, reactions))
+        Ok((invocation_server, inputs, reactions, workspaces))
     })();
-    let (invocation_server, inputs, reactions) = match prepared {
+    let (invocation_server, inputs, reactions, workspaces) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             observer.run_failed(&error.to_string());
@@ -1922,6 +1949,15 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         }
     }
     let executor = DispatchExecutor {
+        workspace_dirs: workspaces
+            .iter()
+            .map(|(name, ws)| {
+                (
+                    name.clone(),
+                    (ws.worktree(config.omar_dir), ws.temp(config.omar_dir)),
+                )
+            })
+            .collect(),
         state: &state,
         code: reactions,
         timeout: config.timeout,
@@ -2002,11 +2038,12 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         .lock()
         .map(|guard| guard.sessions.clone())
         .unwrap_or_default();
-    for failure in deploy::teardown_sessions(
+    let cleanup_failures = deploy::teardown_sessions(
         &executor.agents.client,
         &sessions,
         &deploy::logs_dir(&runtime_dir),
-    ) {
+    );
+    for failure in &cleanup_failures {
         eprintln!("warning: session not cleaned up: {failure}");
     }
     {
@@ -2031,6 +2068,23 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         guard.save(&runtime_dir)?;
     }
     deploy::clear_stop(&runtime_dir)?;
+    // File versions are independent of runtime checkpoints. Agents have
+    // been torn down; keep their final artifacts without reusing the directory.
+    for workspace in workspaces.values() {
+        if !cleanup_failures.is_empty() {
+            eprintln!(
+                "warning: skipped final snapshot of {} because agent cleanup failed",
+                workspace.id
+            );
+            continue;
+        }
+        if let Err(error) = workspace.snapshot(config.omar_dir, "Final topology files") {
+            eprintln!(
+                "warning: could not snapshot workspace {}: {error:#}",
+                workspace.id
+            );
+        }
+    }
     if stopped {
         println!("Topology '{}' stopped", state.team);
     } else {
@@ -2055,12 +2109,13 @@ fn spawn_topology_agents(
     runtime_dir: &Path,
     invocation_server: &InvocationServer,
     config: &TopologyRunConfig<'_>,
+    workspaces: &BTreeMap<String, crate::workspace::Workspace>,
     spawned: &mut BTreeMap<String, String>,
 ) -> Result<()> {
     // The line each agent was launched with, which is what says how it
     // proves readiness.
     let mut launched: BTreeMap<String, String> = BTreeMap::new();
-    let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, use only omar_set_port to set allowed effects and omar_complete to finish. Port writes are buffered and repeated writes use last-writer-wins semantics.";
+    let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
     for (name, agent) in &state.agents {
         // A web agent is not spawned. There is no command to resolve, no pane
         // to put it in, and no readiness to wait for — the agent exists as a
@@ -2077,12 +2132,18 @@ fn spawn_topology_agents(
                 );
             }
             client.ensure_session_not_attached(&session)?;
-            client.kill_session(&session)?;
+            client.kill_session_tree(&session)?;
         }
         let agent_dir = runtime_dir.join("agents").join(name);
         fs::create_dir_all(&agent_dir)?;
         let prompt_file = agent_dir.join("system.md");
-        fs::write(&prompt_file, protocol)?;
+        let workspace = workspaces
+            .get(&agent.instance)
+            .context("agent instance has no workspace")?;
+        let worktree = workspace.worktree(config.omar_dir);
+        let temp = workspace.temp(config.omar_dir);
+        let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
+        fs::write(&prompt_file, format!("{protocol}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.\n", temp.display()))?;
         let backend = canonical_backend(&agent.backend);
         let base_command = crate::backend::resolve(backend)
             .map(|backend| backend.default_command().to_string())
@@ -2092,7 +2153,7 @@ fn spawn_topology_agents(
             ea_id: config.ea_id,
             session_prefix: config.base_prefix.to_string(),
             default_command: base_command.clone(),
-            default_workdir: config.default_workdir.to_string(),
+            default_workdir: workdir.to_string(),
             health_idle_warning: config.health_idle_warning,
             agent_name: None,
             tmux_server: std::env::var("OMAR_TMUX_SERVER").ok(),
@@ -2107,11 +2168,16 @@ fn spawn_topology_agents(
             }),
         };
         let command = manager::build_agent_command(&base_command, &prompt_file, &[], &context);
-        client.new_session_with_backend(
+        client.new_session_with_backend_env(
             &session,
             &command,
-            Some(config.default_workdir),
+            Some(workdir),
             Some(backend),
+            &[
+                ("OMAR_WORKTREE".into(), workdir.into()),
+                ("OMAR_TEMP".into(), temp.to_string_lossy().into_owned()),
+                ("TMPDIR".into(), temp.to_string_lossy().into_owned()),
+            ],
         )?;
         spawned.insert(name.clone(), session);
         launched.insert(name.clone(), command);
@@ -5433,6 +5499,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let outcome = DispatchExecutor {
+            workspace_dirs: BTreeMap::new(),
             state: &state,
             code: Some(code),
             timeout: Duration::from_secs(30),
@@ -5474,6 +5541,7 @@ mod tests {
             )
             .unwrap();
             DispatchExecutor {
+                workspace_dirs: BTreeMap::new(),
                 state: &state,
                 code: Some(code),
                 timeout: Duration::from_secs(30),
