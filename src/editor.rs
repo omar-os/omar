@@ -337,7 +337,19 @@ mod tests {
             last_used: Mutex::new(Instant::now()),
         });
         let mut client = TcpStream::connect(address).unwrap();
-        let (server, _) = listener.accept().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (server, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(1))
+                }
+                Err(error) => panic!("accept test connection: {error}"),
+            }
+        };
         let handler = thread::spawn(move || relay(server, gateway).unwrap());
         let backend = thread::spawn(move || {
             let (mut stream, _) = upstream.accept().unwrap();
