@@ -16,6 +16,7 @@ default-run = "omar"
 
 [dependencies]
 libc = "0.2"
+cap-std = "3"
 shlex = "2.0.1"
 ratatui = "0.29"
 crossterm = "0.28"

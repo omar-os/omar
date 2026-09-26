@@ -18,6 +18,8 @@ mod paths;
 mod process;
 mod projects;
 // The generator runs under `cargo test`; nothing in a release build calls it.
+mod artifacts;
+mod editor;
 #[cfg(test)]
 mod protocol;
 mod reaction;

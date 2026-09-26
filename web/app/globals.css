@@ -2221,3 +2221,28 @@ h2 {
 .deploy-confirmation h2 { margin: 12px 0 20px; font-size: 22px; }
 .deploy-confirmation p { margin: 12px 0; line-height: 1.6; font-size: 14px; }
 .deploy-confirmation-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px; }
+
+/* Workspace artifacts are a full-width inspector; editing opens separately. */
+.workspace-file-action { display: flex; justify-content: flex-end; padding: 12px 18px 0; }
+.artifacts-dialog { margin: auto; width: min(1160px, 94vw); max-height: 90vh; padding: 24px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface, #17151d); color: var(--text, #eee); overflow: auto; }
+.artifacts-dialog::backdrop { background: #08060dcc; }
+.artifacts-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.artifacts-dialog h2 { margin: 4px 0 20px; }
+.artifact-controls { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.artifact-controls label { display: grid; gap: 6px; font-size: 12px; flex: 1; min-width: 180px; }
+.artifact-controls select { width: 100%; padding: 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel, #25212e); color: inherit; }
+.artifact-guidance { font-size: 12px; line-height: 1.6; opacity: .75; }
+.artifact-body { display: grid; grid-template-columns: 230px minmax(0, 1fr); min-height: 360px; border-top: 1px solid var(--line); }
+.artifact-body nav { border-right: 1px solid var(--line); padding: 12px 10px 12px 0; overflow: auto; max-height: 55vh; }
+.artifact-path { overflow-wrap: anywhere; font: 12px var(--font-mono, monospace); opacity: .7; padding: 8px; }
+.artifact-body nav button { display: block; text-align: left; width: 100%; padding: 7px 10px; color: inherit; background: transparent; border: none; border-radius: 5px; overflow-wrap: anywhere; cursor: pointer; }
+.artifact-body nav button:hover { background: #a78bfa22; }
+.artifact-body nav button:disabled { opacity: .45; cursor: default; }
+.artifact-preview { padding: 16px; min-width: 0; overflow: auto; max-height: 55vh; }
+.artifact-preview-title { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; font-size: 12px; }
+.artifact-text { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.7 var(--font-mono, monospace); margin: 0; }
+.artifact-image { max-width: 100%; max-height: 400px; object-fit: contain; }
+.artifact-comparison { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+.artifact-comparison h3 { font-size: 12px; color: #bca4f5; }
+.artifact-link { border: none; padding: 0; background: none; color: inherit; text-decoration: underline; cursor: pointer; }
+@media (max-width: 700px) { .artifact-body { grid-template-columns: 1fr; } .artifact-body nav { max-height: 180px; border-right: 0; } .artifact-comparison { grid-template-columns: 1fr; } .artifacts-dialog { padding: 16px; } }

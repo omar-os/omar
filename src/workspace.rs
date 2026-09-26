@@ -56,7 +56,7 @@ impl Workspace {
     fn admin(&self, root: &Path) -> PathBuf {
         root.join("workspace-history").join(&self.id)
     }
-    fn git(&self, root: &Path) -> Command {
+    pub(crate) fn git(&self, root: &Path) -> Command {
         let mut cmd = Command::new("git");
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("GIT_") {

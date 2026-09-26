@@ -236,6 +236,7 @@ struct Workspaces {
     contexts: Mutex<BTreeMap<String, Arc<Context_>>>,
     root: Arc<Context_>,
     selection: Mutex<()>,
+    editors: Mutex<crate::editor::Editors>,
     presence: Mutex<Presence>,
     launch_ea: AtomicBool,
     shutdown: Arc<AtomicBool>,
@@ -409,6 +410,7 @@ impl Serve {
             contexts: Mutex::new(BTreeMap::from([(conversation_id, context.clone())])),
             root: context.clone(),
             selection: Mutex::new(()),
+            editors: Mutex::new(crate::editor::Editors::default()),
             presence: Mutex::new(Presence::default()),
             launch_ea: AtomicBool::new(false),
             shutdown,
@@ -597,6 +599,11 @@ impl Serve {
 impl Drop for Serve {
     fn drop(&mut self) {
         self.workspaces.shutdown.store(true, Ordering::SeqCst);
+        self.workspaces
+            .editors
+            .lock()
+            .expect("editors poisoned")
+            .stop_all();
         self.running.store(false, Ordering::Relaxed);
         let _ = TcpStream::connect(self.address);
         if let Some(thread) = self.thread.take() {
@@ -670,7 +677,76 @@ pub fn run(
     server.wait()
 }
 
+fn workspace_request(
+    workspaces: &Workspaces,
+    context: &Context_,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<Value> {
+    let root = &context.omar_dir;
+    if method == "GET" && path == "/v1/workspaces" {
+        return Ok(json!({"workspaces": crate::workspace::list(root, context.ea_id)?}));
+    }
+    let rest = path
+        .strip_prefix("/v1/workspaces/")
+        .context("unknown workspace route")?;
+    let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
+    let ws = crate::workspace::Workspace::load(root, id)?;
+    anyhow::ensure!(
+        ws.ea_id == context.ea_id,
+        "workspace belongs to another chat"
+    );
+    if method == "GET" && action.is_empty() {
+        return Ok(
+            json!({"workspace":ws, "worktree":ws.worktree(root), "snapshots":ws.snapshots(root)?}),
+        );
+    }
+    anyhow::ensure!(method == "POST", "unsupported workspace operation");
+    match action {
+        "browse" | "preview" => {
+            let selection = serde_json::from_slice::<crate::artifacts::Selection>(body)?;
+            if action == "browse" {
+                crate::artifacts::browse(&ws, root, &selection)
+            } else {
+                crate::artifacts::preview(&ws, root, &selection)
+            }
+        }
+        "restore" => {
+            let selection = serde_json::from_slice::<crate::artifacts::Selection>(body)?;
+            let restored = ws.restore(
+                root,
+                selection
+                    .snapshot
+                    .as_deref()
+                    .context("select a snapshot to restore")?,
+            )?;
+            Ok(json!({"workspace":restored}))
+        }
+        "editor" => {
+            let presence = workspaces.presence.lock().expect("presence poisoned");
+            anyhow::ensure!(!presence.stopping, "runtime is shutting down");
+            let url = workspaces
+                .editors
+                .lock()
+                .expect("editors poisoned")
+                .open(root, &ws)?;
+            Ok(json!({"url":url}))
+        }
+        "editor/stop" => {
+            workspaces
+                .editors
+                .lock()
+                .expect("editors poisoned")
+                .stop(id);
+            Ok(json!({"stopped":true}))
+        }
+        _ => bail!("unknown workspace operation"),
+    }
+}
+
 fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -681,6 +757,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
     let mut path = parts.next().unwrap_or("").to_string();
 
     let mut content_length = 0usize;
+    let mut host = None;
     let mut origin = None;
     let mut origin_header = None;
     let mut websocket_key = None;
@@ -690,6 +767,9 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
             break;
         }
         let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("host:") {
+            host = Some(value.trim().to_owned());
+        }
         if let Some(value) = lower.strip_prefix("content-length:") {
             content_length = value.trim().parse().unwrap_or(0);
         }
@@ -780,6 +860,30 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
             }
         }
     };
+
+    if path == "/v1/workspaces" || path.starts_with("/v1/workspaces/") {
+        // Workspace reads expose host files; editor launch grants shell access.
+        // Reject cross-site requests, including simple POSTs, rather than only
+        // withholding CORS headers after executing the operation.
+        let local_hosts = [
+            context.address.to_string(),
+            format!("localhost:{}", context.address.port()),
+        ];
+        if !host.as_ref().is_some_and(|h| local_hosts.contains(h))
+            || (origin_header.is_some() && origin.is_none())
+        {
+            return write_json(&mut stream, 403, &json!({"error":"origin rejected"}), None);
+        }
+        if method == "OPTIONS" {
+            return write_json(&mut stream, 204, &Value::Null, origin);
+        }
+        let response = workspace_request(&workspaces, &context, &method, &path, &raw_body);
+        let (status, body) = match response {
+            Ok(body) => (200, body),
+            Err(error) => (400, json!({"error":format!("{error:#}")})),
+        };
+        return write_json(&mut stream, status, &body, origin);
+    }
 
     // Geometry is only a terminal handshake parameter; leave other API paths
     // and their routing unchanged.
@@ -1339,7 +1443,10 @@ impl Workspaces {
                 .values()
                 .any(|run| run.status.is_active())
         });
-        if !presence.shutdown_due(Instant::now(), active) {
+        if !presence.shutdown_due(
+            Instant::now(),
+            active || self.editors.lock().expect("editors poisoned").connected(),
+        ) {
             return false;
         }
         presence.stopping = true;
@@ -1364,6 +1471,7 @@ impl Workspaces {
             chat.needs_relaunch = true;
             chat.owned = false;
         }
+        self.editors.lock().expect("editors poisoned").stop_all();
         eprintln!("Mission Control closed; no active topologies. Runtime stopped.");
         true
     }
@@ -2428,6 +2536,72 @@ mod tests {
             0,
         )
         .expect("server starts")
+    }
+
+    #[test]
+    fn workspace_routes_scope_files_to_the_chat_and_reject_cross_site_requests() {
+        let server = test_server();
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("report.txt"), "workspace data").unwrap();
+        let root = &server.context.omar_dir;
+        let ws = crate::workspace::Workspace::create(
+            root,
+            server.context.ea_id,
+            "run",
+            "writer",
+            None,
+            source.path(),
+        )
+        .unwrap();
+        let other = crate::workspace::Workspace::create(
+            root,
+            server.context.ea_id + 1,
+            "run",
+            "other",
+            None,
+            source.path(),
+        )
+        .unwrap();
+        let listing = request(server.address(), "GET", "/v1/workspaces", None);
+        assert!(listing.contains(&ws.id));
+        assert!(!listing.contains(&other.id));
+        let preview = request(
+            server.address(),
+            "POST",
+            &format!("/v1/workspaces/{}/preview", ws.id),
+            Some(r#"{"path":"report.txt"}"#),
+        );
+        assert!(preview.contains("workspace data"));
+        let denied = request(
+            server.address(),
+            "GET",
+            &format!("/v1/workspaces/{}", other.id),
+            None,
+        );
+        assert!(denied.contains("workspace belongs to another chat"));
+        let mut client = TcpStream::connect(server.address()).unwrap();
+        write!(
+            client,
+            "GET /v1/workspaces HTTP/1.1\r\nHost: {}\r\nOrigin: https://attacker.example\r\n\r\n",
+            server.address()
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.contains("403 Forbidden"));
+        assert!(!response.contains(&ws.id));
+        let snapshot = ws.snapshots(root).unwrap()[0].id.clone();
+        let restored = workspace_request(
+            &server.workspaces,
+            &server.context,
+            "POST",
+            &format!("/v1/workspaces/{}/restore", ws.id),
+            serde_json::to_string(&json!({"snapshot":snapshot}))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_ne!(restored["workspace"]["id"], ws.id);
     }
 
     #[test]
