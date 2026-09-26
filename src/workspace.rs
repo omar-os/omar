@@ -118,16 +118,24 @@ impl Workspace {
             source: source.to_path_buf(),
             restored_from: None,
         };
-        fs::create_dir_all(workspace.admin(root).join("snapshots"))?;
-        fs::create_dir_all(workspace.temp(root))?;
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(workspace.admin(root), fs::Permissions::from_mode(0o700))?;
-        fs::set_permissions(workspace.root(root), fs::Permissions::from_mode(0o700))?;
-        let mut git = workspace.git(root);
-        // init does not use --git-dir to choose its destination.
-        git.args(["init", "--bare", "--quiet", "--object-format=sha1"])
-            .arg(workspace.admin(root).join("repository.git"));
-        output(git, None)?;
+        let result = (|| -> Result<()> {
+            fs::create_dir_all(workspace.admin(root).join("snapshots"))?;
+            fs::create_dir_all(workspace.temp(root))?;
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(workspace.admin(root), fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(workspace.root(root), fs::Permissions::from_mode(0o700))?;
+            let mut git = workspace.git(root);
+            // init does not use --git-dir to choose its destination.
+            git.args(["init", "--bare", "--quiet", "--object-format=sha1"])
+                .arg(workspace.admin(root).join("repository.git"));
+            output(git, None)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(workspace.root(root));
+            let _ = fs::remove_dir_all(workspace.admin(root));
+            return Err(error);
+        }
         Ok(workspace)
     }
     pub fn create(
@@ -287,8 +295,18 @@ impl Workspace {
         }
         for entry in fs::read_dir(deployments)? {
             if let Some(record) = crate::deploy::DeploymentRecord::load(&entry?.path())? {
-                anyhow::ensure!(record.deployment_id != self.deployment_id || !record.is_active() || !record.runner_alive(),
-                    "stop the topology before taking a file snapshot; coordinated live checkpoints are not supported yet");
+                if !record.workspaces.values().any(|id| id == &self.id) {
+                    continue;
+                }
+                anyhow::ensure!(!record.is_active(),
+                    "stop the topology before taking a file snapshot; a dead runner does not confirm cleanup");
+                let client = crate::tmux::TmuxClient::new("");
+                for session in record.sessions.values() {
+                    anyhow::ensure!(
+                        !client.session_has_live_pane(session)?,
+                        "stop remaining topology sessions before taking a file snapshot"
+                    );
+                }
             }
         }
         Ok(())
@@ -468,14 +486,46 @@ pub fn for_topology(
     {
         owners.insert(String::new(), None);
     }
-    owners
-        .into_iter()
-        .map(|(instance, parent)| {
-            let workspace =
-                Workspace::create(root, ea_id, deployment_id, &instance, parent, source)?;
-            Ok((instance, workspace))
-        })
-        .collect()
+    create_batch(
+        owners,
+        |instance, parent| Workspace::create(root, ea_id, deployment_id, instance, parent, source),
+        root,
+    )
+}
+
+// Publish the instance set only after every workspace has been created. No
+// agents have started yet, so these files can be removed on a partial failure.
+fn create_batch(
+    owners: BTreeMap<String, Option<String>>,
+    mut create: impl FnMut(&str, Option<String>) -> Result<Workspace>,
+    root: &Path,
+) -> Result<BTreeMap<String, Workspace>> {
+    let mut workspaces: BTreeMap<String, Workspace> = BTreeMap::new();
+    for (instance, parent) in owners {
+        match create(&instance, parent) {
+            Ok(workspace) => {
+                workspaces.insert(instance, workspace);
+            }
+            Err(error) => {
+                let mut cleanup_errors = Vec::new();
+                for workspace in workspaces.values() {
+                    for path in [workspace.root(root), workspace.admin(root)] {
+                        if let Err(error) = fs::remove_dir_all(&path) {
+                            cleanup_errors.push(format!("{}: {error}", path.display()));
+                        }
+                    }
+                }
+                if !cleanup_errors.is_empty() {
+                    return Err(error.context(format!(
+                        "workspace cleanup failed: {}",
+                        cleanup_errors.join("; ")
+                    )));
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(workspaces)
 }
 
 fn output(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -829,6 +879,45 @@ mod tests {
     }
 
     #[test]
+    fn failed_batch_removes_only_its_new_workspaces() {
+        let (_dir, root, source) = setup();
+        fs::write(source.join("keep"), "source data").unwrap();
+        let existing = create(&root, &source);
+        let owners = [("first".into(), None), ("second".into(), None)].into();
+        let result = create_batch(
+            owners,
+            |instance, parent| {
+                if instance == "second" {
+                    // Fail seeding after allocating the second workspace.
+                    std::os::unix::net::UnixListener::bind(source.join("socket"))?;
+                }
+                Workspace::create(&root, 7, "failed", instance, parent, &source)
+            },
+            &root,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            list(&root, 7)
+                .unwrap()
+                .iter()
+                .map(|w| &w.id)
+                .collect::<Vec<_>>(),
+            vec![&existing.id]
+        );
+        for directory in ["workspaces", "workspace-history"] {
+            assert_eq!(fs::read_dir(root.join(directory)).unwrap().count(), 1);
+        }
+        assert_eq!(
+            fs::read_to_string(source.join("keep")).unwrap(),
+            "source data"
+        );
+        assert_eq!(
+            fs::read_to_string(existing.worktree(&root).join("keep")).unwrap(),
+            "source data"
+        );
+    }
+
+    #[test]
     fn live_deployments_refuse_manual_snapshots_and_state_directory_is_not_seeded() {
         let (dir, root, _) = setup();
         let ws = create(&root, dir.path());
@@ -836,7 +925,17 @@ mod tests {
         let mut deployment =
             crate::deploy::DeploymentRecord::create("Example", BTreeMap::new(), 60);
         deployment.deployment_id = ws.deployment_id.clone();
+        deployment
+            .workspaces
+            .insert(ws.instance.clone(), ws.id.clone());
         let deployment_dir = crate::deploy::dir_for(&root, 7, "Example");
+        deployment.save(&deployment_dir).unwrap();
+        assert!(ws.ensure_inactive(&root).is_err());
+        let restored = ws
+            .restore(&root, &ws.snapshots(&root).unwrap()[0].id)
+            .unwrap();
+        restored.ensure_inactive(&root).unwrap();
+        deployment.pid = u32::MAX;
         deployment.save(&deployment_dir).unwrap();
         assert!(ws.ensure_inactive(&root).is_err());
         deployment

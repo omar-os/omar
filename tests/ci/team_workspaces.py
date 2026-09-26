@@ -113,6 +113,13 @@ out = Some(cwd.display().to_string());
             for workspace in later:
                 snapshots = json.loads(run("workspace", "show", workspace["id"]))["snapshots"]
                 assert [s["label"] for s in snapshots] == ["Initial workspace"], snapshots
+                refused = subprocess.run([str(BIN), "workspace", "snapshot", workspace["id"]],
+                                         cwd=source, env=env, text=True, capture_output=True, timeout=30)
+                assert refused.returncode != 0, refused.stdout
+                assert "stop remaining topology sessions" in refused.stderr, refused.stderr
+            subprocess.run([tmux, "-L", server, "kill-server"], check=True, capture_output=True)
+            # Once cleanup is confirmed, the same terminal deployment permits snapshots.
+            run("workspace", "snapshot", later[0]["id"], "--label", "after cleanup")
             print("PASS: team workspaces, nested ownership, agent launch, Rust cwd/env, snapshots, and CLI restore")
         finally:
             subprocess.run([tmux, "-L", server, "kill-server"], capture_output=True)

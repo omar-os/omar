@@ -45,8 +45,10 @@ omar workspace restore <workspace-id> <snapshot-id>
 ```
 
 Commands return JSON with stable IDs. `show` and `restore` include the directory
-paths. Manual snapshots refuse a live owning deployment; quiesce any other
-writers before snapshotting. Atomic publication protects completed snapshots,
+paths. Manual snapshots require a terminal owning deployment with no remaining
+live agent sessions; a dead runner alone does not establish cleanup. Restored
+copies have their own workspace IDs and are not owned by the original run.
+Quiesce any other writers before snapshotting. Atomic publication protects completed snapshots,
 but reading a changing directory is not a transactional filesystem snapshot.
 
 Snapshots include all files in `worktree/`, including ignored/untracked files and
