@@ -162,3 +162,35 @@ jobs:
             web/playwright-report/
             web/test-results/
           retention-days: 7
+
+  workspace-editor:
+    name: Workspace Editor Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - run: .github/scripts/install-packages.sh tmux
+        working-directory: .
+      - name: Install pinned code-server
+        working-directory: .
+        run: |
+          curl --fail --location --retry 3 https://github.com/coder/code-server/releases/download/v4.112.0/code-server-4.112.0-linux-amd64.tar.gz -o "$RUNNER_TEMP/code-server.tar.gz"
+          tar -xzf "$RUNNER_TEMP/code-server.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/code-server-4.112.0-linux-amd64/bin" >> "$GITHUB_PATH"
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build:spa
+      - run: cargo build --bin omar --features ui
+        working-directory: .
+      - run: node tests/editor-smoke.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: workspace-editor-smoke
+          path: /tmp/omar-editor-smoke-*/**/*.png
