@@ -96,3 +96,22 @@ Edits save directly to disk. Agents can concurrently overwrite them; stop the
 topology before conflicting edits. Unsaved editor buffers are not snapshots.
 The IDE's Git history is separate from OMAR's snapshot history. Terminals and
 extensions still run with host-user permissions; container isolation is later.
+
+## Agent tools and Codex startup
+
+Topology agents may use their normal file and command tools to do invocation
+work. Only topology communication is restricted: write the invocation's allowed
+output ports with `omar_set_port`, then finish with `omar_complete`. Persistent
+artifacts belong in `worktree/`; disposable files belong in `temp/`.
+
+For unattended Codex agents, disable the startup update prompt by setting this
+at the top level of `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`):
+
+```toml
+check_for_update_on_startup = false
+```
+
+Manage Codex updates separately. An update dialog can prevent the TUI from
+loading a thread before OMAR's delivery deadline. OMAR does not change this
+user-wide setting or dismiss dialogs automatically. Passing `-c` to the remote
+TUI is not equivalent: config overrides select OMAR's native exec path instead.
