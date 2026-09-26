@@ -294,7 +294,7 @@ impl Workspace {
             return Ok(());
         }
         for entry in fs::read_dir(deployments)? {
-            if let Some(record) = crate::deploy::DeploymentRecord::load(&entry?.path())? {
+            for record in crate::deploy::DeploymentRecord::load_all(&entry?.path())? {
                 if !record.workspaces.values().any(|id| id == &self.id) {
                     continue;
                 }
@@ -941,6 +941,14 @@ mod tests {
         deployment.pid = u32::MAX;
         deployment.save(&deployment_dir).unwrap();
         assert!(ws.ensure_inactive(&root).is_err());
+        let replacement = crate::deploy::DeploymentRecord::create("Example", BTreeMap::new(), 60);
+        replacement.save(&deployment_dir).unwrap();
+        assert!(
+            ws.ensure_inactive(&root).is_err(),
+            "redeployment lost ownership of the crashed run"
+        );
+        // Put the original back to exercise a terminal record as well.
+        deployment.save(&deployment_dir).unwrap();
         deployment
             .advance(crate::deploy::DeploymentState::Failed, Some("test"))
             .unwrap();

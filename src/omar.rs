@@ -451,7 +451,7 @@ async fn async_main() -> Result<()> {
                 .map(|dir| deploy::record_path(&dir).exists())
                 .unwrap_or(false);
             if deployment {
-                kill_deployment(&omar_dir, target.id, &client, &name)
+                kill_deployment(&omar_dir, target.id, &name)
             } else {
                 kill_agent(
                     &client,
@@ -1025,12 +1025,7 @@ fn status_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) ->
 
 /// Force kill: the runner dies first, then its sessions, then the record says
 /// CANCELLED. Also sweeps sessions a crashed run left behind.
-fn kill_deployment(
-    omar_dir: &std::path::Path,
-    ea_id: ea::EaId,
-    client: &TmuxClient,
-    team: &str,
-) -> Result<()> {
+fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> Result<()> {
     let dir = deployment_dir(omar_dir, ea_id, team)?;
     let mut record = deploy::DeploymentRecord::load(&dir)?
         .ok_or_else(|| anyhow::anyhow!("no deployment '{}'", team))?;
@@ -1041,7 +1036,8 @@ fn kill_deployment(
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    for failure in deploy::teardown_sessions(client, &record.sessions, &deploy::logs_dir(&dir)) {
+    let client = TmuxClient::on_server("", record.tmux_server.clone());
+    for failure in deploy::teardown_sessions(&client, &record.sessions, &deploy::logs_dir(&dir)) {
         eprintln!("warning: session not cleaned up: {failure}");
     }
     deploy::clear_stop(&dir)?;
