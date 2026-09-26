@@ -11,6 +11,7 @@ license = "MIT"
 default-run = "omar"
 
 [dependencies]
+cap-std = "3"
 shlex = "2.0.1"
 ratatui = "0.29"
 crossterm = "0.28"

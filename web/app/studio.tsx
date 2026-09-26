@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
 import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
+import { Artifacts } from "./artifacts";
 import { DeployConfirmation } from "./deploy-confirmation";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
@@ -172,6 +173,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   /** Diagram components the operator has highlighted for the next message. */
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
+  const [filesOpen, setFilesOpen] = useState(false);
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -905,6 +907,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               </button>
             </div>
           ) : null}
+          {!isDemo ? <div className="workspace-file-action"><button className="secondary-button" disabled={switchingChat || daemon.state !== "live"} onClick={() => setFilesOpen(true)}>Files & versions</button></div> : null}
           <div className="messages" ref={threadRef}>
             {messages.length === 0 && snapshot ? (
               <p className="builder-status">
@@ -1193,6 +1196,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         />
       ) : null}
 
+      {filesOpen ? <Artifacts key={serveUrl} serveUrl={serveUrl} onClose={() => setFilesOpen(false)} /> : null}
       {terminalAgent ? (
         <AgentTerminal
           serveUrl={serveUrl}
