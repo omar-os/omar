@@ -181,6 +181,17 @@ impl Workspace {
     }
     pub fn snapshot(&self, root: &Path, label: &str) -> Result<Snapshot> {
         let _lock = self.lock(root)?;
+        let reactions = self
+            .worktree(root)
+            .parent()
+            .context("workspace has no parent")?
+            .join("reactions");
+        if reactions.exists() {
+            anyhow::ensure!(
+                fs::read_dir(reactions)?.next().is_none(),
+                "reaction cleanup is unconfirmed; cannot snapshot workspace"
+            );
+        }
         let previous = self.snapshots(root)?.pop();
         let sequence = previous
             .as_ref()
@@ -918,6 +929,24 @@ mod tests {
             fs::read_to_string(existing.worktree(&root).join("keep")).unwrap(),
             "source data"
         );
+    }
+
+    #[test]
+    fn outstanding_reaction_cleanup_blocks_file_versions() {
+        let (dir, root, _) = setup();
+        let ws = create(&root, dir.path());
+        let reactions = ws.worktree(&root).parent().unwrap().join("reactions");
+        fs::create_dir(&reactions).unwrap();
+        let marker = reactions.join("unconfirmed");
+        fs::write(&marker, "runner died before cleanup").unwrap();
+        assert!(ws
+            .snapshot(&root, "Final topology files")
+            .unwrap_err()
+            .to_string()
+            .contains("reaction cleanup is unconfirmed"));
+        assert_eq!(ws.snapshots(&root).unwrap().len(), 1);
+        fs::remove_file(marker).unwrap();
+        ws.snapshot(&root, "confirmed clean").unwrap();
     }
 
     #[test]
