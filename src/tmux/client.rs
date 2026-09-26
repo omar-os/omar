@@ -484,6 +484,17 @@ impl TmuxClient {
         workdir: Option<&str>,
         backend: Option<&str>,
     ) -> Result<()> {
+        self.new_session_with_backend_env(name, command, workdir, backend, &[])
+    }
+
+    pub(crate) fn new_session_with_backend_env(
+        &self,
+        name: &str,
+        command: &str,
+        workdir: Option<&str>,
+        backend: Option<&str>,
+        environment: &[(String, String)],
+    ) -> Result<()> {
         let (cols, rows) = agent_dimensions(crossterm::terminal::size().ok());
         let cols = cols.to_string();
         let rows = rows.to_string();
@@ -508,6 +519,7 @@ impl TmuxClient {
         let env: Vec<String> = setup
             .env
             .iter()
+            .chain(environment)
             .map(|(key, value)| format!("{key}={value}"))
             .collect();
         for value in &env {

@@ -650,6 +650,7 @@ impl Reactions {
         self.reactions.contains(reaction_id)
     }
 
+    #[cfg(test)]
     pub fn invoke(
         &self,
         state: &VmState,
@@ -658,6 +659,18 @@ impl Reactions {
         state_values: &BTreeMap<String, Value>,
         deadline: Duration,
     ) -> Result<Option<BTreeMap<String, Value>>> {
+        self.invoke_in(state, reaction_id, triggers, state_values, deadline, None)
+    }
+
+    pub fn invoke_in(
+        &self,
+        state: &VmState,
+        reaction_id: &str,
+        triggers: &BTreeMap<String, Value>,
+        state_values: &BTreeMap<String, Value>,
+        deadline: Duration,
+        workspace: Option<&(PathBuf, PathBuf)>,
+    ) -> Result<Option<BTreeMap<String, Value>>> {
         let mut request = format!("{reaction_id}\n");
         for (name, value) in triggers.iter().chain(state_values) {
             let ty = wire_type(state, name)
@@ -665,7 +678,15 @@ impl Reactions {
             request.push_str(&format!("{name}\t{}\n", encode(value, ty)?));
         }
 
-        let mut child = Command::new(&self.binary)
+        let mut command = Command::new(self.binary.canonicalize()?);
+        if let Some((worktree, temp)) = workspace {
+            command
+                .current_dir(worktree)
+                .env("OMAR_WORKTREE", worktree)
+                .env("OMAR_TEMP", temp)
+                .env("TMPDIR", temp);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

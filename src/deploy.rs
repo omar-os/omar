@@ -92,6 +92,9 @@ pub struct DeploymentRecord {
     /// read back and, once there is a resume, continued.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub state_vars: BTreeMap<String, serde_json::Value>,
+    /// Instance name to stable workspace id; retained after the run ends.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspaces: BTreeMap<String, String>,
 }
 
 impl DeploymentRecord {
@@ -113,6 +116,7 @@ impl DeploymentRecord {
                 detail: None,
             }],
             state_vars: BTreeMap::new(),
+            workspaces: BTreeMap::new(),
         }
     }
 
