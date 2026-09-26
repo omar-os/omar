@@ -39,7 +39,7 @@ def main():
         wrapper.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
                            f"with open({str(launches)!r}, 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
                            "if os.environ.get('OMAR_TEST_KILL_FAIL') and ('kill-session' in sys.argv or '#{pane_pid}' in sys.argv): sys.exit(1)\n"
-                           f"if 'new-session' in sys.argv and not os.environ.get('OMAR_TEST_KILL_FAIL'): sys.argv[-1] = {('python3 ' + shlex.quote(str(sidecar)) + ' & ')!r} + sys.argv[-1]\n"
+                           f"if 'new-session' in sys.argv and (not os.environ.get('OMAR_TEST_KILL_FAIL') or os.environ.get('OMAR_TEST_REPLACE_SIDECAR')): sys.argv[-1] = {('python3 ' + shlex.quote(str(sidecar)) + ' & ')!r} + sys.argv[-1]\n"
                            f"os.execv({tmux!r}, [{tmux!r}, *sys.argv[1:]])\n")
         wrapper.chmod(0o700)
         server = "omar-workspace-" + uuid.uuid4().hex[:12]
@@ -190,6 +190,26 @@ out = Some(cwd.display().to_string());
             run("workspace", "snapshot", old_workspace, "--label", "archived run cleaned up")
             # Once cleanup is confirmed, the same terminal deployment permits snapshots.
             run("workspace", "snapshot", later[0]["id"], "--label", "after cleanup")
+            # Replacing leftover sessions must also terminate their sidecars.
+            env["OMAR_TEST_KILL_FAIL"] = "1"
+            env["OMAR_TEST_REPLACE_SIDECAR"] = "1"
+            run("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
+                "--input", "right.tick=1", "--fast")
+            replaced = json.loads(records[0].read_text())
+            old_heartbeats = [p for workspace_id in replaced["workspaces"].values()
+                              for p in (root_state / "workspaces" / workspace_id / "temp").glob("sidecar-*")]
+            assert len(old_heartbeats) == 3, old_heartbeats
+            before = {p: p.read_bytes() for p in old_heartbeats}
+            time.sleep(0.1)
+            assert all(p.read_bytes() != value for p, value in before.items()), "fixture writers did not start"
+            env.pop("OMAR_TEST_KILL_FAIL")
+            env.pop("OMAR_TEST_REPLACE_SIDECAR")
+            run("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
+                "--input", "right.tick=1", "--fast", "--replace")
+            after = {p: p.read_bytes() for p in old_heartbeats}
+            time.sleep(0.2)
+            assert all(p.read_bytes() == value for p, value in after.items()), "replacement left old workspace writers alive"
+            run("workspace", "snapshot", replaced["workspaces"]["left"], "--label", "after replacement cleanup")
             print("PASS: team workspaces, nested ownership, agent launch, Rust cwd/env, snapshots, and CLI restore")
         finally:
             subprocess.run([tmux, "-L", server, "kill-server"], capture_output=True)
