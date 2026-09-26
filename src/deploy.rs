@@ -85,6 +85,9 @@ pub struct DeploymentRecord {
     pub error: Option<String>,
     /// Agent name to tmux session, so teardown needs no re-verify.
     pub sessions: BTreeMap<String, String>,
+    /// Named tmux server used at launch; None means the default server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_server: Option<String>,
     /// Per-invocation timeout, which bounds a graceful stop.
     pub timeout_seconds: u64,
     pub history: Vec<TransitionEvent>,
@@ -109,6 +112,9 @@ impl DeploymentRecord {
             finished_at: None,
             error: None,
             sessions,
+            tmux_server: std::env::var("OMAR_TMUX_SERVER")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             timeout_seconds,
             history: vec![TransitionEvent {
                 state: DeploymentState::Created,
@@ -248,7 +254,7 @@ impl SessionHost for TmuxClient {
     }
 
     fn kill(&self, session: &str) -> Result<()> {
-        self.kill_session(session)
+        self.kill_session_tree(session)
     }
 }
 

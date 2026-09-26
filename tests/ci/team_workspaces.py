@@ -11,6 +11,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
+import shlex
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
@@ -27,10 +29,17 @@ def main():
             path.mkdir()
         (source / "seed.txt").write_text("original source")
         launches = root / "tmux.jsonl"
+        sidecar = root / "sidecar.py"
+        sidecar.write_text("import os, signal, time\nfrom pathlib import Path\n"
+                           "signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+                           "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                           "path = Path(os.environ['OMAR_TEMP']) / ('sidecar-' + str(os.getpid()))\n"
+                           "while True:\n path.write_text(str(time.monotonic_ns()))\n time.sleep(0.02)\n")
         wrapper = shims / "tmux"
         wrapper.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
                            f"with open({str(launches)!r}, 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
-                           "if 'kill-session' in sys.argv and os.environ.get('OMAR_TEST_KILL_FAIL'): sys.exit(1)\n"
+                           "if os.environ.get('OMAR_TEST_KILL_FAIL') and ('kill-session' in sys.argv or '#{pane_pid}' in sys.argv): sys.exit(1)\n"
+                           f"if 'new-session' in sys.argv and not os.environ.get('OMAR_TEST_KILL_FAIL'): sys.argv[-1] = {('python3 ' + shlex.quote(str(sidecar)) + ' & ')!r} + sys.argv[-1]\n"
                            f"os.execv({tmux!r}, [{tmux!r}, *sys.argv[1:]])\n")
         wrapper.chmod(0o700)
         server = "omar-workspace-" + uuid.uuid4().hex[:12]
@@ -85,6 +94,11 @@ out = Some(cwd.display().to_string());
                 assert (path / "artifact.bin").read_bytes() == b"\0\xff\r\n"
                 assert (path / "seed.txt").read_text() == "original source"
             assert not (source / "artifact.bin").exists()
+            heartbeats = {p: p.read_bytes() for tree in paths.values()
+                          for p in (tree.parent / "temp").glob("sidecar-*")}
+            assert len(heartbeats) == 3, heartbeats
+            time.sleep(0.2)
+            assert all(p.read_bytes() == value for p, value in heartbeats.items()), "sidecar survived teardown"
             spawned = [json.loads(line) for line in launches.read_text().splitlines() if "new-session" in json.loads(line)]
             assert len(spawned) == 3, spawned
             cwd_counts = {}
@@ -114,7 +128,8 @@ out = Some(cwd.display().to_string());
                 snapshots = json.loads(run("workspace", "show", workspace["id"]))["snapshots"]
                 assert [s["label"] for s in snapshots] == ["Initial workspace"], snapshots
                 refused = subprocess.run([str(BIN), "workspace", "snapshot", workspace["id"]],
-                                         cwd=source, env=env, text=True, capture_output=True, timeout=30)
+                                         cwd=source, env=dict(env, OMAR_TMUX_SERVER=server + "-other"),
+                                         text=True, capture_output=True, timeout=30)
                 assert refused.returncode != 0, refused.stdout
                 assert "stop remaining topology sessions" in refused.stderr, refused.stderr
             subprocess.run([tmux, "-L", server, "kill-server"], check=True, capture_output=True)

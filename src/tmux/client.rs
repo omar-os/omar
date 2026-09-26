@@ -76,12 +76,16 @@ thread_local! {
 }
 
 pub fn tmux_command() -> Command {
+    tmux_command_for_server(std::env::var("OMAR_TMUX_SERVER").ok().as_deref())
+}
+
+fn tmux_command_for_server(server: Option<&str>) -> Command {
     #[cfg(test)]
     if let Some(path) = TEST_TMUX.with(|path| path.borrow().clone()) {
         return Command::new(path);
     }
     let mut cmd = Command::new("tmux");
-    if let Ok(server) = std::env::var("OMAR_TMUX_SERVER") {
+    if let Some(server) = server {
         let server = server.trim();
         if !server.is_empty() {
             cmd.args(["-L", server]);
@@ -670,8 +674,20 @@ impl TmuxClient {
     /// around with `remain-on-exit`. `has-session` is still true in that state,
     /// but the session cannot accept input or be attached as a running agent.
     pub fn session_has_live_pane(&self, name: &str) -> Result<bool> {
+        self.session_has_live_pane_on_server(
+            name,
+            std::env::var("OMAR_TMUX_SERVER").ok().as_deref(),
+        )
+    }
+
+    /// Inspect the server recorded at launch, independently of this caller's environment.
+    pub fn session_has_live_pane_on_server(
+        &self,
+        name: &str,
+        server: Option<&str>,
+    ) -> Result<bool> {
         let target = exact_session_target(name);
-        let result = tmux_command()
+        let result = tmux_command_for_server(server)
             .args(["list-panes", "-t", &target, "-F", "#{pane_dead}"])
             .output()
             .context("Failed to execute tmux")?;
