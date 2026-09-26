@@ -2038,11 +2038,12 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         .lock()
         .map(|guard| guard.sessions.clone())
         .unwrap_or_default();
-    for failure in deploy::teardown_sessions(
+    let cleanup_failures = deploy::teardown_sessions(
         &executor.agents.client,
         &sessions,
         &deploy::logs_dir(&runtime_dir),
-    ) {
+    );
+    for failure in &cleanup_failures {
         eprintln!("warning: session not cleaned up: {failure}");
     }
     {
@@ -2070,6 +2071,13 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
     // File versions are independent of runtime checkpoints. Agents have
     // been torn down; keep their final artifacts without reusing the directory.
     for workspace in workspaces.values() {
+        if !cleanup_failures.is_empty() {
+            eprintln!(
+                "warning: skipped final snapshot of {} because agent cleanup failed",
+                workspace.id
+            );
+            continue;
+        }
         if let Err(error) = workspace.snapshot(config.omar_dir, "Final topology files") {
             eprintln!(
                 "warning: could not snapshot workspace {}: {error:#}",

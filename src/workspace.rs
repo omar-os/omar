@@ -586,6 +586,12 @@ fn seed(source: &Path, destination: &Path, root: &Path) -> Result<()> {
                 .collect::<Vec<_>>()
         }
         _ => {
+            anyhow::ensure!(
+                !source
+                    .ancestors()
+                    .any(|parent| parent.join(".git").exists()),
+                "could not list Git source files; refusing to copy ignored files as a fallback"
+            );
             let mut paths = Vec::new();
             collect_seed(source, source, &root, &mut paths)?;
             paths
@@ -767,6 +773,10 @@ mod tests {
         assert!(!ws.worktree(&root).join("deleted").exists());
         assert!(!ws.worktree(&root).join("cache").exists());
         assert_eq!(before, git_at(&source, &["status", "--porcelain=v1", "-z"]));
+        let broken = source.parent().unwrap().join("broken-repository");
+        fs::create_dir(&broken).unwrap();
+        fs::write(broken.join(".git"), "invalid gitfile").unwrap();
+        assert!(Workspace::create(&root, 7, "failed", "team", None, &broken).is_err());
     }
 
     #[test]

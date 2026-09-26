@@ -30,6 +30,7 @@ def main():
         wrapper = shims / "tmux"
         wrapper.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
                            f"with open({str(launches)!r}, 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
+                           "if 'kill-session' in sys.argv and os.environ.get('OMAR_TEST_KILL_FAIL'): sys.exit(1)\n"
                            f"os.execv({tmux!r}, [{tmux!r}, *sys.argv[1:]])\n")
         wrapper.chmod(0o700)
         server = "omar-workspace-" + uuid.uuid4().hex[:12]
@@ -102,6 +103,16 @@ out = Some(cwd.display().to_string());
             assert (paths["left"] / "artifact.bin").read_bytes() == b"newer files"
             show = json.loads(run("workspace", "show", selected))
             assert {s["label"] for s in show["snapshots"]} >= {"Initial workspace", "Final topology files", "known files"}
+            # A failed cleanup is not evidence that agents stopped writing.
+            existing = {w["id"] for w in json.loads(run("workspace", "list"))}
+            env["OMAR_TEST_KILL_FAIL"] = "1"
+            run("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
+                "--input", "right.tick=1", "--fast")
+            later = [w for w in json.loads(run("workspace", "list")) if w["id"] not in existing]
+            assert len(later) == 3
+            for workspace in later:
+                snapshots = json.loads(run("workspace", "show", workspace["id"]))["snapshots"]
+                assert [s["label"] for s in snapshots] == ["Initial workspace"], snapshots
             print("PASS: team workspaces, nested ownership, agent launch, Rust cwd/env, snapshots, and CLI restore")
         finally:
             subprocess.run([tmux, "-L", server, "kill-server"], capture_output=True)
