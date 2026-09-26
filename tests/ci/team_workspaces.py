@@ -141,12 +141,50 @@ out = Some(cwd.display().to_string());
                                          text=True, capture_output=True, timeout=30)
                 assert refused.returncode != 0, refused.stdout
                 assert "stop remaining topology sessions" in refused.stderr, refused.stderr
+            # Force cleanup must target the launch server, never the caller's server.
+            env.pop("OMAR_TEST_KILL_FAIL")
+            records = list(root_state.glob("**/topologies/Workspaces/deployment.json"))
+            assert len(records) == 1, records
+            record = json.loads(records[0].read_text())
+            other_server = server + "-other"
+            for session in record["sessions"].values():
+                subprocess.run([tmux, "-L", other_server, "new-session", "-d", "-s", session,
+                                "sleep 300"], check=True, capture_output=True)
+            cleanup = subprocess.run([str(BIN), "kill", "Workspaces"], cwd=source,
+                                     env=dict(env, OMAR_TMUX_SERVER=other_server),
+                                     text=True, capture_output=True, timeout=30)
+            assert cleanup.returncode == 0, cleanup.stderr
+            for session in record["sessions"].values():
+                assert subprocess.run([tmux, "-L", server, "has-session", "-t", session],
+                                      capture_output=True).returncode != 0
+                assert subprocess.run([tmux, "-L", other_server, "has-session", "-t", session],
+                                      capture_output=True).returncode == 0, "killed caller's session"
+            run("workspace", "snapshot", later[0]["id"], "--label", "after recorded-server cleanup")
+            subprocess.run([tmux, "-L", other_server, "kill-server"], check=True, capture_output=True)
+
+            # A subsequent deployment must not hide older workspaces' live writers.
+            env["OMAR_TEST_KILL_FAIL"] = "1"
+            run("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
+                "--input", "right.tick=1", "--fast")
+            old = json.loads(records[0].read_text())
+            old_workspace = old["workspaces"]["left"]
+            env.pop("OMAR_TEST_KILL_FAIL")
+            env["OMAR_TMUX_SERVER"] = other_server
+            run("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
+                "--input", "right.tick=1", "--fast")
+            archived = records[0].parent / "deployments" / (old["deployment_id"] + ".json")
+            assert json.loads(archived.read_text())["tmux_server"] == server
+            refused = subprocess.run([str(BIN), "workspace", "snapshot", old_workspace],
+                                     cwd=source, env=env, text=True, capture_output=True, timeout=30)
+            assert refused.returncode != 0 and "stop remaining topology sessions" in refused.stderr, refused
             subprocess.run([tmux, "-L", server, "kill-server"], check=True, capture_output=True)
+            run("workspace", "snapshot", old_workspace, "--label", "archived run cleaned up")
             # Once cleanup is confirmed, the same terminal deployment permits snapshots.
             run("workspace", "snapshot", later[0]["id"], "--label", "after cleanup")
             print("PASS: team workspaces, nested ownership, agent launch, Rust cwd/env, snapshots, and CLI restore")
         finally:
             subprocess.run([tmux, "-L", server, "kill-server"], capture_output=True)
+            subprocess.run([tmux, "-L", server + "-other", "kill-server"], capture_output=True)
 
 
 if __name__ == "__main__":

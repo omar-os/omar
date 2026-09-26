@@ -35,6 +35,10 @@ OMAR uses its own temporary index and immutable snapshot refs.
 An initial file version is recorded at deployment, and a final version after a
 successful completion or graceful stop. Workspaces survive termination and
 redeployment. Deployment records retain the instance-to-workspace mapping.
+Before a new run replaces `deployment.json`, the previous record is archived in
+`topologies/<team>/deployments/<deployment-id>.json`. Snapshot guards consult
+both current and historical records. Force cleanup uses the recorded tmux server,
+even when the caller selects a different server.
 
 ```sh
 omar workspace list
