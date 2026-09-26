@@ -2115,7 +2115,7 @@ fn spawn_topology_agents(
     // The line each agent was launched with, which is what says how it
     // proves readiness.
     let mut launched: BTreeMap<String, String> = BTreeMap::new();
-    let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, use only omar_set_port to set allowed effects and omar_complete to finish. Port writes are buffered and repeated writes use last-writer-wins semantics.";
+    let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
     for (name, agent) in &state.agents {
         // A web agent is not spawned. There is no command to resolve, no pane
         // to put it in, and no readiness to wait for — the agent exists as a

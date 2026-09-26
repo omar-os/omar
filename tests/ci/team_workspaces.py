@@ -108,6 +108,15 @@ out = Some(cwd.display().to_string());
                 assert f"OMAR_WORKTREE={cwd}" in args
                 assert f"OMAR_TEMP={Path(cwd).parent / 'temp'}" in args
             assert cwd_counts == {str(paths["left"]): 2, str(paths["right"]): 1}, cwd_counts
+            prompts = list(root_state.glob("**/agents/*/system.md"))
+            assert len(prompts) == 3, prompts
+            for prompt in prompts:
+                text = prompt.read_text()
+                assert "inspect, create, and edit files and run commands" in text, text
+                assert "For topology communication, use omar_set_port only" in text, text
+                assert "then call omar_complete to finish" in text, text
+                assert "use only omar_set_port" not in text, text
+                assert any(f"workspace is {path}." in text for path in paths.values()), text
             selected = by_instance["left"]["id"]
             snapshot = json.loads(run("workspace", "snapshot", selected, "--label", "known files"))
             (paths["left"] / "artifact.bin").write_bytes(b"newer files")
