@@ -38,7 +38,7 @@ struct Gateway {
 impl Editors {
     pub fn open(&mut self, root: &Path, workspace: &Workspace) -> Result<String> {
         if let Some(editor) = self.sessions.get_mut(&workspace.id) {
-            if editor.child.try_wait()?.is_none() {
+            if crate::process::child_exited(&editor.child)?.is_none() {
                 *editor
                     .gateway
                     .last_used
@@ -125,7 +125,7 @@ impl Editor {
             .stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log)
             .process_group(0).spawn()
             .context("Could not start code-server. Install code-server from https://coder.com/docs/code-server/install, then try again (or set OMAR_CODE_SERVER_BIN).")?;
-        let mut editor = Self {
+        let editor = Self {
             child,
             gateway: gateway.clone(),
             directory: directory.to_path_buf(),
@@ -133,7 +133,7 @@ impl Editor {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             anyhow::ensure!(
-                editor.child.try_wait()?.is_none(),
+                crate::process::child_exited(&editor.child)?.is_none(),
                 "code-server exited; see {}",
                 data.join("code-server.log").display()
             );
@@ -171,11 +171,13 @@ impl Drop for Editor {
         self.gateway.stopping.store(true, Ordering::SeqCst);
         // All editor children share the process group. Keep the child unreaped
         // until after signaling so its group ID cannot be recycled.
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", self.child.id())])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        if crate::process::child_exited(&self.child).is_ok() {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", self.child.id())])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_dir_all(&self.directory);
@@ -318,6 +320,45 @@ fn pump(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exited_editor_leader_stays_unreaped_until_descendants_are_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("editor");
+        fs::create_dir(&directory).unwrap();
+        let heartbeat = root.path().join("heartbeat");
+        let child = Command::new("sh").args(["-c", "sh -c 'trap \"\" TERM HUP; while :; do echo tick >> \"$HEARTBEAT\"; sleep 0.02; done' >/dev/null 2>&1 & while [ ! -s \"$HEARTBEAT\" ]; do sleep 0.01; done"])
+            .env("HEARTBEAT", &heartbeat).process_group(0).spawn().unwrap();
+        let editor = Editor {
+            child,
+            directory,
+            gateway: Arc::new(Gateway {
+                address: "127.0.0.1:1".parse().unwrap(),
+                socket: root.path().join("unused.sock"),
+                ticket: "secret".into(),
+                cookie: "test".into(),
+                stopping: AtomicBool::new(false),
+                connections: AtomicUsize::new(0),
+                last_used: Mutex::new(Instant::now()),
+            }),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::process::child_exited(&editor.child)
+            .unwrap()
+            .is_none()
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            crate::process::child_exited(&editor.child).unwrap(),
+            Some(true)
+        );
+        drop(editor);
+        let before = fs::read(&heartbeat).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(before, fs::read(heartbeat).unwrap());
+    }
+
     #[test]
     fn editor_gateway_relays_large_assets_without_truncation() {
         use std::os::unix::net::UnixListener;

@@ -30,19 +30,42 @@ fn relative(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn live_directory(ws: &Workspace, root: &Path, path: &str) -> Result<cap_std::fs::Dir> {
-    relative(path)?;
-    let dir = cap_std::fs::Dir::open_ambient_dir(ws.worktree(root), cap_std::ambient_authority())?;
-    let mut partial = std::path::PathBuf::new();
-    for part in Path::new(path).components() {
-        partial.push(part);
-        anyhow::ensure!(
-            !dir.symlink_metadata(&partial)?.file_type().is_symlink(),
-            "symlinks cannot be previewed"
-        );
+// Single-component openat calls retain each parent handle and atomically refuse
+// symlinks. NONBLOCK prevents a concurrently substituted FIFO from hanging a read.
+fn open_child(
+    dir: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    directory: bool,
+) -> Result<std::fs::File> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    };
+    let name = std::ffi::CString::new(name.as_bytes())?;
+    let flags = libc::O_RDONLY
+        | libc::O_CLOEXEC
+        | libc::O_NOFOLLOW
+        | libc::O_NONBLOCK
+        | if directory { libc::O_DIRECTORY } else { 0 };
+    // The path is a validated single component; the returned descriptor is owned.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
-    // Capability-relative opens also prevent a concurrent symlink replacement
-    // from redirecting the subsequent read outside this worktree.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+fn live_directory(ws: &Workspace, root: &Path, path: &str) -> Result<cap_std::fs::Dir> {
+    use std::os::unix::fs::OpenOptionsExt;
+    relative(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(ws.worktree(root))?;
+    let mut dir = cap_std::fs::Dir::from_std_file(file);
+    for part in Path::new(path).components() {
+        dir = cap_std::fs::Dir::from_std_file(open_child(&dir, part.as_os_str(), true)?);
+    }
     Ok(dir)
 }
 
@@ -97,16 +120,12 @@ pub fn browse(ws: &Workspace, root: &Path, selection: &Selection) -> Result<Valu
         }
     } else {
         let dir = live_directory(ws, root, &selection.path)?;
-        for entry in dir.read_dir(if selection.path.is_empty() {
-            "."
-        } else {
-            &selection.path
-        })? {
+        for entry in dir.entries()? {
             let entry = entry?;
             if entry.file_name() == ".git" {
                 continue;
             }
-            let meta = dir.symlink_metadata(Path::new(&selection.path).join(entry.file_name()))?;
+            let meta = dir.symlink_metadata(entry.file_name())?;
             entries.push(json!({"name": entry.file_name().to_string_lossy(), "kind": if meta.file_type().is_symlink() {"symlink"} else if meta.is_dir() {"directory"} else if meta.is_file() {"file"} else {"special"}, "size": meta.len()}));
             if entries.len() > MAX_ENTRIES {
                 break;
@@ -162,16 +181,21 @@ pub fn preview(ws: &Workspace, root: &Path, selection: &Selection) -> Result<Val
         anyhow::ensure!(result.status.success(), "cannot read snapshot blob");
         result.stdout
     } else {
-        let dir = live_directory(ws, root, &selection.path)?;
-        let metadata = dir.symlink_metadata(&selection.path)?;
+        let path = Path::new(&selection.path);
+        let parent = path
+            .parent()
+            .context("file has no parent")?
+            .to_str()
+            .context("invalid path")?;
+        let dir = live_directory(ws, root, parent)?;
+        let file = open_child(&dir, path.file_name().context("select a file")?, false)?;
+        let metadata = file.metadata()?;
         anyhow::ensure!(metadata.is_file(), "select a regular file");
         if metadata.len() > PREVIEW_BYTES {
             return Ok(json!({"kind":"large", "size":metadata.len()}));
         }
         let mut bytes = Vec::new();
-        dir.open(&selection.path)?
-            .take(PREVIEW_BYTES + 1)
-            .read_to_end(&mut bytes)?;
+        file.take(PREVIEW_BYTES + 1).read_to_end(&mut bytes)?;
         bytes
     };
     if bytes.len() as u64 > PREVIEW_BYTES {
@@ -238,6 +262,33 @@ mod tests {
             browse(&ws, &root, &selection).unwrap()["entries"][0]["name"],
             "report.txt"
         );
+        // Retained parent handles survive path replacement without following the new link.
+        let held = live_directory(&ws, &root, "nested").unwrap();
+        fs::rename(
+            ws.worktree(&root).join("nested"),
+            ws.worktree(&root).join("saved"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(source.join("nested"), ws.worktree(&root).join("nested"))
+            .unwrap();
+        let mut text = String::new();
+        open_child(&held, std::ffi::OsStr::new("report.txt"), false)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "after");
+        selection.snapshot = None;
+        assert!(browse(&ws, &root, &selection).is_err());
+        selection.path = "nested/report.txt".into();
+        assert!(preview(&ws, &root, &selection).is_err());
+        let fifo = ws.worktree(&root).join("fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        selection.path = "fifo".into();
+        assert!(preview(&ws, &root, &selection).is_err());
         selection.path = "".into();
         selection.snapshot = None;
         assert!(!browse(&ws, &root, &selection).unwrap()["entries"]
