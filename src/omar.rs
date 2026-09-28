@@ -1037,17 +1037,27 @@ fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> R
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    for failure in deploy::teardown_sessions(&client, &record.sessions, &deploy::logs_dir(&dir)) {
+    let failures = if record.sessions_cleaned {
+        Vec::new()
+    } else {
+        deploy::teardown_sessions(&client, &record.sessions, &deploy::logs_dir(&dir))
+    };
+    for failure in &failures {
         eprintln!("warning: session not cleaned up: {failure}");
     }
+    record.sessions_cleaned = failures.is_empty();
     deploy::clear_stop(&dir)?;
     if record.is_active() {
         record.advance(
             deploy::DeploymentState::Cancelled,
             Some("killed by operator"),
         )?;
-        record.save(&dir)?;
     }
+    record.save(&dir)?;
+    anyhow::ensure!(
+        failures.is_empty(),
+        "deployment cleanup remains unconfirmed"
+    );
     println!("Deployment '{}' is {}", team, record.state);
     Ok(())
 }

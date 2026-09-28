@@ -311,14 +311,18 @@ impl Workspace {
                 }
                 anyhow::ensure!(!record.is_active(),
                     "stop the topology before taking a file snapshot; a dead runner does not confirm cleanup");
-                let client = crate::tmux::TmuxClient::new("");
-                for session in record.sessions.values() {
-                    anyhow::ensure!(
-                        !client
-                            .session_has_live_pane_on_server(session, record.launch_server()?)?,
-                        "stop remaining topology sessions before taking a file snapshot"
-                    );
+                if record.sessions.is_empty() {
+                    continue;
                 }
+                let server = record.launch_server()?;
+                if record.sessions_cleaned {
+                    continue;
+                }
+                let client = crate::tmux::TmuxClient::on_server("", server.map(str::to_owned));
+                for session in record.sessions.values() {
+                    client.has_session_for_cleanup(session)?;
+                }
+                anyhow::bail!("stop remaining topology sessions before taking a file snapshot; cleanup is unconfirmed");
             }
         }
         Ok(())

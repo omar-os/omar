@@ -677,6 +677,14 @@ impl TmuxClient {
 
     /// Check if a session exists
     pub fn has_session(&self, name: &str) -> Result<bool> {
+        self.check_session(name, false)
+    }
+
+    pub fn has_session_for_cleanup(&self, name: &str) -> Result<bool> {
+        self.check_session(name, true)
+    }
+
+    fn check_session(&self, name: &str, require_server: bool) -> Result<bool> {
         let target = exact_session_target(name);
         let result = self
             .command()
@@ -684,7 +692,21 @@ impl TmuxClient {
             .output()
             .context("Failed to execute tmux")?;
 
-        Ok(result.status.success())
+        if result.status.success() {
+            return Ok(true);
+        }
+        let error = String::from_utf8_lossy(&result.stderr);
+        if error.contains("can't find session")
+            || (!require_server
+                && (error.contains("no server running")
+                    || error.contains("no sessions")
+                    || (error.contains("error connecting to")
+                        && (error.contains("No such file or directory")
+                            || error.contains("Connection refused")))))
+        {
+            return Ok(false);
+        }
+        anyhow::bail!("tmux session state is unknown: {}", error.trim())
     }
 
     /// Return true when a tmux session exists and has at least one live pane.
@@ -788,6 +810,54 @@ impl TmuxClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_requires_reachable_server_and_propagates_unexpected_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("tmux");
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_TMUX.with(|p| *p.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        TEST_TMUX.with(|p| *p.borrow_mut() = Some(script.clone()));
+        let client = TmuxClient::new("");
+        for (message, ordinary_missing, cleanup_missing) in [
+            ("can't find session: example", true, true),
+            ("no server running on /tmp/test", true, false),
+            (
+                "error connecting to /tmp/test (No such file or directory)",
+                true,
+                false,
+            ),
+            (
+                "error connecting to /tmp/test (Permission denied)",
+                false,
+                false,
+            ),
+            ("unexpected failure", false, false),
+        ] {
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\nprintf '%s\\n' \"{message}\" >&2\nexit 1\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                client.has_session("example").is_ok(),
+                ordinary_missing,
+                "{message}"
+            );
+            assert_eq!(
+                client.has_session_for_cleanup("example").is_ok(),
+                cleanup_missing,
+                "{message}"
+            );
+        }
+    }
 
     #[test]
     fn launch_geometry_uses_the_terminal_or_a_bounded_headless_fallback() {

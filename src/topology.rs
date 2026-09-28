@@ -1802,13 +1802,15 @@ fn fail_deployment(
     sessions: &BTreeMap<String, String>,
     error: &anyhow::Error,
 ) {
-    for failure in deploy::teardown_sessions(host, sessions, &deploy::logs_dir(dir)) {
+    let failures = deploy::teardown_sessions(host, sessions, &deploy::logs_dir(dir));
+    for failure in &failures {
         eprintln!("warning: session not cleaned up: {failure}");
     }
     if let Ok(mut guard) = record.lock() {
         let message = format!("{error:#}");
         let _ = guard.advance(DeploymentState::Failed, Some(&message));
         guard.error = Some(message);
+        guard.sessions_cleaned = failures.is_empty();
         let _ = guard.save(dir);
     }
     let _ = deploy::clear_stop(dir);
@@ -1829,11 +1831,14 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
                 existing.pid
             );
         }
-        if config.replace {
+        if config.replace && !existing.sessions.is_empty() {
+            existing.launch_server()?;
+        }
+        if config.replace && !existing.sessions_cleaned {
             let old_client =
                 TmuxClient::on_server("", existing.launch_server()?.map(str::to_owned));
             for session in existing.sessions.values() {
-                if old_client.has_session(session)? {
+                if old_client.has_session_for_cleanup(session)? {
                     old_client.ensure_session_not_attached(session)?;
                 }
             }
@@ -1853,6 +1858,7 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
                     Some("cleaned up before replacement"),
                 )?;
             }
+            existing.sessions_cleaned = true;
             existing.save(&runtime_dir)?;
         } else if existing.is_active() {
             bail!("deployment '{}' has an unconfirmed crashed run; use --replace to clean it up first", state.team);
@@ -2091,6 +2097,7 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         };
         // The record keeps the state a run ended with, the way it keeps
         // the outputs, so a stopped run can be read back.
+        guard.sessions_cleaned = cleanup_failures.is_empty();
         guard.state_vars = state_vars.clone();
         guard.advance(DeploymentState::Terminated, Some(detail))?;
         guard.save(&runtime_dir)?;

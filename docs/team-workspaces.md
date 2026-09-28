@@ -107,3 +107,9 @@ default server: cleanup, replacement, and workspace activity checks fail closed.
 After verifying the original launch server, migrate that record by setting
 `tmux_server` to its name, or explicit JSON `null` for the default server. New
 records always write the field, including `null` for the default.
+
+Deployment records retain `sessions_cleaned` only after confirmed teardown. A
+missing or inaccessible tmux server during cleanup is an error, not evidence that
+its children stopped. Final snapshots are skipped and manual snapshots stay
+blocked when cleanup is uncertain. For an orphaned historical run whose server
+is gone, independently stop its writers before recording cleanup as confirmed.

@@ -36,8 +36,9 @@ def main():
                            "path = Path(os.environ['OMAR_TEMP']) / ('sidecar-' + str(os.getpid()))\n"
                            "while True:\n path.write_text(str(time.monotonic_ns()))\n time.sleep(0.02)\n")
         wrapper = shims / "tmux"
-        wrapper.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+        wrapper.write_text("#!/usr/bin/env python3\nimport json, os, sys, subprocess\n"
                            f"with open({str(launches)!r}, 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
+                           f"if os.environ.get('OMAR_TEST_SERVER_VANISH') and '#{{pane_pid}}' in sys.argv: subprocess.run([{tmux!r}, '-L', os.environ['OMAR_TMUX_SERVER'], 'kill-server'], capture_output=True)\n"
                            "if os.environ.get('OMAR_TEST_KILL_FAIL') and ('kill-session' in sys.argv or '#{pane_pid}' in sys.argv): sys.exit(1)\n"
                            f"if 'new-session' in sys.argv and (not os.environ.get('OMAR_TEST_KILL_FAIL') or os.environ.get('OMAR_TEST_REPLACE_SIDECAR')): sys.argv[-1] = {('python3 ' + shlex.quote(str(sidecar)) + ' & ')!r} + sys.argv[-1]\n"
                            f"os.execv({tmux!r}, [{tmux!r}, *sys.argv[1:]])\n")
@@ -187,7 +188,9 @@ out = Some(cwd.display().to_string());
                                      cwd=source, env=env, text=True, capture_output=True, timeout=30)
             assert refused.returncode != 0 and "stop remaining topology sessions" in refused.stderr, refused
             subprocess.run([tmux, "-L", server, "kill-server"], check=True, capture_output=True)
-            run("workspace", "snapshot", old_workspace, "--label", "archived run cleaned up")
+            refused = subprocess.run([str(BIN), "workspace", "snapshot", old_workspace],
+                                     cwd=source, env=env, text=True, capture_output=True, timeout=30)
+            assert refused.returncode != 0 and "tmux session state is unknown" in refused.stderr, refused
             # Once cleanup is confirmed, the same terminal deployment permits snapshots.
             run("workspace", "snapshot", later[0]["id"], "--label", "after cleanup")
             # Replacing leftover sessions must also terminate their sidecars.
@@ -239,6 +242,18 @@ out = Some(cwd.display().to_string());
                 assert refused.returncode != 0 and "no recorded tmux server" in refused.stderr, refused
                 assert json.loads(records[0].read_text()) == legacy
             records[0].write_text(current)
+            # Losing the server during teardown is not proof that its sidecars stopped.
+            env["OMAR_TEST_SERVER_VANISH"] = "1"
+            run("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
+                "--input", "right.tick=1", "--fast")
+            vanished = json.loads(records[0].read_text())
+            assert not vanished["sessions_cleaned"]
+            for workspace_id in vanished["workspaces"].values():
+                versions = json.loads(run("workspace", "show", workspace_id))["snapshots"]
+                assert [v["label"] for v in versions] == ["Initial workspace"]
+                refused = subprocess.run([str(BIN), "workspace", "snapshot", workspace_id],
+                                         cwd=source, env=env, text=True, capture_output=True, timeout=30)
+                assert refused.returncode != 0 and "tmux session state is unknown" in refused.stderr, refused
             print("PASS: team workspaces, nested ownership, agent launch, Rust cwd/env, snapshots, and CLI restore")
         finally:
             subprocess.run([tmux, "-L", server, "kill-server"], capture_output=True)

@@ -92,6 +92,9 @@ pub struct DeploymentRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub tmux_server: Option<Option<String>>,
+    /// Confirmed teardown, independent of whether tmux still has a server/socket.
+    #[serde(default)]
+    pub sessions_cleaned: bool,
     /// Per-invocation timeout, which bounds a graceful stop.
     pub timeout_seconds: u64,
     pub history: Vec<TransitionEvent>,
@@ -127,6 +130,7 @@ impl DeploymentRecord {
                     .ok()
                     .filter(|s| !s.trim().is_empty()),
             ),
+            sessions_cleaned: false,
             timeout_seconds,
             history: vec![TransitionEvent {
                 state: DeploymentState::Created,
@@ -304,7 +308,7 @@ const CAPTURE_LINES: i32 = 10_000;
 
 impl SessionHost for TmuxClient {
     fn exists(&self, session: &str) -> Result<bool> {
-        self.has_session(session)
+        self.has_session_for_cleanup(session)
     }
 
     fn capture(&self, session: &str) -> Result<String> {
