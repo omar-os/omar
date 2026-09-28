@@ -651,12 +651,15 @@ fn seed(source: &Path, destination: &Path, root: &Path) -> Result<()> {
                 .collect::<Vec<_>>()
         }
         _ => {
-            anyhow::ensure!(
-                !source
-                    .ancestors()
-                    .any(|parent| parent.join(".git").exists()),
-                "could not list Git source files; refusing to copy ignored files as a fallback"
-            );
+            for parent in source.ancestors() {
+                match fs::symlink_metadata(parent.join(".git")) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).context("inspect Git source marker"),
+                    Ok(_) => bail!(
+                        "could not list Git source files; refusing to copy ignored files as a fallback"
+                    ),
+                }
+            }
             let mut paths = Vec::new();
             collect_seed(source, source, &root, &mut paths)?;
             paths
@@ -814,6 +817,18 @@ mod tests {
         assert!(list(&root, 8).unwrap().is_empty());
         assert!(tree.join(".git").is_file());
         assert!(!tree.join("repository.git").exists());
+    }
+
+    #[test]
+    fn invalid_git_marker_never_falls_back_to_copying_ignored_files() {
+        use std::os::unix::fs::symlink;
+        let (_dir, root, source) = setup();
+        fs::write(source.join("secret"), "ignored content").unwrap();
+        symlink(".git", source.join(".git")).unwrap();
+        let destination = root.join("seed-test");
+        fs::create_dir_all(&destination).unwrap();
+        assert!(seed(&source, &destination, &root).is_err());
+        assert!(!destination.join("secret").exists());
     }
 
     #[test]

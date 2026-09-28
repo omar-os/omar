@@ -1793,16 +1793,35 @@ fn advance_record(
     guard.save(dir)
 }
 
+/// Cleanup must use the deployment's launch identity, never ambient tmux
+/// state. Unknown ownership prevents final snapshots.
+fn cleanup_recorded_sessions(
+    record: &Arc<Mutex<deploy::DeploymentRecord>>,
+    sessions: &BTreeMap<String, String>,
+    dir: &Path,
+) -> Vec<String> {
+    if sessions.is_empty() {
+        return Vec::new();
+    }
+    let client = record
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))
+        .and_then(|record| record.session_client());
+    match client {
+        Ok(client) => deploy::teardown_sessions(&client, sessions, &deploy::logs_dir(dir)),
+        Err(error) => vec![format!("{error:#}")],
+    }
+}
+
 /// The failure funnel: keep pane output as logs, kill the sessions, record
 /// FAILED. Best effort; the caller reports the error already on its way out.
 fn fail_deployment(
     record: &Arc<Mutex<deploy::DeploymentRecord>>,
     dir: &Path,
-    host: &dyn deploy::SessionHost,
     sessions: &BTreeMap<String, String>,
     error: &anyhow::Error,
 ) {
-    let failures = deploy::teardown_sessions(host, sessions, &deploy::logs_dir(dir));
+    let failures = cleanup_recorded_sessions(record, sessions, dir);
     for failure in &failures {
         eprintln!("warning: session not cleaned up: {failure}");
     }
@@ -1960,7 +1979,7 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         Ok(prepared) => prepared,
         Err(error) => {
             observer.run_failed(&error.to_string());
-            fail_deployment(&record, &runtime_dir, &client, &spawned, &error);
+            fail_deployment(&record, &runtime_dir, &spawned, &error);
             return Err(error);
         }
     };
@@ -2046,13 +2065,7 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
                 .lock()
                 .map(|guard| guard.sessions.clone())
                 .unwrap_or_default();
-            fail_deployment(
-                &record,
-                &runtime_dir,
-                &executor.agents.client,
-                &sessions,
-                &error,
-            );
+            fail_deployment(&record, &runtime_dir, &sessions, &error);
             return Err(error);
         }
     };
@@ -2069,13 +2082,10 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
     write_json_atomic(&deploy::outputs_path(&runtime_dir), &outputs)?;
     let sessions = record
         .lock()
-        .map(|guard| guard.sessions.clone())
-        .unwrap_or_default();
-    let cleanup_failures = deploy::teardown_sessions(
-        &executor.agents.client,
-        &sessions,
-        &deploy::logs_dir(&runtime_dir),
-    );
+        .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
+        .sessions
+        .clone();
+    let cleanup_failures = cleanup_recorded_sessions(&record, &sessions, &runtime_dir);
     for failure in &cleanup_failures {
         eprintln!("warning: session not cleaned up: {failure}");
     }
@@ -3122,6 +3132,18 @@ fn canonical_backend(backend: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cleanup_refuses_unknown_recorded_tmux_identity() {
+        let mut record = crate::deploy::DeploymentRecord::create("test", Default::default(), 10);
+        record.tmux_server = None;
+        let record = std::sync::Arc::new(std::sync::Mutex::new(record));
+        let sessions = std::collections::BTreeMap::from([("worker".into(), "session".into())]);
+        let directory = tempfile::tempdir().unwrap();
+        let failures = super::cleanup_recorded_sessions(&record, &sessions, directory.path());
+        assert_eq!(failures.len(), 1);
+        assert!(!record.lock().unwrap().sessions_cleaned);
+    }
+
     use super::*;
     use std::sync::Mutex;
 

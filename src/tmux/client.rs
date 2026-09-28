@@ -684,17 +684,15 @@ impl TmuxClient {
     /// Stop the assistant and its sidecars, including background children
     /// which may ignore the terminal hangup sent by `kill-session` alone.
     pub fn kill_session_tree(&self, name: &str) -> Result<()> {
-        if !self.has_session(name)? {
-            return Ok(());
-        }
+        self.has_session_for_cleanup(name)?;
         let tree = crate::process::process_tree(self.get_pane_pid(name)?);
+        // Capture ownership before closing tmux. Always signal the captured
+        // descendants, including when kill-session itself fails.
+        let teardown = self.kill_session(name);
         crate::process::signal_tree(&tree, "-TERM");
-        if self.has_session(name)? {
-            self.kill_session(name)?;
-        }
         thread::sleep(Duration::from_millis(500));
         crate::process::signal_tree(&tree, "-KILL");
-        Ok(())
+        teardown
     }
 
     /// Check if a session exists
@@ -718,13 +716,13 @@ impl TmuxClient {
             return Ok(true);
         }
         let error = String::from_utf8_lossy(&result.stderr);
-        if error.contains("can't find session")
-            || (!require_server
-                && (error.contains("no server running")
-                    || error.contains("no sessions")
-                    || (error.contains("error connecting to")
-                        && (error.contains("No such file or directory")
-                            || error.contains("Connection refused")))))
+        if !require_server
+            && (error.contains("can't find session")
+                || error.contains("no server running")
+                || error.contains("no sessions")
+                || (error.contains("error connecting to")
+                    && (error.contains("No such file or directory")
+                        || error.contains("Connection refused"))))
         {
             return Ok(false);
         }
@@ -834,7 +832,7 @@ mod tests {
         TEST_TMUX.with(|p| *p.borrow_mut() = Some(script.clone()));
         let client = TmuxClient::new("");
         for (message, ordinary_missing, cleanup_missing) in [
-            ("can't find session: example", true, true),
+            ("can't find session: example", true, false),
             ("no server running on /tmp/test", true, false),
             (
                 "error connecting to /tmp/test (No such file or directory)",
