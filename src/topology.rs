@@ -1820,7 +1820,7 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
     fs::create_dir_all(&runtime_dir)?;
     // One live run per team: its sessions are named by team and agent, so a
     // second run would be answered by the first run's panes.
-    if let Some(existing) = deploy::DeploymentRecord::load(&runtime_dir)? {
+    if let Some(mut existing) = deploy::DeploymentRecord::load(&runtime_dir)? {
         if existing.is_active() && existing.pid != std::process::id() && existing.runner_alive() {
             bail!(
                 "deployment '{}' is {} (pid {}); stop it first",
@@ -1828,6 +1828,34 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
                 existing.state,
                 existing.pid
             );
+        }
+        if config.replace {
+            let old_client =
+                TmuxClient::on_server("", existing.launch_server()?.map(str::to_owned));
+            for session in existing.sessions.values() {
+                if old_client.has_session(session)? {
+                    old_client.ensure_session_not_attached(session)?;
+                }
+            }
+            let failures = deploy::teardown_sessions(
+                &old_client,
+                &existing.sessions,
+                &deploy::logs_dir(&runtime_dir),
+            );
+            anyhow::ensure!(
+                failures.is_empty(),
+                "cannot replace deployment until old sessions are cleaned up: {}",
+                failures.join("; ")
+            );
+            if existing.is_active() {
+                existing.advance(
+                    DeploymentState::Cancelled,
+                    Some("cleaned up before replacement"),
+                )?;
+            }
+            existing.save(&runtime_dir)?;
+        } else if existing.is_active() {
+            bail!("deployment '{}' has an unconfirmed crashed run; use --replace to clean it up first", state.team);
         }
     }
     // A stop left over from an earlier run must not end this one.

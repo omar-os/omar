@@ -85,9 +85,13 @@ pub struct DeploymentRecord {
     pub error: Option<String>,
     /// Agent name to tmux session, so teardown needs no re-verify.
     pub sessions: BTreeMap<String, String>,
-    /// Named tmux server used at launch; None means the default server.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tmux_server: Option<String>,
+    /// Missing is unknown (legacy); explicit null is the default server.
+    #[serde(
+        default,
+        deserialize_with = "read_launch_server",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tmux_server: Option<Option<String>>,
     /// Per-invocation timeout, which bounds a graceful stop.
     pub timeout_seconds: u64,
     pub history: Vec<TransitionEvent>,
@@ -98,6 +102,12 @@ pub struct DeploymentRecord {
     /// Instance name to stable workspace id; retained after the run ends.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspaces: BTreeMap<String, String>,
+}
+
+fn read_launch_server<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 impl DeploymentRecord {
@@ -112,9 +122,11 @@ impl DeploymentRecord {
             finished_at: None,
             error: None,
             sessions,
-            tmux_server: std::env::var("OMAR_TMUX_SERVER")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
+            tmux_server: Some(
+                std::env::var("OMAR_TMUX_SERVER")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
+            ),
             timeout_seconds,
             history: vec![TransitionEvent {
                 state: DeploymentState::Created,
@@ -198,6 +210,12 @@ impl DeploymentRecord {
             records.push(current);
         }
         Ok(records)
+    }
+
+    pub fn launch_server(&self) -> Result<Option<&str>> {
+        self.tmux_server.as_ref().map(|server| server.as_deref()).context(
+            "deployment has no recorded tmux server; verify its original server and set tmux_server in its deployment record to that server name (or explicit null for the default server) before cleanup or snapshots"
+        )
     }
 
     pub fn is_active(&self) -> bool {
@@ -379,6 +397,26 @@ mod tests {
         let states: Vec<_> = record.history.iter().map(|event| event.state).collect();
         use DeploymentState::*;
         assert_eq!(states, vec![Created, Deploying, Running, Terminated]);
+    }
+
+    #[test]
+    fn legacy_missing_server_is_not_an_explicit_default() {
+        let record = DeploymentRecord::create("Demo", BTreeMap::new(), 42);
+        let mut json = serde_json::to_value(record).unwrap();
+        json.as_object_mut().unwrap().remove("tmux_server");
+        let legacy: DeploymentRecord = serde_json::from_value(json.clone()).unwrap();
+        assert!(legacy.launch_server().is_err());
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("tmux_server")
+            .is_none());
+        json["tmux_server"] = serde_json::Value::Null;
+        let default: DeploymentRecord = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(default.launch_server().unwrap(), None);
+        assert!(serde_json::to_value(default).unwrap()["tmux_server"].is_null());
+        json["tmux_server"] = serde_json::json!("original-server");
+        let named: DeploymentRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(named.launch_server().unwrap(), Some("original-server"));
     }
 
     #[test]

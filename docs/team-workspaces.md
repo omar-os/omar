@@ -99,3 +99,11 @@ remain before allowing file versions. An outstanding cleanup marker under
 including after a runner crash. Remove such a marker only after independently
 confirming its writers have stopped. Reactions must not detach children into
 other process groups/sessions; host process groups are not container isolation.
+
+`--replace` first cleans the previous deployment on its recorded tmux server,
+then marks a crashed active record cancelled before archiving it. Cleanup failure
+aborts replacement. A missing legacy `tmux_server` field is unknown, not the
+default server: cleanup, replacement, and workspace activity checks fail closed.
+After verifying the original launch server, migrate that record by setting
+`tmux_server` to its name, or explicit JSON `null` for the default server. New
+records always write the field, including `null` for the default.

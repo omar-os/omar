@@ -204,12 +204,41 @@ out = Some(cwd.display().to_string());
             assert all(p.read_bytes() != value for p, value in before.items()), "fixture writers did not start"
             env.pop("OMAR_TEST_KILL_FAIL")
             env.pop("OMAR_TEST_REPLACE_SIDECAR")
+            # Simulate a crashed active run on the old server, then replace from another.
+            replaced["state"] = "RUNNING"
+            replaced["pid"] = 4294967295
+            records[0].write_text(json.dumps(replaced))
+            env["OMAR_TMUX_SERVER"] = server
+            refused = subprocess.run([str(BIN), "run", str(program), "--replace", "--fast"],
+                                     cwd=source, env=dict(env, OMAR_TEST_KILL_FAIL="1"),
+                                     text=True, capture_output=True, timeout=30)
+            assert refused.returncode != 0 and "cannot replace deployment" in refused.stderr, refused
+            assert json.loads(records[0].read_text()) == replaced, "failed cleanup retired the old run"
             run("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
                 "--input", "right.tick=1", "--fast", "--replace")
             after = {p: p.read_bytes() for p in old_heartbeats}
             time.sleep(0.2)
             assert all(p.read_bytes() == value for p, value in after.items()), "replacement left old workspace writers alive"
             run("workspace", "snapshot", replaced["workspaces"]["left"], "--label", "after replacement cleanup")
+            archived = records[0].parent / "deployments" / (replaced["deployment_id"] + ".json")
+            assert json.loads(archived.read_text())["state"] == "CANCELLED"
+            for session in replaced["sessions"].values():
+                assert subprocess.run([tmux, "-L", other_server, "has-session", "-t", session],
+                                      capture_output=True).returncode != 0
+
+            # Missing legacy identity must not become an explicit default server.
+            current = records[0].read_text()
+            legacy = json.loads(current)
+            del legacy["tmux_server"]
+            records[0].write_text(json.dumps(legacy))
+            for args in [("kill", "Workspaces"),
+                         ("workspace", "snapshot", legacy["workspaces"]["left"]),
+                         ("run", str(program), "--replace", "--fast")]:
+                refused = subprocess.run([str(BIN), *args], cwd=source, env=env,
+                                         text=True, capture_output=True, timeout=30)
+                assert refused.returncode != 0 and "no recorded tmux server" in refused.stderr, refused
+                assert json.loads(records[0].read_text()) == legacy
+            records[0].write_text(current)
             print("PASS: team workspaces, nested ownership, agent launch, Rust cwd/env, snapshots, and CLI restore")
         finally:
             subprocess.run([tmux, "-L", server, "kill-server"], capture_output=True)

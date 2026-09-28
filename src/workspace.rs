@@ -314,10 +314,8 @@ impl Workspace {
                 let client = crate::tmux::TmuxClient::new("");
                 for session in record.sessions.values() {
                     anyhow::ensure!(
-                        !client.session_has_live_pane_on_server(
-                            session,
-                            record.tmux_server.as_deref()
-                        )?,
+                        !client
+                            .session_has_live_pane_on_server(session, record.launch_server()?)?,
                         "stop remaining topology sessions before taking a file snapshot"
                     );
                 }

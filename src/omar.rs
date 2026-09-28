@@ -1029,6 +1029,7 @@ fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> R
     let dir = deployment_dir(omar_dir, ea_id, team)?;
     let mut record = deploy::DeploymentRecord::load(&dir)?
         .ok_or_else(|| anyhow::anyhow!("no deployment '{}'", team))?;
+    let client = TmuxClient::on_server("", record.launch_server()?.map(str::to_owned));
     if record.pid != std::process::id() && record.runner_alive() {
         deploy::kill_process(record.pid);
         let waited = std::time::Instant::now();
@@ -1036,7 +1037,6 @@ fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> R
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    let client = TmuxClient::on_server("", record.tmux_server.clone());
     for failure in deploy::teardown_sessions(&client, &record.sessions, &deploy::logs_dir(&dir)) {
         eprintln!("warning: session not cleaned up: {failure}");
     }
