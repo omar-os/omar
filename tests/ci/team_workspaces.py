@@ -242,6 +242,45 @@ out = Some(cwd.display().to_string());
                 assert refused.returncode != 0 and "no recorded tmux server" in refused.stderr, refused
                 assert json.loads(records[0].read_text()) == legacy
             records[0].write_text(current)
+            # Inherited TMUX must be recorded as a socket, not mistaken for default.
+            inherited_server = server + "-inherited"
+            subprocess.run([tmux, "-L", inherited_server, "new-session", "-d", "-s", "keeper", "sleep 300"], check=True)
+            socket = subprocess.check_output([tmux, "-L", inherited_server, "display-message", "-p", "#{socket_path}"], text=True).strip()
+            pid = subprocess.check_output([tmux, "-L", inherited_server, "display-message", "-p", "#{pid}"], text=True).strip()
+            original_env = env.copy()
+            env.pop("OMAR_TMUX_SERVER")
+            env["TMUX"] = f"{socket},{pid},0"
+            env["OMAR_TEST_KILL_FAIL"] = "1"
+            run("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1", "--input", "right.tick=1", "--fast")
+            inherited_record = json.loads(records[0].read_text())
+            assert inherited_record["tmux_socket"] == socket
+            env = original_env.copy()
+            run("kill", "Workspaces")
+            for session in inherited_record["sessions"].values():
+                assert subprocess.run([tmux, "-S", socket, "has-session", "-t", session], capture_output=True).returncode != 0
+            subprocess.run([tmux, "-L", inherited_server, "kill-server"], check=True)
+
+            # Explicit default must ignore a different inherited TMUX when cleaning up.
+            private_tmp = root / "tmux-default"
+            private_tmp.mkdir(mode=0o700)
+            env.pop("OMAR_TMUX_SERVER")
+            env.pop("TMUX", None)
+            env["TMUX_TMPDIR"] = str(private_tmp)
+            env["OMAR_TEST_KILL_FAIL"] = "1"
+            run("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1", "--input", "right.tick=1", "--fast")
+            default_record = json.loads(records[0].read_text())
+            assert default_record["tmux_server"] is None and "tmux_socket" not in default_record
+            subprocess.run([tmux, "-L", "caller", "new-session", "-d", "-s", "keeper", "sleep 300"], env=env, check=True)
+            caller_socket = subprocess.check_output([tmux, "-L", "caller", "display-message", "-p", "#{socket_path}"], env=env, text=True).strip()
+            caller_pid = subprocess.check_output([tmux, "-L", "caller", "display-message", "-p", "#{pid}"], env=env, text=True).strip()
+            env.pop("OMAR_TEST_KILL_FAIL")
+            env["TMUX"] = f"{caller_socket},{caller_pid},0"
+            run("kill", "Workspaces")
+            for session in default_record["sessions"].values():
+                assert subprocess.run([tmux, "-L", "default", "has-session", "-t", session], env=env, capture_output=True).returncode != 0
+            assert subprocess.run([tmux, "-L", "caller", "has-session", "-t", "keeper"], env=env, capture_output=True).returncode == 0
+            subprocess.run([tmux, "-L", "caller", "kill-server"], env=env, check=True)
+            env = original_env
             # Losing the server during teardown is not proof that its sidecars stopped.
             env["OMAR_TEST_SERVER_VANISH"] = "1"
             run("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
@@ -258,6 +297,9 @@ out = Some(cwd.display().to_string());
         finally:
             subprocess.run([tmux, "-L", server, "kill-server"], capture_output=True)
             subprocess.run([tmux, "-L", server + "-other", "kill-server"], capture_output=True)
+            subprocess.run([tmux, "-L", server + "-inherited", "kill-server"], capture_output=True)
+            for socket in (root / "tmux-default").glob("tmux-*/*"):
+                subprocess.run([tmux, "-S", str(socket), "kill-server"], capture_output=True)
 
 
 if __name__ == "__main__":

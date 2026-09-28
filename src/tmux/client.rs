@@ -58,6 +58,7 @@ const SESSION_DELIVERY_VAR: &str = "OMAR_DELIVERY";
 pub struct TmuxClient {
     prefix: String,
     server: Option<Option<String>>,
+    socket: Option<String>,
 }
 
 /// An agent name as tmux will store it.
@@ -77,7 +78,12 @@ thread_local! {
 }
 
 pub fn tmux_command() -> Command {
-    tmux_command_for_server(std::env::var("OMAR_TMUX_SERVER").ok().as_deref())
+    let mut command = tmux_command_for_server(std::env::var("OMAR_TMUX_SERVER").ok().as_deref());
+    // Ordinary interactive operations retain the caller's tmux context.
+    if let Some(tmux) = std::env::var_os("TMUX") {
+        command.env("TMUX", tmux);
+    }
+    command
 }
 
 fn tmux_command_for_server(server: Option<&str>) -> Command {
@@ -86,6 +92,7 @@ fn tmux_command_for_server(server: Option<&str>) -> Command {
         return Command::new(path);
     }
     let mut cmd = Command::new("tmux");
+    cmd.env_remove("TMUX");
     if let Some(server) = server {
         let server = server.trim();
         if !server.is_empty() {
@@ -138,6 +145,7 @@ impl TmuxClient {
         Self {
             prefix: prefix.into(),
             server: None,
+            socket: None,
         }
     }
 
@@ -146,10 +154,24 @@ impl TmuxClient {
         Self {
             prefix: prefix.into(),
             server: Some(server),
+            socket: None,
+        }
+    }
+
+    pub fn on_socket(socket: String) -> Self {
+        Self {
+            prefix: String::new(),
+            server: Some(None),
+            socket: Some(socket),
         }
     }
 
     fn command(&self) -> Command {
+        if let Some(socket) = &self.socket {
+            let mut command = tmux_command_for_server(None);
+            command.args(["-S", socket]);
+            return command;
+        }
         match &self.server {
             Some(server) => tmux_command_for_server(server.as_deref()),
             None => tmux_command(),
@@ -715,23 +737,9 @@ impl TmuxClient {
     /// around with `remain-on-exit`. `has-session` is still true in that state,
     /// but the session cannot accept input or be attached as a running agent.
     pub fn session_has_live_pane(&self, name: &str) -> Result<bool> {
-        self.session_has_live_pane_on_server(
-            name,
-            self.server
-                .clone()
-                .unwrap_or_else(|| std::env::var("OMAR_TMUX_SERVER").ok())
-                .as_deref(),
-        )
-    }
-
-    /// Inspect the server recorded at launch, independently of this caller's environment.
-    pub fn session_has_live_pane_on_server(
-        &self,
-        name: &str,
-        server: Option<&str>,
-    ) -> Result<bool> {
         let target = exact_session_target(name);
-        let result = tmux_command_for_server(server)
+        let result = self
+            .command()
             .args(["list-panes", "-t", &target, "-F", "#{pane_dead}"])
             .output()
             .context("Failed to execute tmux")?;

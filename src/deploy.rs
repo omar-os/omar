@@ -92,6 +92,9 @@ pub struct DeploymentRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub tmux_server: Option<Option<String>>,
+    /// Inherited TMUX socket when no explicit named server was selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_socket: Option<String>,
     /// Confirmed teardown, independent of whether tmux still has a server/socket.
     #[serde(default)]
     pub sessions_cleaned: bool,
@@ -116,6 +119,20 @@ fn read_launch_server<'de, D: serde::Deserializer<'de>>(
 impl DeploymentRecord {
     pub fn create(team: &str, sessions: BTreeMap<String, String>, timeout_seconds: u64) -> Self {
         let now = now_unix();
+        let named = std::env::var("OMAR_TMUX_SERVER")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let inherited = if named.is_none() {
+            std::env::var("TMUX").ok().filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        let socket = inherited
+            .as_ref()
+            .and_then(|value| value.rsplitn(3, ',').nth(2))
+            .filter(|path| Path::new(path).is_absolute())
+            .map(str::to_owned);
+        let identity_known = inherited.is_none() || socket.is_some();
         Self {
             deployment_id: uuid::Uuid::new_v4().to_string(),
             team: team.to_string(),
@@ -125,11 +142,8 @@ impl DeploymentRecord {
             finished_at: None,
             error: None,
             sessions,
-            tmux_server: Some(
-                std::env::var("OMAR_TMUX_SERVER")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty()),
-            ),
+            tmux_server: identity_known.then_some(named),
+            tmux_socket: socket,
             sessions_cleaned: false,
             timeout_seconds,
             history: vec![TransitionEvent {
@@ -214,6 +228,18 @@ impl DeploymentRecord {
             records.push(current);
         }
         Ok(records)
+    }
+
+    pub fn session_client(&self) -> Result<TmuxClient> {
+        let server = self.launch_server()?;
+        if let Some(socket) = &self.tmux_socket {
+            anyhow::ensure!(
+                Path::new(socket).is_absolute(),
+                "invalid recorded tmux socket"
+            );
+            return Ok(TmuxClient::on_socket(socket.clone()));
+        }
+        Ok(TmuxClient::on_server("", server.map(str::to_owned)))
     }
 
     pub fn launch_server(&self) -> Result<Option<&str>> {

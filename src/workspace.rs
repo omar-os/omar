@@ -314,11 +314,10 @@ impl Workspace {
                 if record.sessions.is_empty() {
                     continue;
                 }
-                let server = record.launch_server()?;
+                let client = record.session_client()?;
                 if record.sessions_cleaned {
                     continue;
                 }
-                let client = crate::tmux::TmuxClient::on_server("", server.map(str::to_owned));
                 for session in record.sessions.values() {
                     client.has_session_for_cleanup(session)?;
                 }

@@ -1832,11 +1832,10 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             );
         }
         if config.replace && !existing.sessions.is_empty() {
-            existing.launch_server()?;
+            existing.session_client()?;
         }
         if config.replace && !existing.sessions_cleaned {
-            let old_client =
-                TmuxClient::on_server("", existing.launch_server()?.map(str::to_owned));
+            let old_client = existing.session_client()?;
             for session in existing.sessions.values() {
                 if old_client.has_session_for_cleanup(session)? {
                     old_client.ensure_session_not_attached(session)?;

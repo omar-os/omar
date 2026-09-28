@@ -113,3 +113,8 @@ missing or inaccessible tmux server during cleanup is an error, not evidence tha
 its children stopped. Final snapshots are skipped and manual snapshots stay
 blocked when cleanup is uncertain. For an orphaned historical run whose server
 is gone, independently stop its writers before recording cleanup as confirmed.
+
+When launched inside tmux without `OMAR_TMUX_SERVER`, the inherited socket path
+is recorded in `tmux_socket`. Cleanup uses that socket explicitly. Explicit
+default-server cleanup clears inherited `TMUX`, so entering another tmux session
+cannot redirect it.
