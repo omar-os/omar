@@ -2,6 +2,7 @@
 name = "omar-slack-bridge"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Slack bridge for OMAR — connects Slack channels to OMAR agents via Socket Mode"
 
 [[bin]]

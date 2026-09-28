@@ -2,10 +2,14 @@
 members = [".", "bridges/slack", "bridges/computer"]
 default-members = [".", "bridges/slack", "bridges/computer"]
 
+[workspace.package]
+rust-version = "1.89"
+
 [package]
 name = "omar"
 version = "0.4.2"
 edition = "2021"
+rust-version.workspace = true
 description = "Agent dashboard for tmux"
 license = "MIT"
 default-run = "omar"

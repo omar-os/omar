@@ -11,6 +11,16 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  msrv:
+    name: Minimum Rust 1.89
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - name: Check minimum supported Rust
+        run: cargo check --workspace --all-targets --locked
+
   check:
     name: Check
     runs-on: ubuntu-latest
@@ -755,14 +765,15 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [pi-bridge, check, fmt, clippy, test, codex-shared-history, backend-supervision-contracts, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
+    needs: [msrv, pi-bridge, check, fmt, clippy, test, codex-shared-history, backend-supervision-contracts, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: always()
     steps:
       - name: Check all jobs passed
         run: |
-          if [[ "${{ needs.pi-bridge.result }}" != "success" ]] || \
+          if [[ "${{ needs.msrv.result }}" != "success" ]] || \
+             [[ "${{ needs.pi-bridge.result }}" != "success" ]] || \
              [[ "${{ needs.check.result }}" != "success" ]] || \
              [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \

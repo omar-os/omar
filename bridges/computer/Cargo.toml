@@ -2,6 +2,7 @@
 name = "omar-computer-bridge"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Computer-use HTTP bridge for OMAR — exposes mouse, keyboard, and screenshot control via REST"
 
 [[bin]]
