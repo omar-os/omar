@@ -158,6 +158,7 @@ impl ReactionProcess {
         if self.cleaned {
             return Ok(());
         }
+        crate::process::child_exited(&self.child).context("verify reaction child ownership")?;
         let group = self.child.id();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -168,7 +169,6 @@ impl ReactionProcess {
                 .stderr(Stdio::null())
                 .status()
                 .context("signal reaction process group")?;
-            self.child.try_wait().context("reap reaction process")?;
             let output = Command::new("ps")
                 .args(["-axo", "pgid=,stat="])
                 .output()
@@ -848,7 +848,7 @@ impl Reactions {
             // close what it writes to and keep running. The deadline covers this
             // wait too, or `within` would be a promise the body could opt out of.
             let status = loop {
-                match child.try_wait()? {
+                match crate::process::child_exited(child)? {
                     Some(status) => break status,
                     None if started.elapsed() >= deadline => {
                         said();
@@ -859,7 +859,7 @@ impl Reactions {
             };
             // Diagnostics are bounded; process-group cleanup below closes inherited streams.
             let errors = said();
-            if !status.success() {
+            if !status {
                 bail!("reaction '{reaction_id}' failed: {}", errors.trim());
             }
 

@@ -26,6 +26,35 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// Observe exit without reaping: retaining the child PID prevents its process
+/// group ID from being recycled before descendant cleanup has finished.
+pub(crate) fn child_exited(child: &std::process::Child) -> anyhow::Result<Option<bool>> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0,
+    ))
+}
+
 pub(crate) fn pid_file_is_stale(path: &Path) -> bool {
     fs::read_to_string(path)
         .ok()
@@ -107,6 +136,22 @@ mod tests {
     use super::pid_file_is_stale;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn exit_observation_keeps_child_waitable_until_cleanup() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while super::child_exited(&child).unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(super::child_exited(&child).unwrap(), Some(false));
+        assert_eq!(super::child_exited(&child).unwrap(), Some(false));
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+    }
 
     #[test]
     fn pid_file_with_invalid_content_is_treated_as_stale() {

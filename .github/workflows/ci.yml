@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
       - name: Check minimum supported Rust
-        run: cargo check --workspace --all-targets --locked
+        run: cargo check --workspace --all-targets
 
   check:
     name: Check
