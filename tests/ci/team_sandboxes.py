@@ -124,6 +124,10 @@ else: sys.exit(2)
                 assert len(list((history/"workspace-history"/ws/"snapshots").glob("*.json"))) == 1
                 refused = run("workspace", "snapshot", ws)
                 assert refused.returncode != 0 and "sandbox cleanup is unconfirmed" in refused.stderr, refused
+            # Unique VM names must not let a new run overwrite unclean ownership.
+            refused = run(*args)
+            assert refused.returncode != 0 and "unconfirmed sandbox cleanup" in refused.stderr, refused
+            assert json.loads(records_found[0].read_text()) == record
             assert run("kill", "SandboxTeams").returncode == 0
             # Partial creation failures stop every persisted VM, including the
             # VM whose create returned an error after allocating resources.

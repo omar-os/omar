@@ -2013,6 +2013,11 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
                 existing.pid
             );
         }
+        anyhow::ensure!(
+            config.replace || existing.sandboxes.is_empty() || existing.sessions_cleaned,
+            "deployment '{}' has unconfirmed sandbox cleanup; use --replace to clean it up first",
+            state.team
+        );
         if config.replace && !existing.sessions.is_empty() {
             existing.session_client()?;
         }
