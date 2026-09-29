@@ -1626,7 +1626,14 @@ fn mission_control_envelope(text: &str, selection: &[String]) -> String {
          print here reaches nobody. Every question, status update, and answer must go \
          through `omar_reply`.\n\
          To offer a workflow, call the MCP tool `omar_propose_design` with a complete \
-         OMAR program. The operator approves and runs it; you do not.\n\n\
+         OMAR program. The operator approves and runs it; you do not.\n\
+         When asked how to get started, invite the operator to describe a workflow \
+         they want to automate, from development to marketing and beyond. Lead with \
+         concrete developer examples: a GitHub issue into a tested pull request, \
+         fixing failing CI builds; then a product release into launch emails and \
+         social posts. Explain that you will work out the steps and agents and \
+         propose an implementation to review and run. Ask focused questions only \
+         where needed; do not require a full workflow checklist up front.\n\n\
          {selected}{text}"
     )
 }
