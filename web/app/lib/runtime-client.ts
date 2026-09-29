@@ -251,6 +251,21 @@ export async function startRun(
   return assertRunRecord(await response.json());
 }
 
+/** Read the immutable output captured for one finished run. */
+export async function fetchRunResult(
+  serveUrl: string,
+  runId: string,
+): Promise<Record<string, unknown>> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/result`);
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { outputs?: unknown };
+  if (!body.outputs || typeof body.outputs !== "object" || Array.isArray(body.outputs)) {
+    throw new Error("Runtime returned an invalid result.");
+  }
+  return body.outputs as Record<string, unknown>;
+}
+
 /**
  * What the run's web agents are waiting on.
  *
@@ -400,6 +415,22 @@ export async function selectConversation(serveUrl: string, id?: string): Promise
     method: "POST",
     headers: { "content-type": "application/json" },
     body: "{}",
+  });
+  if (!response.ok) throw new Error(await readError(response));
+  return response.json();
+}
+
+/** Create a named chat containing the operator's request and a checked template proposal. */
+export async function prepareTemplateConversation(serveUrl: string, request: {
+  title: string;
+  description: string;
+  program: string;
+  filename: string;
+}): Promise<ConversationSummary> {
+  const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/chats/templates`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(request),
   });
   if (!response.ok) throw new Error(await readError(response));
   return response.json();

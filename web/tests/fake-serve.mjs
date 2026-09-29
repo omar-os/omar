@@ -76,6 +76,13 @@ export async function startFakeServe({
         runs: [...chat.runs.values()].map((entry) => entry.record),
       });
     }
+    if (request.method === "GET" && url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/result")) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/result".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      if (!["completed", "stopped"].includes(entry.record.status)) return json(response, 409, { error: "run has not finished" });
+      return json(response, 200, { outputs: { "flow.result": "final answer" } });
+    }
     // Before the run-record route, which matches any suffix — the same order
     // the daemon's own arms are in, and for the same reason.
     if (
@@ -214,6 +221,36 @@ export async function startFakeServe({
     if (request.method === "GET" && url.pathname === "/v1/chats") {
       return json(response, 200, { active_id: activeChat.id, conversations: [...chats.values()].map(chatSummary).sort((a, b) => b.updated_at - a.updated_at) });
     }
+    if (request.method === "POST" && url.pathname === "/v1/chats/templates") {
+      let payload;
+      try { payload = JSON.parse(await readBody(request)); }
+      catch { return json(response, 400, { error: "invalid request: not JSON" }); }
+      if (typeof payload.title !== "string" || !payload.title.trim() || payload.title.trim().length > 80) {
+        return json(response, 400, { error: "title must be 1–80 characters" });
+      }
+      if (typeof payload.description !== "string" || Array.from(payload.description.trim()).length < 50) {
+        return json(response, 400, { error: "describe the work in at least 50 characters" });
+      }
+      if (typeof payload.filename !== "string" || !/^[A-Za-z_]\w*\.omar$/.test(payload.filename)) {
+        return json(response, 400, { error: "filename must be a plain .omar name" });
+      }
+      if (typeof payload.program !== "string" || !/^team\s+[A-Za-z_]\w*\[/.test(payload.program) || payload.program.includes(INVALID_MARKER)) {
+        return json(response, 400, { error: "invalid program" });
+      }
+      const title = payload.title.trim().replace(/\s+/g, " ");
+      const team = payload.filename.replace(/\.omar$/, "");
+      const next = newChat();
+      next.title = title;
+      activeChat = next;
+      chats.set(next.id, next);
+      publishChat("operator", payload.description.trim(), null, false, [], next);
+      publishChat("assistant", `Prepared ${title}. Review the workflow before deploying.`, {
+        program: payload.program,
+        inputs: { "flow.request": payload.description.trim() },
+        preview: { ...structuredClone(golden), team },
+      }, false, [], next);
+      return json(response, 201, chatSummary(next));
+    }
     if (request.method === "POST" && (url.pathname === "/v1/chats" || /^\/v1\/chats\/[^/]+\/activate$/.test(url.pathname))) {
       await readBody(request);
       const id = url.pathname === "/v1/chats" ? null : url.pathname.split("/")[3];
@@ -311,7 +348,7 @@ export async function startFakeServe({
       design: design ?? null,
       selection,
     };
-    if (role === "operator" && !chat.messages.some((m) => m.role === "operator")) chat.title = text.slice(0, 80);
+    if (role === "operator" && chat.title === "New chat" && !chat.messages.some((m) => m.role === "operator")) chat.title = text.slice(0, 80);
     chat.messages.push(message);
     chat.updated_at = Date.now();
     if (role === "operator") chat.busy = true;
@@ -536,6 +573,9 @@ export async function startFakeServe({
     if (typeof request.program !== "string" || request.program.length === 0) {
       return json(response, 400, { error: "invalid request: missing program" });
     }
+    if (request.filename && !/^[A-Za-z_]\w*\.omar$/.test(request.filename)) {
+      return json(response, 400, { error: "filename must be a plain .omar name" });
+    }
     if (request.program.includes(INVALID_MARKER)) {
       // What the real daemon does with a program omarc rejects.
       return json(response, 400, {
@@ -546,6 +586,7 @@ export async function startFakeServe({
     const runId = randomUUID();
     const address = `${host}:${server.address().port}`;
     const snapshot = structuredClone(golden);
+    if (request.filename) snapshot.team = request.filename.replace(/\.omar$/, "");
     snapshot.status = "running";
     const requested = request.inputs?.["flow.request"];
     for (const port of snapshot.ports) {

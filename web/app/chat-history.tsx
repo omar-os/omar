@@ -30,7 +30,18 @@ export function SidebarIcon({ direction }: { direction: "open" | "close" }) {
   );
 }
 
-export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, onClose, onOpen, onSelect, onSwitchingChange, railButtonRef }: {
+export function TemplateIcon() {
+  return (
+    <svg className="template-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+      <rect x="3" y="3" width="7" height="7" rx="1.5" />
+      <rect x="14" y="3" width="7" height="7" rx="1.5" />
+      <rect x="3" y="14" width="7" height="7" rx="1.5" />
+      <rect x="14" y="14" width="7" height="7" rx="1.5" />
+    </svg>
+  );
+}
+
+export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, onClose, onOpen, onTemplates, onSelect, onSwitchingChange, railButtonRef }: {
   serveUrl: string;
   activeId: string;
   mobile: boolean;
@@ -38,6 +49,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
   collapsed: boolean;
   onClose: () => void;
   onOpen: () => void;
+  onTemplates: () => void;
   onSelect: (conversation: ConversationSummary) => void;
   onSwitchingChange: (switching: boolean) => void;
   railButtonRef: RefObject<HTMLButtonElement | null>;
@@ -119,6 +131,9 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
         >
           <SidebarIcon direction="open" />
         </button>
+        <button type="button" className="rail-templates" onClick={onTemplates} aria-label="Templates" title="Templates">
+          <TemplateIcon />
+        </button>
       </nav>
     );
   }
@@ -146,6 +161,9 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
       ))}
     </ul>
     {loading ? <p role="status">Loading conversations…</p> : visible.length === 0 && !error ? <p>No chats found.</p> : null}
+    <div className="history-footer">
+      <button type="button" onClick={onTemplates}><TemplateIcon />Templates</button>
+    </div>
   </>;
   return mobile ? (
     <dialog id="chat-history" ref={dialogRef} className="chat-history history-drawer" aria-label="Chat history" onCancel={onClose} onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>

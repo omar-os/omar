@@ -2,7 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
-import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
+import { ChatHistory, OmarLogo, SidebarIcon, TemplateIcon, useHistoryDrawer } from "./chat-history";
 import { DeployConfirmation } from "./deploy-confirmation";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
@@ -12,6 +12,9 @@ import { OmarEditor } from "./omar-source";
 import { PortPanel } from "./port-panel";
 import { Resizer } from "./resizer";
 import { Waiting } from "./waiting";
+import { TemplateLibrary } from "./template-library";
+import { RunResult } from "./run-result";
+import { templateProgram, templateTeam, type Template } from "./lib/templates";
 import {
   eaDesignAgent,
   scriptedDesignAgent,
@@ -45,6 +48,7 @@ import {
   stopRun,
   subscribeToDiagram,
   fetchConversations,
+  prepareTemplateConversation,
 } from "./lib/runtime-client";
 
 /**
@@ -157,6 +161,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   });
   // Deploying starts real agents, so the button arms a second, explicit step.
   const [confirming, setConfirming] = useState(false);
+  const [templateLibraryOpen, setTemplateLibraryOpen] = useState(false);
+  const [resultOpen, setResultOpen] = useState(false);
   const [daemon, setDaemon] = useState<Daemon>(
     isDemo ? { state: "demo" } : { state: "checking" },
   );
@@ -177,7 +183,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [historyRevision, setHistoryRevision] = useState(0);
   const historyButtonRef = useRef<HTMLButtonElement>(null);
-    const historyRailButtonRef = useRef<HTMLButtonElement>(null);
+  const historyRailButtonRef = useRef<HTMLButtonElement>(null);
   const historyDrawer = useHistoryDrawer();
   useEffect(() => {
     if (historyDrawer && !switchingChat && serveUrl !== historyUrl) historyButtonRef.current?.focus();
@@ -188,7 +194,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     else setHistoryOpen(false);
     historyButtonRef.current?.focus();
   }
-    function openHistory() {
+  function openHistory() {
     if (historyDrawer) setDrawerOpen(true);
     else setHistoryOpen(true);
   }
@@ -318,6 +324,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     setSourceErrors([]);
     setSelection([]);
     setConfirming(false);
+    setResultOpen(false);
     setPhase("idle");
     setPrompt("");
     setError("");
@@ -663,6 +670,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       // they are looking at is what they are deploying.
       const record = await startRun(serveUrl, {
         program: source,
+        filename,
         inputs: design.inputs,
         conversation_id: conversationIdRef.current ?? undefined,
       });
@@ -678,6 +686,20 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       setError(cause instanceof Error ? cause.message : String(cause));
       setPhase("review");
     }
+  }
+
+  async function prepareTemplate(template: Template, request: string, backend: string) {
+    if (daemon.state !== "live") {
+      throw new Error("A live runtime is needed to prepare a template.");
+    }
+    const conversation = await prepareTemplateConversation(historyUrl, {
+      title: template.title,
+      description: request,
+      program: templateProgram(template, backend),
+      filename: `${templateTeam(template)}.omar`,
+    });
+    setTemplateLibraryOpen(false);
+    onSelect(conversation);
   }
 
   /**
@@ -851,7 +873,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       </div>
 
       <div className="studio-content">
-        {isDemo ? <aside className="history-rail" aria-label="Omar"><OmarLogo /></aside> : null}
+        {isDemo ? <nav className="history-rail demo-navigation" aria-label="Omar"><OmarLogo /><button type="button" className="rail-templates" onClick={() => setTemplateLibraryOpen(true)} aria-label="Templates" title="Templates"><TemplateIcon /></button></nav> : null}
         {!isDemo && (!historyDrawer || drawerOpen) ? (
           <ChatHistory
             serveUrl={historyUrl}
@@ -859,9 +881,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             onSwitchingChange={setSelectingChat}
             mobile={historyDrawer}
             revision={`${historyRevision}:${messages.length}`}
-                        collapsed={!historyDrawer && !historyOpen}
+            collapsed={!historyDrawer && !historyOpen}
             onClose={closeHistory}
-                        onOpen={openHistory}
+            onOpen={openHistory}
+            onTemplates={() => {
+              if (historyDrawer) setDrawerOpen(false);
+              setTemplateLibraryOpen(true);
+            }}
             railButtonRef={historyRailButtonRef}
             onSelect={(conversation) => {
               onSelect(conversation);
@@ -889,6 +915,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             .join(" ")}
         >
           <h1 className="visually-hidden">{conversationTitle}</h1>
+          {run && (run.status === "completed" || run.status === "stopped") && !snapshot ? <div className="result-launch"><button type="button" className="primary-button" onClick={() => setResultOpen(true)}>View latest result</button></div> : null}
           {!isDemo && historyDrawer ? (
             <div className="chat-mobile-controls">
               <button
@@ -1032,8 +1059,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               <span><small>TAG</small>{tag}</span>
               <span><small>LAG</small>{lag}</span>
             </div>
-            {(phase === "review" && design) || (phase === "observing" && run) ? (
+            {(phase === "review" && design) || (phase === "observing" && run) || (run && (run.status === "completed" || run.status === "stopped")) ? (
             <div className="workflow-actions">
+              {run && (run.status === "completed" || run.status === "stopped") ? <button className="primary-button" type="button" onClick={() => setResultOpen(true)}>View result</button> : null}
               {phase === "review" && design ? (
                 <span role="group" aria-label="Deploy design">
                   <button className="secondary-button" onClick={discardDesign} type="button">
@@ -1181,6 +1209,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           onConfirm={() => void confirmDesign()}
         />
       ) : null}
+
+      {templateLibraryOpen ? <TemplateLibrary serveUrl={serveUrl} live={daemon.state === "live"} onClose={() => setTemplateLibraryOpen(false)} onUse={prepareTemplate} /> : null}
+      {resultOpen && run ? <RunResult serveUrl={serveUrl} runId={run.run_id} onClose={() => setResultOpen(false)} /> : null}
 
       {panelAgent && snapshot ? (
         <PortPanel

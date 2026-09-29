@@ -29,6 +29,7 @@ import test, { after, before, describe } from "node:test";
 import WebSocket from "ws";
 
 import { startFakeServe } from "./fake-serve.mjs";
+import { templateProgram, templateTeam, templates } from "../app/lib/templates.ts";
 
 // The runtime is a sibling directory now, not a sibling checkout: these are
 // built from the same commit as the client they are checked against.
@@ -212,12 +213,72 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     assert.deepEqual(r.body.runs, []);
   });
 
+  test("every agent template compiles with the real OMAR compiler", async () => {
+    for (const template of templates) {
+      if (template.id === "secrets") continue;
+      const response = await fetch(`${real.url}/v1/programs/check`, post({
+        filename: `${templateTeam(template)}.omar`,
+        program: templateProgram(template),
+      }));
+      const result = await response.json();
+      assert.equal(response.status, 200, `${template.id}: ${JSON.stringify(result)}`);
+      assert.equal(result.ok, true, `${template.id}: ${JSON.stringify(result.errors)}`);
+      assert.equal(result.preview?.team, templateTeam(template), template.id);
+    }
+  });
+
+  test("preparing a template creates a separate, named chat with a durable proposal", async () => {
+    const before = await both("/v1/chat");
+    const template = templates.find((item) => item.id === "docs");
+    const description = "Update README examples using current source and tests, check local links, and report each changed file with the verification performed.";
+    const payload = { title: template.title, description, program: templateProgram(template), filename: `${templateTeam(template)}.omar` };
+    const { real: r, fake: f } = await both("/v1/chats/templates", post(payload));
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    assert.equal(f.status, r.status);
+    assert.equal(r.body.title, "Generate documentation");
+    assert.equal(f.body.title, r.body.title);
+    assert.notEqual(r.body.id, before.real.body.id);
+    assert.notEqual(f.body.id, before.fake.body.id);
+    assert.equal(r.body.message_count, 2);
+    assert.equal(f.body.message_count, 2);
+    const { real: realChat, fake: fakeChat } = await both("/v1/chat");
+    for (const [chat, expectedId] of [[realChat.body, r.body.id], [fakeChat.body, f.body.id]]) {
+      assert.equal(chat.id, expectedId);
+      assert.equal(chat.messages[0].text, description);
+      assert.equal(chat.messages[1].design.preview.team, "Documentation");
+      assert.equal(chat.messages[1].design.inputs["flow.request"], description);
+    }
+    const short = { ...payload, description: "Too brief" };
+    const invalid = await both("/v1/chats/templates", post(short));
+    assert.equal(invalid.real.status, 400);
+    assert.equal(invalid.fake.status, 400);
+    const current = await both("/v1/chat");
+    assert.equal(current.real.body.id, r.body.id);
+    assert.equal(current.fake.body.id, f.body.id);
+    const badProgram = await both("/v1/chats/templates", post({ ...payload, program: "!!invalid!!" }));
+    assert.equal(badProgram.real.status, 400);
+    assert.equal(badProgram.fake.status, 400);
+    const afterBadProgram = await both("/v1/chat");
+    assert.equal(afterBadProgram.real.body.id, r.body.id);
+    assert.equal(afterBadProgram.fake.body.id, f.body.id);
+    const reopen = async (base, id) => fetch(`${base}/v1/chats/${id}/activate`, post({}));
+    assert.equal((await reopen(real.url, before.real.body.id)).status, 200);
+    assert.equal((await reopen(fake.url, before.fake.body.id)).status, 200);
+  });
+
   test("an unknown run is a 404 with an error field", async () => {
     const { real: r, fake: f } = await both("/v1/runs/does-not-exist");
     assert.equal(r.status, 404);
     assert.equal(f.status, r.status);
     assert.equal(typeof r.body.error, "string");
     assert.equal(typeof f.body.error, "string");
+  });
+
+  test("an unknown run result is scoped to the current chat", async () => {
+    const { real: r, fake: f } = await both("/v1/runs/does-not-exist/result");
+    assert.equal(r.status, 404);
+    assert.equal(f.status, r.status);
+    assert.equal(r.body.error, "unknown run");
   });
 
   test("a malformed body is a 400 on both", async () => {
@@ -362,7 +423,7 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     assert.equal(response.status, 202, `proposal rejected: ${response.status}`);
 
     const { messages } = await (await fetch(`${real.url}/v1/chat`)).json();
-    const proposal = messages.find((message) => message.design);
+    const proposal = messages.findLast((message) => message.design);
     assert.ok(proposal, "the proposal reached the conversation");
 
     // Everything the renderer resolves against, produced by the real compiler.
@@ -469,6 +530,10 @@ describe(
 
       assert.equal(latest.status, "completed", JSON.stringify(latest));
       assert.equal(latest.error, null);
+      const resultResponse = await fetch(`${real.url}/v1/runs/${record.run_id}/result`);
+      assert.equal(resultResponse.status, 200);
+      const { outputs } = await resultResponse.json();
+      assert.equal(typeof outputs["flow.blurb"], "string");
     });
   },
 );

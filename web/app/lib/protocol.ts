@@ -203,6 +203,7 @@ export function assertChatMessage(value: unknown): ChatMessage {
 
 export type RunRequest = {
   program: string;
+  filename?: string;
   inputs: Record<string, unknown>;
   conversation_id?: string;
 };

@@ -122,6 +122,107 @@ test("prompt to finished run, gated on an explicit confirmation", async ({ page 
   await expect(page.locator(".source-title")).toContainText("completed");
 });
 
+test("templates stay at the bottom of navigation when the sidebar folds or becomes a drawer", async ({ page }) => {
+  await useFakeServe(page);
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  const templates = history.getByRole("button", { name: "Templates" });
+  const historyBox = (await history.boundingBox())!;
+  const templatesBox = (await templates.boundingBox())!;
+  expect(templatesBox.y + templatesBox.height).toBeGreaterThan(historyBox.y + historyBox.height - 40);
+  await expect(page.locator(".builder-panel").getByRole("button", { name: /Browse templates/ })).toHaveCount(0);
+  await templates.click();
+  await expect(page.getByRole("dialog", { name: "Template library" })).toBeVisible();
+  await page.getByRole("button", { name: "Close template library" }).click();
+
+  await history.getByRole("button", { name: "Fold chat history" }).click();
+  const rail = page.getByRole("navigation", { name: "Chat navigation" });
+  await rail.getByRole("button", { name: "Templates" }).click();
+  await expect(page.getByRole("dialog", { name: "Template library" })).toBeVisible();
+  await page.getByRole("button", { name: "Close template library" }).click();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole("button", { name: "Open chat history" }).click();
+  const drawer = page.getByRole("dialog", { name: "Chat history" });
+  await drawer.getByRole("button", { name: "Templates" }).click();
+  await expect(drawer).toBeHidden();
+  await expect(page.getByRole("dialog", { name: "Template library" })).toBeVisible();
+});
+
+test("template selection prepares a runnable design and exposes its result", async ({ page }) => {
+  await useFakeServe(page);
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  await expect(history.getByRole("list", { name: "Saved chats" }).getByRole("button")).toHaveCount(1);
+  await page.getByRole("complementary", { name: "Chat history" }).getByRole("button", { name: "Templates" }).click();
+  const library = page.getByRole("dialog", { name: "Template library" });
+  await expect(library).toBeVisible();
+  await expect(library.locator(".template-card")).toHaveCount(24);
+  await library.getByRole("button", { name: "Security", exact: true }).click();
+  await library.getByRole("button", { name: /Test permissions/ }).click();
+  await expect(library).toContainText("tenant isolation");
+  await expect(library.getByLabel("Local paths or source material")).toHaveCount(0);
+  const description = library.getByLabel("Describe work");
+  const prepare = library.getByRole("button", { name: "Prepare Workflow", exact: true });
+  await expect(prepare).toBeInViewport();
+  await expect(prepare).toBeDisabled();
+  await expect(library.locator("#template-work-count")).toContainText("Minimum 50 characters · 0/50");
+  await description.fill("x".repeat(49));
+  await expect(prepare).toBeDisabled();
+  await expect(library.locator("#template-work-count")).toContainText("49/50");
+  const details = "Check tenant isolation in fixtures/permissions. Test allowed own-tenant reads and forbidden cross-tenant reads; report the exact failing assertions.";
+  await description.fill(details);
+  await expect(library.locator("#template-work-count")).toContainText("50-character minimum met");
+  await expect(library.getByRole("button", { name: "Prepare Workflow Live" })).toBeEnabled();
+  await library.getByRole("button", { name: "Prepare Workflow Live" }).click();
+  await expect(library).toBeHidden();
+  await expect(history.getByRole("list", { name: "Saved chats" }).getByRole("button")).toHaveCount(2);
+  await expect(history.getByRole("button", { name: /Test permissions & tenant isolation/ })).toHaveAttribute("aria-current", "true");
+  await expect(page.locator(".messages")).toContainText(details);
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+  await expect(page.locator(".source-code")).toContainText("team TestPermissionsTenantIsolation[");
+  await deploy(page);
+  await expect(page.locator(".connection")).toContainText("finished", { timeout: 30_000 });
+  const runs = await (await page.request.get(`${FAKE_SERVE_URL}/v1/runs`)).json();
+  expect(runs.runs[0].team).toBe("TestPermissionsTenantIsolation");
+  await page.getByRole("button", { name: "View result" }).click();
+  const result = page.getByRole("dialog", { name: "Result" });
+  await expect(result.getByLabel("Output text")).toHaveValue("final answer");
+  await result.getByLabel("Output text").fill("edited local draft");
+  await expect(result.getByLabel("Output text")).toHaveValue("edited local draft");
+});
+
+test("documentation template keeps a readable workflow name and prepared chat after reload", async ({ page }) => {
+  await useFakeServe(page);
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  await history.getByRole("button", { name: "Templates" }).click();
+  const library = page.getByRole("dialog", { name: "Template library" });
+  await library.getByRole("button", { name: /Generate documentation/ }).click();
+  await library.getByLabel("Describe work").fill("Update the README usage examples to match the current API. Inspect the implementation and tests, cite source files, and check local links.");
+  await library.getByRole("button", { name: "Prepare Workflow Live" }).click();
+  await expect(history.getByRole("button", { name: /Generate documentation/ })).toHaveAttribute("aria-current", "true");
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
+  await page.reload();
+  await expect(history.getByRole("button", { name: /Generate documentation/ })).toHaveAttribute("aria-current", "true");
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+  await expect(page.locator(".source-code")).toContainText("team Documentation[");
+  await expect(page.getByLabel("Program file name")).toHaveValue("Documentation.omar");
+});
+
+test("secret screening redacts matches in the browser", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("complementary", { name: "Chat history" }).getByRole("button", { name: "Templates" }).click();
+  const library = page.getByRole("dialog", { name: "Template library" });
+  await library.getByRole("button", { name: "Security", exact: true }).click();
+  await library.getByRole("button", { name: /Find exposed secrets/ }).click();
+  const token = `ghp_${"A".repeat(24)}`;
+  await library.getByLabel("Text to screen").fill(token);
+  await library.getByRole("button", { name: "Scan text locally" }).click();
+  await expect(library.locator(".template-findings")).toContainText("1 potential exposure");
+  await expect(library.locator(".template-findings")).not.toContainText(token);
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeHidden();
+});
+
 test("the diagram reflects live reaction state from the run", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);

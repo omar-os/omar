@@ -1,0 +1,550 @@
+[
+  {
+    "number": 1,
+    "id": "test",
+    "title": "Fix a failing test",
+    "group": "development",
+    "audience": "Developers",
+    "value": "Reduce time spent debugging.",
+    "outcome": "A minimal patch + before/after evidence",
+    "field": "Reproduction command",
+    "input": "npm test",
+    "prereq": "Node.js + npm · authenticated backend",
+    "scope": "Run npm test and edit a working copy.",
+    "stages": [
+      "Reproduce",
+      "Fix",
+      "Check",
+      "Review"
+    ],
+    "example": {
+      "summary": "Handle an empty basket.\n\nThe reducer now starts at zero, so total([]) returns 0 instead of throwing.\n\nChanged: src/total.js\nUnresolved: none in this example.",
+      "evidence": "PRECOMPUTED EXAMPLE\n\nBefore · npm test · exit 1\nEmpty basket throws TypeError.\n\nAfter · npm test · exit 0\n3 tests passed.\n\nEvidence belongs to the sample, not your project."
+    }
+  },
+  {
+    "number": 2,
+    "id": "understand",
+    "title": "Understand this repository",
+    "group": "development",
+    "audience": "Developers joining a project",
+    "value": "Reduce onboarding and investigation time.",
+    "outcome": "Architecture, entry points + cited files",
+    "field": "What do you want to understand?",
+    "input": "Where do requests enter, and where should I add validation?",
+    "prereq": "Readable repository · authenticated backend",
+    "scope": "Inspect a working copy and write a guide.",
+    "stages": [
+      "Map files",
+      "Explain",
+      "Verify sources"
+    ],
+    "example": {
+      "summary": "# Repository guide\n\nThe sample exposes a notes API.\n\nEntry point: src/server.ts\nRouting: src/routes/notes.ts\nBusiness logic: src/services/notes.ts\nPersistence: src/storage/notes.ts\n\nSetup commands were found in package.json; they were not executed.",
+      "evidence": "PRECOMPUTED EXAMPLE\n\n4 cited paths resolve to the input snapshot.\nNo source changes included.\nSetup commands: not executed.\nRuntime behavior: not independently verified."
+    }
+  },
+  {
+    "number": 3,
+    "id": "review",
+    "title": "Review my changes",
+    "group": "development",
+    "audience": "Developers and reviewers",
+    "value": "Reduce review effort and catch actionable defects.",
+    "outcome": "Actionable findings attached to the diff",
+    "field": "Change to review",
+    "input": "Uncommitted changes",
+    "prereq": "Local Git diff · authenticated backend",
+    "scope": "Inspect the selected diff and source context.",
+    "stages": [
+      "Capture diff",
+      "Review",
+      "Verify findings"
+    ],
+    "example": {
+      "summary": "# Review\n\n1 actionable finding in this sample.\n\nP2 · Last page drops one item\nTrigger: request 10 items from a 10-item list.\nObserved: 9 returned.\nLocation: src/paginate.js:14\nRemedy: remove the extra subtraction.\n\nThe formatting-only change has no finding.",
+      "evidence": "PRECOMPUTED EXAMPLE\n\nFinding bound to the selected sample diff.\nReproduction: expected 10, received 9.\nCoverage: selected diff and nearby code.\nNo claim of full-project correctness."
+    }
+  },
+  {
+    "number": 4,
+    "id": "upgrade",
+    "title": "Upgrade one dependency",
+    "group": "development",
+    "audience": "Maintainers",
+    "value": "Reduce time spent on dependency maintenance.",
+    "outcome": "Version update + compatibility checks",
+    "field": "Package and exact target version",
+    "input": "example-parser → 2.0.0 (owned fixture)",
+    "prereq": "Supported npm project · registry or fixture access",
+    "scope": "Update one dependency, install and run confirmed checks.",
+    "stages": [
+      "Baseline",
+      "Migrate",
+      "Check",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Upgrade report\n\nOwned fixture package: example-parser\nVersion: 1.0.0 → 2.0.0\n\nChanged:\n- dependency declaration\n- lockfile\n- one consumer call\n\nPublic-registry behavior is outside this example.",
+      "evidence": "PRECOMPUTED EXAMPLE\n\nRequested and resolved version: 2.0.0\nManifest / lockfile: consistent\nProtected consumer check: passed\nPublic registry: not contacted"
+    }
+  },
+  {
+    "number": 5,
+    "id": "docs",
+    "title": "Generate documentation",
+    "group": "development",
+    "audience": "Developers and technical writers",
+    "value": "Reduce documentation writing and correction work.",
+    "outcome": "Readable docs grounded in actual code",
+    "field": "Documentation goal",
+    "input": "Update README usage examples for the current API.",
+    "prereq": "Selected docs + source · authenticated backend",
+    "scope": "Propose changes to the selected documentation files.",
+    "stages": [
+      "Read code",
+      "Write",
+      "Check",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Formatting library\n\nUse formatCents to display integer cents.\n\nExample:\nformatCents(1250) returns \"$12.50\".\n\nSource: src/index.js\nThe old formatPrice example has been removed.",
+      "evidence": "PRECOMPUTED EXAMPLE\n\nExport exists in src/index.js.\nOwned example test: passed\nInternal source references: resolve\nChanged source code: none"
+    }
+  },
+  {
+    "number": 6,
+    "id": "issue",
+    "title": "Implement a small issue",
+    "group": "development",
+    "audience": "Product engineers",
+    "value": "Complete a bounded issue with acceptance evidence.",
+    "outcome": "A scoped patch + acceptance evidence",
+    "field": "Issue and acceptance criteria",
+    "input": "Add case-insensitive filtering. Handle empty input and no matches.",
+    "prereq": "Bounded issue · runnable checks",
+    "scope": "Edit a working copy and run confirmed checks.",
+    "stages": [
+      "Scope",
+      "Implement",
+      "Check",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Implementation notes\n\nFiltering now ignores case.\n\nAcceptance criteria are mapped to three protected example tests.\nA patch is available; no remote PR is created.",
+      "evidence": "PRECOMPUTED EXAMPLE\n\nEmpty query: passed\nMixed case: passed\nNo match: passed\nScope: supplied sample criteria only"
+    }
+  },
+  {
+    "number": 7,
+    "id": "security",
+    "title": "Fix a security finding",
+    "group": "security",
+    "audience": "Developers and security teams",
+    "value": "Shorten remediation of a demonstrated weakness.",
+    "outcome": "A remediation patch + regression proof",
+    "field": "Validated finding",
+    "input": "Supplied local fixture: a ../ path escapes the permitted directory.",
+    "prereq": "Supplied finding + authorized local fixture",
+    "scope": "Reproduce only in the selected local test environment.",
+    "stages": [
+      "Reproduce",
+      "Patch",
+      "Regression",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Remediation report\n\nThe owned fixture validates the resolved path against its permitted root.\n\nThe demonstrated traversal is rejected.\nThis is a finding-specific remediation, not a full security audit.",
+      "evidence": "PRECOMPUTED EXAMPLE\n\nTraversal regression: passed\nValid path behavior: passed\nBroader security review: not performed"
+    }
+  },
+  {
+    "number": 8,
+    "id": "release",
+    "title": "Prepare a release pack",
+    "group": "development",
+    "audience": "Engineering leads",
+    "value": "Reduce release preparation and coordination.",
+    "outcome": "Changelog, migration notes + checklist",
+    "field": "Release range",
+    "input": "v1.0.0 → selected local head",
+    "prereq": "Local revisions · optional supplied issue notes",
+    "scope": "Read change evidence and create draft documents.",
+    "stages": [
+      "Collect changes",
+      "Draft",
+      "Check sources"
+    ],
+    "example": {
+      "summary": "# Release draft\n\nAdded: case-insensitive filtering.\nFixed: empty basket handling.\nChanged: parser API name; see migration notes.\n\nOperational readiness remains unconfirmed.",
+      "evidence": "PRECOMPUTED EXAMPLE\n\n3 change references resolve.\nDeployment checks: not supplied\nRelease publication: not performed"
+    }
+  },
+  {
+    "number": 9,
+    "id": "research",
+    "title": "Research supplied documents",
+    "group": "operations",
+    "audience": "Researchers and analysts",
+    "value": "Reduce time spent comparing supplied evidence.",
+    "outcome": "A cited brief + comparison table",
+    "field": "Research question",
+    "input": "Compare the three proposals. Identify conflicting and missing evidence.",
+    "prereq": "Local text/Markdown sources",
+    "scope": "Read the supplied corpus and write a cited report.",
+    "stages": [
+      "Read sources",
+      "Synthesize",
+      "Review support"
+    ],
+    "example": {
+      "summary": "# Comparison brief\n\nThe supplied documents support different tradeoffs.\n\nSource A describes setup.\nSource B describes batch export.\nSource C does not supply a price.\n\nConflicting retention statements need clarification.",
+      "evidence": "PRECOMPUTED EXAMPLE\n\nSource references resolve.\n1 conflicting claim retained.\n1 unanswered question retained.\nWeb retrieval: not performed"
+    }
+  },
+  {
+    "number": 10,
+    "id": "launch",
+    "title": "Create a launch kit",
+    "group": "revenue",
+    "audience": "Founders and marketers",
+    "value": "Reduce time to approved campaign drafts.",
+    "outcome": "Page copy, announcement drafts + claim checks",
+    "field": "Audience and output",
+    "input": "Write a launch kit for developers using only the supplied approved facts.",
+    "prereq": "Product brief + approved facts",
+    "scope": "Create editable drafts; no sending or publication.",
+    "stages": [
+      "Extract facts",
+      "Draft",
+      "Review",
+      "Revise"
+    ],
+    "example": {
+      "summary": "# Launch copy\n\nYour next useful result, one workflow away.\n\nPick a task. Review the plan. Open the result.\n\nSupporting drafts: email and social copy.\nCustomer testimonials and growth claims are omitted because none were supplied.",
+      "evidence": "PRECOMPUTED EXAMPLE\n\nClaims linked to the supplied fictional brief.\nCustomer metrics: not supplied\nExternal messages sent: none"
+    }
+  },
+  {
+    "number": 11,
+    "id": "dependency-security",
+    "title": "Triage vulnerable dependencies",
+    "group": "security",
+    "audience": "Maintainers and security teams",
+    "value": "Reduce time spent triaging dependency alerts.",
+    "outcome": "An evidence-backed remediation queue",
+    "field": "Scan scope",
+    "input": "Review the supplied npm lockfile and scanner report. Deduplicate advisory aliases.",
+    "prereq": "Supported lockfile + pinned scanner or report",
+    "scope": "Inspect package versions and advisory evidence; propose actions.",
+    "stages": [
+      "Scan",
+      "Normalize",
+      "Prioritize",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Dependency triage\n\nOne affected fixture package appears in the queue. Duplicate advisory aliases are grouped.\n\nSuggested fix is tied to the supplied advisory. Deployment exposure and exploitability require additional evidence.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nAffected-version matching: checked\nDuplicate advisory aliases: grouped\nDatabase freshness: shown per real run\nReachability: not tested"
+    }
+  },
+  {
+    "number": 12,
+    "id": "secrets",
+    "title": "Find exposed secrets",
+    "group": "security",
+    "audience": "Developers and security operators",
+    "value": "Find credential exposure and reduce response preparation.",
+    "outcome": "Redacted findings + response checklist",
+    "field": "Repository scope",
+    "input": "Scan the working tree. Use only synthetic, nonfunctional token-like strings in the example.",
+    "prereq": "Local scanner · explicit working-tree/history scope",
+    "scope": "Scan locally and redact before any model request; no credential use or rotation.",
+    "stages": [
+      "Scan locally",
+      "Redact",
+      "Group",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Secret exposure review\n\nA synthetic nonfunctional token-like string appears in the fixture.\n\nThe report preserves location and type, never the raw match. A response checklist names the evidence and required owner action. No live credential is tested or rotated.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nRaw match in model payload: absent\nRaw match in export: absent\nDuplicate locations: grouped\nProvider validation: not performed"
+    }
+  },
+  {
+    "number": 13,
+    "id": "permissions",
+    "title": "Test permissions & tenant isolation",
+    "group": "security",
+    "audience": "SaaS engineers and security teams",
+    "value": "Catch cross-tenant access defects before release.",
+    "outcome": "An allow/deny matrix + failing regressions",
+    "field": "Policy to test",
+    "input": "Members may read their own tenant documents. They must not read another tenant’s private documents.",
+    "prereq": "Owned API fixture or SpiceDB schema + assertions",
+    "scope": "Test synthetic identities against a selected local fixture.",
+    "stages": [
+      "Define cases",
+      "Build tests",
+      "Execute",
+      "Explain"
+    ],
+    "example": {
+      "summary": "# Permission review\n\nThe intentionally vulnerable example exposes another tenant’s private document.\n\nThe regression records the expected deny and observed allow. The result includes a test and a proposed repair for review.\n\nSchema and application tests are reported separately.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nOwn-tenant read: expected allow / observed allow\nCross-tenant read: expected deny / observed allow\nUnauthenticated read: expected deny / observed deny\n\nResult: failing enforcement test, not a security approval"
+    }
+  },
+  {
+    "number": 14,
+    "id": "infrastructure",
+    "title": "Review infrastructure configuration",
+    "group": "security",
+    "audience": "Infrastructure and platform engineers",
+    "value": "Reduce configuration review work and catch unsafe changes.",
+    "outcome": "Resource findings + a proposed patch",
+    "field": "Review scope",
+    "input": "Review the supplied Terraform source against the approved network-access baseline.",
+    "prereq": "Supported Terraform ruleset · sanitized source/plan",
+    "scope": "Static configuration review; no live cloud changes.",
+    "stages": [
+      "Parse",
+      "Check rules",
+      "Explain",
+      "Propose patch"
+    ],
+    "example": {
+      "summary": "# Infrastructure review\n\nThe example admin ingress rule exceeds the supplied baseline. The report identifies the resource and proposes a narrower source range.\n\nThe internal rule is accepted; a documented exception remains visible. Nothing is applied to a cloud account.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nResource reference: resolves\nProposed patch: parses\nLive posture: not inspected\nCloud writes: none"
+    }
+  },
+  {
+    "number": 15,
+    "id": "questionnaire",
+    "title": "Complete a security questionnaire",
+    "group": "security",
+    "audience": "Security leads, founders and sales engineers",
+    "value": "Reduce the manual review work that holds up enterprise deals.",
+    "outcome": "Cited customer answers + explicit gaps",
+    "field": "Response instructions",
+    "input": "Answer each customer question using approved evidence. Preserve question IDs. Mark unsupported claims unknown.",
+    "prereq": "Questionnaire CSV + approved policy documents",
+    "scope": "Prepare a draft response; no submission or attestation.",
+    "stages": [
+      "Map questions",
+      "Find evidence",
+      "Draft",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Customer questionnaire\n\nQ01: Supported by the approved encryption policy, section 3.\nQ02: Unknown. No certification evidence was supplied.\n\nThe draft preserves the customer’s IDs and question order. An owner must review open items before submission.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nQuestion IDs/order: preserved\nSupported answer: source-linked\nUnsupported certification: unknown\nSubmitted to customer: no"
+    }
+  },
+  {
+    "number": 16,
+    "id": "pipeline",
+    "title": "Prioritize a sales pipeline",
+    "group": "revenue",
+    "audience": "Sales leads and account executives",
+    "value": "Reduce pipeline cleanup and missed follow-up preparation.",
+    "outcome": "An explained follow-up and cleanup queue",
+    "field": "Prioritization rules",
+    "input": "Flag opportunities with no activity for 14 days, missing owners or missing next actions.",
+    "prereq": "Opportunity/activity CSV + confirmed stage rules",
+    "scope": "Analyze exported records; no CRM writes or outreach.",
+    "stages": [
+      "Validate exports",
+      "Apply rules",
+      "Draft actions",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Pipeline actions\n\nExample A: review the stale opportunity and confirm a next action.\nExample B: assign an owner.\nExample C: no attention rule triggered.\n\nThese are rule-based priorities, not predicted conversion rates.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nAging: calculated from supplied dates\nMissing owner: identified\nAmbiguous duplicates: retained for review\nCRM updates / messages: none"
+    }
+  },
+  {
+    "number": 17,
+    "id": "proposal",
+    "title": "Build a customer proposal",
+    "group": "revenue",
+    "audience": "Consultants, agencies and sales engineers",
+    "value": "Reduce the time to prepare an accurate quote.",
+    "outcome": "Priced scope + an editable proposal",
+    "field": "Proposal requirements",
+    "input": "Scope the requested discovery and implementation services using the approved catalog. Leave unsupported work unpriced.",
+    "prereq": "Discovery notes + approved prices/currency",
+    "scope": "Draft scope and prices; no sending, acceptance or commitments.",
+    "stages": [
+      "Map needs",
+      "Price scope",
+      "Draft",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Proposal draft\n\nDiscovery and implementation total USD 5,000 under the synthetic approved catalog.\n\nThe requested custom integration is unpriced because it is outside that catalog. Delivery assumptions and open questions remain visible. This draft has not been sent.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nLine-item arithmetic: reconciled\nApproved catalog prices: matched\nUnspecified tax: not invented\nUnsupported integration: visibly unpriced"
+    }
+  },
+  {
+    "number": 18,
+    "id": "rfp",
+    "title": "Draft an RFP response",
+    "group": "revenue",
+    "audience": "Bid teams and sales engineers",
+    "value": "Reduce repetitive writing while exposing bid gaps early.",
+    "outcome": "A requirement-by-requirement bid draft",
+    "field": "Response requirements",
+    "input": "Preserve all requirement IDs, cite product evidence and flag unmet mandatory requirements.",
+    "prereq": "RFP Markdown/CSV + approved capability evidence",
+    "scope": "Prepare a response draft; no bid submission or obligation acceptance.",
+    "stages": [
+      "Parse requirements",
+      "Retrieve facts",
+      "Draft",
+      "Review"
+    ],
+    "example": {
+      "summary": "# RFP response draft\n\nR01 links to approved batch-export documentation.\nR02 is an unmet mandatory requirement.\nR03 needs an approved support-hours statement.\n\nNo capability, reference customer or certification is invented.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nRequirement IDs: preserved\nMandatory gap: retained\nResponse word limit: checked\nBid submission: not performed"
+    }
+  },
+  {
+    "number": 19,
+    "id": "renewals",
+    "title": "Prepare customer renewals",
+    "group": "revenue",
+    "audience": "Customer-success managers",
+    "value": "Reduce account preparation and missing renewal actions.",
+    "outcome": "Account briefs + evidence-backed action plans",
+    "field": "Renewal review window",
+    "input": "Review upcoming renewals using supplied usage trends, support issues and success milestones.",
+    "prereq": "Account, renewal, usage and support exports",
+    "scope": "Prepare briefs and discussion agendas; no customer outreach.",
+    "stages": [
+      "Join accounts",
+      "Calculate trends",
+      "Draft brief",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Renewal preparation\n\nThe synthetic account’s active seats declined from 100 to 70 across comparable supplied periods. Two issues remain unresolved.\n\nThe agenda asks whether those issues block adoption. It does not assert causation or predict churn.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nAccount IDs: matched\nUsage change: −30 seats / −30%\nMissing-data accounts: separate queue\nCustomer messages: none"
+    }
+  },
+  {
+    "number": 20,
+    "id": "cloud-cost",
+    "title": "Find cloud-cost opportunities",
+    "group": "operations",
+    "audience": "Infrastructure owners and founders",
+    "value": "Identify potentially avoidable spend without promising unverified savings.",
+    "outcome": "Spend breakdown + qualified opportunities",
+    "field": "Cost review instructions",
+    "input": "Reconcile the export, inspect supplied utilization and deduplicate overlapping recommendations. Keep unknown savings explicit.",
+    "prereq": "Supported billing export + utilization/recommendations",
+    "scope": "Analyze local exports; no cloud changes or purchases.",
+    "stages": [
+      "Reconcile bill",
+      "Join utilization",
+      "Qualify opportunities",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Cloud-cost review\n\nSynthetic resource costs reconcile to USD 1,200. Supplied sample evidence supports a conditional opportunity of up to USD 120; overlapping recommendations are not added twice.\n\nNo infrastructure change has occurred. Realized savings remain unmeasured.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nBilling total: reconciled\nOverlapping recommendations: deduplicated\nMissing utilization: flagged\nRealized savings: not measured"
+    }
+  },
+  {
+    "number": 21,
+    "id": "invoices",
+    "title": "Reconcile invoices & payments",
+    "group": "operations",
+    "audience": "Operations and bookkeeping teams",
+    "value": "Reduce manual matching and exception investigation.",
+    "outcome": "A matched ledger + an exception queue",
+    "field": "Reconciliation rules",
+    "input": "Match exact invoice references within currency. Separate partial, duplicate and ambiguous records.",
+    "prereq": "Invoice/payment CSV + cutoff and matching rules",
+    "scope": "Analyze exports; no ledger edits or payments.",
+    "stages": [
+      "Validate records",
+      "Match amounts",
+      "Reconcile totals",
+      "Explain"
+    ],
+    "example": {
+      "summary": "# Reconciliation\n\nSynthetic invoices total USD 1,600. Exact and allocated matches total USD 1,400, leaving USD 200 open. A separate USD 50 receipt lacks a reliable reference.\n\nThe duplicate import is excluded. No accounting records are changed.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nInvoice control: 1,600 = 1,400 + 200\nPayment control: 1,450 = 1,400 + 50\nDuplicate amounts: not double-counted\nAmbiguous receipt: unresolved"
+    }
+  },
+  {
+    "number": 22,
+    "id": "support",
+    "title": "Triage support tickets",
+    "group": "operations",
+    "audience": "Support leads and agents",
+    "value": "Reduce classification and drafting time on a backlog.",
+    "outcome": "A routing queue + reply and KB drafts",
+    "field": "Routing and response policy",
+    "input": "Apply supplied category/priority rules. Ground replies in the approved knowledge base and flag unknown issues.",
+    "prereq": "Ticket CSV + routing policy and knowledge base",
+    "scope": "Prepare routing/reply suggestions; no ticket edits or messages.",
+    "stages": [
+      "Normalize",
+      "Apply policy",
+      "Draft replies",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Support triage\n\nT-101 receives a reply grounded in the approved login article.\nT-102 follows the supplied outage routing rule.\nT-103 needs more information rather than an invented diagnosis.\n\nTickets remain unchanged.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nTicket IDs: preserved\nPriority rules: applied\nSupported replies: source-linked\nOutbound replies: none"
+    }
+  },
+  {
+    "number": 23,
+    "id": "feedback",
+    "title": "Prioritize customer feedback",
+    "group": "operations",
+    "audience": "Product managers and founders",
+    "value": "Reduce synthesis time and make prioritization reviewable.",
+    "outcome": "Evidence-linked product opportunities",
+    "field": "Prioritization criteria",
+    "input": "Count unique sources, preserve serious minority issues and show the evidence and weighting behind each opportunity.",
+    "prereq": "Feedback exports + segment labels and criteria",
+    "scope": "Analyze the supplied sample; no roadmap or account changes.",
+    "stages": [
+      "Deduplicate",
+      "Group themes",
+      "Apply criteria",
+      "Review"
+    ],
+    "example": {
+      "summary": "# Product opportunities\n\nExport friction appears in 8 unique synthetic sources; setup confusion in 5. A single blocking access issue remains visible under the supplied severity rule.\n\nDuplicate imports do not increase counts. This corpus is not assumed representative of all customers.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nDuplicate imports: removed from counts\nUnique-source totals: reconciled\nMinority blocker: retained\nPriority weights: explicitly supplied"
+    }
+  },
+  {
+    "number": 24,
+    "id": "weekly-review",
+    "title": "Prepare a weekly business review",
+    "group": "operations",
+    "audience": "Founders and operations analysts",
+    "value": "Reduce recurring reporting work and correction cycles.",
+    "outcome": "A KPI report with calculation evidence",
+    "field": "Report definition",
+    "input": "Compare supplied weekly periods using confirmed metric definitions and timezone. Label incomplete metrics.",
+    "prereq": "CSV exports + explicit metric definitions",
+    "scope": "Build a report from exports; recurring scheduling is separate.",
+    "stages": [
+      "Validate sources",
+      "Calculate",
+      "Reconcile",
+      "Explain"
+    ],
+    "example": {
+      "summary": "# Weekly business review\n\nActivated accounts increased from 40 to 50 under the supplied definition: a 25% change. Revenue is not reported because its source is missing.\n\nThe report links numbers to input rows and calculation definitions. It does not infer why activation changed.",
+      "evidence": "SYNTHETIC EXAMPLE\n\nActivation change: (50 − 40) / 40 = 25%\nDuplicate events: excluded\nTimezone boundary: covered\nRevenue source: missing / metric withheld"
+    }
+  }
+]

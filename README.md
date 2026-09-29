@@ -89,6 +89,18 @@ the topology it compiles to.
 Nothing runs until you press **Confirm deploy**,
 then the diagram goes live.
 
+Or choose **Templates** at the bottom of Mission Control's chat navigation.
+The library contains 24 local jobs across development, security, sales and
+operations. For an agent workflow,
+choose a backend and describe the work in detail (at least 50 characters),
+including local paths or source material, constraints, and the result you want.
+**Prepare Workflow Live** opens a separate, named chat with a compiled proposal
+for review. Confirm deployment there to run it. Finished runs
+offer **View result** with a text download. The exposed-secret screen runs in
+your browser and reports redacted matches without sending source text to an
+agent. Other templates produce agent drafts and evidence references; verify
+test claims, security findings and calculations before using them.
+
 ### Terminal UI (Legacy)
 
 Note: The legacy terminal UI does not yet implement the deterministic model in the mission control.

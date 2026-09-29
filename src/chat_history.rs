@@ -163,6 +163,35 @@ impl History {
         Ok(())
     }
 
+    /// Create a titled chat with an already checked proposal in one durable
+    /// update. A template's initial request and design survive a reload even
+    /// when no agent has been launched yet.
+    pub fn create_named(&mut self, title: &str, messages: Vec<ChatMessage>) -> Result<String> {
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        anyhow::ensure!(
+            !title.is_empty() && title.chars().count() <= 80,
+            "invalid chat title"
+        );
+        let mut next = self.clone();
+        let mut chat = Conversation::new();
+        chat.title = title;
+        chat.messages = messages
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut message)| {
+                message.sequence = index as u64 + 1;
+                message
+            })
+            .collect();
+        chat.updated_at = now();
+        let id = chat.id.clone();
+        next.active_id = id.clone();
+        next.conversations.push(chat);
+        next.save()?;
+        *self = next;
+        Ok(id)
+    }
+
     pub fn assign_ea(&mut self, id: &str, ea_id: crate::ea::EaId) -> Result<()> {
         let mut next = self.clone();
         next.conversations
@@ -195,7 +224,8 @@ impl History {
             .find(|chat| chat.id == id)
             .expect("active chat exists");
         message.sequence = chat.messages.last().map_or(1, |last| last.sequence + 1);
-        if message.role == ChatRole::Operator
+        if chat.title == "New chat"
+            && message.role == ChatRole::Operator
             && !chat.messages.iter().any(|m| m.role == ChatRole::Operator)
         {
             chat.title = message
@@ -294,6 +324,32 @@ mod tests {
         assert!(context.contains("flow.planner"));
         assert!(!context.contains("Prepare the launch"));
         assert_eq!(restored.append(message("Continue")).unwrap().sequence, 2);
+    }
+
+    #[test]
+    fn named_chat_keeps_its_title_and_initial_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chats.json");
+        let mut history = History::load(path.clone()).unwrap();
+        let previous = history.active_id.clone();
+        let id = history
+            .create_named(
+                "Generate documentation",
+                vec![
+                    message("Describe the documentation work"),
+                    message("Prepared proposal"),
+                ],
+            )
+            .unwrap();
+        assert_ne!(id, previous);
+        assert_eq!(history.active_id, id);
+        let mut restored = History::load(path).unwrap();
+        assert_eq!(restored.conversation(&id).title, "Generate documentation");
+        assert_eq!(restored.conversation(&id).messages[0].sequence, 1);
+        assert_eq!(restored.conversation(&id).messages[1].sequence, 2);
+        restored.append(message("A follow-up request")).unwrap();
+        assert_eq!(restored.conversation(&id).title, "Generate documentation");
+        assert_eq!(restored.conversation(&id).messages[2].sequence, 3);
     }
 
     #[test]

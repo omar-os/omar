@@ -100,6 +100,8 @@ pub struct RunRecord {
 struct StartRunRequest {
     program: String,
     #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
     conversation_id: Option<String>,
     #[serde(default)]
     inputs: BTreeMap<String, Value>,
@@ -219,6 +221,14 @@ struct ChatRequest {
     text: String,
     #[serde(default)]
     selection: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrepareTemplateChatRequest {
+    title: String,
+    description: String,
+    program: String,
+    filename: String,
 }
 
 struct Chat {
@@ -925,6 +935,9 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
             let _ = read_body(content_length)?;
             select_chat(&workspaces, None)
         }
+        ("POST", "/v1/chats/templates") => {
+            prepare_template_chat(&workspaces, &read_body(content_length)?)
+        }
         ("POST", rest) if rest.starts_with("/v1/chats/") && rest.ends_with("/activate") => {
             let _ = read_body(content_length)?;
             let id = rest
@@ -953,6 +966,12 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         ("GET", "/v1/runs") => {
             let runs = context.runs.lock().expect("serve runs poisoned");
             (200, json!({"runs": runs.values().collect::<Vec<_>>()}))
+        }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/result") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/result");
+            run_result(&context, id)
         }
         // Before the run-record route, which would otherwise swallow the
         // suffix and answer with a record for a run id that has "/panel" on it.
@@ -1485,6 +1504,92 @@ fn select_chat(workspaces: &Arc<Workspaces>, id: Option<&str>) -> (u16, Value) {
     (200, json!(summary))
 }
 
+/// A template gets its own durable chat before it appears in review. Compile
+/// first so a bad program cannot leave an empty chat in the navigation.
+fn prepare_template_chat(workspaces: &Arc<Workspaces>, body: &[u8]) -> (u16, Value) {
+    let request: PrepareTemplateChatRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    let title = request
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() || title.chars().count() > 80 {
+        return (400, json!({"error": "title must be 1–80 characters"}));
+    }
+    let description = request.description.trim();
+    if description.chars().count() < 50 {
+        return (
+            400,
+            json!({"error": "describe the work in at least 50 characters"}),
+        );
+    }
+    let staged = match stage_program(&request.program, Some(&request.filename)) {
+        Ok(staged) => staged,
+        Err((_, body)) => {
+            return (
+                400,
+                json!({"error": body["errors"][0].as_str().unwrap_or("invalid program")}),
+            )
+        }
+    };
+    let outcome =
+        topology::load_program(&staged.path).and_then(|bytecode| topology::verify(&bytecode));
+    let state = match staged.finish(outcome) {
+        Ok(state) => state,
+        Err(error) => return (400, json!({"error": error})),
+    };
+    let messages = vec![
+        ChatMessage {
+            sequence: 0,
+            role: ChatRole::Operator,
+            text: description.to_string(),
+            progress: false,
+            design: None,
+            selection: Vec::new(),
+        },
+        ChatMessage {
+            sequence: 0,
+            role: ChatRole::Assistant,
+            text: format!("Prepared {title}. Review the workflow before deploying."),
+            progress: false,
+            design: Some(ProposedDesign {
+                program: request.program,
+                inputs: BTreeMap::from([(
+                    "flow.request".to_string(),
+                    Value::String(description.to_string()),
+                )]),
+                preview: crate::diagram::DiagramSnapshot::from_vm_state(&state),
+            }),
+            selection: Vec::new(),
+        },
+    ];
+    let _selection = workspaces.selection.lock().expect("selection poisoned");
+    let selected = match workspaces
+        .history
+        .lock()
+        .expect("history poisoned")
+        .create_named(&title, messages)
+    {
+        Ok(id) => id,
+        Err(error) => return (500, json!({"error": error.to_string()})),
+    };
+    let context = match workspaces.get(&selected) {
+        Ok(context) => context,
+        Err(error) => return (500, json!({"error": error.to_string()})),
+    };
+    let mut summary = workspaces
+        .history
+        .lock()
+        .expect("history poisoned")
+        .conversation(&selected)
+        .summary();
+    context.live_summary(&mut summary);
+    (201, json!(summary))
+}
+
 fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     let _operation = context
         .chat_operation
@@ -1825,7 +1930,11 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
         .join("serve")
         .join(&run_id);
-    let program_path = run_dir.join("program.omar");
+    let filename = request.filename.as_deref().unwrap_or("program.omar");
+    if !filename.ends_with(".omar") || filename.contains('/') || filename.contains('\\') {
+        return (400, json!({"error": "filename must be a plain .omar name"}));
+    }
+    let program_path = run_dir.join(filename);
     if let Err(error) =
         fs::create_dir_all(&run_dir).and_then(|_| fs::write(&program_path, &request.program))
     {
@@ -2142,6 +2251,40 @@ fn panel_answer(context: &Arc<Context_>, run_id: &str, body: &[u8]) -> (u16, Val
     }
 }
 
+fn run_result(context: &Context_, id: &str) -> (u16, Value) {
+    let runs = context.runs.lock().expect("serve runs poisoned");
+    let Some(status) = runs.get(id).map(|record| record.status) else {
+        return (404, json!({"error": "unknown run"}));
+    };
+    drop(runs);
+    if status.is_active() {
+        return (409, json!({"error": "run has not finished"}));
+    }
+    if status == RunStatus::Failed {
+        return (409, json!({"error": "run failed; no completed result"}));
+    }
+    let path = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id)
+        .join("outputs.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                500,
+                json!({"error": format!("cannot read run result: {error}")}),
+            )
+        }
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(outputs) => (200, json!({"outputs": outputs})),
+        Err(error) => (
+            500,
+            json!({"error": format!("invalid run result: {error}")}),
+        ),
+    }
+}
+
 fn spawn_run_thread(
     context: &Arc<Context_>,
     run_id: &str,
@@ -2169,6 +2312,14 @@ fn spawn_run_thread(
     }
     let context = context.clone();
     let run_id = run_id.to_string();
+    let team = context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .get(&run_id)
+        .expect("new run must exist")
+        .team
+        .clone();
     let replace = request.replace;
     let timeout = Duration::from_secs(request.timeout_seconds);
     let pace = if request.fast {
@@ -2196,6 +2347,22 @@ fn spawn_run_thread(
                 panel_ready: Some(panel_sender),
             },
         );
+        // The topology directory belongs to a team and is replaced on a
+        // rerun. Preserve this run's result before reporting it completed.
+        let outcome = outcome.and_then(|end| {
+            let source = crate::deploy::outputs_path(&crate::deploy::dir_for(
+                &context.omar_dir,
+                context.ea_id,
+                &team,
+            ));
+            let target = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+                .join("serve")
+                .join(&run_id)
+                .join("outputs.json");
+            fs::copy(&source, &target)
+                .with_context(|| format!("failed to preserve result for run {run_id}"))?;
+            Ok(end)
+        });
         // The run is over, so its invocation service is gone with it. Leaving
         // the entry would let a panel offer work nothing can accept.
         context
@@ -2581,6 +2748,29 @@ mod tests {
             !request(server.address(), "GET", "/v1/chat", None).contains("This belongs elsewhere")
         );
         assert_eq!(server.context.runs.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn invalid_template_description_does_not_create_a_chat() {
+        let server = test_server();
+        let previous = server.workspaces.history.lock().unwrap().active_id.clone();
+        let payload = json!({
+            "title": "Generate documentation",
+            "description": "Too brief",
+            "program": include_str!("../web/tests/fixtures/review-flow.omar"),
+            "filename": "Documentation.omar",
+        })
+        .to_string();
+        let response = request(
+            server.address(),
+            "POST",
+            "/v1/chats/templates",
+            Some(&payload),
+        );
+        assert!(response.contains(" 400 "), "{response}");
+        let saved = server.workspaces.history.lock().unwrap();
+        assert_eq!(saved.active_id, previous);
+        assert_eq!(saved.conversations.len(), 1);
     }
 
     #[test]
@@ -3007,6 +3197,48 @@ while True:
         let response = request(server.address(), "GET", "/v1/runs/nope", None);
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
         assert!(response.contains("unknown run"));
+    }
+
+    #[test]
+    fn finished_run_result_is_scoped_and_preserved() {
+        let server = test_server();
+        let finished = record("Template13", RunStatus::Completed);
+        let path = crate::ea::ea_state_dir(server.context.ea_id, &server.context.omar_dir)
+            .join("serve")
+            .join(&finished.run_id)
+            .join("outputs.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"flow.result":"permission matrix"}"#).unwrap();
+        server
+            .context
+            .runs
+            .lock()
+            .unwrap()
+            .insert(finished.run_id.clone(), finished.clone());
+        let response = request(
+            server.address(),
+            "GET",
+            &format!("/v1/runs/{}/result", finished.run_id),
+            None,
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("permission matrix"), "{response}");
+        let unknown = request(server.address(), "GET", "/v1/runs/not-owned/result", None);
+        assert!(unknown.starts_with("HTTP/1.1 404 Not Found"), "{unknown}");
+        let active = record("Active", RunStatus::Running);
+        server
+            .context
+            .runs
+            .lock()
+            .unwrap()
+            .insert(active.run_id.clone(), active.clone());
+        let pending = request(
+            server.address(),
+            "GET",
+            &format!("/v1/runs/{}/result", active.run_id),
+            None,
+        );
+        assert!(pending.starts_with("HTTP/1.1 409 Conflict"), "{pending}");
     }
 
     #[test]
