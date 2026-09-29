@@ -190,7 +190,8 @@ not present in an invocation, its interpolation expands to `<absent>`.
   `self.round`. It starts at the literal and keeps its last value from one
   invocation to the next. Types are `int`, `bool`, `string`, so the value a
   run ends with can be kept in the deployment record and shown. Reactions of
-  an instance that keeps state run in declaration order at a tag.
+  the same instance run in declaration order at a tag, whether or not it
+  declares state.
 
 ### 2.3 Effect contracts
 
@@ -271,9 +272,11 @@ The runtime derives a port-to-reaction subscription index from reaction
 triggers. Explicit connections copy values between compatible ports without
 invoking an agent.
 
-Prompt declaration order is semantically significant. It orders reactions that
-may write the same port. Unrelated reactions remain unordered and may run in
-parallel.
+Prompt definition order is semantically significant. All reactions directly
+belonging to the same team instance run sequentially in definition order at a
+tag, including reactions on different agents and code reactions. Nested team
+instances have their own order and workspace. Independent reactions in different
+instances may run in parallel.
 
 For each reaction and port, the compiler computes:
 
@@ -326,7 +329,8 @@ Reaction `A` must precede `B` when:
 - `A` writes a port that reaches one of `B`'s triggers over hops that cost
   nothing; or
 - both write a port in common, and `A` is declared first; or
-- both run on the same agent, and `A` is declared first.
+- both run on the same agent, and `A` is declared first; or
+- both belong directly to the same team instance, and `A` is declared first.
 
 Those constraints form a graph. A cycle in it is a **causality loop**: every
 reaction on the cycle would have to run before itself, and no order exists. The
@@ -374,9 +378,9 @@ The precedence graph of §4.0 is the invocation DAG. It is a property of the
 wiring, computed once, and the same at every tag; what changes from tag to tag
 is only which of its vertices have a trigger present.
 
-Two of its three edge kinds follow declaration order and so cannot cycle. The
-third — `A` writes what `B` reads — can, and that is the loop the runtime
-refuses.
+Definition-order edges cannot cycle on their own. Data-dependency edges
+(`A` writes what `B` reads) can conflict with that order. The runtime rejects
+such a causality loop; use a delayed connection or action to cross a tag boundary.
 
 ### 4.2 Agent protocol
 
