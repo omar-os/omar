@@ -1952,6 +1952,7 @@ mod tests {
 
     fn test_config_with_prefix(session_prefix: String) -> Config {
         Config {
+            sandbox: Default::default(),
             dashboard: DashboardConfig {
                 session_prefix,
                 ..DashboardConfig::default()

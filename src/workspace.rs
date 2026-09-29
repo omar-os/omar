@@ -311,6 +311,13 @@ impl Workspace {
                 }
                 anyhow::ensure!(!record.is_active(),
                     "stop the topology before taking a file snapshot; a dead runner does not confirm cleanup");
+                if !record.sandboxes.is_empty() {
+                    anyhow::ensure!(
+                        record.sessions_cleaned,
+                        "sandbox cleanup is unconfirmed; cannot snapshot workspace"
+                    );
+                    continue;
+                }
                 if record.sessions.is_empty() {
                     continue;
                 }

@@ -1,0 +1,11 @@
+*
+!Cargo.toml
+!src/
+!src/**
+!bridges/
+!bridges/**
+bridges/**/target/
+!prompts/
+!prompts/**
+!tests/
+!tests/**

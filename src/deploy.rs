@@ -85,6 +85,11 @@ pub struct DeploymentRecord {
     pub error: Option<String>,
     /// Agent name to tmux session, so teardown needs no re-verify.
     pub sessions: BTreeMap<String, String>,
+    /// Instance to owned Docker Sandbox; cleanup must stop VMs, not host panes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sandboxes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_template: Option<String>,
     /// Missing is unknown (legacy); explicit null is the default server.
     #[serde(
         default,
@@ -145,6 +150,8 @@ impl DeploymentRecord {
             tmux_server: identity_known.then_some(named),
             tmux_socket: socket,
             sessions_cleaned: false,
+            sandboxes: BTreeMap::new(),
+            sandbox_template: None,
             timeout_seconds,
             history: vec![TransitionEvent {
                 state: DeploymentState::Created,
