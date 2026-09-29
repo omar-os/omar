@@ -881,6 +881,14 @@ pub fn must_follow(state: &VmState, id: &str) -> BTreeSet<String> {
     let Some(reaction) = state.reactions.get(id) else {
         return BTreeSet::new();
     };
+    // A chain establishes the total order without materializing every
+    // transitive pair (quadratic storage for large team instances).
+    let next_in_instance = state
+        .reactions
+        .iter()
+        .filter(|(_, other)| other.instance == reaction.instance && other.order > reaction.order)
+        .min_by_key(|(_, other)| other.order)
+        .map(|(id, _)| id.as_str());
     // An action carries a microstep even at zero delay, so writing one settles
     // nothing at this tag and orders nobody.
     let instant_writes: BTreeSet<String> = reaction
@@ -907,9 +915,10 @@ pub fn must_follow(state: &VmState, id: &str) -> BTreeSet<String> {
             // Definition order serializes a team's invocations; data
             // dependencies must agree with it or verification rejects a cycle.
             reads
-                || ((shares_port || shares_agent || shares_instance)
-                    && state_of.order > reaction.order
-                    && other.as_str() != id)
+                || next_in_instance == Some(other.as_str())
+                || (!shares_instance
+                    && (shares_port || shares_agent)
+                    && state_of.order > reaction.order)
         })
         .map(|(other, _)| other.clone())
         .collect()
@@ -4940,6 +4949,46 @@ mod tests {
             &executor,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn instance_order_uses_a_linear_chain_even_with_shared_agents_and_effects() {
+        let mut state = independent_team_reactions();
+        let template = state.reactions["reaction.1"].clone();
+        state.reactions.clear();
+        let count = 128;
+        let ids: Vec<_> = (0..count)
+            .map(|order| format!("reaction.{}", count - order))
+            .collect();
+        for (order, id) in ids.iter().enumerate() {
+            let mut reaction = template.clone();
+            reaction.order = order;
+            state.reactions.insert(id.clone(), reaction);
+        }
+        // All reactions share an agent and an action effect, which must not
+        // reintroduce redundant same-instance ordering edges.
+        let edge_count: usize = ids.iter().map(|id| must_follow(&state, id).len()).sum();
+        assert_eq!(edge_count, count - 1);
+        assert_eq!(
+            precedence_layers(&state).unwrap(),
+            ids.iter().map(|id| vec![id.clone()]).collect::<Vec<_>>()
+        );
+        reject_causality_loops(&state).unwrap();
+
+        // A backwards data dependency still closes a cycle through the chain,
+        // even when the source and consumer are not adjacent definitions.
+        state.ports.get_mut("opinion1").unwrap().kind = PortKind::Input;
+        for reaction in state.reactions.values_mut() {
+            reaction.effects.clear();
+        }
+        state
+            .reactions
+            .get_mut(ids.last().unwrap())
+            .unwrap()
+            .effects = vec!["opinion1".into()];
+        state.reactions.get_mut(&ids[0]).unwrap().triggers = vec!["opinion1".into()];
+        assert!(precedence_layers(&state).is_err());
+        assert!(reject_causality_loops(&state).is_err());
     }
 
     #[test]
