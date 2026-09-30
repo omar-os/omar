@@ -229,14 +229,19 @@ mod tests {
     #[test]
     fn previews_history_without_following_links_or_rendering_active_content() {
         let dir = tempfile::tempdir().unwrap();
+        // A directory outside the workspace, for the symlink-escape checks below.
         let source = dir.path().join("source");
         fs::create_dir_all(source.join("nested")).unwrap();
-        fs::write(source.join("nested/report.txt"), "before").unwrap();
-        fs::write(source.join("page.html"), "<script>alert(1)</script>").unwrap();
+        fs::write(source.join("nested/report.txt"), "outside").unwrap();
+        fs::write(source.join("page.html"), "outside").unwrap();
         let root = dir.path().join("state");
-        let ws = Workspace::create(&root, 0, "run", "team", None, &source).unwrap();
-        let id = ws.snapshots(&root).unwrap()[0].id.clone();
-        fs::write(ws.worktree(&root).join("nested/report.txt"), "after").unwrap();
+        let ws = Workspace::create(&root, 0, "run", "team", None).unwrap();
+        let tree = ws.worktree(&root);
+        fs::create_dir(tree.join("nested")).unwrap();
+        fs::write(tree.join("nested/report.txt"), "before").unwrap();
+        fs::write(tree.join("page.html"), "<script>alert(1)</script>").unwrap();
+        let id = ws.snapshot(&root, "before").unwrap().id;
+        fs::write(tree.join("nested/report.txt"), "after").unwrap();
         let mut selection = Selection {
             path: "nested/report.txt".into(),
             snapshot: Some(id.clone()),

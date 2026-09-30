@@ -2293,7 +2293,6 @@ fn spawn_run_thread(
                 omar_dir: &context.omar_dir,
                 generated: &generated,
                 base_prefix: &context.session_prefix,
-                default_workdir: &context.default_workdir,
                 health_idle_warning: context.health_idle_warning,
                 inputs: &inputs,
                 replace,
@@ -2541,25 +2540,17 @@ mod tests {
     #[test]
     fn workspace_routes_scope_files_to_the_chat_and_reject_cross_site_requests() {
         let server = test_server();
-        let source = tempfile::tempdir().unwrap();
-        fs::write(source.path().join("report.txt"), "workspace data").unwrap();
         let root = &server.context.omar_dir;
-        let ws = crate::workspace::Workspace::create(
-            root,
-            server.context.ea_id,
-            "run",
-            "writer",
-            None,
-            source.path(),
-        )
-        .unwrap();
+        let ws =
+            crate::workspace::Workspace::create(root, server.context.ea_id, "run", "writer", None)
+                .unwrap();
+        fs::write(ws.worktree(root).join("report.txt"), "workspace data").unwrap();
         let other = crate::workspace::Workspace::create(
             root,
             server.context.ea_id + 1,
             "run",
             "other",
             None,
-            source.path(),
         )
         .unwrap();
         let listing = request(server.address(), "GET", "/v1/workspaces", None);

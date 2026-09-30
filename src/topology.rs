@@ -1737,7 +1737,6 @@ pub struct TopologyRunConfig<'a> {
     /// Where this program's generated artifacts go, from `generated_dir`.
     pub generated: &'a Path,
     pub base_prefix: &'a str,
-    pub default_workdir: &'a str,
     pub health_idle_warning: i64,
     pub inputs: &'a [String],
     pub replace: bool,
@@ -1945,13 +1944,8 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
             .deployment_id
             .clone();
-        let workspaces = crate::workspace::for_topology(
-            config.omar_dir,
-            config.ea_id,
-            &deployment_id,
-            &state,
-            Path::new(config.default_workdir),
-        )?;
+        let workspaces =
+            crate::workspace::for_topology(config.omar_dir, config.ea_id, &deployment_id, &state)?;
         {
             let mut guard = record
                 .lock()

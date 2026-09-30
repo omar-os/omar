@@ -16,13 +16,8 @@ it; `OMAR_TEMP` and `TMPDIR` point to `temp/`. Agents receive these conventions
 in their topology instructions. Web agents can inspect the workspace via the
 CLI; artifact browsing in Mission Control is a later feature.
 
-New worktrees are seeded from the configured `agent.default_workdir`. Git sources
-include current tracked-file edits and non-ignored untracked files, without
-changing the source repository or its index. Deleted files stay deleted.
-Non-Git sources copy ordinary files and symlinks, excluding OMAR's state tree.
-Source writers should be idle during deployment. Git submodules/nested
-repositories and special files require a separate source directory; they are
-not silently omitted from file snapshots.
+New worktrees start empty. Nothing is copied from the directory `omar run` was
+started in; agents fetch or create what they need.
 
 ## File versions
 
