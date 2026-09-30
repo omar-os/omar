@@ -29,6 +29,11 @@ assert!(std::fs::read_to_string({json.dumps(str(secret))}).is_err());
 assert!(std::fs::read_dir({json.dumps(str(state_root / "workspace-history"))}).is_err());
 assert!(std::fs::read_to_string({json.dumps(str(source / "seed.txt"))}).is_err());
 assert_eq!(std::fs::read_to_string("seed.txt").unwrap(), "seed");
+assert_eq!(std::fs::read_to_string("boundary-probe").unwrap(), "untouched");
+for foreign in std::fs::read_to_string("foreign-paths").unwrap().lines() {{
+    assert!(std::fs::read_to_string(foreign).is_err(), "read another team's file");
+    assert!(std::fs::write(foreign, "changed").is_err(), "wrote another team's file");
+}}
 assert!(std::fs::write({json.dumps(str(secret))}, "changed").is_err());
 std::fs::write("artifact", "inside sandbox").unwrap();
 out = Some("isolated".to_string());
@@ -56,8 +61,21 @@ out = Some("isolated".to_string());
         # Keep sbx's real HOME for its Docker login and daemon. OMAR uses a
         # dedicated HOME; this adapter restores only sbx's host environment.
         adapter = root / "sbx"
-        adapter.write_text("#!/usr/bin/env python3\nimport os,sys\nos.environ['HOME']="+repr(str(Path.home()))+
-                           "\nos.execvp("+repr(SBX)+", ["+repr(SBX)+", *sys.argv[1:]])\n")
+        adapter.write_text("#!/usr/bin/env python3\n" +
+            "import json,os,sys\nfrom pathlib import Path\n" +
+            "state_root=Path(" + repr(str(state_root)) + ")\n" +
+            "if len(sys.argv)>1 and sys.argv[1]=='exec':\n" +
+            "    record=json.loads(next(state_root.rglob('deployment.json')).read_text())\n" +
+            "    own=Path(sys.argv[sys.argv.index('--workdir')+1])\n" +
+            "    others=[]\n" +
+            "    for ws in record['workspaces'].values():\n" +
+            "        tree=state_root/'workspaces'/ws/'worktree'\n" +
+            "        probe=tree/'boundary-probe'\n" +
+            "        if not probe.exists(): probe.write_text('untouched')\n" +
+            "        if tree!=own: others.append(str(probe))\n" +
+            "    (own/'foreign-paths').write_text('\\n'.join(others))\n" +
+            "os.environ['HOME']="+repr(str(Path.home()))+
+            "\nos.execvp("+repr(SBX)+", ["+repr(SBX)+", *sys.argv[1:]])\n")
         adapter.chmod(0o700)
         env = dict(os.environ, HOME=str(home), OMAR_SBX_BIN=str(adapter), OMARC_BIN=str(compiler))
         try:
@@ -71,6 +89,7 @@ out = Some("isolated".to_string());
             assert secret.read_text() == "host-only" and not (source/"artifact").exists()
             for ws in record["workspaces"].values():
                 tree = state_root/"workspaces"/ws/"worktree"
+                assert (tree/"boundary-probe").read_text() == "untouched"
                 assert (tree/"artifact").read_text() == "inside sandbox"
                 assert len(list((state_root/"workspace-history"/ws/"snapshots").glob("*.json"))) == 2
             print("PASS: real Docker Sandbox execution, parent/child separation, denied host/history access, native backend, snapshots")
@@ -78,7 +97,7 @@ out = Some("isolated".to_string());
             for path in state_root.rglob("deployment.json"):
                 for name in json.loads(path.read_text()).get("sandboxes", {}).values():
                     subprocess.run([SBX, "stop", name], capture_output=True, timeout=60)
-                    subprocess.run([SBX, "rm", name], capture_output=True, timeout=60)
+                    subprocess.run([SBX, "rm", "--force", name], capture_output=True, timeout=60, check=True)
 
 
 if __name__ == "__main__":

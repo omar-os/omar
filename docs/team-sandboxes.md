@@ -6,6 +6,11 @@ OMAR worker protocol. Docker Engine containers are not a fallback.
 
 ## Configure
 
+Sign in with `sbx login`. On a fresh installation, Docker also requires a
+one-time global network policy, such as `sbx policy init balanced`. This affects
+all local Docker Sandboxes: balanced allows typical AI/development traffic;
+choose `deny-all` instead if you intend to allow destinations explicitly.
+
 Build the template from the repository root:
 
 ```sh
@@ -31,6 +36,20 @@ sandbox failure never falls back to host execution. Docker Engine's image store
 is separate from sbx; building an image locally alone does not make it available
 to the sandbox runtime.
 `OMAR_SBX_BIN` selects a CLI executable for installations outside PATH.
+
+For local development without publishing, import a canonical digest reference:
+
+```sh
+docker build -f sandbox/Dockerfile -t omar-sandbox:dev .
+docker save -o /tmp/omar-image.tar omar-sandbox:dev
+python3 sandbox/pin-image.py /tmp/omar-image.tar /tmp/omar-pinned.tar
+sbx template load /tmp/omar-pinned.tar
+```
+
+Use the `IMAGE@sha256:...` printed by the helper in the config or CLI. Choose
+unused archive filenames; the helper refuses to overwrite an existing archive.
+A plain tag-only `docker save` import is insufficient for digest lookup in sbx
+0.46: the helper preserves image content and adds its canonical digest name.
 
 ## Files and execution
 
@@ -90,7 +109,7 @@ For the real filesystem boundary, after signing into Docker Sandboxes:
 OMAR_SANDBOX_TEMPLATE=IMAGE@sha256:DIGEST python3 tests/ci/team_sandboxes_real.py
 ```
 
-This launches parent/child sandboxes, tests denied host-file/history access,
+This launches parent/child sandboxes, tests denied host-file/history and other-team file access,
 runs native stub invocations and Rust reactions, checks final snapshots, and
 removes only the test's recorded VMs.
 
