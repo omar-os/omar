@@ -234,11 +234,16 @@ fn relay(mut stream: TcpStream, gateway: Arc<Gateway>) -> Result<()> {
         return respond(&mut stream, "403 Forbidden", "", "Editor origin rejected");
     }
     if method == "GET" && path == format!("/open/{}", gateway.ticket) {
+        // Lax, not Strict: Mission Control may be open on `localhost` while
+        // this gateway is on 127.0.0.1, which browsers treat as another site.
+        // A Strict cookie is then never sent on the redirected navigation.
+        // Lax still withholds it from cross-site fetches and WebSocket
+        // handshakes, and those carry an Origin the check above rejects.
         return respond(
             &mut stream,
             "303 See Other",
             &format!(
-                "Location: /\r\nSet-Cookie: {}={}; HttpOnly; SameSite=Strict; Path=/\r\n",
+                "Location: /\r\nSet-Cookie: {}={}; HttpOnly; SameSite=Lax; Path=/\r\n",
                 gateway.cookie, gateway.ticket
             ),
             "",
@@ -461,6 +466,9 @@ mod tests {
             let mut response = String::new();
             client.read_to_string(&mut response).unwrap();
             assert!(response.contains(expected), "{response}");
+            if expected == "303 See Other" {
+                assert!(response.contains("SameSite=Lax"), "{response}");
+            }
             handler.join().unwrap();
         }
     }
