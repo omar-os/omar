@@ -103,17 +103,12 @@ work. Only topology communication is restricted: write the invocation's allowed
 output ports with `omar_set_port`, then finish with `omar_complete`. Persistent
 artifacts belong in `worktree/`; disposable files belong in `temp/`.
 
-For unattended Codex agents, disable the startup update prompt by setting this
-at the top level of `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`):
-
-```toml
-check_for_update_on_startup = false
-```
-
-Manage Codex updates separately. An update dialog can prevent the TUI from
-loading a thread before OMAR's delivery deadline. OMAR does not change this
-user-wide setting or dismiss dialogs automatically. Passing `-c` to the remote
-TUI is not equivalent: config overrides select OMAR's native exec path instead.
+OMAR handles two startup dialogs for newly launched native agents before
+sending their first task: Claude Code's workspace trust dialog selects
+**Yes, I trust this folder**; Codex's update dialog selects **Skip** for this
+launch, not **Skip until next version**. Update preferences remain unchanged.
+Only these recognized startup dialogs receive keystrokes; tasks still use the
+backend's delivery channel. Unrecognized startup dialogs time out normally.
 
 Reaction commands run in a dedicated process group. OMAR kills remaining group
 members on return, timeout, or failure and verifies that no running members

@@ -53,6 +53,7 @@ const SESSION_BACKEND_VAR: &str = "OMAR_BACKEND";
 
 /// Session-environment key describing the backend's side channel, if it has one.
 const SESSION_DELIVERY_VAR: &str = "OMAR_DELIVERY";
+const SESSION_STARTUP_VAR: &str = "OMAR_STARTUP_PENDING";
 
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
@@ -411,6 +412,9 @@ impl TmuxClient {
         answered: &dyn Fn() -> bool,
     ) -> Result<()> {
         let deadline = Instant::now() + opts.startup_timeout;
+        if !answered() {
+            self.finish_backend_startup(session, opts.startup_timeout)?;
+        }
         loop {
             if answered() {
                 return Ok(());
@@ -440,6 +444,72 @@ impl TmuxClient {
                 "no delivery channel available for {session} ({backend}); composer untouched"
             );
             thread::sleep(opts.poll_interval);
+        }
+    }
+
+    /// Resolve only known launch-time gates, before any protocol prompt is sent.
+    /// The launch stamp is cleared permanently once the native TUI is ready;
+    /// normal delivery never scans or edits an existing conversation's composer.
+    fn finish_backend_startup(&self, session: &str, timeout: Duration) -> Result<()> {
+        if self.session_env(session, SESSION_STARTUP_VAR).as_deref() != Some("1") {
+            return Ok(());
+        }
+        let name = self
+            .session_backend(session)
+            .context("missing startup backend")?;
+        let backend = crate::backend::by_name(&name).context("unknown startup backend")?;
+        let target = exact_pane_target(session);
+        let start = Instant::now();
+        let mut previous = String::new();
+        let mut acted_on = String::new();
+        let mut answered_gate = self.session_env(session, "OMAR_STARTUP_ANSWERED");
+        loop {
+            // Current viewport only: scrollback may contain old dialogs.
+            let screen = self.run(&["capture-pane", "-p", "-t", &target])?;
+            if let Some(gate) = backend.startup_gate(&screen) {
+                if screen == previous
+                    && screen != acted_on
+                    && !gate.keys.is_empty()
+                    && answered_gate.as_deref() != Some(gate.id)
+                {
+                    if gate.confirms {
+                        // Record before sending so retries cannot confirm twice.
+                        self.run(&[
+                            "set-environment",
+                            "-t",
+                            &exact_session_target(session),
+                            "OMAR_STARTUP_ANSWERED",
+                            gate.id,
+                        ])?;
+                        answered_gate = Some(gate.id.to_owned());
+                    }
+                    let mut args = vec!["send-keys", "-t", &target];
+                    args.extend_from_slice(gate.keys);
+                    self.run(&args)?;
+                    acted_on = screen.clone();
+                }
+            } else if screen == previous
+                && !backend.readiness_markers().is_empty()
+                && backend
+                    .readiness_markers()
+                    .iter()
+                    .all(|marker| screen.contains(marker))
+            {
+                self.run(&[
+                    "set-environment",
+                    "-u",
+                    "-t",
+                    &exact_session_target(session),
+                    SESSION_STARTUP_VAR,
+                ])?;
+                return Ok(());
+            }
+            anyhow::ensure!(
+                start.elapsed() < timeout,
+                "{name} startup did not become ready for {session}"
+            );
+            previous = screen;
+            thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -499,6 +569,9 @@ impl TmuxClient {
         }
         let needles: Vec<String> = markers.iter().map(|m| m.to_ascii_lowercase()).collect();
         let start = Instant::now();
+        if self.finish_backend_startup(session, timeout).is_err() {
+            return false;
+        }
         while start.elapsed() < timeout {
             // Use plain capture (no ANSI escapes) so multi-word markers like
             // "Claude Code" match even when the TUI styles each word
@@ -603,6 +676,22 @@ impl TmuxClient {
         }
         if let Some(stamp) = &setup.stamp {
             let _ = self.set_session_delivery(name, stamp);
+        }
+        if let Some(backend) = backend {
+            if backend.has_startup_gates()
+                && matches!(
+                    backend.readiness(&setup.command),
+                    crate::backend::Readiness::Banner(_)
+                )
+            {
+                self.run(&[
+                    "set-environment",
+                    "-t",
+                    &exact_session_target(name),
+                    SESSION_STARTUP_VAR,
+                    "1",
+                ])?;
+            }
         }
         // Finish channel setup before the launcher can return or exec tmux.
         if let Some(backend) = backend {
@@ -905,6 +994,95 @@ mod tests {
         let size = String::from_utf8_lossy(&reported.stdout).trim().to_string();
         let (cols, rows) = agent_dimensions(crossterm::terminal::size().ok());
         assert_eq!(size, format!("{cols}x{rows}"));
+    }
+
+    #[test]
+    fn startup_gates_are_answered_once_before_channel_delivery() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        for scenario in ["claude", "codex", "unknown"] {
+            let backend = if scenario == "unknown" {
+                "claude"
+            } else {
+                scenario
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("startup.py");
+            let log = dir.path().join("keys");
+            let spool = dir.path().join("events");
+            std::fs::write(
+                &script,
+                include_str!("../../tests/fixtures/delivery/startup_gate.py"),
+            )
+            .unwrap();
+            let session = format!("omar-test-startup-{backend}-{}", std::process::id());
+            let _guard = SessionGuard(session.clone());
+            let client = TmuxClient::new("");
+            let command = format!(
+                "python3 {} {} {}",
+                crate::manager::shell_single_quote(&script.display().to_string()),
+                scenario,
+                crate::manager::shell_single_quote(&log.display().to_string())
+            );
+            client
+                .new_session_with_backend(&session, &command, None, Some(backend))
+                .unwrap();
+            client
+                .set_session_delivery(&session, &format!("spool:{}", spool.display()))
+                .unwrap();
+            if scenario == "unknown" {
+                assert!(client
+                    .deliver_prompt(
+                        &session,
+                        "must not send",
+                        &DeliveryOptions {
+                            startup_timeout: Duration::from_millis(400),
+                            poll_interval: Duration::from_millis(50),
+                        }
+                    )
+                    .is_err());
+                assert!(crate::backend::spool::drain_spool(&spool).is_empty());
+                assert!(std::fs::read(&log).unwrap_or_default().is_empty());
+                continue;
+            }
+            // Exercise the topology readiness path for Claude and the direct
+            // delivery path for Codex. Both must clear the launch gate first.
+            if backend == "claude" {
+                assert!(client.wait_for_markers(
+                    &session,
+                    &["Claude Code", "❯"],
+                    Duration::from_secs(5),
+                    Duration::from_millis(50)
+                ));
+            }
+            let options = DeliveryOptions {
+                startup_timeout: Duration::from_secs(5),
+                poll_interval: Duration::from_millis(50),
+            };
+            client
+                .deliver_prompt(&session, "first task", &options)
+                .unwrap();
+            // Dialog text later printed in a conversation is not a startup gate.
+            std::fs::write(log.with_extension("again"), "").unwrap();
+            thread::sleep(Duration::from_millis(200));
+            client
+                .deliver_prompt(&session, "follow-up", &options)
+                .unwrap();
+            assert_eq!(
+                crate::backend::spool::drain_spool(&spool),
+                ["first task", "follow-up"]
+            );
+            assert_eq!(client.session_env(&session, SESSION_STARTUP_VAR), None);
+            thread::sleep(Duration::from_millis(150));
+            let expected: &[u8] = if backend == "claude" {
+                b"\x1b[B\r"
+            } else {
+                b"\x1b"
+            };
+            assert_eq!(std::fs::read(&log).unwrap(), expected);
+        }
     }
 
     #[test]

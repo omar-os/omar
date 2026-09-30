@@ -2874,6 +2874,7 @@ output = pathlib.Path(__file__).with_name('captured.txt')
 spool = output.with_suffix('.queue')
 subprocess.run(['tmux', 'set-environment', '-t', os.environ['TMUX_PANE'],
                 'OMAR_DELIVERY', 'spool:' + str(spool)], check=True)
+print('Claude Code\n❯ ', flush=True)
 while True:
     claimed = spool.with_suffix('.draining')
     try:
