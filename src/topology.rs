@@ -1801,6 +1801,32 @@ fn validate_sandbox_writes(
     validate_contract(&invocation.contract, &effects)
 }
 
+/// A worker receives only its team's definitions and initial values. The host
+/// retains routing and other teams' parameters/state, including nested teams.
+fn sandbox_state(state: &VmState, instance: &str) -> VmState {
+    let mut local = state.clone();
+    local.instances.retain(|name, _| name == instance);
+    local
+        .agents
+        .retain(|_, agent| agent.instance == instance && !is_web_backend(&agent.backend));
+    local
+        .reactions
+        .retain(|_, reaction| reaction.instance == instance);
+    let referenced: BTreeSet<_> = local
+        .reactions
+        .values()
+        .flat_map(|reaction| reaction.triggers.iter().chain(&reaction.effects))
+        .cloned()
+        .collect();
+    // Parents may consume child outputs; retain their schemas, not child values.
+    local.ports.retain(|name, _| referenced.contains(name));
+    local.timers.retain(|name, _| referenced.contains(name));
+    local.state_vars.retain(|_, var| var.instance == instance);
+    local.params.retain(|_, param| param.instance == instance);
+    local.connections.clear();
+    local
+}
+
 /// Internal VM-side service. No host paths other than the two mounts are used.
 /// stdout is reserved for bounded protocol frames; backend panes/logs stay in VM.
 pub fn sandbox_worker() -> Result<()> {
@@ -2167,16 +2193,9 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
                         .join("sandbox-logs")
                         .join(format!("{}.log", workspace.id)),
                 )?;
-                let mut local_state = state.clone();
-                local_state.agents.retain(|_, agent| {
-                    agent.instance == *instance && !is_web_backend(&agent.backend)
-                });
-                local_state
-                    .reactions
-                    .retain(|_, reaction| reaction.instance == *instance);
                 let init = crate::sandbox::Init {
                     protocol: crate::sandbox::PROTOCOL,
-                    state: local_state,
+                    state: sandbox_state(&state, instance),
                     workspace: workspace.clone(),
                     root: config.omar_dir.to_path_buf(),
                     timeout: config.timeout,
@@ -3401,6 +3420,48 @@ mod tests {
         )
         .is_err());
         assert!(validate_sandbox_writes(&state, &invocation, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn sandbox_initialization_does_not_disclose_other_teams_values() {
+        let mut state = hr_state();
+        state.state_vars.insert(
+            "child.secret".into(),
+            StateVarState {
+                ty: "string".into(),
+                initial: json!("private child state"),
+                instance: "child".into(),
+            },
+        );
+        state.params.insert(
+            "child.key".into(),
+            ParamState {
+                ty: "string".into(),
+                value: json!("private child parameter"),
+                instance: "child".into(),
+            },
+        );
+        state.params.insert(
+            "key".into(),
+            ParamState {
+                ty: "string".into(),
+                value: json!("own parameter"),
+                instance: "".into(),
+            },
+        );
+        state.ports.get_mut("opinion1").unwrap().instance = "child".into();
+        let parent = sandbox_state(&state, "");
+        assert!(parent.ports.contains_key("opinion1"));
+        let serialized = serde_json::to_string(&parent).unwrap();
+        assert!(!serialized.contains("private child"));
+        assert!(serialized.contains("own parameter"));
+        assert!(parent.connections.is_empty());
+        assert!(!parent.reactions.is_empty());
+        let child = sandbox_state(&state, "child");
+        assert_eq!(child.state_vars.len(), 1);
+        assert_eq!(child.params.len(), 1);
+        assert!(child.agents.is_empty());
+        assert!(child.reactions.is_empty());
     }
 
     #[test]

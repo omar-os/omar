@@ -71,6 +71,12 @@ else: sys.exit(2)
             instructions.append(dict(op="install_reaction", instance=instance, id=instance+".agent",
                 agent=instance+".second", triggers=[instance+".tick"], effects=[instance+".out"],
                 contract=instance+".out", prompt="Return a string."))
+        # A parent can react to a child's output without receiving child-private
+        # definitions. Its worker still needs the referenced port's type.
+        instructions.append(dict(op="define_port", instance="a", kind="output", name="a.observed", type="string"))
+        instructions.append(dict(op="install_reaction", instance="a", id="a.observe-child", agent="",
+            triggers=["a.child.out"], effects=["a.observed"], contract="a.observed", prompt="",
+            body='observed = Some(out.unwrap());'))
         instructions.append({"op": "commit_plan"})
         bytecode = root / "program.json"
         bytecode.write_text(json.dumps(dict(version=1, team="SandboxTeams", instructions=instructions)))
