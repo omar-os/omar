@@ -50,7 +50,8 @@ Control pointed at it, and opens a browser. Ctrl-C stops both.
 make dev
 ```
 
-`OMAR_SERVE_ADDRESS`, `OMAR_WEB_PORT` and `OMAR_DEV_OPEN=0` adjust it. The two
+`OMAR_SERVE_ADDRESS`, `OMAR_WEB_PORT` and `OMAR_DEV_OPEN=0` adjust it.
+`OMAR_DEV_NO_EA=1` starts without an assistant for frontend-only development. The two
 halves separately, if you want them in separate terminals:
 
 ```bash

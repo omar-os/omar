@@ -396,6 +396,10 @@ pub(crate) fn resolve_omarc() -> PathBuf {
         return PathBuf::from(path);
     }
 
+    resolve_build_omarc()
+}
+
+pub(crate) fn resolve_build_omarc() -> PathBuf {
     let executable_name = format!("omarc{}", std::env::consts::EXE_SUFFIX);
     if let Ok(current_executable) = std::env::current_exe() {
         if let Some(directory) = current_executable.parent() {

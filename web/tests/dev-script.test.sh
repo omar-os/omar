@@ -17,12 +17,18 @@ web_url="http://localhost:$web_port"
 
 dev_pid=""
 log=$(mktemp)
+session_home=$(mktemp -d)
 
 finish() {
   [[ -n $dev_pid ]] && kill "$dev_pid" 2>/dev/null || true
   # Belt and braces: if the script leaked children, this test must not.
   pkill -f "vinext dev --port $web_port" 2>/dev/null || true
   pkill -f "omar serve --address $serve_address" 2>/dev/null || true
+  for record in "$session_home"/registry/*.json; do
+    [[ -f $record ]] || continue
+    OMAR_HOME="$session_home" "$web_dir/../target/debug/omar" down "$(basename "$record" .json)" --force --timeout 5 >/dev/null 2>&1 || true
+  done
+  rm -rf "$session_home"
   rm -f "$log"
 }
 trap finish EXIT
@@ -53,6 +59,7 @@ EOF
 chmod +x "$stub_dir/node"
 
 guard_log=$(mktemp)
+session_home=$(mktemp -d)
 if PATH="$stub_dir:$PATH" OMAR_DEV_OPEN=0 "$web_dir/dev.sh" >"$guard_log" 2>&1; then
   printf 'FAIL: dev.sh ran on Node 20 instead of refusing\n' >&2
   cat "$guard_log" >&2
@@ -79,7 +86,7 @@ touch -t 202001010000 "$web_dir/node_modules"
 touch "$web_dir/package.json"
 
 printf 'Starting dev.sh...\n'
-OMAR_DEV_OPEN=0 \
+OMAR_DEV_OPEN=0 OMAR_DEV_NO_EA=1 OMAR_HOME="$session_home" \
   OMAR_SERVE_ADDRESS="$serve_address" \
   OMAR_WEB_PORT="$web_port" \
   "$web_dir/dev.sh" >"$log" 2>&1 &

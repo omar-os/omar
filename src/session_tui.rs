@@ -21,7 +21,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), crossterm::cursor::Show, LeaveAlternateScreen);
     }
 }
 pub fn attach(mut session: Session, initial_ea: Option<&str>) -> Result<()> {
@@ -203,12 +203,9 @@ pub fn attach(mut session: Session, initial_ea: Option<&str>) -> Result<()> {
                             };
                         }
                     }
-                    KeyCode::Tab => {
-                        if !eas.is_empty() {
-                            let index =
-                                eas.iter().position(|e| e["id"] == selected_id).unwrap_or(0);
-                            ea = eas[(index + 1) % eas.len()]["id"].to_string();
-                        }
+                    KeyCode::Tab if !eas.is_empty() => {
+                        let index = eas.iter().position(|e| e["id"] == selected_id).unwrap_or(0);
+                        ea = eas[(index + 1) % eas.len()]["id"].to_string();
                     }
                     _ => (),
                 }

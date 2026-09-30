@@ -345,7 +345,22 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
     let source_executable = fs::canonicalize(std::env::current_exe()?)?;
     let executable = directory.join("bin/omar");
     let build_id = pin_executable(&source_executable, &executable)?;
-    if let Ok(compiler) = executable_on_path(crate::topology::resolve_omarc()) {
+    // A newly built runtime launched by an agent must not inherit the
+    // supervising runtime's pinned compiler. Explicit external overrides stay
+    // supported; invoking the parent's pinned executable uses its sibling.
+    let inherited_compiler = std::env::var_os("OMAR_STATE_DIR")
+        .map(PathBuf::from)
+        .is_some_and(|parent| {
+            source_executable != parent.join("bin/omar")
+                && std::env::var_os("OMARC_BIN").map(PathBuf::from)
+                    == Some(parent.join("bin/omarc"))
+        });
+    let compiler = if inherited_compiler {
+        crate::topology::resolve_build_omarc()
+    } else {
+        crate::topology::resolve_omarc()
+    };
+    if let Ok(compiler) = executable_on_path(compiler) {
         pin_executable(&compiler, &directory.join("bin/omarc"))?;
     }
     let config_path = cli
@@ -825,7 +840,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         Some(Commands::Serve { name, address, no_ea, ui, restart_ea }) => {
             if *restart_ea { return Some(Err(anyhow::anyhow!("serve creates a fresh session; --restart-ea is available only with --legacy"))); }
             if *ui { return Some(Err(anyhow::anyhow!("use omar up, then omar web <session>; legacy serve --ui remains available with --legacy"))); }
-            launch(cli, UpOptions { name: name.clone(), address: *address, no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
+            launch(cli, UpOptions { name: name.clone(), address: address.unwrap_or_else(|| UpOptions::default().address), no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
         },
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
         None => launch(cli, UpOptions::default(), false).and_then(|s| print_started(&s,cli.json)),

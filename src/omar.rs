@@ -318,8 +318,8 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
         /// Loopback address to bind the admission API
-        #[arg(long, default_value = "127.0.0.1:0")]
-        address: std::net::SocketAddr,
+        #[arg(long)]
+        address: Option<std::net::SocketAddr>,
 
         /// Restart the executive assistant so it can reply and propose designs.
         /// Its MCP context is fixed at launch, so an already running EA cannot
@@ -784,6 +784,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             no_ea,
             ui,
         }) => {
+            let address = address.unwrap_or_else(|| "127.0.0.1:7340".parse().unwrap());
             if ui && !web_assets::is_bundled() {
                 anyhow::bail!(web_assets::MISSING);
             }

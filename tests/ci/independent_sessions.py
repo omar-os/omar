@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -103,6 +104,23 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
                         f"127.0.0.1:{occupied.getsockname()[1]}", ok=False)
             assert "startup failed" in error and "runtime.log" in error
         assert info("conflict")["session"]["state"] == "failed"
+        # A separately built runtime selects its own sibling compiler, even
+        # inside a parent that exports its pinned OMARC_BIN.
+        with tempfile.TemporaryDirectory(prefix="omar-build-") as build:
+            built = Path(build)
+            shutil.copyfile(BIN, built / "omar")
+            (built / "omar").chmod(0o700)
+            marker = "#!/bin/sh\necho selected-build-compiler\n"
+            (built / "omarc").write_text(marker)
+            (built / "omarc").chmod(0o700)
+            context = dict(inherited, OMARC_BIN=str(Path(outer["directory"]) / "bin/omarc"))
+            output = subprocess.run([str(built / "omar"), "up", "--name", "build", "--no-ea", "--json"],
+                                    cwd=root, env=context, text=True, capture_output=True, timeout=90)
+            assert output.returncode == 0, output.stderr
+            selected = json.loads(output.stdout)
+            sessions.append(selected)
+            assert (Path(selected["directory"]) / "bin/omarc").read_text() == marker
+            cli("down", "build")
         # Browser disconnection no longer shuts down a managed runtime after 10s.
         host, port = inner["url"].removeprefix("http://").split(":")
         with socket.create_connection((host, int(port))) as browser:
@@ -164,6 +182,8 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             assert time.monotonic() < deadline, info("assistants")
             time.sleep(.1)
         pid = int(reaction_pid.read_text())
+        for worktree in (Path(managed["directory"]) / "workspaces").glob("*/worktree"):
+            assert not (worktree / "state").exists(), "workspace copied another session's private state"
         cli("down", "assistants", "--force")
         status = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True)
         assert status.returncode != 0 or status.stdout.strip().startswith("Z"), "force left code reaction alive"
