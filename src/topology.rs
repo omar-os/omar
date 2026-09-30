@@ -1766,7 +1766,7 @@ impl<E: ReactionExecutor> ReactionExecutor for SandboxExecutor<'_, E> {
         let deadline = invocation.within.unwrap_or(self.timeout);
         let response = worker.request(
             serde_json::to_value(&invocation)?,
-            deadline + Duration::from_secs(20),
+            deadline.saturating_add(Duration::from_secs(20)),
         )?;
         let writes: BTreeMap<String, Value> = serde_json::from_value(
             response
