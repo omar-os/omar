@@ -488,12 +488,11 @@ impl TmuxClient {
                     self.run(&args)?;
                     acted_on = screen.clone();
                 }
-            } else if screen == previous
-                && !backend.readiness_markers().is_empty()
+            } else if !backend.readiness_markers().is_empty()
                 && backend
                     .readiness_markers()
                     .iter()
-                    .all(|marker| screen.contains(marker))
+                    .all(|marker| screen.contains(marker) && previous.contains(marker))
             {
                 self.run(&[
                     "set-environment",

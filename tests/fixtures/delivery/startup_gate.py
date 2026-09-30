@@ -55,11 +55,17 @@ if data != expected:
 time.sleep(0.4)
 sys.stdout.write('\x1b[2J\x1b[H' + ready)
 sys.stdout.flush()
+frame = 0
 while True:
+    # A ready Codex composer animates continuously. Its markers remain stable,
+    # but requiring the entire viewport to stop changing would deadlock startup.
+    frame += 1
+    sys.stdout.write(f'\x1b[12;1Hanimation frame {frame}')
+    sys.stdout.flush()
     if log.with_suffix('.again').exists():
         sys.stdout.write('\x1b[2J\x1b[H' + dialog)
         sys.stdout.flush()
         log.with_suffix('.again').unlink()
-    if select.select([sys.stdin], [], [], 0.1)[0]:
+    if select.select([sys.stdin], [], [], 0.025)[0]:
         with log.open('ab') as output:
             output.write(os.read(sys.stdin.fileno(), 1024))
