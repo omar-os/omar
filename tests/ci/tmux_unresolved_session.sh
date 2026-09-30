@@ -59,7 +59,7 @@ wait_for_session() {
 }
 
 tmux_cmd new-session -d -s omar-dashboard \
-  "cd '$REPO_ROOT' && HOME='$home_dir' OMAR_TMUX_SERVER='$server' '$OMAR_BIN'"
+  "cd '$REPO_ROOT' && HOME='$home_dir' OMAR_TMUX_SERVER='$server' '$OMAR_BIN' --legacy"
 
 wait_for_session omar-dashboard
 wait_for_session omar-agent-ea-0

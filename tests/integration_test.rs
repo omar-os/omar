@@ -29,6 +29,7 @@ fn tmux_command() -> Command {
 
 fn omar_command(home: &Path) -> Command {
     let mut cmd = Command::new(omar_bin());
+    cmd.arg("--legacy");
     cmd.env("HOME", home)
         .env("OMAR_TMUX_SERVER", test_tmux_server());
     cmd
@@ -616,7 +617,7 @@ fn test_omar_help() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Agent dashboard for tmux"),
+        stdout.contains("Independent agent runtimes and topology orchestration"),
         "Help should contain description: {}",
         stdout
     );

@@ -58,7 +58,7 @@ def main():
             started = time.monotonic()
             try:
                 run = subprocess.run(
-                    [str(BIN), 'run', str(program), '--input', 'ping.request=smoke', '--replace'],
+                    [str(BIN), "--legacy", 'run', str(program), '--input', 'ping.request=smoke', '--replace'],
                     env=env, capture_output=True, text=True, timeout=180)
             finally:
                 subprocess.run(['tmux', '-L', server, 'kill-server'], capture_output=True)

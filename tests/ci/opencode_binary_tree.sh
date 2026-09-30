@@ -94,7 +94,7 @@ tmux_cmd() {
 }
 
 omar_cmd() {
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" "$@"
+  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" --legacy "$@"
 }
 
 wait_for_session() {

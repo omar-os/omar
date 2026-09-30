@@ -57,6 +57,7 @@ impl Harness {
 
     fn omar(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_omar"));
+        cmd.arg("--legacy");
         cmd.env("HOME", self.home.path())
             .env("OMAR_TMUX_SERVER", &self.tmux_server)
             .env("OMARC_BIN", &self.omarc);

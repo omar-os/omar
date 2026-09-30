@@ -625,6 +625,14 @@ fn seed(source: &Path, destination: &Path, root: &Path) -> Result<()> {
         !source.starts_with(&root),
         "workspace source must be outside OMAR state directory"
     );
+    // A session root is only one child of OMAR_HOME. Seeding a parent
+    // directory must not copy another session's credentials or workspaces.
+    // A nested runtime may legitimately seed its supervising team's worktree,
+    // which itself lives under OMAR_HOME; keep that explicit source usable.
+    let shared = crate::sessions::home_root().canonicalize().ok();
+    let excluded = shared
+        .filter(|home| root.starts_with(home) && !source.starts_with(home))
+        .unwrap_or_else(|| root.clone());
     let mut git = Command::new("git");
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("GIT_") {
@@ -661,7 +669,7 @@ fn seed(source: &Path, destination: &Path, root: &Path) -> Result<()> {
                 }
             }
             let mut paths = Vec::new();
-            collect_seed(source, source, &root, &mut paths)?;
+            collect_seed(source, source, &excluded, &mut paths)?;
             paths
         }
     };
@@ -670,7 +678,7 @@ fn seed(source: &Path, destination: &Path, root: &Path) -> Result<()> {
     for path in paths {
         safe_relative(&path)?;
         let from = source.join(&path);
-        if from.starts_with(&root) {
+        if from.starts_with(&excluded) {
             continue;
         }
         let metadata = match fs::symlink_metadata(&from) {

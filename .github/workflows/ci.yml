@@ -116,9 +116,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Build compiler for independent-session integration
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lang
+          test: false
+
       - name: Verify legacy supervision through MCP and tmux
         run: |
           cargo build -p omar
+          python3 tests/ci/independent_sessions.py
           python3 tests/ci/team_workspaces.py
           python3 tests/ci/legacy_supervision.py
           python3 tests/ci/backend_coordination_contracts.py
@@ -270,7 +277,7 @@ jobs:
         env:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
         run: |
-          output=$(cargo run --quiet --bin omar -- run \
+          output=$(cargo run --quiet --bin omar -- --legacy run \
             tests/ci/direct_run.omar --input run.request=hello --replace)
           echo "$output"
           grep -Fq 'Output run.result = "hello"' <<<"$output"
@@ -279,7 +286,7 @@ jobs:
         env:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
         run: |
-          output=$(cargo run --quiet --bin omar -- run \
+          output=$(cargo run --quiet --bin omar -- --legacy run \
             tests/ci/side_channel_stub.omar --input run.request=go \
             --timeout-seconds 15 --replace)
           echo "$output"
@@ -291,7 +298,7 @@ jobs:
         env:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
         run: |
-          output=$(cargo run --quiet --bin omar -- run \
+          output=$(cargo run --quiet --bin omar -- --legacy run \
             tests/topology/src/RingCode.omar --input n1.token=0 --replace)
           echo "$output"
           grep -Fq 'Output n1.done = 6' <<<"$output"
@@ -302,7 +309,7 @@ jobs:
         env:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
         run: |
-          output=$(cargo run --quiet --bin omar -- run \
+          output=$(cargo run --quiet --bin omar -- --legacy run \
             tests/topology/src/RingLeader.omar --replace)
           echo "$output"
           grep -Fq 'Output leader.done = true' <<<"$output"
@@ -679,7 +686,7 @@ jobs:
       - name: The installed runtime compiles without the source tree
         run: |
           mv lang/.lake "$RUNNER_TEMP/lake-aside"
-          output=$(env -u OMARC_BIN "$RUNNER_TEMP/bin/omar" run \
+          output=$(env -u OMARC_BIN "$RUNNER_TEMP/bin/omar" --legacy run \
             tests/ci/direct_run.omar --input run.request=hello --replace)
           echo "$output"
           grep -Fq 'Output run.result = "hello"' <<<"$output"

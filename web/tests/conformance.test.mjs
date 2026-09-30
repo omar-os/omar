@@ -49,7 +49,7 @@ function runtimeSupports(args, needle) {
   return `${probe.stdout}${probe.stderr}`.includes(needle);
 }
 
-const SERVES_HEADLESS = runtimeSupports(["serve", "--help"], "--no-ea");
+const SERVES_HEADLESS = runtimeSupports(["--legacy", "serve", "--help"], "--no-ea");
 const HAS_STUB_AGENT = runtimeSupports(["stub-agent", "--help"], null);
 // Topology agents run in tmux panes, so a real run needs one.
 const HAS_TMUX = spawnSync("tmux", ["-V"], { encoding: "utf8" }).status === 0;
@@ -114,7 +114,7 @@ async function startRealServe() {
     join(home, ".omar/config.toml"),
     `[dashboard]\nsession_prefix = "${sessionPrefix}"\n`,
   );
-  const child = spawn(OMAR_BIN, ["serve", "--address", "127.0.0.1:0", "--no-ea"], {
+  const child = spawn(OMAR_BIN, ["--legacy", "serve", "--address", "127.0.0.1:0", "--no-ea"], {
     env: { ...process.env, HOME: home, OMARC_BIN },
     stdio: ["ignore", "pipe", "pipe"],
   });

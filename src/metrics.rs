@@ -17,9 +17,7 @@ fn enabled() -> bool {
 }
 
 fn sink_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar")
+    crate::sessions::state_root()
         .join("metrics")
         .join("spawn_metrics.jsonl")
 }
