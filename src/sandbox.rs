@@ -48,13 +48,16 @@ pub fn map_input_paths(
     } else if ty == "path" {
         let path = PathBuf::from(value.as_str().context("expected path")?);
         anyhow::ensure!(
-            path.is_absolute()
-                && !path
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir)),
-            "sandbox path inputs must be absolute without parent traversal"
+            !path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "sandbox path inputs must not contain parent traversal"
         );
         let worktree = workspace.worktree(root);
+        if path.is_relative() {
+            *value = Value::String(worktree.join(path).to_string_lossy().into_owned());
+            return Ok(());
+        }
         if !path.starts_with(&worktree) && !path.starts_with(workspace.temp(root)) {
             let relative = path.strip_prefix(&workspace.source)
                 .context("sandbox path input is outside its workspace and seeded source; explicit artifact transfer is required")?;
@@ -126,13 +129,13 @@ fn checked(mut command: Command, timeout: Duration) -> Result<Vec<u8>> {
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            let bytes = errors.recv_timeout(Duration::from_secs(1))??;
+            let bytes = errors.recv_timeout(timeout.saturating_sub(started.elapsed()))??;
             anyhow::ensure!(
                 status.success(),
                 "sbx failed: {}",
                 String::from_utf8_lossy(&bytes)
             );
-            let bytes = output.recv_timeout(Duration::from_secs(1))??;
+            let bytes = output.recv_timeout(timeout.saturating_sub(started.elapsed()))??;
             anyhow::ensure!(bytes.len() <= 1024 * 1024, "sbx output too large");
             return Ok(bytes);
         }
@@ -173,41 +176,53 @@ pub fn create(name: &str, template: &str, worktree: &Path, temp: &Path) -> Resul
     checked(cmd, Duration::from_secs(180)).map(|_| ())
 }
 
-/// Names originate from a persisted workspace UUID, never arbitrary CLI input.
-pub fn stop(name: &str) -> Result<()> {
-    let id = name
-        .strip_prefix("omar-team-")
-        .context("invalid sandbox name")?;
-    anyhow::ensure!(
-        uuid::Uuid::parse_str(id)?.to_string() == id,
-        "invalid sandbox ID"
-    );
-    let mut cmd = command();
-    cmd.args(["stop", name]);
-    match checked(cmd, Duration::from_secs(60)) {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            // Creation may have failed before allocation, or an operator may
-            // have removed the VM. Only a successful inventory proves absence;
-            // an authentication/daemon failure cannot confirm cleanup.
-            let mut inventory = command();
-            inventory.args(["ls", "--quiet"]);
-            let output = checked(inventory, Duration::from_secs(60))?;
-            let names = std::str::from_utf8(&output)?;
-            if names.lines().any(|line| line.trim() == name) {
-                Err(error)
-            } else {
-                Ok(())
+pub fn stop_all(names: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    cleanup(names, Duration::from_secs(60), |args, timeout| {
+        let mut cmd = command();
+        cmd.args(args);
+        checked(cmd, timeout)
+    })
+}
+
+/// One deployment-wide budget and, on failure, one inventory check. A stalled
+/// daemon must not make cleanup take a fresh minute for every team instance.
+fn cleanup(
+    names: &std::collections::BTreeMap<String, String>,
+    budget: Duration,
+    run: impl Fn(&[&str], Duration) -> Result<Vec<u8>>,
+) -> Vec<String> {
+    let started = Instant::now();
+    let mut failures = std::collections::BTreeMap::new();
+    for name in names.values() {
+        let result = (|| -> Result<()> {
+            // Persisted identities must never address arbitrary user sandboxes.
+            let id = name
+                .strip_prefix("omar-team-")
+                .context("invalid sandbox name")?;
+            anyhow::ensure!(
+                uuid::Uuid::parse_str(id)?.to_string() == id,
+                "invalid sandbox ID"
+            );
+            let left = budget.saturating_sub(started.elapsed());
+            anyhow::ensure!(!left.is_zero(), "deployment sandbox cleanup timed out");
+            run(&["stop", name], left)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            failures.insert(name.clone(), format!("{name}: {error:#}"));
+        }
+    }
+    let left = budget.saturating_sub(started.elapsed());
+    if !failures.is_empty() && !left.is_zero() {
+        // Creation may fail before allocation, or an operator may remove a VM.
+        // Only a successful inventory proves absence, never a daemon/auth error.
+        if let Ok(output) = run(&["ls", "--quiet"], left) {
+            if let Ok(list) = std::str::from_utf8(&output) {
+                failures.retain(|name, _| list.lines().any(|line| line.trim() == name));
             }
         }
     }
-}
-
-pub fn stop_all(names: &std::collections::BTreeMap<String, String>) -> Vec<String> {
-    names
-        .values()
-        .filter_map(|name| stop(name).err().map(|e| format!("{name}: {e:#}")))
-        .collect()
+    failures.into_values().collect()
 }
 
 type Request = (Value, mpsc::Sender<Result<Value>>);
@@ -337,8 +352,13 @@ mod tests {
         );
         assert!(paths[1].is_null());
         assert_eq!(paths[2], own.to_str().unwrap());
+        let mut relative = serde_json::json!("artifact");
+        map_input_paths(&mut relative, "path", &workspace, root).unwrap();
+        assert_eq!(
+            relative,
+            workspace.worktree(root).join("artifact").to_str().unwrap()
+        );
         for path in [
-            "relative",
             "/source/../secret",
             "/source-other/file",
             "/omar/workspace-history/key",
@@ -371,5 +391,33 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unavailable"));
+    }
+    #[test]
+    fn cleanup_uses_one_budget_and_one_inventory() {
+        let names: std::collections::BTreeMap<_, _> = (0..3)
+            .map(|n| (n.to_string(), format!("omar-team-{}", uuid::Uuid::new_v4())))
+            .collect();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let failed = cleanup(&names, Duration::from_secs(1), |args, _| {
+            calls.borrow_mut().push(args[0].to_string());
+            if args[0] == "stop" {
+                bail!("not found or daemon unavailable");
+            }
+            Ok(format!("{}\n", names["1"]).into_bytes())
+        });
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].contains(&names["1"]));
+        assert_eq!(*calls.borrow(), ["stop", "stop", "stop", "ls"]);
+
+        let count = std::cell::Cell::new(0);
+        let started = Instant::now();
+        let failed = cleanup(&names, Duration::from_millis(10), |_, _| {
+            count.set(count.get() + 1);
+            std::thread::sleep(Duration::from_millis(15));
+            bail!("daemon stalled")
+        });
+        assert_eq!(count.get(), 1);
+        assert_eq!(failed.len(), 3);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

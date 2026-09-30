@@ -77,6 +77,14 @@ else: sys.exit(2)
         instructions.append(dict(op="install_reaction", instance="a", id="a.observe-child", agent="",
             triggers=["a.child.out"], effects=["a.observed"], contract="a.observed", prompt="",
             body='observed = Some(out.unwrap());'))
+        instructions.append(dict(op="define_port", instance="a", kind="action", name="a.artifact_path", type="path"))
+        instructions.append(dict(op="define_port", instance="a", kind="output", name="a.file_result", type="string"))
+        instructions.append(dict(op="install_reaction", instance="a", id="a.publish-path", agent="",
+            triggers=["a.tick"], effects=["a.artifact_path"], contract="a.artifact_path", prompt="",
+            body='artifact_path = Some("artifact".to_string());'))
+        instructions.append(dict(op="install_reaction", instance="a", id="a.read-path", agent="",
+            triggers=["a.artifact_path"], effects=["a.file_result"], contract="a.file_result", prompt="",
+            body='let text = std::fs::read_to_string(artifact_path.unwrap()).unwrap(); assert_eq!(text, "second"); file_result = Some(text);'))
         instructions.append({"op": "commit_plan"})
         bytecode = root / "program.json"
         bytecode.write_text(json.dumps(dict(version=1, team="SandboxTeams", instructions=instructions)))

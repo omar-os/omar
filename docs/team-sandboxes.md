@@ -46,7 +46,8 @@ delivery channels all run inside the sandbox. Host-to-worker control uses
 bounded `sbx exec` stdin/stdout frames. No host invocation listener or token is
 passed into the VM; returned effects and state are validated again on the host.
 
-Typed path inputs inside the seeded source directory are translated to that
+Relative path inputs resolve in the receiving team's worktree. Absolute inputs
+inside the seeded source directory are translated to that
 team's worktree. Paths outside that source and the team's own mounts are rejected;
 cross-team artifact transfer requires a future explicit interface. Ordinary
 strings are not interpreted as paths. Agents cannot use the external `.git`
@@ -60,7 +61,8 @@ tools interactively is not a portable checkpoint.
 
 Deployment records persist sandbox names and the template digest before creation. Completion, graceful
 stop, force kill, and replacement stop the recorded VMs. A failed stop leaves
-cleanup unconfirmed and blocks final/manual snapshots. Workspaces and stopped
+cleanup unconfirmed and blocks final/manual snapshots. Cleanup has a single
+60-second budget for the deployment, including one inventory check. Workspaces and stopped
 VMs remain available; use `sbx rm NAME` when their VM-local state is no longer
 needed. OMAR does not automatically delete file history.
 
