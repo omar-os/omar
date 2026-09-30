@@ -249,6 +249,7 @@ struct Context_ {
     session_prefix: String,
     default_workdir: String,
     health_idle_warning: i64,
+    sandbox_template: Option<String>,
     runs: Runs,
     /// Where each run's web-backed invocations are answered. Absent for a run
     /// whose program has no `Web` agent, which is what makes the panel routes
@@ -384,6 +385,7 @@ impl Serve {
             session_prefix: config.dashboard.session_prefix.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
+            sandbox_template: config.sandbox.template.clone(),
             runs: Runs::default(),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
@@ -1401,6 +1403,7 @@ impl Workspaces {
             session_prefix: self.root.session_prefix.clone(),
             default_workdir: self.root.default_workdir.clone(),
             health_idle_warning: self.root.health_idle_warning,
+            sandbox_template: self.root.sandbox_template.clone(),
             runs: Runs::default(),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
@@ -2187,6 +2190,7 @@ fn spawn_run_thread(
                 base_prefix: &context.session_prefix,
                 default_workdir: &context.default_workdir,
                 health_idle_warning: context.health_idle_warning,
+                sandbox_template: context.sandbox_template.as_deref(),
                 inputs: &inputs,
                 replace,
                 timeout,
