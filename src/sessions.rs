@@ -827,6 +827,27 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
                 "legacy mode cannot target or inherit a managed session"
             )));
         }
+        if matches!(
+            cli.command,
+            Some(
+                Commands::Up(_)
+                    | Commands::Ls
+                    | Commands::Info { .. }
+                    | Commands::Attach { .. }
+                    | Commands::Web { .. }
+                    | Commands::Logs { .. }
+                    | Commands::Down { .. }
+                    | Commands::Start(_)
+                    | Commands::Runs { .. }
+                    | Commands::Ea { .. }
+                    | Commands::SessionDaemon { .. }
+                    | Commands::SessionExec { .. }
+            )
+        ) {
+            return Some(Err(anyhow::anyhow!(
+                "session commands do not support --legacy"
+            )));
+        }
         return None;
     }
     if !matches!(

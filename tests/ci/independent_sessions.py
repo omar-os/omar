@@ -76,6 +76,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             cli(*args)
         assert not Path(env["OMAR_HOME"]).exists(), "help wrote runtime state"
         cli("runs", ok=False)
+        assert "do not support --legacy" in cli("--legacy", "up", ok=False)
         outer = up("outer")
         inherited = dict(env, OMAR_SESSION_ID=outer["id"], OMAR_STATE_DIR=outer["directory"],
                          OMAR_TMUX_SERVER=outer["tmux_server"], OMAR_EA_ID="99", TMUX="parent")
