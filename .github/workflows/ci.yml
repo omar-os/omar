@@ -128,6 +128,28 @@ jobs:
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1
 
+  decision-support:
+    name: Optional Jev Assistance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lang
+          build: true
+          test: false
+      - run: cargo clippy --bin omar --features decision-support -- -D warnings
+      - run: cargo test --bin omar --features decision-support decisions:: -- --test-threads=1
+      - run: cargo test --bin omar --features decision-support serve::assistance::tests -- --test-threads=1
+      - run: cargo test --bin omar --features decision-support advisory_reader -- --test-threads=1
+      - run: cargo test --bin omar --features decision-support protocol::
+      - run: cargo test --bin omar --features decision-support starter_workflows_compile -- --ignored
+      # Live evaluation is never selected here and no provider secret is set.
+
   codex-shared-history:
     name: Codex Shared History
     runs-on: ubuntu-latest

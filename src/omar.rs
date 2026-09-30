@@ -5,6 +5,7 @@ mod backend_runner;
 mod chat_history;
 mod computer;
 mod config;
+mod decisions;
 mod deploy;
 mod diagram;
 mod ea;

@@ -1,0 +1,31 @@
+{
+  "assumed_input_usd_per_million": 1.0,
+  "baseline": {
+    "coverage": 0.0,
+    "false_positive_covered_or_satisfied": 0,
+    "policy": "always abstain",
+    "precision_among_surfaced": null
+  },
+  "by_profile": null,
+  "cases": [],
+  "corpus_version": "jev-workflow-corpus-v1",
+  "cost_note": "Estimate uses request UTF-8 bytes as a conservative token proxy. Provider overhead, billing rules and taxes are unknown. This is not a provider-side spend cap. Actual invoice cost is unavailable.",
+  "label_status": "synthetic-provisional-not-human-reviewed",
+  "max_estimated_usd": 0.001,
+  "max_requests": 1,
+  "measured_invoice_cost_usd": null,
+  "metrics": null,
+  "model_quality_validated": false,
+  "model_requested": "jev-1.13.0",
+  "policy_version": "workflow-advice-v1",
+  "product_enablement": "off",
+  "profiles": [
+    "template-fit-v1",
+    "scenario-coverage-v1",
+    "artifact-requirement-v1"
+  ],
+  "requests_sent": 0,
+  "schema_version": 1,
+  "split": "held-out",
+  "status": "skipped_missing_credentials"
+}
