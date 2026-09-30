@@ -87,7 +87,7 @@ fi
 pi --version
 
 # Initialize EA-scoped state, then use the same MCP protocol the extension uses.
-"$OMAR_BIN" list >/dev/null 2>&1 || true
+"$OMAR_BIN" --legacy list >/dev/null 2>&1 || true
 
 mcp_call() {
   local tool="$1" args="$2"

@@ -77,10 +77,13 @@ cd omar && make install
 #### Step 1: Launch Mission Control
 
 ```bash
-$ omar serve --ui
+$ omar up --name dev
+$ omar web dev
 ```
 
-Serves the web UI from the daemon's own address and opens it in your browser.
+Starts an independent background runtime, then opens its web UI. Closing the
+browser leaves the runtime and its topologies running. Stop it with `omar down dev`.
+See [session commands and lifecycle](docs/sessions.md).
 
 #### Step 2: Describe a workflow
 
@@ -89,14 +92,19 @@ the topology it compiles to.
 Nothing runs until you press **Confirm deploy**,
 then the diagram goes live.
 
+### Terminal client
+
+Run `omar attach dev`. `q` detaches, `s` switches sessions, `Tab` selects an EA,
+and `Enter` inspects the selected agent. The runtime owns all workloads.
+
 ### Terminal UI (Legacy)
 
 Note: The legacy terminal UI does not yet implement the deterministic model in the mission control.
 
-#### Step 1: Launch `omar`
+#### Step 1: Launch `omar --legacy`
 
 ```bash
-$ omar
+$ omar --legacy
 ```
 
 Go [here](#supported-agent-backends) to see how to launch with specific agent backends.
@@ -130,10 +138,11 @@ Shutdown the test project and its agents.
 | [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy` |
 | [Pi](https://pi.dev) | `omar -a pi` |
 
-Each `omar -a <backend>` launch creates a new EA, named with its new EA number.
-Use `omar -a codex --ea Research` to give the new EA a semantic name. An existing
-name is rejected rather than replacing its manager. Run `omar --ea <id-or-name>`
-without `-a` to open an existing EA.
+Each `omar -a <backend>` launch starts a new independent session with EA 0.
+Use `omar -a codex up --name dev` to name the session. Add another EA inside it
+with `omar --session dev ea create --name Research --agent codex`.
+Target it with `omar --session dev --ea Research ...`; this does not change
+another client's selection.
 
 Codex launch commands no longer disable the alternate screen. OMAR does not
 add `--no-alt-screen`; an explicit flag in a custom command is still respected.

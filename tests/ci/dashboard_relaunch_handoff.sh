@@ -127,7 +127,7 @@ launch_handoff() {
   rm -f "$handoff_file"
   (
     cd "$work_dir"
-    HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" "$@" </dev/null >"$home_dir/launch.log" 2>&1
+    HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" --legacy "$@" </dev/null >"$home_dir/launch.log" 2>&1
   ) || true
   [ -f "$handoff_file" ] || fail "fresh dashboard_handoff.json was not written for: $*"
 }
@@ -209,7 +209,7 @@ rm -f "$handoff_file"
 
 (
   cd "$work_dir"
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" -a claude </dev/null >"$home_dir/launch.log" 2>&1 || true
+  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" --legacy -a claude </dev/null >"$home_dir/launch.log" 2>&1 || true
 )
 
 assert_backend_alive 3

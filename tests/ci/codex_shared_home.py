@@ -118,12 +118,12 @@ trust_level="trusted"
             if index == 1:
                 # Exercise the real cold dashboard exec inside a PTY. It must
                 # reuse the already allocated EA rather than allocate twice.
-                command = shlex.join(['env', '-u', 'TMUX', OMAR, '-a', 'codex'])
+                command = shlex.join(['env', '-u', 'TMUX', OMAR, '--legacy', '-a', 'codex'])
                 tmux('new-session', '-d', '-s', 'cold-launch', '-x', '110', '-y', '35', '-c', str(work), command)
                 until(lambda: 'omar-dashboard' in tmux('list-sessions'), 'cold dashboard')
             else:
                 # Non-TTY attach can fail after the new manager starts.
-                subprocess.run([OMAR, '-a', 'codex'], cwd=work, env=env, capture_output=True, text=True, timeout=30)
+                subprocess.run([OMAR, "--legacy", '-a', 'codex'], cwd=work, env=env, capture_output=True, text=True, timeout=30)
             session = 'omar-agent-ea-'+str(index)
             paths = until(lambda: list((home/'.omar/codex-runtime').glob('*/app.sock')), 'socket')
             start = tmux('display-message', '-p', '-t', session, '#{pane_start_command}')
@@ -175,7 +175,7 @@ trust_level="trusted"
         tmux('set-option', '-g', 'remain-on-exit', 'on')
         resume_config = work/'resume.toml'
         resume_config.write_text('[agent]\ndefault_command="codex resume '+first_thread+'"\n')
-        result = subprocess.run([OMAR, '-c', str(resume_config), '--ea', '1', 'manager', 'start'], cwd=work, env=env, capture_output=True, text=True, timeout=30)
+        result = subprocess.run([OMAR, "--legacy", '-c', str(resume_config), '--ea', '1', 'manager', 'start'], cwd=work, env=env, capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
         start = tmux('display-message', '-p', '-t', first_session, '#{pane_start_command}')
         endpoint = next(p for p in (home/'.omar/codex-runtime').glob('*/app.sock') if str(p) in start)
@@ -195,7 +195,7 @@ trust_level="trusted"
             port_socket.bind(('127.0.0.1', 0))
             port = port_socket.getsockname()[1]
         daemon_log = open(work/'serve.log', 'w')
-        daemon = subprocess.Popen([OMAR, '-a', 'codex', '--ea', 'ServeTrial', 'serve', '--address', f'127.0.0.1:{port}'], cwd=work, env=env, stdout=daemon_log, stderr=daemon_log)
+        daemon = subprocess.Popen([OMAR, "--legacy", '-a', 'codex', '--ea', 'ServeTrial', 'serve', '--address', f'127.0.0.1:{port}'], cwd=work, env=env, stdout=daemon_log, stderr=daemon_log)
         until(lambda: len(json.loads((home/'.omar/eas.json').read_text())) == 3, 'serve allocates new EA')
         registry = json.loads((home/'.omar/eas.json').read_text())
         assert registry[-1]['id'] == 3 and registry[-1]['name'] == 'ServeTrial', registry
@@ -203,7 +203,7 @@ trust_level="trusted"
         until(lambda: 'Ask Codex' in tmux('capture-pane', '-p', '-t', served, check=False), 'served EA composer')
         tmux('send-keys', '-t', served, '-l', 'SERVE_UNSENT_DRAFT')
         until(lambda: 'SERVE_UNSENT_DRAFT' in pane(served), 'served draft')
-        subprocess.run([OMAR, '--ea', '3', 'event', 'schedule', '--receiver', 'ea', '--payload', 'LIVE_SCHEDULER_SENTINEL', '--in-seconds', '0'], cwd=work, env=env, check=True, capture_output=True, text=True)
+        subprocess.run([OMAR, "--legacy", '--ea', '3', 'event', 'schedule', '--receiver', 'ea', '--payload', 'LIVE_SCHEDULER_SENTINEL', '--in-seconds', '0'], cwd=work, env=env, check=True, capture_output=True, text=True)
         until(lambda: 'LIVE_SCHEDULER_SENTINEL' in json.dumps(requests), 'real scheduler event')
         assert 'SERVE_UNSENT_DRAFT' in pane(served), pane(served)
         assert tmux('display-message', '-p', '-t', 'omar-agent-ea-2', '#{pane_id}') == second_pane
@@ -226,7 +226,7 @@ trust_level="trusted"
             {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
                 'name': 'send_input', 'arguments': {'name': served, 'text': 'MCP_FOLLOWUP_SENTINEL', 'enter': True}}},
         ]
-        mcp = subprocess.run([OMAR, '--ea', '3', 'mcp-server'], cwd=work,
+        mcp = subprocess.run([OMAR, "--legacy", '--ea', '3', 'mcp-server'], cwd=work,
                              env=dict(env, OMAR_EA_ID='3', OMAR_DIR=str(home/'.omar')),
                              input=''.join(json.dumps(m)+'\n' for m in mcp_messages),
                              capture_output=True, text=True, timeout=30, check=True)

@@ -57,7 +57,7 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
     for key in ['TMUX', 'OMAR_DIR', 'OMAR_EA_ID']:
         env.pop(key, None)
     try:
-        launched = subprocess.run([OMAR, 'manager', 'start'], cwd=folder, env=env,
+        launched = subprocess.run([OMAR, "--legacy", 'manager', 'start'], cwd=folder, env=env,
                                   capture_output=True, text=True, timeout=30)
         # Non-TTY attach can fail after setup. Inspect the actual channel, not
         # that attach status, and only after the launcher has fully exited.
@@ -73,7 +73,7 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
         request = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
             'name': 'send_input', 'arguments': {
                 'name': 'omar-agent-ea-0', 'text': 'AFTER_LAUNCHER_EXIT'}}}
-        sent = subprocess.run([OMAR, 'mcp-server', '--context-file', str(root/'context.json')],
+        sent = subprocess.run([OMAR, "--legacy", 'mcp-server', '--context-file', str(root/'context.json')],
                               cwd=folder, env=env, input=json.dumps(request)+'\n',
                               capture_output=True, text=True, check=True, timeout=20)
         reply = json.loads(sent.stdout)

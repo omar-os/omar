@@ -391,7 +391,7 @@ fn read_claim(path: &Path) -> String {
 /// Tells one compile's draft from another's in the same process.
 static DRAFTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn resolve_omarc() -> PathBuf {
+pub(crate) fn resolve_omarc() -> PathBuf {
     if let Some(path) = std::env::var_os("OMARC_BIN") {
         return PathBuf::from(path);
     }

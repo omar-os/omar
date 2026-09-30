@@ -23,6 +23,8 @@ mod protocol;
 mod reaction;
 mod scheduler;
 mod serve;
+mod session_tui;
+mod sessions;
 mod stub_agent;
 mod supervision;
 mod terminal;
@@ -72,20 +74,36 @@ pub const DASHBOARD_SESSION: &str = "omar-dashboard";
 const TMUX_SETUP_WARNING: &str = "⚠ tmux not configured for omar — run 'omar setup-tmux' to fix";
 
 #[derive(Parser)]
-#[command(name = "omar", about = "Agent dashboard for tmux", version)]
+#[command(
+    name = "omar",
+    about = "Independent agent runtimes and topology orchestration",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Use the pre-session runtime layout during migration (never implicit)
+    #[arg(long, global = true)]
+    legacy: bool,
+
+    /// Target an existing runtime session by id or name
+    #[arg(short = 's', long, global = true)]
+    session: Option<String>,
+
+    /// Print structured command results
+    #[arg(long, global = true)]
+    json: bool,
 
     /// Path to config file
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Create a new EA with this backend: claude, codex, cursor, opencode, pi, agy
+    /// Backend for the initial EA of a new session
     #[arg(short, long)]
     agent: Option<String>,
 
-    /// Name for a new EA with -a; otherwise target an EA by id or name
+    /// Target an EA within the selected runtime (default: 0)
     #[arg(long, global = true)]
     ea: Option<String>,
 
@@ -100,6 +118,56 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Create a new independent background runtime
+    Up(sessions::UpOptions),
+    /// List independently addressable runtime sessions
+    Ls,
+    /// Inspect a runtime session
+    Info { session: String },
+    /// Attach a terminal client (q detaches; runtime keeps running)
+    Attach { session: String },
+    /// Open Mission Control for an existing runtime
+    Web {
+        session: String,
+        #[arg(long)]
+        print_url: bool,
+    },
+    /// Read a runtime's log
+    Logs {
+        session: String,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long, default_value_t = 100)]
+        tail: usize,
+    },
+    /// Shut down one runtime and its owned workloads
+    Down {
+        session: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
+    /// Submit a topology to the selected runtime
+    Start(sessions::StartOptions),
+    /// List topology runs in the selected runtime
+    Runs {
+        #[arg(long)]
+        all_eas: bool,
+    },
+    /// Manage EAs inside a runtime session
+    Ea {
+        #[command(subcommand)]
+        action: sessions::EaAction,
+    },
+    #[command(hide = true)]
+    SessionDaemon { directory: PathBuf },
+    #[command(hide = true)]
+    SessionExec {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Inspect and version team-instance files (not runtime checkpoints)
     Workspace {
         #[command(subcommand)]
@@ -160,6 +228,7 @@ enum Commands {
     SetupTmux,
 
     /// Start or interact with the manager agent
+    #[command(arg_required_else_help = true)]
     Manager {
         /// Manager action (start, orchestrate)
         #[command(subcommand)]
@@ -200,7 +269,7 @@ enum Commands {
         context_file: Option<String>,
     },
 
-    /// Run an OMAR program to completion
+    /// Legacy foreground topology runner (requires --legacy; use start)
     Run {
         /// OMAR source program
         program: PathBuf,
@@ -245,8 +314,11 @@ enum Commands {
 
     /// Accept OMAR programs over HTTP and supervise their runs
     Serve {
+        /// Name for a new independent foreground session
+        #[arg(long)]
+        name: Option<String>,
         /// Loopback address to bind the admission API
-        #[arg(long, default_value = "127.0.0.1:7340")]
+        #[arg(long, default_value = "127.0.0.1:0")]
         address: std::net::SocketAddr,
 
         /// Restart the executive assistant so it can reply and propose designs.
@@ -374,6 +446,8 @@ fn open_browser(url: &str) {
 }
 
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+    sessions::prepare_process(&cli)?;
     // Install the persisted-panic hook FIRST, before tokio builds its
     // runtime (and spawns worker threads). If the tmux parent dies it
     // takes the stderr pane with it (see issue #118), so panics need
@@ -389,12 +463,32 @@ fn main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(async_main())
+        .block_on(async_main(cli))
 }
 
-async fn async_main() -> Result<()> {
-    let cli = Cli::parse();
+async fn async_main(mut cli: Cli) -> Result<()> {
+    let internal = if let Some(Commands::SessionExec { args }) = &cli.command {
+        let args = args.clone();
+        cli = Cli::try_parse_from(std::iter::once("omar".to_string()).chain(args))?;
+        sessions::validate_exec(&cli)?;
+        true
+    } else {
+        false
+    };
+    if !internal {
+        if let Some(result) = sessions::dispatch(&cli).await {
+            return result;
+        }
+    }
     let mut config = Config::load(cli.config.as_deref())?;
+    if internal {
+        let target = ea::resolve_ea_selector(&omar_dir(), cli.ea.as_deref())?;
+        if let Ok(command) = std::fs::read_to_string(
+            ea::ea_state_dir(target.id, &omar_dir()).join("assistant-command"),
+        ) {
+            config.agent.default_command = command;
+        }
+    }
     if let Some(ref agent) = cli.agent {
         config.agent.default_command = crate::backend::resolve(agent)
             .map(|backend| backend.default_command().to_string())
@@ -411,7 +505,7 @@ async fn async_main() -> Result<()> {
     let new_ea_launch = cli.agent.is_some() && cli.command.is_none();
     let defer_active_ea_save = new_ea_launch;
 
-    if !defer_active_ea_save {
+    if !defer_active_ea_save && !sessions::is_managed() {
         if let Some(ref selector) = cli.ea {
             let (ea_info, created) = ea::resolve_or_create_ea_selector(&omar_dir, Some(selector))?;
             if created {
@@ -422,6 +516,20 @@ async fn async_main() -> Result<()> {
     }
 
     match cli.command {
+        Some(
+            Commands::Up(_)
+            | Commands::Ls
+            | Commands::Info { .. }
+            | Commands::Attach { .. }
+            | Commands::Web { .. }
+            | Commands::Logs { .. }
+            | Commands::Down { .. }
+            | Commands::Start(_)
+            | Commands::Runs { .. }
+            | Commands::Ea { .. }
+            | Commands::SessionDaemon { .. }
+            | Commands::SessionExec { .. },
+        ) => unreachable!(),
         Some(Commands::Spawn {
             name,
             command,
@@ -670,6 +778,7 @@ async fn async_main() -> Result<()> {
         }
         Some(Commands::StubAgent { context_file }) => stub_agent::run(&context_file),
         Some(Commands::Serve {
+            name: _,
             address,
             restart_ea,
             no_ea,
@@ -770,9 +879,7 @@ async fn async_main() -> Result<()> {
 }
 
 fn omar_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar")
+    sessions::state_root()
 }
 
 fn resolve_cli_ea(omar_dir: &std::path::Path, selector: Option<&str>) -> Result<ea::EaInfo> {

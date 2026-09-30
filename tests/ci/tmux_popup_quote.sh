@@ -62,7 +62,7 @@ wait_for_session() {
 }
 
 tmux -L "$server" new-session -d -s omar-dashboard \
-  "cd '$REPO_ROOT' && HOME='$home_dir' OMAR_TMUX_SERVER='$server' '$OMAR_BIN'"
+  "cd '$REPO_ROOT' && HOME='$home_dir' OMAR_TMUX_SERVER='$server' '$OMAR_BIN' --legacy"
 tmux_cmd set-option -g default-shell "$(command -v zsh)"
 
 wait_for_session omar-dashboard

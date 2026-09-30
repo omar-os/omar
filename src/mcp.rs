@@ -481,11 +481,7 @@ fn apply_context_environment(context: &McpLaunchContext) {
 pub fn run_server_with_default_context() -> Result<()> {
     let omar_dir = std::env::var_os("OMAR_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".omar")
-        });
+        .unwrap_or_else(crate::sessions::state_root);
     let config_path = omar_dir.join("config.toml").to_string_lossy().into_owned();
     let config = crate::config::Config::load(Some(&config_path))
         .with_context(|| format!("Failed to load omar config for {}", omar_dir.display()))?;

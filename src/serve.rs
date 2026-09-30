@@ -335,6 +335,137 @@ pub struct Serve {
 }
 
 impl Serve {
+    pub(crate) fn session_runs(&self, ea: Option<EaId>) -> Vec<Value> {
+        self.workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|context| ea.is_none_or(|id| id == context.ea_id))
+            .flat_map(|context| {
+                context
+                    .runs
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .map(|run| {
+                        let mut value = json!(run);
+                        value["ea_id"] = json!(context.ea_id);
+                        value
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    pub(crate) fn session_start(&self, ea: EaId, body: Value) -> Result<Value> {
+        let _admission = self.workspaces.presence.lock().unwrap();
+        anyhow::ensure!(
+            !self.workspaces.shutdown.load(Ordering::SeqCst),
+            "runtime is stopping"
+        );
+        let id = self.workspaces.history.lock().unwrap().chat_for_ea(ea)?;
+        let context = self.workspaces.get(&id)?;
+        let (status, value) = start_run(&context, &serde_json::to_vec(&body)?);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    pub(crate) fn session_create_ea(&self, name: &str, command: Option<&str>) -> Result<EaId> {
+        // Browser-created chats allocate from this same registry.
+        let _selection = self.workspaces.selection.lock().unwrap();
+        let root = &self.workspaces.root.omar_dir;
+        let id = crate::ea::register_ea(root, name, None)?;
+        if let Some(command) = command {
+            crate::manager::write_private_file(
+                &crate::ea::ea_state_dir(id, root).join("assistant-command"),
+                command.as_bytes(),
+            )?;
+        }
+        Ok(id)
+    }
+
+    pub(crate) fn session_start_manager(&self, ea: EaId) -> Result<Value> {
+        let _admission = self.workspaces.presence.lock().unwrap();
+        anyhow::ensure!(
+            !self.workspaces.shutdown.load(Ordering::SeqCst),
+            "runtime is stopping"
+        );
+        let id = self.workspaces.history.lock().unwrap().chat_for_ea(ea)?;
+        let context = self.workspaces.get(&id)?;
+        let _operation = context.chat_operation.lock().unwrap();
+        let name = crate::ea::ea_manager_session(ea, &context.session_prefix);
+        let client = TmuxClient::new("");
+        if !client.has_session(&name)? {
+            let command = context.command.lock().unwrap().clone();
+            relaunch_ea(&context, &command)?;
+        }
+        context.chat.lock().unwrap().needs_relaunch = false;
+        Ok(json!({"session": name, "ea_id":ea}))
+    }
+
+    pub(crate) fn session_stop(&self, ea: EaId, selector: &str) -> Result<Value> {
+        let contexts = self
+            .workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut matches = Vec::new();
+        for context in contexts {
+            if context.ea_id != ea {
+                continue;
+            }
+            for run in context.runs.lock().unwrap().values() {
+                if run.run_id == selector || (run.team == selector && run.status.is_active()) {
+                    matches.push((context.clone(), run.run_id.clone()));
+                }
+            }
+        }
+        anyhow::ensure!(
+            matches.len() == 1,
+            "run '{selector}' is missing or ambiguous; use its run id"
+        );
+        let (context, id) = &matches[0];
+        let (status, value) = stop_run(context, id);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    pub(crate) fn session_stopping(&self) -> Result<()> {
+        // Admission uses this same mutex when checking shutdown and inserting a run.
+        let mut presence = self.workspaces.presence.lock().unwrap();
+        presence.stopping = true;
+        self.workspaces.shutdown.store(true, Ordering::SeqCst);
+        for context in self.workspaces.contexts.lock().unwrap().values() {
+            for run in context
+                .runs
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|r| r.status.is_active())
+            {
+                crate::deploy::request_stop(&crate::deploy::dir_for(
+                    &context.omar_dir,
+                    context.ea_id,
+                    &run.team,
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn session_has_work(&self) -> bool {
+        self.session_runs(None).iter().any(|r| {
+            matches!(
+                r["status"].as_str(),
+                Some("starting" | "running" | "stopping")
+            )
+        })
+    }
+
     pub fn start(
         address: SocketAddr,
         config: &Config,
@@ -476,7 +607,7 @@ impl Serve {
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
             agent_name: None,
-            tmux_server: None,
+            tmux_server: std::env::var("OMAR_TMUX_SERVER").ok(),
             topology: None,
             serve: Some(crate::manager::ServeMcpContext {
                 endpoint: self.address.to_string(),
@@ -1323,6 +1454,9 @@ fn relaunch_ea(context: &Arc<Context_>, command: &str) -> Result<String> {
 
 impl Workspaces {
     fn shutdown_if_idle(&self) -> bool {
+        if crate::sessions::is_managed() {
+            return false;
+        }
         let mut presence = self.presence.lock().expect("presence poisoned");
         let contexts: Vec<_> = self
             .contexts

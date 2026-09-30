@@ -133,7 +133,7 @@ fail() {
 }
 
 tmux_cmd new-session -d -s omar-dashboard \
-  "cd '$REPO_ROOT' && HOME='$home_dir' OMAR_TMUX_SERVER='$server' '$OMAR_BIN'"
+  "cd '$REPO_ROOT' && HOME='$home_dir' OMAR_TMUX_SERVER='$server' '$OMAR_BIN' --legacy"
 
 wait_for_session omar-dashboard || fail "dashboard session did not start"
 wait_for_session omar-agent-ea-0 || fail "initial manager session failed to appear"

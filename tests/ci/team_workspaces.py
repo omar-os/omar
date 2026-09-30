@@ -50,7 +50,7 @@ def main():
                    RUSTUP_HOME=os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")))
 
         def run(*args):
-            result = subprocess.run([str(BIN), *args], cwd=source, env=env,
+            result = subprocess.run([str(BIN), "--legacy", *args], cwd=source, env=env,
                                     text=True, capture_output=True, timeout=180)
             assert result.returncode == 0, f"{args}: {result.stdout}\n{result.stderr}"
             return result.stdout
@@ -146,7 +146,7 @@ out = Some(cwd.display().to_string());
             for workspace in later:
                 snapshots = json.loads(run("workspace", "show", workspace["id"]))["snapshots"]
                 assert [s["label"] for s in snapshots] == ["Initial workspace"], snapshots
-                refused = subprocess.run([str(BIN), "workspace", "snapshot", workspace["id"]],
+                refused = subprocess.run([str(BIN), "--legacy", "workspace", "snapshot", workspace["id"]],
                                          cwd=source, env=dict(env, OMAR_TMUX_SERVER=server + "-other"),
                                          text=True, capture_output=True, timeout=30)
                 assert refused.returncode != 0, refused.stdout
@@ -160,7 +160,7 @@ out = Some(cwd.display().to_string());
             for session in record["sessions"].values():
                 subprocess.run([tmux, "-L", other_server, "new-session", "-d", "-s", session,
                                 "sleep 300"], check=True, capture_output=True)
-            cleanup = subprocess.run([str(BIN), "kill", "Workspaces"], cwd=source,
+            cleanup = subprocess.run([str(BIN), "--legacy", "kill", "Workspaces"], cwd=source,
                                      env=dict(env, OMAR_TMUX_SERVER=other_server),
                                      text=True, capture_output=True, timeout=30)
             assert cleanup.returncode == 0, cleanup.stderr
@@ -184,11 +184,11 @@ out = Some(cwd.display().to_string());
                 "--input", "right.tick=1", "--fast")
             archived = records[0].parent / "deployments" / (old["deployment_id"] + ".json")
             assert json.loads(archived.read_text())["tmux_server"] == server
-            refused = subprocess.run([str(BIN), "workspace", "snapshot", old_workspace],
+            refused = subprocess.run([str(BIN), "--legacy", "workspace", "snapshot", old_workspace],
                                      cwd=source, env=env, text=True, capture_output=True, timeout=30)
             assert refused.returncode != 0 and "stop remaining topology sessions" in refused.stderr, refused
             subprocess.run([tmux, "-L", server, "kill-server"], check=True, capture_output=True)
-            refused = subprocess.run([str(BIN), "workspace", "snapshot", old_workspace],
+            refused = subprocess.run([str(BIN), "--legacy", "workspace", "snapshot", old_workspace],
                                      cwd=source, env=env, text=True, capture_output=True, timeout=30)
             assert refused.returncode != 0 and "tmux session state is unknown" in refused.stderr, refused
             # Once cleanup is confirmed, the same terminal deployment permits snapshots.
@@ -212,7 +212,7 @@ out = Some(cwd.display().to_string());
             replaced["pid"] = 4294967295
             records[0].write_text(json.dumps(replaced))
             env["OMAR_TMUX_SERVER"] = server
-            refused = subprocess.run([str(BIN), "run", str(program), "--replace", "--fast"],
+            refused = subprocess.run([str(BIN), "--legacy", "run", str(program), "--replace", "--fast"],
                                      cwd=source, env=dict(env, OMAR_TEST_KILL_FAIL="1"),
                                      text=True, capture_output=True, timeout=30)
             assert refused.returncode != 0 and "cannot replace deployment" in refused.stderr, refused
@@ -237,7 +237,7 @@ out = Some(cwd.display().to_string());
             for args in [("kill", "Workspaces"),
                          ("workspace", "snapshot", legacy["workspaces"]["left"]),
                          ("run", str(program), "--replace", "--fast")]:
-                refused = subprocess.run([str(BIN), *args], cwd=source, env=env,
+                refused = subprocess.run([str(BIN), "--legacy", *args], cwd=source, env=env,
                                          text=True, capture_output=True, timeout=30)
                 assert refused.returncode != 0 and "no recorded tmux server" in refused.stderr, refused
                 assert json.loads(records[0].read_text()) == legacy
@@ -290,7 +290,7 @@ out = Some(cwd.display().to_string());
             for workspace_id in vanished["workspaces"].values():
                 versions = json.loads(run("workspace", "show", workspace_id))["snapshots"]
                 assert [v["label"] for v in versions] == ["Initial workspace"]
-                refused = subprocess.run([str(BIN), "workspace", "snapshot", workspace_id],
+                refused = subprocess.run([str(BIN), "--legacy", "workspace", "snapshot", workspace_id],
                                          cwd=source, env=env, text=True, capture_output=True, timeout=30)
                 assert refused.returncode != 0 and "tmux session state is unknown" in refused.stderr, refused
             print("PASS: team workspaces, nested ownership, agent launch, Rust cwd/env, snapshots, and CLI restore")

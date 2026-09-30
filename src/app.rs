@@ -127,9 +127,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: &Config, ticker: TickerBuffer, scheduler: Arc<Scheduler>) -> Self {
-        let omar_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".omar");
+        let omar_dir = crate::sessions::state_root();
 
         Self::new_with_omar_dir(config, ticker, scheduler, omar_dir)
     }
