@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import { FAKE_SERVE_PORT, FAKE_SERVE_URL } from "../../playwright.config";
 import { startFakeServe } from "../fake-serve.mjs";
 
-type FakeServe = { url: string; close(): Promise<void> };
+type FakeServe = { url: string; agentToken: string; close(): Promise<void> };
 
 let fake: FakeServe;
 
@@ -1992,6 +1992,57 @@ test("an undeployed proposal remains actionable after a finished run and chat sw
   await expect(controls.getByRole("button", { name: "Discard", exact: true })).toBeVisible();
   await page.reload();
   await expect(controls).toBeVisible();
+});
+
+test("a new proposal replaces a finished run despite delayed run and diagram responses", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const chat = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+  const program = chat.messages.find((message: { design?: { program: string } }) => message.design).design.program
+    .replace(/\bmain\s+\w+/, "main RevisedFlow");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let held = 0;
+  let delivered = 0;
+  await page.route(/\/v1\/(?:diagram|runs\/[^/?]+)(?:\?.*)?$/, async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    if (body.status === "completed") {
+      held += 1;
+      await gate;
+      await route.fulfill({ response });
+      delivered += 1;
+    } else {
+      await route.fulfill({ response });
+    }
+  });
+  try {
+    await deploy(page);
+    await expect(page.locator(".connection")).toContainText("finished");
+    // Hold both the final record and its diagram after the completion event.
+    await expect.poll(() => held).toBeGreaterThanOrEqual(2);
+    const proposal = await page.request.post(`${fake.url}/v1/agent/proposals`, {
+      data: { token: fake.agentToken, program, summary: "A revised design", inputs: {} },
+    });
+    expect(proposal.ok()).toBeTruthy();
+    await expect(page.locator(".diagram-heading h2")).toHaveText("RevisedFlow");
+    await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("PROPOSED TOPOLOGY");
+    await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
+    await expect(page.locator(".tabs button")).toHaveText(["Source"]);
+    release();
+    await expect.poll(() => delivered).toBe(held);
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    await expect(page.locator(".connection")).toContainText("review");
+    await expect(page.locator(".diagram-heading h2")).toHaveText("RevisedFlow");
+    await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("PROPOSED TOPOLOGY");
+    // Editing must also project the new design, with no old run retaining ownership.
+    await page.getByRole("button", { name: "Show the source pane" }).click();
+    await page.getByLabel("OMAR program").fill(program.replace("main RevisedFlow", "main EditedFlow"));
+    await expect(page.locator(".diagram-heading h2")).toHaveText("EditedFlow");
+  } finally {
+    release();
+    await page.unrouteAll({ behavior: "wait" });
+  }
 });
 
 test("a delayed deploy response cannot replace the chat selected afterward", async ({ page }) => {

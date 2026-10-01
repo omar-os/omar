@@ -14,15 +14,10 @@ bytecode without instance names uses one root workspace.
 Agents and Rust reaction bodies start in `worktree/`. `OMAR_WORKTREE` points to
 it; `OMAR_TEMP` and `TMPDIR` point to `temp/`. Agents receive these conventions
 in their topology instructions. Web agents can inspect the workspace via the
-CLI; artifact browsing in Mission Control is a later feature.
+CLI; operators can browse and edit artifacts in Mission Control.
 
-New worktrees are seeded from the configured `agent.default_workdir`. Git sources
-include current tracked-file edits and non-ignored untracked files, without
-changing the source repository or its index. Deleted files stay deleted.
-Non-Git sources copy ordinary files and symlinks, excluding OMAR's state tree.
-Source writers should be idle during deployment. Git submodules/nested
-repositories and special files require a separate source directory; they are
-not silently omitted from file snapshots.
+New worktrees start empty. Nothing is copied from the directory `omar run` was
+started in; agents fetch or create what they need.
 
 ## File versions
 
@@ -73,6 +68,34 @@ as the host user and can access paths outside their worktree. Container mounts
 and mediated Git access will enforce the boundary later. Restoring files does
 not undo external actions such as sent messages or database writes.
 
+## Browse and edit in Mission Control
+
+Use **Files & versions** in the chat to select a team workspace, browse text and
+raster images, or compare saved files with the current worktree. HTML, SVG and
+Markdown previews are shown as text; symlinks are not followed. Previews are limited to
+512 KiB and directory listings to 2,000 entries. **Refresh** reads new agent or
+editor changes. Historical versions are read-only; **Restore as new workspace**
+creates an editable copy without changing the active topology.
+
+**Open in Web VS Code** starts code-server on demand and opens a new tab on the
+same `worktree/`. Install it separately using the [code-server instructions](https://coder.com/docs/code-server/install).
+OMAR uses `code-server` from PATH; `OMAR_CODE_SERVER_BIN` can select another binary.
+Editor settings/logs live in `~/.omar/editors/<workspace-id>/`, outside snapshots.
+Extensions use code-server's Open VSX gallery; Microsoft's extension catalog is
+not interchangeable.
+
+OMAR gives each editor a private Unix socket and an authenticated loopback
+HTTP/WebSocket gateway. The launch link is a credential; do not share it. No
+manual port/password setup is required. Editor tabs keep the runtime alive.
+**Stop editor** only stops the editor and its child processes. Idle editors are
+reclaimed after 60 seconds without connections; normal runtime shutdown also
+stops them. Closing Mission Control alone does not interrupt a connected editor.
+
+Edits save directly to disk. Agents can concurrently overwrite them; stop the
+topology before conflicting edits. Unsaved editor buffers are not snapshots.
+The IDE's Git history is separate from OMAR's snapshot history. Terminals and
+extensions still run with host-user permissions; container isolation is later.
+
 ## Agent tools and Codex startup
 
 Topology agents may use their normal file and command tools to do invocation
@@ -80,17 +103,12 @@ work. Only topology communication is restricted: write the invocation's allowed
 output ports with `omar_set_port`, then finish with `omar_complete`. Persistent
 artifacts belong in `worktree/`; disposable files belong in `temp/`.
 
-For unattended Codex agents, disable the startup update prompt by setting this
-at the top level of `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`):
-
-```toml
-check_for_update_on_startup = false
-```
-
-Manage Codex updates separately. An update dialog can prevent the TUI from
-loading a thread before OMAR's delivery deadline. OMAR does not change this
-user-wide setting or dismiss dialogs automatically. Passing `-c` to the remote
-TUI is not equivalent: config overrides select OMAR's native exec path instead.
+OMAR handles two startup dialogs for newly launched native agents before
+sending their first task: Claude Code's workspace trust dialog selects
+**Yes, I trust this folder**; Codex's update dialog selects **Skip** for this
+launch, not **Skip until next version**. Update preferences remain unchanged.
+Only these recognized startup dialogs receive keystrokes; tasks still use the
+backend's delivery channel. Unrecognized startup dialogs time out normally.
 
 Reaction commands run in a dedicated process group. OMAR kills remaining group
 members on return, timeout, or failure and verifies that no running members

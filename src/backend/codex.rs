@@ -16,6 +16,29 @@ use std::path::{Path, PathBuf};
 pub struct Codex;
 
 impl Backend for Codex {
+    fn has_startup_gates(&self) -> bool {
+        true
+    }
+    fn startup_gate(&self, screen: &str) -> Option<super::StartupGate> {
+        if screen.contains("Update available")
+            && screen.contains("Update now")
+            && screen.contains("Skip until next version")
+            && screen.lines().any(|line| {
+                let option = line.trim().trim_start_matches(['›', '❯', '>']).trim();
+                option.strip_prefix("2.").unwrap_or(option).trim() == "Skip"
+            })
+        {
+            // Codex maps Escape to NotNow, exactly like plain Skip. It does
+            // not persist a version dismissal or change update preferences.
+            Some(super::StartupGate {
+                id: "update",
+                keys: &["Escape"],
+                confirms: true,
+            })
+        } else {
+            None
+        }
+    }
     fn kind(&self) -> Kind {
         Kind::Codex
     }
@@ -570,6 +593,26 @@ pub(crate) fn only_thread(listed: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_update_gate_skips_once_without_persistent_dismissal() {
+        use super::Backend;
+        for options in [
+            "› 1. Update now (runs `brew upgrade codex`)\n  2. Skip\n  3. Skip until next version",
+            "  Update now\n› Skip\n  Skip until next version",
+            "  1. Update now\n  2. Skip\n› 3. Skip until next version",
+        ] {
+            let screen =
+                format!("Update available · 1.0 → 2.0\n{options}\nenter continue · esc skip");
+            assert_eq!(super::Codex.startup_gate(&screen).unwrap().keys, ["Escape"]);
+        }
+        assert!(super::Codex
+            .startup_gate("Update available! See release notes")
+            .is_none());
+        assert!(super::Codex
+            .startup_gate("OpenAI Codex\n› draft about Skip until next version")
+            .is_none());
+    }
+
     use super::*;
     use crate::manager::build_agent_command;
     use crate::manager::tests::*;
