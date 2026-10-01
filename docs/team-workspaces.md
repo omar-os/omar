@@ -14,7 +14,7 @@ bytecode without instance names uses one root workspace.
 Agents and Rust reaction bodies start in `worktree/`. `OMAR_WORKTREE` points to
 it; `OMAR_TEMP` and `TMPDIR` point to `temp/`. Agents receive these conventions
 in their topology instructions. Web agents can inspect the workspace via the
-CLI; artifact browsing in Mission Control is a later feature.
+CLI; operators can browse and edit artifacts in Mission Control.
 
 New worktrees start empty. Nothing is copied from the directory `omar run` was
 started in; agents fetch or create what they need.
@@ -72,7 +72,7 @@ not undo external actions such as sent messages or database writes.
 
 Use **Files & versions** in the chat to select a team workspace, browse text and
 raster images, or compare saved files with the current worktree. HTML, SVG and
-Markdown preview as text; symlinks are not followed. Previews are limited to
+Markdown previews are shown as text; symlinks are not followed. Previews are limited to
 512 KiB and directory listings to 2,000 entries. **Refresh** reads new agent or
 editor changes. Historical versions are read-only; **Restore as new workspace**
 creates an editable copy without changing the active topology.

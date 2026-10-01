@@ -53,7 +53,7 @@ const SESSION_BACKEND_VAR: &str = "OMAR_BACKEND";
 
 /// Session-environment key describing the backend's side channel, if it has one.
 const SESSION_DELIVERY_VAR: &str = "OMAR_DELIVERY";
-const SESSION_STARTUP_VAR: &str = "OMAR_STARTUP_PENDING";
+const SESSION_STARTUP_VAR: &str = "@omar_startup_pending";
 
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
@@ -447,11 +447,25 @@ impl TmuxClient {
         }
     }
 
+    fn startup_state(&self, session: &str, option: &str) -> Option<String> {
+        let value = self
+            .run(&[
+                "show-options",
+                "-qv",
+                "-t",
+                exact_session_target(session).trim_start_matches('='),
+                option,
+            ])
+            .ok()?;
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    }
+
     /// Resolve only known launch-time gates, before any protocol prompt is sent.
     /// The launch stamp is cleared permanently once the native TUI is ready;
     /// normal delivery never scans or edits an existing conversation's composer.
     fn finish_backend_startup(&self, session: &str, timeout: Duration) -> Result<()> {
-        if self.session_env(session, SESSION_STARTUP_VAR).as_deref() != Some("1") {
+        if self.startup_state(session, SESSION_STARTUP_VAR).as_deref() != Some("1") {
             return Ok(());
         }
         let name = self
@@ -463,12 +477,12 @@ impl TmuxClient {
         // Scheduler deliveries have a zero wait budget. Persist observations
         // so their next poll can advance the handshake without blocking.
         let mut previous = self
-            .session_env(session, "OMAR_STARTUP_OBSERVED")
+            .startup_state(session, "@omar_startup_observed")
             .unwrap_or_default();
         let mut acted_on = self
-            .session_env(session, "OMAR_STARTUP_ACTION")
+            .startup_state(session, "@omar_startup_action")
             .unwrap_or_default();
-        let mut answered_gate = self.session_env(session, "OMAR_STARTUP_ANSWERED");
+        let mut answered_gate = self.startup_state(session, "@omar_startup_answered");
         loop {
             // Current viewport only: scrollback may contain old dialogs.
             let screen = self.run(&["capture-pane", "-p", "-t", &target])?;
@@ -482,28 +496,11 @@ impl TmuxClient {
                     && !gate.keys.is_empty()
                     && answered_gate.as_deref() != Some(gate.id)
                 {
-                    if gate.confirms {
-                        // Record before sending so retries cannot confirm twice.
-                        self.run(&[
-                            "set-environment",
-                            "-t",
-                            &exact_session_target(session),
-                            "OMAR_STARTUP_ANSWERED",
-                            gate.id,
-                        ])?;
-                        answered_gate = Some(gate.id.to_owned());
-                    }
-                    self.run(&[
-                        "set-environment",
-                        "-t",
-                        &exact_session_target(session),
-                        "OMAR_STARTUP_ACTION",
-                        &observation,
-                    ])?;
-                    let mut args = vec!["send-keys", "-t", &target];
-                    args.extend_from_slice(gate.keys);
-                    self.run(&args)?;
-                    acted_on = observation.clone();
+                    self.claim_startup_action(session, &gate, &observation, &acted_on)?;
+                    acted_on = self
+                        .startup_state(session, "@omar_startup_action")
+                        .unwrap_or_default();
+                    answered_gate = self.startup_state(session, "@omar_startup_answered");
                 }
             } else if !backend.readiness_markers().is_empty()
                 && backend
@@ -512,20 +509,20 @@ impl TmuxClient {
                     .all(|marker| screen.contains(marker))
             {
                 self.run(&[
-                    "set-environment",
+                    "set-option",
                     "-u",
                     "-t",
-                    &exact_session_target(session),
+                    exact_session_target(session).trim_start_matches('='),
                     SESSION_STARTUP_VAR,
                 ])?;
                 return Ok(());
             }
             if observation != previous {
                 self.run(&[
-                    "set-environment",
+                    "set-option",
                     "-t",
-                    &exact_session_target(session),
-                    "OMAR_STARTUP_OBSERVED",
+                    exact_session_target(session).trim_start_matches('='),
+                    "@omar_startup_observed",
                     &observation,
                 ])?;
             }
@@ -536,6 +533,58 @@ impl TmuxClient {
             previous = observation;
             thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Compare-and-set inside one tmux command queue, shared by every client
+    /// process. A stale reader cannot repeat navigation or confirmation after
+    /// another caller advances the startup handshake.
+    fn claim_startup_action(
+        &self,
+        session: &str,
+        gate: &crate::backend::StartupGate,
+        observation: &str,
+        expected_action: &str,
+    ) -> Result<()> {
+        use crate::manager::shell_single_quote as quote;
+        anyhow::ensure!(
+            expected_action.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid startup action marker"
+        );
+        let target = exact_session_target(session);
+        let condition = format!(
+            "#{{&&:#{{==:#{{@omar_startup_pending}},1}},#{{&&:#{{==:#{{@omar_startup_action}},{expected_action}}},#{{!=:#{{@omar_startup_answered}},{}}}}}}}",
+            gate.id,
+        );
+        let mut commands = format!(
+            "set-option -t {} @omar_startup_action {}",
+            quote(target.trim_start_matches('=')),
+            quote(observation)
+        );
+        if gate.confirms {
+            commands.push_str(&format!(
+                " ; set-option -t {} @omar_startup_answered {}",
+                quote(target.trim_start_matches('=')),
+                quote(gate.id)
+            ));
+        }
+        commands.push_str(&format!(
+            " ; send-keys -t {} {}",
+            quote(&exact_pane_target(session)),
+            gate.keys
+                .iter()
+                .map(|key| quote(key))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+        self.run(&[
+            "if-shell",
+            "-F",
+            "-t",
+            &exact_pane_target(session),
+            &condition,
+            &commands,
+        ])?;
+        Ok(())
     }
 
     /// Wait for pane activity to be quiet for `quiet` duration, or until `timeout`.
@@ -710,9 +759,9 @@ impl TmuxClient {
                 )
             {
                 self.run(&[
-                    "set-environment",
+                    "set-option",
                     "-t",
-                    &exact_session_target(name),
+                    exact_session_target(name).trim_start_matches('='),
                     SESSION_STARTUP_VAR,
                     "1",
                 ])?;
@@ -1022,6 +1071,99 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_startup_claims_send_each_action_once() {
+        if !tmux_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("record.py");
+        let log = dir.path().join("keys");
+        std::fs::write(
+            &script,
+            r#"import os, sys, tty
+from pathlib import Path
+tty.setraw(0)
+print('recorder ready', flush=True)
+with Path(sys.argv[1]).open('ab', buffering=0) as log:
+    while True:
+        log.write(os.read(0, 1024))
+"#,
+        )
+        .unwrap();
+        let session = format!("omar-test-startup-claims-{}", std::process::id());
+        let _guard = SessionGuard(session.clone());
+        let client = TmuxClient::new("");
+        let command = format!(
+            "python3 {} {}",
+            crate::manager::shell_single_quote(&script.display().to_string()),
+            crate::manager::shell_single_quote(&log.display().to_string())
+        );
+        client.new_session(&session, &command, None).unwrap();
+        assert!(client.wait_for_markers(
+            &session,
+            &["recorder ready"],
+            Duration::from_secs(5),
+            Duration::from_millis(50)
+        ));
+        client
+            .run(&["set-option", "-t", &session, SESSION_STARTUP_VAR, "1"])
+            .unwrap();
+        for (expected, observation, keys, confirms) in
+            [("", "a", &["x"][..], false), ("a", "b", &["y"][..], true)]
+        {
+            // Separate tmux clients all race with the same stale observation.
+            let barrier = std::sync::Barrier::new(8);
+            thread::scope(|scope| {
+                let mut workers = Vec::new();
+                for _ in 0..8 {
+                    let barrier = &barrier;
+                    let client = &client;
+                    let session = &session;
+                    workers.push(scope.spawn(move || {
+                        barrier.wait();
+                        client
+                            .claim_startup_action(
+                                session,
+                                &crate::backend::StartupGate {
+                                    id: "test",
+                                    keys,
+                                    confirms,
+                                },
+                                observation,
+                                expected,
+                            )
+                            .unwrap();
+                    }));
+                }
+                for worker in workers {
+                    worker.join().unwrap();
+                }
+            });
+        }
+        // A delayed navigation reader and a caller arriving after readiness
+        // must not type into the now-live composer.
+        let gate = crate::backend::StartupGate {
+            id: "test",
+            keys: &["z"],
+            confirms: false,
+        };
+        client
+            .claim_startup_action(&session, &gate, "c", "a")
+            .unwrap();
+        client
+            .run(&["set-option", "-u", "-t", &session, SESSION_STARTUP_VAR])
+            .unwrap();
+        client
+            .claim_startup_action(&session, &gate, "c", "b")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while std::fs::read(&log).unwrap_or_default().len() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read(&log).unwrap(), b"xy");
+    }
+
+    #[test]
     fn startup_gates_are_answered_once_before_channel_delivery() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
@@ -1124,7 +1266,7 @@ mod tests {
                 crate::backend::spool::drain_spool(&spool),
                 ["first task", "follow-up"]
             );
-            assert_eq!(client.session_env(&session, SESSION_STARTUP_VAR), None);
+            assert_eq!(client.startup_state(&session, SESSION_STARTUP_VAR), None);
             thread::sleep(Duration::from_millis(150));
             let expected: &[u8] = if backend == "claude" {
                 b"\x1b[B\r"
