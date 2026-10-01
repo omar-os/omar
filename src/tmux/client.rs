@@ -460,15 +460,25 @@ impl TmuxClient {
         let backend = crate::backend::by_name(&name).context("unknown startup backend")?;
         let target = exact_pane_target(session);
         let start = Instant::now();
-        let mut previous = String::new();
-        let mut acted_on = String::new();
+        // Scheduler deliveries have a zero wait budget. Persist observations
+        // so their next poll can advance the handshake without blocking.
+        let mut previous = self
+            .session_env(session, "OMAR_STARTUP_OBSERVED")
+            .unwrap_or_default();
+        let mut acted_on = self
+            .session_env(session, "OMAR_STARTUP_ACTION")
+            .unwrap_or_default();
         let mut answered_gate = self.session_env(session, "OMAR_STARTUP_ANSWERED");
         loop {
             // Current viewport only: scrollback may contain old dialogs.
             let screen = self.run(&["capture-pane", "-p", "-t", &target])?;
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            screen.hash(&mut hash);
+            let observation = format!("{:x}", hash.finish());
             if let Some(gate) = backend.startup_gate(&screen) {
-                if screen == previous
-                    && screen != acted_on
+                if observation == previous
+                    && observation != acted_on
                     && !gate.keys.is_empty()
                     && answered_gate.as_deref() != Some(gate.id)
                 {
@@ -483,16 +493,23 @@ impl TmuxClient {
                         ])?;
                         answered_gate = Some(gate.id.to_owned());
                     }
+                    self.run(&[
+                        "set-environment",
+                        "-t",
+                        &exact_session_target(session),
+                        "OMAR_STARTUP_ACTION",
+                        &observation,
+                    ])?;
                     let mut args = vec!["send-keys", "-t", &target];
                     args.extend_from_slice(gate.keys);
                     self.run(&args)?;
-                    acted_on = screen.clone();
+                    acted_on = observation.clone();
                 }
             } else if !backend.readiness_markers().is_empty()
                 && backend
                     .readiness_markers()
                     .iter()
-                    .all(|marker| screen.contains(marker) && previous.contains(marker))
+                    .all(|marker| screen.contains(marker))
             {
                 self.run(&[
                     "set-environment",
@@ -503,11 +520,20 @@ impl TmuxClient {
                 ])?;
                 return Ok(());
             }
+            if observation != previous {
+                self.run(&[
+                    "set-environment",
+                    "-t",
+                    &exact_session_target(session),
+                    "OMAR_STARTUP_OBSERVED",
+                    &observation,
+                ])?;
+            }
             anyhow::ensure!(
                 start.elapsed() < timeout,
                 "{name} startup did not become ready for {session}"
             );
-            previous = screen;
+            previous = observation;
             thread::sleep(Duration::from_millis(100));
         }
     }
@@ -1060,9 +1086,34 @@ mod tests {
                 startup_timeout: Duration::from_secs(5),
                 poll_interval: Duration::from_millis(50),
             };
-            client
-                .deliver_prompt(&session, "first task", &options)
-                .unwrap();
+            if backend == "codex" {
+                // The scheduler deliberately never waits inside a poll.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if client
+                        .deliver_prompt(
+                            &session,
+                            "first task",
+                            &DeliveryOptions {
+                                startup_timeout: Duration::ZERO,
+                                ..options.clone()
+                            },
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "zero-budget startup never progressed"
+                    );
+                    thread::sleep(Duration::from_millis(100));
+                }
+            } else {
+                client
+                    .deliver_prompt(&session, "first task", &options)
+                    .unwrap();
+            }
             // Dialog text later printed in a conversation is not a startup gate.
             std::fs::write(log.with_extension("again"), "").unwrap();
             thread::sleep(Duration::from_millis(200));
