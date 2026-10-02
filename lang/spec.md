@@ -549,3 +549,47 @@ Important verification targets are:
 - bytecode never references an undefined component;
 - compatible retained agents are never unnecessarily restarted; and
 - equal compiler inputs produce equal bytecode.
+
+## External JSON Schema types
+
+Declare schema imports before teams:
+
+```omar
+type Decision from "./schemas/decision.json"
+team Review[reviewer : Codex] {
+    input request : string
+    output decision : Decision
+    prompt reviewer(request) -> decision "Review $(request)"
+}
+main { review = Review() }
+```
+
+The schema file contains `{"type":"string","enum":["approved","needs_revision"]}`.
+Paths resolve relative to the input `.omar` file, independent of the compiler's
+working directory. Imported schemas are read and validated at compile time and
+embedded as canonical string refinements in bytecode; deployment needs no schema
+file. `list<Decision>` and `option<Decision>` are supported too. Imports cannot
+shadow built-in types or repeat a name.
+
+This version supports only a nonempty enum of unique strings. Optional
+`$schema`, `title`, and `description` string metadata is accepted. Other keywords
+are rejected, including `$ref` and object constraints, rather than ignored.
+Object schemas and general Pydantic-generated models are not yet supported.
+
+Named types are aliases: connections compare their expanded type strings, as
+existing OMAR types do. Identical enums with the same value order are compatible;
+different enum orderings are not normalized. The compiler emits internal string
+refinements; schemas are declared externally, not with inline `string in [...]`
+syntax in an OMAR source file. Runtime writes remain ordinary
+strings, not JSON-encoded string documents. Allowed values appear in the agent's
+effect types. Descriptive schema metadata is not added to prompts in this version.
+Illegal writes return the allowed values and do not satisfy the output contract.
+This validates vocabulary, not the correctness of a decision or its routing.
+Enum ports, including nested enum types, cannot be triggers or effects of Rust
+code reactions in this version. The compiler rejects them because generated
+Rust `String` values do not enforce enum membership. Use an agent prompt for
+those ports; ordinary code reactions elsewhere in the topology remain supported.
+
+Pure compiler integrations can use `schemaImports` and
+`compileSourceWithSchemas`, supplying `(import path, JSON contents)` entries.
+`compileSource` remains filesystem-free and reports missing schema contents.

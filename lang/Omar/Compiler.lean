@@ -391,7 +391,7 @@ private def natural : Parser Nat
   | Token.nat value :: rest => pure (value, rest)
   | tokens => throw s!"expected natural number, found {reprStr tokens.head?}"
 
-private partial def parseType : Parser String
+private partial def parseType (aliases : Array (String × String)) : Parser String
   | Token.word "bool" :: rest => pure ("bool", rest)
   | Token.word "int" :: rest => pure ("int", rest)
   | Token.word "float" :: rest => pure ("float", rest)
@@ -401,10 +401,13 @@ private partial def parseType : Parser String
   | Token.word outer :: Token.sym "<" :: rest => do
       if outer != "list" && outer != "option" then
         throw s!"unknown generic type '{outer}'"
-      let (inner, rest) ← parseType rest
+      let (inner, rest) ← parseType aliases rest
       let (_, rest) ← expectSym ">" rest
       pure (s!"{outer}<{inner}>", rest)
-  | Token.word value :: _ => throw s!"unknown port type '{value}'"
+  | Token.word value :: rest =>
+      match aliases.find? (fun entry => entry.1 == value) with
+      | some (_, type) => pure (type, rest)
+      | none => throw s!"unknown port type '{value}'"
   | tokens => throw s!"expected port type, found {reprStr tokens.head?}"
 
 private partial def parseAgents (tokens : List Token) : Except String (Array Agent × List Token) := do
@@ -421,17 +424,17 @@ private partial def parseAgents (tokens : List Token) : Except String (Array Age
           pure (#[agent] ++ agents, tail)
       | _ => pure (#[agent], tokens)
 
-private partial def parseParams (tokens : List Token) : Except String (Array Param × List Token) := do
+private partial def parseParams (aliases : Array (String × String)) (tokens : List Token) : Except String (Array Param × List Token) := do
   match tokens with
   | Token.sym ")" :: _ => pure (#[], tokens)
   | _ =>
       let (name, tokens) ← word tokens
       let (_, tokens) ← expectSym ":" tokens
-      let (type, tokens) ← parseType tokens
+      let (type, tokens) ← parseType aliases tokens
       let param := { name, type : Param }
       match tokens with
       | Token.sym "," :: rest =>
-          let (params, tail) ← parseParams rest
+          let (params, tail) ← parseParams aliases rest
           pure (#[param] ++ params, tail)
       | _ => pure (#[param], tokens)
 
@@ -528,6 +531,7 @@ private def parseActionDelay : Parser (Option Nat)
   | tokens => pure (none, tokens)
 
 private partial def parseDeclarations
+    (aliases : Array (String × String))
     (reactionIndex : Nat)
     (ports : Array Port)
     (timers : Array Timer)
@@ -544,26 +548,26 @@ private partial def parseDeclarations
   -- `a = A();` ends with an optional semicolon; it separates declarations and
   -- means nothing else.
   | Token.sym ";" :: rest =>
-      parseDeclarations reactionIndex ports timers connections reactions instances states rest
+      parseDeclarations aliases reactionIndex ports timers connections reactions instances states rest
   | Token.word "input" :: rest => do
       let (name, rest) ← word rest
       let (_, rest) ← expectSym ":" rest
-      let (type, rest) ← parseType rest
-      parseDeclarations reactionIndex (ports.push { name, kind := .input, type }) timers connections reactions instances states rest
+      let (type, rest) ← parseType aliases rest
+      parseDeclarations aliases reactionIndex (ports.push { name, kind := .input, type }) timers connections reactions instances states rest
   | Token.word "output" :: rest => do
       let (name, rest) ← word rest
       let (_, rest) ← expectSym ":" rest
-      let (type, rest) ← parseType rest
-      parseDeclarations reactionIndex (ports.push { name, kind := .output, type }) timers connections reactions instances states rest
+      let (type, rest) ← parseType aliases rest
+      parseDeclarations aliases reactionIndex (ports.push { name, kind := .output, type }) timers connections reactions instances states rest
   | Token.word "action" :: rest => do
       let (name, rest) ← word rest
       let (delay, rest) ← parseActionDelay rest
       match rest with
       | Token.sym ":" :: tail =>
-          let (type, tail) ← parseType tail
-          parseDeclarations reactionIndex (ports.push { name, kind := .action, type, delay }) timers connections reactions instances states tail
+          let (type, tail) ← parseType aliases tail
+          parseDeclarations aliases reactionIndex (ports.push { name, kind := .action, type, delay }) timers connections reactions instances states tail
       | _ =>
-          parseDeclarations reactionIndex (ports.push { name, kind := .action, type := "signal", delay }) timers connections reactions instances states rest
+          parseDeclarations aliases reactionIndex (ports.push { name, kind := .action, type := "signal", delay }) timers connections reactions instances states rest
   | Token.word "timer" :: rest => do
       let (name, rest) ← word rest
       let (_, rest) ← expectSym "(" rest
@@ -571,21 +575,21 @@ private partial def parseDeclarations
       let (_, rest) ← expectSym "," rest
       let (period, rest) ← delayValue rest
       let (_, rest) ← expectSym ")" rest
-      parseDeclarations reactionIndex ports (timers.push { name, offset, period }) connections reactions instances states rest
+      parseDeclarations aliases reactionIndex ports (timers.push { name, offset, period }) connections reactions instances states rest
   -- `state round : int = 0`: a value a code body keeps between invocations.
   | Token.word "state" :: rest => do
       let (name, rest) ← word rest
       let (_, rest) ← expectSym ":" rest
-      let (type, rest) ← parseType rest
+      let (type, rest) ← parseType aliases rest
       let (_, rest) ← expectSym "=" rest
       let (initial, rest) ← literal rest
-      parseDeclarations reactionIndex ports timers connections reactions instances
+      parseDeclarations aliases reactionIndex ports timers connections reactions instances
         (states.push { name, type, initial }) rest
   | Token.word name :: Token.sym "=" :: rest => do
       let (team, rest) ← word rest
       let (_, rest) ← expectSym "(" rest
       let (args, rest) ← parseArgs #[] rest
-      parseDeclarations reactionIndex ports timers connections reactions
+      parseDeclarations aliases reactionIndex ports timers connections reactions
         (instances.push { name, team, args }) states rest
   | Token.word "prompt" :: rest => do
       let (agent, rest) ← word rest
@@ -612,7 +616,7 @@ private partial def parseDeclarations
         id := s!"reaction.{reactionIndex}"
         agent, triggers, effects, contract, prompt, within
       }
-      parseDeclarations (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
+      parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
   -- `prompt` asks an agent, `reaction` just runs, so a reaction names none.
   | Token.word "reaction" :: rest => do
       let (_, rest) ← expectSym "(" rest
@@ -637,7 +641,7 @@ private partial def parseDeclarations
         id := s!"reaction.{reactionIndex}"
         agent := "", triggers, effects, contract, prompt := "", body := some body, within
       }
-      parseDeclarations (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
+      parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
   | Token.word first :: rest => do
       -- An endpoint is either a port of this team or `instance.port` of one it
       -- instantiated. Both are one name once the instance path is prepended,
@@ -653,18 +657,18 @@ private partial def parseDeclarations
             let (value, tail) ← delayValue tail
             pure (some value, tail)
         | _ => pure (none, rest)
-      parseDeclarations reactionIndex ports timers (connections.push { source, target, delay }) reactions instances states rest
+      parseDeclarations aliases reactionIndex ports timers (connections.push { source, target, delay }) reactions instances states rest
   | token :: _ => throw s!"unexpected token in team body: {reprStr token}"
   | [] => throw "unterminated team body"
 
-private def parseTeam : Parser TeamDecl := fun tokens => do
+private def parseTeam (aliases : Array (String × String)) : Parser TeamDecl := fun tokens => do
   let (_, tokens) ← expectWord "team" tokens
   let (name, tokens) ← word tokens
   -- Both lists are optional: a team with neither parameters nor agents is
   -- just `team Name { ... }`.
   let (params, tokens) ← match tokens with
     | Token.sym "(" :: rest => do
-        let (params, rest) ← parseParams rest
+        let (params, rest) ← parseParams aliases rest
         let (_, rest) ← expectSym ")" rest
         pure (params, rest)
     | _ => pure (#[], tokens)
@@ -676,7 +680,7 @@ private def parseTeam : Parser TeamDecl := fun tokens => do
     | _ => pure (#[], tokens)
   let (_, tokens) ← expectSym "{" tokens
   let (ports, timers, connections, reactions, instances, states, tokens) ←
-    parseDeclarations 0 #[] #[] #[] #[] #[] #[] tokens
+    parseDeclarations aliases 0 #[] #[] #[] #[] #[] #[] tokens
   pure ({ name, params, agents, ports, timers, connections, reactions, instances, states }, tokens)
 
 private partial def parseMainBody
@@ -718,13 +722,13 @@ private def parseMain : Parser Main := fun tokens => do
   let (instances, connections, tokens) ← parseMainBody #[] #[] tokens
   pure ({ name, instances, connections }, tokens)
 
-private partial def parseTeams (acc : Array TeamDecl) :
+private partial def parseTeams (aliases : Array (String × String)) (acc : Array TeamDecl) :
     List Token -> Except String (Array TeamDecl × List Token)
   | [] => pure (acc, [])
   | tokens@(Token.word "main" :: _) => pure (acc, tokens)
   | tokens => do
-      let (decl, tokens) ← parseTeam tokens
-      parseTeams (acc.push decl) tokens
+      let (decl, tokens) ← parseTeam aliases tokens
+      parseTeams aliases (acc.push decl) tokens
 
 private def containsName (names : Array String) (name : String) : Bool :=
   names.any (· == name)
@@ -770,6 +774,12 @@ private def validate (program : Program) : Except String Program := do
   for reaction in program.reactions do
     if reaction.body.isNone && !containsName agentNames reaction.agent then
       throw s!"reaction references unknown agent '{reaction.agent}'"
+    if reaction.body.isSome then
+      for port in program.ports do
+        if (containsName reaction.triggers port.name || containsName reaction.effects port.name) &&
+            (port.type.splitOn "string in ").length > 1 then
+          throw s!"code reaction '{reaction.id}' cannot use enum port '{port.name}'; \
+            generated Rust strings do not enforce enum membership; use an agent prompt instead"
     for trigger in reaction.triggers do
       -- A reaction reads its own team's inputs and actions, and the *outputs*
       -- of teams its team instantiated. Reading its own output would be
@@ -961,8 +971,9 @@ private def elaborate (programName : String) (teams : Array TeamDecl) (main : Ma
     the way a C binary is named for its file rather than for `main`. A program
     that arrives over the wire has no file, which is why `main` can name
     itself. -/
-def parse (programName : String) (tokens : List Token) : Except String Program := do
-  let (teams, tokens) ← parseTeams #[] tokens
+def parse (programName : String) (tokens : List Token)
+    (aliases : Array (String × String) := #[]) : Except String Program := do
+  let (teams, tokens) ← parseTeams aliases #[] tokens
   if teams.isEmpty then throw "program declares no team"
   ensureUnique "team" (teams.map (·.name))
   if tokens.isEmpty then
@@ -1064,7 +1075,66 @@ def compile (program : Program) : String :=
   "{\n  \"version\": 1,\n  \"team\": " ++ (toJson program.team).compress ++
     ",\n  \"instructions\": [\n    " ++ rendered ++ "\n  ]\n}\n"
 
-def compileSource (programName : String) (source : String) : Except String String := do
-  pure (compile (← parse programName (← lex source)))
+/-- External schemas are deliberately restricted to string enums for now.
+    Never silently ignore a validation keyword we do not implement. -/
+def stringEnumSchema (source : String) : Except String (Array String) := do
+  let schema ← Json.parse source
+  let fields ← schema.getObj?
+  for (key, _) in fields.toArray do
+    if !(["type", "enum", "$schema", "title", "description"].contains key) then
+      throw s!"unsupported JSON Schema keyword '{key}'; only string enums are supported"
+  if (← schema.getObjValAs? String "type") != "string" then
+    throw "only JSON Schema string enums are supported"
+  for key in ["$schema", "title", "description"] do
+    if fields.contains key then
+      let _ ← schema.getObjValAs? String key
+  let entries ← (← schema.getObjVal? "enum").getArr?
+  if entries.isEmpty then throw "a string enum schema must list at least one value"
+  let values ← entries.mapM Json.getStr?
+  let mut seen : Array String := #[]
+  for value in values do
+    if seen.contains value then throw s!"duplicate JSON Schema enum value {toJson value}"
+    seen := seen.push value
+  pure values
+
+/-- Imports precede team declarations. The compiler CLI resolves paths; pure
+    callers supply schema contents explicitly, without filesystem access. -/
+private partial def parseSchemaImports (acc : Array (String × String)) :
+    Parser (Array (String × String))
+  | Token.word "type" :: rest => do
+      let (name, rest) ← word rest
+      if ["bool", "int", "float", "string", "path", "bytes", "list", "option"].contains name then
+        throw s!"schema type '{name}' conflicts with a built-in type"
+      if acc.any (fun entry => entry.1 == name) then
+        throw s!"duplicate schema type '{name}'"
+      let (_, rest) ← expectWord "from" rest
+      match rest with
+      | Token.text path :: rest =>
+          if path.isEmpty then throw s!"schema type '{name}' has an empty path"
+          let rest := match rest with
+            | Token.sym ";" :: tail => tail
+            | tail => tail
+          parseSchemaImports (acc.push (name, path)) rest
+      | _ => throw s!"schema type '{name}' requires a quoted JSON Schema path"
+  | rest => pure (acc, rest)
+
+def schemaImports (source : String) : Except String (Array (String × String)) := do
+  pure (← parseSchemaImports #[] (← lex source)).1
+
+def compileSourceWithSchemas (programName source : String)
+    (schemas : Array (String × String)) : Except String String := do
+  let (imports, tokens) ← parseSchemaImports #[] (← lex source)
+  let aliases ← imports.mapM fun (name, path) => do
+    let contents ← match schemas.find? (fun entry => entry.1 == path) with
+      | some (_, contents) => pure contents
+      | none => throw s!"schema type '{name}': no contents supplied for '{path}'"
+    let values ← match stringEnumSchema contents with
+      | .ok values => pure values
+      | .error error => throw s!"schema type '{name}' from '{path}': {error}"
+    pure (name, "string in " ++ (Json.arr (values.map toJson)).compress)
+  pure (compile (← parse programName tokens aliases))
+
+def compileSource (programName : String) (source : String) : Except String String :=
+  compileSourceWithSchemas programName source #[]
 
 end Omar

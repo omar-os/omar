@@ -528,6 +528,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 if ty.trim().is_empty() {
                     bail!("port '{name}' has an empty type");
                 }
+                check_refinement(name, ty)?;
                 if delay.is_some() && *kind != PortKind::Action {
                     bail!("only action ports may declare a fixed delay");
                 }
@@ -1407,7 +1408,37 @@ fn validate_invocation_owner(team: &str, agent: &str, invocation: &InvocationRec
     Ok(())
 }
 
+/// The values a refined string type admits, or `None` if `ty` is not one.
+///
+/// A refinement travels inside the flat type string -- `string in ["a","b"]` --
+/// rather than in a field of its own. Nothing downstream has to learn a new
+/// shape: the bytecode's `type` stays a string, and connection checking stays
+/// equality over the canonical spelling `omarc` emits.
+pub(crate) fn string_enum(ty: &str) -> Option<Vec<String>> {
+    serde_json::from_str(ty.strip_prefix("string in ")?).ok()
+}
+
 fn validate_value(ty: &str, value: &Value) -> Result<()> {
+    if let Some(allowed) = string_enum(ty) {
+        // The agent acts on this message, so it names every legal answer
+        // rather than only reporting that this one was wrong.
+        let text = value
+            .as_str()
+            .with_context(|| format!("expected {ty}, got {value}"))?;
+        // `omarc` rejects an empty refinement, so this is reachable only from
+        // hand-written bytecode. Say what is wrong with the port rather than
+        // offering the agent a choice of nothing.
+        if allowed.is_empty() {
+            bail!("port type {ty} admits no value");
+        }
+        if !allowed.iter().any(|option| option == text) {
+            // Quoted by serde rather than by hand: an admitted value may itself
+            // contain a quote or a newline, and the agent reads this message.
+            let options: Vec<String> = allowed.iter().map(|o| json!(o).to_string()).collect();
+            bail!("expected one of {}, got {value}", options.join(", "));
+        }
+        return Ok(());
+    }
     if let Some(inner) = generic_inner(ty, "list") {
         let values = value
             .as_array()
@@ -1438,6 +1469,32 @@ fn validate_value(ty: &str, value: &Value) -> Result<()> {
         bail!("expected {ty}, got {value}");
     }
     Ok(())
+}
+
+/// Reject a refinement that does not parse, wherever it sits in the type.
+///
+/// A refinement that is not well formed is a broken port, not a plain `string`.
+/// Saying so once, here, keeps `string_enum` free to answer "not refined"
+/// everywhere downstream. `validate_value` looks inside `list` and `option`, so
+/// this has to as well, or a nested one would reach the agent and be reported
+/// against the value it wrote rather than against the port.
+fn check_refinement(name: &str, ty: &str) -> Result<()> {
+    for outer in ["list", "option"] {
+        if ty.starts_with(&format!("{outer}<")) {
+            let Some(inner) = generic_inner(ty, outer) else {
+                bail!("port '{name}' has an invalid type '{ty}'");
+            };
+            return check_refinement(name, inner);
+        }
+    }
+    let Some(list) = ty.strip_prefix("string in ") else {
+        return Ok(());
+    };
+    match serde_json::from_str::<Vec<String>>(list) {
+        Ok(values) if !values.is_empty() => Ok(()),
+        Ok(_) => bail!("port '{name}' admits no value"),
+        Err(error) => bail!("port '{name}' has an invalid string refinement: {error}"),
+    }
 }
 
 fn generic_inner<'a>(ty: &'a str, outer: &str) -> Option<&'a str> {
@@ -2310,6 +2367,12 @@ pub fn parse_inputs(state: &VmState, raw_inputs: &[String]) -> Result<BTreeMap<S
 }
 
 fn parse_input_value(ty: &str, value: &str) -> Result<Value> {
+    // A refined string is still supplied as bare text on the command line;
+    // whether it is one of the values the port admits is `validate_value`'s
+    // answer, not the parser's.
+    if string_enum(ty).is_some() {
+        return Ok(Value::String(value.to_string()));
+    }
     match ty {
         "bool" => Ok(Value::Bool(value.parse()?)),
         "int" => Ok(json!(value.parse::<i64>()?)),
@@ -3232,6 +3295,62 @@ mod tests {
     }
 
     #[test]
+    fn external_schema_compiles_and_enforces_the_imported_enum() {
+        let compiler = Path::new(env!("CARGO_MANIFEST_DIR")).join("lang/.lake/build/bin/omarc");
+        if !compiler.exists() {
+            eprintln!("skipping: {} has not been built", compiler.display());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let schema = directory.path().join("decision.json");
+        let source = directory.path().join("review.omar");
+        fs::write(
+            &schema,
+            r#"{"type":"string","enum":["approved","needs_revision"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &source,
+            r#"
+            type Decision from "decision.json"
+            team Review[reviewer : Codex] {
+                input request : string
+                output decision : Decision
+                prompt reviewer(request) -> decision "Review $(request)"
+            }
+            main { review = Review() }
+        "#,
+        )
+        .unwrap();
+        let bytecode = load_program_with_compiler(&source, Some(&compiler)).unwrap();
+        let plan = verify(&bytecode).unwrap();
+        let ty = &plan.ports["review.decision"].ty;
+        assert_eq!(ty, r#"string in ["approved","needs_revision"]"#);
+        validate_value(ty, &json!("approved")).unwrap();
+        let error = validate_value(ty, &json!("approved with revisions"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs_revision"), "{error}");
+        assert!(validate_value(ty, &json!({"decision":"approved"})).is_err());
+        // The bytecode embeds constraints; deployed validation needs no file.
+        fs::remove_file(&schema).unwrap();
+        validate_value(ty, &json!("needs_revision")).unwrap();
+        let error = load_program_with_compiler(&source, Some(&compiler))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("decision.json"), "{error}");
+        fs::write(
+            &schema,
+            r#"{"type":"string","enum":["approved"],"minLength":20}"#,
+        )
+        .unwrap();
+        let error = load_program_with_compiler(&source, Some(&compiler))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported JSON Schema keyword"), "{error}");
+    }
+
+    #[test]
     fn verifies_initial_topology() {
         let state = verify(&program()).unwrap();
         assert_eq!(state.agents.len(), 1);
@@ -3240,10 +3359,96 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_port_whose_refinement_does_not_parse() {
+        // `omarc` cannot emit either of these. Hand-written bytecode can, and
+        // the port is what is wrong -- not the first value written to it.
+        for (ty, expected) in [
+            (r#"string in [oops"#, "invalid string refinement"),
+            (r#"string in [1,2]"#, "invalid string refinement"),
+            (r#"string in []"#, "admits no value"),
+            // `validate_value` looks inside these, so `verify` must too.
+            (r#"list<string in [oops>"#, "invalid string refinement"),
+            (r#"list<string in [oops"#, "invalid type"),
+            (r#"option<string in ["a"]"#, "invalid type"),
+            (r#"list<>"#, "invalid type"),
+            (r#"option<>"#, "invalid type"),
+            (r#"list<option<string in [oops>"#, "invalid type"),
+            (r#"option<string in []>"#, "admits no value"),
+            (
+                r#"list<option<string in [1,2]>>"#,
+                "invalid string refinement",
+            ),
+        ] {
+            let mut program = program();
+            program.instructions[2] = serde_json::from_str(&format!(
+                r#"{{"op":"define_port","kind":"input","name":"request","type":{}}}"#,
+                serde_json::to_string(ty).unwrap()
+            ))
+            .unwrap();
+            let error = verify(&program).unwrap_err().to_string();
+            assert!(error.contains(expected), "{ty} gave {error}");
+        }
+    }
+
+    #[test]
     fn rejects_incomplete_topology() {
         let mut program = program();
         program.instructions.pop();
         assert!(verify(&program).is_err());
+    }
+
+    #[test]
+    fn a_refined_string_admits_only_what_it_lists() {
+        let ty = "string in [\"continue\",\"stop\"]";
+        validate_value(ty, &json!("continue")).unwrap();
+        validate_value(ty, &json!("stop")).unwrap();
+
+        // The failure the refinement exists for: a value that is a perfectly
+        // good string and not one of the answers the port accepts.
+        let rejected = validate_value(ty, &json!("this is a terminal record, not a forward"))
+            .unwrap_err()
+            .to_string();
+        assert!(rejected.contains("\"continue\""), "{rejected}");
+        assert!(rejected.contains("\"stop\""), "{rejected}");
+
+        assert!(validate_value(ty, &json!(1)).is_err());
+        validate_value("list<string in [\"a\",\"b\"]>", &json!(["a", "b"])).unwrap();
+        assert!(validate_value("list<string in [\"a\",\"b\"]>", &json!(["c"])).is_err());
+    }
+
+    #[test]
+    fn enum_cli_inputs_are_bare_text_and_still_validate_membership() {
+        let ty = r#"string in ["continue","stop"]"#;
+        let value = parse_input_value(ty, "continue").unwrap();
+        assert_eq!(value, json!("continue"));
+        validate_value(ty, &value).unwrap();
+        for raw in ["unknown", r#""continue""#] {
+            let value = parse_input_value(ty, raw).unwrap();
+            assert_eq!(value, json!(raw));
+            assert!(validate_value(ty, &value).is_err());
+        }
+        let nested = "list<string in [\"continue\",\"stop\"]>";
+        let value = parse_input_value(nested, r#"["continue","stop"]"#).unwrap();
+        validate_value(nested, &value).unwrap();
+        assert!(parse_input_value(nested, "continue").is_err());
+    }
+
+    #[test]
+    fn a_refinement_reports_awkward_values_readably() {
+        // An admitted value may contain a quote or a newline, and the agent
+        // reads the rejection, so the options are quoted by serde.
+        let ty = r#"string in ["say \"hi\"","two\nlines"]"#;
+        validate_value(ty, &json!("say \"hi\"")).unwrap();
+        let rejected = validate_value(ty, &json!("no")).unwrap_err().to_string();
+        assert!(rejected.contains(r#""say \"hi\"""#), "{rejected}");
+        assert!(rejected.contains(r#""two\nlines""#), "{rejected}");
+
+        // `omarc` rejects an empty refinement; hand-written bytecode can still
+        // carry one, and it is the port that is wrong, not the value.
+        let empty = validate_value("string in []", &json!("anything"))
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("admits no value"), "{empty}");
     }
 
     #[test]
@@ -5052,6 +5257,86 @@ mod tests {
         let writes = completion.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(writes["opinion"], json!("second"));
         server.registry.remove("invocation-1");
+    }
+
+    #[test]
+    fn a_rejected_refinement_can_be_corrected_over_the_invocation_protocol() {
+        let server = InvocationServer::start().unwrap();
+        let context = TopologyMcpContext {
+            team: "Recovery".into(),
+            agent: "worker".into(),
+            endpoint: server.endpoint.clone(),
+            token: server.token.clone(),
+        };
+        let completion = server
+            .registry
+            .register(InvocationRecord {
+                id: "retry-1".into(),
+                team: "Recovery".into(),
+                agent: "worker".into(),
+                reaction: "reaction.0".into(),
+                contract: "decision".into(),
+                allowed_effects: BTreeMap::from([(
+                    "decision".into(),
+                    r#"string in ["continue","stop"]"#.into(),
+                )]),
+                trigger_values: BTreeMap::new(),
+                prompt: "Choose a permitted decision.".into(),
+                writes: BTreeMap::new(),
+                completed: false,
+            })
+            .unwrap();
+
+        // Exercise the real socket path, not just validate_value.
+        let error = mcp_set_port(
+            &context,
+            json!({
+                "invocation_id": "retry-1", "port": "decision",
+                "value": "this is a terminal record, not a forward"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("decision"), "{error}");
+        assert!(error.contains("expected one of"), "{error}");
+        assert!(error.contains("\"continue\""), "{error}");
+        assert!(error.contains("\"stop\""), "{error}");
+
+        // Rejection must not satisfy the required output or release a result.
+        let error = mcp_complete(&context, json!({"invocation_id": "retry-1"}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("effect contract 'decision' is not satisfied"),
+            "{error}"
+        );
+        assert!(matches!(
+            completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(!server.registry.answered("retry-1"));
+
+        let response = mcp_set_port(
+            &context,
+            json!({
+                "invocation_id": "retry-1", "port": "decision", "value": "continue"
+            }),
+        )
+        .unwrap();
+        assert_eq!(response["status"], json!("buffered"));
+        assert!(matches!(
+            completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let response = mcp_complete(&context, json!({"invocation_id": "retry-1"})).unwrap();
+        assert_eq!(response["status"], json!("complete"));
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(1)).unwrap(),
+            BTreeMap::from([("decision".into(), json!("continue"))])
+        );
+        assert!(server.registry.answered("retry-1"));
+        server.registry.remove("retry-1");
     }
 
     #[test]

@@ -230,6 +230,9 @@ jobs:
           build: true
           test: true
 
+      - name: Test external schema imports
+        run: python3 tests/ci/schema_imports.py
+
       - name: Compile topology corpus to bytecode (offline)
         working-directory: lang
         run: |

@@ -12,7 +12,17 @@ def main (args : List String) : IO UInt32 := do
         -- The program takes its source file's name, the way a C binary takes
         -- its file's name rather than `main`'s.
         let programName := (System.FilePath.mk input).fileStem.getD "main"
-        match compileSource programName source with
+        let imports ← match schemaImports source with
+          | .ok imports => pure imports
+          | .error message => throw (IO.userError message)
+        let schemas ← imports.mapM fun (name, path) => do
+          let schemaPath := (System.FilePath.mk input).parent.getD (System.FilePath.mk ".") /
+            System.FilePath.mk path
+          try
+            pure (path, ← IO.FS.readFile schemaPath)
+          catch error =>
+            throw (IO.userError s!"schema type '{name}' from '{schemaPath}': {error}")
+        match compileSourceWithSchemas programName source schemas with
         | .ok bytecode =>
             IO.FS.writeFile output bytecode
             IO.println s!"compiled {input} -> {output}"
