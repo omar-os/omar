@@ -97,6 +97,9 @@ struct Launch {
     session: Session,
     address: SocketAddr,
     no_ea: bool,
+    /// Foreground startup prints the session record in the requested mode.
+    #[serde(default)]
+    json: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct Request {
@@ -598,6 +601,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
             session: session.clone(),
             address: options.address,
             no_ea: options.no_ea,
+            json: foreground && cli.json,
         },
     )?;
     let log = OpenOptions::new()
@@ -743,7 +747,7 @@ fn overview(server: &Serve, session: &Session) -> Result<Value> {
 /// is published before any work that could wait behind an in-flight
 /// admission, and a forced shutdown never does that work at all.
 fn begin_shutdown(
-    server: &Serve,
+    server: &Arc<Serve>,
     shared: &Mutex<Session>,
     record: &mut Session,
     force: &AtomicBool,
@@ -753,26 +757,31 @@ fn begin_shutdown(
     record.state = "stopping".into();
     publish(record)?;
     *shared.lock().unwrap() = record.clone();
-    if forced {
-        server.session_shutdown_now();
-    } else {
-        server.session_stopping()?;
+    server.session_shutdown_now();
+    if !forced {
+        request_stops(server);
     }
     Ok(json!({"status":"stopping"}))
 }
 
-/// A signal asks for a graceful shutdown. Its stop requests may wait behind an
-/// in-flight admission, so they run off the daemon loop.
-fn request_graceful(server: &Arc<Serve>, session: &Mutex<Session>) -> Result<()> {
-    let mut record = session.lock().unwrap();
-    record.state = "stopping".into();
-    publish(&record)?;
+/// Graceful stop requests may wait behind an in-flight admission, so they run
+/// off the request (acknowledged at once) and off the daemon loop.
+fn request_stops(server: &Arc<Serve>) {
     let server = server.clone();
     std::thread::spawn(move || {
         if let Err(error) = server.session_stopping() {
             eprintln!("graceful stop requests failed: {error:#}");
         }
     });
+}
+
+/// A signal asks for a graceful shutdown.
+fn request_graceful(server: &Arc<Serve>, session: &Mutex<Session>) -> Result<()> {
+    let mut record = session.lock().unwrap();
+    record.state = "stopping".into();
+    publish(&record)?;
+    server.session_shutdown_now();
+    request_stops(server);
     Ok(())
 }
 
@@ -883,6 +892,9 @@ impl RuntimeCleanup {
         crate::process::signal_tree(&children, "-TERM");
         std::thread::sleep(Duration::from_millis(500));
         crate::process::signal_tree(&children, "-KILL");
+        // A handler that was mid-admission may have spawned after the snapshot.
+        let late = crate::process::process_tree(std::process::id());
+        crate::process::signal_tree(&late, "-KILL");
         let _ = fs::remove_file(&session.socket);
     }
 }
@@ -935,10 +947,11 @@ async fn daemon(directory: &Path) -> Result<()> {
     session.url = format!("http://{}", server.address());
     session.state = "ready".into();
     publish(&session)?;
-    print_started(&session, false)?;
+    print_started(&session, launch.json)?;
     let session = Arc::new(Mutex::new(session));
     let force = Arc::new(AtomicBool::new(false));
     let operations = Arc::new(Mutex::new(()));
+    let mut force_since: Option<Instant> = None;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
@@ -989,10 +1002,19 @@ async fn daemon(directory: &Path) -> Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
             Err(error) => return Err(error.into()),
         }
-        if session.lock().unwrap().state == "stopping"
-            && (force.load(Ordering::SeqCst) || !server.session_has_work())
-        {
-            break;
+        if session.lock().unwrap().state == "stopping" {
+            // A handler past admission can still spawn a topology after the
+            // last run check, so in-flight operations must drain first; a
+            // forced shutdown waits for them only briefly.
+            let idle = operations.try_lock().is_ok();
+            if force.load(Ordering::SeqCst) {
+                let since = *force_since.get_or_insert_with(Instant::now);
+                if idle || since.elapsed() > Duration::from_secs(5) {
+                    break;
+                }
+            } else if idle && !server.session_has_work() {
+                break;
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(40)) => (),

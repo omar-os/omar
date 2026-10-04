@@ -109,6 +109,18 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         assert sorted(p.returncode == 0 for p in results) == [False, True]
         sessions.append(json.loads(next(p.stdout for p in results if p.returncode == 0)))
         cli("down", "-s", "race")
+        # Foreground serve honours --json for its startup record.
+        foreground = subprocess.Popen([str(BIN), "--json", "serve", "--name", "fg", "--no-ea"], cwd=root, env=env,
+                                      text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        lines = []
+        for line in foreground.stdout:
+            lines.append(line)
+            if line.rstrip() == "}": break
+        started = json.loads("".join(lines))
+        sessions.append(started)
+        assert started["name"] == "fg" and started["state"] == "ready", started
+        cli("down", "-s", "fg")
+        assert foreground.wait(timeout=30) == 0
         # Occupied endpoint fails readiness instead of advertising a dead URL.
         with socket.socket() as occupied:
             occupied.bind(("127.0.0.1", 0)); occupied.listen()
