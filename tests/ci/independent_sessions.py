@@ -57,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
     def terminal_attach(name, context=None):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
-        process = subprocess.Popen([str(BIN), "attach", "-s", name], env=context or env, stdin=slave, stdout=slave, stderr=slave)
+        process = subprocess.Popen([str(BIN), "attach", "-s", name, "--tui"], env=context or env, stdin=slave, stdout=slave, stderr=slave)
         os.close(slave)
         return process, master
 
@@ -87,12 +87,16 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             cli(*args)
         assert not Path(env["OMAR_HOME"]).exists(), "help wrote runtime state"
         cli("runs", ok=False)
+        bare = subprocess.run([str(BIN)], cwd=root, env=env, text=True, capture_output=True)
+        assert bare.returncode != 0 and "Usage:" in bare.stdout + bare.stderr, "bare omar must print the command list"
         assert "do not support --legacy" in cli("--legacy", "up", ok=False)
         outer = up("outer")
         inherited = dict(env, OMAR_SESSION_ID=outer["id"], OMAR_STATE_DIR=outer["directory"],
                          OMAR_TMUX_SERVER=outer["tmux_server"], OMAR_EA_ID="99", TMUX="parent")
         inner = up("inner", inherited)
         assert outer["url"] != inner["url"] and outer["socket"] != inner["socket"]
+        assert cli("attach", "-s", "outer", "--web", "--print-url").strip() == outer["url"]
+        assert "--tui" in cli("attach", "-s", "outer", ok=False) or "--web" in cli("attach", "-s", "outer", ok=False)
         assert outer["tmux_server"] != inner["tmux_server"]
         assert len(json.loads(cli("ls", "--json"))) == 2
         cli("up", "--name", "outer", "--no-ea", ok=False)

@@ -8,13 +8,13 @@ session. TUI/browser clients can disconnect without stopping any workload.
 
 | Command | Behavior |
 | --- | --- |
-| `omar` / `omar up [--name NAME]` | Create a new session; return after readiness |
+| `omar up [--name NAME] [--web] [--tui]` | Create a new session; return after readiness; `--web` opens Mission Control, `--tui` attaches the terminal dashboard |
 | `omar up --workdir PATH --no-ea` | Start without launching an assistant |
 | `omar ls [--json]` | List sessions, health, URL, and exact executable build |
 | `omar info -s SESSION` | Inspect session, EAs, agents, and runs |
 | `omar logs -s SESSION [--follow] [--tail N]` | Read runtime log |
-| `omar attach -s SESSION [--ea EA]` | Terminal dashboard as a client of that session, inside its tmux server; z detaches, Q stops the session |
-| `omar web -s SESSION [--print-url]` | Open or print Mission Control URL |
+| `omar attach -s SESSION --tui [--ea EA]` | Terminal dashboard as a client of that session, inside its tmux server; z detaches, Q stops the session |
+| `omar attach -s SESSION --web [--print-url]` | Open or print Mission Control URL |
 | `omar down -s SESSION [--timeout SECONDS]` | Reject new work, finish current tags, clean owned processes |
 | `omar down -s SESSION --force` | Terminate owned workloads without waiting for tag boundaries |
 | `omar serve [--name NAME] [--address 127.0.0.1:PORT]` | New independent foreground runtime; SIGINT/SIGTERM requests graceful shutdown |
@@ -40,8 +40,8 @@ Every command that targets a session takes it as `-s`/`--session` (id or
 name). Explicit `--session` wins over inherited `OMAR_SESSION_ID`. Without
 either, the command fails with selection guidance. No persisted global selection.
 Explicit `--ea` wins; inherited `OMAR_EA_ID` applies only with inherited session
-routing. Otherwise EA 0 is selected. `up` and bare `omar` **always create a new
-session**, even from an agent inside an existing session. New-session configuration
+routing. Otherwise EA 0 is selected. `up` **always creates a new session**,
+even from an agent inside an existing session; bare `omar` prints the command list. New-session configuration
 uses `--config`/`-a`, the shared configuration template, or defaults; it never
 copies the parent's private state. `--ea` is for existing-session commands.
 
@@ -95,7 +95,7 @@ never mount the supervising runtime's private directory or tmux/control sockets.
 A host needs an explicitly forwarded **nested runtime** HTTP endpoint to open
 its dashboard, and an authenticated sandbox exec channel to run its CLI/TUI.
 For an SSH-capable environment, this is a loopback SSH port forward plus
-`ssh -t <environment> omar attach -s <session>`; it is not a shared state mount.
+`ssh -t <environment> omar attach -s <session> --tui`; it is not a shared state mount.
 Automatic Docker Sandbox endpoint forwarding and the real microVM nested-build
 smoke test depend on the separate sandbox PR #277. This change provides host
 session lifecycle; it does not claim that integration or checkpoint/upgrade support.

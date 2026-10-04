@@ -38,6 +38,12 @@ pub struct UpOptions {
     pub no_ea: bool,
     #[arg(long, default_value_t = 60)]
     pub startup_timeout: u64,
+    /// Open Mission Control once the runtime is ready
+    #[arg(long)]
+    pub web: bool,
+    /// Attach the terminal dashboard once the runtime is ready
+    #[arg(long)]
+    pub tui: bool,
 }
 impl Default for UpOptions {
     fn default() -> Self {
@@ -47,6 +53,8 @@ impl Default for UpOptions {
             address: "127.0.0.1:0".parse().unwrap(),
             no_ea: false,
             startup_timeout: 60,
+            web: false,
+            tui: false,
         }
     }
 }
@@ -303,7 +311,7 @@ pub fn prepare_process(cli: &Cli) -> Result<()> {
 
 fn dashboard_target(cli: &Cli) -> Result<Option<Session>> {
     match &cli.command {
-        Some(Commands::Attach) => target(cli).map(Some),
+        Some(Commands::Attach { tui: true, .. }) => target(cli).map(Some),
         Some(Commands::Manager {
             action: Some(crate::ManagerAction::Orchestrate),
         }) => target(cli).map(Some),
@@ -414,7 +422,14 @@ fn relaunch_dashboard(
             .args(["-s", crate::DASHBOARD_SESSION, "-c"])
             .arg(&config.agent.default_workdir)
             .arg(&exe)
-            .args(["attach", "-s", &session.id, "--ea", &ea.to_string()]);
+            .args([
+                "attach",
+                "-s",
+                &session.id,
+                "--tui",
+                "--ea",
+                &ea.to_string(),
+            ]);
         command
     };
     if running && explicit {
@@ -1041,8 +1056,8 @@ fn print_started(session: &Session, json_output: bool) -> Result<()> {
         return print_value(json!(session));
     }
     println!(
-        "Started session {} ({})\nURL:    {}\nAttach: omar attach -s {}\nStop:   omar down -s {}",
-        session.name, session.id, session.url, session.id, session.id
+        "Started session {} ({})\nURL:    {}\nTUI:    omar attach -s {} --tui\nWeb:    omar attach -s {} --web\nStop:   omar down -s {}",
+        session.name, session.id, session.url, session.id, session.id, session.id
     );
     Ok(())
 }
@@ -1083,8 +1098,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
                 Commands::Up(_)
                     | Commands::Ls
                     | Commands::Info
-                    | Commands::Attach
-                    | Commands::Web { .. }
+                    | Commands::Attach { .. }
                     | Commands::Logs { .. }
                     | Commands::Down { .. }
                     | Commands::Start(_)
@@ -1110,7 +1124,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
     if matches!(
         cli.command,
         Some(
-            Commands::Attach
+            Commands::Attach { tui: true, .. }
                 | Commands::Manager {
                     action: Some(crate::ManagerAction::Orchestrate)
                 }
@@ -1121,12 +1135,21 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
     let result = match &cli.command {
         Some(Commands::Serve { name, address, no_ea, ui, restart_ea }) => {
             if *restart_ea { return Some(Err(anyhow::anyhow!("serve creates a fresh session; --restart-ea is available only with --legacy"))); }
-            if *ui { return Some(Err(anyhow::anyhow!("use omar up, then omar web -s <session>; legacy serve --ui remains available with --legacy"))); }
+            if *ui { return Some(Err(anyhow::anyhow!("use omar up, then omar attach -s <session> --web; legacy serve --ui remains available with --legacy"))); }
             launch(cli, UpOptions { name: name.clone(), address: address.unwrap_or_else(|| UpOptions::default().address), no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
         },
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
-        None => launch(cli, UpOptions::default(), false).and_then(|s| print_started(&s,cli.json)),
-        Some(Commands::Up(options)) => launch(cli, options.clone(), false).and_then(|s| print_started(&s,cli.json)),
+        None => Err(anyhow::anyhow!("a command is required; see omar --help")),
+        Some(Commands::Up(options)) => launch(cli, options.clone(), false).and_then(|s| {
+            print_started(&s, cli.json)?;
+            if options.web { crate::open_browser(&s.url); }
+            if options.tui {
+                // A fresh process attaches: the dashboard selects its session before Tokio starts.
+                let error = Command::new(std::env::current_exe()?).args(["attach", "-s", &s.id, "--tui"]).exec();
+                bail!("failed to attach: {error}");
+            }
+            Ok(())
+        }),
         Some(Commands::Ls) => discover().and_then(|sessions| {
             if cli.json { return print_value(json!(sessions)); }
             println!("{:<20} {:<12} {:<26} BUILD / ID", "NAME", "STATUS", "URL");
@@ -1137,11 +1160,12 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             if matches!(s.state.as_str(), "stopped" | "failed" | "stale") { Ok(json!({"session":s})) }
             else { rpc(&s,json!({"op":"overview"}),Duration::from_secs(5)) }
         }).and_then(print_value),
-        Some(Commands::Web { print_url }) => target(cli).and_then(|s| {
+        Some(Commands::Attach { web: true, print_url, .. }) => target(cli).and_then(|s| {
             rpc(&s,json!({"op":"hello"}),Duration::from_secs(5))?;
             if *print_url { println!("{}",s.url); } else { crate::open_browser(&s.url); }
             Ok(())
         }),
+        Some(Commands::Attach { .. }) => Err(anyhow::anyhow!("attach needs --tui or --web")),
         Some(Commands::Logs { follow, tail }) => target(cli).and_then(|s| {
             let mut command = Command::new("tail"); command.arg("-n").arg(tail.to_string());
             if *follow { command.arg("-f"); }

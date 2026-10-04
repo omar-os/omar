@@ -76,7 +76,9 @@ const TMUX_SETUP_WARNING: &str = "⚠ tmux not configured for omar — run 'omar
 #[command(
     name = "omar",
     about = "Independent agent runtimes and topology orchestration",
-    version
+    version,
+    subcommand_required = true,
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -123,11 +125,17 @@ enum Commands {
     Ls,
     /// Inspect the selected runtime session
     Info,
-    /// Attach the terminal dashboard (z detaches; Q stops the session)
-    Attach,
-    /// Open Mission Control for an existing runtime
-    Web {
+    /// Attach to the selected runtime with the terminal dashboard or Mission Control
+    #[command(group = clap::ArgGroup::new("mode").required(true).args(["tui", "web"]))]
+    Attach {
+        /// Terminal dashboard inside the session's tmux server (z detaches; Q stops the session)
         #[arg(long)]
+        tui: bool,
+        /// Mission Control in the browser
+        #[arg(long)]
+        web: bool,
+        /// Print the Mission Control URL instead of opening it
+        #[arg(long, requires = "web")]
         print_url: bool,
     },
     /// Read a runtime's log
@@ -516,8 +524,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             Commands::Up(_)
             | Commands::Ls
             | Commands::Info
-            | Commands::Attach
-            | Commands::Web { .. }
+            | Commands::Attach { .. }
             | Commands::Logs { .. }
             | Commands::Down { .. }
             | Commands::Start(_)

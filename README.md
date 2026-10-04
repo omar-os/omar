@@ -78,7 +78,7 @@ cd omar && make install
 
 ```bash
 $ omar up --name dev
-$ omar web -s dev
+$ omar attach -s dev --web
 ```
 
 Starts an independent background runtime, then opens its web UI. Closing the
@@ -94,7 +94,8 @@ then the diagram goes live.
 
 ### Terminal client
 
-Run `omar attach -s dev` (`--ea NAME` picks an EA). The terminal dashboard opens
+Run `omar attach -s dev --tui` (`--ea NAME` picks an EA), or `omar up --tui` to
+start and attach in one go. The terminal dashboard opens
 inside the session's tmux server. `z` detaches and the runtime keeps every
 workload running; `Q` stops the session after confirmation.
 
