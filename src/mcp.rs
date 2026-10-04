@@ -435,7 +435,7 @@ impl Drop for FileLock {
     }
 }
 
-pub fn run_server_from_context_file(path: PathBuf) -> Result<()> {
+pub fn run_server_from_context_file(path: PathBuf, bare_tool_names: bool) -> Result<()> {
     let mut context: McpLaunchContext = serde_json::from_str(
         &fs::read_to_string(&path)
             .with_context(|| format!("Failed to read MCP context file {}", path.display()))?,
@@ -463,7 +463,9 @@ pub fn run_server_from_context_file(path: PathBuf) -> Result<()> {
         }
     }
     apply_context_environment(&context);
-    OmarMcpServer::new(context).run()
+    OmarMcpServer::new(context)
+        .with_bare_tool_names(bare_tool_names)
+        .run()
 }
 
 fn apply_context_environment(context: &McpLaunchContext) {
@@ -478,7 +480,7 @@ fn apply_context_environment(context: &McpLaunchContext) {
 /// processes (e.g. the Slack bridge) that aren't spawned by a specific
 /// backend launch and need a default context derived from the current
 /// config + active EA.
-pub fn run_server_with_default_context() -> Result<()> {
+pub fn run_server_with_default_context(bare_tool_names: bool) -> Result<()> {
     let omar_dir = std::env::var_os("OMAR_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -506,7 +508,9 @@ pub fn run_server_with_default_context() -> Result<()> {
         topology: None,
         serve: None,
     };
-    OmarMcpServer::new(context).run()
+    OmarMcpServer::new(context)
+        .with_bare_tool_names(bare_tool_names)
+        .run()
 }
 
 /// Pick the EA id for a default-context server. Honors `OMAR_EA_ID` so
@@ -537,7 +541,16 @@ struct OmarMcpServer {
     session_prefix: String,
     manager_session: String,
     scheduler: scheduler::Scheduler,
+    /// Expose `omar_set_port` as `set_port`, and so on. For clients that
+    /// prefix every tool with the server name: opencode would otherwise show
+    /// `omar_omar_set_port` while every OMAR prompt says `omar_set_port`, and
+    /// a model that takes the prompt literally calls a tool that does not
+    /// exist. With bare names its prefix rebuilds exactly the documented one.
+    bare_tool_names: bool,
 }
+
+/// The prefix bare-name clients drop from tool names and rebuild themselves.
+const TOOL_PREFIX: &str = "omar_";
 
 impl OmarMcpServer {
     fn new(context: McpLaunchContext) -> Self {
@@ -552,7 +565,29 @@ impl OmarMcpServer {
             session_prefix,
             manager_session,
             scheduler,
+            bare_tool_names: false,
         }
+    }
+
+    fn with_bare_tool_names(mut self, bare: bool) -> Self {
+        self.bare_tool_names = bare;
+        self
+    }
+
+    /// The name OMAR dispatches on, for a name the client may have sent bare.
+    fn canonical_tool_name(&self, name: &str) -> String {
+        if self.bare_tool_names && !name.starts_with(TOOL_PREFIX) {
+            let prefixed = format!("{TOOL_PREFIX}{name}");
+            let known = topology_tool_definitions()
+                .into_iter()
+                .chain(ea_tool_definitions())
+                .chain(tool_definitions())
+                .any(|tool| tool["name"].as_str() == Some(prefixed.as_str()));
+            if known {
+                return prefixed;
+            }
+        }
+        name.to_string()
     }
 
     fn run(&self) -> Result<()> {
@@ -629,6 +664,22 @@ impl OmarMcpServer {
                     }
                     tools
                 };
+                let tools = if self.bare_tool_names {
+                    tools
+                        .into_iter()
+                        .map(|mut tool| {
+                            if let Some(bare) = tool["name"]
+                                .as_str()
+                                .and_then(|name| name.strip_prefix(TOOL_PREFIX))
+                            {
+                                tool["name"] = json!(bare);
+                            }
+                            tool
+                        })
+                        .collect()
+                } else {
+                    tools
+                };
                 ok_response(id, json!({ "tools": tools }))
             }
             "tools/call" => match serde_json::from_value::<ToolCallRequest>(request.params) {
@@ -646,6 +697,10 @@ impl OmarMcpServer {
     }
 
     fn call_tool(&self, call: ToolCallRequest) -> Value {
+        let call = ToolCallRequest {
+            name: self.canonical_tool_name(&call.name),
+            arguments: call.arguments,
+        };
         append_debug_log(
             &self.context,
             &format!("tool_call name={} args={}", call.name, call.arguments),
@@ -3002,6 +3057,84 @@ mod tests {
         // And it is the message the model is shown, not something wrapping it.
         let rendered = serde_json::to_string(&tool_error(anyhow!("{error}"))).unwrap();
         assert!(rendered.contains("expected identifier"), "{rendered}");
+    }
+
+    #[test]
+    fn bare_names_let_a_prefixing_client_rebuild_the_documented_ones() {
+        // opencode lists MCP tools as `<server>_<tool>`; with bare names its
+        // `omar_` prefix yields `omar_set_port`, the name every prompt uses.
+        let topology = McpLaunchContext {
+            topology: Some(crate::manager::TopologyMcpContext {
+                team: "T".to_string(),
+                agent: "a".to_string(),
+                endpoint: "127.0.0.1:1".to_string(),
+                token: "t".to_string(),
+            }),
+            ..test_context()
+        };
+        let bare = OmarMcpServer::new(topology.clone()).with_bare_tool_names(true);
+        assert_eq!(
+            listed_tools_of(&bare),
+            ["set_port", "complete", "pending"],
+            "bare names drop only the omar_ prefix"
+        );
+        assert_eq!(
+            listed_tools_of(&OmarMcpServer::new(topology)),
+            ["omar_set_port", "omar_complete", "omar_pending"],
+            "other clients keep the documented names"
+        );
+        let ea = OmarMcpServer::new(McpLaunchContext {
+            serve: Some(crate::manager::ServeMcpContext {
+                endpoint: "127.0.0.1:1".to_string(),
+                token: "t".to_string(),
+            }),
+            ..test_context()
+        })
+        .with_bare_tool_names(true);
+        let names = listed_tools_of(&ea);
+        assert!(names.contains(&"reply".to_string()), "{names:?}");
+        assert!(names.contains(&"propose_design".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"coordination_state".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with(TOOL_PREFIX)),
+            "{names:?}"
+        );
+        // A bare call reaches the omar_reply handler: it is validated as one.
+        let result = ea.call_tool(ToolCallRequest {
+            name: "reply".to_string(),
+            arguments: json!("not an object"),
+        });
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(
+            rendered.contains("expects an object of arguments"),
+            "{rendered}"
+        );
+        // Names that were never prefixed are passed through untouched.
+        assert_eq!(
+            ea.canonical_tool_name("coordination_state"),
+            "coordination_state"
+        );
+        assert_eq!(ea.canonical_tool_name("omar_reply"), "omar_reply");
+    }
+
+    fn listed_tools_of(server: &OmarMcpServer) -> Vec<String> {
+        let response = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(1)),
+                method: "tools/list".to_string(),
+                params: json!({}),
+            })
+            .expect("tools/list responds");
+        response.result.expect("tools result")["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect()
     }
 
     #[test]
