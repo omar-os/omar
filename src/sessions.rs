@@ -300,7 +300,7 @@ pub fn prepare_process(cli: &Cli) -> Result<()> {
 
 fn dashboard_target(cli: &Cli) -> Result<Option<Session>> {
     match &cli.command {
-        Some(Commands::Attach { session }) => resolve(session).map(Some),
+        Some(Commands::Attach) => target(cli).map(Some),
         Some(Commands::Manager {
             action: Some(crate::ManagerAction::Orchestrate),
         }) => target(cli).map(Some),
@@ -385,7 +385,7 @@ fn relaunch_dashboard(session: &Session, ea: ea::EaId) -> Result<()> {
         .args(["new-session", "-s", crate::DASHBOARD_SESSION, "-c"])
         .arg(&config.agent.default_workdir)
         .arg(&exe)
-        .args(["attach", &session.id, "--ea", &ea.to_string()])
+        .args(["attach", "-s", &session.id, "--ea", &ea.to_string()])
         .exec();
     bail!("failed to launch tmux: {error}")
 }
@@ -904,7 +904,7 @@ fn print_started(session: &Session, json_output: bool) -> Result<()> {
         return print_value(json!(session));
     }
     println!(
-        "Started session {} ({})\nURL:    {}\nAttach: omar attach {}\nStop:   omar down {}",
+        "Started session {} ({})\nURL:    {}\nAttach: omar attach -s {}\nStop:   omar down -s {}",
         session.name, session.id, session.url, session.id, session.id
     );
     Ok(())
@@ -945,8 +945,8 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             Some(
                 Commands::Up(_)
                     | Commands::Ls
-                    | Commands::Info { .. }
-                    | Commands::Attach { .. }
+                    | Commands::Info
+                    | Commands::Attach
                     | Commands::Web { .. }
                     | Commands::Logs { .. }
                     | Commands::Down { .. }
@@ -973,7 +973,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
     if matches!(
         cli.command,
         Some(
-            Commands::Attach { .. }
+            Commands::Attach
                 | Commands::Manager {
                     action: Some(crate::ManagerAction::Orchestrate)
                 }
@@ -984,7 +984,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
     let result = match &cli.command {
         Some(Commands::Serve { name, address, no_ea, ui, restart_ea }) => {
             if *restart_ea { return Some(Err(anyhow::anyhow!("serve creates a fresh session; --restart-ea is available only with --legacy"))); }
-            if *ui { return Some(Err(anyhow::anyhow!("use omar up, then omar web <session>; legacy serve --ui remains available with --legacy"))); }
+            if *ui { return Some(Err(anyhow::anyhow!("use omar up, then omar web -s <session>; legacy serve --ui remains available with --legacy"))); }
             launch(cli, UpOptions { name: name.clone(), address: address.unwrap_or_else(|| UpOptions::default().address), no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
         },
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
@@ -996,28 +996,28 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             for s in sessions { println!("{:<20} {:<12} {:<26} {} {} {}",s.name,s.state,s.url,s.version,&s.build_id[..12.min(s.build_id.len())],s.id); }
             Ok(())
         }),
-        Some(Commands::Info { session }) => resolve(session).and_then(|s| {
+        Some(Commands::Info) => target(cli).and_then(|s| {
             if matches!(s.state.as_str(), "stopped" | "failed" | "stale") { Ok(json!({"session":s})) }
             else { rpc(&s,json!({"op":"overview"}),Duration::from_secs(5)) }
         }).and_then(print_value),
-        Some(Commands::Web { session, print_url }) => resolve(session).and_then(|s| {
+        Some(Commands::Web { print_url }) => target(cli).and_then(|s| {
             rpc(&s,json!({"op":"hello"}),Duration::from_secs(5))?;
             if *print_url { println!("{}",s.url); } else { crate::open_browser(&s.url); }
             Ok(())
         }),
-        Some(Commands::Logs { session, follow, tail }) => resolve(session).and_then(|s| {
+        Some(Commands::Logs { follow, tail }) => target(cli).and_then(|s| {
             let mut command = Command::new("tail"); command.arg("-n").arg(tail.to_string());
             if *follow { command.arg("-f"); }
             anyhow::ensure!(command.arg(s.directory.join("logs/runtime.log")).status()?.success(),"reading logs failed"); Ok(())
         }),
-        Some(Commands::Down { session, force, timeout }) => resolve(session).and_then(|s| {
+        Some(Commands::Down { force, timeout }) => target(cli).and_then(|s| {
             if s.state == "stopped" { return Ok(()); }
             rpc(&s,json!({"op":"down","force":force}),Duration::from_secs(10))?;
             let deadline = Instant::now()+Duration::from_secs(*timeout);
             loop {
                 let saved: Session = serde_json::from_slice(&fs::read(registry().join(format!("{}.json",s.id)))?)?;
                 if saved.state == "stopped" { return if cli.json { print_value(json!(saved)) } else { println!("Stopped session {}",s.name); Ok(()) }; }
-                anyhow::ensure!(Instant::now()<deadline,"shutdown is still pending; inspect omar info {} or explicitly use down --force",s.id);
+                anyhow::ensure!(Instant::now()<deadline,"shutdown is still pending; inspect omar info -s {} or explicitly use down --force",s.id);
                 std::thread::sleep(Duration::from_millis(100));
             }
         }),

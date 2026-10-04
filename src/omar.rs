@@ -121,19 +121,17 @@ enum Commands {
     Up(sessions::UpOptions),
     /// List independently addressable runtime sessions
     Ls,
-    /// Inspect a runtime session
-    Info { session: String },
+    /// Inspect the selected runtime session
+    Info,
     /// Attach the terminal dashboard (z detaches; Q stops the session)
-    Attach { session: String },
+    Attach,
     /// Open Mission Control for an existing runtime
     Web {
-        session: String,
         #[arg(long)]
         print_url: bool,
     },
     /// Read a runtime's log
     Logs {
-        session: String,
         #[arg(long)]
         follow: bool,
         #[arg(long, default_value_t = 100)]
@@ -141,7 +139,6 @@ enum Commands {
     },
     /// Shut down one runtime and its owned workloads
     Down {
-        session: String,
         #[arg(long)]
         force: bool,
         #[arg(long, default_value_t = 30)]
@@ -518,8 +515,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         Some(
             Commands::Up(_)
             | Commands::Ls
-            | Commands::Info { .. }
-            | Commands::Attach { .. }
+            | Commands::Info
+            | Commands::Attach
             | Commands::Web { .. }
             | Commands::Logs { .. }
             | Commands::Down { .. }

@@ -42,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         return result
 
     def info(name):
-        return json.loads(cli("info", name))
+        return json.loads(cli("info", "-s", name))
 
     def wait_status(session, run, expected):
         deadline = time.monotonic() + 20
@@ -57,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
     def terminal_attach(name):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
-        process = subprocess.Popen([str(BIN), "attach", name], env=env, stdin=slave, stdout=slave, stderr=slave)
+        process = subprocess.Popen([str(BIN), "attach", "-s", name], env=env, stdin=slave, stdout=slave, stderr=slave)
         os.close(slave)
         return process, master
 
@@ -97,7 +97,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
                                   env=env, text=True, capture_output=True, timeout=90), range(2)))
         assert sorted(p.returncode == 0 for p in results) == [False, True]
         sessions.append(json.loads(next(p.stdout for p in results if p.returncode == 0)))
-        cli("down", "race")
+        cli("down", "-s", "race")
         # Occupied endpoint fails readiness instead of advertising a dead URL.
         with socket.socket() as occupied:
             occupied.bind(("127.0.0.1", 0)); occupied.listen()
@@ -121,7 +121,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             selected = json.loads(output.stdout)
             sessions.append(selected)
             assert (Path(selected["directory"]) / "bin/omarc").read_text() == marker
-            cli("down", "build")
+            cli("down", "-s", "build")
         # Browser disconnection no longer shuts down a managed runtime after 10s.
         host, port = inner["url"].removeprefix("http://").split(":")
         with socket.create_connection((host, int(port))) as browser:
@@ -213,18 +213,18 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         pid = int(reaction_pid.read_text())
         for worktree in (Path(managed["directory"]) / "workspaces").glob("*/worktree"):
             assert not (worktree / "state").exists(), "workspace copied another session's private state"
-        cli("down", "assistants", "--force")
+        cli("down", "-s", "assistants", "--force")
         status = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True)
         assert status.returncode != 0 or status.stdout.strip().startswith("Z"), "force left code reaction alive"
         # A stale registry record never causes a PID-only signal or wrong attachment.
         stale = up("stale")
         os.kill(stale["pid"], signal.SIGKILL)
         time.sleep(.2)
-        cli("down", stale["id"], ok=False)
+        cli("down", "-s", stale["id"], ok=False)
         assert info("outer")["session"]["state"] == "ready"
         print("PASS: session isolation, nested routing, help, startup races/failure, dashboard attach/detach, browser close, live topologies, targeted shutdown")
     finally:
         for session in sessions:
-            subprocess.run([str(BIN), "down", session["id"], "--force", "--timeout", "5"],
+            subprocess.run([str(BIN), "down", "-s", session["id"], "--force", "--timeout", "5"],
                            env=env, capture_output=True, timeout=15)
             subprocess.run(["tmux", "-L", session["tmux_server"], "kill-server"], capture_output=True)

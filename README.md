@@ -78,11 +78,11 @@ cd omar && make install
 
 ```bash
 $ omar up --name dev
-$ omar web dev
+$ omar web -s dev
 ```
 
 Starts an independent background runtime, then opens its web UI. Closing the
-browser leaves the runtime and its topologies running. Stop it with `omar down dev`.
+browser leaves the runtime and its topologies running. Stop it with `omar down -s dev`.
 See [session commands and lifecycle](docs/sessions.md).
 
 #### Step 2: Describe a workflow
@@ -94,7 +94,7 @@ then the diagram goes live.
 
 ### Terminal client
 
-Run `omar attach dev` (`--ea NAME` picks an EA). The terminal dashboard opens
+Run `omar attach -s dev` (`--ea NAME` picks an EA). The terminal dashboard opens
 inside the session's tmux server. `z` detaches and the runtime keeps every
 workload running; `Q` stops the session after confirmation.
 
