@@ -16,6 +16,7 @@ default-run = "omar"
 
 [dependencies]
 sha2 = "0.10"
+cap-std = "3"
 libc = "0.2"
 shlex = "2.0.1"
 ratatui = "0.29"

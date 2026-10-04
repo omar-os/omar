@@ -199,6 +199,7 @@ export async function startFakeServe({
         } else if (url.pathname === "/v1/agent/proposals") {
           const preview = structuredClone(golden);
           preview.status = "ready";
+          preview.team = String(payload.program ?? "").match(/\bmain\s+([A-Za-z_]\w*)/)?.[1] ?? preview.team;
           publishChat("assistant", String(payload.summary ?? ""), {
             program: String(payload.program ?? ""),
             inputs: payload.inputs ?? {},

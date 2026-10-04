@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
 import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
+import { Artifacts } from "./artifacts";
 import { DeployConfirmation } from "./deploy-confirmation";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
@@ -172,6 +173,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   /** Diagram components the operator has highlighted for the next message. */
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
+  const [filesOpen, setFilesOpen] = useState(false);
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -421,15 +423,15 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         for (let attempt = 0; attempt < 10; attempt += 1) {
           const latest = await fetchRun(serveUrl, record.run_id).catch(() => null);
           if (!connected) return;
-          if (latest) {
+          if (latest && isRunFinished(latest.status)) {
+            runRef.current = latest;
             setRun(latest);
-            if (isRunFinished(latest.status)) {
-              // `stopped` is the ending a stop asked for, so it reads as
-              // finished; only `failed` is a failure.
-              setPhase(latest.status === "failed" ? "failed" : "finished");
-              if (latest.error) setError(latest.error);
-              return;
-            }
+            // `stopped` is the ending a stop asked for, so it reads as
+            // finished; only `failed` is a failure. A still-running record
+            // must not undo a terminal event while persistence catches up.
+            setPhase(latest.status === "failed" ? "failed" : "finished");
+            if (latest.error) setError(latest.error);
+            return;
           }
           await new Promise((resolve) => setTimeout(resolve, 300));
         }
@@ -470,6 +472,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             void loadPanel(record.run_id);
           }
           if (event.kind === "run_completed") {
+            // Release ownership synchronously: the EA can propose again before
+            // the final run record is persisted or React commits this update.
+            runRef.current = { ...record, status: "completed" };
+            setRun(runRef.current);
             setPhase("finished");
             // The run's invocation service goes with it, so nothing is owed
             // any more whatever the last fetch saw.
@@ -484,6 +490,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             void settle();
           }
           if (event.kind === "run_failed") {
+            runRef.current = { ...record, status: "failed" };
+            setRun(runRef.current);
             setPhase("failed");
             const message = (event.payload as { message?: unknown }).message;
             setError(typeof message === "string" ? message : "The run failed.");
@@ -562,6 +570,20 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       // A fresh proposal remains in the transcript while this chat's
       // deployed topology continues to own the live diagram and controls.
       if (!replaying && runRef.current && !isRunFinished(runRef.current.status)) return;
+      if (!runRef.current || isRunFinished(runRef.current.status)) {
+        // The proposal now owns the view. Disconnecting also invalidates any
+        // in-flight refresh/settle responses belonging to the previous run.
+        disconnectRef.current?.();
+        disconnectRef.current = null;
+        runRef.current = null;
+        setRun(null);
+        setEvents([]);
+        setPending([]);
+        setPanelAgent(null);
+        setSelection([]);
+        setTab("source");
+        setError("");
+      }
       setConfirming(false);
       setDesign(message.design);
       setSource(message.design.program);
@@ -912,6 +934,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               </button>
             </div>
           ) : null}
+          {!isDemo ? <div className="workspace-file-action"><button className="secondary-button" disabled={switchingChat || daemon.state !== "live"} onClick={() => setFilesOpen(true)}>Files & versions</button></div> : null}
           <div className="messages" ref={threadRef}>
             {messages.length === 0 && snapshot ? (
               <p className="builder-status">
@@ -1200,6 +1223,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         />
       ) : null}
 
+      {filesOpen ? <Artifacts key={serveUrl} serveUrl={serveUrl} onClose={() => setFilesOpen(false)} /> : null}
       {terminalAgent ? (
         <AgentTerminal
           serveUrl={serveUrl}

@@ -1739,7 +1739,6 @@ pub struct TopologyRunConfig<'a> {
     /// Where this program's generated artifacts go, from `generated_dir`.
     pub generated: &'a Path,
     pub base_prefix: &'a str,
-    pub default_workdir: &'a str,
     pub health_idle_warning: i64,
     pub inputs: &'a [String],
     pub replace: bool,
@@ -2295,7 +2294,7 @@ fn launch(
             .deployment_id
             .clone();
         // A resumed run's files were restored before launch; a fresh run's
-        // instances get new, empty-history workspaces.
+        // instances get new, empty workspaces.
         let workspaces = match restored {
             Some(workspaces) => workspaces,
             None => crate::workspace::for_topology(
@@ -2303,7 +2302,6 @@ fn launch(
                 config.ea_id,
                 &deployment_id,
                 &state,
-                Path::new(config.default_workdir),
             )?,
         };
         {

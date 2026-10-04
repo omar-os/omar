@@ -19,6 +19,8 @@ mod paths;
 mod process;
 mod projects;
 // The generator runs under `cargo test`; nothing in a release build calls it.
+mod artifacts;
+mod editor;
 #[cfg(test)]
 mod protocol;
 mod reaction;
@@ -695,7 +697,6 @@ async fn async_main() -> Result<()> {
                     omar_dir: &omar_dir,
                     generated: &generated,
                     base_prefix: &config.dashboard.session_prefix,
-                    default_workdir: &config.agent.default_workdir,
                     health_idle_warning: config.health.idle_warning,
                     inputs: &inputs,
                     replace,
@@ -753,7 +754,6 @@ async fn async_main() -> Result<()> {
                     omar_dir: &omar_dir,
                     generated: &generated,
                     base_prefix: &config.dashboard.session_prefix,
-                    default_workdir: &config.agent.default_workdir,
                     health_idle_warning: config.health.idle_warning,
                     inputs: &[],
                     replace,
