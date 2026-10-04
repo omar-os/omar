@@ -87,6 +87,7 @@ fn vocabularies() -> Vec<Vocabulary> {
                 RunStatus::Stopping,
                 RunStatus::Completed,
                 RunStatus::Stopped,
+                RunStatus::Paused,
                 RunStatus::Failed,
             ],
         ),
@@ -236,7 +237,7 @@ mod tests {
     fn the_values_are_spelled_the_way_serde_spells_them() {
         let generated = generate();
         assert!(generated.contains(
-            r#"export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "failed"] as const;"#
+            r#"export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "paused", "failed"] as const;"#
         ));
         assert!(
             generated.contains(r#"export const CHAT_ROLES = ["operator", "assistant"] as const;"#)

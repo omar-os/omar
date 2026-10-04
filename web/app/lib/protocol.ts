@@ -214,7 +214,7 @@ export type RunRequest = {
  * failure. It was missing here for as long as the daemon could answer it.
  */
 export function isRunFinished(status: RunStatus): boolean {
-  return status === "completed" || status === "stopped" || status === "failed";
+  return status === "completed" || status === "stopped" || status === "paused" || status === "failed";
 }
 
 export function assertRunRecord(value: unknown): RunRecord {

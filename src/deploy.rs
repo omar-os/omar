@@ -11,7 +11,9 @@ use crate::tmux::TmuxClient;
 use crate::topology::write_json_atomic;
 
 /// TERMINATED covers natural drain and graceful stop; CANCELLED is a force
-/// kill; FAILED is any error.
+/// kill; FAILED is any error. PAUSED means the run's runner has exited with
+/// a durable checkpoint behind it: no process owns the run until a resume
+/// starts a new one, so the record is terminal, and the run is not over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DeploymentState {
@@ -19,6 +21,8 @@ pub enum DeploymentState {
     Deploying,
     Running,
     Stopping,
+    Pausing,
+    Paused,
     Terminated,
     Failed,
     Cancelled,
@@ -26,7 +30,10 @@ pub enum DeploymentState {
 
 impl DeploymentState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Terminated | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Terminated | Self::Failed | Self::Cancelled | Self::Paused
+        )
     }
 
     /// Whether `next` is a legal successor. Forward-only; any non-terminal
@@ -40,6 +47,8 @@ impl DeploymentState {
             Deploying => self == Created,
             Running => self == Deploying,
             Stopping => self == Running,
+            Pausing => self == Running,
+            Paused => self == Pausing,
             Terminated => matches!(self, Running | Stopping),
             Failed | Cancelled => true,
             Created => false,
@@ -54,6 +63,8 @@ impl fmt::Display for DeploymentState {
             Self::Deploying => "DEPLOYING",
             Self::Running => "RUNNING",
             Self::Stopping => "STOPPING",
+            Self::Pausing => "PAUSING",
+            Self::Paused => "PAUSED",
             Self::Terminated => "TERMINATED",
             Self::Failed => "FAILED",
             Self::Cancelled => "CANCELLED",
@@ -108,6 +119,18 @@ pub struct DeploymentRecord {
     /// Instance name to stable workspace id; retained after the run ends.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspaces: BTreeMap<String, String>,
+    /// The last checkpoint this run published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    /// Why the last capture failed, while the run holds at that boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_error: Option<String>,
+    /// Unix time the next automatic capture is due, for status displays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_checkpoint_at: Option<u64>,
+    /// The checkpoint a resumed run continued from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<String>,
 }
 
 fn read_launch_server<'de, D: serde::Deserializer<'de>>(
@@ -153,6 +176,10 @@ impl DeploymentRecord {
             }],
             state_vars: BTreeMap::new(),
             workspaces: BTreeMap::new(),
+            checkpoint: None,
+            checkpoint_error: None,
+            next_checkpoint_at: None,
+            resumed_from: None,
         }
     }
 
@@ -284,26 +311,63 @@ pub fn outputs_path(dir: &Path) -> PathBuf {
     dir.join("outputs.json")
 }
 
+/// What an operator asked the runner to do at its next tag boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlOp {
+    Stop,
+    /// Checkpoint, then end the runner with the run resumable.
+    Pause,
+    /// Checkpoint now and keep going.
+    Checkpoint,
+    /// Try again after a capture failed and the run held at its boundary.
+    RetryCheckpoint,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-struct StopRequest {
+struct ControlRequest {
+    /// Missing in records a pre-checkpoint runtime wrote, where the file's
+    /// presence meant stop.
+    #[serde(default)]
+    op: Option<ControlOp>,
     requested_at: u64,
 }
 
-/// Ask the runner to stop at the next tag boundary.
-pub fn request_stop(dir: &Path) -> Result<()> {
+pub fn request(dir: &Path, op: ControlOp) -> Result<()> {
     write_json_atomic(
         &control_path(dir),
-        &StopRequest {
+        &ControlRequest {
+            op: Some(op),
             requested_at: now_unix(),
         },
     )
 }
 
-pub fn stop_requested(dir: &Path) -> bool {
-    control_path(dir).exists()
+/// Ask the runner to stop at the next tag boundary.
+pub fn request_stop(dir: &Path) -> Result<()> {
+    request(dir, ControlOp::Stop)
 }
 
-/// Remove any stop request, so a finished stop cannot end the next run.
+/// The request waiting for the runner, if any. Unreadable requests count as
+/// a stop: an operator reached for the control file, and stopping is the
+/// one answer that abandons nothing mid-tag.
+pub fn pending_request(dir: &Path) -> Option<ControlOp> {
+    let path = control_path(dir);
+    if !path.exists() {
+        return None;
+    }
+    let request: Option<ControlRequest> = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    Some(request.and_then(|r| r.op).unwrap_or(ControlOp::Stop))
+}
+
+#[cfg(test)]
+pub fn stop_requested(dir: &Path) -> bool {
+    pending_request(dir) == Some(ControlOp::Stop)
+}
+
+/// Remove any pending request, so a finished one cannot act on the next run.
 pub fn clear_stop(dir: &Path) -> Result<()> {
     let path = control_path(dir);
     if path.exists() {
@@ -311,6 +375,23 @@ pub fn clear_stop(dir: &Path) -> Result<()> {
             .with_context(|| format!("failed to remove {}", path.display()))?;
     }
     Ok(())
+}
+
+fn policy_path(dir: &Path) -> PathBuf {
+    dir.join("checkpoint-policy.json")
+}
+
+/// The run's checkpoint policy as last persisted, if an operator set one.
+pub fn read_policy(dir: &Path) -> Result<Option<crate::checkpoint::Policy>> {
+    let path = policy_path(dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&std::fs::read(&path)?)?))
+}
+
+pub fn write_policy(dir: &Path, policy: crate::checkpoint::Policy) -> Result<()> {
+    write_json_atomic(&policy_path(dir), &policy)
 }
 
 pub fn kill_process(pid: u32) {
@@ -396,7 +477,11 @@ mod tests {
         assert!(Running.may_become(Stopping));
         assert!(Running.may_become(Terminated));
         assert!(Stopping.may_become(Terminated));
-        for state in [Created, Deploying, Running, Stopping] {
+        assert!(Running.may_become(Pausing));
+        assert!(Pausing.may_become(Paused));
+        assert!(!Pausing.may_become(Terminated));
+        assert!(!Stopping.may_become(Paused));
+        for state in [Created, Deploying, Running, Stopping, Pausing] {
             assert!(state.may_become(Failed));
             assert!(state.may_become(Cancelled));
         }
@@ -404,9 +489,10 @@ mod tests {
         assert!(!Created.may_become(Running));
         assert!(!Deploying.may_become(Terminated));
         assert!(!Stopping.may_become(Running));
-        for terminal in [Terminated, Failed, Cancelled] {
+        for terminal in [Terminated, Failed, Cancelled, Paused] {
             for next in [
-                Created, Deploying, Running, Stopping, Terminated, Failed, Cancelled,
+                Created, Deploying, Running, Stopping, Pausing, Paused, Terminated, Failed,
+                Cancelled,
             ] {
                 assert!(!terminal.may_become(next));
             }
@@ -467,6 +553,17 @@ mod tests {
         assert!(stop_requested(dir.path()));
         clear_stop(dir.path()).unwrap();
         assert!(!stop_requested(dir.path()));
+        // A pause is not a stop, and a legacy request without an op is.
+        request(dir.path(), ControlOp::Pause).unwrap();
+        assert!(!stop_requested(dir.path()));
+        assert_eq!(pending_request(dir.path()), Some(ControlOp::Pause));
+        std::fs::write(dir.path().join("control.json"), b"{\"requested_at\":1}").unwrap();
+        assert!(stop_requested(dir.path()));
+        clear_stop(dir.path()).unwrap();
+        assert_eq!(pending_request(dir.path()), None);
+        assert!(read_policy(dir.path()).unwrap().is_none());
+        write_policy(dir.path(), crate::checkpoint::Policy { period_secs: 90 }).unwrap();
+        assert_eq!(read_policy(dir.path()).unwrap().unwrap().period_secs, 90);
     }
 
     #[test]

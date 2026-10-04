@@ -154,6 +154,7 @@ pub enum RunStatus {
     /// a failure -- the daemon has answered this since `RunEnd::Stopped`
     /// existed, and no client had it written down.
     Stopped,
+    Paused,
     Failed,
 }
 
@@ -2194,6 +2195,8 @@ fn spawn_run_thread(
                 diagram_address: Some(diagram_address),
                 diagram_ready: Some(ready_sender),
                 panel_ready: Some(panel_sender),
+                checkpoint_period: None,
+                program_path: None,
             },
         );
         // The run is over, so its invocation service is gone with it. Leaving
@@ -2209,6 +2212,7 @@ fn spawn_run_thread(
             match outcome {
                 Ok(topology::RunEnd::Completed) => record.status = RunStatus::Completed,
                 Ok(topology::RunEnd::Stopped) => record.status = RunStatus::Stopped,
+                Ok(topology::RunEnd::Paused) => record.status = RunStatus::Paused,
                 Err(error) => {
                     record.status = RunStatus::Failed;
                     record.error = Some(format!("{error:#}"));
