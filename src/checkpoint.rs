@@ -217,6 +217,21 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Replace a pointer file durably: synced temporary, rename, synced
+/// directory. A crash leaves the old pointer or the new one, never a torn
+/// file that a loader cannot read.
+fn write_pointer(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().context("pointer has no directory")?;
+    let staged = dir.join(format!(
+        ".{}.{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        Uuid::new_v4().simple()
+    ));
+    write_synced(&staged, bytes)?;
+    fs::rename(&staged, path)?;
+    fsync_dir(dir)
+}
+
 impl Store {
     pub fn new(deployment_dir: &Path) -> Self {
         Self {
@@ -277,18 +292,17 @@ impl Store {
             );
             fs::rename(&staging, &published)?;
             fsync_dir(&self.dir)?;
-            write_synced(&self.dir.join(LATEST), manifest.id.as_bytes())?;
+            write_pointer(&self.dir.join(LATEST), manifest.id.as_bytes())?;
             // A new checkpoint is the run's head: a resume continues from
             // it, until a rollback moves the head to an older one.
-            crate::topology::write_json_atomic(
+            write_pointer(
                 &self.dir.join(HEAD),
-                &Head {
+                &serde_json::to_vec(&Head {
                     checkpoint_id: manifest.id.clone(),
                     abandoned: None,
                     updated_at: crate::deploy::now_unix(),
-                },
+                })?,
             )?;
-            fsync_dir(&self.dir)?;
             Ok(published)
         })();
         if result.is_err() {
@@ -447,7 +461,7 @@ impl Store {
             abandoned: previous,
             updated_at: crate::deploy::now_unix(),
         };
-        crate::topology::write_json_atomic(&self.dir.join(HEAD), &head)?;
+        write_pointer(&self.dir.join(HEAD), &serde_json::to_vec(&head)?)?;
         Ok(head)
     }
 

@@ -1289,8 +1289,8 @@ fn rollback_deployment(
     let record = deploy::DeploymentRecord::load(&dir)?
         .ok_or_else(|| anyhow::anyhow!("no deployment '{}'", team))?;
     anyhow::ensure!(
-        record.state.is_terminal() && !(record.is_active() && record.runner_alive()),
-        "deployment '{}' is {}; pause it before rolling back",
+        record.state == deploy::DeploymentState::Paused,
+        "deployment '{}' is {}; only a paused run can roll back",
         team,
         record.state
     );

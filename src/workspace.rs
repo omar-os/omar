@@ -478,13 +478,9 @@ pub fn list(root: &Path, ea_id: u32) -> Result<Vec<Workspace>> {
     Ok(result)
 }
 
-pub fn for_topology(
-    root: &Path,
-    ea_id: u32,
-    deployment_id: &str,
-    state: &crate::topology::VmState,
-    source: &Path,
-) -> Result<BTreeMap<String, Workspace>> {
+/// Which instances own a workspace, and their parents. Legacy bytecode with
+/// agents or reactions outside any instance gets one root workspace.
+pub fn instance_owners(state: &crate::topology::VmState) -> BTreeMap<String, Option<String>> {
     let mut owners: BTreeMap<String, Option<String>> = state
         .instances
         .iter()
@@ -501,6 +497,17 @@ pub fn for_topology(
     {
         owners.insert(String::new(), None);
     }
+    owners
+}
+
+pub fn for_topology(
+    root: &Path,
+    ea_id: u32,
+    deployment_id: &str,
+    state: &crate::topology::VmState,
+    source: &Path,
+) -> Result<BTreeMap<String, Workspace>> {
+    let owners = instance_owners(state);
     create_batch(
         owners,
         |instance, parent| Workspace::create(root, ea_id, deployment_id, instance, parent, source),

@@ -333,14 +333,31 @@ struct ControlRequest {
     requested_at: u64,
 }
 
+/// Admit one request at a time. The file is linked into place rather than
+/// written over, so two operators racing to ask for a pause and a stop get
+/// one request and one refusal, never a silently replaced one.
 pub fn request(dir: &Path, op: ControlOp) -> Result<()> {
+    let path = control_path(dir);
+    let staged = dir.join(format!(".control-{}.json", uuid::Uuid::new_v4().simple()));
     write_json_atomic(
-        &control_path(dir),
+        &staged,
         &ControlRequest {
             op: Some(op),
             requested_at: now_unix(),
         },
-    )
+    )?;
+    let linked = std::fs::hard_link(&staged, &path);
+    let _ = std::fs::remove_file(&staged);
+    match linked {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let pending = pending_request(dir)
+                .map(|op| format!("{op:?}").to_lowercase())
+                .unwrap_or_else(|| "another".to_string());
+            bail!("a {pending} request is already pending; wait for the runner to answer it")
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to write {}", path.display())),
+    }
 }
 
 /// Ask the runner to stop at the next tag boundary.
@@ -557,6 +574,14 @@ mod tests {
         request(dir.path(), ControlOp::Pause).unwrap();
         assert!(!stop_requested(dir.path()));
         assert_eq!(pending_request(dir.path()), Some(ControlOp::Pause));
+        // One request at a time: a stop cannot silently replace the pause.
+        let refused = request_stop(dir.path()).unwrap_err().to_string();
+        assert!(
+            refused.contains("pause request is already pending"),
+            "{refused}"
+        );
+        assert_eq!(pending_request(dir.path()), Some(ControlOp::Pause));
+        clear_stop(dir.path()).unwrap();
         std::fs::write(dir.path().join("control.json"), b"{\"requested_at\":1}").unwrap();
         assert!(stop_requested(dir.path()));
         clear_stop(dir.path()).unwrap();

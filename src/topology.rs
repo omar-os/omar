@@ -2050,8 +2050,13 @@ impl Checkpointer for RunCheckpointer<'_> {
         Ok(id)
     }
 
-    fn capture_failed(&self, error: &anyhow::Error, attempt: u32) {
+    fn capture_failed(&self, error: &anyhow::Error, attempt: u32, held: bool) {
         eprintln!("warning: checkpoint attempt {attempt} failed: {error:#}");
+        // Only a held failure is the operator's to act on; a waiting
+        // `checkpoint create` must not read a retry in progress as final.
+        if !held {
+            return;
+        }
         if let Ok(mut guard) = self.record.lock() {
             guard.checkpoint_error = Some(format!("{error:#}"));
             let _ = guard.save(&self.dir);
@@ -2101,9 +2106,11 @@ pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunE
             record.pid
         );
     }
+    // Only a paused run: a stopped one executed tags after its last
+    // checkpoint, and continuing from there would replay them.
     anyhow::ensure!(
-        record.checkpoint.is_some() || record.state == DeploymentState::Paused,
-        "deployment '{team}' is {} and left no checkpoint to resume from",
+        record.state == DeploymentState::Paused,
+        "deployment '{team}' is {}; only a paused run can resume",
         record.state
     );
     let store = checkpoint::Store::new(&runtime_dir);
@@ -2119,8 +2126,20 @@ pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunE
         manifest.id,
         state.team
     );
-    // Every instance the program declares must have a captured version;
-    // a checkpoint missing one cannot stand in for the run.
+    // Every instance the program declares must have a captured version, and
+    // nothing else may be listed: a checkpoint that disagrees with its own
+    // program cannot stand in for the run.
+    let expected: BTreeSet<String> = crate::workspace::instance_owners(&state)
+        .into_keys()
+        .collect();
+    let captured: BTreeSet<String> = manifest.workspaces.keys().cloned().collect();
+    anyhow::ensure!(
+        expected == captured,
+        "checkpoint {} covers instances {:?}, program declares {:?}",
+        manifest.id,
+        captured,
+        expected
+    );
     let mut workspaces = BTreeMap::new();
     let result = (|| -> Result<()> {
         for (instance, artifact) in &manifest.workspaces {
@@ -3162,8 +3181,9 @@ pub(crate) trait Checkpointer {
     fn due(&self) -> bool;
     /// Publish a checkpoint for `state`. Returns its id.
     fn capture(&self, state: &ExecutionState, trigger: Trigger) -> Result<String>;
-    /// A capture failed; the run holds at its boundary until a retry or stop.
-    fn capture_failed(&self, error: &anyhow::Error, attempt: u32);
+    /// A capture attempt failed. `held` says the internal retries are spent
+    /// and the run now waits at its boundary for an operator.
+    fn capture_failed(&self, error: &anyhow::Error, attempt: u32, held: bool);
 }
 
 /// What a boundary decided.
@@ -3214,7 +3234,7 @@ fn settle_boundary(
             Ok(_) => break,
             Err(error) => {
                 attempt += 1;
-                checkpointer.capture_failed(&error, attempt);
+                checkpointer.capture_failed(&error, attempt, attempt > CAPTURE_RETRIES);
                 if attempt <= CAPTURE_RETRIES {
                     thread::sleep(Duration::from_secs(1 << (attempt - 1)));
                     continue;
@@ -5926,7 +5946,8 @@ mod tests {
             self.captures.lock().unwrap().push((trigger, state.clone()));
             Ok(format!("cp-{}", self.captures.lock().unwrap().len()))
         }
-        fn capture_failed(&self, _error: &anyhow::Error, _attempt: u32) {
+        fn capture_failed(&self, _error: &anyhow::Error, _attempt: u32, held: bool) {
+            assert!(!held, "one failure is retried internally, never held");
             *self.failures.lock().unwrap() += 1;
         }
     }
