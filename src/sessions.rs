@@ -319,18 +319,35 @@ fn prepare_dashboard(cli: &Cli, session: Session) -> Result<()> {
         session.name,
         session.state
     );
-    let ea = ea::resolve_ea_selector(&session.directory, cli.ea.as_deref())?;
+    // Same precedence as every other session command: explicit `--ea`, an
+    // inherited EA only with inherited routing, else EA 0. A dashboard that
+    // is already running keeps its EA unless one is named.
+    let explicit =
+        cli.ea.is_some() || (cli.session.is_none() && std::env::var_os("OMAR_EA_ID").is_some());
+    let ea = ea::resolve_ea_selector(&session.directory, Some(&ea_selector(cli)))?;
     std::env::set_var("OMAR_STATE_DIR", &session.directory);
     std::env::set_var("OMAR_SESSION_ID", &session.id);
     std::env::set_var("OMAR_TMUX_SERVER", &session.tmux_server);
     std::env::set_var("OMARC_BIN", session.directory.join("bin/omarc"));
-    if cli.ea.is_some() {
+    let running = dashboard_running(&session);
+    if explicit || !running {
         ea::save_active_ea(&session.directory, ea.id)?;
     }
     if inside_tmux_server(&session.tmux_server) {
         return Ok(());
     }
-    relaunch_dashboard(&session, ea.id)
+    relaunch_dashboard(&session, ea.id, explicit, running)
+}
+
+fn dashboard_running(session: &Session) -> bool {
+    Command::new("tmux")
+        .args(["-L", &session.tmux_server, "has-session", "-t"])
+        .arg(format!("={}", crate::DASHBOARD_SESSION))
+        .env_remove("TMUX")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn inside_tmux_server(server: &str) -> bool {
@@ -347,7 +364,12 @@ fn inside_tmux_server(server: &str) -> bool {
 /// A dashboard that is already running there receives a launch handoff and
 /// this client attaches to it; otherwise a fresh one is started. Never returns
 /// on success: the process becomes the tmux client.
-fn relaunch_dashboard(session: &Session, ea: ea::EaId) -> Result<()> {
+fn relaunch_dashboard(
+    session: &Session,
+    ea: ea::EaId,
+    explicit: bool,
+    running: bool,
+) -> Result<()> {
     let config = Config::load(session.directory.join("config.toml").to_str())?;
     let exe = std::env::current_exe()?;
     let dashboard = format!("={}", crate::DASHBOARD_SESSION);
@@ -359,22 +381,18 @@ fn relaunch_dashboard(session: &Session, ea: ea::EaId) -> Result<()> {
             .env_remove("TMUX_PANE");
         command
     };
-    let running = tmux()
-        .args(["has-session", "-t", &dashboard])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?
-        .success();
     if running {
-        ea::save_dashboard_launch_handoff(
-            &session.directory,
-            &ea::DashboardLaunchHandoff {
-                active_ea: ea,
-                default_command: config.agent.default_command.clone(),
-                default_workdir: config.agent.default_workdir.clone(),
-                restart_manager: false,
-            },
-        )?;
+        if explicit {
+            ea::save_dashboard_launch_handoff(
+                &session.directory,
+                &ea::DashboardLaunchHandoff {
+                    active_ea: ea,
+                    default_command: config.agent.default_command.clone(),
+                    default_workdir: config.agent.default_workdir.clone(),
+                    restart_manager: false,
+                },
+            )?;
+        }
         let status = tmux().args(["attach-session", "-t", &dashboard]).status()?;
         if status.success() {
             std::process::exit(0);
@@ -676,13 +694,15 @@ fn handle_operation(
         return overview(server, session);
     }
     if op == "down" {
-        server.session_stopping()?;
-        force.fetch_or(
-            operation["force"].as_bool().unwrap_or(false),
-            Ordering::SeqCst,
-        );
+        let forced = operation["force"].as_bool().unwrap_or(false);
+        force.fetch_or(forced, Ordering::SeqCst);
         session.state = "stopping".into();
         publish(session)?;
+        // A graceful stop request can fail on a broken deployment directory;
+        // an explicit force still gets through.
+        if let Err(error) = server.session_stopping() {
+            anyhow::ensure!(forced, "{error:#}");
+        }
         return Ok(json!({"status":"stopping"}));
     }
     anyhow::ensure!(
@@ -815,6 +835,12 @@ async fn daemon(directory: &Path) -> Result<()> {
     crate::metrics::configure(config.metrics.spawn_metrics_enabled);
     ea::ensure_default_ea(directory)?;
     let server = Arc::new(Serve::start(launch.address, &config, directory, 0)?);
+    // Slack and computer integrations belong to the runtime, never to a client.
+    let mut bridges: Vec<std::process::Child> =
+        [crate::spawn_slack_bridge(), crate::spawn_computer_bridge()]
+            .into_iter()
+            .flatten()
+            .collect();
     server.attach_ea(&config, directory, 0, false, !launch.no_ea)?;
     // A session owns exactly one scheduled-event delivery loop, even with no clients.
     let scheduler = Arc::new(crate::scheduler::Scheduler::with_store(
@@ -848,8 +874,11 @@ async fn daemon(directory: &Path) -> Result<()> {
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
                     let request =
                         read_frame(&stream).and_then(|v| Ok(serde_json::from_value::<Request>(v)?));
-                    let hello = request.as_ref().is_ok_and(|r| r.operation["op"] == "hello");
-                    let _operation = (!hello).then(|| operations.lock().unwrap());
+                    // `down` must not queue behind a stuck operation it exists to end.
+                    let direct = request.as_ref().is_ok_and(|r| {
+                        matches!(r.operation["op"].as_str(), Some("hello" | "down"))
+                    });
+                    let _operation = (!direct).then(|| operations.lock().unwrap());
                     let mut record = session.lock().unwrap().clone();
                     let result = request.and_then(|request| {
                         anyhow::ensure!(
@@ -889,6 +918,9 @@ async fn daemon(directory: &Path) -> Result<()> {
         }
     }
     scheduler_task.abort();
+    for bridge in &mut bridges {
+        crate::kill_child_gracefully(bridge, Duration::from_secs(3));
+    }
     cleanup.cleanup();
     let mut session = session.lock().unwrap();
     session.state = "stopped".into();
@@ -1031,18 +1063,16 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             }
             let body=json!({"program":fs::read_to_string(&options.program)?,"inputs":inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast});
             let run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
-            print_value(run.clone())?;
-            if options.wait {
-                loop {
-                    let state=rpc(&s,json!({"op":"status","ea":ea,"run":run["run_id"]}),Duration::from_secs(5))?;
-                    match state["status"].as_str() {
-                        Some("completed"|"stopped") => return print_value(state),
-                        Some("failed") => bail!("topology failed: {}",state["error"]),
-                        _ => std::thread::sleep(Duration::from_millis(200)),
-                    }
+            // One structured result: the admission record, or with --wait the terminal record.
+            if !options.wait { return print_value(run); }
+            loop {
+                let state=rpc(&s,json!({"op":"status","ea":ea,"run":run["run_id"]}),Duration::from_secs(5))?;
+                match state["status"].as_str() {
+                    Some("completed"|"stopped") => return print_value(state),
+                    Some("failed") => bail!("topology failed: {}",state["error"]),
+                    _ => std::thread::sleep(Duration::from_millis(200)),
                 }
             }
-            Ok(())
         })(),
         Some(Commands::Runs { all_eas }) => target(cli).and_then(|s|rpc(&s,json!({"op":"runs","ea":ea_selector(cli),"all_eas":all_eas}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Status { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"status","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),

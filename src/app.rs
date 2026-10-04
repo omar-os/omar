@@ -1284,6 +1284,13 @@ impl App {
     /// Delete the specified EA: kill all its tmux sessions, remove state, unregister.
     /// Blocked if it is the last EA. Switches to the lowest remaining EA when active.
     pub fn delete_ea(&mut self, ea_id: EaId) -> Result<()> {
+        if self.session.is_some() {
+            // The daemon holds this EA's context and runs; deleting it
+            // underneath the daemon would corrupt them.
+            self.set_status("EA deletion is not available while attached; the runtime owns EAs");
+            self.pending_confirm = None;
+            return Ok(());
+        }
         if self.registered_eas.len() <= 1 {
             self.set_status("Cannot delete the only EA");
             self.pending_confirm = None;

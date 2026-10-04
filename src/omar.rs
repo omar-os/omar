@@ -774,12 +774,16 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         }
         Some(Commands::StubAgent { context_file }) => stub_agent::run(&context_file),
         Some(Commands::Serve {
-            name: _,
+            name,
             address,
             restart_ea,
             no_ea,
             ui,
         }) => {
+            anyhow::ensure!(
+                name.is_none(),
+                "--name creates a managed session; legacy serve has no session name"
+            );
             let address = address.unwrap_or_else(|| "127.0.0.1:7340".parse().unwrap());
             if ui && !web_assets::is_bundled() {
                 anyhow::bail!(web_assets::MISSING);
@@ -2115,7 +2119,11 @@ async fn run_dashboard(config: Config, session: Option<sessions::Session>) -> Re
                         }
                         KeyCode::Char('D') => {
                             // Delete the currently active EA (last EA is protected)
-                            if app.registered_eas.len() > 1 {
+                            if app.session.is_some() {
+                                app.set_status(
+                                    "EA deletion is not available while attached; the runtime owns EAs",
+                                );
+                            } else if app.registered_eas.len() > 1 {
                                 app.pending_confirm = Some(app::ConfirmAction::DeleteEa);
                             } else {
                                 app.set_status("Cannot delete the only EA");

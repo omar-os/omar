@@ -130,6 +130,10 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         # A running timer topology keeps doing useful work independently of clients.
         program = root / "clock.omar"
         program.write_text('team Clock { timer tick(0, 1s) output stamp : int reaction(tick) -> stamp {= stamp = Some(1); =} }\nmain ClockRun { clock = Clock() }\n')
+        once = root / "once.omar"
+        once.write_text('team Once { timer tick(1ns, 0) output done : int reaction(tick) -> done {= done = Some(1); =} }\nmain OnceRun { once = Once() }\n')
+        # --wait prints exactly one structured result: the terminal record.
+        assert json.loads(cli("--session", "outer", "start", str(once), "--wait"))["status"] == "completed"
         run_a = json.loads(cli("--session", "outer", "start", str(program)))["run_id"]
         run_b = json.loads(cli("--session", "inner", "start", str(program)))["run_id"]
         wait_status("outer", run_a, "running")
@@ -192,7 +196,8 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         terminal, master = terminal_attach("assistants")
         try:
             terminal_expect(master, "OMAR assistants")
-            terminal_expect(master, "Executive Assistant")
+            # A fresh dashboard opens EA 0, whatever other clients targeted before.
+            terminal_expect(master, "Executive Assistant (Default)")
             os.write(master, b"z")
             assert terminal.wait(timeout=10) == 0
         finally:

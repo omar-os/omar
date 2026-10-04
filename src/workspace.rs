@@ -619,20 +619,40 @@ fn collect(base: &Path, directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()
     }
     Ok(())
 }
+/// A session root is only one child of OMAR_HOME. Seeding a parent directory
+/// must not copy another session's credentials or workspaces. A nested runtime
+/// may legitimately seed its supervising team's worktree, which itself lives
+/// under OMAR_HOME; that is the only source allowed there.
+fn seed_exclusion(source: &Path, root: &Path, home: Option<&Path>) -> Result<PathBuf> {
+    let Some(home) = home.filter(|home| root.starts_with(home)) else {
+        return Ok(root.to_path_buf());
+    };
+    if !source.starts_with(home) {
+        return Ok(home.to_path_buf());
+    }
+    let relative: Vec<String> = source
+        .strip_prefix(home)?
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let worktree = matches!(relative.as_slice(),
+        [a, _, b, _, c, ..] if a == "sessions" && b == "workspaces" && c == "worktree")
+        || matches!(relative.as_slice(), [a, _, b, ..] if a == "workspaces" && b == "worktree");
+    anyhow::ensure!(
+        worktree,
+        "a workspace source under the OMAR home directory must be a team worktree"
+    );
+    Ok(root.to_path_buf())
+}
+
 fn seed(source: &Path, destination: &Path, root: &Path) -> Result<()> {
     let root = root.canonicalize()?;
     anyhow::ensure!(
         !source.starts_with(&root),
         "workspace source must be outside OMAR state directory"
     );
-    // A session root is only one child of OMAR_HOME. Seeding a parent
-    // directory must not copy another session's credentials or workspaces.
-    // A nested runtime may legitimately seed its supervising team's worktree,
-    // which itself lives under OMAR_HOME; keep that explicit source usable.
     let shared = crate::sessions::home_root().canonicalize().ok();
-    let excluded = shared
-        .filter(|home| root.starts_with(home) && !source.starts_with(home))
-        .unwrap_or_else(|| root.clone());
+    let excluded = seed_exclusion(source, &root, shared.as_deref())?;
     let mut git = Command::new("git");
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("GIT_") {
@@ -825,6 +845,34 @@ mod tests {
         assert!(list(&root, 8).unwrap().is_empty());
         assert!(tree.join(".git").is_file());
         assert!(!tree.join("repository.git").exists());
+    }
+
+    #[test]
+    fn sources_under_omar_home_are_limited_to_team_worktrees() {
+        let home = Path::new("/home/x/.omar");
+        let root = home.join("sessions/s-1");
+        let exclusion = |source: &Path| seed_exclusion(source, &root, Some(home));
+        assert_eq!(exclusion(Path::new("/work/repo")).unwrap(), home);
+        assert_eq!(
+            exclusion(&home.join("sessions/s-0/workspaces/w/worktree")).unwrap(),
+            root
+        );
+        assert_eq!(
+            exclusion(&home.join("workspaces/w/worktree/sub")).unwrap(),
+            root
+        );
+        for source in [
+            home.to_path_buf(),
+            home.join("sessions"),
+            home.join("sessions/s-0"),
+            home.join("sessions/s-0/workspaces/w"),
+            home.join("sessions/s-0/workspaces/w/snapshots"),
+        ] {
+            assert!(exclusion(&source).is_err(), "{}", source.display());
+        }
+        let legacy = Path::new("/legacy/.omar");
+        assert_eq!(seed_exclusion(home, legacy, Some(home)).unwrap(), legacy);
+        assert_eq!(seed_exclusion(home, &root, None).unwrap(), root);
     }
 
     #[test]

@@ -26,7 +26,7 @@ finish() {
   pkill -f "omar serve --address $serve_address" 2>/dev/null || true
   for record in "$session_home"/registry/*.json; do
     [[ -f $record ]] || continue
-    OMAR_HOME="$session_home" "$web_dir/../target/debug/omar" down "$(basename "$record" .json)" --force --timeout 5 >/dev/null 2>&1 || true
+    OMAR_HOME="$session_home" "$web_dir/../target/debug/omar" down -s "$(basename "$record" .json)" --force --timeout 5 >/dev/null 2>&1 || true
   done
   rm -rf "$session_home"
   rm -f "$log"
@@ -59,7 +59,6 @@ EOF
 chmod +x "$stub_dir/node"
 
 guard_log=$(mktemp)
-session_home=$(mktemp -d)
 if PATH="$stub_dir:$PATH" OMAR_DEV_OPEN=0 "$web_dir/dev.sh" >"$guard_log" 2>&1; then
   printf 'FAIL: dev.sh ran on Node 20 instead of refusing\n' >&2
   cat "$guard_log" >&2
