@@ -120,6 +120,7 @@ jobs:
         run: |
           cargo build -p omar
           python3 tests/ci/team_workspaces.py
+          python3 tests/ci/team_checkpoints.py
           python3 tests/ci/legacy_supervision.py
           python3 tests/ci/backend_coordination_contracts.py
           python3 tests/ci/protocol_runner.py
