@@ -94,8 +94,9 @@ then the diagram goes live.
 
 ### Terminal client
 
-Run `omar attach dev`. `q` detaches, `s` switches sessions, `Tab` selects an EA,
-and `Enter` inspects the selected agent. The runtime owns all workloads.
+Run `omar attach dev` (`--ea NAME` picks an EA). The terminal dashboard opens
+inside the session's tmux server. `z` detaches and the runtime keeps every
+workload running; `Q` stops the session after confirmation.
 
 ### Terminal UI (Legacy)
 

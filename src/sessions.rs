@@ -290,7 +290,120 @@ pub fn prepare_process(cli: &Cli) -> Result<()> {
         std::env::set_var("OMARC_BIN", directory.join("bin/omarc"));
         std::env::remove_var("TMUX");
     }
+    if !cli.legacy {
+        if let Some(session) = dashboard_target(cli)? {
+            prepare_dashboard(cli, session)?;
+        }
+    }
     Ok(())
+}
+
+fn dashboard_target(cli: &Cli) -> Result<Option<Session>> {
+    match &cli.command {
+        Some(Commands::Attach { session }) => resolve(session).map(Some),
+        Some(Commands::Manager {
+            action: Some(crate::ManagerAction::Orchestrate),
+        }) => target(cli).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// The terminal dashboard is a client of one session: it reads that session's
+/// state directory, drives its tmux server, and runs inside that server so
+/// popups and agent attachment keep working. The daemon stays the owner of
+/// the scheduler, assistant launches, and every workload.
+fn prepare_dashboard(cli: &Cli, session: Session) -> Result<()> {
+    anyhow::ensure!(
+        session.state == "ready",
+        "session '{}' is {}; attach needs a ready runtime",
+        session.name,
+        session.state
+    );
+    let ea = ea::resolve_ea_selector(&session.directory, cli.ea.as_deref())?;
+    std::env::set_var("OMAR_STATE_DIR", &session.directory);
+    std::env::set_var("OMAR_SESSION_ID", &session.id);
+    std::env::set_var("OMAR_TMUX_SERVER", &session.tmux_server);
+    std::env::set_var("OMARC_BIN", session.directory.join("bin/omarc"));
+    if cli.ea.is_some() {
+        ea::save_active_ea(&session.directory, ea.id)?;
+    }
+    if inside_tmux_server(&session.tmux_server) {
+        return Ok(());
+    }
+    relaunch_dashboard(&session, ea.id)
+}
+
+fn inside_tmux_server(server: &str) -> bool {
+    std::env::var("TMUX")
+        .ok()
+        .and_then(|value| {
+            let socket = value.split(',').next()?.to_string();
+            Path::new(&socket).file_name().map(|name| name == server)
+        })
+        .unwrap_or(false)
+}
+
+/// Mirror of the legacy `relaunch_in_tmux`, on the session's own tmux server.
+/// A dashboard that is already running there receives a launch handoff and
+/// this client attaches to it; otherwise a fresh one is started. Never returns
+/// on success: the process becomes the tmux client.
+fn relaunch_dashboard(session: &Session, ea: ea::EaId) -> Result<()> {
+    let config = Config::load(session.directory.join("config.toml").to_str())?;
+    let exe = std::env::current_exe()?;
+    let dashboard = format!("={}", crate::DASHBOARD_SESSION);
+    let tmux = || {
+        let mut command = Command::new("tmux");
+        command
+            .args(["-L", &session.tmux_server, "-2"])
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE");
+        command
+    };
+    let running = tmux()
+        .args(["has-session", "-t", &dashboard])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success();
+    if running {
+        ea::save_dashboard_launch_handoff(
+            &session.directory,
+            &ea::DashboardLaunchHandoff {
+                active_ea: ea,
+                default_command: config.agent.default_command.clone(),
+                default_workdir: config.agent.default_workdir.clone(),
+                restart_manager: false,
+            },
+        )?;
+        let status = tmux().args(["attach-session", "-t", &dashboard]).status()?;
+        if status.success() {
+            std::process::exit(0);
+        }
+        let _ = tmux().args(["kill-session", "-t", &dashboard]).status();
+    }
+    let error = tmux()
+        .args(["new-session", "-s", crate::DASHBOARD_SESSION, "-c"])
+        .arg(&config.agent.default_workdir)
+        .arg(&exe)
+        .args(["attach", &session.id, "--ea", &ea.to_string()])
+        .exec();
+    bail!("failed to launch tmux: {error}")
+}
+
+/// Whether `up` was asked to launch an assistant. An attached dashboard never
+/// starts one in a session created with `--no-ea`.
+pub fn launched_with_assistant(session: &Session) -> bool {
+    fs::read(session.directory.join("launch.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Launch>(&bytes).ok())
+        .is_some_and(|launch| !launch.no_ea)
+}
+
+/// The legacy dashboard, attached to the session `prepare_process` selected.
+async fn attach_dashboard() -> Result<()> {
+    let session = resolve(&std::env::var("OMAR_SESSION_ID")?)?;
+    let config = Config::load(session.directory.join("config.toml").to_str())?;
+    crate::run_dashboard(config, Some(session)).await
 }
 fn executable_on_path(path: PathBuf) -> Result<PathBuf> {
     if path.components().count() > 1 {
@@ -857,6 +970,17 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
     {
         return Some(Err(anyhow::anyhow!("configuration options apply when creating a session; target an existing session without changing its configuration")));
     }
+    if matches!(
+        cli.command,
+        Some(
+            Commands::Attach { .. }
+                | Commands::Manager {
+                    action: Some(crate::ManagerAction::Orchestrate)
+                }
+        )
+    ) {
+        return Some(attach_dashboard().await);
+    }
     let result = match &cli.command {
         Some(Commands::Serve { name, address, no_ea, ui, restart_ea }) => {
             if *restart_ea { return Some(Err(anyhow::anyhow!("serve creates a fresh session; --restart-ea is available only with --legacy"))); }
@@ -876,7 +1000,6 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             if matches!(s.state.as_str(), "stopped" | "failed" | "stale") { Ok(json!({"session":s})) }
             else { rpc(&s,json!({"op":"overview"}),Duration::from_secs(5)) }
         }).and_then(print_value),
-        Some(Commands::Attach { session }) => resolve(session).and_then(|s| crate::session_tui::attach(s, cli.ea.as_deref())),
         Some(Commands::Web { session, print_url }) => resolve(session).and_then(|s| {
             rpc(&s,json!({"op":"hello"}),Duration::from_secs(5))?;
             if *print_url { println!("{}",s.url); } else { crate::open_browser(&s.url); }
@@ -898,7 +1021,6 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }),
-        Some(Commands::Manager { action: Some(crate::ManagerAction::Orchestrate) }) => target(cli).and_then(|s| crate::session_tui::attach(s, cli.ea.as_deref())),
         Some(Commands::Manager { action: None | Some(crate::ManagerAction::Start) }) => target(cli).and_then(|s|rpc(&s,json!({"op":"manager_start","ea":ea_selector(cli)}),Duration::from_secs(120))).and_then(print_value),
         Some(Commands::Start(options)) => (|| {
             let s=target(cli)?; let ea=ea_selector(cli);

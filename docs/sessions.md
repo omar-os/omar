@@ -13,7 +13,7 @@ session. TUI/browser clients can disconnect without stopping any workload.
 | `omar ls [--json]` | List sessions, health, URL, and exact executable build |
 | `omar info SESSION` | Inspect session, EAs, agents, and runs |
 | `omar logs SESSION [--follow] [--tail N]` | Read runtime log |
-| `omar attach SESSION` | TUI client: q detach, s switch, Tab EA, arrows/Enter inspect agent |
+| `omar attach SESSION [--ea EA]` | Terminal dashboard as a client of that session, inside its tmux server; z detaches, Q stops the session |
 | `omar web SESSION [--print-url]` | Open or print Mission Control URL |
 | `omar down SESSION [--timeout SECONDS]` | Reject new work, finish current tags, clean owned processes |
 | `omar down SESSION --force` | Terminate owned workloads without waiting for tag boundaries |
@@ -72,6 +72,16 @@ old shared layout and foreground `run` / `serve --ui` / terminal dashboard for
 migration and legacy regression tests. It cannot target or inherit a managed
 session. Use `start` for daemon-owned topologies; legacy `run` requires
 `--legacy`. `manager orchestrate` now aliases terminal attachment.
+
+`attach` runs the same terminal dashboard as before, as a client: it reads the
+session's state directory and drives the session's tmux server, and it runs
+inside a `omar-dashboard` tmux session on that server so popups and agent
+attachment work unchanged. The daemon keeps the scheduler, assistant launches
+(the dashboard asks it through the control protocol), and every workload.
+`z` detaches and leaves everything running; reattaching joins the dashboard
+that is still running there. `Q` asks for confirmation, then stops the
+session's runtime like `omar down`.
+Slack and computer bridges are not started by an attached dashboard.
 
 ## Sandbox boundary
 

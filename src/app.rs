@@ -123,6 +123,8 @@ pub struct App {
     default_command: String,
     default_workdir: String,
     pub scheduler: Arc<Scheduler>,
+    /// The runtime this dashboard is attached to as a client, if any.
+    pub session: Option<crate::sessions::Session>,
 }
 
 impl App {
@@ -218,6 +220,7 @@ impl App {
             default_command: config.agent.default_command.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             scheduler,
+            session: None,
         }
     }
 
@@ -518,6 +521,19 @@ impl App {
                 return Ok(());
             }
             let _ = self.client.kill_session(&manager_session);
+        }
+
+        // An attached dashboard asks the runtime, which launches the assistant
+        // with its serve/MCP context; it never launches one itself.
+        if let Some(session) = &self.session {
+            if crate::sessions::launched_with_assistant(session) {
+                crate::sessions::rpc(
+                    session,
+                    serde_json::json!({"op": "manager_start", "ea": self.active_ea.to_string()}),
+                    std::time::Duration::from_secs(120),
+                )?;
+            }
+            return Ok(());
         }
 
         // Reload registry on cache miss so we have the latest EA names
@@ -1237,7 +1253,22 @@ impl App {
 
     /// Create a new EA and add it to the registry
     pub fn create_ea(&mut self, name: String, desc: Option<String>) -> Result<EaId> {
-        match ea::register_ea(&self.omar_dir, &name, desc.as_deref()) {
+        let created = match &self.session {
+            // The runtime registers the EA and allocates its chat/workspace.
+            Some(session) => crate::sessions::rpc(
+                session,
+                serde_json::json!({"op": "create_ea", "name": name}),
+                std::time::Duration::from_secs(10),
+            )
+            .and_then(|value| {
+                value["id"]
+                    .as_u64()
+                    .map(|id| id as EaId)
+                    .ok_or_else(|| anyhow::anyhow!("runtime returned no EA id"))
+            }),
+            None => ea::register_ea(&self.omar_dir, &name, desc.as_deref()),
+        };
+        match created {
             Ok(ea_id) => {
                 self.registered_eas = ea::load_registry(&self.omar_dir);
                 self.set_status(format!("Created EA {}: {}", ea_id, name));

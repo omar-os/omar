@@ -134,20 +134,37 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         run_b = json.loads(cli("--session", "inner", "start", str(program)))["run_id"]
         wait_status("outer", run_a, "running")
         wait_status("inner", run_b, "running")
+        # The legacy dashboard attaches as a client inside the session's tmux
+        # server; z detaches, the dashboard and everything the runtime owns go on.
         terminal, master = terminal_attach("outer")
         try:
-            terminal_expect(master, "outer")
-            os.write(master, b"sinner\r")
-            terminal_expect(master, run_b)
-            os.write(master, b"q")
+            terminal_expect(master, "OMAR outer")
+            os.write(master, b"z")
             assert terminal.wait(timeout=10) == 0
         finally:
             if terminal.poll() is None: terminal.kill(); terminal.wait()
             os.close(master)
+        assert subprocess.run(["tmux", "-L", outer["tmux_server"], "has-session", "-t", "=omar-dashboard"],
+                              capture_output=True).returncode == 0, "z stopped the dashboard"
         time.sleep(11)
         assert info("inner")["session"]["state"] == "ready"
         wait_status("outer", run_a, "running")
-        cli("down", "inner")
+        # Q in an attached dashboard stops that session only, after confirmation.
+        terminal, master = terminal_attach("inner")
+        try:
+            terminal_expect(master, "OMAR inner")
+            os.write(master, b"Q")
+            terminal_expect(master, "Stop this session?")
+            os.write(master, b"y")
+            terminal.wait(timeout=15)
+        finally:
+            if terminal.poll() is None: terminal.kill(); terminal.wait()
+            os.close(master)
+        record = Path(env["OMAR_HOME"]) / "registry" / f"{inner['id']}.json"
+        deadline = time.monotonic() + 20
+        while json.loads(record.read_text())["state"] != "stopped":
+            assert time.monotonic() < deadline, record.read_text()
+            time.sleep(.2)
         wait_status("outer", run_a, "running")
         assert info("inner")["session"]["state"] == "stopped"
         cli("--session", "outer", "stop", run_a)
@@ -171,6 +188,17 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             assert context["tmux_server"] == managed["tmux_server"]
             assert context["serve"]["endpoint"] == managed["url"].removeprefix("http://")
         assert not (Path(managed["directory"]) / "active_ea").exists(), "client targeting changed global selection"
+        # Attaching with assistants running shows them and leaves them running after detach.
+        terminal, master = terminal_attach("assistants")
+        try:
+            terminal_expect(master, "OMAR assistants")
+            terminal_expect(master, "Executive Assistant")
+            os.write(master, b"z")
+            assert terminal.wait(timeout=10) == 0
+        finally:
+            if terminal.poll() is None: terminal.kill(); terminal.wait()
+            os.close(master)
+        assert {a["ea_id"] for a in info("assistants")["agents"]} == {0, 1}, "detaching stopped assistants"
         slow = root / "slow.omar"
         reaction_pid = root / "reaction.pid"
         slow.write_text('team Slow { timer tick(1ns, 0) output done : int reaction(tick) -> done {= '
@@ -194,7 +222,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         time.sleep(.2)
         cli("down", stale["id"], ok=False)
         assert info("outer")["session"]["state"] == "ready"
-        print("PASS: session isolation, nested routing, help, startup races/failure, TUI switch/detach, browser close, live topologies, targeted shutdown")
+        print("PASS: session isolation, nested routing, help, startup races/failure, dashboard attach/detach, browser close, live topologies, targeted shutdown")
     finally:
         for session in sessions:
             subprocess.run([str(BIN), "down", session["id"], "--force", "--timeout", "5"],

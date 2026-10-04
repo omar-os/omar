@@ -23,7 +23,6 @@ mod protocol;
 mod reaction;
 mod scheduler;
 mod serve;
-mod session_tui;
 mod sessions;
 mod stub_agent;
 mod supervision;
@@ -124,7 +123,7 @@ enum Commands {
     Ls,
     /// Inspect a runtime session
     Info { session: String },
-    /// Attach a terminal client (q detaches; runtime keeps running)
+    /// Attach the terminal dashboard (z detaches; Q stops the session)
     Attach { session: String },
     /// Open Mission Control for an existing runtime
     Web {
@@ -873,7 +872,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
                 };
                 relaunch_in_tmux(&config, &omar_dir, target_id, false)
             } else {
-                run_dashboard(config).await
+                run_dashboard(config, None).await
             }
         }
     }
@@ -1601,7 +1600,10 @@ fn kill_child_gracefully(child: &mut std::process::Child, timeout: Duration) {
     let _ = child.wait();
 }
 
-async fn run_dashboard(config: Config) -> Result<()> {
+/// With `session`, the dashboard is a client of that runtime: the daemon owns
+/// the event loop, assistant launches, and every workload, so nothing here
+/// starts a second scheduler or stops anything on exit.
+async fn run_dashboard(config: Config, session: Option<sessions::Session>) -> Result<()> {
     // Some shells/dev tools export NO_COLOR globally. That disables all ANSI
     // styling and makes the TUI monochrome. The dashboard is explicitly color-coded.
     if std::env::var_os("NO_COLOR").is_some() {
@@ -1615,24 +1617,34 @@ async fn run_dashboard(config: Config) -> Result<()> {
         scheduler::events_store_path(&omar_dir),
     ));
     let base_prefix = config.dashboard.session_prefix.clone();
-    tokio::spawn(scheduler::run_event_loop(
-        scheduler.clone(),
-        ticker.clone(),
-        base_prefix,
-    ));
+    // A session's daemon owns its only delivery loop.
+    if session.is_none() {
+        tokio::spawn(scheduler::run_event_loop(
+            scheduler.clone(),
+            ticker.clone(),
+            base_prefix,
+        ));
+    }
 
     // Create SINGLE shared App instance for the dashboard/runtime state.
-    let shared_app = Arc::new(Mutex::new(App::new(
-        &config,
-        ticker.clone(),
-        scheduler.clone(),
-    )));
+    let mut app = App::new(&config, ticker.clone(), scheduler.clone());
+    app.session = session.clone();
+    let shared_app = Arc::new(Mutex::new(app));
 
-    // Spawn Slack bridge if configured
-    let mut slack_bridge = spawn_slack_bridge();
+    // Spawn Slack bridge if configured. Bridges belong to a runtime, not to
+    // an attached client.
+    let mut slack_bridge = if session.is_none() {
+        spawn_slack_bridge()
+    } else {
+        None
+    };
 
     // Spawn computer-use bridge if X11 is available
-    let mut computer_bridge = spawn_computer_bridge();
+    let mut computer_bridge = if session.is_none() {
+        spawn_computer_bridge()
+    } else {
+        None
+    };
 
     // Initialize terminal
     enable_raw_mode()?;
@@ -1764,10 +1776,28 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                         scheduler.cancel_by_receiver_and_ea(&name, app.active_ea);
                                     }
                                 }
-                                app::ConfirmAction::ResetQuit => {
-                                    app.reset_on_quit = true;
-                                    app.should_quit = true;
-                                }
+                                app::ConfirmAction::ResetQuit => match &app.session {
+                                    // Quitting an attached dashboard stops the
+                                    // session's runtime; the daemon cleans up
+                                    // its own workloads. `z` detaches instead.
+                                    Some(session) => {
+                                        match sessions::rpc(
+                                            session,
+                                            serde_json::json!({"op": "down", "force": false}),
+                                            Duration::from_secs(10),
+                                        ) {
+                                            Ok(_) => app.should_quit = true,
+                                            Err(e) => {
+                                                app.pending_confirm = None;
+                                                app.set_status(format!("Error: {}", e));
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        app.reset_on_quit = true;
+                                        app.should_quit = true;
+                                    }
+                                },
                                 app::ConfirmAction::DeleteEa => {
                                     let ea_id = app.active_ea;
                                     if let Err(e) = app.delete_ea(ea_id) {
@@ -2193,7 +2223,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
 
     // Kill ALL OMAR EA sessions on quit (managers + workers), even if
     // registry and tmux are temporarily out of sync.
-    {
+    if session.is_none() {
         let app = shared_app.lock().await;
         let client = TmuxClient::new("");
         let base_prefix = app.base_prefix.clone();

@@ -397,7 +397,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     // Render overlays
     if app.show_help {
-        render_help_popup(frame);
+        render_help_popup(frame, app);
     }
 
     if let Some(action) = app.pending_confirm {
@@ -438,8 +438,12 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap()
         .as_nanos() as u64;
 
+    let heading = match &app.session {
+        Some(session) => format!("OMAR {} ", session.name),
+        None => "OMAR ".to_string(),
+    };
     let mut status_spans = vec![
-        Span::styled("OMAR ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(heading, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("| Agents: "),
         Span::styled(format!("{}", total), Style::default().fg(Color::Reset)),
         Span::raw(" | "),
@@ -1251,7 +1255,7 @@ fn render_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_help_popup(frame: &mut Frame) {
+fn render_help_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(60, 50, frame.area());
 
     let help_content = vec![
@@ -1260,7 +1264,11 @@ fn render_help_popup(frame: &mut Frame) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  Q           Quit and reset runtime state"),
+        Line::from(if app.session.is_some() {
+            "  Q           Stop this session's runtime (z detaches instead)"
+        } else {
+            "  Q           Quit and reset runtime state"
+        }),
         Line::from("  ←/→, h/l   Switch panel (sidebar ↔ main)"),
         Line::from("  ↑/↓, j/k   Move selection up/down"),
         Line::from("  Tab         Drill into selected agent"),
@@ -1307,13 +1315,25 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
                 .unwrap_or_else(|| "?".to_string());
             (" Confirm ", "Kill this agent?", name, String::new(), 40)
         }
-        ConfirmAction::ResetQuit => (
-            " Confirm Quit ",
-            "Quit omar?",
-            "This will kill ALL EA sessions and agents.".to_string(),
-            "Press z to walk away instead.".to_string(),
-            50,
-        ),
+        ConfirmAction::ResetQuit => match &app.session {
+            Some(session) => (
+                " Confirm Quit ",
+                "Stop this session?",
+                format!(
+                    "Session {} shuts down: every EA, agent, and topology.",
+                    session.name
+                ),
+                "Press z to detach instead.".to_string(),
+                60,
+            ),
+            None => (
+                " Confirm Quit ",
+                "Quit omar?",
+                "This will kill ALL EA sessions and agents.".to_string(),
+                "Press z to walk away instead.".to_string(),
+                50,
+            ),
+        },
         ConfirmAction::DeleteEa => {
             let ea_name = app
                 .registered_eas
