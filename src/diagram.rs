@@ -51,6 +51,8 @@ pub enum DiagramStatus {
     Running,
     Completed,
     Failed,
+    /// Checkpointed and parked; `omar resume` continues it.
+    Paused,
 }
 
 /// The name serde puts on the wire for a unit variant.
@@ -76,6 +78,7 @@ pub enum DiagramEventKind {
     ReactionCompleted,
     RunCompleted,
     RunFailed,
+    RunPaused,
 }
 
 impl std::fmt::Display for DiagramEventKind {
@@ -376,6 +379,9 @@ pub trait TopologyObserver: Send + Sync {
     }
     fn run_completed(&self, _outputs: &BTreeMap<String, Value>) {}
     fn run_failed(&self, _message: &str) {}
+    /// The run checkpointed and parked at a tag boundary; nothing more
+    /// happens until a resume.
+    fn run_paused(&self, _checkpoint: &str) {}
 }
 
 pub struct NoopTopologyObserver;
@@ -557,6 +563,14 @@ impl TopologyObserver for DiagramPublisher {
             DiagramEventKind::RunFailed,
             DiagramStatus::Failed,
             json!({ "message": message }),
+        );
+    }
+
+    fn run_paused(&self, checkpoint: &str) {
+        self.publish_status(
+            DiagramEventKind::RunPaused,
+            DiagramStatus::Paused,
+            json!({ "checkpoint": checkpoint }),
         );
     }
 }

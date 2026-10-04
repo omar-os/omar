@@ -9,7 +9,7 @@ export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "st
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
 /** Where a drawing stands. `ready` is compiled but never run, which is what a proposal's preview is. */
-export const DIAGRAM_STATUSES = ["ready", "running", "completed", "failed"] as const;
+export const DIAGRAM_STATUSES = ["ready", "running", "completed", "failed", "paused"] as const;
 export type DiagramStatus = (typeof DIAGRAM_STATUSES)[number];
 
 /** Where one reaction stands. */
@@ -25,7 +25,7 @@ export const PORT_KINDS = ["input", "output", "action"] as const;
 export type PortKind = (typeof PORT_KINDS)[number];
 
 /** What happened, as the event stream names it. */
-export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed"] as const;
+export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused"] as const;
 export type DiagramEventKind = (typeof DIAGRAM_EVENT_KINDS)[number];
 
 /** Who spoke. */

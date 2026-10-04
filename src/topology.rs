@@ -2479,6 +2479,7 @@ fn launch(
             id
         };
         deploy::clear_stop(&runtime_dir)?;
+        observer.run_paused(&checkpoint_id);
         let next = paused
             .next_tag()
             .map(|(t, m)| format!("({t}, {m})"))

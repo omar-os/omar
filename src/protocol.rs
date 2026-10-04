@@ -100,6 +100,7 @@ fn vocabularies() -> Vec<Vocabulary> {
                 DiagramStatus::Running,
                 DiagramStatus::Completed,
                 DiagramStatus::Failed,
+                DiagramStatus::Paused,
             ],
         ),
         vocabulary(
@@ -135,6 +136,7 @@ fn vocabularies() -> Vec<Vocabulary> {
                 DiagramEventKind::ReactionCompleted,
                 DiagramEventKind::RunCompleted,
                 DiagramEventKind::RunFailed,
+                DiagramEventKind::RunPaused,
             ],
         ),
         vocabulary(
