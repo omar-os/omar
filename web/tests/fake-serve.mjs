@@ -81,6 +81,38 @@ export async function startFakeServe({
     if (
       request.method === "POST" &&
       url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/pause")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/pause".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      const active = ["starting", "running", "stopping", "pausing"].includes(entry.record.status);
+      if (!active) return json(response, 200, entry.record);
+      // Accepted, not done: the daemon checkpoints at the next tag boundary
+      // and only then parks. Held briefly so the waiting state is observable.
+      entry.record.status = "pausing";
+      // The walk parks at its next tag boundary, as the runtime does.
+      return json(response, 202, entry.record);
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/resume")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/resume".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      if (entry.record.status !== "paused") {
+        return json(response, 409, { error: `run is ${entry.record.status}; only a paused run can resume` });
+      }
+      entry.record.status = "running";
+      entry.record.finished_at = null;
+      publish(entry, "run_started", {});
+      return json(response, 200, entry.record);
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
       url.pathname.endsWith("/stop")
     ) {
       const id = url.pathname.slice("/v1/runs/".length, -"/stop".length);
@@ -632,7 +664,21 @@ export async function startFakeServe({
     await wait();
     publish(entry, "run_started", {});
 
+    // A pause lands at a tag boundary: nothing in flight, a checkpoint
+    // announced, and the walk parked until a resume sets the run going.
+    const boundary = async () => {
+      if (entry.record.status !== "pausing") return;
+      entry.record.status = "paused";
+      entry.record.finished_at = Math.floor(Date.now() / 1000);
+      entry.snapshot.status = "paused";
+      publish(entry, "run_paused", { checkpoint: "fake-checkpoint" });
+      while (entry.record.status === "paused") await wait();
+      entry.snapshot.status = "running";
+      publish(entry, "run_started", {});
+    };
+
     for (const [index, reaction] of entry.snapshot.reactions.entries()) {
+      await boundary();
       // Nanoseconds, as the runtime sends them: a tag a second apart, each one
       // a fixed 250ms behind its logical time so the readout has something to
       // show that is neither zero nor a round second.
@@ -666,6 +712,7 @@ export async function startFakeServe({
       publish(entry, "reaction_completed", { reaction: reaction.id }, tag);
       await wait();
     }
+    await boundary();
 
     entry.snapshot.status = "completed";
     entry.record.status = "completed";

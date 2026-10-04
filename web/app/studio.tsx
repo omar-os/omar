@@ -42,6 +42,8 @@ import {
   fetchPanel,
   fetchRun,
   checkProgram,
+  pauseRun,
+  resumeRun,
   startRun,
   stopRun,
   subscribeToDiagram,
@@ -734,6 +736,38 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     }
   }
 
+  /** Ask the run to checkpoint and park at its next tag boundary. */
+  async function requestPause() {
+    if (!run || isStopping || isPausing) return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const record = await pauseRun(serveUrl, run.run_id);
+      if (scope === scopeRef.current) setRun(record);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  /** Continue a paused run: the daemon restores its files and agents, then the panel watches it again. */
+  async function requestResume() {
+    if (!run || run.status !== "paused") return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const record = await resumeRun(serveUrl, run.run_id);
+      if (scope !== scopeRef.current) return;
+      runRef.current = record;
+      setRun(record);
+      setPhase("observing");
+      observe(record);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
   /** Click a component to include it in the next message, click it again to drop it. */
   function toggleComponent(component: string) {
     setSelection((current) =>
@@ -835,6 +869,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   // The daemon's own word for it. Every terminal status replaces it, so the
   // state cannot outlive the run it was asked of.
   const isStopping = run?.status === "stopping";
+  const isPausing = run?.status === "pausing";
+  const isPaused = run?.status === "paused";
 
   // Widths are clamped against the workspace so the diagram always keeps a
   // usable column, whichever divider is being dragged. Below a panel's minimum
@@ -1062,7 +1098,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               <span><small>TAG</small>{tag}</span>
               <span><small>LAG</small>{lag}</span>
             </div>
-            {(phase === "review" && design) || (phase === "observing" && run) ? (
+            {(phase === "review" && design) || (phase === "observing" && run) || (isPaused && run) ? (
             <div className="workflow-actions">
               {phase === "review" && design ? (
                 <span role="group" aria-label="Deploy design">
@@ -1080,12 +1116,37 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                   </button>
                 </span>
               ) : null}
+              {isPaused && run ? (
+                <button
+                  className="primary-button"
+                  onClick={() => void requestResume()}
+                  type="button"
+                  title="Restores the checkpointed files and agents, then continues the queue"
+                >
+                  Resume
+                </button>
+              ) : null}
+              {phase === "observing" && run ? (
+                <button
+                  className="secondary-button"
+                  onClick={() => void requestPause()}
+                  type="button"
+                  disabled={isStopping || isPausing}
+                  title={
+                    isPausing
+                      ? "The current tag has to close first"
+                      : "Checkpoints at the next tag boundary, then parks the run"
+                  }
+                >
+                  {isPausing ? "Pausing…" : "Pause"}
+                </button>
+              ) : null}
               {phase === "observing" && run ? (
                 <button
                   className="secondary-button"
                   onClick={() => void requestStop()}
                   type="button"
-                  disabled={isStopping}
+                  disabled={isStopping || isPausing}
                   title={
                     isStopping
                       ? "The current tag has to close first"

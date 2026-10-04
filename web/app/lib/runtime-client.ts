@@ -322,6 +322,39 @@ export async function stopRun(
   return assertRunRecord(await response.json());
 }
 
+/** Ask a run to checkpoint at its next tag boundary and park; answers `pausing`. */
+export async function pauseRun(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<RunRecord> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/pause`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  return assertRunRecord(await response.json());
+}
+
+/**
+ * Continue a paused run under the same id. Answers once the resumed run's
+ * diagram is up, so the record comes back `running` with a fresh address.
+ */
+export async function resumeRun(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<RunRecord> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/resume`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  return assertRunRecord(await response.json());
+}
+
 export async function fetchRun(
   serveUrl: string,
   runId: string,

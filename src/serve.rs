@@ -154,6 +154,9 @@ pub enum RunStatus {
     /// a failure -- the daemon has answered this since `RunEnd::Stopped`
     /// existed, and no client had it written down.
     Stopped,
+    /// A pause has been requested and the loop has not reached the tag
+    /// boundary where it checkpoints and parks.
+    Pausing,
     Paused,
     Failed,
 }
@@ -165,7 +168,10 @@ impl RunStatus {
     /// current tag closes, so a second run of the same team would still be
     /// answered by the first one's panes.
     pub fn is_active(self) -> bool {
-        matches!(self, Self::Starting | Self::Running | Self::Stopping)
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Stopping | Self::Pausing
+        )
     }
 }
 
@@ -1069,6 +1075,35 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         }
         // Before the run-record route, which would otherwise take the suffix
         // for part of the id.
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/pause") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/pause")
+                .to_string();
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "body too large"}))
+            } else {
+                let _ = read_body(content_length)?;
+                pause_run(&context, &id)
+            }
+        }
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/resume") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/resume")
+                .to_string();
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "body too large"}))
+            } else {
+                let _ = read_body(content_length)?;
+                let presence = workspaces.presence.lock().expect("presence poisoned");
+                if presence.stopping {
+                    (503, json!({"error": "runtime is shutting down"}))
+                } else {
+                    resume_run(&context, &id)
+                }
+            }
+        }
         ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/stop") => {
             let id = rest
                 .trim_start_matches("/v1/runs/")
@@ -1998,7 +2033,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         context,
         &run_id,
         bytecode,
-        topology::generated_dir(&program_path),
+        program_path,
         inputs,
         &request,
         ready_sender,
@@ -2255,7 +2290,7 @@ fn spawn_run_thread(
     context: &Arc<Context_>,
     run_id: &str,
     bytecode: topology::Bytecode,
-    generated: std::path::PathBuf,
+    program_path: std::path::PathBuf,
     inputs: Vec<String>,
     request: &StartRunRequest,
     ready_sender: mpsc::Sender<SocketAddr>,
@@ -2292,7 +2327,7 @@ fn spawn_run_thread(
             TopologyRunConfig {
                 ea_id: context.ea_id,
                 omar_dir: &context.omar_dir,
-                generated: &generated,
+                generated: &topology::generated_dir(&program_path),
                 base_prefix: &context.session_prefix,
                 health_idle_warning: context.health_idle_warning,
                 inputs: &inputs,
@@ -2303,29 +2338,10 @@ fn spawn_run_thread(
                 diagram_ready: Some(ready_sender),
                 panel_ready: Some(panel_sender),
                 checkpoint_period: None,
-                program_path: None,
+                program_path: Some(&program_path),
             },
         );
-        // The run is over, so its invocation service is gone with it. Leaving
-        // the entry would let a panel offer work nothing can accept.
-        context
-            .panels
-            .lock()
-            .expect("serve panels poisoned")
-            .remove(&run_id);
-        let mut runs = context.runs.lock().expect("serve runs poisoned");
-        if let Some(record) = runs.get_mut(&run_id) {
-            record.finished_at = Some(now_unix());
-            match outcome {
-                Ok(topology::RunEnd::Completed) => record.status = RunStatus::Completed,
-                Ok(topology::RunEnd::Stopped) => record.status = RunStatus::Stopped,
-                Ok(topology::RunEnd::Paused) => record.status = RunStatus::Paused,
-                Err(error) => {
-                    record.status = RunStatus::Failed;
-                    record.error = Some(format!("{error:#}"));
-                }
-            }
-        }
+        finish_run(&context, &run_id, outcome);
     });
 }
 
@@ -2401,6 +2417,164 @@ fn stop_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
         Some(record) => (200, json!(record)),
         None => (404, json!({"error": "unknown run"})),
     }
+}
+
+/// Ask a run to pause: checkpoint at its next tag boundary, then park. The
+/// same request `omar pause` makes, answered with the record marked pausing.
+fn pause_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let team = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) if record.status.is_active() => record.team.clone(),
+            Some(record) => return (200, json!(record)),
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let dir = crate::deploy::dir_for(&context.omar_dir, context.ea_id, &team);
+    if let Err(error) = crate::deploy::request(&dir, crate::deploy::ControlOp::Pause) {
+        return (409, json!({"error": format!("{error:#}")}));
+    }
+    let mut runs = context.runs.lock().expect("serve runs poisoned");
+    match runs.get_mut(id) {
+        Some(record) if record.status.is_active() => {
+            record.status = RunStatus::Pausing;
+            (202, json!(record))
+        }
+        Some(record) => (200, json!(record)),
+        None => (404, json!({"error": "unknown run"})),
+    }
+}
+
+/// Continue a paused run from its resume point, in this daemon, under the
+/// same run id. The program it was admitted with is still staged beside the
+/// run, so generated code lands where the original run put it.
+fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let team = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) if record.status == RunStatus::Paused => record.team.clone(),
+            Some(record) => {
+                return (
+                    409,
+                    json!({"error": format!("run is {}; only a paused run can resume", crate::diagram::wire_name(&record.status).unwrap_or_default())}),
+                )
+            }
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let program_path = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id)
+        .join("program.omar");
+    if !program_path.exists() {
+        return (
+            409,
+            json!({"error": format!("the run's program is no longer staged at {}", program_path.display())}),
+        );
+    }
+    {
+        let mut runs = context.runs.lock().expect("serve runs poisoned");
+        if let Some(active) = find_active_run(&runs, &team) {
+            return (
+                409,
+                json!({
+                    "error": format!("team '{team}' already has an active run"),
+                    "run_id": active.run_id,
+                }),
+            );
+        }
+        let Some(record) = runs.get_mut(id) else {
+            return (404, json!({"error": "unknown run"}));
+        };
+        record.status = RunStatus::Starting;
+        record.diagram_address = None;
+        record.finished_at = None;
+        record.error = None;
+    }
+    context.chat.lock().expect("chat poisoned").latest_run = Some(id.to_string());
+    let (ready_sender, ready_receiver) = mpsc::channel();
+    spawn_resume_thread(context, id, &team, program_path, ready_sender);
+    match ready_receiver.recv_timeout(DIAGRAM_READY_TIMEOUT) {
+        Ok(diagram_address) => {
+            let mut runs = context.runs.lock().expect("serve runs poisoned");
+            if let Some(record) = runs.get_mut(id) {
+                record.diagram_address = Some(diagram_address.to_string());
+                if record.status == RunStatus::Starting {
+                    record.status = RunStatus::Running;
+                }
+                return (200, json!(record));
+            }
+            (500, json!({"error": "run vanished"}))
+        }
+        Err(_) => {
+            let runs = context.runs.lock().expect("serve runs poisoned");
+            let message = runs
+                .get(id)
+                .and_then(|record| record.error.clone())
+                .unwrap_or_else(|| "the resumed run did not come up in time".to_string());
+            (502, json!({"error": message}))
+        }
+    }
+}
+
+/// What the daemon records once a run's loop returns, however it returned.
+fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::RunEnd>) {
+    // The run is over, so its invocation service is gone with it. Leaving
+    // the entry would let a panel offer work nothing can accept.
+    context
+        .panels
+        .lock()
+        .expect("serve panels poisoned")
+        .remove(run_id);
+    let mut runs = context.runs.lock().expect("serve runs poisoned");
+    if let Some(record) = runs.get_mut(run_id) {
+        record.finished_at = Some(now_unix());
+        match outcome {
+            Ok(topology::RunEnd::Completed) => record.status = RunStatus::Completed,
+            Ok(topology::RunEnd::Stopped) => record.status = RunStatus::Stopped,
+            Ok(topology::RunEnd::Paused) => record.status = RunStatus::Paused,
+            Err(error) => {
+                record.status = RunStatus::Failed;
+                record.error = Some(format!("{error:#}"));
+            }
+        }
+    }
+}
+
+fn spawn_resume_thread(
+    context: &Arc<Context_>,
+    run_id: &str,
+    team: &str,
+    program_path: std::path::PathBuf,
+    ready_sender: mpsc::Sender<SocketAddr>,
+) {
+    let context = context.clone();
+    let run_id = run_id.to_string();
+    let team = team.to_string();
+    thread::spawn(move || {
+        let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
+        let generated = topology::generated_dir(&program_path);
+        let outcome = topology::resume_topology(
+            TopologyRunConfig {
+                ea_id: context.ea_id,
+                omar_dir: &context.omar_dir,
+                generated: &generated,
+                base_prefix: &context.session_prefix,
+                health_idle_warning: context.health_idle_warning,
+                inputs: &[],
+                replace: true,
+                timeout: Duration::from_secs(default_timeout_seconds()),
+                pace: topology::Pace::RealTime,
+                diagram_address: Some(diagram_address),
+                diagram_ready: Some(ready_sender),
+                panel_ready: None,
+                checkpoint_period: None,
+                program_path: Some(&program_path),
+            },
+            &team,
+        );
+        finish_run(&context, &run_id, outcome);
+    });
 }
 
 fn now_unix() -> u64 {
@@ -2983,6 +3157,71 @@ while True:
     /// The route's whole job is to leave the same control file `omar stop`
     /// leaves, in the directory the run is actually using — so the assertion
     /// worth making is that the file lands where the runner looks.
+    /// A pause is the same kind of request as a stop: a control file where
+    /// the runner looks, and a status the record carries until the boundary.
+    #[test]
+    fn pausing_a_run_leaves_the_request_and_resuming_needs_a_paused_run() {
+        let server = test_server();
+        let address = server.address();
+        let team = "Cadence";
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: team.to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                },
+            );
+        }
+        let dir = crate::deploy::dir_for(&server.context.omar_dir, 0, team);
+        std::fs::create_dir_all(&dir).expect("deployment dir");
+
+        // Not paused: nothing to resume.
+        let response = request(address, "POST", "/v1/runs/run-1/resume", Some("{}"));
+        assert!(response.contains(" 409 "), "{response}");
+        assert!(
+            response.contains("only a paused run can resume"),
+            "{response}"
+        );
+
+        let response = request(address, "POST", "/v1/runs/run-1/pause", Some("{}"));
+        assert!(response.contains(" 202 "), "{response}");
+        assert_eq!(
+            crate::deploy::pending_request(&dir),
+            Some(crate::deploy::ControlOp::Pause)
+        );
+        assert!(response.contains("\"status\":\"pausing\""), "{response}");
+        assert!(RunStatus::Pausing.is_active());
+
+        // A second request while one is pending is refused, not swapped in.
+        let response = request(address, "POST", "/v1/runs/run-1/stop", Some("{}"));
+        assert!(
+            response.contains(" 500 ") || response.contains(" 409 "),
+            "{response}"
+        );
+        assert_eq!(
+            crate::deploy::pending_request(&dir),
+            Some(crate::deploy::ControlOp::Pause)
+        );
+
+        // Paused, but the program the daemon staged is gone: refused before
+        // anything is launched, with the path it looked at.
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.get_mut("run-1").expect("run").status = RunStatus::Paused;
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/resume", Some("{}"));
+        assert!(response.contains(" 409 "), "{response}");
+        assert!(response.contains("no longer staged"), "{response}");
+        assert!(request(address, "POST", "/v1/runs/nobody/resume", Some("{}")).contains(" 404 "));
+    }
+
     #[test]
     fn stopping_a_run_leaves_the_request_where_the_runner_reads_it() {
         let server = test_server();

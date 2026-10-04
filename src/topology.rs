@@ -5786,7 +5786,9 @@ mod tests {
     impl ReactionExecutor for StopWhileAnsweringExecutor {
         fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
             *self.calls.lock().unwrap() += 1;
-            crate::deploy::request_stop(&self.dir).unwrap();
+            // Filed once; a second invocation finds it pending and is refused,
+            // which is the rule, not a failure of this executor.
+            let _ = crate::deploy::request_stop(&self.dir);
             let port = invocation.allowed_effects.keys().next().unwrap().clone();
             Ok(BTreeMap::from([(port, json!("ping"))]))
         }

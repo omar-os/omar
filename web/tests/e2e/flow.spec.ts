@@ -711,6 +711,35 @@ test("the workflow's buttons sit with the workflow", async ({ page }) => {
   expect(stats.x + stats.width).toBeLessThanOrEqual(first.x + 1);
 });
 
+test("a run can be paused and resumed from the panel that shows it", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const actions = page.locator(".diagram-heading .workflow-actions");
+  await expect(actions.getByRole("button", { name: "Pause" })).toHaveCount(0);
+
+  await deploy(page);
+  const pause = actions.getByRole("button", { name: "Pause" });
+  await expect(pause).toBeEnabled();
+  await pause.click();
+
+  // A pause lands at the next tag boundary, after a checkpoint, so the
+  // button has to say it was heard.
+  await expect(actions.getByRole("button", { name: "Pausing…" })).toBeDisabled();
+
+  // Parked: the picture stays, labelled paused, and the one thing left to
+  // offer is to continue.
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  const resume = actions.getByRole("button", { name: "Resume" });
+  await expect(resume).toBeVisible();
+  await expect(actions.getByRole("button", { name: /Stop|Pause/ })).toHaveCount(0);
+
+  await resume.click();
+  // Back to a live run, with its controls.
+  await expect(actions.getByRole("button", { name: "Pause" })).toBeEnabled();
+  await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
+  await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
+});
+
 test("a run can be stopped from the panel that shows it", async ({ page }) => {
   // Until now the only way to end a run started from the UI was to leave the
   // UI and type `omar stop` in a terminal.

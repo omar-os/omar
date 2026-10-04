@@ -49,11 +49,17 @@ If capture fails, the run holds at the boundary: previous checkpoint stands,
   every referenced file version without launching anything.
 
 Resume reads the program path recorded at launch for generated code; pass
-`--program` if it moved. Daemon-launched runs (`omar serve`) checkpoint and
-pause the same way; resume from the CLI.
+`--program` if it moved.
 
-Not in this PR: Mission Control controls, checkpoint import into another
-session, input journalling while paused, format migration, pruning.
+Daemon: `POST /v1/runs/<id>/pause` and `POST /v1/runs/<id>/resume`; the run
+keeps its id and comes back `running` with a new diagram address. Mission
+Control shows Pause while a run is live and Resume once it is paused; the
+live diagram reports `paused`. A resumed daemon run uses the default timeout
+and real-time pace.
+
+Not in this PR: checkpoint import into another session, input journalling
+while paused, format migration, pruning, checkpoint controls in Mission
+Control beyond pause/resume.
 
 Validation: `python3 tests/ci/team_checkpoints.py` (CI) runs a real-time
 timer topology with a Rust body and a stub agent: automatic and manual
