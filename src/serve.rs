@@ -434,6 +434,13 @@ impl Serve {
         Ok(value)
     }
 
+    /// Refuse new admissions without touching the admission mutex, which an
+    /// in-flight start may hold for tens of seconds; a forced shutdown must
+    /// never wait behind it.
+    pub(crate) fn session_shutdown_now(&self) {
+        self.workspaces.shutdown.store(true, Ordering::SeqCst);
+    }
+
     pub(crate) fn session_stopping(&self) -> Result<()> {
         // Admission uses this same mutex when checking shutdown and inserting a run.
         let mut presence = self.workspaces.presence.lock().unwrap();

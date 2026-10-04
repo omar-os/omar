@@ -54,12 +54,23 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             time.sleep(.1)
         raise AssertionError((expected, state))
 
-    def terminal_attach(name):
+    def terminal_attach(name, context=None):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
-        process = subprocess.Popen([str(BIN), "attach", "-s", name], env=env, stdin=slave, stdout=slave, stderr=slave)
+        process = subprocess.Popen([str(BIN), "attach", "-s", name], env=context or env, stdin=slave, stdout=slave, stderr=slave)
         os.close(slave)
         return process, master
+
+    def terminal_exit(process, master, timeout=15):
+        # Keep draining the pty: a blocked write would stall the tmux client.
+        deadline = time.monotonic() + timeout
+        while process.poll() is None and time.monotonic() < deadline:
+            if select.select([master], [], [], .1)[0]:
+                try:
+                    os.read(master, 65536)
+                except OSError:
+                    break
+        return process.wait(timeout=5)
 
     def terminal_expect(master, text):
         data = b""
@@ -144,12 +155,28 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         try:
             terminal_expect(master, "OMAR outer")
             os.write(master, b"z")
-            assert terminal.wait(timeout=10) == 0
+            assert terminal_exit(terminal, master) == 0
         finally:
             if terminal.poll() is None: terminal.kill(); terminal.wait()
             os.close(master)
         assert subprocess.run(["tmux", "-L", outer["tmux_server"], "has-session", "-t", "=omar-dashboard"],
                               capture_output=True).returncode == 0, "z stopped the dashboard"
+        # From a workload pane on the session's own tmux server, attach joins the
+        # dedicated dashboard session instead of running a second dashboard there.
+        tmux = lambda *args: subprocess.run(["tmux", "-L", outer["tmux_server"], *args], capture_output=True, text=True)
+        assert tmux("new-session", "-d", "-s", "worker-pane", "sh").returncode == 0
+        pane = tmux("display-message", "-p", "-t", "worker-pane", "#{pane_id}").stdout.strip()
+        in_pane = dict(env, TMUX=f"/tmp/tmux-{os.getuid()}/{outer['tmux_server']},0,0", TMUX_PANE=pane)
+        terminal, master = terminal_attach("outer", in_pane)
+        try:
+            terminal_expect(master, "OMAR outer")
+            os.write(master, b"z")
+            assert terminal_exit(terminal, master) == 0
+        finally:
+            if terminal.poll() is None: terminal.kill(); terminal.wait()
+            os.close(master)
+        assert "omar" not in tmux("list-panes", "-t", "worker-pane", "-F", "#{pane_current_command}").stdout
+        assert tmux("list-sessions", "-F", "#{session_name}").stdout.split().count("omar-dashboard") == 1
         time.sleep(11)
         assert info("inner")["session"]["state"] == "ready"
         wait_status("outer", run_a, "running")
@@ -160,7 +187,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             os.write(master, b"Q")
             terminal_expect(master, "Stop this session?")
             os.write(master, b"y")
-            terminal.wait(timeout=15)
+            terminal_exit(terminal, master)
         finally:
             if terminal.poll() is None: terminal.kill(); terminal.wait()
             os.close(master)
@@ -199,7 +226,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             # A fresh dashboard opens EA 0, whatever other clients targeted before.
             terminal_expect(master, "Executive Assistant (Default)")
             os.write(master, b"z")
-            assert terminal.wait(timeout=10) == 0
+            assert terminal_exit(terminal, master) == 0
         finally:
             if terminal.poll() is None: terminal.kill(); terminal.wait()
             os.close(master)

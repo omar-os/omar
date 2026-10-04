@@ -81,7 +81,9 @@ attachment work unchanged. The daemon keeps the scheduler, assistant launches
 (the dashboard asks it through the control protocol), and every workload.
 `z` detaches and leaves everything running; reattaching joins the dashboard
 that is still running there, on the EA it was showing unless `--ea` names one.
-A fresh dashboard opens EA 0 unless `--ea` names one; no persisted selection. `Q` asks for confirmation, then stops the
+A fresh dashboard opens EA 0 unless `--ea` names one; no persisted selection.
+From an agent pane on the session's tmux server, `attach` switches that client
+to the dashboard session instead of running a second dashboard in the pane. `Q` asks for confirmation, then stops the
 session's runtime like `omar down`.
 Slack and computer bridges are not started by an attached dashboard.
 

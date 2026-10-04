@@ -334,9 +334,27 @@ fn prepare_dashboard(cli: &Cli, session: Session) -> Result<()> {
         ea::save_active_ea(&session.directory, ea.id)?;
     }
     if inside_tmux_server(&session.tmux_server) {
-        return Ok(());
+        if current_tmux_session(&session.tmux_server).as_deref() == Some(crate::DASHBOARD_SESSION) {
+            return Ok(());
+        }
+        // An agent pane on this server switches to the dedicated dashboard
+        // session rather than running a second dashboard inside the workload.
+        return relaunch_dashboard(&session, ea.id, explicit, running, true);
     }
-    relaunch_dashboard(&session, ea.id, explicit, running)
+    relaunch_dashboard(&session, ea.id, explicit, running, false)
+}
+
+fn current_tmux_session(server: &str) -> Option<String> {
+    let mut command = Command::new("tmux");
+    command.args(["-L", server, "display-message", "-p"]);
+    if let Ok(pane) = std::env::var("TMUX_PANE") {
+        command.args(["-t", &pane]);
+    }
+    let output = command.arg("#{session_name}").output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn dashboard_running(session: &Session) -> bool {
@@ -361,14 +379,16 @@ fn inside_tmux_server(server: &str) -> bool {
 }
 
 /// Mirror of the legacy `relaunch_in_tmux`, on the session's own tmux server.
-/// A dashboard that is already running there receives a launch handoff and
-/// this client attaches to it; otherwise a fresh one is started. Never returns
-/// on success: the process becomes the tmux client.
+/// A dashboard that is already running there is joined (with a launch handoff
+/// when an EA was named); otherwise a fresh one is started. From a pane on
+/// that server (`nested`) this client switches to the dashboard session.
+/// Never returns on success: the process becomes the tmux client.
 fn relaunch_dashboard(
     session: &Session,
     ea: ea::EaId,
     explicit: bool,
     running: bool,
+    nested: bool,
 ) -> Result<()> {
     let config = Config::load(session.directory.join("config.toml").to_str())?;
     let exe = std::env::current_exe()?;
@@ -381,30 +401,69 @@ fn relaunch_dashboard(
             .env_remove("TMUX_PANE");
         command
     };
-    if running {
-        if explicit {
-            ea::save_dashboard_launch_handoff(
-                &session.directory,
-                &ea::DashboardLaunchHandoff {
-                    active_ea: ea,
-                    default_command: config.agent.default_command.clone(),
-                    default_workdir: config.agent.default_workdir.clone(),
-                    restart_manager: false,
-                },
-            )?;
+    let launch = |detached: bool| {
+        let mut command = tmux();
+        command.arg("new-session");
+        if detached {
+            command.arg("-d");
         }
+        command
+            .args(["-s", crate::DASHBOARD_SESSION, "-c"])
+            .arg(&config.agent.default_workdir)
+            .arg(&exe)
+            .args(["attach", "-s", &session.id, "--ea", &ea.to_string()]);
+        command
+    };
+    if running && explicit {
+        ea::save_dashboard_launch_handoff(
+            &session.directory,
+            &ea::DashboardLaunchHandoff {
+                active_ea: ea,
+                default_command: config.agent.default_command.clone(),
+                default_workdir: config.agent.default_workdir.clone(),
+                restart_manager: false,
+            },
+        )?;
+    }
+    if nested {
+        if !running {
+            anyhow::ensure!(
+                launch(true).status()?.success(),
+                "failed to start the dashboard session"
+            );
+        }
+        // Switch this client to the dashboard; a pane without a client of its
+        // own (a script, say) attaches nested instead.
+        let switched = Command::new("tmux")
+            .args([
+                "-L",
+                &session.tmux_server,
+                "switch-client",
+                "-t",
+                &dashboard,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if switched
+            || tmux()
+                .args(["attach-session", "-t", &dashboard])
+                .status()?
+                .success()
+        {
+            std::process::exit(0);
+        }
+        bail!("could not switch to the dashboard session");
+    }
+    if running {
         let status = tmux().args(["attach-session", "-t", &dashboard]).status()?;
         if status.success() {
             std::process::exit(0);
         }
         let _ = tmux().args(["kill-session", "-t", &dashboard]).status();
     }
-    let error = tmux()
-        .args(["new-session", "-s", crate::DASHBOARD_SESSION, "-c"])
-        .arg(&config.agent.default_workdir)
-        .arg(&exe)
-        .args(["attach", "-s", &session.id, "--ea", &ea.to_string()])
-        .exec();
+    let error = launch(false).exec();
     bail!("failed to launch tmux: {error}")
 }
 
@@ -680,30 +739,50 @@ fn overview(server: &Serve, session: &Session) -> Result<Value> {
         json!({"session":session, "eas":ea::load_registry(&session.directory), "agents":agents, "runs":server.session_runs(None)}),
     )
 }
-fn handle_operation(
+/// Shutdown is admitted ahead of everything else: the shared stopping state
+/// is published before any work that could wait behind an in-flight
+/// admission, and a forced shutdown never does that work at all.
+fn begin_shutdown(
     server: &Serve,
-    session: &mut Session,
-    operation: Value,
+    shared: &Mutex<Session>,
+    record: &mut Session,
     force: &AtomicBool,
+    forced: bool,
 ) -> Result<Value> {
+    force.fetch_or(forced, Ordering::SeqCst);
+    record.state = "stopping".into();
+    publish(record)?;
+    *shared.lock().unwrap() = record.clone();
+    if forced {
+        server.session_shutdown_now();
+    } else {
+        server.session_stopping()?;
+    }
+    Ok(json!({"status":"stopping"}))
+}
+
+/// A signal asks for a graceful shutdown. Its stop requests may wait behind an
+/// in-flight admission, so they run off the daemon loop.
+fn request_graceful(server: &Arc<Serve>, session: &Mutex<Session>) -> Result<()> {
+    let mut record = session.lock().unwrap();
+    record.state = "stopping".into();
+    publish(&record)?;
+    let server = server.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = server.session_stopping() {
+            eprintln!("graceful stop requests failed: {error:#}");
+        }
+    });
+    Ok(())
+}
+
+fn handle_operation(server: &Serve, session: &mut Session, operation: Value) -> Result<Value> {
     let op = operation["op"].as_str().context("operation is required")?;
     if op == "hello" {
         return Ok(json!(session));
     }
     if op == "overview" {
         return overview(server, session);
-    }
-    if op == "down" {
-        let forced = operation["force"].as_bool().unwrap_or(false);
-        force.fetch_or(forced, Ordering::SeqCst);
-        session.state = "stopping".into();
-        publish(session)?;
-        // A graceful stop request can fail on a broken deployment directory;
-        // an explicit force still gets through.
-        if let Err(error) = server.session_stopping() {
-            anyhow::ensure!(forced, "{error:#}");
-        }
-        return Ok(json!({"status":"stopping"}));
     }
     anyhow::ensure!(
         session.state == "ready",
@@ -887,7 +966,11 @@ async fn daemon(directory: &Path) -> Result<()> {
                                 && request.incarnation == record.incarnation,
                             "session identity/protocol mismatch"
                         );
-                        handle_operation(&server, &mut record, request.operation, &force)
+                        if request.operation["op"] == "down" {
+                            let forced = request.operation["force"].as_bool().unwrap_or(false);
+                            return begin_shutdown(&server, &session, &mut record, &force, forced);
+                        }
+                        handle_operation(&server, &mut record, request.operation)
                     });
                     if record.state == "stopping" {
                         *session.lock().unwrap() = record.clone();
@@ -913,8 +996,8 @@ async fn daemon(directory: &Path) -> Result<()> {
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(40)) => (),
-            _ = interrupt.recv() => { let mut s = session.lock().unwrap(); server.session_stopping()?; s.state = "stopping".into(); publish(&s)?; },
-            _ = terminate.recv() => { let mut s = session.lock().unwrap(); server.session_stopping()?; s.state = "stopping".into(); publish(&s)?; },
+            _ = interrupt.recv() => request_graceful(&server, &session)?,
+            _ = terminate.recv() => request_graceful(&server, &session)?,
         }
     }
     scheduler_task.abort();
