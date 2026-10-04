@@ -480,7 +480,7 @@ fn apply_context_environment(context: &McpLaunchContext) {
 /// processes (e.g. the Slack bridge) that aren't spawned by a specific
 /// backend launch and need a default context derived from the current
 /// config + active EA.
-pub fn run_server_with_default_context() -> Result<()> {
+pub fn run_server_with_default_context(bare_tool_names: bool) -> Result<()> {
     let omar_dir = std::env::var_os("OMAR_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -508,7 +508,9 @@ pub fn run_server_with_default_context() -> Result<()> {
         topology: None,
         serve: None,
     };
-    OmarMcpServer::new(context).run()
+    OmarMcpServer::new(context)
+        .with_bare_tool_names(bare_tool_names)
+        .run()
 }
 
 /// Pick the EA id for a default-context server. Honors `OMAR_EA_ID` so

@@ -588,7 +588,7 @@ async fn async_main() -> Result<()> {
             bare_tool_names,
         }) => match context_file {
             Some(path) => mcp::run_server_from_context_file(PathBuf::from(path), bare_tool_names),
-            None => mcp::run_server_with_default_context(),
+            None => mcp::run_server_with_default_context(bare_tool_names),
         },
         Some(Commands::Run {
             program,
