@@ -476,6 +476,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             setPending([]);
             void settle();
           }
+          if (event.kind === "run_paused") {
+            // Checkpointed and parked at a tag boundary: the picture stays,
+            // labelled paused, and nothing is owed until `omar resume`.
+            setPhase("finished");
+            setPending([]);
+            void settle();
+          }
           if (event.kind === "run_failed") {
             setPhase("failed");
             const message = (event.payload as { message?: unknown }).message;
