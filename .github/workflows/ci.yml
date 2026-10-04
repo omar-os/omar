@@ -155,7 +155,7 @@ jobs:
   backend-supervision-contracts:
     name: Backend Supervision Contracts
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -163,6 +163,22 @@ jobs:
           node-version: '22'
       - name: Install pinned backend CLIs
         run: npm install -g @anthropic-ai/claude-code@2.1.274 opencode-ai@1.18.31 @openai/codex@0.154.0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      # The opencode contract registers OMAR's real MCP server to check the
+      # tool names opencode offers the model.
+      - name: Build OMAR
+        run: cargo build --bin omar
       - name: Verify native prompt and wake contracts against local mock providers
         run: |
           python3 tests/ci/claude_prompt_contract.py
