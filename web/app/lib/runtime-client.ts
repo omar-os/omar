@@ -375,6 +375,7 @@ export function subscribeToDiagram(
     "reaction_completed",
     "run_completed",
     "run_failed",
+    "run_paused",
   ];
   for (const kind of kinds) {
     stream.addEventListener(kind, (raw) => {

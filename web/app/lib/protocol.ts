@@ -339,6 +339,18 @@ export function applyDiagramEvent(
             : reaction,
         ),
       };
+    case "run_paused":
+      // A pause lands at a tag boundary, where nothing is in flight: whatever
+      // was painted as running has finished, and the run waits for a resume.
+      return {
+        ...snapshot,
+        status: "paused",
+        reactions: snapshot.reactions.map((reaction) =>
+          reaction.status === "running"
+            ? { ...reaction, status: "completed", invocation_id: null }
+            : reaction,
+        ),
+      };
     case "run_failed":
       // A reaction interrupted by the failure did not complete, so it goes back
       // to idle rather than claiming a result it never produced.
