@@ -88,18 +88,6 @@ pub fn record_backend_bootstrap(backend: &str) {
     );
 }
 
-pub fn record_manager_start(ea_id: u32, session: &str, ready: bool, startup_ms: u64) {
-    write_metric(
-        "manager_start",
-        serde_json::json!({
-            "ea_id": ea_id,
-            "session": session,
-            "ready": ready,
-            "startup_ms": startup_ms
-        }),
-    );
-}
-
 pub struct AgentSpawnMetric<'a> {
     pub ea_id: u32,
     pub session: &'a str,

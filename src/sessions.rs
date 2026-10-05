@@ -301,10 +301,8 @@ pub fn prepare_process(cli: &Cli) -> Result<()> {
         std::env::set_var("OMARC_BIN", directory.join("bin/omarc"));
         std::env::remove_var("TMUX");
     }
-    if !cli.legacy {
-        if let Some(session) = dashboard_target(cli)? {
-            prepare_dashboard(cli, session)?;
-        }
+    if let Some(session) = dashboard_target(cli)? {
+        prepare_dashboard(cli, session)?;
     }
     Ok(())
 }
@@ -389,7 +387,7 @@ fn inside_tmux_server(server: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Mirror of the legacy `relaunch_in_tmux`, on the session's own tmux server.
+/// Relaunch inside the session's own tmux server.
 /// A dashboard that is already running there is joined (with a launch handoff
 /// when an EA was named); otherwise a fresh one is started. From a pane on
 /// that server (`nested`) this client switches to the dashboard session.
@@ -494,11 +492,11 @@ pub fn launched_with_assistant(session: &Session) -> bool {
         .is_some_and(|launch| !launch.no_ea)
 }
 
-/// The legacy dashboard, attached to the session `prepare_process` selected.
+/// The terminal dashboard, attached to the session `prepare_process` selected.
 async fn attach_dashboard() -> Result<()> {
     let session = resolve(&std::env::var("OMAR_SESSION_ID")?)?;
     let config = Config::load(session.directory.join("config.toml").to_str())?;
-    crate::run_dashboard(config, Some(session)).await
+    crate::run_dashboard(config, session).await
 }
 fn executable_on_path(path: PathBuf) -> Result<PathBuf> {
     if path.components().count() > 1 {
@@ -589,7 +587,6 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
     }
     let workdir = fs::canonicalize(options.workdir.unwrap_or(std::env::current_dir()?))?;
     config.agent.default_workdir = workdir.to_string_lossy().into_owned();
-    config.dashboard.session_prefix = format!("omar-{}-agent-", &id[2..10]);
     config.metrics.spawn_metrics_enabled |= cli.spawn_metrics;
     fs::write(directory.join("config.toml"), toml::to_string(&config)?)?;
     // Short private socket paths also work on macOS's 104-byte Unix path limit.
@@ -712,11 +709,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
 pub fn validate_exec(cli: &Cli) -> Result<()> {
     anyhow::ensure!(is_managed(), "internal command requires a session runtime");
     anyhow::ensure!(
-        !cli.legacy
-            && cli.config.is_none()
-            && cli.agent.is_none()
-            && !cli.spawn_metrics
-            && cli.session.is_none(),
+        cli.config.is_none() && cli.agent.is_none() && !cli.spawn_metrics && cli.session.is_none(),
         "runtime configuration cannot be changed by a client invocation"
     );
     anyhow::ensure!(
@@ -861,11 +854,15 @@ fn handle_operation(server: &Serve, session: &mut Session, operation: Value) -> 
                 Cli::try_parse_from(std::iter::once("omar".to_string()).chain(args.clone()))?;
             validate_exec(&parsed)?;
             if let Some(Commands::Kill { name }) = &parsed.command {
+                // A finished run's agents are ordinary leftovers; only a live one is daemon-owned.
                 anyhow::ensure!(
-                    !server
-                        .session_runs(Some(target.id))
-                        .iter()
-                        .any(|r| r["team"] == name.as_str() || r["run_id"] == name.as_str()),
+                    !server.session_runs(Some(target.id)).iter().any(|r| {
+                        (r["team"] == name.as_str() || r["run_id"] == name.as_str())
+                            && matches!(
+                                r["status"].as_str(),
+                                Some("starting" | "running" | "stopping")
+                            )
+                    }),
                     "use stop for a daemon-owned topology, or down --force for the whole session"
                 );
             }
@@ -947,7 +944,15 @@ async fn daemon(directory: &Path) -> Result<()> {
             .into_iter()
             .flatten()
             .collect();
-    server.attach_ea(&config, directory, 0, false, !launch.no_ea)?;
+    match server.attach_ea(&config, directory, 0, false, !launch.no_ea)? {
+        crate::serve::AttachEa::Attached(session) => eprintln!("Executive assistant running in {session}"),
+        crate::serve::AttachEa::AlreadyRunningWithoutServe(session) => eprintln!(
+            "Executive assistant {session} is running without this runtime's context; restart it with manager start"
+        ),
+        crate::serve::AttachEa::LaunchedWithoutServe { session, reason } => {
+            eprintln!("Executive assistant {session} launched without serve context: {reason}")
+        }
+    }
     // A session owns exactly one scheduled-event delivery loop, even with no clients.
     let scheduler = Arc::new(crate::scheduler::Scheduler::with_store(
         crate::scheduler::events_store_path(directory),
@@ -1047,6 +1052,24 @@ async fn daemon(directory: &Path) -> Result<()> {
     publish(&session)?;
     Ok(())
 }
+/// The registry record once the daemon has published `stopped`.
+fn wait_stopped(session: &Session, timeout: Duration) -> Result<Session> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let saved: Session =
+            serde_json::from_slice(&fs::read(registry().join(format!("{}.json", session.id)))?)?;
+        if saved.state == "stopped" {
+            return Ok(saved);
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "shutdown is still pending; inspect omar info -s {} or explicitly use down --force",
+            session.id
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn print_value(value: Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
@@ -1086,37 +1109,9 @@ fn strip_target_args(args: impl Iterator<Item = String>) -> Vec<String> {
     stripped
 }
 pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
-    if cli.legacy {
-        if cli.session.is_some() || is_managed() {
-            return Some(Err(anyhow::anyhow!(
-                "legacy mode cannot target or inherit a managed session"
-            )));
-        }
-        if matches!(
-            cli.command,
-            Some(
-                Commands::Up(_)
-                    | Commands::Ls
-                    | Commands::Info
-                    | Commands::Attach { .. }
-                    | Commands::Logs { .. }
-                    | Commands::Down { .. }
-                    | Commands::Start(_)
-                    | Commands::Runs { .. }
-                    | Commands::Ea { .. }
-                    | Commands::SessionDaemon { .. }
-                    | Commands::SessionExec { .. }
-            )
-        ) {
-            return Some(Err(anyhow::anyhow!(
-                "session commands do not support --legacy"
-            )));
-        }
-        return None;
-    }
     if !matches!(
         cli.command,
-        None | Some(Commands::Up(_) | Commands::Serve { .. })
+        None | Some(Commands::Up(_) | Commands::Serve { .. } | Commands::Run(_))
     ) && (cli.config.is_some() || cli.agent.is_some() || cli.spawn_metrics)
     {
         return Some(Err(anyhow::anyhow!("configuration options apply when creating a session; target an existing session without changing its configuration")));
@@ -1133,9 +1128,9 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         return Some(attach_dashboard().await);
     }
     let result = match &cli.command {
-        Some(Commands::Serve { name, address, no_ea, ui, restart_ea }) => {
-            if *restart_ea { return Some(Err(anyhow::anyhow!("serve creates a fresh session; --restart-ea is available only with --legacy"))); }
-            if *ui { return Some(Err(anyhow::anyhow!("use omar up, then omar attach -s <session> --web; legacy serve --ui remains available with --legacy"))); }
+        Some(Commands::Serve { name, address, no_ea, ui }) => {
+            // The runtime serves Mission Control whenever the build has it; `--ui` insists on it.
+            if *ui && !crate::web_assets::is_bundled() { return Some(Err(anyhow::anyhow!("{}", crate::web_assets::MISSING))); }
             launch(cli, UpOptions { name: name.clone(), address: address.unwrap_or_else(|| UpOptions::default().address), no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
         },
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
@@ -1174,34 +1169,50 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         Some(Commands::Down { force, timeout }) => target(cli).and_then(|s| {
             if s.state == "stopped" { return Ok(()); }
             rpc(&s,json!({"op":"down","force":force}),Duration::from_secs(10))?;
-            let deadline = Instant::now()+Duration::from_secs(*timeout);
-            loop {
-                let saved: Session = serde_json::from_slice(&fs::read(registry().join(format!("{}.json",s.id)))?)?;
-                if saved.state == "stopped" { return if cli.json { print_value(json!(saved)) } else { println!("Stopped session {}",s.name); Ok(()) }; }
-                anyhow::ensure!(Instant::now()<deadline,"shutdown is still pending; inspect omar info -s {} or explicitly use down --force",s.id);
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            let saved = wait_stopped(&s, Duration::from_secs(*timeout))?;
+            if cli.json { print_value(json!(saved)) } else { println!("Stopped session {}",s.name); Ok(()) }
         }),
         Some(Commands::Manager { action: None | Some(crate::ManagerAction::Start) }) => target(cli).and_then(|s|rpc(&s,json!({"op":"manager_start","ea":ea_selector(cli)}),Duration::from_secs(120))).and_then(print_value),
-        Some(Commands::Start(options)) => (|| {
-            let s=target(cli)?; let ea=ea_selector(cli);
-            let mut inputs=serde_json::Map::new();
-            for input in &options.inputs {
-                let (name,value)=input.split_once('=').context("input must be NAME=VALUE")?;
-                inputs.insert(name.into(),serde_json::from_str(value).unwrap_or_else(|_|json!(value)));
-            }
-            let body=json!({"program":fs::read_to_string(&options.program)?,"inputs":inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast});
-            let run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
+        Some(Commands::Run(options)) => (|| {
+            // No runtime selected: this run gets a session of its own, shut
+            // down again after a --wait run ends.
+            let (s, owned) = match target(cli) {
+                Ok(s) => {
+                    anyhow::ensure!(cli.config.is_none() && cli.agent.is_none() && !cli.spawn_metrics,
+                        "configuration options apply only when run creates a session");
+                    (s, false)
+                }
+                Err(_) if cli.session.is_none() && std::env::var_os("OMAR_SESSION_ID").is_none() => {
+                    let s = launch(cli, UpOptions { no_ea: true, ..UpOptions::default() }, false)?;
+                    if !cli.json { eprintln!("Started session {} ({}); omar down -s {} stops it", s.name, s.id, s.id); }
+                    (s, true)
+                }
+                Err(error) => return Err(error),
+            };
+            let ea = ea_selector(cli);
+            for input in &options.inputs { anyhow::ensure!(input.contains('='), "input must be NAME=VALUE"); }
+            let body=json!({"program":fs::read_to_string(&options.program)?,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast});
+            let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
+            if owned { run["session_id"] = json!(s.id); }
             // One structured result: the admission record, or with --wait the terminal record.
             if !options.wait { return print_value(run); }
-            loop {
+            let state = loop {
                 let state=rpc(&s,json!({"op":"status","ea":ea,"run":run["run_id"]}),Duration::from_secs(5))?;
                 match state["status"].as_str() {
-                    Some("completed"|"stopped") => return print_value(state),
-                    Some("failed") => bail!("topology failed: {}",state["error"]),
+                    Some("completed"|"stopped"|"failed") => break state,
                     _ => std::thread::sleep(Duration::from_millis(200)),
                 }
+            };
+            if owned {
+                let _ = rpc(&s,json!({"op":"down","force":false}),Duration::from_secs(10));
+                let _ = wait_stopped(&s, Duration::from_secs(30));
             }
+            if state["status"] == "failed" { bail!("topology failed: {}", state["error"]); }
+            if cli.json { return print_value(state); }
+            println!("Topology '{}' {}", state["team"].as_str().unwrap_or(""), state["status"].as_str().unwrap_or(""));
+            for (port, value) in state["outputs"].as_object().into_iter().flatten() { println!("Output {port} = {value}"); }
+            for (name, value) in state["state"].as_object().into_iter().flatten() { println!("State {name} = {value}"); }
+            Ok(())
         })(),
         Some(Commands::Runs { all_eas }) => target(cli).and_then(|s|rpc(&s,json!({"op":"runs","ea":ea_selector(cli),"all_eas":all_eas}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Status { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"status","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
@@ -1215,7 +1226,6 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             let value=rpc(&s,json!({"op":"exec","ea":ea_selector(cli),"cwd":std::env::current_dir()?,"args":args}),Duration::from_secs(120))?;
             if cli.json { print_value(value) } else { print!("{}",value["stdout"].as_str().unwrap_or("")); eprint!("{}",value["stderr"].as_str().unwrap_or("")); Ok(()) }
         }),
-        Some(Commands::Run { .. }) => Err(anyhow::anyhow!("run is the legacy foreground runner; use --session <session> start, or explicitly opt into --legacy run")),
         _ if cli.session.is_some() => Err(anyhow::anyhow!("this internal/setup command does not accept --session")),
         _ => return None,
     };

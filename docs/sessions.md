@@ -18,7 +18,7 @@ session. TUI/browser clients can disconnect without stopping any workload.
 | `omar down -s SESSION [--timeout SECONDS]` | Reject new work, finish current tags, clean owned processes |
 | `omar down -s SESSION --force` | Terminate owned workloads without waiting for tag boundaries |
 | `omar serve [--name NAME] [--address 127.0.0.1:PORT]` | New independent foreground runtime; SIGINT/SIGTERM requests graceful shutdown |
-| `omar -s SESSION [--ea EA] start FILE [--input NAME=VALUE] [--wait]` | Admit a topology; optionally wait as a client |
+| `omar run FILE [-s SESSION] [--ea EA] [--input NAME=VALUE] [--wait]` | Run a topology in the selected runtime, or in a new session when none is selected; `--wait` prints its outputs and final state, and shuts down a session it created. `start` is an alias |
 | `omar -s SESSION [--ea EA] runs [--all-eas]` | List topology runs |
 | `omar -s SESSION [--ea EA] status RUN-OR-TEAM` | Inspect one run; ambiguous names require a run ID |
 | `omar -s SESSION [--ea EA] stop RUN-OR-TEAM` | Stop one topology at a tag boundary |
@@ -34,7 +34,7 @@ session. TUI/browser clients can disconnect without stopping any workload.
 Every group has hierarchical help: `omar event --help` lists its subcommands;
 `omar event schedule --help` explains scheduling and targeting. Help never starts
 a runtime or writes configuration. `--json` produces structured session results;
-forwarded legacy operations return a stdout/stderr envelope.
+forwarded operations return a stdout/stderr envelope.
 
 Every command that targets a session takes it as `-s`/`--session` (id or
 name). Explicit `--session` wins over inherited `OMAR_SESSION_ID`. Without
@@ -65,16 +65,15 @@ at launch. Helpers use that pinned runtime, so rebuilding/replacing an installed
 binary does not change existing sessions. `ls`/`info` expose the source path and
 SHA-256 build identity. Do not delete a live session directory.
 
-## Migration
+## Layout
 
-Normal launches no longer reuse `omar-dashboard` or implicitly target shared
-`~/.omar` state. Existing state is preserved. `--legacy` explicitly retains the
-old shared layout and foreground `run` / `serve --ui` / terminal dashboard for
-migration and legacy regression tests. It cannot target or inherit a managed
-session. Use `start` for daemon-owned topologies; legacy `run` requires
-`--legacy`. `manager orchestrate` now aliases terminal attachment.
+The session layout is the only layout: every runtime lives under
+`$OMAR_HOME/sessions/<id>/` and nothing targets a shared `~/.omar` state
+directory any more. `$OMAR_HOME/config.toml` is only the template a new
+session copies. `omar run` (alias `start`) submits a topology to a runtime; the
+foreground runner is gone. `manager orchestrate` aliases `attach --tui`.
 
-`attach` runs the same terminal dashboard as before, as a client: it reads the
+`attach --tui` runs the terminal dashboard as a client: it reads the
 session's state directory and drives the session's tmux server, and it runs
 inside a `omar-dashboard` tmux session on that server so popups and agent
 attachment work unchanged. The daemon keeps the scheduler, assistant launches
@@ -83,9 +82,9 @@ attachment work unchanged. The daemon keeps the scheduler, assistant launches
 that is still running there, on the EA it was showing unless `--ea` names one.
 A fresh dashboard opens EA 0 unless `--ea` names one; no persisted selection.
 From an agent pane on the session's tmux server, `attach` switches that client
-to the dashboard session instead of running a second dashboard in the pane. `Q` asks for confirmation, then stops the
-session's runtime like `omar down`.
-Slack and computer bridges are not started by an attached dashboard.
+to the dashboard session instead of running a second dashboard in the pane.
+`Q` asks for confirmation, then stops the session's runtime like `omar down`.
+Slack and computer bridges belong to the daemon.
 
 ## Sandbox boundary
 

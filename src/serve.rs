@@ -94,6 +94,14 @@ pub struct RunRecord {
     pub started_at: u64,
     pub finished_at: Option<u64>,
     pub error: Option<String>,
+    /// Output ports a finished run ended with.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(optional, type = "Record<string, unknown>")]
+    pub outputs: BTreeMap<String, Value>,
+    /// State variables a finished run ended with.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(optional, type = "Record<string, unknown>")]
+    pub state: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +111,10 @@ struct StartRunRequest {
     conversation_id: Option<String>,
     #[serde(default)]
     inputs: BTreeMap<String, Value>,
+    /// `NAME=VALUE` inputs exactly as a CLI received them; the runtime parses
+    /// them by port type, so a bare `hello` is the string hello.
+    #[serde(default)]
+    raw_inputs: Vec<String>,
     /// A daemon re-runs the same team repeatedly, so stale agent sessions are
     /// replaced rather than treated as a conflict.
     #[serde(default = "default_replace")]
@@ -397,7 +409,14 @@ impl Serve {
         let name = crate::ea::ea_manager_session(ea, &context.session_prefix);
         let client = TmuxClient::new("");
         if !client.has_session(&name)? {
-            let command = context.command.lock().unwrap().clone();
+            // The EA's `assistant-command` file is its explicit override
+            // (`ea create --agent` writes it); a start honours its current content.
+            let command = {
+                let mut current = context.command.lock().unwrap();
+                let chosen = assistant_command(&context.omar_dir, ea, &current);
+                *current = chosen.clone();
+                chosen
+            };
             relaunch_ea(&context, &command)?;
         }
         context.chat.lock().unwrap().needs_relaunch = false;
@@ -722,14 +741,6 @@ impl Serve {
             ),
         }
     }
-
-    /// Block until shutdown, including the last-window idle timeout.
-    pub fn wait(mut self) -> Result<()> {
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        Ok(())
-    }
 }
 
 impl Drop for Serve {
@@ -744,6 +755,7 @@ impl Drop for Serve {
 }
 
 /// Reopening the launcher should reuse a live runtime, not replace its runs.
+#[cfg(test)]
 pub fn is_running(address: SocketAddr) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
         return false;
@@ -768,44 +780,6 @@ pub fn is_running(address: SocketAddr) -> bool {
         .is_some_and(|body| {
             body["status"] == "ok" && body["protocol_version"] == SERVE_PROTOCOL_VERSION
         })
-}
-
-pub fn run(
-    address: SocketAddr,
-    config: &Config,
-    omar_dir: &Path,
-    ea_id: EaId,
-    restart_ea: bool,
-    launch_ea: bool,
-    override_backend: bool,
-) -> Result<()> {
-    let server = Serve::start(address, config, omar_dir, ea_id)?;
-    if override_backend {
-        *server
-            .workspaces
-            .root
-            .command
-            .lock()
-            .expect("command poisoned") = config.agent.default_command.clone();
-    }
-    println!("OMAR serve: http://{}", server.address());
-    match server.attach_ea(config, omar_dir, ea_id, restart_ea, launch_ea) {
-        Ok(AttachEa::Attached(session)) => println!("Executive assistant: {session}"),
-        Ok(AttachEa::AlreadyRunningWithoutServe(session)) => eprintln!(
-            "Executive assistant '{session}' is already running and was launched without this \
-             server, so it cannot reply or propose designs. Restart it with \
-             `omar serve --restart-ea` to enable them."
-        ),
-        Ok(AttachEa::LaunchedWithoutServe { session, reason }) => eprintln!(
-            "Executive assistant '{session}' started, but will NOT see omar_reply or \
-             omar_propose_design: {reason}.\nIt answers in its terminal instead, where the \
-             operator cannot see it. Reinstall the runtime (`cargo install --path . --force`) \
-             so every entry point launches agents with this build, then restart with \
-             `omar serve --restart-ea`."
-        ),
-        Err(error) => eprintln!("Executive assistant unavailable: {error:#}"),
-    }
-    server.wait()
 }
 
 fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<()> {
@@ -1986,10 +1960,11 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
-    let inputs = match encode_inputs(&state, &request.inputs) {
+    let mut inputs = match encode_inputs(&state, &request.inputs) {
         Ok(inputs) => inputs,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
+    inputs.extend(request.raw_inputs.iter().cloned());
     if let Err(error) = topology::parse_inputs(&state, &inputs) {
         return (400, json!({"error": format!("{error:#}")}));
     }
@@ -2017,6 +1992,8 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         started_at: now_unix(),
         finished_at: None,
         error: None,
+        outputs: BTreeMap::new(),
+        state: BTreeMap::new(),
     };
     context
         .runs
@@ -2049,11 +2026,23 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             (500, json!({"error": "run vanished"}))
         }
         Err(_) => {
-            let runs = context.runs.lock().expect("serve runs poisoned");
-            let message = runs
-                .get(&run_id)
-                .and_then(|record| record.error.clone())
-                .unwrap_or_else(|| "run did not start".to_string());
+            // The readiness channel closes when the runner gives up, a moment
+            // before the run thread records why; wait for that reason.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let message = loop {
+                let runs = context.runs.lock().expect("serve runs poisoned");
+                let record = runs.get(&run_id);
+                if let Some(error) = record.and_then(|record| record.error.clone()) {
+                    break error;
+                }
+                if record.is_none_or(|record| !record.status.is_active())
+                    || Instant::now() >= deadline
+                {
+                    break "run did not start".to_string();
+                }
+                drop(runs);
+                thread::sleep(Duration::from_millis(50));
+            };
             (500, json!({"error": message, "run_id": run_id}))
         }
     }
@@ -2348,8 +2337,14 @@ fn spawn_run_thread(
         if let Some(record) = runs.get_mut(&run_id) {
             record.finished_at = Some(now_unix());
             match outcome {
-                Ok(topology::RunEnd::Completed) => record.status = RunStatus::Completed,
-                Ok(topology::RunEnd::Stopped) => record.status = RunStatus::Stopped,
+                Ok(outcome) => {
+                    record.status = match outcome.end {
+                        topology::RunEnd::Completed => RunStatus::Completed,
+                        topology::RunEnd::Stopped => RunStatus::Stopped,
+                    };
+                    record.outputs = outcome.outputs;
+                    record.state = outcome.state;
+                }
                 Err(error) => {
                     record.status = RunStatus::Failed;
                     record.error = Some(format!("{error:#}"));
@@ -2556,6 +2551,8 @@ mod tests {
             started_at: 0,
             finished_at: None,
             error: None,
+            outputs: BTreeMap::new(),
+            state: BTreeMap::new(),
         }
     }
 
@@ -2973,6 +2970,8 @@ while True:
                     started_at: 0,
                     finished_at: None,
                     error: None,
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
                 },
             );
         }

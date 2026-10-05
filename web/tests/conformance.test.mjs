@@ -49,7 +49,7 @@ function runtimeSupports(args, needle) {
   return `${probe.stdout}${probe.stderr}`.includes(needle);
 }
 
-const SERVES_HEADLESS = runtimeSupports(["--legacy", "serve", "--help"], "--no-ea");
+const SERVES_HEADLESS = runtimeSupports(["serve", "--help"], "--no-ea");
 const HAS_STUB_AGENT = runtimeSupports(["stub-agent", "--help"], null);
 // Topology agents run in tmux panes, so a real run needs one.
 const HAS_TMUX = spawnSync("tmux", ["-V"], { encoding: "utf8" }).status === 0;
@@ -114,7 +114,7 @@ async function startRealServe() {
     join(home, ".omar/config.toml"),
     `[dashboard]\nsession_prefix = "${sessionPrefix}"\n`,
   );
-  const child = spawn(OMAR_BIN, ["--legacy", "serve", "--address", "127.0.0.1:0", "--no-ea"], {
+  const child = spawn(OMAR_BIN, ["serve", "--address", "127.0.0.1:0", "--no-ea"], {
     env: { ...process.env, HOME: home, OMARC_BIN },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -127,7 +127,7 @@ async function startRealServe() {
     );
     child.stdout.on("data", (chunk) => {
       buffer += chunk;
-      const match = /OMAR serve: (http:\/\/\S+)/.exec(buffer);
+      const match = /URL:\s+(http:\/\/\S+)/.exec(buffer);
       if (match) {
         clearTimeout(timer);
         resolveUrl(match[1]);
@@ -139,9 +139,19 @@ async function startRealServe() {
     });
   });
 
+  // The runtime's private state (its MCP context among it) lives in the
+  // session's own directory, found through the registry.
+  const listed = spawnSync(OMAR_BIN, ["ls", "--json"], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: home },
+  });
+  const stateDir = JSON.parse(listed.stdout || "[]").find((s) => s.state === "ready")?.directory;
+  assert.ok(stateDir, `no ready session listed: ${listed.stdout} ${listed.stderr}`);
+
   return {
     url,
     home,
+    stateDir,
     sessionPrefix,
     async close() {
       child.kill();
@@ -351,7 +361,7 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     // `--no-ea` still writes the context, so the harness can stand in for the
     // assistant without an agent process existing.
     const context = JSON.parse(
-      await readFile(join(real.home, ".omar/mcp/ea-0/context.json"), "utf8"),
+      await readFile(join(real.stateDir, "mcp/ea-0/context.json"), "utf8"),
     );
     const token = context.serve?.token;
     assert.equal(typeof token, "string", "serve wrote its token into the context");

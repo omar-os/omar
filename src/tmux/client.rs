@@ -787,16 +787,6 @@ impl TmuxClient {
         Ok(session)
     }
 
-    /// Attach to a session (blocks until detached)
-    pub fn attach_session(&self, session: &str) -> Result<()> {
-        let target = exact_session_target(session);
-        self.command()
-            .args(["attach-session", "-t", &target])
-            .status()
-            .context("Failed to attach to tmux session")?;
-        Ok(())
-    }
-
     /// Open a popup attached to a session
     pub fn attach_popup(&self, session: &str, width: &str, height: &str) -> Result<()> {
         let target = exact_session_target(session);

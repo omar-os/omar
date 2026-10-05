@@ -19,11 +19,14 @@ if [ ! -x "$OMAR_BIN" ]; then
   exit 1
 fi
 
-server="omar-ea-selector-${RANDOM}-$$"
+server=""
+session_id=""
+state_dir=""
 home_dir="$(mktemp -d)"
 
 cleanup() {
-  tmux -L "$server" kill-server >/dev/null 2>&1 || true
+  [ -n "$session_id" ] && HOME="$home_dir" "$OMAR_BIN" down -s "$session_id" --force --timeout 5 >/dev/null 2>&1 || true
+  [ -n "$server" ] && tmux -L "$server" kill-server >/dev/null 2>&1 || true
   rm -rf "$home_dir"
 }
 trap cleanup EXIT
@@ -39,8 +42,13 @@ default_command = "bash"
 default_workdir = "."
 EOF
 
+session_json="$(cd "$REPO_ROOT" && HOME="$home_dir" "$OMAR_BIN" up --name selector --no-ea --json)"
+session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$session_json")"
+server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
+state_dir="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["directory"])' <<<"$session_json")"
+
 tmux_cmd() {
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" tmux -L "$server" "$@"
+  HOME="$home_dir" tmux -L "$server" "$@"
 }
 
 wait_for_session() {
@@ -62,7 +70,7 @@ fail() {
 }
 
 run_case_single_ea_no_zero() {
-  cat >"$home_dir/.omar/eas.json" <<'EOF'
+  cat >"$state_dir/eas.json" <<'EOF'
 [
   {
     "id": 3,
@@ -77,7 +85,7 @@ EOF
   tmux_cmd new-session -d -s "omar-agent-3-capx-services" "sleep 9999"
   wait_for_session "omar-agent-3-capx-services"
 
-  output="$(HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" --legacy --ea 0 list 2>&1)"
+  output="$(HOME="$home_dir" "$OMAR_BIN" -s "$session_id" --ea 0 list 2>&1)"
   if ! grep -q "EA 3: cap-x" <<<"$output"; then
     echo "$output" >&2
     fail "Expected --ea 0 to resolve to existing EA name cap-x"
@@ -88,7 +96,7 @@ EOF
     fail "Expected output to include cap-x worker session for EA 3"
   fi
 
-  python3 - "$home_dir/.omar/eas.json" <<'PY'
+  python3 - "$state_dir/eas.json" <<'PY'
 import json
 import sys
 
@@ -106,7 +114,7 @@ PY
 }
 
 run_case_multi_ea_still_fails() {
-  cat >"$home_dir/.omar/eas.json" <<'EOF'
+  cat >"$state_dir/eas.json" <<'EOF'
 [
   {
     "id": 2,
@@ -128,7 +136,7 @@ EOF
   wait_for_session "omar-agent-3-capx-services"
 
   set +e
-  output="$(HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" --legacy --ea 0 list 2>&1)"
+  output="$(HOME="$home_dir" "$OMAR_BIN" -s "$session_id" --ea 0 list 2>&1)"
   status=$?
   set -e
 

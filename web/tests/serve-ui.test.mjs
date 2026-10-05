@@ -40,7 +40,7 @@ after(() => rmSync(testHome, { recursive: true, force: true }));
  */
 function bundled() {
   if (!existsSync(OMAR_BIN)) return false;
-  const probe = spawnSync(OMAR_BIN, ["--legacy", "serve", "--ui", "--no-ea", "--address", "0.0.0.0:0"], {
+  const probe = spawnSync(OMAR_BIN, ["serve", "--ui", "--no-ea", "--address", "127.0.0.1:0"], {
     encoding: "utf8",
     env: testEnv,
     timeout: 20_000,
@@ -78,7 +78,7 @@ describe("omar serve --ui", { skip: AVAILABLE ? false : "no bundled runtime" }, 
   before(async () => {
     // `--no-ea` keeps this from launching an assistant in tmux: the bundle is
     // what is under test, not the agent.
-    daemon = spawn(OMAR_BIN, ["--legacy", "serve", "--address", `127.0.0.1:${PORT}`, "--no-ea"], {
+    daemon = spawn(OMAR_BIN, ["serve", "--address", `127.0.0.1:${PORT}`, "--no-ea"], {
       stdio: "ignore",
       env: testEnv,
     });
@@ -165,7 +165,7 @@ describe("omar serve --ui", { skip: AVAILABLE ? false : "no bundled runtime" }, 
 /** Guards the other half: a build without the feature must say so. */
 test("a runtime without the bundle refuses --ui and explains itself", { skip: AVAILABLE }, () => {
   if (!existsSync(OMAR_BIN)) return;
-  const probe = spawnSync(OMAR_BIN, ["--legacy", "serve", "--ui", "--no-ea", "--address", "0.0.0.0:0"], {
+  const probe = spawnSync(OMAR_BIN, ["serve", "--ui", "--no-ea", "--address", "127.0.0.1:0"], {
     encoding: "utf8",
     env: testEnv,
     timeout: 20_000,

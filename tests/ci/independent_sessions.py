@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shutil
 import signal
@@ -89,7 +90,6 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         cli("runs", ok=False)
         bare = subprocess.run([str(BIN)], cwd=root, env=env, text=True, capture_output=True)
         assert bare.returncode != 0 and "Usage:" in bare.stdout + bare.stderr, "bare omar must print the command list"
-        assert "do not support --legacy" in cli("--legacy", "up", ok=False)
         outer = up("outer")
         inherited = dict(env, OMAR_SESSION_ID=outer["id"], OMAR_STATE_DIR=outer["directory"],
                          OMAR_TMUX_SERVER=outer["tmux_server"], OMAR_EA_ID="99", TMUX="parent")
@@ -160,12 +160,18 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         once = root / "once.omar"
         once.write_text('team Once { timer tick(1ns, 0) output done : int reaction(tick) -> done {= done = Some(1); =} }\nmain OnceRun { once = Once() }\n')
         # --wait prints exactly one structured result: the terminal record.
-        assert json.loads(cli("--session", "outer", "start", str(once), "--wait"))["status"] == "completed"
+        assert json.loads(cli("--json", "--session", "outer", "start", str(once), "--wait"))["status"] == "completed"
+        # Without a selected runtime, run creates a session, prints the summary, and shuts it down.
+        summary = subprocess.run([str(BIN), "run", str(once), "--wait"], cwd=root, env=env, text=True, capture_output=True, timeout=120)
+        assert summary.returncode == 0 and "Topology 'OnceRun' completed" in summary.stdout and "Output once.done = 1" in summary.stdout, summary
+        created = re.search(r"Started session \S+ \((s-[0-9a-f]+)\)", summary.stderr)
+        assert created, summary.stderr
+        assert info(created.group(1))["session"]["state"] == "stopped", "run --wait left its own session running"
         run_a = json.loads(cli("--session", "outer", "start", str(program)))["run_id"]
         run_b = json.loads(cli("--session", "inner", "start", str(program)))["run_id"]
         wait_status("outer", run_a, "running")
         wait_status("inner", run_b, "running")
-        # The legacy dashboard attaches as a client inside the session's tmux
+        # The terminal dashboard attaches as a client inside the session's tmux
         # server; z detaches, the dashboard and everything the runtime owns go on.
         terminal, master = terminal_attach("outer")
         try:

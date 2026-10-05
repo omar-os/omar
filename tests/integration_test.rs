@@ -4,9 +4,10 @@
 //! test sessions during execution.
 
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::OnceLock;
@@ -15,23 +16,138 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const TEST_PREFIX: &str = "omar-test-";
-static TEST_TMUX_SERVER: OnceLock<String> = OnceLock::new();
+static FALLBACK_TMUX_SERVER: OnceLock<String> = OnceLock::new();
 
-fn test_tmux_server() -> &'static str {
-    TEST_TMUX_SERVER.get_or_init(|| format!("omar-test-{}", Uuid::new_v4()))
+/// Every test home gets one runtime session, created on first use and shut
+/// down when the test thread ends. Commands target it with `-s`, and tmux
+/// helpers address its dedicated server.
+struct TestSession {
+    home: PathBuf,
+    record: Value,
+}
+
+impl Drop for TestSession {
+    fn drop(&mut self) {
+        let id = self.record["id"].as_str().unwrap_or_default().to_string();
+        let _ = Command::new(omar_bin())
+            .args(["down", "-s", &id, "--force", "--timeout", "5"])
+            .env("HOME", &self.home)
+            .output();
+        let _ = Command::new("tmux")
+            .args(["-L", self.tmux_server(), "kill-server"])
+            .output();
+    }
+}
+
+impl TestSession {
+    fn tmux_server(&self) -> &str {
+        self.record["tmux_server"].as_str().expect("tmux server")
+    }
+}
+
+thread_local! {
+    static SESSION: RefCell<Option<TestSession>> = const { RefCell::new(None) };
+}
+
+fn session_for(home: &Path) -> Value {
+    if let Some(record) = SESSION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|session| session.home == home)
+            .map(|session| session.record.clone())
+    }) {
+        return record;
+    }
+    let mut command = Command::new(omar_bin());
+    for key in [
+        "TMUX",
+        "TMUX_PANE",
+        "OMAR_SESSION_ID",
+        "OMAR_STATE_DIR",
+        "OMAR_TMUX_SERVER",
+        "OMAR_HOME",
+        "OMAR_EA_ID",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command
+        .args(["up", "--no-ea", "--json"])
+        .env("HOME", home)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run omar up");
+    assert!(
+        output.status.success(),
+        "omar up failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record: Value = serde_json::from_slice(&output.stdout).expect("session record");
+    SESSION.with(|cell| {
+        *cell.borrow_mut() = Some(TestSession {
+            home: home.to_path_buf(),
+            record: record.clone(),
+        })
+    });
+    record
+}
+
+/// The session's private state directory, where `~/.omar` used to be.
+fn omar_dir(home: &Path) -> PathBuf {
+    PathBuf::from(session_for(home)["directory"].as_str().expect("directory"))
+}
+
+fn test_tmux_server() -> String {
+    SESSION
+        .with(|cell| cell.borrow().as_ref().map(|s| s.tmux_server().to_string()))
+        .unwrap_or_else(|| {
+            FALLBACK_TMUX_SERVER
+                .get_or_init(|| format!("omar-test-{}", Uuid::new_v4()))
+                .clone()
+        })
 }
 
 fn tmux_command() -> Command {
     let mut cmd = Command::new("tmux");
-    cmd.args(["-L", test_tmux_server()]);
+    cmd.args(["-L", &test_tmux_server()]);
+    cmd
+}
+
+/// A command that runs outside any session: internal commands such as
+/// `mcp-server --context-file`, which carry their own context.
+fn omar_internal(home: &Path) -> Command {
+    session_for(home);
+    let mut cmd = Command::new(omar_bin());
+    for key in [
+        "TMUX",
+        "TMUX_PANE",
+        "OMAR_SESSION_ID",
+        "OMAR_STATE_DIR",
+        "OMAR_TMUX_SERVER",
+        "OMAR_HOME",
+        "OMAR_EA_ID",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd.env("HOME", home);
     cmd
 }
 
 fn omar_command(home: &Path) -> Command {
+    let session = session_for(home);
     let mut cmd = Command::new(omar_bin());
-    cmd.arg("--legacy");
-    cmd.env("HOME", home)
-        .env("OMAR_TMUX_SERVER", test_tmux_server());
+    for key in [
+        "TMUX",
+        "TMUX_PANE",
+        "OMAR_SESSION_ID",
+        "OMAR_STATE_DIR",
+        "OMAR_TMUX_SERVER",
+        "OMAR_HOME",
+        "OMAR_EA_ID",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd.args(["-s", session["id"].as_str().expect("session id")])
+        .env("HOME", home);
     cmd
 }
 
@@ -122,13 +238,15 @@ impl McpCliServer {
     fn start(home: &Path, default_command: &str) -> Self {
         bootstrap_cli_home(home);
 
+        let session = session_for(home);
         let context = json!({
-            "omar_dir": home.join(".omar"),
+            "omar_dir": omar_dir(home),
             "ea_id": 0,
             "session_prefix": "omar-agent-",
             "default_command": default_command,
             "default_workdir": env!("CARGO_MANIFEST_DIR"),
             "health_idle_warning": 15,
+            "tmux_server": session["tmux_server"],
         });
         let context_path = home.join("mcp-context.json");
         fs::write(
@@ -137,7 +255,9 @@ impl McpCliServer {
         )
         .expect("write MCP context");
 
-        let mut child = omar_command(home)
+        // An internal command: it takes everything from the context file, not
+        // from a session selector.
+        let mut child = omar_internal(home)
             .args([
                 "mcp-server",
                 "--context-file",
@@ -741,7 +861,7 @@ fn test_mcp_delete_ea_refuses_attached_session() {
     let created = server.tool_call("create_ea", json!({ "name": "attached-ea" }));
     let ea_id = created["id"].as_u64().expect("created EA id") as u32;
 
-    let ea_dir = home.path().join(format!(".omar/ea/{}", ea_id));
+    let ea_dir = omar_dir(home.path()).join(format!("ea/{}", ea_id));
     std::fs::create_dir_all(&ea_dir).expect("ea state dir");
     std::fs::write(ea_dir.join("sentinel.txt"), b"keep").expect("state sentinel");
 
@@ -995,7 +1115,7 @@ fn test_omar_event_cli_roundtrip() {
 /// without exercising `add_project`.
 /// Format: one numbered line `N. Project name`; IDs are not renumbered.
 fn register_project(home: &Path, project_name: &str) -> usize {
-    let tasks_md = home.join(".omar/ea/0/tasks.md");
+    let tasks_md = omar_dir(home).join("ea/0/tasks.md");
     fs::create_dir_all(tasks_md.parent().expect("tasks.md parent")).expect("mk ea dir");
     let existing = fs::read_to_string(&tasks_md).unwrap_or_default();
     let next_id = existing
@@ -1153,7 +1273,7 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
         listed
     );
 
-    let worker_tasks_path = home.path().join(".omar/ea/0/worker_tasks.json");
+    let worker_tasks_path = omar_dir(home.path()).join("ea/0/worker_tasks.json");
     let worker_tasks = fs::read_to_string(&worker_tasks_path).expect("worker_tasks.json");
     assert!(
         worker_tasks.contains(&format!("\"omar-agent-0-{}\": \"watch sleep demo\"", name)),
@@ -1161,7 +1281,7 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
         worker_tasks
     );
 
-    let agent_projects_path = home.path().join(".omar/ea/0/agent_projects.json");
+    let agent_projects_path = omar_dir(home.path()).join("ea/0/agent_projects.json");
     let agent_projects = fs::read_to_string(&agent_projects_path).expect("agent_projects.json");
     assert!(
         agent_projects.contains(&format!("\"omar-agent-0-{}\": {}", name, project_id)),
@@ -1169,7 +1289,7 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
         agent_projects
     );
 
-    let task_registry_path = home.path().join(".omar/ea/0/task_registry.json");
+    let task_registry_path = omar_dir(home.path()).join("ea/0/task_registry.json");
     assert!(
         !task_registry_path.exists(),
         "task_registry.json should not be created"
@@ -1249,7 +1369,7 @@ fn test_spawn_agent_task_is_durable_and_visible_via_cli() {
     assert_eq!(content["assignment"], "echo tracked-task-test");
     assert_eq!(durable["status"], "running");
 
-    let worker_tasks = fs::read_to_string(home.path().join(".omar/ea/0/worker_tasks.json"))
+    let worker_tasks = fs::read_to_string(omar_dir(home.path()).join("ea/0/worker_tasks.json"))
         .expect("worker_tasks.json");
     assert!(
         worker_tasks.contains("echo tracked-task-test"),
@@ -1257,7 +1377,7 @@ fn test_spawn_agent_task_is_durable_and_visible_via_cli() {
         worker_tasks
     );
 
-    let task_registry_path = home.path().join(".omar/ea/0/task_registry.json");
+    let task_registry_path = omar_dir(home.path()).join("ea/0/task_registry.json");
     assert!(
         !task_registry_path.exists(),
         "task_registry.json should not be created"
@@ -1339,7 +1459,7 @@ fn test_spawn_agent_requires_explicit_parent_when_project_has_pm() {
     );
     assert_eq!(spawned["agent_name"].as_str(), Some(worker_name.as_str()));
 
-    let parents_path = home.path().join(".omar/ea/0/agent_parents.json");
+    let parents_path = omar_dir(home.path()).join("ea/0/agent_parents.json");
     let parents: Value =
         serde_json::from_str(&fs::read_to_string(&parents_path).expect("agent_parents.json"))
             .expect("parse agent_parents.json");
@@ -1804,14 +1924,13 @@ fn test_manager_notes_shell_write_persists_across_ea_restart() {
     let home = tempfile::tempdir().expect("temp home");
     let session_prefix = format!("omar-notes-{}-", Uuid::new_v4());
 
-    // Bootstrap so ~/.omar/{config.toml, prompts/} are populated.
-    bootstrap_cli_home(home.path());
-
     // Override default_command so `omar manager start` runs a tame shell
     // instead of invoking a real backend (which isn't installed in CI). The
     // shell stays alive long enough for us to drive it with `tmux send-keys`.
-    let omar_dir = home.path().join(".omar");
-    let config_path = omar_dir.join("config.toml");
+    // Written before the session exists: `up` takes it as the template.
+    let template = home.path().join(".omar");
+    fs::create_dir_all(&template).expect("template dir");
+    let config_path = template.join("config.toml");
     fs::write(
         &config_path,
         format!(
@@ -1825,6 +1944,8 @@ default_command = "exec bash"
         ),
     )
     .expect("write test config.toml");
+    bootstrap_cli_home(home.path());
+    let omar_dir = omar_dir(home.path());
 
     // EA 0's manager session under the test tmux server.
     let manager_session = format!("{session_prefix}ea-0");

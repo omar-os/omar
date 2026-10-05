@@ -32,24 +32,23 @@ if [ "${PI_E2E_LIVE:-0}" = "1" ] && [ ! -s "$auth_source" ] && [ -z "${OPENAI_AP
 fi
 
 test_root="$(mktemp -d)"
-server="omar-pi-tree-${RANDOM}-$$"
+server=""
+session_id=""
 export HOME="$test_root/home"
-export OMAR_DIR="$HOME/.omar"
-export OMAR_EA_ID=0
-export OMAR_TMUX_SERVER="$server"
 export OMAR_BINARY="$OMAR_BIN"
-unset OMAR_MCP_CONTEXT_FILE
+unset OMAR_MCP_CONTEXT_FILE OMAR_DIR OMAR_EA_ID OMAR_TMUX_SERVER OMAR_SESSION_ID OMAR_STATE_DIR OMAR_HOME TMUX TMUX_PANE
 export PI_CODING_AGENT_DIR="$HOME/.pi/agent"
 export PI_CODING_AGENT_SESSION_DIR="$HOME/.pi/agent/sessions"
 export PATH="$HOME/bin:$PATH"
 
 cleanup() {
-  tmux -L "$server" kill-server >/dev/null 2>&1 || true
+  [ -n "$session_id" ] && "$OMAR_BIN" down -s "$session_id" --force --timeout 5 >/dev/null 2>&1 || true
+  [ -n "$server" ] && tmux -L "$server" kill-server >/dev/null 2>&1 || true
   rm -rf "$test_root"
 }
 trap cleanup EXIT
 
-mkdir -p "$HOME/bin" "$PI_CODING_AGENT_DIR" "$PI_CODING_AGENT_SESSION_DIR" "$OMAR_DIR"
+mkdir -p "$HOME/bin" "$PI_CODING_AGENT_DIR" "$PI_CODING_AGENT_SESSION_DIR" "$HOME/.omar"
 if [ "${PI_E2E_LIVE:-0}" = "1" ] && [ -s "$auth_source" ]; then
   cp "$auth_source" "$PI_CODING_AGENT_DIR/auth.json"
 fi
@@ -86,8 +85,15 @@ if [ "${PI_E2E_LIVE:-0}" != "1" ]; then
 fi
 pi --version
 
-# Initialize EA-scoped state, then use the same MCP protocol the extension uses.
-"$OMAR_BIN" --legacy list >/dev/null 2>&1 || true
+# A runtime session owns the EA-scoped state and the tmux server; the MCP
+# protocol below is the one the extension uses, pointed at that session.
+session_json="$(cd "$test_root" && "$OMAR_BIN" up --no-ea --name pi-tree --json)"
+session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$session_json")"
+server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
+export OMAR_DIR="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["directory"])' <<<"$session_json")"
+export OMAR_STATE_DIR="$OMAR_DIR"
+export OMAR_EA_ID=0
+export OMAR_TMUX_SERVER="$server"
 
 mcp_call() {
   local tool="$1" args="$2"

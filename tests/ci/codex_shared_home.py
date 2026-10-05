@@ -98,37 +98,49 @@ trust_level="trusted"
     # the trust prompt does not guarantee its input handler is ready yet.
     (codex_home/'config.toml').write_text(config)
     (work/'.git').mkdir()
-    server = 'omar-shared-home-'+str(os.getpid())
-    env = dict(os.environ, HOME=str(home), CODEX_HOME=str(codex_home), OMAR_TMUX_SERVER=server)
-    env.pop('TMUX', None)
+    env = dict(os.environ, HOME=str(home), CODEX_HOME=str(codex_home))
+    for key in ('TMUX', 'TMUX_PANE', 'OMAR_TMUX_SERVER', 'OMAR_SESSION_ID', 'OMAR_STATE_DIR', 'OMAR_HOME', 'OMAR_DIR', 'OMAR_EA_ID'):
+        env.pop(key, None)
+    # One runtime session holds every EA here; it owns the tmux server, the
+    # shared Codex runtime sockets, and the HTTP endpoint Mission Control uses.
+    session = {}
+    server = None
     # The tool runner disables colors; this fixture explicitly tests RGB UI.
     env.pop('NO_COLOR', None)
     clients = []
-    daemon = None
     def tmux(*args, check=True):
         return subprocess.run(['tmux', '-L', server, *args], env=env, capture_output=True, text=True, check=check).stdout
     def pane(name):
         return tmux('capture-pane', '-p', '-t', name)
+    def omar(*args, **kwargs):
+        return subprocess.run([OMAR, '-s', session['id'], *args], cwd=work, env=env, capture_output=True, text=True, **kwargs)
     try:
-        for index in [1, 2]:
-            if index == 2:
+        for index in [0, 1]:
+            if index == 1:
                 tmux('set-option', '-gw', 'window-style', 'fg=#abcdef,bg=#112233')
                 tmux('set-environment', '-g', 'CODEX_HOME', str(work/'stale-home'))
                 tmux('set-environment', '-g', 'NO_COLOR', '1')
-            if index == 1:
-                # Exercise the real cold dashboard exec inside a PTY. It must
-                # reuse the already allocated EA rather than allocate twice.
-                command = shlex.join(['env', '-u', 'TMUX', OMAR, '--legacy', '-a', 'codex'])
+            if index == 0:
+                # The runtime launches EA 0; the dashboard then attaches inside
+                # a PTY, which must join that EA rather than allocate another.
+                session = json.loads(subprocess.run([OMAR, '-a', 'codex', 'up', '--name', 'shared', '--json'], cwd=work, env=env,
+                                                    capture_output=True, text=True, timeout=120, check=True).stdout)
+                server = session['tmux_server']
+                state = Path(session['directory'])
+                command = shlex.join(['env', '-u', 'TMUX', OMAR, 'attach', '-s', session['id'], '--tui'])
                 tmux('new-session', '-d', '-s', 'cold-launch', '-x', '110', '-y', '35', '-c', str(work), command)
                 until(lambda: 'omar-dashboard' in tmux('list-sessions'), 'cold dashboard')
             else:
-                # Non-TTY attach can fail after the new manager starts.
-                subprocess.run([OMAR, "--legacy", '-a', 'codex'], cwd=work, env=env, capture_output=True, text=True, timeout=30)
-            session = 'omar-agent-ea-'+str(index)
-            paths = until(lambda: list((home/'.omar/codex-runtime').glob('*/app.sock')), 'socket')
-            start = tmux('display-message', '-p', '-t', session, '#{pane_start_command}')
-            endpoint = next(p for p in paths if str(p) in start)
-            assert tmux('show-environment', '-t', session, 'OMAR_DELIVERY').strip() == 'OMAR_DELIVERY=codex:'+str(endpoint)
+                # A second EA, started without a TTY.
+                assert omar('ea', 'create', '--name', '1', '--agent', 'codex', timeout=30).returncode == 0
+                assert omar('--ea', '1', 'manager', 'start', timeout=120).returncode == 0
+            tmux_session = 'omar-agent-ea-'+str(index)
+            def stamped():
+                stamp = tmux('show-environment', '-t', tmux_session, 'OMAR_DELIVERY', check=False).strip()
+                return Path(stamp.split('codex:', 1)[1]) if stamp.startswith('OMAR_DELIVERY=codex:') else None
+            endpoint = until(lambda: (lambda p: p if p and p.exists() else None)(stamped()), 'socket')
+            start = tmux('display-message', '-p', '-t', tmux_session, '#{pane_start_command}')
+            assert str(endpoint) in start, (endpoint, start)
             rpc = Rpc(endpoint)
             clients.append(rpc)
             ids = until(lambda: rpc.call('thread/loaded/list', {}).get('data'), 'TUI thread')
@@ -137,19 +149,19 @@ trust_level="trusted"
             status = until(lambda: rpc.call('mcpServerStatus/list', {'threadId': thread}).get('data'), 'MCP tools')
             omar_status = next(s for s in status if s['name'] == 'omar')
             assert omar_status.get('tools'), omar_status
-            assert str(index) == json.loads((home/'.omar/eas.json').read_text())[-1]['name']
+            assert {0: 'Default', 1: '1'}[index] == json.loads((state/'eas.json').read_text())[-1]['name']
             assert 'export CODEX_HOME=' not in start, start
-            assert str(work) == tmux('display-message', '-p', '-t', session, '#{pane_current_path}').strip()
-            if index == 1:
-                until(lambda: any(dot in pane(session) for dot in '⠁⠂⠄⠈⠐⠠⡀⢀'), 'Astra composer starfield', seconds=8)
+            assert str(work) == tmux('display-message', '-p', '-t', tmux_session, '#{pane_current_path}').strip()
+            if index == 0:
+                until(lambda: any(dot in pane(tmux_session) for dot in '⠁⠂⠄⠈⠐⠠⡀⢀'), 'Astra composer starfield', seconds=8)
                 print('PASS: Astra starfield renders in the detached OMAR pane', flush=True)
-                first_thread, first_session, first_rpc = thread, session, rpc
+                first_thread, first_session, first_rpc = thread, tmux_session, rpc
             else:
                 assert thread != first_thread
-                assert tmux('display-message', '-p', '-t', session, '#{window-style}').strip() == 'fg=#abcdef,bg=#112233'
+                assert tmux('display-message', '-p', '-t', tmux_session, '#{window-style}').strip() == 'fg=#abcdef,bg=#112233'
                 tmux('set-option', '-gw', 'window-style', 'default')
-                assert tmux('show-environment', '-t', session, 'CODEX_HOME').strip() == 'CODEX_HOME='+str(codex_home)
-                until(lambda: any(dot in pane(session) for dot in '⠁⠂⠄⠈⠐⠠⡀⢀'), 'starfield despite stale server NO_COLOR', seconds=8)
+                assert tmux('show-environment', '-t', tmux_session, 'CODEX_HOME').strip() == 'CODEX_HOME='+str(codex_home)
+                until(lambda: any(dot in pane(tmux_session) for dot in '⠁⠂⠄⠈⠐⠠⡀⢀'), 'starfield despite stale server NO_COLOR', seconds=8)
                 tmux('set-environment', '-g', 'CODEX_HOME', str(codex_home))
                 tmux('set-environment', '-gu', 'NO_COLOR')
         print('PASS: real OMAR launches two EAs with distinct sockets, working MCP, shared history home, and correct cwd', flush=True)
@@ -162,6 +174,10 @@ trust_level="trusted"
         assert 'EVENT_SENTINEL' in json.dumps(requests), requests
         assert clients[1].call('thread/loaded/list', {})['data'] != [first_thread]
         print('PASS: event wakes the right agent without submitting its draft', flush=True)
+        # The attached dashboard restarts a missing EA at once; detach it first
+        # so the restart below is the one this test asks for.
+        tmux('kill-session', '-t', 'cold-launch', check=False)
+        tmux('kill-session', '-t', 'omar-dashboard', check=False)
         # Kill the entire original pane; a normal Codex invocation must resume
         # the stored conversation without an OMAR home or server.
         tmux('kill-session', '-t', first_session)
@@ -169,16 +185,18 @@ trust_level="trusted"
         tmux('new-session', '-d', '-s', 'plain-resume', '-x', '110', '-y', '35', '-c', str(work), command)
         until(lambda: 'PROBE_ACK' in pane('plain-resume'), 'ordinary Codex resume')
         assert 'No saved chat' not in pane('plain-resume')
-        assert not (home/'.omar/codex').exists()
+        assert not (state/'codex').exists()
         print('PASS: ordinary codex resume restores the OMAR conversation after its pane exits', flush=True)
         tmux('kill-session', '-t', 'plain-resume')
         tmux('set-option', '-g', 'remain-on-exit', 'on')
-        resume_config = work/'resume.toml'
-        resume_config.write_text('[agent]\ndefault_command="codex resume '+first_thread+'"\n')
-        result = subprocess.run([OMAR, "--legacy", '-c', str(resume_config), '--ea', '1', 'manager', 'start'], cwd=work, env=env, capture_output=True, text=True, timeout=30)
+        # The EA's assistant-command override is what a start launches.
+        (state/'ea/0/assistant-command').write_text('codex resume '+first_thread)
+        result = omar('--ea', '0', 'manager', 'start', timeout=120)
         assert result.returncode == 0, result.stderr
         start = tmux('display-message', '-p', '-t', first_session, '#{pane_start_command}')
-        endpoint = next(p for p in (home/'.omar/codex-runtime').glob('*/app.sock') if str(p) in start)
+        stamp = tmux('show-environment', '-t', first_session, 'OMAR_DELIVERY').strip()
+        endpoint = Path(stamp.split('codex:', 1)[1])
+        assert str(endpoint) in start, (endpoint, start)
         resumed = Rpc(endpoint)
         clients.append(resumed)
         ids = until(lambda: resumed.call('thread/loaded/list', {}).get('data'), 'OMAR resume thread')
@@ -190,24 +208,21 @@ trust_level="trusted"
         until(lambda: len(requests) > before, 'resumed event request')
         assert 'RESUMED_EVENT_SENTINEL' in json.dumps(requests[-1])
         print('PASS: resume inside OMAR preserves the thread and restores MCP plus event delivery', flush=True)
-        second_pane = tmux('display-message', '-p', '-t', 'omar-agent-ea-2', '#{pane_id}')
-        with socket.socket() as port_socket:
-            port_socket.bind(('127.0.0.1', 0))
-            port = port_socket.getsockname()[1]
-        daemon_log = open(work/'serve.log', 'w')
-        daemon = subprocess.Popen([OMAR, "--legacy", '-a', 'codex', '--ea', 'ServeTrial', 'serve', '--address', f'127.0.0.1:{port}'], cwd=work, env=env, stdout=daemon_log, stderr=daemon_log)
-        until(lambda: len(json.loads((home/'.omar/eas.json').read_text())) == 3, 'serve allocates new EA')
-        registry = json.loads((home/'.omar/eas.json').read_text())
-        assert registry[-1]['id'] == 3 and registry[-1]['name'] == 'ServeTrial', registry
-        served = 'omar-agent-ea-3'
+        second_pane = tmux('display-message', '-p', '-t', 'omar-agent-ea-1', '#{pane_id}')
+        port = int(session['url'].rsplit(':', 1)[1])
+        assert omar('ea', 'create', '--name', 'ServeTrial', '--agent', 'codex', timeout=30).returncode == 0
+        assert omar('--ea', 'ServeTrial', 'manager', 'start', timeout=120).returncode == 0
+        registry = json.loads((state/'eas.json').read_text())
+        assert len(registry) == 3 and registry[-1]['id'] == 2 and registry[-1]['name'] == 'ServeTrial', registry
+        served = 'omar-agent-ea-2'
         until(lambda: 'Ask Codex' in tmux('capture-pane', '-p', '-t', served, check=False), 'served EA composer')
         tmux('send-keys', '-t', served, '-l', 'SERVE_UNSENT_DRAFT')
         until(lambda: 'SERVE_UNSENT_DRAFT' in pane(served), 'served draft')
-        subprocess.run([OMAR, "--legacy", '--ea', '3', 'event', 'schedule', '--receiver', 'ea', '--payload', 'LIVE_SCHEDULER_SENTINEL', '--in-seconds', '0'], cwd=work, env=env, check=True, capture_output=True, text=True)
+        assert omar('--ea', 'ServeTrial', 'event', 'schedule', '--receiver', 'ea', '--payload', 'LIVE_SCHEDULER_SENTINEL', '--in-seconds', '0', timeout=30).returncode == 0
         until(lambda: 'LIVE_SCHEDULER_SENTINEL' in json.dumps(requests), 'real scheduler event')
         assert 'SERVE_UNSENT_DRAFT' in pane(served), pane(served)
-        assert tmux('display-message', '-p', '-t', 'omar-agent-ea-2', '#{pane_id}') == second_pane
-        print('PASS: serve creates a named EA and the real scheduler delivers through its socket without consuming the draft', flush=True)
+        assert tmux('display-message', '-p', '-t', 'omar-agent-ea-1', '#{pane_id}') == second_pane
+        print('PASS: a named EA joins the session and the real scheduler delivers through its socket without consuming the draft', flush=True)
         # Exercise Mission Control through the same shared delivery path used by
         # initial tasks and MCP follow-ups, while a native-terminal draft exists.
         import urllib.request
@@ -226,8 +241,8 @@ trust_level="trusted"
             {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
                 'name': 'send_input', 'arguments': {'name': served, 'text': 'MCP_FOLLOWUP_SENTINEL', 'enter': True}}},
         ]
-        mcp = subprocess.run([OMAR, "--legacy", '--ea', '3', 'mcp-server'], cwd=work,
-                             env=dict(env, OMAR_EA_ID='3', OMAR_DIR=str(home/'.omar')),
+        mcp = subprocess.run([OMAR, 'mcp-server'], cwd=work,
+                             env=dict(env, OMAR_EA_ID='2', OMAR_DIR=str(state), OMAR_TMUX_SERVER=server),
                              input=''.join(json.dumps(m)+'\n' for m in mcp_messages),
                              capture_output=True, text=True, timeout=30, check=True)
         replies = [json.loads(line) for line in mcp.stdout.splitlines()]
@@ -248,27 +263,22 @@ trust_level="trusted"
 
 
     except Exception:
-        if (work/'serve.log').exists():
-            print('serve log:', (work/'serve.log').read_text()[-2000:])
-        for path in (home/'.omar/codex-runtime').glob('*/server.log'):
+        if session:
+            print('runtime log:', (Path(session['directory'])/'logs/runtime.log').read_text()[-2000:])
+        for path in (Path(session['directory'])/'codex-runtime').glob('*/server.log') if session else []:
             print(path, path.read_text()[-2000:])
         print(tmux('list-sessions', check=False))
-        print('palette:', tmux('show-options', '-w', '-t', 'omar-agent-ea-1', 'window-style', check=False))
-        print('color env:', tmux('show-environment', '-t', 'omar-agent-ea-1', 'COLORTERM', check=False))
-        for name in ['omar-agent-ea-1', 'omar-agent-ea-2', 'omar-agent-ea-3', 'plain-resume']:
+        print('palette:', tmux('show-options', '-w', '-t', 'omar-agent-ea-0', 'window-style', check=False))
+        print('color env:', tmux('show-environment', '-t', 'omar-agent-ea-0', 'COLORTERM', check=False))
+        for name in ['omar-agent-ea-0', 'omar-agent-ea-1', 'omar-agent-ea-2', 'plain-resume']:
             print(name, tmux('capture-pane', '-p', '-t', name, check=False))
         raise
     finally:
-        if daemon:
-            daemon.terminate()
-            try:
-                daemon.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                daemon.kill()
-                daemon.wait()
-            daemon_log.close()
         for rpc in clients:
             rpc.close()
-        tmux('kill-server', check=False)
+        if session:
+            subprocess.run([OMAR, 'down', '-s', session['id'], '--force', '--timeout', '5'], env=env, capture_output=True)
+        if server:
+            tmux('kill-server', check=False)
         http.shutdown()
         http.server_close()

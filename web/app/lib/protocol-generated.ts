@@ -119,5 +119,13 @@ export type Conversation = { id: string, title: string, ea_id: number | null, cr
 
 export type ConversationSummary = { id: string, title: string, created_at: number, updated_at: number, message_count: number, ea_id: number | null, busy: boolean, run: RunRecord | null, };
 
-export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number, finished_at: number | null, error: string | null, };
+export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number, finished_at: number | null, error: string | null, 
+/**
+ * Output ports a finished run ended with.
+ */
+outputs?: Record<string, unknown>, 
+/**
+ * State variables a finished run ended with.
+ */
+state?: Record<string, unknown>, };
 

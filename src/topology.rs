@@ -1784,6 +1784,13 @@ pub enum RunEnd {
     Stopped,
 }
 
+/// How a run ended, with the output ports and state variables it ended with.
+pub struct RunOutcome {
+    pub end: RunEnd,
+    pub outputs: BTreeMap<String, Value>,
+    pub state: BTreeMap<String, Value>,
+}
+
 /// Advance the shared record and persist it, as one step.
 fn advance_record(
     record: &Arc<Mutex<deploy::DeploymentRecord>>,
@@ -1840,7 +1847,7 @@ fn fail_deployment(
     let _ = deploy::clear_stop(dir);
 }
 
-pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunEnd> {
+pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunOutcome> {
     let state = verify(bytecode)?;
     let runtime_dir = deploy::dir_for(config.omar_dir, config.ea_id, &state.team);
     fs::create_dir_all(&runtime_dir)?;
@@ -2139,16 +2146,20 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
     } else {
         println!("Topology '{}' completed", state.team);
     }
-    for (port, value) in outputs {
+    for (port, value) in &outputs {
         println!("Output {port} = {value}");
     }
-    for (name, value) in state_vars {
+    for (name, value) in &state_vars {
         println!("State {name} = {value}");
     }
-    Ok(if stopped {
-        RunEnd::Stopped
-    } else {
-        RunEnd::Completed
+    Ok(RunOutcome {
+        end: if stopped {
+            RunEnd::Stopped
+        } else {
+            RunEnd::Completed
+        },
+        outputs,
+        state: state_vars,
     })
 }
 
