@@ -42,8 +42,11 @@ import {
   fetchPanel,
   fetchRun,
   checkProgram,
+  fetchCheckpoints,
   pauseRun,
   resumeRun,
+  rollbackRun,
+  type CheckpointSummary,
   startRun,
   stopRun,
   subscribeToDiagram,
@@ -171,6 +174,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [design, setDesign] = useState<ProposedDesign | null>(null);
   const [run, setRun] = useState<RunRecord | null>(null);
   const [error, setError] = useState("");
+  // A paused run's checkpoints, and the one a resume would continue from.
+  const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>([]);
+  const [resumePoint, setResumePoint] = useState<string | null>(null);
+  const [rollbackTarget, setRollbackTarget] = useState("");
   const [prompt, setPrompt] = useState("");
   /** Diagram components the operator has highlighted for the next message. */
   const [selection, setSelection] = useState<string[]>([]);
@@ -750,6 +757,21 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     }
   }
 
+  /** Move the resume point of a paused run back to an older checkpoint. */
+  async function requestRollback() {
+    if (!run || run.status !== "paused" || !rollbackTarget || rollbackTarget === resumePoint) return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const point = await rollbackRun(serveUrl, run.run_id, rollbackTarget);
+      if (scope !== scopeRef.current) return;
+      setResumePoint(point);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
   /** Continue a paused run: the daemon restores its files and agents, then the panel watches it again. */
   async function requestResume() {
     if (!run || run.status !== "paused") return;
@@ -871,6 +893,22 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const isStopping = run?.status === "stopping";
   const isPausing = run?.status === "pausing";
   const isPaused = run?.status === "paused";
+
+  // What a paused run can roll back to, refreshed whenever it pauses or the
+  // resume point moves.
+  useEffect(() => {
+    if (!isPaused || !run) return;
+    const scope = scopeRef.current;
+    const runId = run.run_id;
+    void fetchCheckpoints(serveUrl, runId)
+      .then((listing) => {
+        if (scope !== scopeRef.current) return;
+        setCheckpoints(listing.checkpoints);
+        setResumePoint(listing.resume_point);
+        setRollbackTarget(listing.resume_point ?? "");
+      })
+      .catch(() => {});
+  }, [isPaused, run, serveUrl, resumePoint]);
 
   // Widths are clamped against the workspace so the diagram always keeps a
   // usable column, whichever divider is being dragged. Below a panel's minimum
@@ -1116,12 +1154,36 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                   </button>
                 </span>
               ) : null}
+              {isPaused && run && checkpoints.length > 0 ? (
+                <span role="group" aria-label="Roll back">
+                  <select
+                    aria-label="Checkpoint"
+                    value={rollbackTarget}
+                    onChange={(e) => setRollbackTarget(e.target.value)}
+                  >
+                    {checkpoints.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {`#${c.sequence} ${c.trigger} · after ${c.completed_tag ? `${c.completed_tag[0] / 1e9}s` : "start"}${c.id === resumePoint ? " · resume point" : ""}`}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className="secondary-button"
+                    onClick={() => void requestRollback()}
+                    type="button"
+                    disabled={!rollbackTarget || rollbackTarget === resumePoint}
+                    title="Moves the resume point to this checkpoint; nothing is deleted and external effects are not undone"
+                  >
+                    Roll back
+                  </button>
+                </span>
+              ) : null}
               {isPaused && run ? (
                 <button
                   className="primary-button"
                   onClick={() => void requestResume()}
                   type="button"
-                  title="Restores the checkpointed files and agents, then continues the queue"
+                  title="Restores the resume point's files and agents, then continues the queue"
                 >
                   Resume
                 </button>

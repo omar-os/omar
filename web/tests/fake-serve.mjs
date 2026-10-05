@@ -95,6 +95,39 @@ export async function startFakeServe({
       return json(response, 202, entry.record);
     }
     if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/checkpoints")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/checkpoints".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      entry.checkpoints ??= [
+        { id: "cp-1", sequence: 1, parent: null, trigger: "manual", completed_tag: [1_000_000_000, 0], next_tag: [2_000_000_000, 0], created_at: 1 },
+        { id: "cp-2", sequence: 2, parent: "cp-1", trigger: "pause", completed_tag: [2_000_000_000, 0], next_tag: [3_000_000_000, 0], created_at: 2 },
+      ];
+      entry.resumePoint ??= "cp-2";
+      return json(response, 200, { checkpoints: entry.checkpoints, resume_point: entry.resumePoint, unreadable: [] });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/rollback")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/rollback".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      if (entry.record.status !== "paused") {
+        return json(response, 409, { error: `run is ${entry.record.status}; only a paused run can roll back` });
+      }
+      const body = JSON.parse(await readBody(request));
+      const target = (entry.checkpoints ?? []).find((c) => c.id === body.checkpoint);
+      if (!target) return json(response, 409, { error: `no checkpoint '${body.checkpoint}'` });
+      const abandoned = entry.resumePoint;
+      entry.resumePoint = target.id;
+      return json(response, 200, { resume_point: target.id, abandoned, checkpoint: target });
+    }
+    if (
       request.method === "POST" &&
       url.pathname.startsWith("/v1/runs/") &&
       url.pathname.endsWith("/resume")

@@ -51,15 +51,17 @@ If capture fails, the run holds at the boundary: previous checkpoint stands,
 Resume reads the program path recorded at launch for generated code; pass
 `--program` if it moved.
 
-Daemon: `POST /v1/runs/<id>/pause` and `POST /v1/runs/<id>/resume`; the run
-keeps its id and comes back `running` with a new diagram address. Mission
-Control shows Pause while a run is live and Resume once it is paused; the
-live diagram reports `paused`. A resumed daemon run uses the default timeout
-and real-time pace.
+Daemon: `POST /v1/runs/<id>/pause`, `POST /v1/runs/<id>/resume` (the run
+keeps its id and comes back `running` with a new diagram address),
+`GET /v1/runs/<id>/checkpoints`, and `POST /v1/runs/<id>/rollback
+{"checkpoint": ID}` for a paused run. Mission Control shows Pause while a
+run is live; once paused, a checkpoint picker with Roll back, and Resume.
+The live diagram reports `paused`. A resumed daemon run uses the default
+timeout and real-time pace.
 
 Not in this PR: checkpoint import into another session, input journalling
-while paused, format migration, pruning, checkpoint controls in Mission
-Control beyond pause/resume.
+while paused, format migration, pruning, manual capture or period changes
+from Mission Control.
 
 Validation: `python3 tests/ci/team_checkpoints.py` (CI) runs a real-time
 timer topology with a Rust body and a stub agent: automatic and manual

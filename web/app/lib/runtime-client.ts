@@ -322,6 +322,56 @@ export async function stopRun(
   return assertRunRecord(await response.json());
 }
 
+/** One runtime checkpoint of a run, as the daemon lists it. */
+export interface CheckpointSummary {
+  id: string;
+  sequence: number;
+  parent: string | null;
+  trigger: "automatic" | "manual" | "pause";
+  completed_tag: [number, number] | null;
+  next_tag: [number, number] | null;
+  created_at: number;
+}
+
+export interface CheckpointListing {
+  checkpoints: CheckpointSummary[];
+  resume_point: string | null;
+}
+
+/** A run's checkpoints, oldest first, and which one a resume continues from. */
+export async function fetchCheckpoints(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<CheckpointListing> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/checkpoints`, { signal });
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { checkpoints?: unknown; resume_point?: unknown };
+  if (!Array.isArray(body.checkpoints)) throw new Error("checkpoint listing is not a list");
+  return {
+    checkpoints: body.checkpoints as CheckpointSummary[],
+    resume_point: typeof body.resume_point === "string" ? body.resume_point : null,
+  };
+}
+
+/** Move a paused run's resume point to an older checkpoint; nothing is deleted. */
+export async function rollbackRun(
+  serveUrl: string,
+  runId: string,
+  checkpoint: string,
+  signal?: AbortSignal,
+): Promise<CheckpointListing["resume_point"]> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/rollback`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ checkpoint }), signal },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { resume_point?: unknown };
+  return typeof body.resume_point === "string" ? body.resume_point : null;
+}
+
 /** Ask a run to checkpoint at its next tag boundary and park; answers `pausing`. */
 export async function pauseRun(
   serveUrl: string,

@@ -1075,6 +1075,24 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         }
         // Before the run-record route, which would otherwise take the suffix
         // for part of the id.
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/checkpoints") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/checkpoints")
+                .to_string();
+            list_checkpoints(&context, &id)
+        }
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/rollback") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/rollback")
+                .to_string();
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "body too large"}))
+            } else {
+                rollback_run(&context, &id, &read_body(content_length)?)
+            }
+        }
         ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/pause") => {
             let id = rest
                 .trim_start_matches("/v1/runs/")
@@ -2445,6 +2463,99 @@ fn pause_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     }
 }
 
+/// One checkpoint as Mission Control lists it.
+fn checkpoint_summary(manifest: &crate::checkpoint::Manifest) -> Value {
+    json!({
+        "id": manifest.id,
+        "sequence": manifest.sequence,
+        "parent": manifest.parent,
+        "trigger": manifest.trigger,
+        "completed_tag": manifest.completed_tag,
+        "next_tag": manifest.next_tag,
+        "created_at": manifest.created_at,
+    })
+}
+
+/// A run's checkpoints, oldest first, and which one a resume continues from.
+fn list_checkpoints(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let team = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) => record.team.clone(),
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let store = crate::checkpoint::Store::new(&crate::deploy::dir_for(
+        &context.omar_dir,
+        context.ea_id,
+        &team,
+    ));
+    let (manifests, problems) = match store.list() {
+        Ok(listed) => listed,
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    let resume_point = match store.resume_point() {
+        Ok(point) => point.map(|m| m.id),
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    (
+        200,
+        json!({
+            "checkpoints": manifests.iter().map(checkpoint_summary).collect::<Vec<_>>(),
+            "resume_point": resume_point,
+            "unreadable": problems,
+        }),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct RollbackRequest {
+    checkpoint: String,
+}
+
+/// Move a paused run's resume point to an older checkpoint. Nothing is
+/// deleted; the next resume continues from there with that checkpoint's
+/// files restored into new workspaces.
+fn rollback_run(context: &Arc<Context_>, id: &str, body: &[u8]) -> (u16, Value) {
+    let request: RollbackRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    let team = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) if record.status == RunStatus::Paused => record.team.clone(),
+            Some(record) => {
+                return (
+                    409,
+                    json!({"error": format!("run is {}; only a paused run can roll back", crate::diagram::wire_name(&record.status).unwrap_or_default())}),
+                )
+            }
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let store = crate::checkpoint::Store::new(&crate::deploy::dir_for(
+        &context.omar_dir,
+        context.ea_id,
+        &team,
+    ));
+    let manifest = match store.verify(&context.omar_dir, &request.checkpoint) {
+        Ok(manifest) => manifest,
+        Err(error) => return (409, json!({"error": format!("{error:#}")})),
+    };
+    match store.set_head(&manifest.id) {
+        Ok(head) => (
+            200,
+            json!({
+                "resume_point": head.checkpoint_id,
+                "abandoned": head.abandoned,
+                "checkpoint": checkpoint_summary(&manifest),
+            }),
+        ),
+        Err(error) => (500, json!({"error": format!("{error:#}")})),
+    }
+}
+
 /// Continue a paused run from its resume point, in this daemon, under the
 /// same run id. The program it was admitted with is still staged beside the
 /// run, so generated code lands where the original run put it.
@@ -3220,6 +3331,112 @@ while True:
         assert!(response.contains(" 409 "), "{response}");
         assert!(response.contains("no longer staged"), "{response}");
         assert!(request(address, "POST", "/v1/runs/nobody/resume", Some("{}")).contains(" 404 "));
+    }
+
+    /// Mission Control lists a run's checkpoints and moves a paused run's
+    /// resume point; the store underneath is the one `omar rollback` uses.
+    #[test]
+    fn checkpoints_are_listed_and_a_paused_run_rolls_back() {
+        let server = test_server();
+        let address = server.address();
+        let team = "Cadence";
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: team.to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                },
+            );
+        }
+        let dir = crate::deploy::dir_for(&server.context.omar_dir, 0, team);
+        std::fs::create_dir_all(&dir).expect("deployment dir");
+        let response = request(address, "GET", "/v1/runs/run-1/checkpoints", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"checkpoints\":[]"),
+            "{response}"
+        );
+
+        // Two checkpoints with no file versions to verify, published the way
+        // the runtime publishes them.
+        let store = crate::checkpoint::Store::new(&dir);
+        let program = json!({"version": 1, "team": team, "instructions": [
+            {"op": "begin_plan", "team": team},
+            {"op": "define_port", "kind": "input", "name": "tick", "type": "int"},
+            {"op": "commit_plan"}]});
+        let mut ids = Vec::new();
+        for sequence in 1..=2u64 {
+            let state = crate::checkpoint::ExecutionState {
+                version: crate::checkpoint::FORMAT,
+                completed_tag: Some((sequence, 0)),
+                queue: Vec::new(),
+                outputs: BTreeMap::new(),
+                state_vars: BTreeMap::new(),
+                elapsed_ns: sequence,
+            };
+            let manifest = crate::checkpoint::Manifest {
+                version: crate::checkpoint::FORMAT,
+                id: Uuid::new_v4().to_string(),
+                sequence,
+                parent: ids.last().cloned(),
+                deployment_id: "d".into(),
+                team: team.into(),
+                ea_id: 0,
+                created_at: sequence,
+                completed_tag: state.completed_tag,
+                next_tag: None,
+                trigger: crate::checkpoint::Trigger::Manual,
+                policy: crate::checkpoint::Policy::default(),
+                pace: "fast".into(),
+                program_sha256: crate::checkpoint::sha256(&serde_json::to_vec(&program).unwrap()),
+                program_path: None,
+                state_sha256: crate::checkpoint::sha256(
+                    &serde_json::to_vec_pretty(&state).unwrap(),
+                ),
+                elapsed_ns: state.elapsed_ns,
+                workspaces: BTreeMap::new(),
+                agents: BTreeMap::new(),
+            };
+            store.publish(&manifest, &state, &program).expect("publish");
+            ids.push(manifest.id);
+        }
+        let response = request(address, "GET", "/v1/runs/run-1/checkpoints", None);
+        assert!(
+            response.contains(&format!("\"resume_point\":\"{}\"", ids[1])),
+            "{response}"
+        );
+
+        // Only a paused run rolls back.
+        let body = format!("{{\"checkpoint\":\"{}\"}}", ids[0]);
+        let response = request(address, "POST", "/v1/runs/run-1/rollback", Some(&body));
+        assert!(
+            response.contains(" 409 ") && response.contains("only a paused run"),
+            "{response}"
+        );
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.get_mut("run-1").expect("run").status = RunStatus::Paused;
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/rollback", Some(&body));
+        assert!(response.contains(" 200 "), "{response}");
+        assert!(
+            response.contains(&format!("\"abandoned\":\"{}\"", ids[1])),
+            "{response}"
+        );
+        assert_eq!(store.resume_point().unwrap().unwrap().id, ids[0]);
+        let response = request(
+            address,
+            "POST",
+            "/v1/runs/run-1/rollback",
+            Some("{\"checkpoint\":\"nope\"}"),
+        );
+        assert!(response.contains(" 409 "), "{response}");
     }
 
     #[test]
