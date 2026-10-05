@@ -742,7 +742,7 @@ test("a run can be paused and resumed from the panel that shows it", async ({ pa
   await picker.selectOption("cp-1");
   await expect(rollback).toBeEnabled();
   await rollback.click();
-  await expect(picker.locator("option[value=cp-1]")).toHaveText(/resume point/);
+  await expect(picker.locator("option[value=cp-1]")).toHaveText(/✓/);
   await expect(rollback).toBeDisabled();
 
   await resume.click();

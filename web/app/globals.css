@@ -293,7 +293,18 @@ button {
 .workflow-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
+}
+
+/* A paused run's checkpoint picker shares the row with Roll back and
+   Resume; capped so a long list cannot push the heading out of view. */
+.workflow-actions select {
+  height: 30px;
+  max-width: 13rem;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
 }
 
 .workflow-actions span[role="group"] {

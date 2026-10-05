@@ -1158,12 +1158,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                 <span role="group" aria-label="Roll back">
                   <select
                     aria-label="Checkpoint"
+                    title="Checkpoints, oldest first; ✓ marks the resume point"
                     value={rollbackTarget}
                     onChange={(e) => setRollbackTarget(e.target.value)}
                   >
                     {checkpoints.map((c) => (
                       <option key={c.id} value={c.id}>
-                        {`#${c.sequence} ${c.trigger} · after ${c.completed_tag ? `${c.completed_tag[0] / 1e9}s` : "start"}${c.id === resumePoint ? " · resume point" : ""}`}
+                        {`#${c.sequence} ${c.trigger} · ${c.completed_tag ? `${c.completed_tag[0] / 1e9}s` : "start"}${c.id === resumePoint ? " ✓" : ""}`}
                       </option>
                     ))}
                   </select>
