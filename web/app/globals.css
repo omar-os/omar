@@ -551,6 +551,9 @@ h2 {
 
 .diagram-heading {
   justify-content: space-between;
+  /* A paused run's picker and buttons can outgrow a narrow pane; they drop
+     to a second row rather than pushing the name and stats out of view. */
+  flex-wrap: wrap;
   border-bottom-color: #d8d7d3;
   background: rgba(246, 246, 244, 0.94);
   color: #242326;
