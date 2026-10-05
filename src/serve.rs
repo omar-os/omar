@@ -94,6 +94,10 @@ pub struct RunRecord {
     pub started_at: u64,
     pub finished_at: Option<u64>,
     pub error: Option<String>,
+    /// Input ports the run was admitted with, so its timeline can be
+    /// projected again later from the same starting point.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub present: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1075,6 +1079,13 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         }
         // Before the run-record route, which would otherwise take the suffix
         // for part of the id.
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/timeline") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/timeline")
+                .to_string();
+            run_timeline(&context, &id)
+        }
         ("GET", rest) if rest.starts_with("/v1/runs/") && rest.contains("/checkpoints/") => {
             let rest = rest.trim_start_matches("/v1/runs/");
             let (id, checkpoint) = rest.split_once("/checkpoints/").unwrap_or((rest, ""));
@@ -2035,6 +2046,12 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         }
     }
 
+    // The verified bytecode beside the source: a later timeline projection
+    // or resume reads it back without a compiler.
+    let _ = fs::write(
+        run_dir.join("program.json"),
+        serde_json::to_vec(&bytecode).unwrap_or_default(),
+    );
     let record = RunRecord {
         run_id: run_id.clone(),
         team: state.team.clone(),
@@ -2043,6 +2060,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         started_at: now_unix(),
         finished_at: None,
         error: None,
+        present: request.inputs.keys().cloned().collect(),
     };
     context
         .runs
@@ -2513,6 +2531,43 @@ fn list_checkpoints(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     )
 }
 
+/// The logical timeline of a run the daemon admitted, projected from the
+/// bytecode staged with it and the inputs it started with. The same strip
+/// the editor draws for a draft, available to a client that reloaded or
+/// never saw the draft.
+fn run_timeline(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let present: std::collections::BTreeSet<String> = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) => record.present.iter().cloned().collect(),
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let staged = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id)
+        .join("program.json");
+    let bytecode = match fs::read(&staged)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| serde_json::from_slice::<topology::Bytecode>(&bytes).map_err(Into::into))
+    {
+        Ok(bytecode) => bytecode,
+        Err(error) => {
+            return (
+                409,
+                json!({"error": format!("the run's program is no longer staged: {error:#}")}),
+            )
+        }
+    };
+    match topology::verify(&bytecode) {
+        Ok(state) => {
+            let (steps, truncated) = topology::timeline(&state, &present, MAX_TIMELINE_STEPS);
+            (200, json!({"steps": steps, "truncated": truncated}))
+        }
+        Err(error) => (409, json!({"error": format!("{error:#}")})),
+    }
+}
+
 /// What a checkpoint holds, for the timeline's preview: where the run was,
 /// what it had produced, what was still queued, and which file version each
 /// instance was at.
@@ -2854,6 +2909,7 @@ mod tests {
             started_at: 0,
             finished_at: None,
             error: None,
+            present: Vec::new(),
         }
     }
 
@@ -3330,6 +3386,7 @@ while True:
                     started_at: 0,
                     finished_at: None,
                     error: None,
+                    present: Vec::new(),
                 },
             );
         }
@@ -3395,6 +3452,7 @@ while True:
                     started_at: 0,
                     finished_at: None,
                     error: None,
+                    present: Vec::new(),
                 },
             );
         }
@@ -3471,6 +3529,32 @@ while True:
         );
         assert!(request(address, "GET", "/v1/runs/run-1/checkpoints/nope", None).contains(" 404 "));
 
+        // The run's own timeline, from the bytecode staged beside its program.
+        let response = request(address, "GET", "/v1/runs/run-1/timeline", None);
+        assert!(
+            response.contains(" 409 ") && response.contains("no longer staged"),
+            "{response}"
+        );
+        let staged = crate::ea::ea_state_dir(0, &server.context.omar_dir)
+            .join("serve")
+            .join("run-1");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(
+            staged.join("program.json"),
+            serde_json::to_vec(&program).unwrap(),
+        )
+        .unwrap();
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.get_mut("run-1").expect("run").present = vec!["tick".to_string()];
+        }
+        let response = request(address, "GET", "/v1/runs/run-1/timeline", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"steps\":[{"),
+            "{response}"
+        );
+        assert!(response.contains("\"truncated\":false"), "{response}");
+
         // Only a paused run rolls back.
         let body = format!("{{\"checkpoint\":\"{}\"}}", ids[0]);
         let response = request(address, "POST", "/v1/runs/run-1/rollback", Some(&body));
@@ -3517,6 +3601,7 @@ while True:
                     started_at: 0,
                     finished_at: None,
                     error: None,
+                    present: Vec::new(),
                 },
             );
         }

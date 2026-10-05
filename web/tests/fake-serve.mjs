@@ -107,6 +107,23 @@ export async function startFakeServe({
     if (
       request.method === "GET" &&
       url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/timeline")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/timeline".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      // The same strip the check route projects for a draft.
+      const steps = entry.snapshot.reactions.map((reaction, index) => ({
+        timestamp: 0,
+        microstep: index,
+        events: [],
+        reactions: [reaction.id],
+      }));
+      return json(response, 200, { steps, truncated: false });
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
       url.pathname.includes("/checkpoints/")
     ) {
       const [id, checkpoint] = url.pathname.slice("/v1/runs/".length).split("/checkpoints/");

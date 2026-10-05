@@ -44,6 +44,7 @@ import {
   checkProgram,
   fetchCheckpoint,
   fetchCheckpoints,
+  fetchRunTimeline,
   pauseRun,
   resumeRun,
   rollbackRun,
@@ -924,6 +925,22 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       })
       .catch(() => {});
   }, [runId, serveUrl, checkpointEpoch]);
+
+  // A run observed without a draft behind it (admitted over the API, or the
+  // page reloaded) still gets its timeline: the daemon projects it from the
+  // program it staged, so checkpoints have tags to sit on.
+  const stepsMissing = steps.length === 0;
+  useEffect(() => {
+    if (!runId || !stepsMissing) return;
+    const scope = scopeRef.current;
+    void fetchRunTimeline(serveUrl, runId)
+      .then((projection) => {
+        if (scope !== scopeRef.current || projection.steps.length === 0) return;
+        setSteps(projection.steps);
+        setTruncated(projection.truncated);
+      })
+      .catch(() => {});
+  }, [runId, serveUrl, stepsMissing]);
 
   // The preview of the checkpoint picked on the timeline. Shown only while
   // it matches the pick, so a stale detail never describes another one.

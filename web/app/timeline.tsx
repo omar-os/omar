@@ -73,16 +73,30 @@ export function Timeline({
   const last = steps.length - 1;
 
   // Where each checkpoint sits on the strip: the step whose tag it completed.
-  // One taken before any tag ran sits at the start.
-  const placed = checkpoints.map((checkpoint) => {
-    const at = checkpoint.completed_tag
-      ? steps.findIndex(
-          (s) =>
-            s.timestamp === checkpoint.completed_tag![0] &&
-            s.microstep === checkpoint.completed_tag![1],
-        )
+  // One taken before any tag ran sits at the start. A tag the projection does
+  // not list (it stopped early, or there is none) is placed by its timestamp
+  // against the furthest tag known, so the mark still lands in order.
+  const furthest = Math.max(
+    1,
+    ...steps.map((s) => s.timestamp),
+    ...checkpoints.map((c) => c.completed_tag?.[0] ?? 0),
+  );
+  const placed = checkpoints.map((checkpoint, order) => {
+    const tag = checkpoint.completed_tag;
+    const at = tag
+      ? steps.findIndex((s) => s.timestamp === tag[0] && s.microstep === tag[1])
       : -1;
-    return { checkpoint, at };
+    const fraction =
+      at >= 0 && last > 0
+        ? at / last
+        : tag
+          ? Math.min(1, tag[0] / furthest)
+          : 0;
+    // Two marks on one spot would hide each other; nudge the later one.
+    const nudged = checkpoints
+      .slice(0, order)
+      .some((c) => (c.completed_tag?.[0] ?? 0) === (tag?.[0] ?? 0));
+    return { checkpoint, at, fraction: nudged ? Math.min(1, fraction + 0.015) : fraction };
   });
   const tagLabel = (tag: [number, number] | null) =>
     tag ? `${formatDuration(tag[0])}:${tag[1]}` : "start";
@@ -110,10 +124,7 @@ export function Timeline({
           />
           {/* Checkpoint marks, on the rail at the tag each one completed. */}
           <div className="timeline-marks" aria-label="Checkpoints">
-            {placed
-              .filter(({ at }) => at >= 0 || steps.length === 0)
-              .map(({ checkpoint, at }) => {
-                const fraction = last > 0 ? Math.max(0, at) / last : 0;
+            {placed.map(({ checkpoint, at, fraction }) => {
                 const isResume = checkpoint.id === resumePoint;
                 const isSelected = checkpoint.id === selected;
                 return (

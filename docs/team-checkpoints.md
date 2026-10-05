@@ -62,6 +62,8 @@ Rollback lives on the timeline: each checkpoint is a green mark at the tag it
 completed (the diagram stream announces `run_checkpointed` as they land);
 clicking one scrubs to that tag and opens a preview of what it holds; a
 paused run commits with "Roll back to this checkpoint" from that preview.
+`GET /v1/runs/<id>/timeline` projects a run's strip from its staged bytecode
+and admitted inputs, so it exists without a draft behind it.
 The live diagram reports `paused`. A resumed daemon run uses the default
 timeout and real-time pace.
 

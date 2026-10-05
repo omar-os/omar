@@ -355,6 +355,22 @@ export async function fetchCheckpoints(
   };
 }
 
+/** The logical timeline of a run the daemon admitted, projected from its program and inputs. */
+export async function fetchRunTimeline(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<{ steps: TimelineStep[]; truncated: boolean }> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/timeline`, { signal });
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { steps?: unknown; truncated?: unknown };
+  return {
+    steps: Array.isArray(body.steps) ? (body.steps as TimelineStep[]) : [],
+    truncated: body.truncated === true,
+  };
+}
+
 /** One checkpoint in full: what the run had done, what was queued, and each instance's file version. */
 export interface CheckpointDetail extends CheckpointSummary {
   is_resume_point: boolean;
