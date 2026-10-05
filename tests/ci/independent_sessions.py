@@ -35,8 +35,8 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         assert (result.returncode == 0) == ok, (args, result.stdout, result.stderr)
         return result.stdout if ok else result.stderr
 
-    def up(name, context=None):
-        result = json.loads(cli("up", "--name", name, "--no-ea", "--json", context=context))
+    def up(name, context=None, checkpoint=False):
+        result = json.loads(cli("up", "--name", name, "--no-ea", "--json", *(["--checkpoint"] if checkpoint else []), context=context))
         sessions.append(result)
         assert result["state"] == "ready"
         assert hashlib.sha256(Path(result["executable"]).read_bytes()).hexdigest() == result["build_id"]
@@ -113,6 +113,11 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         assert sorted(p.returncode == 0 for p in results) == [False, True]
         sessions.append(json.loads(next(p.stdout for p in results if p.returncode == 0)))
         cli("down", "-s", "race")
+        # Without --checkpoint a stopped session is gone, like a tmux session.
+        assert "race" not in {s["name"] for s in json.loads(cli("ls", "--json"))}
+        kept = up("kept", checkpoint=True)
+        cli("down", "-s", "kept")
+        assert info("kept")["session"]["state"] == "stopped" and Path(kept["directory"]).is_dir()
         # Foreground serve honours --json for its startup record.
         foreground = subprocess.Popen([str(BIN), "--json", "serve", "--name", "fg", "--no-ea"], cwd=root, env=env,
                                       text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -166,7 +171,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         assert summary.returncode == 0 and "Topology 'OnceRun' completed" in summary.stdout and "Output once.done = 1" in summary.stdout, summary
         created = re.search(r"Started session \S+ \((s-[0-9a-f]+)\)", summary.stderr)
         assert created, summary.stderr
-        assert info(created.group(1))["session"]["state"] == "stopped", "run --wait left its own session running"
+        assert created.group(1) not in {s["id"] for s in json.loads(cli("ls", "--json"))}, "run --wait left its own session behind"
         run_a = json.loads(cli("--session", "outer", "start", str(program)))["run_id"]
         run_b = json.loads(cli("--session", "inner", "start", str(program)))["run_id"]
         wait_status("outer", run_a, "running")
@@ -215,11 +220,12 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             os.close(master)
         record = Path(env["OMAR_HOME"]) / "registry" / f"{inner['id']}.json"
         deadline = time.monotonic() + 20
-        while json.loads(record.read_text())["state"] != "stopped":
+        # A session without a checkpoint removes its record as it stops.
+        while record.exists() and json.loads(record.read_text())["state"] != "stopped":
             assert time.monotonic() < deadline, record.read_text()
             time.sleep(.2)
         wait_status("outer", run_a, "running")
-        assert info("inner")["session"]["state"] == "stopped"
+        assert "inner" not in {s["name"] for s in json.loads(cli("ls", "--json"))}
         cli("--session", "outer", "stop", run_a)
         wait_status("outer", run_a, "stopped")
         assert info("outer")["session"]["state"] == "ready"

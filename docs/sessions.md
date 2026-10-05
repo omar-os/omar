@@ -8,9 +8,9 @@ session. TUI/browser clients can disconnect without stopping any workload.
 
 | Command | Behavior |
 | --- | --- |
-| `omar up [--name NAME] [--web] [--tui]` | Create a new session; return after readiness; `--web` opens Mission Control, `--tui` attaches the terminal dashboard |
+| `omar up [--name NAME] [--web] [--tui] [--checkpoint]` | Create a new session; return after readiness; `--web` opens Mission Control, `--tui` attaches the terminal dashboard; `--checkpoint` keeps its state after it stops |
 | `omar up --workdir PATH --no-ea` | Start without launching an assistant |
-| `omar ls [--json]` | List sessions, health, URL, and exact executable build |
+| `omar ls [--json]` | List sessions, health, URL, and exact executable build; a stopped session appears only if it was started with `--checkpoint` |
 | `omar info -s SESSION` | Inspect session, EAs, agents, and runs |
 | `omar logs -s SESSION [--follow] [--tail N]` | Read runtime log |
 | `omar attach -s SESSION --tui [--ea EA]` | Terminal dashboard as a client of that session, inside its tmux server; z detaches, Q stops the session |
@@ -46,9 +46,13 @@ uses `--config`/`-a`, the shared configuration template, or defaults; it never
 copies the parent's private state. `--ea` is for existing-session commands.
 
 `down` is shutdown, not resumable pause. A timeout leaves shutdown pending; it
-never silently escalates to force. Use `info`/`logs`, or explicitly force. State
-and logs remain on disk after shutdown, but restarting running topologies from
-checkpoints belongs to a later milestone. A stale/unreachable record is never
+never silently escalates to force. Use `info`/`logs`, or explicitly force. A
+session started without `--checkpoint` leaves nothing behind once it stops, like
+a tmux session; `ls` no longer lists it. With `--checkpoint` its state directory
+and record stay, `ls` shows it `stopped`, and `info`/`logs` still work, like a
+stopped Docker container. Restarting from that state belongs to a later
+milestone. A session whose startup failed keeps its directory either way, so
+its log explains why. A stale/unreachable record is never
 permission to signal a PID: control must verify the session's incarnation.
 
 ## Storage and build ownership

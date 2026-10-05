@@ -208,7 +208,7 @@ run_case() {
 
   printf '\n[%s] running with local agents\n' "$name"
   if run_with_timeout "$case_timeout" "$log" "$name" \
-    "$omar" run "$source" --wait --replace \
+    "$omar" run "$source" --wait --checkpoint --replace \
     --timeout-seconds "$invocation_timeout" "$@"; then
     case_passed=$((case_passed + 1))
   else

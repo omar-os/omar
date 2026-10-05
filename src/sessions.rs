@@ -44,6 +44,11 @@ pub struct UpOptions {
     /// Attach the terminal dashboard once the runtime is ready
     #[arg(long)]
     pub tui: bool,
+    /// Keep the session's state after it stops, so `ls` still lists it and
+    /// its logs, chats and workspaces can be inspected. Without this a
+    /// stopped session leaves nothing behind.
+    #[arg(long)]
+    pub checkpoint: bool,
 }
 impl Default for UpOptions {
     fn default() -> Self {
@@ -55,6 +60,7 @@ impl Default for UpOptions {
             startup_timeout: 60,
             web: false,
             tui: false,
+            checkpoint: false,
         }
     }
 }
@@ -72,6 +78,9 @@ pub struct StartOptions {
     /// Wait for completion; disconnecting this client never stops the run.
     #[arg(long)]
     pub wait: bool,
+    /// When this run creates a session, keep its state after it stops
+    #[arg(long)]
+    pub checkpoint: bool,
 }
 #[derive(Subcommand, Debug)]
 pub enum EaAction {
@@ -105,6 +114,9 @@ struct Launch {
     session: Session,
     address: SocketAddr,
     no_ea: bool,
+    /// Keep the state directory and registry record after shutdown.
+    #[serde(default)]
+    checkpoint: bool,
     /// Foreground startup prints the session record in the requested mode.
     #[serde(default)]
     json: bool,
@@ -193,7 +205,13 @@ pub fn discover() -> Result<Vec<Session>> {
         if path.extension().is_none_or(|s| s != "json") {
             continue;
         }
-        let mut session: Session = serde_json::from_slice(&fs::read(&path)?)
+        // A session without a checkpoint removes its record as it stops.
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut session: Session = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid session record {}", path.display()))?;
         if matches!(session.state.as_str(), "ready" | "stopping" | "starting") {
             match rpc(&session, json!({"op":"hello"}), Duration::from_millis(500)) {
@@ -613,6 +631,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
             session: session.clone(),
             address: options.address,
             no_ea: options.no_ea,
+            checkpoint: options.checkpoint,
             json: foreground && cli.json,
         },
     )?;
@@ -1051,14 +1070,27 @@ async fn daemon(directory: &Path) -> Result<()> {
     let mut session = session.lock().unwrap();
     session.state = "stopped".into();
     publish(&session)?;
+    if !launch.checkpoint {
+        // Like a tmux session: once it is over, nothing is left to list.
+        let _ = fs::remove_file(registry().join(format!("{}.json", session.id)));
+        let _ = fs::remove_dir_all(directory);
+    }
     Ok(())
 }
 /// The registry record once the daemon has published `stopped`.
 fn wait_stopped(session: &Session, timeout: Duration) -> Result<Session> {
     let deadline = Instant::now() + timeout;
     loop {
-        let saved: Session =
-            serde_json::from_slice(&fs::read(registry().join(format!("{}.json", session.id)))?)?;
+        let saved: Session = match fs::read(registry().join(format!("{}.json", session.id))) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            // Gone: a session without a checkpoint removed itself on shutdown.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut gone = session.clone();
+                gone.state = "stopped".into();
+                return Ok(gone);
+            }
+            Err(error) => return Err(error.into()),
+        };
         if saved.state == "stopped" {
             return Ok(saved);
         }
@@ -1129,10 +1161,10 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         return Some(attach_dashboard().await);
     }
     let result = match &cli.command {
-        Some(Commands::Serve { name, address, no_ea, ui }) => {
+        Some(Commands::Serve { name, address, no_ea, ui, checkpoint }) => {
             // The runtime serves Mission Control whenever the build has it; `--ui` insists on it.
             if *ui && !crate::web_assets::is_bundled() { return Some(Err(anyhow::anyhow!("{}", crate::web_assets::MISSING))); }
-            launch(cli, UpOptions { name: name.clone(), address: address.unwrap_or_else(|| UpOptions::default().address), no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
+            launch(cli, UpOptions { name: name.clone(), address: address.unwrap_or_else(|| UpOptions::default().address), no_ea: *no_ea, checkpoint: *checkpoint, ..UpOptions::default() }, true).map(|_| ())
         },
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
         None => Err(anyhow::anyhow!("a command is required; see omar --help")),
@@ -1184,7 +1216,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
                     (s, false)
                 }
                 Err(_) if cli.session.is_none() && std::env::var_os("OMAR_SESSION_ID").is_none() => {
-                    let s = launch(cli, UpOptions { no_ea: true, ..UpOptions::default() }, false)?;
+                    let s = launch(cli, UpOptions { no_ea: true, checkpoint: options.checkpoint, ..UpOptions::default() }, false)?;
                     if !cli.json { eprintln!("Started session {} ({}); omar down -s {} stops it", s.name, s.id, s.id); }
                     (s, true)
                 }

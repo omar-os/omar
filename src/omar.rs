@@ -299,6 +299,9 @@ enum Commands {
         /// Insist on the bundled Mission Control, served from this same address
         #[arg(long)]
         ui: bool,
+        /// Keep the session's state after it stops
+        #[arg(long)]
+        checkpoint: bool,
     },
 }
 

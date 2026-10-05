@@ -144,7 +144,8 @@ Shutdown the test project and its agents.
 | [Pi](https://pi.dev) | `omar -a pi up` |
 
 Each `omar -a <backend> up` starts a new independent session with EA 0.
-Add `--name dev` to name it, `--tui` or `--web` to attach at once. Add another EA inside it
+Add `--name dev` to name it, `--tui` or `--web` to attach at once, and
+`--checkpoint` to keep its state after `omar down` (otherwise nothing is left). Add another EA inside it
 with `omar --session dev ea create --name Research --agent codex`.
 Target it with `omar --session dev --ea Research ...`; this does not change
 another client's selection.
