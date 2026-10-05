@@ -185,7 +185,22 @@ pub struct Launch<'a> {
     pub context: &'a McpLaunchContext,
 }
 
+/// A recognized startup dialog. Empty keys mean its options are still painting.
+pub struct StartupGate {
+    pub id: &'static str,
+    pub keys: &'static [&'static str],
+    pub confirms: bool,
+}
+
 pub trait Backend: Send + Sync {
+    /// Only freshly launched native TUIs may have their startup dialogs answered.
+    fn has_startup_gates(&self) -> bool {
+        false
+    }
+    fn startup_gate(&self, _screen: &str) -> Option<StartupGate> {
+        None
+    }
+
     fn kind(&self) -> Kind;
     /// Names an operator may type. The first is canonical.
     fn aliases(&self) -> &'static [&'static str];

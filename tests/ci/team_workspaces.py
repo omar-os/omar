@@ -29,7 +29,7 @@ def main():
         home, source, shims = root / "home", root / "source", root / "bin"
         for path in (home, source, shims):
             path.mkdir()
-        (source / "seed.txt").write_text("original source")
+        (source / "seed.txt").write_text("stays in the operator's directory")
         launches = root / "tmux.jsonl"
         sidecar = root / "sidecar.py"
         sidecar.write_text("import os, signal, time\nfrom pathlib import Path\n"
@@ -115,7 +115,8 @@ out = Some(cwd.display().to_string());
             paths = {name: root_state / "workspaces" / ws["id"] / "worktree" for name, ws in by_instance.items()}
             for path in paths.values():
                 assert (path / "artifact.bin").read_bytes() == b"\0\xff\r\n"
-                assert (path / "seed.txt").read_text() == "original source"
+                # A worktree starts empty: the operator's directory is not copied in.
+                assert sorted(p.name for p in path.iterdir()) == [".git", "artifact.bin"], list(path.iterdir())
             assert not (source / "artifact.bin").exists()
             heartbeats = {p: p.read_bytes() for tree in paths.values()
                           for p in (tree.parent / "temp").glob("sidecar-*")}

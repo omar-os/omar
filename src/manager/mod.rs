@@ -1140,6 +1140,8 @@ pub(crate) mod tests {
         assert!(cmd.contains("OPENCODE_CONFIG_CONTENT="));
         assert!(cmd.contains("\"mcp\""));
         assert!(cmd.contains("\"omar\""));
+        // opencode prefixes tools with the server name; the server must not.
+        assert!(cmd.contains("--bare-tool-names"));
         assert!(cmd.contains("\"doom_loop\":\"deny\""));
         assert!(cmd.contains("\"ScheduleWakeup\":false"));
         // Subagent-dispatcher overlap with OMAR's spawn_agent.

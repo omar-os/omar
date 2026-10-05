@@ -18,6 +18,8 @@ mod paths;
 mod process;
 mod projects;
 // The generator runs under `cargo test`; nothing in a release build calls it.
+mod artifacts;
+mod editor;
 #[cfg(test)]
 mod protocol;
 mod reaction;
@@ -265,6 +267,11 @@ enum Commands {
         /// aren't spawned by a specific backend launch.
         #[arg(long)]
         context_file: Option<String>,
+        /// List tools without their `omar_` prefix, for clients that prefix
+        /// every tool with the server name (opencode): their `omar_` then
+        /// rebuilds the names OMAR's prompts use, instead of `omar_omar_...`.
+        #[arg(long)]
+        bare_tool_names: bool,
     },
 
     /// Answer topology invocations without a model (test backend `stub`)
@@ -579,9 +586,12 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             format,
             event,
         }) => supervision::run_hook(&context_file, &format, event.as_deref()),
-        Some(Commands::McpServer { context_file }) => match context_file {
-            Some(path) => mcp::run_server_from_context_file(PathBuf::from(path)),
-            None => mcp::run_server_with_default_context(),
+        Some(Commands::McpServer {
+            context_file,
+            bare_tool_names,
+        }) => match context_file {
+            Some(path) => mcp::run_server_from_context_file(PathBuf::from(path), bare_tool_names),
+            None => mcp::run_server_with_default_context(bare_tool_names),
         },
         Some(Commands::HookDrain { format }) => {
             // Always print valid JSON, even on misconfiguration: a hook that
