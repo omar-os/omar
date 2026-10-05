@@ -92,11 +92,20 @@ export function Timeline({
         : tag
           ? Math.min(1, tag[0] / furthest)
           : 0;
-    // Two marks on one spot would hide each other; nudge the later one.
-    const nudged = checkpoints
-      .slice(0, order)
-      .some((c) => (c.completed_tag?.[0] ?? 0) === (tag?.[0] ?? 0));
-    return { checkpoint, at, fraction: nudged ? Math.min(1, fraction + 0.015) : fraction };
+    return { checkpoint, at, fraction, order };
+  });
+  // Marks closer than this fraction of the rail would cover each other, and a
+  // covered mark cannot be clicked; such a mark drops to the next row.
+  const spacing = 0.05;
+  const rows: number[][] = [];
+  const rowOf = placed.map(({ fraction }) => {
+    let row = rows.findIndex((taken) => taken.every((f) => Math.abs(f - fraction) >= spacing));
+    if (row < 0) {
+      row = rows.length;
+      rows.push([]);
+    }
+    rows[row].push(fraction);
+    return row;
   });
   const tagLabel = (tag: [number, number] | null) =>
     tag ? `${formatDuration(tag[0])}:${tag[1]}` : "start";
@@ -123,8 +132,12 @@ export function Timeline({
             onChange={(event) => onScrub(Number(event.target.value))}
           />
           {/* Checkpoint marks, on the rail at the tag each one completed. */}
-          <div className="timeline-marks" aria-label="Checkpoints">
-            {placed.map(({ checkpoint, at, fraction }) => {
+          <div
+            className="timeline-marks"
+            aria-label="Checkpoints"
+            style={{ height: `${Math.max(1, rows.length) * 12}px` }}
+          >
+            {placed.map(({ checkpoint, at, fraction, order }) => {
                 const isResume = checkpoint.id === resumePoint;
                 const isSelected = checkpoint.id === selected;
                 return (
@@ -136,7 +149,7 @@ export function Timeline({
                       (isResume ? " resume" : "") +
                       (isSelected ? " selected" : "")
                     }
-                    style={{ left: `${fraction * 100}%` }}
+                    style={{ left: `${fraction * 100}%`, top: `${rowOf[order] * 12}px` }}
                     aria-label={`Checkpoint #${checkpoint.sequence}`}
                     aria-pressed={isSelected}
                     title={`#${checkpoint.sequence} ${checkpoint.trigger} · after ${tagLabel(checkpoint.completed_tag)}${isResume ? " · resume point" : ""}`}
