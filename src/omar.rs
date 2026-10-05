@@ -289,8 +289,7 @@ enum Commands {
         #[arg(long)]
         no_ea: bool,
 
-        /// Open Mission Control in a browser. It is served from this same
-        /// address, so the page and the API share an origin.
+        /// Insist on the bundled Mission Control, served from this same address
         #[arg(long)]
         ui: bool,
     },
