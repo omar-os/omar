@@ -733,17 +733,23 @@ test("a run can be paused and resumed from the panel that shows it", async ({ pa
   await expect(resume).toBeVisible();
   await expect(actions.getByRole("button", { name: /Stop|Pause/ })).toHaveCount(0);
 
-  // A paused run can roll back to an older checkpoint before it resumes. The
-  // resume point is selected by default, so rolling back to it is nothing.
-  const picker = actions.getByLabel("Checkpoint");
-  await expect(picker).toHaveValue("cp-2");
-  const rollback = actions.getByRole("button", { name: "Roll back" });
-  await expect(rollback).toBeDisabled();
-  await picker.selectOption("cp-1");
+  // A paused run rolls back from the timeline: checkpoints are marks at the
+  // tags they completed, a mark opens a preview of what it holds, and the
+  // preview is where "continue from here" is committed.
+  await page.getByRole("button", { name: "▲ Timeline" }).click();
+  const timeline = page.getByLabel("Logical timeline");
+  await expect(timeline.getByLabel("Checkpoints").getByRole("button")).toHaveCount(2);
+  await timeline.getByRole("button", { name: "Checkpoint #1" }).click();
+  const preview = timeline.getByLabel("Checkpoint preview");
+  await expect(preview).toContainText("Checkpoint #1 · manual");
+  await expect(preview).toContainText("leader.round = 1");
+  const rollback = preview.getByRole("button", { name: "Roll back to this checkpoint" });
   await expect(rollback).toBeEnabled();
   await rollback.click();
-  await expect(picker.locator("option[value=cp-1]")).toHaveText(/✓/);
-  await expect(rollback).toBeDisabled();
+  // Committed: this checkpoint is now where a resume continues from, and
+  // the newer one is still listed — nothing was deleted.
+  await expect(preview).toContainText("A resume continues from here.");
+  await expect(timeline.getByLabel("Checkpoints").getByRole("button")).toHaveCount(2);
 
   await resume.click();
   // Back to a live run, with its controls.

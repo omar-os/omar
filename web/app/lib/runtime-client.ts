@@ -355,6 +355,33 @@ export async function fetchCheckpoints(
   };
 }
 
+/** One checkpoint in full: what the run had done, what was queued, and each instance's file version. */
+export interface CheckpointDetail extends CheckpointSummary {
+  is_resume_point: boolean;
+  outputs: Record<string, unknown>;
+  state_vars: Record<string, unknown>;
+  queue_len: number;
+  queued_tags: [number, number][];
+  elapsed_ns: number;
+  workspaces: Record<string, { workspace_id: string; snapshot_id: string; commit: string }>;
+  agents: Record<string, { backend: string; restoration: string }>;
+}
+
+export async function fetchCheckpoint(
+  serveUrl: string,
+  runId: string,
+  checkpoint: string,
+  signal?: AbortSignal,
+): Promise<CheckpointDetail> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/checkpoints/${encodeURIComponent(checkpoint)}`,
+    { signal },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  return (await response.json()) as CheckpointDetail;
+}
+
 /** Move a paused run's resume point to an older checkpoint; nothing is deleted. */
 export async function rollbackRun(
   serveUrl: string,
@@ -459,6 +486,7 @@ export function subscribeToDiagram(
     "run_completed",
     "run_failed",
     "run_paused",
+    "run_checkpointed",
   ];
   for (const kind of kinds) {
     stream.addEventListener(kind, (raw) => {

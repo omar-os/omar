@@ -42,10 +42,12 @@ import {
   fetchPanel,
   fetchRun,
   checkProgram,
+  fetchCheckpoint,
   fetchCheckpoints,
   pauseRun,
   resumeRun,
   rollbackRun,
+  type CheckpointDetail,
   type CheckpointSummary,
   startRun,
   stopRun,
@@ -174,10 +176,16 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [design, setDesign] = useState<ProposedDesign | null>(null);
   const [run, setRun] = useState<RunRecord | null>(null);
   const [error, setError] = useState("");
-  // A paused run's checkpoints, and the one a resume would continue from.
+  // The run's checkpoints, drawn on the timeline; the one a resume would
+  // continue from; and the one whose preview is open.
   const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>([]);
   const [resumePoint, setResumePoint] = useState<string | null>(null);
-  const [rollbackTarget, setRollbackTarget] = useState("");
+  // The pick is remembered with the run it was made in, so a new run starts
+  // with none without an effect having to clear it.
+  const [checkpointPick, setCheckpointPick] = useState<{ run: string; id: string } | null>(null);
+  const [checkpointDetail, setCheckpointDetail] = useState<CheckpointDetail | null>(null);
+  // Bumped whenever the run says a checkpoint landed, so the listing refetches.
+  const [checkpointEpoch, setCheckpointEpoch] = useState(0);
   const [prompt, setPrompt] = useState("");
   /** Diagram components the operator has highlighted for the next message. */
   const [selection, setSelection] = useState<string[]>([]);
@@ -491,6 +499,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             setPending([]);
             void settle();
           }
+          if (event.kind === "run_checkpointed" || event.kind === "run_paused") {
+            // A new mark for the timeline: refetch the listing it draws.
+            setCheckpointEpoch((n) => n + 1);
+          }
           if (event.kind === "run_paused") {
             // Checkpointed and parked at a tag boundary: the picture stays,
             // labelled paused, and nothing is owed until `omar resume`.
@@ -757,15 +769,16 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     }
   }
 
-  /** Move the resume point of a paused run back to an older checkpoint. */
-  async function requestRollback() {
-    if (!run || run.status !== "paused" || !rollbackTarget || rollbackTarget === resumePoint) return;
+  /** Move the resume point of a paused run back to the checkpoint picked on the timeline. */
+  async function requestRollback(checkpoint: string) {
+    if (!run || run.status !== "paused" || checkpoint === resumePoint) return;
     const scope = scopeRef.current;
     setError("");
     try {
-      const point = await rollbackRun(serveUrl, run.run_id, rollbackTarget);
+      const point = await rollbackRun(serveUrl, run.run_id, checkpoint);
       if (scope !== scopeRef.current) return;
       setResumePoint(point);
+      setCheckpointEpoch((n) => n + 1);
     } catch (cause) {
       if (scope !== scopeRef.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -894,29 +907,37 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const isPausing = run?.status === "pausing";
   const isPaused = run?.status === "paused";
 
-  // What a paused run can roll back to, refreshed when it pauses or the
-  // resume point moves. Keyed on the run's id, not the record object: every
-  // poll hands back a fresh record, and refetching on each one reset the
-  // operator's pick in the picker between choosing and clicking.
-  const pausedRunId = isPaused ? run?.run_id : undefined;
+  // The run's checkpoints, for the timeline. Keyed on the run's id rather
+  // than the record object, which every poll replaces; refetched when the
+  // run reports a new checkpoint, pauses, or rolls back.
+  const runId = run?.run_id;
+  const selectedCheckpoint =
+    checkpointPick && checkpointPick.run === runId ? checkpointPick.id : null;
   useEffect(() => {
-    if (!pausedRunId) return;
+    if (!runId) return;
     const scope = scopeRef.current;
-    void fetchCheckpoints(serveUrl, pausedRunId)
+    void fetchCheckpoints(serveUrl, runId)
       .then((listing) => {
         if (scope !== scopeRef.current) return;
         setCheckpoints(listing.checkpoints);
         setResumePoint(listing.resume_point);
-        // Keep a pick that is still on the list; otherwise start from the
-        // resume point, which is the one choice that changes nothing.
-        setRollbackTarget((current) =>
-          current && listing.checkpoints.some((c) => c.id === current)
-            ? current
-            : (listing.resume_point ?? ""),
-        );
       })
       .catch(() => {});
-  }, [pausedRunId, serveUrl, resumePoint]);
+  }, [runId, serveUrl, checkpointEpoch]);
+
+  // The preview of the checkpoint picked on the timeline. Shown only while
+  // it matches the pick, so a stale detail never describes another one.
+  useEffect(() => {
+    if (!runId || !selectedCheckpoint) return;
+    const scope = scopeRef.current;
+    void fetchCheckpoint(serveUrl, runId, selectedCheckpoint)
+      .then((detail) => {
+        if (scope === scopeRef.current) setCheckpointDetail(detail);
+      })
+      .catch(() => {});
+  }, [runId, serveUrl, selectedCheckpoint, checkpointEpoch]);
+  const shownDetail =
+    selectedCheckpoint && checkpointDetail?.id === selectedCheckpoint ? checkpointDetail : null;
 
   // Widths are clamped against the workspace so the diagram always keeps a
   // usable column, whichever divider is being dragged. Below a panel's minimum
@@ -1162,31 +1183,6 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                   </button>
                 </span>
               ) : null}
-              {isPaused && run && checkpoints.length > 0 ? (
-                <span role="group" aria-label="Roll back">
-                  <select
-                    aria-label="Checkpoint"
-                    title="Checkpoints, oldest first; ✓ marks the resume point"
-                    value={rollbackTarget}
-                    onChange={(e) => setRollbackTarget(e.target.value)}
-                  >
-                    {checkpoints.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {`#${c.sequence} ${c.trigger} · ${c.completed_tag ? `${c.completed_tag[0] / 1e9}s` : "start"}${c.id === resumePoint ? " ✓" : ""}`}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    className="secondary-button"
-                    onClick={() => void requestRollback()}
-                    type="button"
-                    disabled={!rollbackTarget || rollbackTarget === resumePoint}
-                    title="Moves the resume point to this checkpoint; nothing is deleted and external effects are not undone"
-                  >
-                    Roll back
-                  </button>
-                </span>
-              ) : null}
               {isPaused && run ? (
                 <button
                   className="primary-button"
@@ -1248,6 +1244,20 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               index={stepIndex}
               live={following && phase === "observing"}
               truncated={truncated}
+              checkpoints={runId ? checkpoints : []}
+              resumePoint={runId ? resumePoint : null}
+              selected={selectedCheckpoint}
+              detail={shownDetail}
+              canRollBack={isPaused}
+              rollBackHint={
+                run && !isPaused
+                  ? "Pause the run first; a rollback picks the tag a paused run continues from."
+                  : undefined
+              }
+              onSelectCheckpoint={(id) =>
+                setCheckpointPick(id && runId ? { run: runId, id } : null)
+              }
+              onRollBack={(id) => void requestRollback(id)}
               onScrub={(next) => {
                 // Scrubbing takes the strip off the run: the operator is
                 // looking at a tag, not at where execution has reached.

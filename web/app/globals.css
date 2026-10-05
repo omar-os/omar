@@ -293,18 +293,7 @@ button {
 .workflow-actions {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  justify-content: flex-end;
   gap: 6px;
-}
-
-/* A paused run's checkpoint picker shares the row with Roll back and
-   Resume; capped so a long list cannot push the heading out of view. */
-.workflow-actions select {
-  height: 30px;
-  max-width: 13rem;
-  font-size: 11.5px;
-  text-overflow: ellipsis;
 }
 
 .workflow-actions span[role="group"] {
@@ -551,9 +540,6 @@ h2 {
 
 .diagram-heading {
   justify-content: space-between;
-  /* A paused run's picker and buttons can outgrow a narrow pane; they drop
-     to a second row rather than pushing the name and stats out of view. */
-  flex-wrap: wrap;
   border-bottom-color: #d8d7d3;
   background: rgba(246, 246, 244, 0.94);
   color: #242326;
@@ -1688,6 +1674,130 @@ h2 {
   flex: 1;
   min-width: 0;
   accent-color: var(--purple);
+}
+
+/* The slider and, under it, a mark wherever a checkpoint was taken. */
+.timeline-rail {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.timeline-rail input[type="range"] {
+  width: 100%;
+}
+
+.timeline-marks {
+  position: relative;
+  height: 12px;
+  margin: 2px 8px 0;
+}
+
+.timeline-mark {
+  position: absolute;
+  top: 0;
+  width: 10px;
+  height: 10px;
+  margin-left: -5px;
+  padding: 0;
+  border: 1.5px solid #2f9e5f;
+  border-radius: 50%;
+  background: #4cc37a;
+  cursor: pointer;
+}
+
+.timeline-mark.resume {
+  box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 3.5px #4cc37a;
+}
+
+.timeline-mark.selected {
+  transform: scale(1.35);
+  background: #7ef0a6;
+}
+
+.timeline-checkpoints {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.timeline-checkpoint-chip {
+  border: 1px solid #2f9e5f;
+  border-radius: 999px;
+  background: transparent;
+  color: #7ef0a6;
+  font-size: 10.5px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+
+.timeline-checkpoint-chip.resume {
+  background: rgba(76, 195, 122, 0.18);
+}
+
+.timeline-checkpoint-chip.selected {
+  border-color: #7ef0a6;
+  color: #fff;
+}
+
+.timeline-preview {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #2f9e5f;
+  border-radius: 8px;
+  background: rgba(76, 195, 122, 0.06);
+  font-size: 11.5px;
+}
+
+.timeline-preview-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+  color: var(--text);
+}
+
+.timeline-preview-head span {
+  color: var(--muted);
+}
+
+.timeline-preview-body {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 12px;
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.timeline-preview-body dt {
+  color: var(--text);
+}
+
+.timeline-preview-body dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.timeline-preview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.timeline-preview-actions .primary-button {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 11.5px;
+}
+
+.timeline-preview-note {
+  color: var(--muted);
 }
 
 .timeline-close {

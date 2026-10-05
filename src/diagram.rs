@@ -79,6 +79,8 @@ pub enum DiagramEventKind {
     RunCompleted,
     RunFailed,
     RunPaused,
+    /// A checkpoint was published at the tag the event carries.
+    RunCheckpointed,
 }
 
 impl std::fmt::Display for DiagramEventKind {
@@ -382,6 +384,8 @@ pub trait TopologyObserver: Send + Sync {
     /// The run checkpointed and parked at a tag boundary; nothing more
     /// happens until a resume.
     fn run_paused(&self, _checkpoint: &str) {}
+    /// A checkpoint was published after `tag` completed; `trigger` says why.
+    fn checkpoint_published(&self, _checkpoint: &str, _trigger: &str, _tag: Option<(u64, u64)>) {}
 }
 
 pub struct NoopTopologyObserver;
@@ -571,6 +575,18 @@ impl TopologyObserver for DiagramPublisher {
             DiagramEventKind::RunPaused,
             DiagramStatus::Paused,
             json!({ "checkpoint": checkpoint }),
+        );
+    }
+
+    fn checkpoint_published(&self, checkpoint: &str, trigger: &str, tag: Option<(u64, u64)>) {
+        self.publish_with(
+            DiagramEventKind::RunCheckpointed,
+            tag.map(|(timestamp, microstep)| DiagramTag {
+                timestamp,
+                microstep,
+            }),
+            json!({ "checkpoint": checkpoint, "trigger": trigger }),
+            |_| {},
         );
     }
 }

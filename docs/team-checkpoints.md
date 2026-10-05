@@ -53,9 +53,15 @@ Resume reads the program path recorded at launch for generated code; pass
 
 Daemon: `POST /v1/runs/<id>/pause`, `POST /v1/runs/<id>/resume` (the run
 keeps its id and comes back `running` with a new diagram address),
-`GET /v1/runs/<id>/checkpoints`, and `POST /v1/runs/<id>/rollback
-{"checkpoint": ID}` for a paused run. Mission Control shows Pause while a
-run is live; once paused, a checkpoint picker with Roll back, and Resume.
+`GET /v1/runs/<id>/checkpoints`, `GET /v1/runs/<id>/checkpoints/<cp>`
+(preview: tag, queue, outputs, state, per-instance file versions), and
+`POST /v1/runs/<id>/rollback {"checkpoint": ID}` for a paused run.
+
+Mission Control: Pause beside Stop while a run is live; Resume once paused.
+Rollback lives on the timeline: each checkpoint is a green mark at the tag it
+completed (the diagram stream announces `run_checkpointed` as they land);
+clicking one scrubs to that tag and opens a preview of what it holds; a
+paused run commits with "Roll back to this checkpoint" from that preview.
 The live diagram reports `paused`. A resumed daemon run uses the default
 timeout and real-time pace.
 

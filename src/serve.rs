@@ -1075,6 +1075,11 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         }
         // Before the run-record route, which would otherwise take the suffix
         // for part of the id.
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.contains("/checkpoints/") => {
+            let rest = rest.trim_start_matches("/v1/runs/");
+            let (id, checkpoint) = rest.split_once("/checkpoints/").unwrap_or((rest, ""));
+            show_checkpoint(&context, id, checkpoint)
+        }
         ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/checkpoints") => {
             let id = rest
                 .trim_start_matches("/v1/runs/")
@@ -2508,6 +2513,44 @@ fn list_checkpoints(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     )
 }
 
+/// What a checkpoint holds, for the timeline's preview: where the run was,
+/// what it had produced, what was still queued, and which file version each
+/// instance was at.
+fn show_checkpoint(context: &Arc<Context_>, id: &str, checkpoint: &str) -> (u16, Value) {
+    let team = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) => record.team.clone(),
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let store = crate::checkpoint::Store::new(&crate::deploy::dir_for(
+        &context.omar_dir,
+        context.ea_id,
+        &team,
+    ));
+    let (manifest, state, _) = match store.load(checkpoint) {
+        Ok(loaded) => loaded,
+        Err(error) => return (404, json!({"error": format!("{error:#}")})),
+    };
+    let resume_point = store.resume_point().ok().flatten().map(|m| m.id);
+    let mut summary = checkpoint_summary(&manifest);
+    summary["is_resume_point"] = json!(resume_point.as_deref() == Some(manifest.id.as_str()));
+    summary["outputs"] = json!(state.outputs);
+    summary["state_vars"] = json!(state.state_vars);
+    summary["queue_len"] = json!(state.queue.len());
+    summary["queued_tags"] = json!(state
+        .queue
+        .iter()
+        .take(8)
+        .map(|tag| (tag.timestamp, tag.microstep))
+        .collect::<Vec<_>>());
+    summary["elapsed_ns"] = json!(manifest.elapsed_ns);
+    summary["workspaces"] = json!(manifest.workspaces);
+    summary["agents"] = json!(manifest.agents);
+    (200, summary)
+}
+
 #[derive(Debug, Deserialize)]
 struct RollbackRequest {
     checkpoint: String,
@@ -3411,6 +3454,22 @@ while True:
             response.contains(&format!("\"resume_point\":\"{}\"", ids[1])),
             "{response}"
         );
+        // The preview: what the checkpoint holds, and whether it is the resume point.
+        let response = request(
+            address,
+            "GET",
+            &format!("/v1/runs/run-1/checkpoints/{}", ids[0]),
+            None,
+        );
+        assert!(
+            response.contains(" 200 ") && response.contains("\"is_resume_point\":false"),
+            "{response}"
+        );
+        assert!(
+            response.contains("\"queue_len\":0") && response.contains("\"completed_tag\":[1,0]"),
+            "{response}"
+        );
+        assert!(request(address, "GET", "/v1/runs/run-1/checkpoints/nope", None).contains(" 404 "));
 
         // Only a paused run rolls back.
         let body = format!("{{\"checkpoint\":\"{}\"}}", ids[0]);

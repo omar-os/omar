@@ -1,6 +1,7 @@
 "use client";
 
-import type { TimelineStep } from "./lib/runtime-client";
+import type { CheckpointDetail, CheckpointSummary, TimelineStep } from "./lib/runtime-client";
+import { formatDuration } from "./lib/protocol";
 
 /**
  * The logical timeline of a program: every tag it passes through, in order.
@@ -19,12 +20,28 @@ import type { TimelineStep } from "./lib/runtime-client";
  *
  * An input arriving mid-run makes the tail of this wrong, so the projection is
  * recomputed and the strip redrawn from where the run actually is.
+ *
+ * Checkpoints live on the same strip, because a checkpoint is a tag: the state
+ * after that tag completed, with every instance's files as they were. A green
+ * mark sits where one was taken; clicking it previews what it holds, and a
+ * paused run can be rolled back to it from there. Rolling back is choosing a
+ * tag to continue from, which is why it belongs on the timeline and not in a
+ * list — the same determinism that lets the strip predict what will happen is
+ * what makes "continue from here" a precise instruction.
  */
 export function Timeline({
   steps,
   index,
   live,
   truncated,
+  checkpoints = [],
+  resumePoint = null,
+  selected = null,
+  detail = null,
+  canRollBack = false,
+  rollBackHint,
+  onSelectCheckpoint,
+  onRollBack,
   onScrub,
   onClose,
 }: {
@@ -35,11 +52,40 @@ export function Timeline({
   live: boolean;
   /** The projection stopped early. The program has not. */
   truncated: boolean;
+  /** Every checkpoint the run has published, oldest first. */
+  checkpoints?: CheckpointSummary[];
+  /** The checkpoint a resume continues from. */
+  resumePoint?: string | null;
+  /** The checkpoint whose preview is open. */
+  selected?: string | null;
+  /** What the selected checkpoint holds, once fetched. */
+  detail?: CheckpointDetail | null;
+  /** Whether the run is in a state that can roll back (paused). */
+  canRollBack?: boolean;
+  /** Why it cannot, when it cannot. */
+  rollBackHint?: string;
+  onSelectCheckpoint?: (id: string | null) => void;
+  onRollBack?: (id: string) => void;
   onScrub: (index: number) => void;
   onClose: () => void;
 }) {
   const step = steps[index];
   const last = steps.length - 1;
+
+  // Where each checkpoint sits on the strip: the step whose tag it completed.
+  // One taken before any tag ran sits at the start.
+  const placed = checkpoints.map((checkpoint) => {
+    const at = checkpoint.completed_tag
+      ? steps.findIndex(
+          (s) =>
+            s.timestamp === checkpoint.completed_tag![0] &&
+            s.microstep === checkpoint.completed_tag![1],
+        )
+      : -1;
+    return { checkpoint, at };
+  });
+  const tagLabel = (tag: [number, number] | null) =>
+    tag ? `${formatDuration(tag[0])}:${tag[1]}` : "start";
 
   return (
     <div className="timeline" aria-label="Logical timeline">
@@ -52,15 +98,46 @@ export function Timeline({
         >
           ‹
         </button>
-        <input
-          type="range"
-          min={0}
-          max={Math.max(0, last)}
-          value={index}
-          aria-label="Logical tag"
-          disabled={steps.length === 0}
-          onChange={(event) => onScrub(Number(event.target.value))}
-        />
+        <div className="timeline-rail">
+          <input
+            type="range"
+            min={0}
+            max={Math.max(0, last)}
+            value={index}
+            aria-label="Logical tag"
+            disabled={steps.length === 0}
+            onChange={(event) => onScrub(Number(event.target.value))}
+          />
+          {/* Checkpoint marks, on the rail at the tag each one completed. */}
+          <div className="timeline-marks" aria-label="Checkpoints">
+            {placed
+              .filter(({ at }) => at >= 0 || steps.length === 0)
+              .map(({ checkpoint, at }) => {
+                const fraction = last > 0 ? Math.max(0, at) / last : 0;
+                const isResume = checkpoint.id === resumePoint;
+                const isSelected = checkpoint.id === selected;
+                return (
+                  <button
+                    key={checkpoint.id}
+                    type="button"
+                    className={
+                      "timeline-mark" +
+                      (isResume ? " resume" : "") +
+                      (isSelected ? " selected" : "")
+                    }
+                    style={{ left: `${fraction * 100}%` }}
+                    aria-label={`Checkpoint #${checkpoint.sequence}`}
+                    aria-pressed={isSelected}
+                    title={`#${checkpoint.sequence} ${checkpoint.trigger} · after ${tagLabel(checkpoint.completed_tag)}${isResume ? " · resume point" : ""}`}
+                    onClick={() => {
+                      if (at >= 0) onScrub(at);
+                      onSelectCheckpoint?.(isSelected ? null : checkpoint.id);
+                    }}
+                  />
+                );
+              })}
+          </div>
+        </div>
         <button
           type="button"
           aria-label="Next tag"
@@ -102,7 +179,119 @@ export function Timeline({
             </span>
           </>
         )}
+        {checkpoints.length > 0 ? (
+          <span className="timeline-checkpoints">
+            {checkpoints.length} checkpoint{checkpoints.length > 1 ? "s" : ""}:
+            {checkpoints.map((checkpoint) => (
+              <button
+                key={checkpoint.id}
+                type="button"
+                className={
+                  "timeline-checkpoint-chip" +
+                  (checkpoint.id === resumePoint ? " resume" : "") +
+                  (checkpoint.id === selected ? " selected" : "")
+                }
+                onClick={() => {
+                  const at = placed.find((p) => p.checkpoint.id === checkpoint.id)?.at ?? -1;
+                  if (at >= 0) onScrub(at);
+                  onSelectCheckpoint?.(checkpoint.id === selected ? null : checkpoint.id);
+                }}
+              >
+                #{checkpoint.sequence} · {tagLabel(checkpoint.completed_tag)}
+                {checkpoint.id === resumePoint ? " ✓" : ""}
+              </button>
+            ))}
+          </span>
+        ) : null}
       </div>
+
+      {selected ? (
+        <section className="timeline-preview" aria-label="Checkpoint preview">
+          {detail && detail.id === selected ? (
+            <>
+              <div className="timeline-preview-head">
+                <strong>
+                  Checkpoint #{detail.sequence} · {detail.trigger}
+                </strong>
+                <span>
+                  after tag {tagLabel(detail.completed_tag)} · next{" "}
+                  {detail.queued_tags.length > 0
+                    ? tagLabel(detail.queued_tags[0])
+                    : "nothing queued"}{" "}
+                  · {detail.queue_len} tag{detail.queue_len === 1 ? "" : "s"} queued ·{" "}
+                  {new Date(detail.created_at * 1000).toLocaleString()}
+                  {detail.is_resume_point ? " · resume point" : ""}
+                </span>
+              </div>
+              <dl className="timeline-preview-body">
+                <dt>Files</dt>
+                <dd>
+                  {Object.entries(detail.workspaces).length === 0
+                    ? "no instance files"
+                    : Object.entries(detail.workspaces)
+                        .map(
+                          ([instance, ws]) =>
+                            `${instance || "root"} → workspace ${ws.workspace_id.slice(0, 8)}, version ${ws.snapshot_id.slice(0, 8)}`,
+                        )
+                        .join(" · ")}
+                </dd>
+                <dt>State</dt>
+                <dd>
+                  {Object.entries(detail.state_vars).length === 0
+                    ? "none"
+                    : Object.entries(detail.state_vars)
+                        .map(([name, value]) => `${name} = ${JSON.stringify(value)}`)
+                        .join(" · ")}
+                </dd>
+                <dt>Outputs</dt>
+                <dd>
+                  {Object.entries(detail.outputs).length === 0
+                    ? "none yet"
+                    : Object.entries(detail.outputs)
+                        .map(([name, value]) => `${name} = ${JSON.stringify(value)}`)
+                        .join(" · ")}
+                </dd>
+                <dt>Agents</dt>
+                <dd>
+                  {Object.entries(detail.agents).length === 0
+                    ? "none"
+                    : Object.entries(detail.agents)
+                        .map(([name, agent]) => `${name} (${agent.backend}): ${agent.restoration.replaceAll("_", " ")}`)
+                        .join(" · ")}
+                </dd>
+              </dl>
+              <div className="timeline-preview-actions">
+                {detail.is_resume_point ? (
+                  <span className="timeline-preview-note">
+                    A resume continues from here.
+                  </span>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="primary-button"
+                      disabled={!canRollBack}
+                      title={
+                        canRollBack
+                          ? "Moves the resume point here; later checkpoints stay on disk and external effects are not undone"
+                          : rollBackHint
+                      }
+                      onClick={() => onRollBack?.(detail.id)}
+                    >
+                      Roll back to this checkpoint
+                    </button>
+                    {!canRollBack && rollBackHint ? (
+                      <span className="timeline-preview-note">{rollBackHint}</span>
+                    ) : null}
+                  </>
+                )}
+              </div>
+            </>
+          ) : (
+            <span className="timeline-preview-note">Loading checkpoint…</span>
+          )}
+        </section>
+      ) : null}
 
       {truncated ? (
         <p className="timeline-truncated">

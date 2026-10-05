@@ -102,12 +102,29 @@ export async function startFakeServe({
       const id = url.pathname.slice("/v1/runs/".length, -"/checkpoints".length);
       const entry = chat.runs.get(id);
       if (!entry) return json(response, 404, { error: "unknown run" });
-      entry.checkpoints ??= [
-        { id: "cp-1", sequence: 1, parent: null, trigger: "manual", completed_tag: [1_000_000_000, 0], next_tag: [2_000_000_000, 0], created_at: 1 },
-        { id: "cp-2", sequence: 2, parent: "cp-1", trigger: "pause", completed_tag: [2_000_000_000, 0], next_tag: [3_000_000_000, 0], created_at: 2 },
-      ];
-      entry.resumePoint ??= "cp-2";
-      return json(response, 200, { checkpoints: entry.checkpoints, resume_point: entry.resumePoint, unreadable: [] });
+      return json(response, 200, { checkpoints: checkpointsOf(entry), resume_point: entry.resumePoint, unreadable: [] });
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.includes("/checkpoints/")
+    ) {
+      const [id, checkpoint] = url.pathname.slice("/v1/runs/".length).split("/checkpoints/");
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      const found = checkpointsOf(entry).find((c) => c.id === checkpoint);
+      if (!found) return json(response, 404, { error: `no checkpoint '${checkpoint}'` });
+      return json(response, 200, {
+        ...found,
+        is_resume_point: entry.resumePoint === found.id,
+        outputs: { result: `value at #${found.sequence}` },
+        state_vars: { "leader.round": found.sequence },
+        queue_len: 1,
+        queued_tags: [found.next_tag],
+        elapsed_ns: found.sequence * 1_000_000_000,
+        workspaces: { leader: { workspace_id: "0123456789abcdef", snapshot_id: `snap-${found.sequence}-0000`, commit: "0".repeat(40) } },
+        agents: { "leader.agent": { backend: "stub", restoration: "fresh_conversation" } },
+      });
     }
     if (
       request.method === "POST" &&
@@ -121,7 +138,7 @@ export async function startFakeServe({
         return json(response, 409, { error: `run is ${entry.record.status}; only a paused run can roll back` });
       }
       const body = JSON.parse(await readBody(request));
-      const target = (entry.checkpoints ?? []).find((c) => c.id === body.checkpoint);
+      const target = checkpointsOf(entry).find((c) => c.id === body.checkpoint);
       if (!target) return json(response, 409, { error: `no checkpoint '${body.checkpoint}'` });
       const abandoned = entry.resumePoint;
       entry.resumePoint = target.id;
@@ -676,6 +693,16 @@ export async function startFakeServe({
     }
   }
 
+  /** Two checkpoints at the fake timeline's first two tags; the newer is the resume point. */
+  function checkpointsOf(entry) {
+    entry.checkpoints ??= [
+      { id: "cp-1", sequence: 1, parent: null, trigger: "manual", completed_tag: [0, 0], next_tag: [0, 1], created_at: 1 },
+      { id: "cp-2", sequence: 2, parent: "cp-1", trigger: "pause", completed_tag: [0, 1], next_tag: [0, 2], created_at: 2 },
+    ];
+    entry.resumePoint ??= "cp-2";
+    return entry.checkpoints;
+  }
+
   function publish(entry, kind, payload, tag = null) {
     entry.sequence += 1;
     entry.snapshot.sequence = entry.sequence;
@@ -701,10 +728,14 @@ export async function startFakeServe({
     // announced, and the walk parked until a resume sets the run going.
     const boundary = async () => {
       if (entry.record.status !== "pausing") return;
+      // Held briefly, as the stop is, so the pausing state is one a test can
+      // observe before the boundary lands.
+      await new Promise((resolve) => setTimeout(resolve, 400));
       entry.record.status = "paused";
       entry.record.finished_at = Math.floor(Date.now() / 1000);
       entry.snapshot.status = "paused";
-      publish(entry, "run_paused", { checkpoint: "fake-checkpoint" });
+      publish(entry, "run_checkpointed", { checkpoint: "cp-2", trigger: "pause" }, { timestamp: 0, microstep: 1 });
+      publish(entry, "run_paused", { checkpoint: "cp-2" });
       while (entry.record.status === "paused") await wait();
       entry.snapshot.status = "running";
       publish(entry, "run_started", {});

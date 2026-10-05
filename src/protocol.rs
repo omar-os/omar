@@ -138,6 +138,7 @@ fn vocabularies() -> Vec<Vocabulary> {
                 DiagramEventKind::RunCompleted,
                 DiagramEventKind::RunFailed,
                 DiagramEventKind::RunPaused,
+                DiagramEventKind::RunCheckpointed,
             ],
         ),
         vocabulary(

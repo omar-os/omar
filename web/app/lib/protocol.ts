@@ -339,6 +339,10 @@ export function applyDiagramEvent(
             : reaction,
         ),
       };
+    case "run_checkpointed":
+      // A checkpoint is a fact about the run's history, not its picture; the
+      // timeline draws it from the listing it refetches on this event.
+      return snapshot;
     case "run_paused":
       // A pause lands at a tag boundary, where nothing is in flight: whatever
       // was painted as running has finished, and the run waits for a resume.

@@ -3201,6 +3201,7 @@ const CAPTURE_RETRIES: u32 = 3;
 fn settle_boundary(
     deployment_dir: Option<&Path>,
     checkpointer: Option<&dyn Checkpointer>,
+    observer: &dyn TopologyObserver,
     snapshot: &dyn Fn() -> ExecutionState,
 ) -> Result<Boundary> {
     let request = deployment_dir.and_then(deploy::pending_request);
@@ -3229,7 +3230,15 @@ fn settle_boundary(
     loop {
         captured = snapshot();
         match checkpointer.capture(&captured, trigger) {
-            Ok(_) => break,
+            Ok(id) => {
+                let kind = match trigger {
+                    Trigger::Automatic => "automatic",
+                    Trigger::Manual => "manual",
+                    Trigger::Pause => "pause",
+                };
+                observer.checkpoint_published(&id, kind, captured.completed_tag);
+                break;
+            }
             Err(error) => {
                 attempt += 1;
                 checkpointer.capture_failed(&error, attempt, attempt > CAPTURE_RETRIES);
@@ -3417,7 +3426,7 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
                 state_vars: store.clone(),
                 elapsed_ns: elapsed().as_nanos() as u64,
             };
-            settle_boundary(deployment_dir, checkpointer, &snapshot)?
+            settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
         };
         match settled {
             Boundary::Continue => {}
@@ -3461,7 +3470,7 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
                         state_vars: store.clone(),
                         elapsed_ns: elapsed().as_nanos() as u64,
                     };
-                    settle_boundary(deployment_dir, checkpointer, &snapshot)?
+                    settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
                 };
                 match settled {
                     Boundary::Continue => {}
