@@ -42,8 +42,12 @@ export PI_CODING_AGENT_SESSION_DIR="$HOME/.pi/agent/sessions"
 export PATH="$HOME/bin:$PATH"
 
 cleanup() {
-  [ -n "$session_id" ] && "$OMAR_BIN" down -s "$session_id" --force --timeout 5 >/dev/null 2>&1 || true
-  [ -n "$server" ] && tmux -L "$server" kill-server >/dev/null 2>&1 || true
+  if [ -n "$session_id" ]; then
+    "$OMAR_BIN" down -s "$session_id" --force --timeout 5 >/dev/null 2>&1 || true
+  fi
+  if [ -n "$server" ]; then
+    tmux -L "$server" kill-server >/dev/null 2>&1 || true
+  fi
   rm -rf "$test_root"
 }
 trap cleanup EXIT
@@ -90,7 +94,8 @@ pi --version
 session_json="$(cd "$test_root" && "$OMAR_BIN" up --no-ea --name pi-tree --json)"
 session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$session_json")"
 server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
-export OMAR_DIR="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["directory"])' <<<"$session_json")"
+OMAR_DIR="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["directory"])' <<<"$session_json")"
+export OMAR_DIR
 export OMAR_STATE_DIR="$OMAR_DIR"
 export OMAR_EA_ID=0
 export OMAR_TMUX_SERVER="$server"

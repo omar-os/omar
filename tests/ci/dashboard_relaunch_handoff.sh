@@ -45,8 +45,12 @@ work_dir="$(mktemp -d)"
 work_dir="$(cd "$work_dir" && pwd -P)"
 
 cleanup() {
-  [ -n "$session_id" ] && HOME="$home_dir" "$OMAR_BIN" down -s "$session_id" --force --timeout 5 >/dev/null 2>&1 || true
-  [ -n "$server" ] && tmux -L "$server" kill-server >/dev/null 2>&1 || true
+  if [ -n "$session_id" ]; then
+    HOME="$home_dir" "$OMAR_BIN" down -s "$session_id" --force --timeout 5 >/dev/null 2>&1 || true
+  fi
+  if [ -n "$server" ]; then
+    tmux -L "$server" kill-server >/dev/null 2>&1 || true
+  fi
   rm -rf "$home_dir" "$work_dir"
 }
 trap cleanup EXIT
