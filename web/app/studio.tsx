@@ -894,21 +894,29 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const isPausing = run?.status === "pausing";
   const isPaused = run?.status === "paused";
 
-  // What a paused run can roll back to, refreshed whenever it pauses or the
-  // resume point moves.
+  // What a paused run can roll back to, refreshed when it pauses or the
+  // resume point moves. Keyed on the run's id, not the record object: every
+  // poll hands back a fresh record, and refetching on each one reset the
+  // operator's pick in the picker between choosing and clicking.
+  const pausedRunId = isPaused ? run?.run_id : undefined;
   useEffect(() => {
-    if (!isPaused || !run) return;
+    if (!pausedRunId) return;
     const scope = scopeRef.current;
-    const runId = run.run_id;
-    void fetchCheckpoints(serveUrl, runId)
+    void fetchCheckpoints(serveUrl, pausedRunId)
       .then((listing) => {
         if (scope !== scopeRef.current) return;
         setCheckpoints(listing.checkpoints);
         setResumePoint(listing.resume_point);
-        setRollbackTarget(listing.resume_point ?? "");
+        // Keep a pick that is still on the list; otherwise start from the
+        // resume point, which is the one choice that changes nothing.
+        setRollbackTarget((current) =>
+          current && listing.checkpoints.some((c) => c.id === current)
+            ? current
+            : (listing.resume_point ?? ""),
+        );
       })
       .catch(() => {});
-  }, [isPaused, run, serveUrl, resumePoint]);
+  }, [pausedRunId, serveUrl, resumePoint]);
 
   // Widths are clamped against the workspace so the diagram always keeps a
   // usable column, whichever divider is being dragged. Below a panel's minimum
