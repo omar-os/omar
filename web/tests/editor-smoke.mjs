@@ -24,16 +24,22 @@ const bytecode = {version:1, team:'Artifacts', instructions:[
 await writeFile(compiler, `#!${process.execPath}\nrequire('fs').writeFileSync(process.argv[3], ${JSON.stringify(JSON.stringify(bytecode))});\n`, {mode:0o700});
 const program = join(root,'artifacts.omar'); await writeFile(program,'// Compiler fixture\n');
 const env = {...process.env,HOME:home,OMARC_BIN:compiler,CARGO_HOME:process.env.CARGO_HOME||join(homedir(),'.cargo'),RUSTUP_HOME:process.env.RUSTUP_HOME||join(homedir(),'.rustup')};
-const result = spawnSync(binary,['run',program,'--input','writer.tick=1','--fast'],{cwd:source,env,encoding:'utf8',timeout:180000});
-assert.equal(result.status,0,result.stderr+result.stdout);
-await writeFile(join(root,'topology.log'),result.stdout+result.stderr);
-const runtime = spawn(binary,['serve','--address','127.0.0.1:0','--no-ea'],{cwd:source,env});
+const runtime = spawn(binary,['serve','--name','editor-smoke','--address','127.0.0.1:0','--no-ea'],{cwd:source,env});
 let logs='',base;
-runtime.stdout.on('data',c=>{logs+=c;base=/OMAR serve: (http:\/\/[^\s]+)/.exec(logs)?.[1];});
+runtime.stdout.on('data',c=>{logs+=c;base=/URL:\s+(http:\/\/[^\s]+)/.exec(logs)?.[1];});
 runtime.stderr.on('data',c=>{logs+=c;});
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
 for(let i=0;!base&&i<100;i++)await wait(100);
 assert.ok(base,logs);
+// The session's private state, where `~/.omar` used to be.
+const listed=spawnSync(binary,['ls','--json'],{env,encoding:'utf8'});
+const session=JSON.parse(listed.stdout||'[]').find(s=>s.name==='editor-smoke');
+assert.ok(session,listed.stdout+listed.stderr);
+const state=session.directory;
+// The topology runs inside that session, so its workspaces are the ones served.
+const result = spawnSync(binary,['-s',session.id,'run',program,'--input','writer.tick=1','--fast','--wait'],{cwd:source,env,encoding:'utf8',timeout:180000});
+assert.equal(result.status,0,result.stderr+result.stdout);
+await writeFile(join(root,'topology.log'),result.stdout+result.stderr);
 const api=async(path,body)=>{
   const r=await fetch(`${base}/v1/workspaces${path}`,body?{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}:{});
   const data=await r.json();assert.ok(r.ok,JSON.stringify(data));return data;
@@ -41,7 +47,7 @@ const api=async(path,body)=>{
 let editorId,browser;
 try {
   const list=(await api('')).workspaces;assert.equal(list.length,1);editorId=list[0].id;
-  const worktree=join(home,'.omar','workspaces',editorId,'worktree');
+  const worktree=join(state,'workspaces',editorId,'worktree');
   browser=await chromium.launch({headless:true});
   const context=await browser.newContext({viewport:{width:1440,height:1000}});
   context.setDefaultTimeout(30000);
@@ -87,7 +93,7 @@ try {
   await page.getByRole('button',{name:'Restore as new workspace',exact:true}).click();
   await page.getByText('Restored into a new workspace.',{exact:false}).waitFor();
   const restored=(await api('')).workspaces.find(w=>w.restored_from);assert.ok(restored);
-  assert.match(await readFile(join(home,'.omar','workspaces',restored.id,'worktree','report.md'),'utf8'),/Created by the topology/);
+  assert.match(await readFile(join(state,'workspaces',restored.id,'worktree','report.md'),'utf8'),/Created by the topology/);
   assert.match(await readFile(join(worktree,'report.md'),'utf8'),/Edited by the operator/);
   assert.equal(await readFile(join(source,'seed.txt'),'utf8'),'Unchanged source\n');
   assert.equal((await fetch(new URL('/',editor.url()))).status,403);
@@ -95,8 +101,13 @@ try {
   await wait(11000); // Past Mission Control's 10-second grace period.
   assert.equal((await fetch(`${base}/health`)).status,200,'editor connection must keep runtime alive');
   await editor.close();await api(`/${editorId}/editor/stop`,{});
+  // A runtime outlives its clients; shutdown is explicit.
+  await wait(2000);
+  assert.equal((await fetch(`${base}/health`)).status,200,'closing the editor must not stop the runtime');
+  const down=spawnSync(binary,['down','-s',session.id,'--timeout','30'],{env,encoding:'utf8'});
+  assert.equal(down.status,0,down.stderr);
   for(let i=0;runtime.exitCode===null&&i<150;i++)await wait(100);
-  assert.equal(runtime.exitCode,0,'runtime should exit after the last editor disconnects');
+  assert.equal(runtime.exitCode,0,'runtime should exit after down');
   console.log(`PASS: topology, previews, authenticated code-server, browser save, compare, restore and lifecycle. Evidence: ${root}`);
 } catch(error) {
   if(browser) for(const [i,p] of browser.contexts()[0].pages().entries()) { await p.screenshot({path:join(root,`failure-${i}.png`)}).catch(()=>{}); await writeFile(join(root,`failure-${i}.html`),await p.content()); console.log((await p.locator('body').innerText().catch(()=>'' )).slice(0,4000)); }

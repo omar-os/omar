@@ -945,6 +945,7 @@ async fn daemon(directory: &Path) -> Result<()> {
             .flatten()
             .collect();
     match server.attach_ea(&config, directory, 0, false, !launch.no_ea)? {
+        crate::serve::AttachEa::Attached(_) if launch.no_ea => {}
         crate::serve::AttachEa::Attached(session) => eprintln!("Executive assistant running in {session}"),
         crate::serve::AttachEa::AlreadyRunningWithoutServe(session) => eprintln!(
             "Executive assistant {session} is running without this runtime's context; restart it with manager start"
