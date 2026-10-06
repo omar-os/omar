@@ -1062,6 +1062,67 @@ struct InvocationRegistry {
     entries: Arc<Mutex<BTreeMap<String, InvocationEntry>>>,
 }
 
+/// How many edits apart a sent invocation id may be from the one it meant.
+///
+/// Small models copying a 36-character id drop, add or change a character or
+/// two; three leaves room for that without matching an unrelated id.
+const MAX_INVOCATION_ID_TYPO: usize = 3;
+
+/// The invocation a `set_port` or `complete` call names.
+///
+/// An exact id wins. Otherwise, when the caller has exactly one invocation
+/// still open and the id it sent is within a few edits of it, that is the one
+/// it meant. Anything else is an error listing the caller's open invocations,
+/// so the agent can retry with the right id instead of guessing again.
+fn resolve_invocation_id(
+    entries: &BTreeMap<String, InvocationEntry>,
+    team: &str,
+    agent: &str,
+    id: &str,
+) -> Result<String> {
+    if entries.contains_key(id) {
+        return Ok(id.to_string());
+    }
+    let open: Vec<&str> = entries
+        .values()
+        .filter(|entry| {
+            !entry.record.completed && entry.record.team == team && entry.record.agent == agent
+        })
+        .map(|entry| entry.record.id.as_str())
+        .collect();
+    if let [only] = open.as_slice() {
+        if edit_distance(only, id) <= MAX_INVOCATION_ID_TYPO {
+            return Ok(only.to_string());
+        }
+    }
+    if open.is_empty() {
+        bail!("unknown invocation '{}'; you have no open invocations", id);
+    }
+    bail!(
+        "unknown invocation '{}'; your open invocations: {}",
+        id,
+        open.join(", ")
+    )
+}
+
+/// Levenshtein distance over bytes; invocation ids are ASCII.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(ca != cb));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
 impl InvocationRegistry {
     fn register(
         &self,
@@ -1116,9 +1177,10 @@ impl InvocationRegistry {
             .map_err(|_| anyhow::anyhow!("invocation registry lock poisoned"))?;
         match command {
             InvocationCommand::SetPort(args) => {
+                let id = resolve_invocation_id(&entries, team, agent, &args.invocation_id)?;
                 let invocation = entries
-                    .get_mut(&args.invocation_id)
-                    .with_context(|| format!("unknown invocation '{}'", args.invocation_id))?;
+                    .get_mut(&id)
+                    .with_context(|| format!("unknown invocation '{}'", id))?;
                 validate_invocation_owner(team, agent, &invocation.record)?;
                 if invocation.record.completed {
                     bail!("invocation '{}' is already complete", invocation.record.id);
@@ -1158,9 +1220,10 @@ impl InvocationRegistry {
                 Ok(json!({ "pending": pending }))
             }
             InvocationCommand::Complete(args) => {
+                let id = resolve_invocation_id(&entries, team, agent, &args.invocation_id)?;
                 let invocation = entries
-                    .get_mut(&args.invocation_id)
-                    .with_context(|| format!("unknown invocation '{}'", args.invocation_id))?;
+                    .get_mut(&id)
+                    .with_context(|| format!("unknown invocation '{}'", id))?;
                 validate_invocation_owner(team, agent, &invocation.record)?;
                 if invocation.record.completed {
                     return Ok(json!({"status":"already_complete"}));
@@ -3972,6 +4035,83 @@ mod tests {
         // What it may set and what it may see, and nothing else in the run.
         assert_eq!(offered["allowed_effects"], json!({"verdict": "string"}));
         assert_eq!(offered["trigger_values"], json!({"topic": "x"}));
+    }
+
+    fn open_invocation(id: &str, agent: &str) -> InvocationRecord {
+        InvocationRecord {
+            id: id.into(),
+            team: "Desk".into(),
+            agent: agent.into(),
+            reaction: "reaction.0".into(),
+            contract: "verdict".into(),
+            allowed_effects: BTreeMap::from([("verdict".into(), "string".into())]),
+            trigger_values: BTreeMap::new(),
+            prompt: "decide".into(),
+            writes: BTreeMap::new(),
+            completed: false,
+        }
+    }
+
+    fn set_verdict(server: &InvocationServer, agent: &str, id: &str) -> Result<Value> {
+        server.registry.execute(
+            "Desk",
+            agent,
+            InvocationCommand::SetPort(SetPortArgs {
+                invocation_id: id.into(),
+                port: "verdict".into(),
+                value: json!("ship"),
+            }),
+        )
+    }
+
+    #[test]
+    fn a_mistyped_id_reaches_the_callers_one_open_invocation() {
+        let server = InvocationServer::start().unwrap();
+        let id = "0fb82a38-c564-4dd4-8ca7-983f9a756b10";
+        server
+            .registry
+            .register(open_invocation(id, "typist"))
+            .unwrap();
+
+        // One character changed, then one dropped: both mean the open one.
+        set_verdict(&server, "typist", "0fbo2a38-c564-4dd4-8ca7-983f9a756b10").unwrap();
+        set_verdict(&server, "typist", "0fb82a38-c56-4dd4-8ca7-983f9a756b10").unwrap();
+
+        // An id nowhere near it is still refused, and the error names the id
+        // that would have worked.
+        let err = set_verdict(&server, "typist", "11111111-2222-3333-4444-555555555555")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(id), "{err}");
+        server.registry.remove(id);
+    }
+
+    #[test]
+    fn a_mistyped_id_is_not_guessed_between_two_open_invocations() {
+        let server = InvocationServer::start().unwrap();
+        let first = "aaaaaaaa-0000-0000-0000-000000000001";
+        let second = "aaaaaaaa-0000-0000-0000-000000000002";
+        server
+            .registry
+            .register(open_invocation(first, "pair"))
+            .unwrap();
+        server
+            .registry
+            .register(open_invocation(second, "pair"))
+            .unwrap();
+
+        let err = set_verdict(&server, "pair", "aaaaaaaa-0000-0000-0000-000000000003")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(first) && err.contains(second), "{err}");
+
+        // Another agent's open invocation is never borrowed.
+        let err = set_verdict(&server, "stranger", first.replace('1', "9").as_str())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no open invocations"), "{err}");
+        server.registry.remove(first);
+        server.registry.remove(second);
     }
 
     #[test]
