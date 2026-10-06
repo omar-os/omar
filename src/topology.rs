@@ -1062,6 +1062,34 @@ struct InvocationRegistry {
     entries: Arc<Mutex<BTreeMap<String, InvocationEntry>>>,
 }
 
+/// The effect a `set_port` call names, and its type.
+///
+/// Effects are instance-qualified (`faq.objection`), but a prompt names its
+/// ports bare (`$(objection)`), and small models copy that form. A bare name
+/// that matches the last segment of exactly one effect means that effect;
+/// anything else is an error naming the ports that would have worked, so the
+/// agent can correct itself instead of retrying the same name.
+fn resolve_effect_port<'a>(
+    allowed: &'a BTreeMap<String, String>,
+    port: &str,
+) -> Result<(&'a String, &'a String)> {
+    if let Some(entry) = allowed.get_key_value(port) {
+        return Ok(entry);
+    }
+    let mut matches = allowed
+        .iter()
+        .filter(|(name, _)| name.rsplit_once('.').is_some_and(|(_, last)| last == port));
+    if let (Some(entry), None) = (matches.next(), matches.next()) {
+        return Ok(entry);
+    }
+    let names: Vec<&str> = allowed.keys().map(String::as_str).collect();
+    bail!(
+        "port '{}' is not an effect of this invocation; valid ports: {}",
+        port,
+        names.join(", ")
+    )
+}
+
 impl InvocationRegistry {
     fn register(
         &self,
@@ -1123,20 +1151,13 @@ impl InvocationRegistry {
                 if invocation.record.completed {
                     bail!("invocation '{}' is already complete", invocation.record.id);
                 }
-                let ty = invocation
-                    .record
-                    .allowed_effects
-                    .get(&args.port)
-                    .with_context(|| {
-                        format!("port '{}' is not an effect of this invocation", args.port)
-                    })?;
-                validate_value(ty, &args.value)
-                    .with_context(|| format!("invalid value for port '{}'", args.port))?;
-                invocation
-                    .record
-                    .writes
-                    .insert(args.port.clone(), args.value);
-                Ok(json!({"status":"buffered","port":args.port}))
+                let (port, ty) =
+                    resolve_effect_port(&invocation.record.allowed_effects, &args.port)?;
+                let (port, ty) = (port.clone(), ty.clone());
+                validate_value(&ty, &args.value)
+                    .with_context(|| format!("invalid value for port '{}'", port))?;
+                invocation.record.writes.insert(port.clone(), args.value);
+                Ok(json!({"status":"buffered","port":port}))
             }
             InvocationCommand::Pending => {
                 let pending: Vec<PendingInvocation> = entries
@@ -3972,6 +3993,31 @@ mod tests {
         // What it may set and what it may see, and nothing else in the run.
         assert_eq!(offered["allowed_effects"], json!({"verdict": "string"}));
         assert_eq!(offered["trigger_values"], json!({"topic": "x"}));
+    }
+
+    #[test]
+    fn a_bare_port_name_resolves_to_its_one_qualified_effect() {
+        let allowed = BTreeMap::from([
+            ("faq.objection".to_string(), "string".to_string()),
+            ("faq.checked".to_string(), "string".to_string()),
+        ]);
+        let (port, _) = resolve_effect_port(&allowed, "objection").unwrap();
+        assert_eq!(port, "faq.objection");
+        let (port, _) = resolve_effect_port(&allowed, "faq.checked").unwrap();
+        assert_eq!(port, "faq.checked");
+
+        // An unknown name says which names would have worked.
+        let err = resolve_effect_port(&allowed, "verdict")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("faq.checked, faq.objection"), "{err}");
+
+        // A bare name two effects share is not guessed at.
+        let ambiguous = BTreeMap::from([
+            ("a.note".to_string(), "string".to_string()),
+            ("b.note".to_string(), "string".to_string()),
+        ]);
+        assert!(resolve_effect_port(&ambiguous, "note").is_err());
     }
 
     #[test]
