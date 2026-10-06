@@ -931,8 +931,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <div className="messages" ref={threadRef}>
             {messages.length === 0 && snapshot ? (
               <p className="builder-status">
-                Describe a workflow. The assistant drafts an OMAR program for
-                you to confirm before anything runs.
+                Describe a workflow you want to automate — from development to
+                marketing and beyond. The assistant will draft an implementation
+                for you to review and run.
               </p>
             ) : null}
             {messages.map((message) => (
@@ -973,7 +974,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
               }}
-              placeholder="Describe a workflow…  Enter to send, Shift+Enter for a new line"
+              placeholder="Describe a workflow you want to automate…  Enter to send, Shift+Enter for a new line"
               aria-label="Describe a workflow"
             />
             <div>
