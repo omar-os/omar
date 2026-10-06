@@ -2726,7 +2726,11 @@ fn topology_tool_definitions() -> Vec<Value> {
                 "properties":{
                     "invocation_id":{"type":"string"},
                     "port":{"type":"string"},
-                    "value":{}
+                    // Any JSON type is accepted, so no `type` is declared. An
+                    // empty schema left small models guessing a shape and
+                    // wrapping strings as {"type":"string","value":…}; the
+                    // description alone stopped that.
+                    "value":{"description":"The value as a bare JSON value of the port's declared type: a JSON string for string, path and bytes ports (never an object wrapping it), a number for int and float, true or false for bool, an array for list<...>, and null for a signal or an empty option."}
                 },
                 "required":["invocation_id","port","value"],
                 "additionalProperties":false
@@ -3144,6 +3148,18 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(names, ["omar_set_port", "omar_complete", "omar_pending"]);
+    }
+
+    #[test]
+    fn set_port_value_is_described_but_untyped() {
+        let tools = topology_tool_definitions();
+        let value = &tools[0]["inputSchema"]["properties"]["value"];
+        // Untyped, because a port may carry any JSON type...
+        assert!(value.get("type").is_none(), "{value}");
+        // ...but described, because an empty schema had small models wrap
+        // strings in an object the string port then rejected.
+        let description = value["description"].as_str().unwrap();
+        assert!(description.contains("never an object"), "{description}");
     }
 
     #[test]
