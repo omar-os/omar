@@ -2,9 +2,9 @@
 
 <img src="img/full-black-banner.jpg" alt="OMAR" width="250">
 
-**LLM agents are unpredictable. Their coordination doesn't have to be.**
+**Turn your coding agents into a programmable team.**
 
-**`omar` delivers deterministic, formally specified orchestration for multi-agent systems.**
+Claude Code, Codex, and other agents. Explicit handoffs. Live control. Running on your machine.
 
 <p align="center">
   <a href="https://omar.rs">omar.rs</a>&nbsp; • &nbsp;
@@ -14,28 +14,37 @@
   <a href="https://discord.gg/X76PSzmfWr"><img src="https://img.shields.io/discord/1467663881588572182?label=Discord&logo=discord&logoColor=white&color=5865F2&cacheSeconds=60" alt="Discord" valign="middle"/></a>
 </p>
 
+</div>
+
+**OMAR (Open Multi-Agent Runtime) is an open-source runtime for coordinating the coding agents you already use.** Describe a workflow in Mission Control, inspect the generated team diagram, and confirm deployment. Watch the work unfold, open individual agents' terminals, and keep the files the team produces.
+
+The coordination itself is a program. OMAR compiles a `.omar` workflow into explicit inputs, outputs, and handoffs, then uses a deterministic runtime to schedule the work. You can define who receives a result, which steps can run in parallel, and where a human decision enters the workflow. That determinism applies to orchestration; model answers and external tool actions can still vary. See the [language specification](lang/spec.md) for the execution model.
+
+<div align="center">
+
 <p align="center">
 <img src="./img/web.gif" alt="Web UI" valign="middle"/>
-Web UI
+Mission Control
 </p>
 
 <p align="center">
 <img src="./img/demo.gif" alt="Terminal UI" valign="middle"/>
-Terminal UI
+Terminal UI (legacy)
 </p>
 
 </div>
 
 ## Features
 
-- **Deep hierarchies**: Agents managing agents, just like a company.
-- **Heterogeneity**: Let `claude`, `codex`, and other agents collaborate as a team.
-- **Full control**: Talk to and control any subagent you want.
-- **Life span**: Long-running or ephemeral agents, your choice.
-- **Customization**: Support all `tmux` commands you love.
-- **Team workspaces**: Each topology team instance gets a versioned `worktree/` and disposable `temp/`. [Inspect and restore file versions](docs/team-workspaces.md).
+- **Explicit coordination contracts**: Declare typed inputs and outputs, triggers, and permitted output writes. The compiler and runtime validate the plan before execution, and the runtime enforces output contracts as agents work.
+- **Mixed agent teams**: Put Claude Code, Codex, Cursor, OpenCode, Antigravity, and Pi in the same workflow. Choose a backend for each role using the [supported agent backends](#supported-agent-backends).
+- **Teams within teams**: Compose reusable, parameterized teams into deeper hierarchies. Build pipelines, parallel branches, and feedback loops with explicit connections between them.
+- **Live visibility and direct access**: Follow execution status and values in Mission Control's live diagram. Open an individual agent's terminal to inspect its session and interact directly.
+- **Human steps in the workflow**: Use the `Web` backend to supply an answer or review decision through Mission Control. Human responses follow the same output contracts as agent responses.
+- **Files with history**: Each team instance gets a persistent `worktree/` and disposable `temp/`. Keep outputs after a run, inspect file snapshots, and restore a version into a new workspace. [Workspace details](docs/team-workspaces.md).
+- **Flexible sessions and familiar tools**: Run long-lived or task-specific agents, with terminal access and the `tmux` controls you already use.
 
-Other features include messaging systems integration (e.g., Slack), computer use, and more.
+Optional bridges connect agents to [Slack](bridges/slack/README.md) and [computer-use tools](bridges/computer/README.md). Explore the [example programs](tests/topology/src) to see how workflows are expressed in `.omar` source.
 
 ## Installation
 
@@ -84,10 +93,17 @@ Serves the web UI from the daemon's own address and opens it in your browser.
 
 #### Step 2: Describe a workflow
 
-Type what the team should do. The assistant drafts an OMAR program and shows you
-the topology it compiles to.
-Nothing runs until you press **Confirm deploy**,
-then the diagram goes live.
+Type what the team should do. For example:
+
+> Create a team that drafts and reviews a technical design. Use Claude Code to
+> write a proposal from my brief, then pass it to Codex to review the tradeoffs
+> and missing requirements. Send both the proposal and review to me for a final
+> decision in Mission Control.
+
+The assistant drafts an OMAR program and shows you the team diagram it compiles
+to. Inspect the roles and handoffs, then press **Confirm deploy** to start the
+workflow. The diagram goes live as agents work and pass results between steps.
+This example requires both Claude Code and Codex to be installed and configured.
 
 ### Terminal UI (Legacy)
 
