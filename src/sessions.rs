@@ -162,6 +162,12 @@ pub fn is_managed() -> bool {
 fn registry() -> PathBuf {
     home_root().join("registry")
 }
+fn home_tag() -> String {
+    let home = home_root();
+    let home = fs::canonicalize(&home).unwrap_or(home);
+    let digest = Sha256::digest(home.to_string_lossy().as_bytes());
+    format!("{:x}", digest)[..8].to_string()
+}
 fn private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
@@ -638,7 +644,11 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
     config.metrics.spawn_metrics_enabled |= cli.spawn_metrics;
     fs::write(directory.join("config.toml"), toml::to_string(&config)?)?;
     // Short private socket paths also work on macOS's 104-byte Unix path limit.
-    let socket = crate::paths::private_temp_dir()?.join(format!("{name}.sock"));
+    // Names are unique within one OMAR_HOME, but the socket and tmux
+    // directories are per user, so a short tag of the home keeps two homes'
+    // like-named sessions apart.
+    let tag = home_tag();
+    let socket = crate::paths::private_temp_dir()?.join(format!("{name}-{tag}.sock"));
     let mut session = Session {
         name: name.clone(),
         protocol: PROTOCOL,
@@ -652,7 +662,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
         source_executable,
         version: env!("CARGO_PKG_VERSION").into(),
         build_id,
-        tmux_server: format!("omar-{name}"),
+        tmux_server: format!("omar-{name}-{tag}"),
     };
     write_json(
         &directory.join("launch.json"),

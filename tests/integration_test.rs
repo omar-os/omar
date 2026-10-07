@@ -49,6 +49,21 @@ thread_local! {
     static SESSION: RefCell<Option<TestSession>> = const { RefCell::new(None) };
 }
 
+/// Every runtime log under the test home, so a failed `up` explains itself.
+fn runtime_logs(home: &Path) -> String {
+    let Ok(sessions) = std::fs::read_dir(home.join(".omar").join("sessions")) else {
+        return String::new();
+    };
+    sessions
+        .flatten()
+        .filter_map(|entry| {
+            let log = entry.path().join("logs").join("runtime.log");
+            let text = std::fs::read_to_string(&log).ok()?;
+            Some(format!("---- {} ----\n{text}", log.display()))
+        })
+        .collect()
+}
+
 fn session_for(home: &Path) -> Value {
     if let Some(record) = SESSION.with(|cell| {
         cell.borrow()
@@ -78,8 +93,9 @@ fn session_for(home: &Path) -> Value {
         .expect("run omar up");
     assert!(
         output.status.success(),
-        "omar up failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "omar up failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        runtime_logs(home)
     );
     let record: Value = serde_json::from_slice(&output.stdout).expect("session record");
     SESSION.with(|cell| {
