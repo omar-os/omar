@@ -119,6 +119,7 @@ jobs:
         run: |
           cargo build -p omar
           python3 tests/ci/team_workspaces.py
+          python3 tests/ci/team_sandboxes.py
           python3 tests/ci/legacy_supervision.py
           python3 tests/ci/backend_coordination_contracts.py
           python3 tests/ci/protocol_runner.py
@@ -126,6 +127,25 @@ jobs:
 
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1
+
+  sandbox-template:
+    name: Sandbox Template
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Linux worker template
+        run: docker build -f sandbox/Dockerfile -t omar-sandbox:test .
+      - name: Prepare digest-pinned local template archive
+        run: |
+          docker save -o "$RUNNER_TEMP/omar-image.tar" omar-sandbox:test
+          python3 sandbox/pin-image.py "$RUNNER_TEMP/omar-image.tar" "$RUNNER_TEMP/omar-pinned.tar"
+      - name: Exercise worker in template (not microVM isolation)
+        run: |
+          docker run --rm --entrypoint python3 \
+            -e OMAR_BIN=/usr/local/bin/omar \
+            -v "$PWD/tests/ci/team_sandboxes.py:/tmp/team_sandboxes.py:ro" \
+            omar-sandbox:test /tmp/team_sandboxes.py
 
   codex-shared-history:
     name: Codex Shared History

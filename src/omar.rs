@@ -23,6 +23,7 @@ mod editor;
 #[cfg(test)]
 mod protocol;
 mod reaction;
+mod sandbox;
 mod scheduler;
 mod serve;
 mod stub_agent;
@@ -102,6 +103,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(hide = true)]
+    SandboxWorker,
     /// Inspect and version team-instance files (not runtime checkpoints)
     Workspace {
         #[command(subcommand)]
@@ -221,6 +224,10 @@ enum Commands {
         /// Replace existing agent sessions with topology-scoped sessions
         #[arg(long)]
         replace: bool,
+
+        /// Docker Sandbox template pinned by digest (one sandbox per team instance)
+        #[arg(long)]
+        sandbox_template: Option<String>,
 
         /// Maximum time to wait for each prompt invocation
         #[arg(long, default_value_t = 300)]
@@ -401,6 +408,9 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Commands::SandboxWorker)) {
+        return topology::sandbox_worker();
+    }
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(ref agent) = cli.agent {
         config.agent.default_command = crate::backend::resolve(agent)
@@ -592,11 +602,13 @@ async fn async_main() -> Result<()> {
             Some(path) => mcp::run_server_from_context_file(PathBuf::from(path), bare_tool_names),
             None => mcp::run_server_with_default_context(bare_tool_names),
         },
+        Some(Commands::SandboxWorker) => unreachable!(),
         Some(Commands::Run {
             program,
             inputs,
             replace,
             timeout_seconds,
+            sandbox_template,
             fast,
             diagram_server,
             diagram_address,
@@ -612,6 +624,9 @@ async fn async_main() -> Result<()> {
                     generated: &generated,
                     base_prefix: &config.dashboard.session_prefix,
                     health_idle_warning: config.health.idle_warning,
+                    sandbox_template: sandbox_template
+                        .as_deref()
+                        .or(config.sandbox.template.as_deref()),
                     inputs: &inputs,
                     replace,
                     timeout: Duration::from_secs(timeout_seconds),
@@ -1038,7 +1053,11 @@ fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> R
     let dir = deployment_dir(omar_dir, ea_id, team)?;
     let mut record = deploy::DeploymentRecord::load(&dir)?
         .ok_or_else(|| anyhow::anyhow!("no deployment '{}'", team))?;
-    let client = record.session_client()?;
+    let client = if record.sandboxes.is_empty() {
+        Some(record.session_client()?)
+    } else {
+        None
+    };
     if record.pid != std::process::id() && record.runner_alive() {
         deploy::kill_process(record.pid);
         let waited = std::time::Instant::now();
@@ -1048,8 +1067,10 @@ fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> R
     }
     let failures = if record.sessions_cleaned {
         Vec::new()
-    } else {
+    } else if let Some(client) = client {
         deploy::teardown_sessions(&client, &record.sessions, &deploy::logs_dir(&dir))
+    } else {
+        sandbox::stop_all(&record.sandboxes)
     };
     for failure in &failures {
         eprintln!("warning: session not cleaned up: {failure}");

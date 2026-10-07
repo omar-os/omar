@@ -9,6 +9,8 @@ use crate::backend_probe;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub sandbox: crate::sandbox::Config,
+    #[serde(default)]
     pub dashboard: DashboardConfig,
 
     #[serde(default)]

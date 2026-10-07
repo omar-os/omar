@@ -142,6 +142,7 @@ fn main() {
 /// A built crate and the reactions it answers.
 #[derive(Debug)]
 pub struct Reactions {
+    cleanup_directory: Option<PathBuf>,
     binary: PathBuf,
     reactions: BTreeSet<String>,
 }
@@ -574,6 +575,7 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
         // Another run may have published it while this one waited.
         if published.exists() {
             return Ok(Some(Reactions {
+                cleanup_directory: None,
                 binary: published,
                 reactions,
             }));
@@ -626,6 +628,7 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
             .with_context(|| format!("failed to publish {}", published.display()))?;
     }
     Ok(Some(Reactions {
+        cleanup_directory: None,
         binary: published,
         reactions,
     }))
@@ -702,6 +705,12 @@ fn decode(raw: &str, ty: &str) -> Result<Value> {
 }
 
 impl Reactions {
+    /// VM-local cleanup markers: only the worktree and temp are host mounts.
+    pub fn with_cleanup_directory(mut self, directory: PathBuf) -> Self {
+        self.cleanup_directory = Some(directory);
+        self
+    }
+
     /// Where the built body lives, which a test asserts about.
     #[cfg(test)]
     pub fn binary(&self) -> &Path {
@@ -750,10 +759,12 @@ impl Reactions {
         }
         let marker = workspace
             .map(|(worktree, _)| -> Result<PathBuf> {
-                let directory = worktree
-                    .parent()
-                    .context("workspace has no parent")?
-                    .join("reactions");
+                let directory = self.cleanup_directory.clone().unwrap_or(
+                    worktree
+                        .parent()
+                        .context("workspace has no parent")?
+                        .join("reactions"),
+                );
                 std::fs::create_dir_all(&directory)?;
                 let marker = directory.join(uuid::Uuid::new_v4().to_string());
                 std::fs::write(&marker, "Reaction cleanup has not been confirmed.\n")?;
@@ -911,6 +922,7 @@ mod tests {
             )).unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
             let code = Reactions {
+                cleanup_directory: None,
                 binary,
                 reactions: BTreeSet::new(),
             };
