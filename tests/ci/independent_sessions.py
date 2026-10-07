@@ -91,7 +91,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         bare = subprocess.run([str(BIN)], cwd=root, env=env, text=True, capture_output=True)
         assert bare.returncode != 0 and "Usage:" in bare.stdout + bare.stderr, "bare omar must print the command list"
         outer = up("outer")
-        inherited = dict(env, OMAR_SESSION_ID=outer["id"], OMAR_STATE_DIR=outer["directory"],
+        inherited = dict(env, OMAR_SESSION_ID=outer["name"], OMAR_STATE_DIR=outer["directory"],
                          OMAR_TMUX_SERVER=outer["tmux_server"], OMAR_EA_ID="99", TMUX="parent")
         inner = up("inner", inherited)
         assert outer["url"] != inner["url"] and outer["socket"] != inner["socket"]
@@ -169,9 +169,9 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         # Without a selected runtime, run creates a session, prints the summary, and shuts it down.
         summary = subprocess.run([str(BIN), "run", str(once), "--wait"], cwd=root, env=env, text=True, capture_output=True, timeout=120)
         assert summary.returncode == 0 and "Topology 'OnceRun' completed" in summary.stdout and "Output once.done = 1" in summary.stdout, summary
-        created = re.search(r"Started session \S+ \((s-[0-9a-f]+)\)", summary.stderr)
+        created = re.search(r"Started session (\S+);", summary.stderr)
         assert created, summary.stderr
-        assert created.group(1) not in {s["id"] for s in json.loads(cli("ls", "--json"))}, "run --wait left its own session behind"
+        assert created.group(1) not in {s["name"] for s in json.loads(cli("ls", "--json"))}, "run --wait left its own session behind"
         run_a = json.loads(cli("--session", "outer", "start", str(program)))["run_id"]
         run_b = json.loads(cli("--session", "inner", "start", str(program)))["run_id"]
         wait_status("outer", run_a, "running")
@@ -218,7 +218,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         finally:
             if terminal.poll() is None: terminal.kill(); terminal.wait()
             os.close(master)
-        record = Path(env["OMAR_HOME"]) / "registry" / f"{inner['id']}.json"
+        record = Path(env["OMAR_HOME"]) / "registry" / f"{inner['name']}.json"
         deadline = time.monotonic() + 20
         # A session without a checkpoint removes its record as it stops.
         while record.exists() and json.loads(record.read_text())["state"] != "stopped":
@@ -280,11 +280,11 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         stale = up("stale")
         os.kill(stale["pid"], signal.SIGKILL)
         time.sleep(.2)
-        cli("down", "-s", stale["id"], ok=False)
+        cli("down", "-s", stale["name"], ok=False)
         assert info("outer")["session"]["state"] == "ready"
         print("PASS: session isolation, nested routing, help, startup races/failure, dashboard attach/detach, browser close, live topologies, targeted shutdown")
     finally:
         for session in sessions:
-            subprocess.run([str(BIN), "down", "-s", session["id"], "--force", "--timeout", "5"],
+            subprocess.run([str(BIN), "down", "-s", session["name"], "--force", "--timeout", "5"],
                            env=env, capture_output=True, timeout=15)
             subprocess.run(["tmux", "-L", session["tmux_server"], "kill-server"], capture_output=True)

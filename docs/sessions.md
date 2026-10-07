@@ -11,6 +11,7 @@ session. TUI/browser clients can disconnect without stopping any workload.
 | `omar up [--name NAME] [--web] [--tui] [--checkpoint]` | Create a new session; return after readiness; `--web` opens Mission Control, `--tui` attaches the terminal dashboard; `--checkpoint` keeps its state after it stops |
 | `omar up --workdir PATH --no-ea` | Start without launching an assistant |
 | `omar ls [--json]` | List sessions, health, URL, and exact executable build; a stopped session appears only if it was started with `--checkpoint` |
+| `omar rm -s SESSION` | Remove a stopped session's record and state |
 | `omar info -s SESSION` | Inspect session, EAs, agents, and runs |
 | `omar logs -s SESSION [--follow] [--tail N]` | Read runtime log |
 | `omar attach -s SESSION --tui [--ea EA]` | Terminal dashboard as a client of that session, inside its tmux server; z detaches, Q stops the session |
@@ -38,8 +39,10 @@ panes and hooks, never typed by a person. Help never starts
 a runtime or writes configuration. `--json` produces structured session results;
 forwarded operations return a stdout/stderr envelope.
 
-Every command that targets a session takes it as `-s`/`--session` (id or
-name). Explicit `--session` wins over inherited `OMAR_SESSION_ID`. Without
+Every command that targets a session takes it as `-s`/`--session` by name.
+A session's name is its only identity: `up` gives it a memorable two-word
+name unless `--name` sets one, and the name must be unused among every
+listed session (`omar rm` frees a stopped one). Explicit `--session` wins over inherited `OMAR_SESSION_ID`. Without
 either, the command fails with selection guidance. No persisted global selection.
 Explicit `--ea` wins; inherited `OMAR_EA_ID` applies only with inherited session
 routing. Otherwise EA 0 is selected. `up` **always creates a new session**,
@@ -60,10 +63,10 @@ permission to signal a PID: control must verify the session's incarnation.
 ## Storage and build ownership
 
 Discovery: `$OMAR_HOME/registry`, default `~/.omar/registry`.
-Private state: `$OMAR_HOME/sessions/<id>/` (owner-only directory).
+Private state: `$OMAR_HOME/sessions/<name>/` (owner-only directory).
 Each session has its own config, EA registry, chats, event store, workspace
 metadata, credentials, logs, HTTP port, control socket, and dedicated tmux server.
-The private local control protocol verifies protocol version, session ID, and
+The private local control protocol verifies protocol version, session name, and
 incarnation before executing operations.
 
 The runtime and available `omarc` compiler are copied into the session's `bin/`
@@ -74,7 +77,7 @@ SHA-256 build identity. Do not delete a live session directory.
 ## Layout
 
 The session layout is the only layout: every runtime lives under
-`$OMAR_HOME/sessions/<id>/` and nothing targets a shared `~/.omar` state
+`$OMAR_HOME/sessions/<name>/` and nothing targets a shared `~/.omar` state
 directory any more. `$OMAR_HOME/config.toml` is only the template a new
 session copies. `omar run` (alias `start`) submits a topology to a runtime; the
 foreground runner is gone.

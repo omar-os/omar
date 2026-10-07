@@ -92,7 +92,7 @@ pi --version
 # A runtime session owns the EA-scoped state and the tmux server; the MCP
 # protocol below is the one the extension uses, pointed at that session.
 session_json="$(cd "$test_root" && "$OMAR_BIN" up --no-ea --name pi-tree --json)"
-session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$session_json")"
+session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$session_json")"
 server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
 OMAR_DIR="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["directory"])' <<<"$session_json")"
 export OMAR_DIR

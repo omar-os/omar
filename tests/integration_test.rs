@@ -28,7 +28,7 @@ struct TestSession {
 
 impl Drop for TestSession {
     fn drop(&mut self) {
-        let id = self.record["id"].as_str().unwrap_or_default().to_string();
+        let id = self.record["name"].as_str().unwrap_or_default().to_string();
         let _ = Command::new(omar_bin())
             .args(["down", "-s", &id, "--force", "--timeout", "5"])
             .env("HOME", &self.home)
@@ -146,7 +146,7 @@ fn omar_command(home: &Path) -> Command {
     ] {
         cmd.env_remove(key);
     }
-    cmd.args(["-s", session["id"].as_str().expect("session id")])
+    cmd.args(["-s", session["name"].as_str().expect("session name")])
         .env("HOME", home);
     cmd
 }

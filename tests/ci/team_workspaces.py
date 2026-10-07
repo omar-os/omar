@@ -59,7 +59,7 @@ def main():
             toggles.write_text(json.dumps(active))
 
         def omar(*args, **kwargs):
-            return subprocess.run([str(BIN), "-s", runtime["id"], *args], cwd=source, env=env,
+            return subprocess.run([str(BIN), "-s", runtime["name"], *args], cwd=source, env=env,
                                   text=True, capture_output=True, timeout=kwargs.get("timeout", 180))
 
         def run(*args):
@@ -253,7 +253,7 @@ out = Some(cwd.display().to_string());
                 print("runtime.log:", log.read_text()[-4000:])
             raise
         finally:
-            subprocess.run([str(BIN), "down", "-s", runtime["id"], "--force", "--timeout", "5"], env=env, capture_output=True)
+            subprocess.run([str(BIN), "down", "-s", runtime["name"], "--force", "--timeout", "5"], env=env, capture_output=True)
             subprocess.run([tmux, "-L", server, "kill-server"], capture_output=True)
             subprocess.run([tmux, "-L", server + "-other", "kill-server"], capture_output=True)
             for socket in (root / "tmux-default").glob("tmux-*/*"):

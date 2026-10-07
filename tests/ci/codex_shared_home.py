@@ -113,7 +113,7 @@ trust_level="trusted"
     def pane(name):
         return tmux('capture-pane', '-p', '-t', name)
     def omar(*args, **kwargs):
-        return subprocess.run([OMAR, '-s', session['id'], *args], cwd=work, env=env, capture_output=True, text=True, **kwargs)
+        return subprocess.run([OMAR, '-s', session['name'], *args], cwd=work, env=env, capture_output=True, text=True, **kwargs)
     try:
         for index in [0, 1]:
             if index == 1:
@@ -127,7 +127,7 @@ trust_level="trusted"
                                                     capture_output=True, text=True, timeout=120, check=True).stdout)
                 server = session['tmux_server']
                 state = Path(session['directory'])
-                command = shlex.join(['env', '-u', 'TMUX', OMAR, 'attach', '-s', session['id'], '--tui'])
+                command = shlex.join(['env', '-u', 'TMUX', OMAR, 'attach', '-s', session['name'], '--tui'])
                 tmux('new-session', '-d', '-s', 'cold-launch', '-x', '110', '-y', '35', '-c', str(work), command)
                 until(lambda: 'omar-dashboard' in tmux('list-sessions'), 'cold dashboard')
             else:
@@ -277,7 +277,7 @@ trust_level="trusted"
         for rpc in clients:
             rpc.close()
         if session:
-            subprocess.run([OMAR, 'down', '-s', session['id'], '--force', '--timeout', '5'], env=env, capture_output=True)
+            subprocess.run([OMAR, 'down', '-s', session['name'], '--force', '--timeout', '5'], env=env, capture_output=True)
         if server:
             tmux('kill-server', check=False)
         http.shutdown()

@@ -125,7 +125,7 @@ while True: time.sleep(1)
         assert api("GET", "/v1/chat")["id"] == before["id"]
         close(reloaded)
         # Shutdown is explicit, and takes the EA and its child with it.
-        down = subprocess.run([BINARY, "down", "-s", sessions[0]["id"], "--timeout", "30"], env=env, capture_output=True, text=True)
+        down = subprocess.run([BINARY, "down", "-s", sessions[0]["name"], "--timeout", "30"], env=env, capture_output=True, text=True)
         assert down.returncode == 0, down.stderr
         assert first.wait(timeout=15) == 0
         original = launches()[0]
@@ -138,7 +138,7 @@ while True: time.sleep(1)
         time.sleep(1)
         assert len(launches()) == 2, "opening the chat launched a second EA"
         close(reopened)
-        down = subprocess.run([BINARY, "down", "-s", sessions[1]["id"], "--timeout", "30"], env=env, capture_output=True, text=True)
+        down = subprocess.run([BINARY, "down", "-s", sessions[1]["name"], "--timeout", "30"], env=env, capture_output=True, text=True)
         assert down.returncode == 0, down.stderr
         assert second.wait(timeout=15) == 0
         eventually(lambda: all(dead(item["pid"]) and dead(item["child"]) for item in launches()))

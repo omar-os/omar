@@ -37,7 +37,7 @@ const session=JSON.parse(listed.stdout||'[]').find(s=>s.name==='editor-smoke');
 assert.ok(session,listed.stdout+listed.stderr);
 const state=session.directory;
 // The topology runs inside that session, so its workspaces are the ones served.
-const result = spawnSync(binary,['-s',session.id,'run',program,'--input','writer.tick=1','--fast','--wait'],{cwd:source,env,encoding:'utf8',timeout:180000});
+const result = spawnSync(binary,['-s',session.name,'run',program,'--input','writer.tick=1','--fast','--wait'],{cwd:source,env,encoding:'utf8',timeout:180000});
 assert.equal(result.status,0,result.stderr+result.stdout);
 await writeFile(join(root,'topology.log'),result.stdout+result.stderr);
 const api=async(path,body)=>{
@@ -104,7 +104,7 @@ try {
   // A runtime outlives its clients; shutdown is explicit.
   await wait(2000);
   assert.equal((await fetch(`${base}/health`)).status,200,'closing the editor must not stop the runtime');
-  const down=spawnSync(binary,['down','-s',session.id,'--timeout','30'],{env,encoding:'utf8'});
+  const down=spawnSync(binary,['down','-s',session.name,'--timeout','30'],{env,encoding:'utf8'});
   assert.equal(down.status,0,down.stderr);
   for(let i=0;runtime.exitCode===null&&i<150;i++)await wait(100);
   assert.equal(runtime.exitCode,0,'runtime should exit after down');

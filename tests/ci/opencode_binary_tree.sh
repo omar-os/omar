@@ -134,7 +134,7 @@ fail() {
 # Start a session; its runtime launches the EA (root) with the configured
 # default_command (opencode + model_a) on the session's own tmux server.
 session_json="$(cd "$REPO_ROOT" && HOME="$home_dir" "$OMAR_BIN" up --name opencode-tree --json)"
-session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$session_json")"
+session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$session_json")"
 server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
 ea_session="omar-agent-ea-0"
 wait_for_session "$ea_session" 60 || fail "EA session never came up"

@@ -80,7 +80,7 @@ impl Harness {
     }
 
     fn id(&self) -> &str {
-        self.session["id"].as_str().expect("session id")
+        self.session["name"].as_str().expect("session name")
     }
 
     fn tmux_server(&self) -> &str {
@@ -336,7 +336,7 @@ fn a_dead_runtime_is_reported_and_never_signalled_blindly() {
             .as_array()
             .into_iter()
             .flatten()
-            .find(|s| s["id"] == harness.session["id"])
+            .find(|s| s["name"] == harness.session["name"])
             .map(|s| s["state"].as_str().unwrap_or_default().to_string())
             .unwrap_or_default();
         if state == "stale" || start.elapsed() > Duration::from_secs(10) {

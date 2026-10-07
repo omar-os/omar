@@ -140,6 +140,8 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         tail: usize,
     },
+    /// Remove a stopped session's record and state
+    Rm,
     /// Shut down one runtime and its owned workloads
     Down {
         #[arg(long)]
@@ -437,6 +439,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Attach { .. }
             | Commands::Logs { .. }
             | Commands::Down { .. }
+            | Commands::Rm
             | Commands::Run(_)
             | Commands::Runs { .. }
             | Commands::SessionDaemon { .. }
@@ -634,7 +637,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
 const HELP_SECTIONS: &[(&str, &[&str])] = &[
     (
         "Sessions",
-        &["up", "ls", "info", "attach", "logs", "down", "serve"],
+        &["up", "ls", "info", "attach", "logs", "down", "rm", "serve"],
     ),
     (
         "Topologies",

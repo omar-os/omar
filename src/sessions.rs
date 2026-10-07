@@ -106,7 +106,8 @@ pub enum EaAction {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
-    pub id: String,
+    /// The session's one identity: the registry file, the state directory,
+    /// the tmux server and the control socket are all named after it.
     pub name: String,
     pub protocol: u32,
     pub incarnation: String,
@@ -170,7 +171,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     crate::topology::write_json_atomic(path, value)
 }
 fn publish(session: &Session) -> Result<()> {
-    write_json(&registry().join(format!("{}.json", session.id)), session)
+    write_json(&registry().join(format!("{}.json", session.name)), session)
 }
 fn validate_name(name: &str) -> Result<()> {
     anyhow::ensure!(
@@ -244,25 +245,42 @@ pub fn discover() -> Result<Vec<Session>> {
     Ok(result)
 }
 pub fn resolve(selector: &str) -> Result<Session> {
-    let sessions = discover()?;
-    if let Some(s) = sessions.iter().find(|s| s.id == selector) {
-        return Ok(s.clone());
-    }
-    let named: Vec<_> = sessions
+    discover()?
         .into_iter()
-        .filter(|s| s.name == selector)
-        .collect();
-    let live: Vec<_> = named
-        .iter()
-        .filter(|s| !matches!(s.state.as_str(), "stopped" | "failed" | "stale"))
-        .cloned()
-        .collect();
-    let matches = if live.is_empty() { named } else { live };
-    anyhow::ensure!(
-        matches.len() == 1,
-        "session '{selector}' is missing or ambiguous; use omar ls and select an id"
-    );
-    Ok(matches[0].clone())
+        .find(|s| s.name == selector)
+        .with_context(|| format!("session '{selector}' is missing; see omar ls"))
+}
+
+/// A memorable name a new session gets when none is given: two words from
+/// short lists, like Docker's container names, unique among every record.
+const ADJECTIVES: &[&str] = &[
+    "amber", "brisk", "calm", "clever", "cosmic", "crisp", "daring", "eager", "fancy", "gentle",
+    "golden", "happy", "humble", "jolly", "keen", "lively", "lucky", "mellow", "merry", "mighty",
+    "nimble", "noble", "plucky", "proud", "quiet", "rapid", "rosy", "shiny", "silent", "sleek",
+    "snappy", "sunny", "swift", "tidy", "vivid", "warm", "wise", "witty", "zesty", "zippy",
+];
+const NOUNS: &[&str] = &[
+    "apple", "badger", "bagel", "beacon", "comet", "cricket", "dolphin", "falcon", "fern",
+    "harbor", "heron", "lantern", "lemon", "maple", "meadow", "noodle", "olive", "orbit", "otter",
+    "panda", "pebble", "pepper", "piano", "pixel", "quartz", "rocket", "saffron", "sparrow",
+    "tiger", "toast", "topaz", "tulip", "turtle", "violet", "walnut", "willow", "yak", "zebra",
+    "zephyr", "zinnia",
+];
+fn generate_name(taken: &[Session]) -> String {
+    for attempt in 0..64u32 {
+        let bits = Uuid::new_v4().as_u128();
+        let adjective = ADJECTIVES[(bits as usize) % ADJECTIVES.len()];
+        let noun = NOUNS[((bits >> 32) as usize) % NOUNS.len()];
+        let name = if attempt < 32 {
+            format!("{adjective}-{noun}")
+        } else {
+            format!("{adjective}-{noun}-{}", (bits >> 64) as u16 % 1000)
+        };
+        if !taken.iter().any(|s| s.name == name) {
+            return name;
+        }
+    }
+    format!("session-{}", Uuid::new_v4().simple())
 }
 fn target(cli: &Cli) -> Result<Session> {
     let selector = cli
@@ -305,14 +323,14 @@ pub fn rpc(session: &Session, operation: Value, timeout: Duration) -> Result<Val
     stream.set_write_timeout(Some(timeout))?;
     let request = Request {
         protocol: PROTOCOL,
-        id: session.id.clone(),
+        id: session.name.clone(),
         incarnation: session.incarnation.clone(),
         operation,
     };
     writeln!(stream, "{}", serde_json::to_string(&request)?)?;
     let response = read_frame(stream)?;
     anyhow::ensure!(
-        response["id"] == session.id && response["incarnation"] == session.incarnation,
+        response["id"] == session.name && response["incarnation"] == session.incarnation,
         "runtime identity mismatch"
     );
     if let Some(error) = response.get("error").and_then(Value::as_str) {
@@ -326,7 +344,7 @@ pub fn prepare_process(cli: &Cli) -> Result<()> {
     if let Some(Commands::SessionDaemon { directory }) = &cli.command {
         let launch: Launch = serde_json::from_slice(&fs::read(directory.join("launch.json"))?)?;
         std::env::set_var("OMAR_STATE_DIR", directory);
-        std::env::set_var("OMAR_SESSION_ID", &launch.session.id);
+        std::env::set_var("OMAR_SESSION_ID", &launch.session.name);
         std::env::set_var("OMAR_TMUX_SERVER", &launch.session.tmux_server);
         std::env::set_var("OMARC_BIN", directory.join("bin/omarc"));
         std::env::remove_var("TMUX");
@@ -362,7 +380,7 @@ fn prepare_dashboard(cli: &Cli, session: Session) -> Result<()> {
         cli.ea.is_some() || (cli.session.is_none() && std::env::var_os("OMAR_EA_ID").is_some());
     let ea = ea::resolve_ea_selector(&session.directory, Some(&ea_selector(cli)))?;
     std::env::set_var("OMAR_STATE_DIR", &session.directory);
-    std::env::set_var("OMAR_SESSION_ID", &session.id);
+    std::env::set_var("OMAR_SESSION_ID", &session.name);
     std::env::set_var("OMAR_TMUX_SERVER", &session.tmux_server);
     std::env::set_var("OMARC_BIN", session.directory.join("bin/omarc"));
     let running = dashboard_running(&session);
@@ -450,7 +468,7 @@ fn relaunch_dashboard(
             .args([
                 "attach",
                 "-s",
-                &session.id,
+                &session.name,
                 "--tui",
                 "--ea",
                 &ea.to_string(),
@@ -562,16 +580,19 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
         "a new session starts with EA 0; create more with omar --session <session> ea create"
     );
     let _lock = RegistryLock::acquire()?;
-    let id = format!("s-{}", Uuid::new_v4().simple());
-    let name = options.name.unwrap_or_else(|| id.clone());
-    validate_name(&name)?;
-    anyhow::ensure!(
-        !discover()?
-            .iter()
-            .any(|s| s.name == name && !matches!(s.state.as_str(), "stopped" | "stale" | "failed")),
-        "session name '{name}' is already in use"
-    );
-    let directory = home_root().join("sessions").join(&id);
+    let existing = discover()?;
+    let name = match options.name {
+        Some(name) => {
+            validate_name(&name)?;
+            anyhow::ensure!(
+                !existing.iter().any(|s| s.name == name),
+                "session '{name}' already exists; omar rm -s {name} removes a stopped one"
+            );
+            name
+        }
+        None => generate_name(&existing),
+    };
+    let directory = home_root().join("sessions").join(&name);
     private_dir(&directory)?;
     private_dir(&directory.join("bin"))?;
     private_dir(&directory.join("logs"))?;
@@ -617,10 +638,9 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
     config.metrics.spawn_metrics_enabled |= cli.spawn_metrics;
     fs::write(directory.join("config.toml"), toml::to_string(&config)?)?;
     // Short private socket paths also work on macOS's 104-byte Unix path limit.
-    let socket = crate::paths::private_temp_dir()?.join(format!("{}.sock", &id[..18]));
+    let socket = crate::paths::private_temp_dir()?.join(format!("{name}.sock"));
     let mut session = Session {
-        id: id.clone(),
-        name,
+        name: name.clone(),
         protocol: PROTOCOL,
         incarnation: Uuid::new_v4().to_string(),
         state: "starting".into(),
@@ -632,7 +652,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
         source_executable,
         version: env!("CARGO_PKG_VERSION").into(),
         build_id,
-        tmux_server: format!("omar-{id}"),
+        tmux_server: format!("omar-{name}"),
     };
     write_json(
         &directory.join("launch.json"),
@@ -951,7 +971,7 @@ async fn daemon(directory: &Path) -> Result<()> {
     session.pid = std::process::id();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let saved = fs::read(registry().join(format!("{}.json", session.id)))
+        let saved = fs::read(registry().join(format!("{}.json", session.name)))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Session>(&bytes).ok());
         if saved.is_some_and(|s| s.pid == session.pid && s.incarnation == session.incarnation) {
@@ -1026,7 +1046,7 @@ async fn daemon(directory: &Path) -> Result<()> {
                     let result = request.and_then(|request| {
                         anyhow::ensure!(
                             request.protocol == PROTOCOL
-                                && request.id == record.id
+                                && request.id == record.name
                                 && request.incarnation == record.incarnation,
                             "session identity/protocol mismatch"
                         );
@@ -1041,10 +1061,10 @@ async fn daemon(directory: &Path) -> Result<()> {
                     }
                     let response = match result {
                         Ok(value) => {
-                            json!({"id":record.id,"incarnation":record.incarnation,"result":value})
+                            json!({"id":record.name,"incarnation":record.incarnation,"result":value})
                         }
                         Err(error) => {
-                            json!({"id":record.id,"incarnation":record.incarnation,"error":format!("{error:#}")})
+                            json!({"id":record.name,"incarnation":record.incarnation,"error":format!("{error:#}")})
                         }
                     };
                     let _ = writeln!(stream, "{response}");
@@ -1083,7 +1103,7 @@ async fn daemon(directory: &Path) -> Result<()> {
     publish(&session)?;
     if !launch.checkpoint {
         // Like a tmux session: once it is over, nothing is left to list.
-        let _ = fs::remove_file(registry().join(format!("{}.json", session.id)));
+        let _ = fs::remove_file(registry().join(format!("{}.json", session.name)));
         let _ = fs::remove_dir_all(directory);
     }
     Ok(())
@@ -1092,7 +1112,7 @@ async fn daemon(directory: &Path) -> Result<()> {
 fn wait_stopped(session: &Session, timeout: Duration) -> Result<Session> {
     let deadline = Instant::now() + timeout;
     loop {
-        let saved: Session = match fs::read(registry().join(format!("{}.json", session.id))) {
+        let saved: Session = match fs::read(registry().join(format!("{}.json", session.name))) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             // Gone: a session without a checkpoint removed itself on shutdown.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1108,7 +1128,7 @@ fn wait_stopped(session: &Session, timeout: Duration) -> Result<Session> {
         anyhow::ensure!(
             Instant::now() < deadline,
             "shutdown is still pending; inspect omar info -s {} or explicitly use down --force",
-            session.id
+            session.name
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -1123,8 +1143,8 @@ fn print_started(session: &Session, json_output: bool) -> Result<()> {
         return print_value(json!(session));
     }
     println!(
-        "Started session {} ({})\nURL:    {}\nTUI:    omar attach -s {} --tui\nWeb:    omar attach -s {} --web\nStop:   omar down -s {}",
-        session.name, session.id, session.url, session.id, session.id, session.id
+        "Started session {}\nURL:    {}\nTUI:    omar attach -s {} --tui\nWeb:    omar attach -s {} --web\nStop:   omar down -s {}",
+        session.name, session.url, session.name, session.name, session.name
     );
     Ok(())
 }
@@ -1176,15 +1196,15 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             if options.web { crate::open_browser(&s.url); }
             if options.tui {
                 // A fresh process attaches: the dashboard selects its session before Tokio starts.
-                let error = Command::new(std::env::current_exe()?).args(["attach", "-s", &s.id, "--tui"]).exec();
+                let error = Command::new(std::env::current_exe()?).args(["attach", "-s", &s.name, "--tui"]).exec();
                 bail!("failed to attach: {error}");
             }
             Ok(())
         }),
         Some(Commands::Ls) => discover().and_then(|sessions| {
             if cli.json { return print_value(json!(sessions)); }
-            println!("{:<20} {:<12} {:<26} BUILD / ID", "NAME", "STATUS", "URL");
-            for s in sessions { println!("{:<20} {:<12} {:<26} {} {} {}",s.name,s.state,s.url,s.version,&s.build_id[..12.min(s.build_id.len())],s.id); }
+            println!("{:<20} {:<12} {:<26} BUILD", "NAME", "STATUS", "URL");
+            for s in sessions { println!("{:<20} {:<12} {:<26} {} {}",s.name,s.state,s.url,s.version,&s.build_id[..12.min(s.build_id.len())]); }
             Ok(())
         }),
         Some(Commands::Info) => target(cli).and_then(|s| {
@@ -1201,6 +1221,13 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             let mut command = Command::new("tail"); command.arg("-n").arg(tail.to_string());
             if *follow { command.arg("-f"); }
             anyhow::ensure!(command.arg(s.directory.join("logs/runtime.log")).status()?.success(),"reading logs failed"); Ok(())
+        }),
+        Some(Commands::Rm) => target(cli).and_then(|s| {
+            anyhow::ensure!(matches!(s.state.as_str(), "stopped" | "failed" | "stale"), "session '{}' is {}; stop it first", s.name, s.state);
+            let _ = Command::new("tmux").args(["-L", &s.tmux_server, "kill-server"]).output();
+            let _ = fs::remove_file(registry().join(format!("{}.json", s.name)));
+            fs::remove_dir_all(&s.directory).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })?;
+            if cli.json { print_value(json!({"name": s.name, "removed": true})) } else { println!("Removed session {}", s.name); Ok(()) }
         }),
         Some(Commands::Down { force, timeout }) => target(cli).and_then(|s| {
             if s.state == "stopped" { return Ok(()); }
@@ -1219,7 +1246,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
                 }
                 Err(_) if cli.session.is_none() && std::env::var_os("OMAR_SESSION_ID").is_none() => {
                     let s = launch(cli, UpOptions { no_ea: true, checkpoint: options.checkpoint, ..UpOptions::default() }, false)?;
-                    if !cli.json { eprintln!("Started session {} ({}); omar down -s {} stops it", s.name, s.id, s.id); }
+                    if !cli.json { eprintln!("Started session {}; omar down -s {} stops it", s.name, s.name); }
                     (s, true)
                 }
                 Err(error) => return Err(error),
@@ -1228,7 +1255,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             for input in &options.inputs { anyhow::ensure!(input.contains('='), "input must be NAME=VALUE"); }
             let body=json!({"program":fs::read_to_string(&options.program)?,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast});
             let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
-            if owned { run["session_id"] = json!(s.id); }
+            if owned { run["session"] = json!(s.name); }
             // One structured result: the admission record, or with --wait the terminal record.
             if !options.wait { return print_value(run); }
             let state = loop {

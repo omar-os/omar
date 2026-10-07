@@ -225,7 +225,7 @@ run_case() {
   # Teardown persists pane transcripts; keep them with the case results. The
   # run created its own session, named on stderr, and shut it down afterwards.
   local session_id
-  session_id=$(grep -o 'Started session [^ ]* (s-[0-9a-f]*)' "$log" | sed 's/.*(\(s-[0-9a-f]*\))/\1/' | tail -1)
+  session_id=$(grep -o 'Started session [^ ;]*' "$log" | awk '{print $3}' | tail -1)
   [[ -n $session_id ]] && cp -R "$HOME/.omar/sessions/$session_id/ea/0/topologies/$team/logs" "$results_dir/$name-agents" 2>/dev/null || true
 
   if grep -Fq "Topology '$team' completed" "$log"; then
