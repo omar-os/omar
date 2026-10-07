@@ -1,5 +1,6 @@
 "use client";
 
+import type { ReactNode } from "react";
 import type { CheckpointDetail, CheckpointSummary, TimelineStep } from "./lib/runtime-client";
 import { formatDuration } from "./lib/protocol";
 
@@ -23,11 +24,13 @@ import { formatDuration } from "./lib/protocol";
  *
  * Checkpoints live on the same strip, because a checkpoint is a tag: the state
  * after that tag completed, with every instance's files as they were. A green
- * mark sits where one was taken; clicking it previews what it holds, and a
- * paused run can be rolled back to it from there. Rolling back is choosing a
- * tag to continue from, which is why it belongs on the timeline and not in a
- * list — the same determinism that lets the strip predict what will happen is
- * what makes "continue from here" a precise instruction.
+ * tick stands on the track where one was taken; it grows under the pointer,
+ * and clicking it previews what it holds, from where a paused run can be
+ * rolled back to it. Rolling back is choosing a tag to continue from, which
+ * is why it belongs on the timeline and not in a list — the same determinism
+ * that lets the strip predict what will happen is what makes "continue from
+ * here" a precise instruction. Pause, Stop and Resume sit here for the same
+ * reason: they act on where the run is on this strip.
  */
 export function Timeline({
   steps,
@@ -40,6 +43,7 @@ export function Timeline({
   detail = null,
   canRollBack = false,
   rollBackHint,
+  controls,
   onSelectCheckpoint,
   onRollBack,
   onScrub,
@@ -64,6 +68,8 @@ export function Timeline({
   canRollBack?: boolean;
   /** Why it cannot, when it cannot. */
   rollBackHint?: string;
+  /** Pause, Stop, Resume: the run's own controls, rendered beside the strip. */
+  controls?: ReactNode;
   onSelectCheckpoint?: (id: string | null) => void;
   onRollBack?: (id: string) => void;
   onScrub: (index: number) => void;
@@ -92,20 +98,7 @@ export function Timeline({
         : tag
           ? Math.min(1, tag[0] / furthest)
           : 0;
-    return { checkpoint, at, fraction, order };
-  });
-  // Marks closer than this fraction of the rail would cover each other, and a
-  // covered mark cannot be clicked; such a mark drops to the next row.
-  const spacing = 0.05;
-  const rows: number[][] = [];
-  const rowOf = placed.map(({ fraction }) => {
-    let row = rows.findIndex((taken) => taken.every((f) => Math.abs(f - fraction) >= spacing));
-    if (row < 0) {
-      row = rows.length;
-      rows.push([]);
-    }
-    rows[row].push(fraction);
-    return row;
+    return { checkpoint, at, fraction };
   });
   const tagLabel = (tag: [number, number] | null) =>
     tag ? `${formatDuration(tag[0])}:${tag[1]}` : "start";
@@ -131,35 +124,33 @@ export function Timeline({
             disabled={steps.length === 0}
             onChange={(event) => onScrub(Number(event.target.value))}
           />
-          {/* Checkpoint marks, on the rail at the tag each one completed. */}
-          <div
-            className="timeline-marks"
-            aria-label="Checkpoints"
-            style={{ height: `${Math.max(1, rows.length) * 12}px` }}
-          >
-            {placed.map(({ checkpoint, at, fraction, order }) => {
-                const isResume = checkpoint.id === resumePoint;
-                const isSelected = checkpoint.id === selected;
-                return (
-                  <button
-                    key={checkpoint.id}
-                    type="button"
-                    className={
-                      "timeline-mark" +
-                      (isResume ? " resume" : "") +
-                      (isSelected ? " selected" : "")
-                    }
-                    style={{ left: `${fraction * 100}%`, top: `${rowOf[order] * 12}px` }}
-                    aria-label={`Checkpoint #${checkpoint.sequence}`}
-                    aria-pressed={isSelected}
-                    title={`#${checkpoint.sequence} ${checkpoint.trigger} · after ${tagLabel(checkpoint.completed_tag)}${isResume ? " · resume point" : ""}`}
-                    onClick={() => {
-                      if (at >= 0) onScrub(at);
-                      onSelectCheckpoint?.(isSelected ? null : checkpoint.id);
-                    }}
-                  />
-                );
-              })}
+          {/* Checkpoint ticks, standing on the track at the tag each one
+              completed. The slider thumb is 16px wide, so the track's usable
+              span is the rail minus one thumb, offset by half of it. */}
+          <div className="timeline-ticks" aria-label="Checkpoints">
+            {placed.map(({ checkpoint, at, fraction }) => {
+              const isResume = checkpoint.id === resumePoint;
+              const isSelected = checkpoint.id === selected;
+              return (
+                <button
+                  key={checkpoint.id}
+                  type="button"
+                  className={
+                    "timeline-tick" +
+                    (isResume ? " resume" : "") +
+                    (isSelected ? " selected" : "")
+                  }
+                  style={{ left: `calc(${fraction} * (100% - 16px) + 8px)` }}
+                  aria-label={`Checkpoint #${checkpoint.sequence}`}
+                  aria-pressed={isSelected}
+                  title={`Checkpoint #${checkpoint.sequence} · ${checkpoint.trigger} · after ${tagLabel(checkpoint.completed_tag)}${isResume ? " · resume point" : ""}`}
+                  onClick={() => {
+                    if (at >= 0) onScrub(at);
+                    onSelectCheckpoint?.(isSelected ? null : checkpoint.id);
+                  }}
+                />
+              );
+            })}
           </div>
         </div>
         <button
@@ -173,6 +164,7 @@ export function Timeline({
         <button type="button" className="timeline-close" onClick={onClose}>
           Hide
         </button>
+        {controls}
       </div>
 
       <div className="timeline-readout">
@@ -205,26 +197,8 @@ export function Timeline({
         )}
         {checkpoints.length > 0 ? (
           <span className="timeline-checkpoints">
-            {checkpoints.length} checkpoint{checkpoints.length > 1 ? "s" : ""}:
-            {checkpoints.map((checkpoint) => (
-              <button
-                key={checkpoint.id}
-                type="button"
-                className={
-                  "timeline-checkpoint-chip" +
-                  (checkpoint.id === resumePoint ? " resume" : "") +
-                  (checkpoint.id === selected ? " selected" : "")
-                }
-                onClick={() => {
-                  const at = placed.find((p) => p.checkpoint.id === checkpoint.id)?.at ?? -1;
-                  if (at >= 0) onScrub(at);
-                  onSelectCheckpoint?.(checkpoint.id === selected ? null : checkpoint.id);
-                }}
-              >
-                #{checkpoint.sequence} · {tagLabel(checkpoint.completed_tag)}
-                {checkpoint.id === resumePoint ? " ✓" : ""}
-              </button>
-            ))}
+            {checkpoints.length} checkpoint{checkpoints.length > 1 ? "s" : ""} on the track
+            {resumePoint ? " · ringed: resume point" : ""}
           </span>
         ) : null}
       </div>

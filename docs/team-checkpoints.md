@@ -57,11 +57,13 @@ keeps its id and comes back `running` with a new diagram address),
 (preview: tag, queue, outputs, state, per-instance file versions), and
 `POST /v1/runs/<id>/rollback {"checkpoint": ID}` for a paused run.
 
-Mission Control: Pause beside Stop while a run is live; Resume once paused.
-Rollback lives on the timeline: each checkpoint is a green mark at the tag it
-completed (the diagram stream announces `run_checkpointed` as they land);
-clicking one scrubs to that tag and opens a preview of what it holds; a
-paused run commits with "Roll back to this checkpoint" from that preview.
+Mission Control: Pause, Stop and Resume live on the timeline bar at the
+bottom, folded or open, because they act on where the run is on its logical
+timeline. Each checkpoint is a green tick on the timeline track at the tag it
+completed (the diagram stream announces `run_checkpointed` as they land); it
+grows under the pointer, and clicking it scrubs to that tag and opens a
+preview of what it holds; a paused run commits with "Roll back to this
+checkpoint" from that preview.
 `GET /v1/runs/<id>/timeline` projects a run's strip from its staged bytecode
 and admitted inputs, so it exists without a draft behind it.
 The live diagram reports `paused`. A resumed daemon run uses the default

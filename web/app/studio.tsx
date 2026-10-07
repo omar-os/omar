@@ -956,6 +956,55 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const shownDetail =
     selectedCheckpoint && checkpointDetail?.id === selectedCheckpoint ? checkpointDetail : null;
 
+  // Pause, Stop and Resume act on the run's timeline — a pause lands at a tag
+  // boundary, a resume continues from a checkpointed tag — so they live with
+  // the strip rather than in the heading, and stay reachable when it is folded.
+  const runControls =
+    (phase === "observing" && run) || (isPaused && run) ? (
+      <span className="run-controls" role="group" aria-label="Run controls">
+        {isPaused && run ? (
+          <button
+            className="primary-button"
+            onClick={() => void requestResume()}
+            type="button"
+            title="Restores the resume point's files and agents, then continues the queue"
+          >
+            Resume
+          </button>
+        ) : null}
+        {phase === "observing" && run ? (
+          <button
+            className="secondary-button"
+            onClick={() => void requestPause()}
+            type="button"
+            disabled={isStopping || isPausing}
+            title={
+              isPausing
+                ? "The current tag has to close first"
+                : "Checkpoints at the next tag boundary, then parks the run"
+            }
+          >
+            {isPausing ? "Pausing…" : "Pause"}
+          </button>
+        ) : null}
+        {phase === "observing" && run ? (
+          <button
+            className="secondary-button"
+            onClick={() => void requestStop()}
+            type="button"
+            disabled={isStopping || isPausing}
+            title={
+              isStopping
+                ? "The current tag has to close first"
+                : "Closes the current tag, then persists and tears down"
+            }
+          >
+            {isStopping ? "Stopping…" : "Stop"}
+          </button>
+        ) : null}
+      </span>
+    ) : null;
+
   // Widths are clamped against the workspace so the diagram always keeps a
   // usable column, whichever divider is being dragged. Below a panel's minimum
   // the drag collapses it rather than leaving a sliver.
@@ -1182,7 +1231,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               <span><small>TAG</small>{tag}</span>
               <span><small>LAG</small>{lag}</span>
             </div>
-            {(phase === "review" && design) || (phase === "observing" && run) || (isPaused && run) ? (
+            {phase === "review" && design ? (
             <div className="workflow-actions">
               {phase === "review" && design ? (
                 <span role="group" aria-label="Deploy design">
@@ -1199,46 +1248,6 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                     Deploy
                   </button>
                 </span>
-              ) : null}
-              {isPaused && run ? (
-                <button
-                  className="primary-button"
-                  onClick={() => void requestResume()}
-                  type="button"
-                  title="Restores the resume point's files and agents, then continues the queue"
-                >
-                  Resume
-                </button>
-              ) : null}
-              {phase === "observing" && run ? (
-                <button
-                  className="secondary-button"
-                  onClick={() => void requestPause()}
-                  type="button"
-                  disabled={isStopping || isPausing}
-                  title={
-                    isPausing
-                      ? "The current tag has to close first"
-                      : "Checkpoints at the next tag boundary, then parks the run"
-                  }
-                >
-                  {isPausing ? "Pausing…" : "Pause"}
-                </button>
-              ) : null}
-              {phase === "observing" && run ? (
-                <button
-                  className="secondary-button"
-                  onClick={() => void requestStop()}
-                  type="button"
-                  disabled={isStopping || isPausing}
-                  title={
-                    isStopping
-                      ? "The current tag has to close first"
-                      : "Closes the current tag, then persists and tears down"
-                  }
-                >
-                  {isStopping ? "Stopping…" : "Stop"}
-                </button>
               ) : null}
             </div>
             ) : null}
@@ -1261,6 +1270,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               index={stepIndex}
               live={following && phase === "observing"}
               truncated={truncated}
+              controls={runControls}
               checkpoints={runId ? checkpoints : []}
               resumePoint={runId ? resumePoint : null}
               selected={selectedCheckpoint}
@@ -1284,13 +1294,16 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               onClose={() => setTimelineOpen(false)}
             />
           ) : (
-            <button
-              type="button"
-              className="timeline-handle"
-              onClick={() => setTimelineOpen(true)}
-            >
-              ▲ Timeline
-            </button>
+            <div className="timeline-handle-bar">
+              <button
+                type="button"
+                className="timeline-handle"
+                onClick={() => setTimelineOpen(true)}
+              >
+                ▲ Timeline
+              </button>
+              {runControls}
+            </div>
           )}
         </section>
         ) : null}

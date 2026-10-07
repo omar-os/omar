@@ -714,8 +714,10 @@ test("the workflow's buttons sit with the workflow", async ({ page }) => {
 test("a run can be paused and resumed from the panel that shows it", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);
-  const actions = page.locator(".diagram-heading .workflow-actions");
-  await expect(actions.getByRole("button", { name: "Pause" })).toHaveCount(0);
+  // The run's controls live with its timeline, not in the heading: a pause
+  // lands at a tag, a resume continues from one. Before a run, none.
+  const actions = page.getByRole("group", { name: "Run controls" });
+  await expect(actions).toHaveCount(0);
 
   await deploy(page);
   const pause = actions.getByRole("button", { name: "Pause" });
@@ -738,6 +740,7 @@ test("a run can be paused and resumed from the panel that shows it", async ({ pa
   // preview is where "continue from here" is committed.
   await page.getByRole("button", { name: "▲ Timeline" }).click();
   const timeline = page.getByLabel("Logical timeline");
+  // Ticks stand on the track itself, one per checkpoint.
   await expect(timeline.getByLabel("Checkpoints").getByRole("button")).toHaveCount(2);
   await timeline.getByRole("button", { name: "Checkpoint #1" }).click();
   const preview = timeline.getByLabel("Checkpoint preview");
@@ -752,7 +755,7 @@ test("a run can be paused and resumed from the panel that shows it", async ({ pa
   await expect(timeline.getByLabel("Checkpoints").getByRole("button")).toHaveCount(2);
 
   await resume.click();
-  // Back to a live run, with its controls.
+  // Back to a live run, with its controls beside the open timeline.
   await expect(actions.getByRole("button", { name: "Pause" })).toBeEnabled();
   await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
   await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
@@ -766,7 +769,8 @@ test("a run can be stopped from the panel that shows it", async ({ page }) => {
 
   // The eyebrow says which topology is on screen: this one has not run.
   await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("PROPOSED TOPOLOGY");
-  const actions = page.locator(".diagram-heading .workflow-actions");
+  // Stop belongs to the run's timeline, where a stop lands on a tag.
+  const actions = page.getByRole("group", { name: "Run controls" });
   await expect(actions.getByRole("button", { name: "Stop" })).toHaveCount(0);
 
   await deploy(page);

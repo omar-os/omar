@@ -1676,72 +1676,104 @@ h2 {
   accent-color: var(--purple);
 }
 
-/* The slider and, under it, a mark wherever a checkpoint was taken. */
+/* The slider, with a tick standing on its track wherever a checkpoint was
+   taken. The ticks overlay the input; each is its own button. */
 .timeline-rail {
   position: relative;
   flex: 1;
   min-width: 0;
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  height: 28px;
 }
 
 .timeline-rail input[type="range"] {
   width: 100%;
 }
 
-.timeline-marks {
-  position: relative;
-  height: 12px;
-  margin: 2px 8px 0;
-}
-
-.timeline-mark {
+.timeline-ticks {
   position: absolute;
-  top: 0;
-  width: 10px;
-  height: 10px;
-  margin-left: -5px;
-  padding: 0;
-  border: 1.5px solid #2f9e5f;
-  border-radius: 50%;
-  background: #4cc37a;
-  cursor: pointer;
+  inset: 0;
+  pointer-events: none;
 }
 
-.timeline-mark.resume {
+.timeline-tick {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 12px;
+  margin-left: -1.5px;
+  padding: 0;
+  border: 0;
+  border-radius: 1.5px;
+  background: #4cc37a;
+  transform: translateY(-50%);
+  transition: height 120ms ease, width 120ms ease, background 120ms ease;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.timeline-tick:hover,
+.timeline-tick:focus-visible {
+  height: 24px;
+  width: 4px;
+  margin-left: -2px;
+  background: #7ef0a6;
+  z-index: 2;
+  outline: none;
+}
+
+.timeline-tick.resume {
   box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 3.5px #4cc37a;
 }
 
-.timeline-mark.selected {
-  transform: scale(1.35);
+.timeline-tick.selected {
+  height: 24px;
+  width: 4px;
+  margin-left: -2px;
   background: #7ef0a6;
+  z-index: 1;
 }
 
 .timeline-checkpoints {
+  margin-left: auto;
+  color: #7ef0a6;
+}
+
+/* Pause, Stop and Resume ride with the strip, folded or not. */
+.run-controls {
   display: inline-flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  margin-left: auto;
+  margin-left: 6px;
 }
 
-.timeline-checkpoint-chip {
-  border: 1px solid #2f9e5f;
-  border-radius: 999px;
-  background: transparent;
-  color: #7ef0a6;
-  font-size: 10.5px;
-  padding: 1px 8px;
-  cursor: pointer;
+.run-controls .primary-button,
+.run-controls .secondary-button {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 11px;
+  white-space: nowrap;
 }
 
-.timeline-checkpoint-chip.resume {
-  background: rgba(76, 195, 122, 0.18);
+.run-controls .secondary-button:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
-.timeline-checkpoint-chip.selected {
-  border-color: #7ef0a6;
-  color: #fff;
+.timeline-handle-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  padding-right: 10px;
+}
+
+.timeline-handle-bar .timeline-handle {
+  border-top: 0;
+  flex: 1;
 }
 
 .timeline-preview {
