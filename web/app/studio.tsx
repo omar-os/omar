@@ -927,7 +927,6 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               </button>
             </div>
           ) : null}
-          {!isDemo ? <div className="workspace-file-action"><button className="secondary-button" disabled={switchingChat || daemon.state !== "live"} onClick={() => setFilesOpen(true)}>Files & versions</button></div> : null}
           <div className="messages" ref={threadRef}>
             {messages.length === 0 && snapshot ? (
               <p className="builder-status">
@@ -1005,6 +1004,17 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                     aria-haspopup="dialog"
                   >
                     Inspect on terminal
+                  </button>
+                ) : null}
+                {!isDemo ? (
+                  <button
+                    type="button"
+                    className="terminal-button"
+                    onClick={() => setFilesOpen(true)}
+                    disabled={switchingChat || daemon.state !== "live"}
+                    aria-haspopup="dialog"
+                  >
+                    Files & versions
                   </button>
                 ) : null}
               </div>

@@ -1390,6 +1390,14 @@ test("the assistant terminal remains available before and after a topology opens
   const inspect = page.getByRole("button", { name: "Inspect on terminal" });
   await expect(inspect).toBeEnabled();
   await expect(page.locator(".composer-tools").getByRole("button", { name: "Inspect on terminal" })).toBeVisible();
+  // Files & versions sits beside it, in the same row and at the same height.
+  const files = page.locator(".composer-tools").getByRole("button", { name: "Files & versions" });
+  await expect(files).toBeEnabled();
+  const inspectBounds = (await inspect.boundingBox())!;
+  const filesBounds = (await files.boundingBox())!;
+  expect(filesBounds.y).toBe(inspectBounds.y);
+  expect(filesBounds.height).toBe(inspectBounds.height);
+  expect(filesBounds.x).toBeGreaterThan(inspectBounds.x);
   await expect(page.locator(".topbar, .panel-heading, .history-footnote")).toHaveCount(0);
   await expect(page.getByRole("img", { name: "Omar", exact: true })).toBeVisible();
   const backendBounds = (await page.locator(".backend-trigger").boundingBox())!;
