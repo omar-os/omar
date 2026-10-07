@@ -32,6 +32,9 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
     def cli(*args, ok=True, context=None):
         result = subprocess.run([str(BIN), *args], cwd=root, env=context or env,
                                 text=True, capture_output=True, timeout=90)
+        if ok and result.returncode != 0 and "runtime.log" in result.stderr:
+            log = Path(result.stderr.split("see ", 1)[1].strip())
+            if log.exists(): print("runtime.log:", log.read_text()[-2000:])
         assert (result.returncode == 0) == ok, (args, result.stdout, result.stderr)
         return result.stdout if ok else result.stderr
 
@@ -118,6 +121,14 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         kept = up("kept", checkpoint=True)
         cli("down", "-s", "kept")
         assert info("kept")["session"]["state"] == "stopped" and Path(kept["directory"]).is_dir()
+        # rm frees a stopped session's name; on a running one only --force does, taking it down first.
+        cli("rm", "-s", "kept")
+        assert not Path(kept["directory"]).exists() and "kept" not in {s["name"] for s in json.loads(cli("ls", "--json"))}
+        doomed = up("doomed", checkpoint=True)
+        assert "rm --force" in cli("rm", "-s", "doomed", ok=False)
+        cli("rm", "-s", "doomed", "--force")
+        assert not Path(doomed["directory"]).exists() and "doomed" not in {s["name"] for s in json.loads(cli("ls", "--json"))}
+        sessions.remove(doomed)
         # Foreground serve honours --json for its startup record.
         foreground = subprocess.Popen([str(BIN), "--json", "serve", "--name", "fg", "--no-ea"], cwd=root, env=env,
                                       text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)

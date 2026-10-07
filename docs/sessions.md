@@ -11,7 +11,7 @@ session. TUI/browser clients can disconnect without stopping any workload.
 | `omar up [--name NAME] [--web] [--tui] [--checkpoint]` | Create a new session; return after readiness; `--web` opens Mission Control, `--tui` attaches the terminal dashboard; `--checkpoint` keeps its state after it stops |
 | `omar up --workdir PATH --no-ea` | Start without launching an assistant |
 | `omar ls [--json]` | List sessions, health, URL, and exact executable build; a stopped session appears only if it was started with `--checkpoint` |
-| `omar rm -s SESSION` | Remove a stopped session's record and state |
+| `omar rm -s SESSION [--force]` | Remove a stopped session's record and state; `--force` takes a running one down first, like `docker rm -f` |
 | `omar info -s SESSION` | Inspect session, EAs, agents, and runs |
 | `omar logs -s SESSION [--follow] [--tail N]` | Read runtime log |
 | `omar attach -s SESSION --tui [--ea EA]` | Terminal dashboard as a client of that session, inside its tmux server; z detaches, Q stops the session |

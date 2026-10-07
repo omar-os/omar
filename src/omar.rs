@@ -141,7 +141,11 @@ enum Commands {
         tail: usize,
     },
     /// Remove a stopped session's record and state
-    Rm,
+    Rm {
+        /// Take a running session down first, like `docker rm -f`
+        #[arg(long)]
+        force: bool,
+    },
     /// Shut down one runtime and its owned workloads
     Down {
         #[arg(long)]
@@ -439,7 +443,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Attach { .. }
             | Commands::Logs { .. }
             | Commands::Down { .. }
-            | Commands::Rm
+            | Commands::Rm { .. }
             | Commands::Run(_)
             | Commands::Runs { .. }
             | Commands::SessionDaemon { .. }

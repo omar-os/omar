@@ -1222,8 +1222,14 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             if *follow { command.arg("-f"); }
             anyhow::ensure!(command.arg(s.directory.join("logs/runtime.log")).status()?.success(),"reading logs failed"); Ok(())
         }),
-        Some(Commands::Rm) => target(cli).and_then(|s| {
-            anyhow::ensure!(matches!(s.state.as_str(), "stopped" | "failed" | "stale"), "session '{}' is {}; stop it first", s.name, s.state);
+        Some(Commands::Rm { force }) => target(cli).and_then(|s| {
+            if !matches!(s.state.as_str(), "stopped" | "failed" | "stale") {
+                // A running session is only removed on request, and then it
+                // goes down the forced way: its work is not waited for.
+                anyhow::ensure!(*force, "session '{}' is {}; omar down -s {} first, or rm --force", s.name, s.state, s.name);
+                rpc(&s, json!({"op":"down","force":true}), Duration::from_secs(10))?;
+                wait_stopped(&s, Duration::from_secs(30))?;
+            }
             let _ = Command::new("tmux").args(["-L", &s.tmux_server, "kill-server"]).output();
             let _ = fs::remove_file(registry().join(format!("{}.json", s.name)));
             fs::remove_dir_all(&s.directory).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })?;
