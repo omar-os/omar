@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use crossterm::{
     event::{
         KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -227,20 +227,6 @@ enum Commands {
     /// Configure tmux for optimal omar experience
     SetupTmux,
 
-    /// Start or interact with the manager agent
-    #[command(arg_required_else_help = true)]
-    Manager {
-        /// Manager action (start, orchestrate)
-        #[command(subcommand)]
-        action: Option<ManagerAction>,
-    },
-
-    /// Manage scheduled events for the target EA
-    Event {
-        #[command(subcommand)]
-        action: EventAction,
-    },
-
     /// Restore authoritative coordination state to a backend lifecycle hook.
     AgentHook {
         #[arg(long)]
@@ -321,16 +307,8 @@ enum WorkspaceAction {
     Restore { id: String, snapshot: String },
 }
 
-#[derive(Subcommand)]
-enum ManagerAction {
-    /// Start the manager session
-    Start,
-    /// Run in orchestration mode (interactive)
-    Orchestrate,
-}
-
-#[derive(Subcommand)]
-enum EventAction {
+#[derive(Subcommand, Debug)]
+pub(crate) enum EventAction {
     /// Schedule an event for an agent or the EA
     Schedule {
         /// Receiver name ("ea" for the manager)
@@ -396,7 +374,8 @@ fn open_browser(url: &str) {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::from_arg_matches(&Cli::command().help_template(help_template()).get_matches())
+        .unwrap_or_else(|error| error.exit());
     sessions::prepare_process(&cli)?;
     // Install the persisted-panic hook FIRST, before tokio builds its
     // runtime (and spawns worker threads). If the tmux parent dies it
@@ -460,7 +439,6 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Down { .. }
             | Commands::Run(_)
             | Commands::Runs { .. }
-            | Commands::Ea { .. }
             | Commands::SessionDaemon { .. }
             | Commands::SessionExec { .. }
             | Commands::Serve { .. },
@@ -549,8 +527,9 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             status_deployment(&omar_dir, target.id, &deployment)
         }
         Some(Commands::SetupTmux) => setup_tmux(),
-        Some(Commands::Manager { .. }) => unreachable!("manager commands go through the runtime"),
-        Some(Commands::Event { action }) => {
+        Some(Commands::Ea {
+            action: sessions::EaAction::Event { action },
+        }) => {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
             let scheduler =
                 scheduler::Scheduler::with_store(scheduler::events_store_path(&omar_dir));
@@ -580,6 +559,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
                 EventAction::Cancel { id } => cancel_cli_event(&scheduler, target.id, &id),
             }
         }
+        Some(Commands::Ea { .. }) => unreachable!("ea commands go through the runtime"),
         Some(Commands::BackendRunner {
             backend: _,
             config_file,
@@ -647,6 +627,75 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         Some(Commands::StubAgent { context_file }) => stub_agent::run(&context_file),
         None => unreachable!("clap requires a command"),
     }
+}
+
+/// `omar --help` lists commands by what they are for. The last section is
+/// what OMAR launches inside agent panes and hooks; a person never types it.
+const HELP_SECTIONS: &[(&str, &[&str])] = &[
+    (
+        "Sessions",
+        &["up", "ls", "info", "attach", "logs", "down", "serve"],
+    ),
+    (
+        "Topologies",
+        &["run", "runs", "status", "stop", "workspace"],
+    ),
+    (
+        "Executive assistants and agents",
+        &["ea", "spawn", "list", "kill"],
+    ),
+    ("Setup", &["setup-tmux", "help"]),
+    (
+        "For agents (launched by OMAR, not typed)",
+        &["agent-hook", "hook-drain", "backend-runner", "mcp-server"],
+    ),
+];
+
+fn help_template() -> String {
+    let command = Cli::command();
+    let about: std::collections::BTreeMap<String, String> = command
+        .get_subcommands()
+        .filter(|c| !c.is_hide_set())
+        .map(|c| {
+            (
+                c.get_name().to_string(),
+                c.get_about().map(|a| a.to_string()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let width = about.keys().map(String::len).max().unwrap_or(0) + 2;
+    fn section(
+        title: &str,
+        names: &[&str],
+        about: &std::collections::BTreeMap<String, String>,
+        width: usize,
+        listed: &mut std::collections::BTreeSet<String>,
+        out: &mut String,
+    ) {
+        out.push_str(title);
+        out.push_str(":\n");
+        for name in names {
+            if let Some(text) = about.get(*name) {
+                out.push_str(&format!("  {name:<width$}{text}\n"));
+                listed.insert((*name).to_string());
+            }
+        }
+        out.push('\n');
+    }
+    let mut sections = String::new();
+    let mut listed = std::collections::BTreeSet::new();
+    for (title, names) in HELP_SECTIONS {
+        section(title, names, &about, width, &mut listed, &mut sections);
+    }
+    let rest: Vec<&str> = about
+        .keys()
+        .map(String::as_str)
+        .filter(|n| !listed.contains(*n))
+        .collect();
+    if !rest.is_empty() {
+        section("Other", &rest, &about, width, &mut listed, &mut sections);
+    }
+    format!("{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{sections}Options:\n{{options}}{{after-help}}")
 }
 
 fn omar_dir() -> PathBuf {

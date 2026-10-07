@@ -84,7 +84,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         raise AssertionError((text, data[-2000:]))
 
     try:
-        for args in [("--help",), ("event", "--help"), ("workspace", "--help"), ("event", "schedule", "--help")]:
+        for args in [("--help",), ("ea", "--help"), ("workspace", "--help"), ("ea", "event", "schedule", "--help")]:
             cli(*args)
         assert not Path(env["OMAR_HOME"]).exists(), "help wrote runtime state"
         cli("runs", ok=False)
@@ -105,7 +105,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         assert len(info("inner")["eas"]) == 1
         assert len(info("outer")["eas"]) == 2
         # Forwarded operations stay in the daemon and respect compact -s syntax.
-        cli("-sinner", "event", "list")
+        cli("-sinner", "ea", "event", "list")
         # Same-name startup is serialized before either daemon is ready.
         with concurrent.futures.ThreadPoolExecutor() as pool:
             results = list(pool.map(lambda _: subprocess.run([str(BIN), "up", "--name", "race", "--no-ea", "--json"],
@@ -239,7 +239,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         managed = json.loads(cli("-a", "claude", "up", "--name", "assistants", "--json", context=fake_env))
         sessions.append(managed)
         cli("-s", "assistants", "ea", "create", "--name", "Research", "--agent", "claude")
-        cli("-s", "assistants", "--ea", "Research", "manager", "start")
+        cli("-s", "assistants", "ea", "start", "Research")
         owned = info("assistants")
         assert {a["ea_id"] for a in owned["agents"]} == {0, 1}, owned
         for ea_id in (0, 1):

@@ -59,7 +59,7 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
                                         capture_output=True, text=True, timeout=90, check=True).stdout)
     server, state = session['tmux_server'], session['directory']
     try:
-        launched = subprocess.run([OMAR, '-s', session['id'], 'manager', 'start'], cwd=folder, env=env,
+        launched = subprocess.run([OMAR, '-s', session['id'], 'ea', 'start', '0'], cwd=folder, env=env,
                                   capture_output=True, text=True, timeout=120)
         # Non-TTY attach can fail after setup. Inspect the actual channel, not
         # that attach status, and only after the launcher has fully exited.

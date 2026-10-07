@@ -84,12 +84,24 @@ pub struct StartOptions {
 }
 #[derive(Subcommand, Debug)]
 pub enum EaAction {
+    /// List the session's EAs
     List,
+    /// Allocate an independent EA namespace
     Create {
         #[arg(long)]
         name: String,
         #[arg(long)]
         agent: Option<String>,
+    },
+    /// Launch or relaunch an EA's assistant
+    Start {
+        /// EA id or name
+        name: String,
+    },
+    /// Manage the selected EA's scheduled events
+    Event {
+        #[command(subcommand)]
+        action: crate::EventAction,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,9 +340,6 @@ pub fn prepare_process(cli: &Cli) -> Result<()> {
 fn dashboard_target(cli: &Cli) -> Result<Option<Session>> {
     match &cli.command {
         Some(Commands::Attach { tui: true, .. }) => target(cli).map(Some),
-        Some(Commands::Manager {
-            action: Some(crate::ManagerAction::Orchestrate),
-        }) => target(cli).map(Some),
         _ => Ok(None),
     }
 }
@@ -739,7 +748,9 @@ pub fn validate_exec(cli: &Cli) -> Result<()> {
                     | Commands::List { .. }
                     | Commands::Kill { .. }
                     | Commands::Workspace { .. }
-                    | Commands::Event { .. }
+                    | Commands::Ea {
+                        action: EaAction::Event { .. }
+                    }
             )
         ),
         "command cannot be executed as a runtime operation"
@@ -1149,15 +1160,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
     {
         return Some(Err(anyhow::anyhow!("configuration options apply when creating a session; target an existing session without changing its configuration")));
     }
-    if matches!(
-        cli.command,
-        Some(
-            Commands::Attach { tui: true, .. }
-                | Commands::Manager {
-                    action: Some(crate::ManagerAction::Orchestrate)
-                }
-        )
-    ) {
+    if matches!(cli.command, Some(Commands::Attach { tui: true, .. })) {
         return Some(attach_dashboard().await);
     }
     let result = match &cli.command {
@@ -1205,7 +1208,6 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             let saved = wait_stopped(&s, Duration::from_secs(*timeout))?;
             if cli.json { print_value(json!(saved)) } else { println!("Stopped session {}",s.name); Ok(()) }
         }),
-        Some(Commands::Manager { action: None | Some(crate::ManagerAction::Start) }) => target(cli).and_then(|s|rpc(&s,json!({"op":"manager_start","ea":ea_selector(cli)}),Duration::from_secs(120))).and_then(print_value),
         Some(Commands::Run(options)) => (|| {
             // No runtime selected: this run gets a session of its own, shut
             // down again after a --wait run ends.
@@ -1250,15 +1252,20 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         Some(Commands::Runs { all_eas }) => target(cli).and_then(|s|rpc(&s,json!({"op":"runs","ea":ea_selector(cli),"all_eas":all_eas}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Status { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"status","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Stop { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"stop","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
-        Some(Commands::Ea { action }) => target(cli).and_then(|s| {
-            let op=match action { EaAction::List=>json!({"op":"eas"}),EaAction::Create{name,agent}=>json!({"op":"create_ea","name":name,"agent":agent}) };
-            rpc(&s,op,Duration::from_secs(10))
-        }).and_then(print_value),
-        Some(Commands::Spawn{..}|Commands::List{..}|Commands::Kill{..}|Commands::Workspace{..}|Commands::Event{..}) => target(cli).and_then(|s| {
+        Some(Commands::Spawn{..}|Commands::List{..}|Commands::Kill{..}|Commands::Workspace{..}|Commands::Ea{action:EaAction::Event{..}}) => target(cli).and_then(|s| {
             let args=strip_target_args(std::env::args().skip(1));
             let value=rpc(&s,json!({"op":"exec","ea":ea_selector(cli),"cwd":std::env::current_dir()?,"args":args}),Duration::from_secs(120))?;
             if cli.json { print_value(value) } else { print!("{}",value["stdout"].as_str().unwrap_or("")); eprint!("{}",value["stderr"].as_str().unwrap_or("")); Ok(()) }
         }),
+        Some(Commands::Ea { action }) => target(cli).and_then(|s| {
+            let (op, timeout) = match action {
+                EaAction::List => (json!({"op":"eas"}), 10),
+                EaAction::Create{name,agent} => (json!({"op":"create_ea","name":name,"agent":agent}), 10),
+                EaAction::Start{name} => (json!({"op":"manager_start","ea":name}), 120),
+                EaAction::Event{..} => unreachable!("forwarded above"),
+            };
+            rpc(&s,op,Duration::from_secs(timeout))
+        }).and_then(print_value),
         _ if cli.session.is_some() => Err(anyhow::anyhow!("this internal/setup command does not accept --session")),
         _ => return None,
     };
@@ -1272,10 +1279,8 @@ mod tests {
     #[test]
     fn help_is_hierarchical_without_session_resolution() {
         for (group, children) in [
-            ("event", vec!["schedule", "list", "cancel"]),
             ("workspace", vec!["list", "show", "snapshot", "restore"]),
-            ("ea", vec!["create", "list"]),
-            ("manager", vec!["start", "orchestrate"]),
+            ("ea", vec!["create", "list", "start", "event"]),
         ] {
             let error = Cli::try_parse_from(["omar", group, "--help"])
                 .err()
@@ -1286,7 +1291,7 @@ mod tests {
             }
             assert!(Cli::try_parse_from(["omar", group]).is_err());
         }
-        let help = Cli::try_parse_from(["omar", "event", "schedule", "--help"])
+        let help = Cli::try_parse_from(["omar", "ea", "event", "schedule", "--help"])
             .err()
             .unwrap()
             .to_string();

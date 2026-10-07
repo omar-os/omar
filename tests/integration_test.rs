@@ -1028,6 +1028,7 @@ fn test_omar_event_cli_roundtrip() {
         .args([
             "--ea",
             "Default",
+            "ea",
             "event",
             "schedule",
             "--receiver",
@@ -1060,7 +1061,7 @@ fn test_omar_event_cli_roundtrip() {
         .to_string();
 
     let output = omar_command(home.path())
-        .args(["--ea", "Default", "event", "list"])
+        .args(["--ea", "Default", "ea", "event", "list"])
         .output()
         .expect("Failed to run omar event list");
     assert!(
@@ -1076,7 +1077,7 @@ fn test_omar_event_cli_roundtrip() {
     );
 
     let output = omar_command(home.path())
-        .args(["--ea", "Default", "event", "cancel", &event_id])
+        .args(["--ea", "Default", "ea", "event", "cancel", &event_id])
         .output()
         .expect("Failed to run omar event cancel");
     assert!(
@@ -1092,7 +1093,7 @@ fn test_omar_event_cli_roundtrip() {
     );
 
     let output = omar_command(home.path())
-        .args(["--ea", "Default", "event", "list"])
+        .args(["--ea", "Default", "ea", "event", "list"])
         .output()
         .expect("Failed to run omar event list after cancel");
     assert!(
@@ -1924,7 +1925,7 @@ fn test_manager_notes_shell_write_persists_across_ea_restart() {
     let home = tempfile::tempdir().expect("temp home");
     let session_prefix = format!("omar-notes-{}-", Uuid::new_v4());
 
-    // Override default_command so `omar manager start` runs a tame shell
+    // Override default_command so `omar ea start` runs a tame shell
     // instead of invoking a real backend (which isn't installed in CI). The
     // shell stays alive long enough for us to drive it with `tmux send-keys`.
     // Written before the session exists: `up` takes it as the template.
@@ -1955,7 +1956,7 @@ default_command = "exec bash"
     // bash, attach (no-op without a TTY but harmless). The combined prompt
     // file gets written to disk before the session is created.
     let output = omar_command(home.path())
-        .args(["--ea", "0", "manager", "start"])
+        .args(["ea", "start", "0"])
         .output()
         .expect("Failed to run omar manager start (1)");
     assert!(
@@ -2074,7 +2075,7 @@ NOTES",
         written,
     );
 
-    // Tear down the first EA session before re-spawning. `omar manager start`
+    // Tear down the first EA session before re-spawning. `omar ea start`
     // will reuse a live session instead of rebuilding the prompt, so we MUST
     // kill it to exercise the second-spawn path.
     cleanup_session(&manager_session);
@@ -2089,7 +2090,7 @@ NOTES",
     fs::remove_file(&combined_prompt).ok();
 
     let output = omar_command(home.path())
-        .args(["--ea", "0", "manager", "start"])
+        .args(["ea", "start", "0"])
         .output()
         .expect("Failed to run omar manager start (2)");
     assert!(

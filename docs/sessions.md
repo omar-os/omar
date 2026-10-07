@@ -24,15 +24,17 @@ session. TUI/browser clients can disconnect without stopping any workload.
 | `omar -s SESSION [--ea EA] stop RUN-OR-TEAM` | Stop one topology at a tag boundary |
 | `omar -s SESSION ea list` | List EAs |
 | `omar -s SESSION ea create --name NAME [--agent BACKEND]` | Allocate an independent EA namespace |
-| `omar -s SESSION --ea EA manager start` | Launch that EA's assistant |
+| `omar -s SESSION ea start EA` | Launch or relaunch that EA's assistant |
 | `omar -s SESSION [--ea EA] list` | List agent panes (different from `ls`) |
 | `omar -s SESSION [--ea EA] spawn ...` | Spawn an agent through the owning runtime |
 | `omar -s SESSION [--ea EA] kill NAME` | Kill a standalone agent; use `stop` for daemon-owned topologies |
-| `omar -s SESSION [--ea EA] event {schedule,list,cancel} ...` | Manage scheduled events |
+| `omar -s SESSION [--ea EA] ea event {schedule,list,cancel} ...` | Manage the EA's scheduled events |
 | `omar -s SESSION [--ea EA] workspace {list,show,snapshot,restore} ...` | Inspect/version team files |
 
-Every group has hierarchical help: `omar event --help` lists its subcommands;
-`omar event schedule --help` explains scheduling and targeting. Help never starts
+Every group has hierarchical help: `omar ea --help` lists its subcommands;
+`omar ea event schedule --help` explains scheduling and targeting. `omar --help`
+lists commands by section; the last section is what OMAR launches inside agent
+panes and hooks, never typed by a person. Help never starts
 a runtime or writes configuration. `--json` produces structured session results;
 forwarded operations return a stdout/stderr envelope.
 
@@ -75,7 +77,7 @@ The session layout is the only layout: every runtime lives under
 `$OMAR_HOME/sessions/<id>/` and nothing targets a shared `~/.omar` state
 directory any more. `$OMAR_HOME/config.toml` is only the template a new
 session copies. `omar run` (alias `start`) submits a topology to a runtime; the
-foreground runner is gone. `manager orchestrate` aliases `attach --tui`.
+foreground runner is gone.
 
 `attach --tui` runs the terminal dashboard as a client: it reads the
 session's state directory and drives the session's tmux server, and it runs

@@ -133,7 +133,7 @@ trust_level="trusted"
             else:
                 # A second EA, started without a TTY.
                 assert omar('ea', 'create', '--name', '1', '--agent', 'codex', timeout=30).returncode == 0
-                assert omar('--ea', '1', 'manager', 'start', timeout=120).returncode == 0
+                assert omar('ea', 'start', '1', timeout=120).returncode == 0
             tmux_session = 'omar-agent-ea-'+str(index)
             def stamped():
                 stamp = tmux('show-environment', '-t', tmux_session, 'OMAR_DELIVERY', check=False).strip()
@@ -191,7 +191,7 @@ trust_level="trusted"
         tmux('set-option', '-g', 'remain-on-exit', 'on')
         # The EA's assistant-command override is what a start launches.
         (state/'ea/0/assistant-command').write_text('codex resume '+first_thread)
-        result = omar('--ea', '0', 'manager', 'start', timeout=120)
+        result = omar('ea', 'start', '0', timeout=120)
         assert result.returncode == 0, result.stderr
         start = tmux('display-message', '-p', '-t', first_session, '#{pane_start_command}')
         stamp = tmux('show-environment', '-t', first_session, 'OMAR_DELIVERY').strip()
@@ -211,14 +211,14 @@ trust_level="trusted"
         second_pane = tmux('display-message', '-p', '-t', 'omar-agent-ea-1', '#{pane_id}')
         port = int(session['url'].rsplit(':', 1)[1])
         assert omar('ea', 'create', '--name', 'ServeTrial', '--agent', 'codex', timeout=30).returncode == 0
-        assert omar('--ea', 'ServeTrial', 'manager', 'start', timeout=120).returncode == 0
+        assert omar('ea', 'start', 'ServeTrial', timeout=120).returncode == 0
         registry = json.loads((state/'eas.json').read_text())
         assert len(registry) == 3 and registry[-1]['id'] == 2 and registry[-1]['name'] == 'ServeTrial', registry
         served = 'omar-agent-ea-2'
         until(lambda: 'Ask Codex' in tmux('capture-pane', '-p', '-t', served, check=False), 'served EA composer')
         tmux('send-keys', '-t', served, '-l', 'SERVE_UNSENT_DRAFT')
         until(lambda: 'SERVE_UNSENT_DRAFT' in pane(served), 'served draft')
-        assert omar('--ea', 'ServeTrial', 'event', 'schedule', '--receiver', 'ea', '--payload', 'LIVE_SCHEDULER_SENTINEL', '--in-seconds', '0', timeout=30).returncode == 0
+        assert omar('--ea', 'ServeTrial', 'ea', 'event', 'schedule', '--receiver', 'ea', '--payload', 'LIVE_SCHEDULER_SENTINEL', '--in-seconds', '0', timeout=30).returncode == 0
         until(lambda: 'LIVE_SCHEDULER_SENTINEL' in json.dumps(requests), 'real scheduler event')
         assert 'SERVE_UNSENT_DRAFT' in pane(served), pane(served)
         assert tmux('display-message', '-p', '-t', 'omar-agent-ea-1', '#{pane_id}') == second_pane
