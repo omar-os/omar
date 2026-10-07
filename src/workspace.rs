@@ -290,6 +290,82 @@ impl Workspace {
         snapshots.sort_by_key(|s| s.sequence);
         Ok(snapshots)
     }
+
+    /// Read a bounded UTF-8 file from an immutable saved revision. No worktree
+    /// traversal, hooks, filters or symlink following is involved.
+    #[cfg(feature = "decision-support")]
+    pub fn read_advisory_text(
+        &self,
+        root: &Path,
+        snapshot_id: &str,
+        path: &str,
+    ) -> Result<(String, String)> {
+        valid_id(snapshot_id)?;
+        anyhow::ensure!(
+            !path.is_empty()
+                && path.len() <= 1024
+                && Path::new(path)
+                    .components()
+                    .all(|c| matches!(c, Component::Normal(n) if n != ".git")),
+            "invalid artifact path"
+        );
+        let snapshot = self
+            .snapshots(root)?
+            .into_iter()
+            .find(|s| s.id == snapshot_id)
+            .context("unknown snapshot")?;
+        anyhow::ensure!(
+            snapshot.commit.len() == 40 && snapshot.commit.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid snapshot commit"
+        );
+        let mut git = self.git(root);
+        git.args([
+            "rev-parse",
+            "--verify",
+            &format!("refs/omar/snapshots/{snapshot_id}^{{commit}}"),
+        ]);
+        anyhow::ensure!(
+            text(output(git, None)?)? == snapshot.commit,
+            "snapshot reference mismatch"
+        );
+        let mut git = self.git(root);
+        git.args([
+            "--literal-pathspecs",
+            "ls-tree",
+            "-z",
+            &snapshot.commit,
+            "--",
+            path,
+        ]);
+        let listing = String::from_utf8(output(git, None)?)?;
+        let entry = listing.strip_suffix('\0').context("artifact not found")?;
+        anyhow::ensure!(!entry.contains('\0'), "artifact path is ambiguous");
+        let (metadata, name) = entry.split_once('\t').context("invalid tree entry")?;
+        let fields: Vec<_> = metadata.split_whitespace().collect();
+        anyhow::ensure!(
+            name == path
+                && fields.len() == 3
+                && matches!(fields[0], "100644" | "100755")
+                && fields[1] == "blob",
+            "artifact must be a regular file"
+        );
+        let object = fields[2];
+        let mut git = self.git(root);
+        git.args(["cat-file", "-s", object]);
+        let size: usize = text(output(git, None)?)?.parse()?;
+        anyhow::ensure!(size <= 64 * 1024, "artifact is too large for text review");
+        let mut git = self.git(root);
+        git.args(["cat-file", "blob", object]);
+        let bytes = output(git, None)?;
+        anyhow::ensure!(
+            bytes.len() == size && !bytes.contains(&0),
+            "artifact is not inspectable text"
+        );
+        Ok((
+            snapshot.commit,
+            String::from_utf8(bytes).context("artifact is not UTF-8 text")?,
+        ))
+    }
     pub fn ensure_inactive(&self, root: &Path) -> Result<()> {
         let deployments = crate::ea::ea_state_dir(self.ea_id, root).join("topologies");
         if !deployments.exists() {
@@ -626,6 +702,49 @@ mod tests {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(path).args(args);
         output(cmd, None).unwrap()
+    }
+
+    #[cfg(feature = "decision-support")]
+    #[test]
+    fn advisory_reader_binds_immutable_bytes_and_refuses_symlinks_traversal_and_large_files() {
+        let (_dir, root) = setup();
+        let ws = create(&root);
+        let source = ws.worktree(&root);
+        fs::write(source.join("result.md"), "Original 文本").unwrap();
+        symlink("result.md", source.join("link.md")).unwrap();
+        fs::write(source.join("large.txt"), vec![b'a'; 65 * 1024]).unwrap();
+        ws.snapshot(&root, "Test artifact").unwrap();
+        let first = ws.snapshots(&root).unwrap().pop().unwrap();
+        fs::write(ws.worktree(&root).join("result.md"), "Edited text").unwrap();
+        let second = ws.snapshot(&root, "Edited").unwrap();
+        assert_eq!(
+            ws.read_advisory_text(&root, &first.id, "result.md")
+                .unwrap()
+                .1,
+            "Original 文本"
+        );
+        assert_eq!(
+            ws.read_advisory_text(&root, &second.id, "result.md")
+                .unwrap()
+                .1,
+            "Edited text"
+        );
+        for path in [
+            "link.md",
+            "../result.md",
+            "/result.md",
+            ".git/config",
+            "large.txt",
+            "missing.md",
+        ] {
+            assert!(
+                ws.read_advisory_text(&root, &first.id, path).is_err(),
+                "{path}"
+            );
+        }
+        assert!(ws
+            .read_advisory_text(&root, "../snapshot", "result.md")
+            .is_err());
     }
 
     #[test]

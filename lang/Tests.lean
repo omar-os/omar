@@ -410,6 +410,34 @@ def testNamedMain : IO Unit :=
   | .ok program => assertEqual "named main" program.team "Payroll"
   | .error message => throw (IO.userError s!"named main: {message}")
 
+def testDecisionGate : IO Unit := do
+  let source := "team Check(requirement : string)[reviewer : Codex] {
+    input evidence : string output ready : string output revise : string
+    prompt reviewer(evidence) -> (ready | revise) within(30s)
+      jev(\"artifact-requirement-v1\", \"$(requirement)\",
+          appears_satisfied: ready, partially_satisfied: revise, not_satisfied: revise)
+      \"Check the requirement; return the original evidence.\"
+  } main Checks { first = Check(\"Identifies the founder\") second = Check(\"Has a CTA\") }"
+  let program ← match lex source >>= parse "Checks" with
+    | .ok p => pure p
+    | .error e => throw (IO.userError e)
+  assertEqual "two gates" program.reactions.size 2
+  let gate ← match (program.reactions[0]?).bind (·.decision) with
+    | some gate => pure gate
+    | none => throw (IO.userError "missing decision gate")
+  assertEqual "gate criterion substitutes parameters" gate.criterion "Identifies the founder"
+  let firstRoute ← match gate.routes[0]? with
+    | some route => pure route.port
+    | none => throw (IO.userError "missing gate route")
+  assertEqual "gate qualifies destination" firstRoute "first.ready"
+  let bytecode ← match compileSource "Checks" source with
+    | .ok b => pure b
+    | .error e => throw (IO.userError e)
+  assertEqual "bytecode retains decision" (mentions bytecode "artifact-requirement-v1") true
+  testRejection "unknown Jev profile" (source.replace "artifact-requirement-v1" "invented") "unsupported automatic Jev profile"
+  testRejection "undeclared Jev route" (source.replace "appears_satisfied: ready" "appears_satisfied: elsewhere") "not a declared effect"
+  testRejection "duplicate Jev outcome" (source.replace "partially_satisfied:" "appears_satisfied:") "duplicate Jev outcome"
+
 def main : IO UInt32 := do
   try
     for test in topologyCases do
@@ -419,6 +447,7 @@ def main : IO UInt32 := do
     testBareTeamHeader
     testNamedMain
     testWithin
+    testDecisionGate
     testDelayUnits
     testStateLiterals
     testCodeTerminator

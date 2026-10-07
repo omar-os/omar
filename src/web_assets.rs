@@ -57,7 +57,7 @@ pub use embedded::ASSETS;
 
 /// Whether this binary was built with the UI in it.
 pub fn is_bundled() -> bool {
-    !ASSETS.is_empty()
+    cfg!(feature = "ui")
 }
 
 /// The asset a request path asks for, if any.

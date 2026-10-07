@@ -1,0 +1,121 @@
+{
+  "protocol_version": 1,
+  "team": "RequirementCheck",
+  "sequence": 0,
+  "status": "ready",
+  "current_tag": null,
+  "lag": null,
+  "instances": [
+    {
+      "id": "instance::check",
+      "name": "check",
+      "team": "Check",
+      "parent": ""
+    }
+  ],
+  "agents": [
+    {
+      "id": "agent::check.reviewer",
+      "name": "check.reviewer",
+      "backend": "Codex",
+      "instance": "check"
+    }
+  ],
+  "timers": [],
+  "ports": [
+    {
+      "id": "port::check.draft",
+      "name": "check.draft",
+      "kind": "input",
+      "type": "string",
+      "delay": null,
+      "value": null,
+      "last_tag": null,
+      "instance": "check"
+    },
+    {
+      "id": "port::check.ready",
+      "name": "check.ready",
+      "kind": "output",
+      "type": "string",
+      "delay": null,
+      "value": null,
+      "last_tag": null,
+      "instance": "check"
+    },
+    {
+      "id": "port::check.revise",
+      "name": "check.revise",
+      "kind": "output",
+      "type": "string",
+      "delay": null,
+      "value": null,
+      "last_tag": null,
+      "instance": "check"
+    }
+  ],
+  "reactions": [
+    {
+      "id": "reaction::check.reaction.0",
+      "name": "check.reaction.0",
+      "agent": "agent::check.reviewer",
+      "order": 0,
+      "triggers": [
+        "port::check.draft"
+      ],
+      "effects": [
+        "port::check.ready",
+        "port::check.revise"
+      ],
+      "contract": "( check.ready | check.revise )",
+      "status": "idle",
+      "invocation_id": null,
+      "instance": "check",
+      "within": 60000000000,
+      "decision_gate": {
+        "profile": "artifact-requirement-v1",
+        "criterion": "The opening identifies the founder and the event.",
+        "routes": [
+          {
+            "outcome": "appears_satisfied",
+            "port": "check.ready",
+            "description": ""
+          },
+          {
+            "outcome": "partially_satisfied",
+            "port": "check.revise",
+            "description": ""
+          },
+          {
+            "outcome": "not_satisfied",
+            "port": "check.revise",
+            "description": ""
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "trigger::check.draft",
+      "kind": "trigger",
+      "source": "port::check.draft",
+      "target": "reaction::check.reaction.0",
+      "delay": null
+    },
+    {
+      "id": "effect::check.ready",
+      "kind": "effect",
+      "source": "reaction::check.reaction.0",
+      "target": "port::check.ready",
+      "delay": null
+    },
+    {
+      "id": "effect::check.revise",
+      "kind": "effect",
+      "source": "reaction::check.reaction.0",
+      "target": "port::check.revise",
+      "delay": null
+    }
+  ]
+}

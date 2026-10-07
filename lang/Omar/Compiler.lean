@@ -244,6 +244,18 @@ structure Connection where
   delay : Option Nat
   deriving Repr
 
+structure DecisionRoute where
+  outcome : String
+  port : String
+  description : String := ""
+  deriving Repr, ToJson
+
+structure DecisionGate where
+  profile : String
+  criterion : String
+  routes : Array DecisionRoute
+  deriving Repr, ToJson
+
 structure Reaction where
   id : String
   agent : String
@@ -257,6 +269,7 @@ structure Reaction where
   /-- How long one invocation may take, in nanoseconds. `none` leaves it to the
       run-wide timeout. -/
   within : Option Nat := none
+  decision : Option DecisionGate := none
   instance_ : String := ""
   deriving Repr
 
@@ -483,6 +496,7 @@ private partial def takeContract (acc : List Token) : List Token -> Except Strin
   | tokens@(Token.text _ :: _) => pure (acc.reverse, tokens)
   | tokens@(Token.code _ :: _) => pure (acc.reverse, tokens)
   | tokens@(Token.word "within" :: _) => pure (acc.reverse, tokens)
+  | tokens@(Token.word "jev" :: Token.sym "(" :: _) => pure (acc.reverse, tokens)
   | token :: rest => takeContract (token :: acc) rest
 
 /-- `port`, or `instance.port` written as one dotted name. -/
@@ -491,6 +505,38 @@ private def qualifiedTail (head : String) : Parser String
       let (member, rest) ← word rest
       pure (s!"{head}.{member}", rest)
   | tokens => pure (head, tokens)
+
+/-- Jev annotates an existing reasoning prompt with bounded, declared routes.
+    The prompt's agent remains its fallback; code reactions cannot use this. -/
+private partial def parseDecisionRoutes (acc : Array DecisionRoute) : Parser (Array DecisionRoute)
+  | tokens => do
+      let (outcome, tokens) ← word tokens
+      let (_, tokens) ← expectSym ":" tokens
+      let (port, tokens) ← word tokens
+      let (port, tokens) ← qualifiedTail port tokens
+      let (description, tokens) := match tokens with
+        | Token.text text :: rest => (text, rest)
+        | _ => ("", tokens)
+      let acc := acc.push { outcome, port, description }
+      match tokens with
+      | Token.sym "," :: rest => parseDecisionRoutes acc rest
+      | Token.sym ")" :: rest => pure (acc, rest)
+      | _ => throw "expected ',' or ')' after Jev route"
+
+private def parseDecision : Parser (Option DecisionGate)
+  | Token.word "jev" :: tokens => do
+      let (_, tokens) ← expectSym "(" tokens
+      let (profile, tokens) ← match tokens with
+        | Token.text text :: rest => pure (text, rest)
+        | _ => throw "expected Jev profile string"
+      let (_, tokens) ← expectSym "," tokens
+      let (criterion, tokens) ← match tokens with
+        | Token.text text :: rest => pure (text, rest)
+        | _ => throw "expected Jev criterion string"
+      let (_, tokens) ← expectSym "," tokens
+      let (routes, tokens) ← parseDecisionRoutes #[] tokens
+      pure (some { profile, criterion, routes }, tokens)
+  | tokens => pure (none, tokens)
 
 private partial def parseDependencies (acc : Array String) : Parser (Array String)
   | Token.sym ")" :: rest => pure (acc, rest)
@@ -603,6 +649,7 @@ private partial def parseDeclarations
             let (_, tail) ← expectSym ")" tail
             pure (some value, tail)
         | _ => pure (none, rest)
+      let (decision, rest) ← parseDecision rest
       let (prompt, rest) ← match rest with
         | Token.text prompt :: tail => pure (prompt, tail)
         | _ => throw "expected prompt string after production contract"
@@ -610,7 +657,7 @@ private partial def parseDeclarations
       let contract := String.intercalate " " (contractTokens.map tokenSource)
       let reaction := {
         id := s!"reaction.{reactionIndex}"
-        agent, triggers, effects, contract, prompt, within
+        agent, triggers, effects, contract, prompt, within, decision
       }
       parseDeclarations (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
   -- `prompt` asks an agent, `reaction` just runs, so a reaction names none.
@@ -770,6 +817,15 @@ private def validate (program : Program) : Except String Program := do
   for reaction in program.reactions do
     if reaction.body.isNone && !containsName agentNames reaction.agent then
       throw s!"reaction references unknown agent '{reaction.agent}'"
+    if let some gate := reaction.decision then
+      if gate.profile != "artifact-requirement-v1" && gate.profile != "review-owner-v1" then
+        throw s!"unsupported automatic Jev profile '{gate.profile}'"
+      if reaction.triggers.size != 1 then
+        throw "Jev requires one complete text trigger"
+      ensureUnique "Jev outcome" (gate.routes.map (·.outcome))
+      for route in gate.routes do
+        if !containsName reaction.effects route.port then
+          throw s!"Jev route '{route.port}' is not a declared effect"
     for trigger in reaction.triggers do
       -- A reaction reads its own team's inputs and actions, and the *outputs*
       -- of teams its team instantiated. Reading its own output would be
@@ -921,7 +977,13 @@ private partial def elaborateInstance
         -- A body names both ports and parameters by their local names, and
         -- the generated Rust binds each. Only a prompt is text to substitute
         -- into.
-        body := reaction.body }
+        body := reaction.body
+        decision := reaction.decision.map fun gate =>
+          { gate with
+            criterion := substitute bindings gate.criterion
+            routes := gate.routes.map fun route =>
+              { route with port := qualify path route.port
+                           description := substitute bindings route.description } } }
   let own : Elaborated :=
     { agents, ports, timers, connections, reactions, states
       params := boundParams decl inst path
@@ -1052,8 +1114,10 @@ def compile (program : Program) : String :=
       ("prompt", toJson reaction.prompt)
     ] ++ (match reaction.body with
       | some body => [("body", toJson body)]
-      | none => []) ++ match reaction.within with
+      | none => []) ++ (match reaction.within with
       | some within => [("within", toJson within)]
+      | none => []) ++ match reaction.decision with
+      | some decision => [("decision", toJson decision)]
       | none => []
     instruction "install_reaction" fields
   let commit := instruction "commit_plan"

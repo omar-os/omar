@@ -1,0 +1,16 @@
+team Route[router : ClaudeCode]
+{
+    input finding : string
+    output backend : string
+    output frontend : string
+    output coordinator : string
+
+    prompt router(finding) -> (backend | frontend | coordinator) within(60s)
+        jev("review-owner-v1", "Which declared responsibility owns resolving this finding?",
+            backend: backend "Server behavior and HTTP validation",
+            frontend: frontend "Browser rendering and interactions",
+            coordinator: coordinator "Cross-team changes and unclear responsibility")
+        "Choose the responsible role from the supplied evidence; use coordinator for cross-team work."
+}
+
+main FindingRouter { route = Route() }

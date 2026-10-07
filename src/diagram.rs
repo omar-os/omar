@@ -74,6 +74,7 @@ pub enum DiagramEventKind {
     TagAdvanced,
     ReactionStarted,
     ReactionCompleted,
+    DecisionUpdated,
     RunCompleted,
     RunFailed,
 }
@@ -146,6 +147,12 @@ pub struct DiagramTimer {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct DiagramReaction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub decision_gate: Option<crate::decisions::automatic::DecisionGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub decision: Option<crate::decisions::automatic::DecisionUpdate>,
     pub id: String,
     pub name: String,
     pub agent: String,
@@ -272,6 +279,8 @@ impl DiagramSnapshot {
             .reactions
             .iter()
             .map(|(name, reaction)| DiagramReaction {
+                decision_gate: reaction.decision.clone(),
+                decision: None,
                 id: reaction_id(name),
                 name: name.clone(),
                 agent: agent_id(&reaction.agent),
@@ -372,6 +381,12 @@ pub trait TopologyObserver: Send + Sync {
         _reaction: &str,
         _invocation_id: &str,
         _writes: &BTreeMap<String, Value>,
+    ) {
+    }
+    fn decision_updated(
+        &self,
+        _reaction: &str,
+        _decision: &crate::decisions::automatic::DecisionUpdate,
     ) {
     }
     fn run_completed(&self, _outputs: &BTreeMap<String, Value>) {}
@@ -500,6 +515,7 @@ impl TopologyObserver for DiagramPublisher {
             {
                 item.status = ReactionStatus::Running;
                 item.invocation_id = Some(invocation_id.to_string());
+                item.decision = None;
             }
         };
         self.publish_with(
@@ -541,6 +557,26 @@ impl TopologyObserver for DiagramPublisher {
                 "writes": writes
             }),
             apply,
+        );
+    }
+
+    fn decision_updated(
+        &self,
+        reaction: &str,
+        decision: &crate::decisions::automatic::DecisionUpdate,
+    ) {
+        self.publish_with(
+            DiagramEventKind::DecisionUpdated,
+            None,
+            json!({"reaction": reaction_id(reaction), "decision": decision}),
+            |snapshot| {
+                if let Some(item) = snapshot.reactions.iter_mut().find(|r| {
+                    r.name == reaction
+                        && r.invocation_id.as_deref() == Some(decision.invocation_id.as_str())
+                }) {
+                    item.decision = Some(decision.clone());
+                }
+            },
         );
     }
 
@@ -859,6 +895,7 @@ mod tests {
             reactions: BTreeMap::from([(
                 "respond".to_string(),
                 ReactionState {
+                    decision: None,
                     order: 0,
                     agent: "worker".to_string(),
                     instance: String::new(),
@@ -871,6 +908,52 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    #[test]
+    fn automatic_decisions_belong_to_the_current_invocation() {
+        let publisher = DiagramPublisher {
+            snapshot: Arc::new(RwLock::new(DiagramSnapshot::from_vm_state(&sample_state()))),
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+            sequence: Arc::new(AtomicU64::new(0)),
+        };
+        let mut decision = crate::decisions::automatic::DecisionUpdate {
+            invocation_id: "old".to_string(),
+            profile: "artifact-requirement-v1".to_string(),
+            criterion: "The opening identifies the founder.".to_string(),
+            stage: "reasoned".to_string(),
+            reason: "The opening omits the founder.".to_string(),
+            route: Some("answer".to_string()),
+            confidence: Some(0.81),
+            selected_probability: Some(0.86),
+            sufficient_context: Some(0.99),
+        };
+        publisher.reaction_started(0, 0, "respond", "old");
+        publisher.decision_updated("respond", &decision);
+        assert!(publisher.snapshot.read().unwrap().reactions[0]
+            .decision
+            .is_some());
+
+        // Reconnecting after the next invocation starts must not resurrect
+        // either a cached decision or a delayed event from the previous one.
+        publisher.reaction_started(0, 1, "respond", "new");
+        assert!(publisher.snapshot.read().unwrap().reactions[0]
+            .decision
+            .is_none());
+        publisher.decision_updated("respond", &decision);
+        assert!(publisher.snapshot.read().unwrap().reactions[0]
+            .decision
+            .is_none());
+        decision.invocation_id = "new".to_string();
+        publisher.decision_updated("respond", &decision);
+        assert_eq!(
+            publisher.snapshot.read().unwrap().reactions[0]
+                .decision
+                .as_ref()
+                .unwrap()
+                .invocation_id,
+            "new"
+        );
     }
 
     /// Two instances of two teams, as `main { writer = Drafter() … }` gives.
@@ -928,6 +1011,7 @@ mod tests {
             reactions: BTreeMap::from([(
                 "writer.reaction.0".to_string(),
                 ReactionState {
+                    decision: None,
                     order: 0,
                     instance: "writer".to_string(),
                     agent: "writer.agent".to_string(),

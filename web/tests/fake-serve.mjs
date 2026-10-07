@@ -648,6 +648,23 @@ export async function startFakeServe({
       publish(entry, "reaction_started", { reaction: reaction.id }, tag);
       await wait();
 
+      // UI fixture only: exercise a bounded decision's escalation and outcome.
+      // Rust tests verify actual Jev dispatch, routing and cancellation.
+      if (reaction.decision_gate) {
+        reaction.decision = {
+          invocation_id: reaction.invocation_id,
+          profile: reaction.decision_gate.profile,
+          criterion: reaction.decision_gate.criterion,
+          stage: "reasoning", reason: "Jev confidence 0.810 is below 0.95",
+          route: null, confidence: 0.81, selected_probability: 0.86, sufficient_context: 0.99,
+        };
+        publish(entry, "decision_updated", { reaction: reaction.id, decision: reaction.decision }, tag);
+        await wait();
+        reaction.decision = { ...reaction.decision, stage: "reasoned", route: "check.revise", reason: "The opening omits the founder. Return the draft for revision." };
+        publish(entry, "decision_updated", { reaction: reaction.id, decision: reaction.decision }, tag);
+        await wait();
+      }
+
       // A web-backed reaction parks until a client answers it, which is the
       // whole point of the backend. Driving straight past would let the run
       // finish while a panel still showed work outstanding — and would make a

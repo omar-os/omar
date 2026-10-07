@@ -1,0 +1,11 @@
+// Finite launch-copy workflow. Input flow.brief includes product and audience.
+team LaunchBrief[writer: Codex, reviewer: Codex] {
+    input brief: string
+    action draft: string
+    action review: string
+    output result: string
+    prompt writer(brief) -> draft "Write launch-page Markdown copy from this product brief. Preserve audience and requirements in the draft. Do not invent customer claims. Brief: $(brief)"
+    prompt reviewer(draft) -> review "Review the actual draft for its stated audience, clarity and unsupported claims. Return the full draft followed by your review comments: $(draft)"
+    prompt writer(review) -> result "Revise the supplied draft using the reviewer comments. Return final Markdown copy. Draft and review: $(review)"
+}
+main { flow = LaunchBrief() }

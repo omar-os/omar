@@ -373,6 +373,7 @@ export function subscribeToDiagram(
     "tag_advanced",
     "reaction_started",
     "reaction_completed",
+    "decision_updated",
     "run_completed",
     "run_failed",
   ];

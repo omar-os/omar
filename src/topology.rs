@@ -109,6 +109,8 @@ pub enum Instruction {
         /// Absent leaves it to the run-wide timeout.
         #[serde(default)]
         within: Option<u64>,
+        #[serde(default)]
+        decision: Option<crate::decisions::automatic::DecisionGate>,
     },
     CommitPlan,
 }
@@ -196,6 +198,8 @@ pub struct ConnectionState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReactionState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<crate::decisions::automatic::DecisionGate>,
     pub order: usize,
     pub agent: String,
     #[serde(default)]
@@ -683,6 +687,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 body,
                 instance,
                 within,
+                decision,
             } => {
                 let order = state.reactions.len();
                 check_instance(&state, "reaction", id, instance)?;
@@ -726,6 +731,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                         id.clone(),
                         ReactionState {
                             order,
+                            decision: decision.clone(),
                             instance: instance.clone(),
                             agent: agent.clone(),
                             triggers: triggers.clone(),
@@ -747,6 +753,11 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
     reject_causality_loops(&state)?;
     reject_shared_names(&state)?;
     reject_bodies_that_cannot_be_generated(&state)?;
+    for reaction in state.reactions.values() {
+        if let Some(gate) = &reaction.decision {
+            gate.verify(&state, reaction)?;
+        }
+    }
     Ok(state)
 }
 
@@ -1556,24 +1567,32 @@ fn validate_contract(contract: &str, writes: &BTreeMap<String, Value>) -> Result
 }
 
 #[derive(Debug, Clone)]
-struct InvocationSpec {
-    id: String,
-    reaction_id: String,
-    agent: String,
-    trigger_values: BTreeMap<String, Value>,
-    allowed_effects: BTreeMap<String, String>,
+pub(crate) struct InvocationSpec {
+    pub(crate) id: String,
+    pub(crate) reaction_id: String,
+    pub(crate) agent: String,
+    pub(crate) trigger_values: BTreeMap<String, Value>,
+    pub(crate) allowed_effects: BTreeMap<String, String>,
     /// Its instance's state variables as they stand, which a code body reads
     /// as `self`.
-    state_values: BTreeMap<String, Value>,
-    contract: String,
-    prompt: String,
+    pub(crate) state_values: BTreeMap<String, Value>,
+    pub(crate) contract: String,
+    pub(crate) prompt: String,
     /// What the program allows this invocation, overriding the run-wide
     /// timeout. `None` means the program said nothing and the run's applies.
-    within: Option<Duration>,
+    pub(crate) within: Option<Duration>,
 }
 
-trait ReactionExecutor: Sync {
+pub(crate) trait ReactionExecutor: Sync {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>>;
+}
+
+pub(crate) fn gate_contract_accepts(contract: &str, port: &str) -> bool {
+    validate_contract(
+        contract,
+        &BTreeMap::from([(port.into(), json!("gate evidence"))]),
+    )
+    .is_ok()
 }
 
 /// What an expired deadline means, which the effect contract decides.
@@ -1599,6 +1618,7 @@ fn expired(invocation: &InvocationSpec, deadline: Duration) -> Result<BTreeMap<S
 }
 
 struct AgentReactionExecutor {
+    cancel_on_stop: Option<PathBuf>,
     client: TmuxClient,
     team: String,
     registry: InvocationRegistry,
@@ -1645,6 +1665,10 @@ impl ReactionExecutor for AgentReactionExecutor {
                 .client
                 .deliver_prompt_until(&session, &message, &DeliveryOptions::default(), &|| {
                     self.registry.answered(&invocation_id)
+                        || self
+                            .cancel_on_stop
+                            .as_deref()
+                            .is_some_and(deploy::stop_requested)
                 })
                 .with_context(|| format!("failed to deliver {}", invocation.reaction_id))
             {
@@ -1654,12 +1678,35 @@ impl ReactionExecutor for AgentReactionExecutor {
         }
 
         let deadline = invocation.within.unwrap_or(self.timeout);
-        let result = match completion.recv_timeout(deadline) {
-            Ok(writes) => Ok(writes),
-            Err(mpsc::RecvTimeoutError::Timeout) => expired(&invocation, deadline),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-                "topology invocation service stopped unexpectedly"
-            )),
+        let started = Instant::now();
+        let result = loop {
+            if self
+                .cancel_on_stop
+                .as_deref()
+                .is_some_and(deploy::stop_requested)
+            {
+                break Err(anyhow::anyhow!(
+                    "workflow stopped while waiting for a decision"
+                ));
+            }
+            let remaining = deadline.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break expired(&invocation, deadline);
+            }
+            let wait = if self.cancel_on_stop.is_some() {
+                remaining.min(Duration::from_millis(250))
+            } else {
+                remaining
+            };
+            match completion.recv_timeout(wait) {
+                Ok(writes) => break Ok(writes),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(anyhow::anyhow!(
+                        "topology invocation service stopped unexpectedly"
+                    ))
+                }
+            }
         };
         self.registry.remove(&invocation_id);
         result
@@ -1690,6 +1737,10 @@ fn state_writes_stay_in_instance(
 /// Sends a reaction to its compiled body when it has one, and to its agent
 /// otherwise. One run may hold both kinds.
 struct DispatchExecutor<'a, E: ReactionExecutor> {
+    decisions: Option<(
+        &'a crate::decisions::automatic::Runtime,
+        &'a dyn TopologyObserver,
+    )>,
     state: &'a VmState,
     code: Option<crate::reaction::Reactions>,
     /// The run-wide timeout, which bounds a body that set no deadline.
@@ -1728,11 +1779,22 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
                 return Ok(writes);
             }
         }
+        if let Some(gate) = &self.state.reactions[&invocation.reaction_id].decision {
+            let (runtime, observer) = self
+                .decisions
+                .context("automatic decision runtime is unavailable")?;
+            let mut invocation = invocation;
+            if invocation.within.is_none() {
+                invocation.within = Some(self.timeout);
+            }
+            return runtime.invoke(gate, invocation, &self.agents, observer);
+        }
         self.agents.invoke(invocation)
     }
 }
 
 pub struct TopologyRunConfig<'a> {
+    pub decision_support: &'a crate::config::DecisionSupportConfig,
     pub ea_id: crate::ea::EaId,
     pub omar_dir: &'a Path,
     /// Where this program's generated artifacts go, from `generated_dir`.
@@ -1995,7 +2057,16 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             });
         }
     }
+    let decisions = crate::decisions::automatic::Runtime::new(
+        config.decision_support,
+        &runtime_dir,
+        &record
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
+            .deployment_id,
+    );
     let executor = DispatchExecutor {
+        decisions: Some((&decisions, observer)),
         workspace_dirs: workspaces
             .iter()
             .map(|(name, ws)| {
@@ -2009,6 +2080,11 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         code: reactions,
         timeout: config.timeout,
         agents: AgentReactionExecutor {
+            cancel_on_stop: state
+                .reactions
+                .values()
+                .any(|reaction| reaction.decision.is_some())
+                .then(|| runtime_dir.clone()),
             client,
             team: state.team.clone(),
             registry: invocation_server.registry.clone(),
@@ -2880,7 +2956,21 @@ fn run_event_loop_observed<E: ReactionExecutor>(
                             .map_err(|_| anyhow::anyhow!("reaction executor panicked"))?
                     })
                     .collect::<Result<Vec<_>>>()
-            })?;
+            });
+
+            if stop_now()
+                && state
+                    .reactions
+                    .values()
+                    .any(|reaction| reaction.decision.is_some())
+            {
+                return Ok(LoopEnd::Stopped(Settled {
+                    outputs,
+                    state_vars: store,
+                }));
+            }
+
+            let results = results?;
 
             // Declaration order decides who wins a port two reactions in this
             // layer both write, which is the rule the language states.
@@ -3410,6 +3500,7 @@ mod tests {
             state.reactions.insert(
                 id.into(),
                 ReactionState {
+                    decision: None,
                     order,
                     instance: String::new(),
                     agent: agent.into(),
@@ -3926,6 +4017,7 @@ mod tests {
         .unwrap();
         let state = verify(&bytecode).unwrap();
         let executor = AgentReactionExecutor {
+            cancel_on_stop: None,
             client: TmuxClient::new("omar-test"),
             team: state.team.clone(),
             registry: server.registry.clone(),
@@ -5687,6 +5779,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let outcome = DispatchExecutor {
+            decisions: None,
             workspace_dirs: BTreeMap::new(),
             state: &state,
             code: Some(code),
@@ -5729,6 +5822,7 @@ mod tests {
             )
             .unwrap();
             DispatchExecutor {
+                decisions: None,
                 workspace_dirs: BTreeMap::new(),
                 state: &state,
                 code: Some(code),
@@ -5746,5 +5840,137 @@ mod tests {
         let error = run("s.out").unwrap_err().to_string();
         assert!(error.contains("requires an effect"), "{error}");
         assert!(error.contains("its body"), "{error}");
+    }
+    fn automatic_gate_program() -> Bytecode {
+        serde_json::from_value(json!({"version":1,"team":"Automatic","instructions":[
+            {"op":"begin_plan","team":"Automatic"},
+            {"op":"declare_instance","name":"gate","team":"Gate","parent":""},
+            {"op":"declare_instance","name":"next","team":"Next","parent":""},
+            {"op":"spawn_agent","name":"gate.reviewer","backend":"Codex","instance":"gate"},
+            {"op":"spawn_agent","name":"next.worker","backend":"Codex","instance":"next"},
+            {"op":"define_port","name":"gate.draft","kind":"input","type":"string","instance":"gate"},
+            {"op":"define_port","name":"gate.ready","kind":"output","type":"string","instance":"gate"},
+            {"op":"define_port","name":"gate.revise","kind":"output","type":"string","instance":"gate"},
+            {"op":"define_port","name":"next.approved","kind":"input","type":"string","instance":"next"},
+            {"op":"define_port","name":"next.rejected","kind":"input","type":"string","instance":"next"},
+            {"op":"define_port","name":"next.continued","kind":"output","type":"string","instance":"next"},
+            {"op":"define_port","name":"next.repaired","kind":"output","type":"string","instance":"next"},
+            {"op":"connect_ports","source":"gate.ready","target":"next.approved"},
+            {"op":"connect_ports","source":"gate.revise","target":"next.rejected"},
+            {"op":"install_reaction","id":"gate.check","agent":"gate.reviewer","instance":"gate","triggers":["gate.draft"],"effects":["gate.ready","gate.revise"],"contract":"( gate.ready | gate.revise )","prompt":"Check the opening","decision":{"profile":"artifact-requirement-v1","criterion":"Identifies the founder","routes":[{"outcome":"appears_satisfied","port":"gate.ready"},{"outcome":"partially_satisfied","port":"gate.revise"},{"outcome":"not_satisfied","port":"gate.revise"}]}},
+            {"op":"install_reaction","id":"next.continue","agent":"next.worker","instance":"next","triggers":["next.approved"],"effects":["next.continued"],"contract":"next.continued","prompt":"Continue"},
+            {"op":"install_reaction","id":"next.repair","agent":"next.worker","instance":"next","triggers":["next.rejected"],"effects":["next.repaired"],"contract":"next.repaired","prompt":"Repair"},
+            {"op":"commit_plan"}
+        ]})).unwrap()
+    }
+
+    struct GateAgent {
+        outcome: &'static str,
+        calls: Mutex<Vec<String>>,
+        stop: Option<PathBuf>,
+    }
+    impl ReactionExecutor for GateAgent {
+        fn invoke(&self, spec: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+            self.calls.lock().unwrap().push(spec.reaction_id.clone());
+            if spec.reaction_id == "gate.check" {
+                let rendered = render_prompt(&spec.prompt, &spec.trigger_values)?;
+                assert!(rendered.contains("founder"));
+                if let Some(dir) = &self.stop {
+                    deploy::request_stop(dir)?;
+                }
+                Ok(BTreeMap::from([(
+                    "__omar_decision".into(),
+                    json!(
+                        json!({"outcome":self.outcome,"reason":"The opening was checked."})
+                            .to_string()
+                    ),
+                )]))
+            } else {
+                Ok(BTreeMap::from([(
+                    spec.allowed_effects.keys().next().unwrap().clone(),
+                    spec.trigger_values.values().next().unwrap().clone(),
+                )]))
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_gate_waits_then_starts_only_the_selected_downstream_branch() {
+        for (choice, downstream) in [
+            ("appears_satisfied", "next.continue"),
+            ("not_satisfied", "next.repair"),
+        ] {
+            let state = verify(&automatic_gate_program()).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = crate::decisions::automatic::Runtime::new(
+                &crate::config::DecisionSupportConfig::default(),
+                temp.path(),
+                "deployment",
+            );
+            let executor = DispatchExecutor {
+                decisions: Some((&runtime, &NoopTopologyObserver)),
+                state: &state,
+                code: None,
+                timeout: Duration::from_secs(10),
+                workspace_dirs: BTreeMap::new(),
+                agents: GateAgent {
+                    outcome: choice,
+                    calls: Mutex::new(vec![]),
+                    stop: None,
+                },
+            };
+            let outputs = run_event_loop(
+                &state,
+                BTreeMap::from([("gate.draft".into(), json!("A founder announces a launch."))]),
+                &executor,
+            )
+            .unwrap();
+            assert_eq!(
+                *executor.agents.calls.lock().unwrap(),
+                ["gate.check", downstream]
+            );
+            assert_eq!(
+                outputs.contains_key("next.continued"),
+                choice == "appears_satisfied"
+            );
+            assert_eq!(
+                outputs.contains_key("next.repaired"),
+                choice == "not_satisfied"
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_during_automatic_review_cannot_start_a_downstream_branch() {
+        let state = verify(&automatic_gate_program()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = crate::decisions::automatic::Runtime::new(
+            &crate::config::DecisionSupportConfig::default(),
+            temp.path(),
+            "deployment",
+        );
+        let executor = DispatchExecutor {
+            decisions: Some((&runtime, &NoopTopologyObserver)),
+            state: &state,
+            code: None,
+            timeout: Duration::from_secs(10),
+            workspace_dirs: BTreeMap::new(),
+            agents: GateAgent {
+                outcome: "appears_satisfied",
+                calls: Mutex::new(vec![]),
+                stop: Some(temp.path().into()),
+            },
+        };
+        let end = run_event_loop_observed(
+            &state,
+            BTreeMap::from([("gate.draft".into(), json!("A founder announces a launch."))]),
+            &executor,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(temp.path()),
+        )
+        .unwrap();
+        assert!(matches!(end, LoopEnd::Stopped(_)));
+        assert_eq!(*executor.agents.calls.lock().unwrap(), ["gate.check"]);
     }
 }

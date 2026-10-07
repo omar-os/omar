@@ -13,6 +13,10 @@ import { OmarEditor } from "./omar-source";
 import { PortPanel } from "./port-panel";
 import { Resizer } from "./resizer";
 import { Waiting } from "./waiting";
+import { Suggestions } from "./suggestions";
+import { AutomaticDecisions } from "./automatic-decisions";
+import { WorkflowAdvice } from "./workflow-advice";
+import { fetchDecisionCapabilities } from "./lib/decision-client";
 import {
   eaDesignAgent,
   scriptedDesignAgent,
@@ -31,6 +35,7 @@ import {
   type PendingInvocation,
   type ProposedDesign,
   type RunRecord,
+  type DecisionCapabilities,
 } from "./lib/protocol";
 import type { TimelineStep } from "./lib/runtime-client";
 import {
@@ -142,7 +147,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [following, setFollowing] = useState(true);
   /** Ports the operator has set on the live run. */
   // can flip back and forth once there is.
-  const [tab, setTab] = useState<"source" | "events">("source");
+  const [tab, setTab] = useState<"source" | "events" | "suggestions">("source");
+  const [decisionCapabilities, setDecisionCapabilities] = useState<DecisionCapabilities | null>(null);
   /** What the run's web agents are waiting to be given. */
   const [pending, setPending] = useState<PendingInvocation[]>([]);
   const [answering, setAnswering] = useState(false);
@@ -289,6 +295,17 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       cancelled = true;
       clearInterval(timer);
     };
+  }, [isDemo, serveUrl]);
+
+  // Older daemons answer 404. Treat that as an absent feature so Mission
+  // Control remains fully usable during a rolling upgrade.
+  useEffect(() => {
+    if (isDemo || !serveUrl) return;
+    let cancelled = false;
+    void fetchDecisionCapabilities(serveUrl)
+      .then((capabilities) => { if (!cancelled) setDecisionCapabilities(capabilities); })
+      .catch(() => { if (!cancelled) setDecisionCapabilities(null); });
+    return () => { cancelled = true; };
   }, [isDemo, serveUrl]);
 
   // One agent for the lifetime of a mode. Demo mode never reaches the network.
@@ -942,6 +959,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             {phase === "spawning" ? <Waiting label="Starting the run" /> : null}
           </div>
 
+          {decisionCapabilities?.enabled && decisionCapabilities.profiles.includes("scenario-coverage-v1") && !isDemo ? <WorkflowAdvice serveUrl={serveUrl} program={source} inputs={design?.inputs ?? {}} canSelect={phase !== "spawning" && phase !== "observing"} onSelect={(chosen) => {
+            setDesign(chosen); setSource(chosen.program); setFilename(`${chosen.preview.team}.omar`); setSnapshot(chosen.preview); setPhase("review");
+          }} /> : null}
           {error ? <div className="connection-error">{error}</div> : null}
           {daemon.state === "offline" ? <div className="connection-error" role="status">Cannot reach the runtime at {historyUrl}.</div> : null}
 
@@ -1091,6 +1111,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             </div>
             ) : null}
           </div>
+          {snapshot ? <AutomaticDecisions reactions={snapshot.reactions} /> : null}
           <DiagramCanvas
             snapshot={snapshot}
             selection={selection}
@@ -1165,6 +1186,16 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                 Events
               </button>
             ) : null}
+            {run && decisionCapabilities?.configured ? (
+              <button
+                role="tab"
+                aria-selected={tab === "suggestions"}
+                className={tab === "suggestions" ? "active" : ""}
+                onClick={() => setTab("suggestions")}
+              >
+                Suggestions
+              </button>
+            ) : null}
           </div>
 
           {tab === "source" ? (
@@ -1177,6 +1208,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               onSourceChange={setSource}
               onFilenameChange={setFilename}
             />
+          ) : tab === "suggestions" && run && decisionCapabilities?.configured ? (
+            <Suggestions serveUrl={serveUrl} runId={run.run_id} capabilities={decisionCapabilities} />
           ) : (
             <div className="event-strip" role="tabpanel">
               {events.length ? (

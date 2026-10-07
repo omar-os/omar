@@ -14,7 +14,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { startFakeServe, INVALID_MARKER } from "./fake-serve.mjs";
-import { RUN_STATUSES, assertRunRecord, isRunFinished } from "../app/lib/protocol.ts";
+import { RUN_STATUSES, assertRunRecord, isRunFinished, applyDiagramEvent } from "../app/lib/protocol.ts";
 
 const golden = JSON.parse(
   await readFile(new URL("./fixtures/diagram-snapshot.v1.json", import.meta.url), "utf8"),
@@ -301,4 +301,19 @@ test("scoped agent callbacks stay in their chat after another chat becomes activ
     assert.deepEqual((await get(`${base}/v1/chat`)).messages.map((message) => message.text), ["Background reply", "Background proposal"]);
     assert.deepEqual((await get("/v1/chat")).messages, []);
   } finally { await fake.close(); }
+});
+
+test("automatic decisions survive terminal events and reject stale invocation updates", () => {
+  const reaction = golden.reactions[0];
+  const event = (kind, payload) => ({kind, payload, tag:null, sequence:1, protocol_version:1});
+  const running = applyDiagramEvent(golden, event("reaction_started", {reaction:reaction.id, invocation_id:"current"}));
+  const decision = {invocation_id:"current", profile:"artifact-requirement-v1", criterion:"Has a CTA", stage:"reasoning", reason:"Jev confidence 0.810 is below 0.95", route:null, confidence:0.81, selected_probability:0.86, sufficient_context:0.99};
+  const checking = applyDiagramEvent(running, event("decision_updated", {reaction:reaction.id, decision}));
+  assert.equal(checking.reactions[0].decision.reason, decision.reason);
+  const stale = applyDiagramEvent(checking, event("decision_updated", {reaction:reaction.id, decision:{...decision, invocation_id:"old", stage:"decided"}}));
+  assert.equal(stale.reactions[0].decision.stage, "reasoning");
+  const finished = applyDiagramEvent(checking, event("run_failed", {message:"fallback unavailable"}));
+  assert.equal(finished.reactions[0].decision.reason, decision.reason);
+  const next = applyDiagramEvent(finished, event("reaction_started", {reaction:reaction.id, invocation_id:"next"}));
+  assert.equal(next.reactions[0].decision, undefined);
 });

@@ -549,3 +549,38 @@ Important verification targets are:
 - bytecode never references an undefined component;
 - compatible retained agents are never unnecessarily restarted; and
 - equal compiler inputs produce equal bytecode.
+
+## Automatic Jev decision gates
+
+A prompt may place `jev(profile, criterion, outcome: effect, ...)` after its
+optional `within(...)` deadline and before the prompt string. This annotates an
+existing reasoning decision; the named agent is its fallback. Code reactions
+cannot carry a gate. A route may include a responsibility description after the
+effect, for example `backend: fix_backend "Server behavior"`.
+
+The two admitted profiles are `artifact-requirement-v1` and `review-owner-v1`.
+A gate requires one complete string trigger, declared string effects with an
+alternative contract, and a Codex, ClaudeCode, or OpenCode fallback. The runtime
+verifies bounded criteria, complete route coverage, and separate pass/repair
+branches for requirement checks. Each route forwards the input unchanged.
+
+```omar
+team Check[reviewer : Codex]
+{
+    input draft : string
+    output ready : string
+    output revise : string
+
+    prompt reviewer(draft) -> (ready | revise) within(60s)
+        jev("artifact-requirement-v1", "The opening identifies the founder and the event.",
+            appears_satisfied: ready, partially_satisfied: revise, not_satisfied: revise)
+        "Review only the stated requirement using the supplied draft."
+}
+
+main RequirementCheck { check = Check() }
+```
+
+The bytecode's `install_reaction` includes an optional `decision` object with
+`profile`, `criterion`, and `routes` (`outcome`, qualified `port`, `description`).
+Unknown profiles or undeclared routes are rejected. See
+[automatic decisions](../docs/jev-automatic-decisions.md) for enablement and policy.

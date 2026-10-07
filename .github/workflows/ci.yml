@@ -127,6 +127,34 @@ jobs:
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1
 
+  decision-support:
+    name: Jev Decisions and Assistance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: .github/scripts/install-packages.sh tmux
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lang
+          build: true
+          test: false
+      - run: cargo clippy --bin omar --features decision-support -- -D warnings
+      - run: |
+          cargo test --bin omar --features decision-support decisions:: -- --test-threads=1
+      - run: |
+          cargo test --bin omar --features decision-support topology:: -- --test-threads=1
+      - run: |
+          cargo test --bin omar --features decision-support serve::assistance::tests -- --test-threads=1
+      - run: cargo test --bin omar --features decision-support advisory_reader -- --test-threads=1
+      - run: |
+          cargo test --bin omar --features decision-support protocol::
+      - run: cargo test --bin omar --features decision-support starter_workflows_compile -- --ignored
+      # Live evaluation is never selected here and no provider secret is set.
+
   codex-shared-history:
     name: Codex Shared History
     runs-on: ubuntu-latest
@@ -780,7 +808,7 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [msrv, pi-bridge, check, fmt, clippy, test, codex-shared-history, backend-supervision-contracts, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
+    needs: [msrv, pi-bridge, check, fmt, clippy, test, decision-support, codex-shared-history, backend-supervision-contracts, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: always()
@@ -793,6 +821,7 @@ jobs:
              [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.decision-support.result }}" != "success" ]] || \
              [[ "${{ needs.codex-shared-history.result }}" != "success" ]] || \
              [[ "${{ needs.backend-supervision-contracts.result }}" != "success" ]] || \
              [[ "${{ needs.omar-language.result }}" != "success" ]] || \
