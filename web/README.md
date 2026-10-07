@@ -106,6 +106,16 @@ recover topology execution; running topologies prevent automatic shutdown.
 Unsent drafts, manual source edits and terminal scrollback are not archived.
 Reopened proposals still require deployment confirmation.
 
+In task details, **Add connection** configures an HTTP API, outbound webhook,
+or an MCP server already installed in the execution agent. HTTP connections
+support no authentication, bearer tokens, and API key headers; credentials are
+referenced by environment variable name. Connection settings travel in the
+task's execution prompt. The agent makes requests with its own tools; adding a
+connection does not test the endpoint or install an MCP server. **Workflow
+inputs** separately control what data triggers the task. **Apply configuration**
+validates the source and saves the edited draft in this browser, scoped to the
+chat and proposal, so it survives reloads. A new proposal starts a new draft.
+
 The catalog routes remain `/v1/chats` and `/v1/chats/<id>/activate`. Activation
 only remembers a default selection. Clients pin a workspace by prefixing its
 API and terminal routes with `/chats/<id>` (for example,
