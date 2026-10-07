@@ -33,7 +33,7 @@ test("renders the OMAR Mission Control application shell", async () => {
   assert.doesNotMatch(html, /WORKFLOW BUILDER/);
   assert.doesNotMatch(html, /class="topbar"/);
   assert.match(html, /alt="Omar"/);
-  assert.match(html, /LIVE TOPOLOGY/);
+  assert.match(html, /WORKFLOW TOPOLOGY/);
   assert.match(html, /ReviewFlow\.omar/);
   // Mode is a launch flag, so with OMAR_SERVE_URL unset the shell renders the
   // offline demo topology rather than any connect affordance.
@@ -100,7 +100,7 @@ test("uses the LF-inspired visual grammar without KIELER", async () => {
   ]);
 
   // Real SVG geometry, not rectangles clipped into shape by CSS.
-  assert.match(diagram, /function chevronPoints/);
+  assert.match(diagram, /<rect className="omar-reaction-body"/);
   assert.match(diagram, /function portTriangle/);
   assert.match(diagram, /function diamondPoints/);
   assert.match(diagram, /"elk\.edgeRouting": "ORTHOGONAL"/);

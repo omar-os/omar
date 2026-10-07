@@ -148,6 +148,13 @@ pub struct DiagramTimer {
 pub struct DiagramReaction {
     pub id: String,
     pub name: String,
+    /// Human-readable task copy; absent in workflows created before task metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub description: Option<String>,
     pub agent: String,
     pub order: usize,
     pub triggers: Vec<String>,
@@ -274,6 +281,8 @@ impl DiagramSnapshot {
             .map(|(name, reaction)| DiagramReaction {
                 id: reaction_id(name),
                 name: name.clone(),
+                title: reaction.title.clone(),
+                description: reaction.description.clone(),
                 agent: agent_id(&reaction.agent),
                 order: reaction.order,
                 triggers: reaction.triggers.iter().map(&trigger_id).collect(),
@@ -866,6 +875,8 @@ mod tests {
                     effects: vec!["answer".to_string()],
                     contract: "answer".to_string(),
                     prompt: "Respond".to_string(),
+                    title: None,
+                    description: None,
                     body: None,
                     within: None,
                 },
@@ -935,11 +946,41 @@ mod tests {
                     effects: vec!["writer.draft".to_string()],
                     contract: "writer.draft".to_string(),
                     prompt: "Draft".to_string(),
+                    title: None,
+                    description: None,
                     body: None,
                     within: None,
                 },
             )]),
         }
+    }
+
+    #[test]
+    fn task_copy_reaches_the_diagram_and_legacy_snapshots_still_load() {
+        let mut state = sample_state();
+        let old = serde_json::to_value(DiagramSnapshot::from_vm_state(&state)).unwrap();
+        let legacy: DiagramSnapshot = serde_json::from_value(old.clone()).unwrap();
+        assert!(legacy.reactions[0].title.is_none());
+        let reaction = state.reactions.get_mut("respond").unwrap();
+        reaction.title = Some("Answer the request".into());
+        reaction.description = Some("Read the request and return a complete answer.".into());
+        let snapshot = DiagramSnapshot::from_vm_state(&state);
+        assert_eq!(
+            snapshot.reactions[0].title.as_deref(),
+            Some("Answer the request")
+        );
+        assert_eq!(
+            snapshot.reactions[0].description.as_deref(),
+            Some("Read the request and return a complete answer.")
+        );
+        assert_eq!(snapshot.reactions[0].id, legacy.reactions[0].id);
+        assert_eq!(serde_json::to_value(&snapshot.edges).unwrap(), old["edges"]);
+        let saved: DiagramSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        assert_eq!(
+            saved.reactions[0].description,
+            snapshot.reactions[0].description
+        );
     }
 
     #[test]

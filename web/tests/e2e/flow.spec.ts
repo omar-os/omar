@@ -58,6 +58,31 @@ async function useFakeServe(page: import("@playwright/test").Page) {
   await expect(page.locator(".daemon")).toContainText(FAKE_SERVE_URL);
 }
 
+test("generated task copy appears on cards and in details after reload", async ({ page }) => {
+  await fake.close();
+  const title = "Prepare reel content";
+  const description = "Research and verify a fresh story, then create the script, narration and captions. Complete this step in ChatGPT and paste the production packet into OMAR.";
+  fake = await startFakeServe({
+    port: FAKE_SERVE_PORT,
+    taskMetadata: { "reaction::flow.reaction.0": { title, description } },
+  }) as FakeServe;
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const card = page.getByRole("button", { name: "Inspect flow.reaction.0", exact: true });
+  await expect(card.locator(".omar-reaction-name")).toHaveText(title);
+  await card.click();
+  const details = page.getByRole("complementary", { name: "Step details" });
+  await expect(details.getByRole("heading", { name: title })).toBeVisible();
+  await expect(details.locator(".inspector-description")).toHaveText(description);
+  await expect(details.locator("code").filter({ hasText: "flow.reaction.0" })).toBeHidden();
+  await details.getByText("Technical details", { exact: true }).click();
+  await expect(details.locator("code").filter({ hasText: "flow.reaction.0" })).toBeVisible();
+  await page.reload();
+  await expect(card.locator(".omar-reaction-name")).toHaveText(title);
+  await card.click();
+  await expect(details.locator(".inspector-description")).toHaveText(description);
+});
+
 test("deployment confirmation is a modal with lifecycle guidance and keyboard cancellation", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);
@@ -193,8 +218,8 @@ test("a reaction's deadline is drawn as a stopwatch on its chevron", async ({
   // The chevron widens for it rather than the stopwatch landing on the name.
   const marked = page.locator(".omar-reaction", { has: deadlines });
   const plain = page.locator(".omar-reaction").first();
-  const markedBox = (await marked.locator("polygon").boundingBox())!;
-  const plainBox = (await plain.locator("polygon").boundingBox())!;
+  const markedBox = (await marked.locator(".omar-reaction-body").boundingBox())!;
+  const plainBox = (await plain.locator(".omar-reaction-body").boundingBox())!;
   expect(markedBox.width).toBeGreaterThan(plainBox.width);
 });
 
@@ -215,7 +240,12 @@ test("a web component's panel opens from the diagram, and answers it", async ({
   await deploy(page);
 
   const panel = page.getByRole("dialog", { name: /Port panel for/ });
-  // Not docked anywhere: nothing is on screen until the component is opened.
+  // The handoff stays visible even when its dialog is closed.
+  await expect(panel).toBeHidden();
+  await expect(page.locator(".run-waiting")).toContainText("Waiting for your response");
+  await page.getByRole("button", { name: "Open response panel" }).click();
+  await expect(panel).toBeVisible();
+  await panel.getByRole("button", { name: "Close", exact: true }).click();
   await expect(panel).toBeHidden();
 
   // Drawn as reachable before it is touched: exactly one reaction on the
@@ -653,7 +683,7 @@ test("the studio opens on a centred prompt, then settles into a thread", async (
   // window size, with room for the larger chat text.
   expect(opening.width).toBe(500);
   expect(opening.height).toBeLessThan(130);
-  await expect(composer.locator("textarea")).toHaveCSS("font-size", "16px");
+  await expect(composer.locator("textarea")).toHaveCSS("font-size", "14px");
 
   await composer.getByLabel("Describe a workflow").fill("Review the release plan");
   await page.keyboard.press("Enter");
@@ -661,8 +691,8 @@ test("the studio opens on a centred prompt, then settles into a thread", async (
   // Once there is a conversation it belongs at the bottom, under the thread.
   await expect(page.locator(".messages")).toContainText("Review the release plan");
   await expect(page.locator(".builder-panel")).not.toHaveClass(/opening/);
-  await expect(page.locator(".message-content > p").first()).toHaveCSS("font-size", "16px");
-  await expect(page.locator(".message.assistant:not(.progress) .message-body").first()).toHaveCSS("font-size", "16px");
+  await expect(page.locator(".message-content > p").first()).toHaveCSS("font-size", "13px");
+  await expect(page.locator(".message.assistant:not(.progress) .message-body").first()).toHaveCSS("font-size", "13px");
   const threaded = (await composer.boundingBox())!;
   expect(threaded.y).toBeGreaterThan(opening.y + 100);
   // The compact size belongs to the opening screen only; in a thread the box
@@ -705,7 +735,7 @@ test("the workflow's buttons sit with the workflow", async ({ page }) => {
 
   // And the stats did not get stranded in the middle by the third child.
   const stats = (await page.locator(".run-stats").boundingBox())!;
-  expect(stats.x).toBeGreaterThan(
+  expect(stats.x).toBeGreaterThanOrEqual(
     (await page.locator(".diagram-heading h2").boundingBox())!.x,
   );
   expect(stats.x + stats.width).toBeLessThanOrEqual(first.x + 1);
@@ -723,7 +753,7 @@ test("a run can be stopped from the panel that shows it", async ({ page }) => {
   await expect(actions.getByRole("button", { name: "Stop" })).toHaveCount(0);
 
   await deploy(page);
-  await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("LIVE TOPOLOGY");
+  await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("WORKFLOW TOPOLOGY");
 
   const stop = actions.getByRole("button", { name: "Stop" });
   await expect(stop).toBeEnabled();
@@ -1291,7 +1321,7 @@ test("an edge into a reaction actually reaches it", async ({ page }) => {
   const strays = async () => {
     const found: string[] = [];
     for (const reaction of reactions) {
-      const id = await reaction.locator(".omar-reaction-name").textContent();
+      const id = (await reaction.getAttribute("aria-label"))?.replace(/^Inspect /, "");
       const box = (await reaction.boundingBox())!;
       const edges = page.locator(`[data-id$="${id}"]`);
       if ((await edges.count()) === 0) found.push(`${id}: no edge`);
@@ -1317,7 +1347,7 @@ test("the timeline projects a program before anything is deployed", async ({
   await useFakeServe(page);
   await draftUntilProposed(page);
 
-  await page.getByRole("button", { name: "▲ Timeline" }).click();
+  await page.getByRole("button", { name: /Run timeline/ }).click();
   const timeline = page.getByLabel("Logical timeline");
   await expect(timeline).toBeVisible();
 
@@ -1387,9 +1417,9 @@ test("the diagram follows the text", async ({ page }) => {
 
 test("the assistant terminal remains available before and after a topology opens", async ({ page }) => {
   await useFakeServe(page);
-  const inspect = page.getByRole("button", { name: "Inspect on terminal" });
+  const inspect = page.getByRole("button", { name: "Inspect terminal" });
   await expect(inspect).toBeEnabled();
-  await expect(page.locator(".composer-tools").getByRole("button", { name: "Inspect on terminal" })).toBeVisible();
+  await expect(page.locator(".composer-tools").getByRole("button", { name: "Inspect terminal" })).toBeVisible();
   await expect(page.locator(".topbar, .panel-heading, .history-footnote")).toHaveCount(0);
   await expect(page.getByRole("img", { name: "Omar", exact: true })).toBeVisible();
   const backendBounds = (await page.locator(".backend-trigger").boundingBox())!;
@@ -1465,7 +1495,7 @@ test("Escape reaches the terminal and only the explicit close chord detaches", a
   page.on("websocket", (socket) => socket.on("framesent", (frame) => {
     if (Buffer.isBuffer(frame.payload)) keys.push(frame.payload);
   }));
-  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await page.getByRole("button", { name: "Inspect terminal" }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toContainText("attached");
   await page.keyboard.press("Escape");
@@ -1476,7 +1506,7 @@ test("Escape reaches the terminal and only the explicit close chord detaches", a
   await page.keyboard.press("Control+Shift+Escape");
   await expect(dialog).toBeHidden();
   expect(Buffer.concat(keys).toString()).toBe("\x1bstill here");
-  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await page.getByRole("button", { name: "Inspect terminal" }).click();
   await expect(dialog).toBeVisible();
   await page.getByRole("button", { name: "Close terminal" }).click();
   await expect(dialog).toBeHidden();
@@ -1491,7 +1521,7 @@ test("an alternate-screen terminal draws at the initial and resized geometry wit
     const url = new URL(socket.url());
     initial = { cols: Number(url.searchParams.get("cols")), rows: Number(url.searchParams.get("rows")) };
   });
-  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await page.getByRole("button", { name: "Inspect terminal" }).click();
   const rows = page.locator(".xterm-rows");
   await expect(rows).toContainText("BOTTOM");
   expect(initial.cols).toBeGreaterThan(80);
@@ -1544,7 +1574,7 @@ test("a drag resizes the view every frame and the session once", async ({
 
   await page.getByLabel("Describe a workflow").fill("Review the release plan");
   await page.keyboard.press("Enter");
-  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await page.getByRole("button", { name: "Inspect terminal" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByRole("dialog")).toContainText("attached");
 
@@ -1591,7 +1621,7 @@ test("the terminal fits the panel and reflows to it", async ({ page }) => {
   await useFakeServe(page);
   await page.getByLabel("Describe a workflow").fill("Review the release plan");
   await page.keyboard.press("Enter");
-  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await page.getByRole("button", { name: "Inspect terminal" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
 
   const inside = async () => {
@@ -1774,7 +1804,7 @@ test("chat history restores messages and proposals after switching and reloading
   expect(sidebarBounds.x + sidebarBounds.width).toBeLessThanOrEqual(workspaceBounds.x);
   await expect(page.getByRole("dialog", { name: "Chat history" })).toHaveCount(0);
   await expect(history.getByRole("list", { name: "Saved chats" })).toContainText("Review the release plan");
-  await history.getByRole("button", { name: "New chat" }).click();
+  await history.getByRole("button", { name: "New workflow" }).click();
   await expect(history).toBeVisible();
   await expect(page.locator(".messages")).not.toContainText("Review the release plan");
   await expect(page.getByRole("group", { name: "Deploy design" })).toBeHidden();
@@ -1785,7 +1815,7 @@ test("chat history restores messages and proposals after switching and reloading
   await expect(page.locator(".messages")).toContainText("Prepare a product launch");
   await expect(page.locator(".messages")).not.toContainText("Review the release plan");
 
-  await history.getByLabel("Search chats").fill("release");
+  await history.getByLabel("Search workflows").fill("release");
   await expect(history.getByRole("listitem")).toHaveCount(1);
   await history.getByRole("button", { name: /Review the release plan/ }).click();
   await expect(page.locator(".messages")).toContainText("The planner");
@@ -1822,7 +1852,7 @@ test("chat history reports load failures and allows switching during a reply", a
   await page.getByLabel("Draft workflow").click();
   await page.getByRole("button", { name: "Open chat history" }).click();
   const history = page.getByRole("dialog", { name: "Chat history" });
-  await expect(history.getByRole("button", { name: "New chat" })).toBeEnabled();
+  await expect(history.getByRole("button", { name: "New workflow" })).toBeEnabled();
   await expect(history).toContainText("Thinking");
   const bounds = (await history.boundingBox())!;
   expect(bounds.x).toBeGreaterThanOrEqual(0);
@@ -1848,17 +1878,17 @@ test("chat history keeps tab selections independent and refreshes background cha
   const second = await context.newPage();
   try {
     await useFakeServe(second);
-    await second.getByRole("complementary", { name: "Chat history" }).getByRole("button", { name: "+ New chat", exact: true }).click();
+    await second.getByRole("complementary", { name: "Chat history" }).getByRole("button", { name: "New workflow", exact: true }).click();
     await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
     await expect(page.locator(".messages")).toContainText("Review the release plan");
     await second.getByLabel("Describe a workflow").fill("Plan the next release");
     await second.getByLabel("Draft workflow").click();
     await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
     await expect(history.getByRole("listitem").first()).toContainText("Plan the next release");
-    await expect(history.getByRole("listitem").first()).not.toContainText(/messages|Current/);
-    await history.getByLabel("Search chats").fill("nothing matches");
-    await expect(history).toContainText("No chats found");
-    await history.getByLabel("Search chats").fill("");
+    await expect(history.getByRole("listitem").first()).not.toContainText(/Current/);
+    await history.getByLabel("Search workflows").fill("nothing matches");
+    await expect(history).toContainText("No workflows found");
+    await history.getByLabel("Search workflows").fill("");
     await expect(history.getByRole("listitem")).toHaveCount(2);
     await page.reload();
     await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
@@ -1877,7 +1907,7 @@ test("chat history drawer closes after selecting a chat and responds to viewport
   expect(bounds.width).toBeLessThan(390);
   await expect(drawer.getByRole("list", { name: "Saved chats" })).not.toBeEmpty();
   await page.screenshot({ path: "/tmp/omar-history-sidebar-mobile.png" });
-  await drawer.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await drawer.getByRole("button", { name: "New workflow", exact: true }).click();
   await expect(drawer).toBeHidden();
   await expect(page.getByRole("button", { name: "Open chat history" })).toBeFocused();
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -1896,7 +1926,7 @@ test("switching chats while thinking preserves both replies", async ({ page }) =
   await page.getByLabel("Draft workflow").click();
   const history = page.getByRole("complementary", { name: "Chat history" });
   await expect(page.locator(".connection")).toContainText("drafting");
-  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await history.getByRole("button", { name: "New workflow", exact: true }).click();
   await expect(page.locator(".messages")).not.toContainText("First workspace");
   await page.getByLabel("Describe a workflow").fill("Second workspace");
   await page.getByLabel("Draft workflow").click();
@@ -1926,7 +1956,7 @@ test("two chats keep live topologies when switching and reloading", async ({ pag
     await expect(page.locator(".connection")).toContainText("observing");
   };
   await draft("Topology A");
-  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await history.getByRole("button", { name: "New workflow", exact: true }).click();
   await draft("Topology B");
   await page.getByLabel("Describe a workflow").fill("Continue monitoring B");
   await page.getByLabel("Draft workflow").click();
@@ -1969,8 +1999,8 @@ test("two chats keep live topologies when switching and reloading", async ({ pag
   await expect(page.locator(".messages")).not.toContainText("Topology A");
   await expect(history.getByRole("button", { name: /Topology A/ })).toContainText("Running");
   await expect(page.locator(".omar-reaction")).not.toHaveCount(0);
-  await expect(history.locator(".chat-running").first()).toHaveCSS("font-weight", "700");
-  await expect(history.locator(".chat-running").first()).toHaveCSS("color", "rgb(196, 181, 253)");
+  await expect(history.locator(".workflow-status.status-running").first()).toHaveCSS("font-weight", "650");
+  await expect(history.locator(".workflow-status.status-running").first()).toHaveCSS("color", "rgb(175, 141, 255)");
   await page.screenshot({ path: "/tmp/omar-live-chats.png" });
 });
 
@@ -1985,7 +2015,7 @@ test("an undeployed proposal remains actionable after a finished run and chat sw
   const controls = page.getByRole("group", { name: "Deploy design" });
   await expect(controls).toBeVisible();
   const history = page.getByRole("complementary", { name: "Chat history" });
-  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await history.getByRole("button", { name: "New workflow", exact: true }).click();
   await history.getByRole("button", { name: /Review the release plan/ }).click();
   await expect(controls).toBeVisible();
   await expect(controls.getByRole("button", { name: "Deploy", exact: true })).toBeEnabled();
@@ -2067,7 +2097,7 @@ test("a delayed deploy response cannot replace the chat selected afterward", asy
   await admission;
   try {
     const history = page.getByRole("complementary", { name: "Chat history" });
-    await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+    await history.getByRole("button", { name: "New workflow", exact: true }).click();
     await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "false");
     await expect(page.locator(".messages")).not.toContainText("Review the release plan");
     release();
@@ -2080,4 +2110,258 @@ test("a delayed deploy response cannot replace the chat selected afterward", asy
   } finally {
     release();
   }
+});
+
+
+test("failed manual handoffs explain the cause and can restart after reload", async ({ page }) => {
+  await fake.close();
+  fake = (await startFakeServe({
+    stepMs: 120,
+    port: FAKE_SERVE_PORT,
+    snapshot: "diagram-web.v1.json",
+    webFailure: "'flow.reviewer' did not answer within 300s, and contract 'critique' requires an effect",
+  })) as FakeServe;
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+  const feedback = page.locator(".run-failure");
+  await expect(feedback).toContainText("No response was submitted for flow.reviewer within 5 minutes");
+  await expect(page.locator(".omar-reaction.running")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Open response panel" })).toBeHidden();
+  await dragDivider(page, "Resize the conversation", -600);
+  await expect(feedback).toBeVisible();
+  const again = page.getByRole("button", { name: "Run again", exact: true });
+  await again.click();
+  const dialog = page.getByRole("dialog", { name: /Run ReviewFlow again/ });
+  await expect(dialog).toContainText("from the beginning");
+  await expect(dialog.getByLabel("Default step timeout")).toHaveValue("3600");
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(again).toBeFocused();
+  const previous = (await (await page.request.get(`${fake.url}/v1/runs`)).json()).runs;
+  expect(previous).toHaveLength(1);
+  await page.reload();
+  await expect(feedback).toBeVisible();
+  await again.click();
+  await dialog.getByLabel("Default step timeout").selectOption("7200");
+  const admission = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/v1/runs"));
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  const body = (await admission).postDataJSON();
+  expect(body.timeout_seconds).toBe(7200);
+  expect(body.inputs["flow.request"]).toBe("Review the release plan");
+  await expect(feedback).toBeVisible();
+  const restarted = (await (await page.request.get(`${fake.url}/v1/runs`)).json()).runs;
+  expect(restarted).toHaveLength(2);
+  expect(restarted[1].run_id).not.toBe(previous[0].run_id);
+});
+
+for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
+  test(`workflow sorting menu orders real rows and supports keyboard dismissal at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    const browserErrors: string[] = [];
+    page.on("pageerror", (error) => browserErrors.push(error.message));
+    const fixtures = [
+      { title: "Zulu running", status: "running" },
+      { title: "Bravo failed", status: "failed" },
+      { title: "alpha draft", status: "draft" },
+      { title: "Delta paused", status: "paused" },
+      { title: "Echo completed", status: "completed" },
+      { title: "Omega running", status: "running" },
+      { title: "Foxtrot stopped", status: "stopped" },
+    ];
+    await page.route("**/v1/chats", async (route) => {
+      if (route.request().method() !== "GET") return route.continue();
+      const response = await route.fetch();
+      const data = await response.json();
+      const template = data.conversations[0];
+      data.conversations = fixtures.map((fixture, index) => ({
+        ...template,
+        id: `sort-${index}`,
+        title: fixture.title,
+        updated_at: Date.UTC(2026, 9, 6, 12, index),
+        busy: false,
+        run: fixture.status === "draft" ? null : { id: `run-${index}`, team: "Review flow", status: fixture.status },
+      }));
+      await route.fulfill({ response, json: data });
+    });
+    await useFakeServe(page);
+    if (viewport.width < 900) await page.getByRole("button", { name: "Open chat history" }).click();
+    const history = page.getByRole(viewport.width < 900 ? "dialog" : "complementary", { name: "Chat history" });
+    const titles = history.locator(".workflow-title");
+    const trigger = history.getByRole("button", { name: "Sort workflows", exact: true });
+    const menu = history.getByRole("menu", { name: "Sort workflows" });
+    await expect(titles).toHaveText(["Foxtrot stopped", "Omega running", "Echo completed", "Delta paused", "alpha draft", "Bravo failed", "Zulu running"]);
+    await trigger.click();
+    await expect(menu.getByRole("menuitemradio", { name: "Recent activity" })).toHaveAttribute("aria-checked", "true");
+    await menu.getByRole("menuitemradio", { name: "Name A–Z" }).click();
+    await expect(menu).toBeHidden();
+    await expect(trigger).toBeFocused();
+    await expect(titles).toHaveText(["alpha draft", "Bravo failed", "Delta paused", "Echo completed", "Foxtrot stopped", "Omega running", "Zulu running"]);
+    await trigger.press("ArrowDown");
+    await expect(menu.getByRole("menuitemradio", { name: "Name A–Z" })).toBeFocused();
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Enter");
+    await expect(titles).toHaveText(["Omega running", "Zulu running", "Bravo failed", "alpha draft", "Delta paused", "Foxtrot stopped", "Echo completed"]);
+    await trigger.click();
+    await expect(menu.getByRole("menuitemradio", { name: "Status", exact: true })).toHaveAttribute("aria-checked", "true");
+    const menuBox = (await menu.boundingBox())!;
+    expect(menuBox.x).toBeGreaterThanOrEqual(0);
+    expect(menuBox.x + menuBox.width).toBeLessThanOrEqual(viewport.width);
+    await page.screenshot({ path: `/tmp/omar-sort-menu-${viewport.width}.png` });
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
+    await expect(history).toBeVisible();
+    await expect(trigger).toBeFocused();
+    await trigger.click();
+    await history.getByRole("textbox", { name: "Search workflows" }).click();
+    await expect(menu).toBeHidden();
+    await history.getByRole("textbox", { name: "Search workflows" }).fill("running");
+    await expect(titles).toHaveText(["Omega running", "Zulu running"]);
+    await history.getByRole("textbox", { name: "Search workflows" }).fill("");
+    fixtures[5].status = "failed";
+    await expect(titles).toHaveText(["Zulu running", "Omega running", "Bravo failed", "alpha draft", "Delta paused", "Foxtrot stopped", "Echo completed"]);
+    await trigger.click();
+    await menu.getByRole("menuitemradio", { name: "Recent activity" }).click();
+    await expect(titles).toHaveText(["Foxtrot stopped", "Omega running", "Echo completed", "Delta paused", "alpha draft", "Bravo failed", "Zulu running"]);
+    expect(browserErrors).toEqual([]);
+  });
+}
+
+test("workflow names save on Enter or blur, cancel on Escape, and survive reload", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  await history.locator(".workflow-title").dblclick();
+  const name = history.getByRole("textbox", { name: "Workflow name", exact: true });
+  const longTitle = "Set up Raisi Wire as ChatGPT → Claude Code → ChatGPT";
+  await name.fill(longTitle);
+  await name.press("Enter");
+  const title = history.locator(".workflow-title");
+  await expect(title).toHaveText(longTitle);
+  for (const width of [1512, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect(title).toHaveCSS("text-overflow", "ellipsis");
+    expect(await title.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
+    expect(await history.getByRole("list", { name: "Saved chats" }).evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  }
+  await title.dblclick();
+  await expect(name).toHaveValue(longTitle);
+  const editor = (await name.boundingBox())!;
+  const chevron = (await history.locator(".workflow-name svg").boundingBox())!;
+  expect(editor.x + editor.width).toBeLessThan(chevron.x);
+  await name.fill("Launch review");
+  await name.press("Enter");
+  await expect(history.locator(".workflow-title")).toHaveText("Launch review");
+  await expect(page.locator(".conversation-crumb")).toContainText("Launch review");
+  await history.locator(".workflow-title").dblclick();
+  await name.fill("Cancelled title");
+  await name.press("Escape");
+  await expect(history.locator(".workflow-title")).toHaveText("Launch review");
+  await history.locator(".workflow-title").dblclick();
+  await name.fill("Launch approvals");
+  await history.getByRole("textbox", { name: "Search workflows" }).click();
+  await expect(history.locator(".workflow-title")).toHaveText("Launch approvals");
+  await page.reload();
+  await expect(history.locator(".workflow-title")).toHaveText("Launch approvals");
+  await history.getByRole("textbox", { name: "Search workflows" }).fill("approvals");
+  await expect(history.locator(".workflow-title")).toHaveCount(1);
+  await history.getByRole("textbox", { name: "Search workflows" }).fill("absent");
+  await expect(history).toContainText("No workflows found");
+});
+
+test("splitter hover collapse and double-click reset keep the composer reachable", async ({ page }) => {
+  await page.setViewportSize({ width: 1512, height: 900 });
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const divider = page.getByRole("separator", { name: "Resize the conversation" });
+  const before = (await page.locator(".builder-panel").boundingBox())!;
+  await dragDivider(page, "Resize the conversation", 90);
+  await divider.dblclick({ position: { x: 2, y: 20 } });
+  await expect.poll(async () => (await page.locator(".builder-panel").boundingBox())!.width).toBeCloseTo(before.width, 0);
+  await divider.hover();
+  await divider.getByRole("button", { name: "Hide the conversation" }).click();
+  await expect(page.getByRole("button", { name: "Show the conversation" })).toBeVisible();
+  await page.getByRole("button", { name: "Show the conversation" }).click();
+  await expect(page.getByLabel("Describe a workflow")).toBeVisible();
+});
+
+test("step configuration validates real source edits and never starts a run", async ({ page }) => {
+  await page.setViewportSize({ width: 1512, height: 900 });
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  let admissions = 0;
+  page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/v1/runs")) admissions++; });
+  await page.locator(".omar-reaction").first().press("Enter");
+  const inspector = page.getByRole("complementary", { name: "Step details" });
+  await expect(inspector.getByLabel("Step prompt")).toHaveValue(/Draft a concrete plan/);
+  let releaseValidation: (() => void) | undefined;
+  await page.route("**/v1/programs/check", async (route) => {
+    if (String(route.request().postDataJSON().program).includes("ClaudeCode") && !releaseValidation) await new Promise<void>((resolve) => { releaseValidation = resolve; });
+    return route.continue();
+  });
+  await inspector.getByLabel("Step execution agent").selectOption("ClaudeCode");
+  await inspector.getByLabel("Step prompt").fill('Read $(request), then produce a "reviewed" plan.');
+  await inspector.getByRole("button", { name: "Apply configuration" }).click();
+  await expect(page.getByRole("button", { name: "Deploy", exact: true })).toBeDisabled();
+  releaseValidation?.();
+  await expect(inspector.getByRole("button", { name: "Apply configuration", exact: true })).toBeDisabled();
+  await expect(inspector.getByLabel("Step prompt")).toHaveValue('Read $(request), then produce a "reviewed" plan.');
+  await inspector.getByRole("button", { name: "Edit prompt & backend in source" }).click();
+  const program = page.getByRole("textbox", { name: "OMAR program", exact: true });
+  await expect(program).toHaveValue(/planner\s+: ClaudeCode/);
+  await expect(program).toHaveValue(/\\"reviewed\\"/);
+  await page.getByRole("separator", { name: "Resize the source pane" }).hover();
+  await page.getByRole("button", { name: "Hide the source pane" }).click();
+  await page.route("**/v1/programs/check", (route) => {
+    if (String(route.request().postDataJSON().program).includes("Rejected edit")) return route.fulfill({ json: { ok: false, errors: ["The selected input is not declared."] } });
+    return route.continue();
+  });
+  await page.locator(".omar-reaction").first().press("Enter");
+  await inspector.getByLabel("Step prompt").fill("Rejected edit");
+  await inspector.getByRole("button", { name: "Apply configuration" }).click();
+  await expect(inspector.getByRole("alert")).toContainText("not declared");
+  await inspector.getByRole("button", { name: "Add connection", exact: true }).click();
+  await inspector.getByLabel("Input connection").selectOption("critique");
+  await inspector.getByRole("button", { name: "Add selected connection" }).click();
+  await expect(inspector.getByRole("button", { name: "Remove input critique" })).toBeVisible();
+  await inspector.getByRole("button", { name: "Remove input critique" }).click();
+  await expect(page.locator(".connection")).toHaveText("review");
+  expect(admissions).toBe(0);
+  await page.screenshot({ path: "/tmp/omar-spec-configuration.png" });
+});
+
+test("workspace files refresh, preview snapshots, and dismiss on backdrop or Escape", async ({ page }) => {
+  let refreshes = 0;
+  let releaseRefresh: (() => void) | undefined;
+  await page.route("**/v1/workspaces**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/v1/workspaces")) {
+      refreshes++;
+      if (refreshes === 2) await new Promise<void>((resolve) => { releaseRefresh = resolve; });
+      return route.fulfill({ json: { workspaces: [{ id: "work-one", instance: "flow", deployment_id: "test", restored_from: null }] } });
+    }
+    if (path.endsWith("/work-one")) return route.fulfill({ json: { snapshots: [{ id: "snap-one", label: "Initial workspace", created_at: 1700000000, sequence: 1 }] } });
+    if (path.endsWith("/browse")) return route.fulfill({ json: { entries: [{ name: "CLAUDE.md", kind: "file", size: 32 }], truncated: false } });
+    if (path.endsWith("/preview")) return route.fulfill({ json: { kind: "text", text: route.request().postDataJSON().snapshot ? "Saved instructions" : "Current instructions", size: 32 } });
+    return route.fulfill({ status: 404, json: { error: "Unexpected workspace operation" } });
+  });
+  await useFakeServe(page);
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  const modal = page.getByRole("dialog", { name: "Files & versions" });
+  await modal.getByRole("button", { name: /CLAUDE.md/ }).click();
+  await expect(modal.getByLabel("File preview")).toContainText("Current instructions");
+  await modal.getByLabel("File version").selectOption("snap-one");
+  await expect(modal).toContainText("Saved version · read-only");
+  await modal.getByRole("button", { name: /CLAUDE.md/ }).click();
+  await expect(modal.getByLabel("File preview")).toContainText("Saved instructions");
+  await modal.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(modal.getByRole("button", { name: "Refreshing…" })).toBeDisabled();
+  releaseRefresh?.();
+  await expect(modal.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
+  await page.screenshot({ path: "/tmp/omar-spec-files.png" });
+  await page.mouse.click(5, 5);
+  await expect(modal).toBeHidden();
+  await expect(page.getByRole("button", { name: "Files & versions" })).toBeFocused();
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  await page.keyboard.press("Escape");
+  await expect(modal).toBeHidden();
 });

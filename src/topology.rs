@@ -100,6 +100,10 @@ pub enum Instruction {
         effects: Vec<String>,
         contract: String,
         prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         /// A Rust body, when the reaction is code rather than a prompt.
         #[serde(default)]
         body: Option<String>,
@@ -204,6 +208,10 @@ pub struct ReactionState {
     pub effects: Vec<String>,
     pub contract: String,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// A Rust body, when the reaction is code rather than a prompt.
     #[serde(default)]
     pub body: Option<String>,
@@ -680,6 +688,8 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 effects,
                 contract,
                 prompt,
+                title,
+                description,
                 body,
                 instance,
                 within,
@@ -732,6 +742,8 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                             effects: effects.clone(),
                             contract: contract.clone(),
                             prompt: prompt.clone(),
+                            title: title.clone(),
+                            description: description.clone(),
                             body: body.clone(),
                             within: *within,
                         },
@@ -3168,6 +3180,41 @@ mod tests {
     }
 
     #[test]
+    fn task_metadata_survives_verification_without_changing_execution() {
+        let old = program();
+        let mut named = old.clone();
+        for instruction in &mut named.instructions {
+            if let Instruction::InstallReaction {
+                title, description, ..
+            } = instruction
+            {
+                *title = Some("Complete the request".into());
+                *description = Some("Process the request and return the result.".into());
+            }
+        }
+        let before = verify(&old).unwrap();
+        let after = verify(&named).unwrap();
+        let reaction = &after.reactions["reaction.0"];
+        assert_eq!(reaction.title.as_deref(), Some("Complete the request"));
+        assert_eq!(reaction.prompt, before.reactions["reaction.0"].prompt);
+        let mut restored = after.clone();
+        for reaction in restored.reactions.values_mut() {
+            reaction.title = None;
+            reaction.description = None;
+        }
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(restored).unwrap()
+        );
+        let roundtrip: VmState =
+            serde_json::from_value(serde_json::to_value(after).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.reactions["reaction.0"].title.as_deref(),
+            Some("Complete the request")
+        );
+    }
+
+    #[test]
     fn generated_artifacts_belong_to_the_project_that_holds_src() {
         // Lingua Franca's layout: `src/` is the project's, so `src-gen` is a
         // sibling of it rather than a child.
@@ -3417,6 +3464,8 @@ mod tests {
                     effects: effects.into_iter().map(str::to_string).collect(),
                     contract: contract.into(),
                     prompt: "prompt".into(),
+                    title: None,
+                    description: None,
                     body: None,
                     within: None,
                 },

@@ -1734,7 +1734,12 @@ fn mission_control_envelope(text: &str, selection: &[String]) -> String {
          print here reaches nobody. Every question, status update, and answer must go \
          through `omar_reply`.\n\
          To offer a workflow, call the MCP tool `omar_propose_design` with a complete \
-         OMAR program. The operator approves and runs it; you do not.\n\n\
+         OMAR program. The operator approves and runs it; you do not.\n\
+         Every step must include task(\"Short action title\", \"What it does and produces.\") \
+         after its output contract and optional within(...) deadline, before its prompt \
+         string or code body. Use a specific 3–6 word action title and 1–3 plain-language \
+         sentences explaining the work, result, and any manual handoff. Keep technical \
+         IDs and backend names out of titles; preserve the actual execution behavior.\n\
          {selected}{text}"
     )
 }
@@ -1793,6 +1798,9 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
+    if let Err(error) = validate_task_metadata(&state) {
+        return (400, json!({"error": error}));
+    }
     if let Err(error) = context.publish(
         ChatRole::Assistant,
         proposal.summary,
@@ -1806,6 +1814,33 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         return (500, json!({"error": format!("{error:#}")}));
     }
     (202, json!({"status": "proposed"}))
+}
+
+/// Only assistant proposals require task copy. Older source and saved runs
+/// remain loadable, and display metadata never changes execution identity.
+fn validate_task_metadata(state: &VmState) -> std::result::Result<(), String> {
+    let invalid: Vec<_> = state
+        .reactions
+        .iter()
+        .filter_map(|(id, reaction)| {
+            let valid = |value: &Option<String>, max: usize| {
+                value.as_deref().is_some_and(|s| {
+                    let s = s.trim();
+                    !s.is_empty() && s.chars().count() <= max
+                })
+            };
+            (!valid(&reaction.title, 80) || !valid(&reaction.description, 1200))
+                .then_some(id.as_str())
+        })
+        .collect();
+    if invalid.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Every proposed step needs a task title (1–80 characters) and description (1–1200 characters). Add task(\"Short action title\", \"What this step does and produces, including any manual handoff.\") after the output contract and optional within(...) deadline, before the prompt string or code body. Missing or invalid task metadata: {}. Preserve existing IDs, prompts, agents and connections.",
+            invalid.join(", ")
+        ))
+    }
 }
 
 fn compile_preview(context: &Arc<Context_>, program: &str) -> Result<VmState> {
@@ -3210,6 +3245,45 @@ while True:
         }
         // Nothing reached the conversation.
         assert!(request(server.address(), "GET", "/v1/chat", None).contains("\"messages\":[]"));
+    }
+
+    #[test]
+    fn proposed_tasks_require_titles_and_descriptions_for_every_step() {
+        let mut state = sample_state();
+        let reaction: topology::ReactionState = serde_json::from_value(json!({
+            "order": 0, "agent": "worker", "triggers": ["request"],
+            "effects": ["answer"], "contract": "answer", "prompt": "Answer the request"
+        }))
+        .unwrap();
+        state
+            .reactions
+            .insert("reaction.0".into(), reaction.clone());
+        state.reactions.insert("nested.reaction.0".into(), reaction);
+        let error = validate_task_metadata(&state).unwrap_err();
+        assert!(error.contains("reaction.0") && error.contains("nested.reaction.0"));
+        for reaction in state.reactions.values_mut() {
+            reaction.title = Some("Answer the request".into());
+            reaction.description = Some("Read the request and return an answer.".into());
+        }
+        assert!(validate_task_metadata(&state).is_ok());
+        let reaction = state.reactions.get_mut("nested.reaction.0").unwrap();
+        reaction.description = Some("  \n ".into());
+        assert!(validate_task_metadata(&state)
+            .unwrap_err()
+            .ends_with("Preserve existing IDs, prompts, agents and connections."));
+        state
+            .reactions
+            .get_mut("nested.reaction.0")
+            .unwrap()
+            .description = Some("x".repeat(1201));
+        assert!(validate_task_metadata(&state).is_err());
+        state
+            .reactions
+            .get_mut("nested.reaction.0")
+            .unwrap()
+            .description = Some("Valid description".into());
+        state.reactions.get_mut("nested.reaction.0").unwrap().title = Some("x".repeat(81));
+        assert!(validate_task_metadata(&state).is_err());
     }
 
     #[test]

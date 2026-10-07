@@ -40,13 +40,21 @@ export async function startFakeServe({
   port = 0,
   /** Which captured topology to replay; see tests/fixtures. */
   snapshot: snapshotFile = "diagram-snapshot.v1.json",
+  /** Optional task copy over the captured execution topology. */
+  taskMetadata = {},
   /** The geometry a terminal announces, as the daemon reports the agent's. */
   terminal: terminalSize = { cols: 96, rows: 28 },
   terminalReflow = false,
+  /** Fail a parked Web step without making tests wait for a real deadline. */
+  webFailure = /** @type {string | null} */ (null),
 } = {}) {
   const golden = JSON.parse(
     await readFile(new URL(`./fixtures/${snapshotFile}`, import.meta.url), "utf8"),
   );
+  for (const reaction of golden.reactions) {
+    const copy = taskMetadata[reaction.id];
+    if (copy) Object.assign(reaction, { title: copy.title, description: copy.description });
+  }
 
   /** @type {Map<string, {record: object, snapshot: object, subscribers: Set<import("node:http").ServerResponse>, sequence: number}>} */
   const runs = new Map();
@@ -653,6 +661,15 @@ export async function startFakeServe({
       // finish while a panel still showed work outstanding — and would make a
       // test of "answer it and the run moves" test nothing.
       while ((entry.pending ?? []).some((item) => item.reaction === reaction.id)) {
+        if (webFailure) {
+          entry.record.status = "failed";
+          entry.record.error = webFailure;
+          entry.record.finished_at = Math.floor(Date.now() / 1000);
+          entry.snapshot.status = "failed";
+          entry.pending = [];
+          publish(entry, "run_failed", { message: webFailure });
+          return;
+        }
         await wait();
       }
 

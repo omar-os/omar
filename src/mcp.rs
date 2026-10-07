@@ -2618,7 +2618,7 @@ fn ea_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "omar_propose_design",
-            "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares.",
+            "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares. Every prompt or code reaction must include task(\"Short action title\", \"What this step does and produces.\") after its output contract and optional within(...) deadline, before its prompt string or code body. Use a specific 3–6 word action title (maximum 80 characters) and 1–3 sentences (maximum 1200 characters), including any manual handoff. Task copy is display metadata; it does not replace the execution prompt.",
             json!({
                 "type":"object",
                 "properties":{

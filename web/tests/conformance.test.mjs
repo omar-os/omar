@@ -95,6 +95,7 @@ const UNRESOLVABLE = `team Conformance[worker : NotARealBackend]
     output done : string
 
     prompt worker(go) -> done
+    task("Echo the request", "Return the request as the completed result.")
     "
         Echo $(go) into done.
     "
@@ -356,6 +357,17 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     const token = context.serve?.token;
     assert.equal(typeof token, "string", "serve wrote its token into the context");
 
+    const legacy = UNRESOLVABLE.replace('    task("Echo the request", "Return the request as the completed result.")\n', '');
+    const rejected = await fetch(`${real.url}/v1/agent/proposals`, {
+      ...post({token, program:legacy, summary:"missing task copy", inputs:{}}),
+    });
+    assert.equal(rejected.status, 400);
+    assert.match((await rejected.json()).error, /only\.reaction\.0/);
+    const legacyCheck = await fetch(`${real.url}/v1/programs/check`, {
+      ...post({program:legacy}),
+    });
+    assert.equal((await legacyCheck.json()).ok, true, "older source still compiles");
+
     const response = await fetch(`${real.url}/v1/agent/proposals`, {
       ...post({ token, program: UNRESOLVABLE, summary: "conformance", inputs: {} }),
     });
@@ -369,6 +381,9 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     const preview = proposal.design.preview;
     assert.equal(preview.protocol_version, 1);
     assert.equal(preview.team, "Conformance");
+    assert.equal(preview.reactions[0].title, "Echo the request");
+    assert.equal(preview.reactions[0].description, "Return the request as the completed result.");
+    assert.equal(preview.reactions[0].name, "only.reaction.0");
     const ids = new Set([
       ...preview.ports.map((port) => port.id),
       ...preview.reactions.map((reaction) => reaction.id),
