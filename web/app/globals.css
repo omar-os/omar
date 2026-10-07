@@ -1695,9 +1695,12 @@ h2 {
   position: absolute;
   inset: 0;
   pointer-events: none;
+  /* Above the slider and its thumb: a tick under the thumb must still take
+     the click. */
+  z-index: 1;
 }
 
-.timeline-tick {
+.timeline-controls .timeline-tick {
   position: absolute;
   top: 50%;
   width: 3px;
@@ -1707,14 +1710,16 @@ h2 {
   border: 0;
   border-radius: 1.5px;
   background: #4cc37a;
+  font-size: 0;
+  line-height: 0;
   transform: translateY(-50%);
   transition: height 120ms ease, width 120ms ease, background 120ms ease;
   cursor: pointer;
   pointer-events: auto;
 }
 
-.timeline-tick:hover,
-.timeline-tick:focus-visible {
+.timeline-controls .timeline-tick:hover,
+.timeline-controls .timeline-tick:focus-visible {
   height: 24px;
   width: 4px;
   margin-left: -2px;
@@ -1723,11 +1728,11 @@ h2 {
   outline: none;
 }
 
-.timeline-tick.resume {
+.timeline-controls .timeline-tick.resume {
   box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 3.5px #4cc37a;
 }
 
-.timeline-tick.selected {
+.timeline-controls .timeline-tick.selected {
   height: 24px;
   width: 4px;
   margin-left: -2px;
@@ -1736,8 +1741,12 @@ h2 {
 }
 
 .timeline-checkpoints {
-  margin-left: auto;
   color: #7ef0a6;
+}
+
+.timeline-run-controls {
+  margin-left: auto;
+  order: 9;
 }
 
 /* Pause, Stop and Resume ride with the strip, folded or not. */
@@ -1838,7 +1847,8 @@ h2 {
 
 .timeline-readout {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 8px;
   font-size: 11px;

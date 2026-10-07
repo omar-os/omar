@@ -87,7 +87,7 @@ export function Timeline({
     ...steps.map((s) => s.timestamp),
     ...checkpoints.map((c) => c.completed_tag?.[0] ?? 0),
   );
-  const placed = checkpoints.map((checkpoint, order) => {
+  const placed = checkpoints.map((checkpoint) => {
     const tag = checkpoint.completed_tag;
     const at = tag
       ? steps.findIndex((s) => s.timestamp === tag[0] && s.microstep === tag[1])
@@ -164,10 +164,12 @@ export function Timeline({
         <button type="button" className="timeline-close" onClick={onClose}>
           Hide
         </button>
-        {controls}
       </div>
 
       <div className="timeline-readout">
+        {/* The run's controls share the readout row, leaving the slider the
+            whole width above: a 128-tag strip needs every pixel. */}
+        {controls ? <span className="timeline-run-controls">{controls}</span> : null}
         {steps.length === 0 ? (
           <span className="timeline-idle">
             Nothing to project: no input is set and no timer fires, so the
