@@ -18,11 +18,17 @@ session. TUI/browser clients can disconnect without stopping any workload.
 | `omar attach -s SESSION --web [--print-url]` | Open or print Mission Control URL |
 | `omar down -s SESSION [--timeout SECONDS]` | Reject new work, finish current tags, clean owned processes |
 | `omar down -s SESSION --force` | Terminate owned workloads without waiting for tag boundaries |
+| `omar up --name SESSION` (stopped session) | Start a stopped session again over its kept state, on this build, at its previous URL; its runs are listed again, paused ones resumable |
+| `omar upgrade -s SESSION [--executable PATH] [--timeout SECONDS]` | Replace the runtime with this build (or `PATH`), keeping name, URL, state and workloads: runs pause at a tag boundary, the old runtime hands over and stops, the new one starts and resumes what the upgrade paused |
 | `omar serve [--name NAME] [--address 127.0.0.1:PORT]` | New independent foreground runtime; SIGINT/SIGTERM requests graceful shutdown |
 | `omar run FILE [-s SESSION] [--ea EA] [--input NAME=VALUE] [--wait]` | Run a topology in the selected runtime, or in a new session when none is selected; `--wait` prints its outputs and final state, and shuts down a session it created. `start` is an alias |
 | `omar -s SESSION [--ea EA] runs [--all-eas]` | List topology runs |
 | `omar -s SESSION [--ea EA] status RUN-OR-TEAM` | Inspect one run; ambiguous names require a run ID |
 | `omar -s SESSION [--ea EA] stop RUN-OR-TEAM` | Stop one topology at a tag boundary |
+| `omar -s SESSION [--ea EA] pause RUN-OR-TEAM [--wait]` | Checkpoint at the next tag boundary and park the run; see [team-checkpoints.md](team-checkpoints.md) |
+| `omar -s SESSION [--ea EA] resume RUN-OR-TEAM` | Continue a paused run under its run id |
+| `omar -s SESSION [--ea EA] rollback RUN-OR-TEAM --checkpoint ID` | Move a paused run's resume point to an older checkpoint |
+| `omar -s SESSION [--ea EA] checkpoint {create,list,show,verify,configure,retry} ...` | Request, inspect, verify and configure a run's checkpoints |
 | `omar -s SESSION ea list` | List EAs |
 | `omar -s SESSION ea create --name NAME [--agent BACKEND]` | Allocate an independent EA namespace |
 | `omar -s SESSION ea start EA` | Launch or relaunch that EA's assistant |
@@ -55,8 +61,8 @@ never silently escalates to force. Use `info`/`logs`, or explicitly force. A
 session started without `--checkpoint` leaves nothing behind once it stops, like
 a tmux session; `ls` no longer lists it. With `--checkpoint` its state directory
 and record stay, `ls` shows it `stopped`, and `info`/`logs` still work, like a
-stopped Docker container. Restarting from that state belongs to a later
-milestone. A session whose startup failed keeps its directory either way, so
+stopped Docker container, and `omar up --name NAME` starts it again in place.
+A session whose startup failed keeps its directory either way, so
 its log explains why. A stale/unreachable record is never
 permission to signal a PID: control must verify the session's incarnation.
 
@@ -73,6 +79,45 @@ The runtime and available `omarc` compiler are copied into the session's `bin/`
 at launch. Helpers use that pinned runtime, so rebuilding/replacing an installed
 binary does not change existing sessions. `ls`/`info` expose the source path and
 SHA-256 build identity. Do not delete a live session directory.
+
+## Restart and upgrade
+
+A runtime that starts over an existing state directory offers the runs the
+previous runtime left unfinished (`ea/<id>/serve/<run>/run.json` plus each
+team's deployment record): paused ones paused, under their own ids. A run
+the old runtime was still executing is interrupted: with a checkpoint it is
+paused there and `resume` continues from it, the tags since are lost;
+without one it has failed. Nothing resumes on its own.
+
+`omar upgrade -s NAME` replaces the runtime with the build running the
+command (`--executable PATH` names another; its sibling `omarc` comes along).
+Steps, each recorded in the session's `upgrade.json` and shown by `info`:
+
+1. **Check.** The new build runs `upgrade-check` on the session directory:
+   it must read the launch and registry records, speak the same control
+   protocol, and `verify` every checkpoint a run would continue from (the
+   checkpoint format it understands against what is on disk). Anything it
+   cannot read stops the upgrade before anything changes. A build that
+   bumps the checkpoint format must keep reading older ones; refusal is
+   reported here, never discovered mid-upgrade.
+2. **Pause.** The session stops admitting work (`ls` shows `upgrading`);
+   every active run pauses at its next tag boundary. Runs the operator had
+   paused already are left alone. A run that does not pause within
+   `--timeout` calls the upgrade off: admission reopens and what did pause
+   resumes, on the old build.
+3. **Handoff.** The old runtime stops, keeping the state directory whether
+   or not the session was started with `--checkpoint`.
+4. **Start.** The previous `bin/omar` becomes `bin/omar.prev`; the new build
+   is pinned and started over the same state at the same address, so
+   Mission Control's URL and `omar attach` keep working. A replacement that
+   does not start is rolled back: the previous build is pinned again and
+   started (`upgrade.json` says `rolled_back`).
+5. **Resume.** The runs the upgrade paused continue under their run ids,
+   each from the checkpoint its pause took, in new workspaces.
+
+Other sessions are never touched. External effects between the pause
+checkpoint and the handoff are not undone; a run paused by the upgrade loses
+nothing, since the pause checkpoint is the boundary it stopped at.
 
 ## Layout
 

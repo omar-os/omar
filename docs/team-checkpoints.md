@@ -97,6 +97,11 @@ before its record said so. A run's checkpoint routes answer only while its
 lineage is the team's live one; after a later run starts, they say so.
 The live diagram reports `paused`.
 
+A runtime started over the same session state (`omar up --name` on a
+stopped session, or `omar upgrade`) lists the runs again from their records;
+a run interrupted mid-tag is paused at its last checkpoint. See
+[sessions.md](sessions.md).
+
 Not in this PR: checkpoint import into another session, input journalling
 while paused, format migration, pruning, manual capture or period changes
 from Mission Control.
