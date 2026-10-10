@@ -5,11 +5,11 @@
 // generator exists to make impossible.
 
 /** Every status `omar serve` can report a run in. */
-export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "failed"] as const;
+export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "pausing", "paused", "failed"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
 /** Where a drawing stands. `ready` is compiled but never run, which is what a proposal's preview is. */
-export const DIAGRAM_STATUSES = ["ready", "running", "completed", "failed"] as const;
+export const DIAGRAM_STATUSES = ["ready", "running", "completed", "failed", "paused"] as const;
 export type DiagramStatus = (typeof DIAGRAM_STATUSES)[number];
 
 /** Where one reaction stands. */
@@ -25,7 +25,7 @@ export const PORT_KINDS = ["input", "output", "action"] as const;
 export type PortKind = (typeof PORT_KINDS)[number];
 
 /** What happened, as the event stream names it. */
-export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed"] as const;
+export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed"] as const;
 export type DiagramEventKind = (typeof DIAGRAM_EVENT_KINDS)[number];
 
 /** Who spoke. */
@@ -120,6 +120,11 @@ export type Conversation = { id: string, title: string, ea_id: number | null, cr
 export type ConversationSummary = { id: string, title: string, created_at: number, updated_at: number, message_count: number, ea_id: number | null, busy: boolean, run: RunRecord | null, };
 
 export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number, finished_at: number | null, error: string | null, 
+/**
+ * Input ports the run was admitted with, so its timeline can be
+ * projected again later from the same starting point.
+ */
+present?: Array<string>, 
 /**
  * Output ports a finished run ended with.
  */

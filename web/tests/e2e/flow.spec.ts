@@ -711,6 +711,65 @@ test("the workflow's buttons sit with the workflow", async ({ page }) => {
   expect(stats.x + stats.width).toBeLessThanOrEqual(first.x + 1);
 });
 
+test("a run can be paused and resumed from the panel that shows it", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  // The run's controls live with its timeline, not in the heading: a pause
+  // lands at a tag, a resume continues from one. Before a run, none.
+  const actions = page.getByRole("group", { name: "Run controls" });
+  await expect(actions).toHaveCount(0);
+
+  await deploy(page);
+  const pause = actions.getByRole("button", { name: "Pause" });
+  await expect(pause).toBeEnabled();
+  await pause.click();
+
+  // A pause lands at the next tag boundary, after a checkpoint, so the
+  // button has to say it was heard.
+  await expect(actions.getByRole("button", { name: "Pausing…" })).toBeDisabled();
+  // A stop still outranks it, in case the capture never lands.
+  await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
+
+  // Parked: the picture stays, labelled paused, and what is left to offer is
+  // to continue, or to give the run up (a paused run holds its team).
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  const resume = actions.getByRole("button", { name: "Resume" });
+  await expect(resume).toBeVisible();
+  await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
+  await expect(actions.getByRole("button", { name: "Pause" })).toHaveCount(0);
+
+  // A reload finds the parked run as it was: its diagram server is gone,
+  // but serve kept the picture, so the controls and the timeline come back.
+  await page.reload();
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  await expect(actions.getByRole("button", { name: "Resume" })).toBeVisible();
+
+  // A paused run rolls back from the timeline: checkpoints are marks at the
+  // tags they completed, a mark opens a preview of what it holds, and the
+  // preview is where "continue from here" is committed.
+  await page.getByRole("button", { name: "▲ Timeline" }).click();
+  const timeline = page.getByLabel("Logical timeline");
+  // Ticks stand on the track itself, one per checkpoint.
+  await expect(timeline.getByLabel("Checkpoints").getByRole("button")).toHaveCount(2);
+  await timeline.getByRole("button", { name: "Checkpoint #1" }).click();
+  const preview = timeline.getByLabel("Checkpoint preview");
+  await expect(preview).toContainText("Checkpoint #1 · manual");
+  await expect(preview).toContainText("leader.round = 1");
+  const rollback = preview.getByRole("button", { name: "Roll back to this checkpoint" });
+  await expect(rollback).toBeEnabled();
+  await rollback.click();
+  // Committed: this checkpoint is now where a resume continues from, and
+  // the newer one is still listed — nothing was deleted.
+  await expect(preview).toContainText("A resume continues from here.");
+  await expect(timeline.getByLabel("Checkpoints").getByRole("button")).toHaveCount(2);
+
+  await resume.click();
+  // Back to a live run, with its controls beside the open timeline.
+  await expect(actions.getByRole("button", { name: "Pause" })).toBeEnabled();
+  await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
+  await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
+});
+
 test("a run can be stopped from the panel that shows it", async ({ page }) => {
   // Until now the only way to end a run started from the UI was to leave the
   // UI and type `omar stop` in a terminal.
@@ -719,7 +778,8 @@ test("a run can be stopped from the panel that shows it", async ({ page }) => {
 
   // The eyebrow says which topology is on screen: this one has not run.
   await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("PROPOSED TOPOLOGY");
-  const actions = page.locator(".diagram-heading .workflow-actions");
+  // Stop belongs to the run's timeline, where a stop lands on a tag.
+  const actions = page.getByRole("group", { name: "Run controls" });
   await expect(actions.getByRole("button", { name: "Stop" })).toHaveCount(0);
 
   await deploy(page);

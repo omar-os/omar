@@ -214,7 +214,7 @@ export type RunRequest = {
  * failure. It was missing here for as long as the daemon could answer it.
  */
 export function isRunFinished(status: RunStatus): boolean {
-  return status === "completed" || status === "stopped" || status === "failed";
+  return status === "completed" || status === "stopped" || status === "paused" || status === "failed";
 }
 
 export function assertRunRecord(value: unknown): RunRecord {
@@ -333,6 +333,22 @@ export function applyDiagramEvent(
       return {
         ...snapshot,
         status: "completed",
+        reactions: snapshot.reactions.map((reaction) =>
+          reaction.status === "running"
+            ? { ...reaction, status: "completed", invocation_id: null }
+            : reaction,
+        ),
+      };
+    case "run_checkpointed":
+      // A checkpoint is a fact about the run's history, not its picture; the
+      // timeline draws it from the listing it refetches on this event.
+      return snapshot;
+    case "run_paused":
+      // A pause lands at a tag boundary, where nothing is in flight: whatever
+      // was painted as running has finished, and the run waits for a resume.
+      return {
+        ...snapshot,
+        status: "paused",
         reactions: snapshot.reactions.map((reaction) =>
           reaction.status === "running"
             ? { ...reaction, status: "completed", invocation_id: null }

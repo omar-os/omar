@@ -85,7 +85,7 @@ impl Drop for WindowConnection {
     }
 }
 
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct RunRecord {
     pub run_id: String,
     pub team: String,
@@ -94,6 +94,10 @@ pub struct RunRecord {
     pub started_at: u64,
     pub finished_at: Option<u64>,
     pub error: Option<String>,
+    /// Input ports the run was admitted with, so its timeline can be
+    /// projected again later from the same starting point.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub present: Vec<String>,
     /// Output ports a finished run ended with.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[ts(optional, type = "Record<string, unknown>")]
@@ -126,6 +130,9 @@ struct StartRunRequest {
     /// a delay means for everyone else's.
     #[serde(default)]
     fast: bool,
+    /// How often to checkpoint on physical time, e.g. `30m`; default 1h.
+    #[serde(default)]
+    checkpoint_period: Option<String>,
 }
 
 fn default_replace() -> bool {
@@ -166,6 +173,10 @@ pub enum RunStatus {
     /// a failure -- the daemon has answered this since `RunEnd::Stopped`
     /// existed, and no client had it written down.
     Stopped,
+    /// A pause has been requested and the loop has not reached the tag
+    /// boundary where it checkpoints and parks.
+    Pausing,
+    Paused,
     Failed,
 }
 
@@ -176,7 +187,18 @@ impl RunStatus {
     /// current tag closes, so a second run of the same team would still be
     /// answered by the first one's panes.
     pub fn is_active(self) -> bool {
-        matches!(self, Self::Starting | Self::Running | Self::Stopping)
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Stopping | Self::Pausing
+        )
+    }
+
+    /// Whether the run still holds its team: its agents, or, paused, the
+    /// deployment record and checkpoints a resume needs. A fresh run of the
+    /// team would write over those, so a paused run blocks one until it is
+    /// resumed or stopped.
+    pub fn holds_team(self) -> bool {
+        self.is_active() || self == Self::Paused
     }
 }
 
@@ -439,7 +461,7 @@ impl Serve {
                 continue;
             }
             for run in context.runs.lock().unwrap().values() {
-                if run.run_id == selector || (run.team == selector && run.status.is_active()) {
+                if run.run_id == selector || (run.team == selector && run.status.holds_team()) {
                     matches.push((context.clone(), run.run_id.clone()));
                 }
             }
@@ -452,6 +474,69 @@ impl Serve {
         let (status, value) = stop_run(context, id);
         anyhow::ensure!(status < 400, "{}", value["error"]);
         Ok(value)
+    }
+
+    pub(crate) fn session_pause(&self, ea: EaId, selector: &str) -> Result<Value> {
+        let (context, id) = self.session_find(ea, selector, |run| run.status.is_active())?;
+        let (status, value) = pause_run(&context, &id);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    pub(crate) fn session_resume(&self, ea: EaId, selector: &str) -> Result<Value> {
+        let (context, id) =
+            self.session_find(ea, selector, |run| run.status == RunStatus::Paused)?;
+        let (status, value) = resume_run(&context, &id);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    pub(crate) fn session_rollback(
+        &self,
+        ea: EaId,
+        selector: &str,
+        checkpoint: &str,
+    ) -> Result<Value> {
+        let (context, id) =
+            self.session_find(ea, selector, |run| run.status == RunStatus::Paused)?;
+        let body = serde_json::to_vec(&json!({ "checkpoint": checkpoint }))?;
+        let (status, value) = rollback_run(&context, &id, &body);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    /// The one run a selector names: its id, or a team name when exactly one
+    /// of that team's runs is in the state the operation acts on.
+    fn session_find(
+        &self,
+        ea: EaId,
+        selector: &str,
+        eligible: impl Fn(&RunRecord) -> bool,
+    ) -> Result<(Arc<Context_>, String)> {
+        let contexts = self
+            .workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut matches = Vec::new();
+        for context in contexts {
+            if context.ea_id != ea {
+                continue;
+            }
+            for run in context.runs.lock().unwrap().values() {
+                if run.run_id == selector || (run.team == selector && eligible(run)) {
+                    matches.push((context.clone(), run.run_id.clone()));
+                }
+            }
+        }
+        anyhow::ensure!(
+            matches.len() == 1,
+            "run '{selector}' is missing or ambiguous; use its run id"
+        );
+        Ok(matches.remove(0))
     }
 
     /// Refuse new admissions without touching the admission mutex, which an
@@ -472,7 +557,9 @@ impl Serve {
                 .lock()
                 .unwrap()
                 .values()
-                .filter(|r| r.status.is_active())
+                // A pausing run is about to park on its own; asking it to
+                // stop would be refused while its pause request waits.
+                .filter(|r| r.status.is_active() && r.status != RunStatus::Pausing)
             {
                 crate::deploy::request_stop(&crate::deploy::dir_for(
                     &context.omar_dir,
@@ -488,7 +575,7 @@ impl Serve {
         self.session_runs(None).iter().any(|r| {
             matches!(
                 r["status"].as_str(),
-                Some("starting" | "running" | "stopping")
+                Some("starting" | "running" | "stopping" | "pausing")
             )
         })
     }
@@ -534,6 +621,11 @@ impl Serve {
         history.assign_ea(&conversation_id, workspace_ea)?;
         let history = Arc::new(Mutex::new(history));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let parked = paused_runs(omar_dir, workspace_ea);
+        let latest_parked = parked
+            .values()
+            .max_by_key(|run| run.started_at)
+            .map(|run| run.run_id.clone());
         let context = Arc::new(Context_ {
             history: history.clone(),
             conversation_id: conversation_id.clone(),
@@ -542,10 +634,10 @@ impl Serve {
             session_prefix: config.dashboard.session_prefix.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
-            runs: Runs::default(),
+            runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
-                latest_run: None,
+                latest_run: latest_parked,
                 subscribers: Vec::new(),
                 busy: false,
                 needs_context: has_history,
@@ -1180,6 +1272,71 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         }
         // Before the run-record route, which would otherwise take the suffix
         // for part of the id.
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/snapshot") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/snapshot");
+            run_snapshot(&context, id)
+        }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/timeline") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/timeline")
+                .to_string();
+            run_timeline(&context, &id)
+        }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.contains("/checkpoints/") => {
+            let rest = rest.trim_start_matches("/v1/runs/");
+            let (id, checkpoint) = rest.split_once("/checkpoints/").unwrap_or((rest, ""));
+            show_checkpoint(&context, id, checkpoint)
+        }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/checkpoints") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/checkpoints")
+                .to_string();
+            list_checkpoints(&context, &id)
+        }
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/rollback") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/rollback")
+                .to_string();
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "body too large"}))
+            } else {
+                rollback_run(&context, &id, &read_body(content_length)?)
+            }
+        }
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/pause") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/pause")
+                .to_string();
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "body too large"}))
+            } else {
+                let _ = read_body(content_length)?;
+                pause_run(&context, &id)
+            }
+        }
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/resume") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/resume")
+                .to_string();
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "body too large"}))
+            } else {
+                let _ = read_body(content_length)?;
+                let presence = workspaces.presence.lock().expect("presence poisoned");
+                if presence.stopping {
+                    (503, json!({"error": "runtime is shutting down"}))
+                } else {
+                    resume_run(&context, &id)
+                }
+            }
+        }
         ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/stop") => {
             let id = rest
                 .trim_start_matches("/v1/runs/")
@@ -1616,6 +1773,16 @@ impl Workspaces {
                 ea_id
             }
         };
+        // The EA's parked runs, unless a chat already offers them.
+        let mut parked = paused_runs(&self.root.omar_dir, ea_id);
+        for other in contexts.values() {
+            let held = other.runs.lock().expect("runs poisoned");
+            parked.retain(|run_id, _| !held.contains_key(run_id));
+        }
+        let latest_parked = parked
+            .values()
+            .max_by_key(|run| run.started_at)
+            .map(|run| run.run_id.clone());
         let context = Arc::new(Context_ {
             history: self.history.clone(),
             conversation_id: id.to_string(),
@@ -1624,10 +1791,10 @@ impl Workspaces {
             session_prefix: self.root.session_prefix.clone(),
             default_workdir: self.root.default_workdir.clone(),
             health_idle_warning: self.root.health_idle_warning,
-            runs: Runs::default(),
+            runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
-                latest_run: None,
+                latest_run: latest_parked,
                 subscribers: Vec::new(),
                 busy: false,
                 needs_context: has_history,
@@ -2076,22 +2243,30 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     if let Err(error) = topology::parse_inputs(&state, &inputs) {
         return (400, json!({"error": format!("{error:#}")}));
     }
+    if let Err(error) = request
+        .checkpoint_period
+        .as_deref()
+        .map(crate::checkpoint::parse_period)
+        .transpose()
+    {
+        return (400, json!({"error": format!("{error:#}")}));
+    }
 
     // Agent sessions are named `prefix + agent`, so two concurrent runs of one
     // team would fight over the same tmux sessions. Serialise per team.
     {
         let runs = context.runs.lock().expect("serve runs poisoned");
         if let Some(active) = find_active_run(&runs, &state.team) {
-            return (
-                409,
-                json!({
-                    "error": format!("team '{}' already has an active run", state.team),
-                    "run_id": active.run_id,
-                }),
-            );
+            return (409, team_held_error(active));
         }
     }
 
+    // The verified bytecode beside the source: a later timeline projection
+    // or resume reads it back without a compiler.
+    let _ = fs::write(
+        run_dir.join("program.json"),
+        serde_json::to_vec(&bytecode).unwrap_or_default(),
+    );
     let record = RunRecord {
         run_id: run_id.clone(),
         team: state.team.clone(),
@@ -2100,9 +2275,15 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         started_at: now_unix(),
         finished_at: None,
         error: None,
+        // From the combined list: a CLI start names its inputs in `raw_inputs`.
+        present: inputs
+            .iter()
+            .filter_map(|input| input.split_once('=').map(|(name, _)| name.to_string()))
+            .collect(),
         outputs: BTreeMap::new(),
         state: BTreeMap::new(),
     };
+    persist_run(context, &record);
     context
         .runs
         .lock()
@@ -2115,7 +2296,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         context,
         &run_id,
         bytecode,
-        topology::generated_dir(&program_path),
+        program_path,
         inputs,
         &request,
         ready_sender,
@@ -2384,7 +2565,7 @@ fn spawn_run_thread(
     context: &Arc<Context_>,
     run_id: &str,
     bytecode: topology::Bytecode,
-    generated: std::path::PathBuf,
+    program_path: std::path::PathBuf,
     inputs: Vec<String>,
     request: &StartRunRequest,
     ready_sender: mpsc::Sender<SocketAddr>,
@@ -2414,6 +2595,11 @@ fn spawn_run_thread(
     } else {
         topology::Pace::RealTime
     };
+    // Validated at admission, so a bad period was already a 400.
+    let checkpoint_period = request
+        .checkpoint_period
+        .as_deref()
+        .and_then(|period| crate::checkpoint::parse_period(period).ok());
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let outcome = topology::run_topology(
@@ -2421,7 +2607,7 @@ fn spawn_run_thread(
             TopologyRunConfig {
                 ea_id: context.ea_id,
                 omar_dir: &context.omar_dir,
-                generated: &generated,
+                generated: &topology::generated_dir(&program_path),
                 base_prefix: &context.session_prefix,
                 health_idle_warning: context.health_idle_warning,
                 inputs: &inputs,
@@ -2431,33 +2617,11 @@ fn spawn_run_thread(
                 diagram_address: Some(diagram_address),
                 diagram_ready: Some(ready_sender),
                 panel_ready: Some(panel_sender),
+                checkpoint_period,
+                program_path: Some(&program_path),
             },
         );
-        // The run is over, so its invocation service is gone with it. Leaving
-        // the entry would let a panel offer work nothing can accept.
-        context
-            .panels
-            .lock()
-            .expect("serve panels poisoned")
-            .remove(&run_id);
-        let mut runs = context.runs.lock().expect("serve runs poisoned");
-        if let Some(record) = runs.get_mut(&run_id) {
-            record.finished_at = Some(now_unix());
-            match outcome {
-                Ok(outcome) => {
-                    record.status = match outcome.end {
-                        topology::RunEnd::Completed => RunStatus::Completed,
-                        topology::RunEnd::Stopped => RunStatus::Stopped,
-                    };
-                    record.outputs = outcome.outputs;
-                    record.state = outcome.state;
-                }
-                Err(error) => {
-                    record.status = RunStatus::Failed;
-                    record.error = Some(format!("{error:#}"));
-                }
-            }
-        }
+        finish_run(&context, &run_id, outcome);
     });
 }
 
@@ -2485,7 +2649,20 @@ fn encode_inputs(state: &VmState, inputs: &BTreeMap<String, Value>) -> Result<Ve
 
 fn find_active_run<'a>(runs: &'a BTreeMap<String, RunRecord>, team: &str) -> Option<&'a RunRecord> {
     runs.values()
-        .find(|record| record.team == team && record.status.is_active())
+        .find(|record| record.team == team && record.status.holds_team())
+}
+
+/// Why a team cannot take a new run while this one holds it.
+fn team_held_error(active: &RunRecord) -> Value {
+    let error = if active.status == RunStatus::Paused {
+        format!(
+            "team '{}' has a paused run; resume it, or stop it to discard it",
+            active.team
+        )
+    } else {
+        format!("team '{}' already has an active run", active.team)
+    };
+    json!({ "error": error, "run_id": active.run_id })
 }
 
 /// Ask a run to stop at its next tag boundary.
@@ -2505,16 +2682,26 @@ fn find_active_run<'a>(runs: &'a BTreeMap<String, RunRecord>, team: &str) -> Opt
 /// finishing, and the outcome is the same either way.
 fn stop_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     let team = {
-        let runs = context.runs.lock().expect("serve runs poisoned");
-        match runs.get(id) {
+        let mut runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get_mut(id) {
             Some(record) if record.status.is_active() => record.team.clone(),
+            // Paused: no runner to ask. The run is given up, which frees the
+            // team; its checkpoints stay on disk for inspection.
+            Some(record) if record.status == RunStatus::Paused => {
+                record.status = RunStatus::Stopped;
+                record.finished_at = Some(now_unix());
+                persist_run(context, record);
+                return (200, json!(record));
+            }
             Some(record) => return (200, json!(record)),
             None => return (404, json!({"error": "unknown run"})),
         }
     };
 
     let dir = crate::deploy::dir_for(&context.omar_dir, context.ea_id, &team);
-    if let Err(error) = crate::deploy::request_stop(&dir) {
+    // Outranks a pause still waiting for its boundary: the operator asked for
+    // the run to end, and a held capture has no other way out.
+    if let Err(error) = crate::deploy::override_with_stop(&dir) {
         return (500, json!({"error": format!("{error:#}")}));
     }
 
@@ -2533,6 +2720,487 @@ fn stop_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
         Some(record) => (200, json!(record)),
         None => (404, json!({"error": "unknown run"})),
     }
+}
+
+/// Ask a run to pause: checkpoint at its next tag boundary, then park. The
+/// same request `omar pause` makes, answered with the record marked pausing.
+fn pause_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let team = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) if record.status.is_active() => record.team.clone(),
+            Some(record) => return (200, json!(record)),
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let dir = crate::deploy::dir_for(&context.omar_dir, context.ea_id, &team);
+    if let Err(error) = crate::deploy::request(&dir, crate::deploy::ControlOp::Pause) {
+        return (409, json!({"error": format!("{error:#}")}));
+    }
+    let mut runs = context.runs.lock().expect("serve runs poisoned");
+    match runs.get_mut(id) {
+        Some(record) if record.status.is_active() => {
+            record.status = RunStatus::Pausing;
+            persist_run(context, record);
+            (202, json!(record))
+        }
+        Some(record) => (200, json!(record)),
+        None => (404, json!({"error": "unknown run"})),
+    }
+}
+
+/// One checkpoint as Mission Control lists it.
+fn checkpoint_summary(manifest: &crate::checkpoint::Manifest) -> Value {
+    json!({
+        "id": manifest.id,
+        "sequence": manifest.sequence,
+        "parent": manifest.parent,
+        "trigger": manifest.trigger,
+        "completed_tag": manifest.completed_tag,
+        "next_tag": manifest.next_tag,
+        "created_at": manifest.created_at,
+    })
+}
+
+/// The team whose live checkpoint directory is this run's, or why it is not:
+/// a later run of the team started a new lineage and archived this one.
+fn lineage_team(context: &Arc<Context_>, id: &str) -> Result<String, (u16, Value)> {
+    let runs = context.runs.lock().expect("serve runs poisoned");
+    let Some(record) = runs.get(id) else {
+        return Err((404, json!({"error": "unknown run"})));
+    };
+    if let Some(later) = superseded_by(&runs, id) {
+        return Err((
+            409,
+            json!({
+                "error": format!(
+                    "run {} of team '{}' started after this one; this run's checkpoints are archived beside the team's checkpoints directory",
+                    later.run_id, record.team
+                ),
+                "run_id": later.run_id,
+            }),
+        ));
+    }
+    Ok(record.team.clone())
+}
+
+/// A run's checkpoints, oldest first, and which one a resume continues from.
+fn list_checkpoints(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let team = match lineage_team(context, id) {
+        Ok(team) => team,
+        Err(response) => return response,
+    };
+    let store = crate::checkpoint::Store::new(&crate::deploy::dir_for(
+        &context.omar_dir,
+        context.ea_id,
+        &team,
+    ));
+    let (manifests, problems) = match store.list() {
+        Ok(listed) => listed,
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    let resume_point = match store.resume_point() {
+        Ok(point) => point.map(|m| m.id),
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    (
+        200,
+        json!({
+            "checkpoints": manifests.iter().map(checkpoint_summary).collect::<Vec<_>>(),
+            "resume_point": resume_point,
+            "unreadable": problems,
+        }),
+    )
+}
+
+/// The logical timeline of a run the daemon admitted, projected from the
+/// bytecode staged with it and the inputs it started with. The same strip
+/// the editor draws for a draft, available to a client that reloaded or
+/// never saw the draft.
+fn run_timeline(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let present: std::collections::BTreeSet<String> = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) => record.present.iter().cloned().collect(),
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let staged = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id)
+        .join("program.json");
+    let bytecode = match fs::read(&staged)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| serde_json::from_slice::<topology::Bytecode>(&bytes).map_err(Into::into))
+    {
+        Ok(bytecode) => bytecode,
+        Err(error) => {
+            return (
+                409,
+                json!({"error": format!("the run's program is no longer staged: {error:#}")}),
+            )
+        }
+    };
+    match topology::verify(&bytecode) {
+        Ok(state) => {
+            let (steps, truncated) = topology::timeline(&state, &present, MAX_TIMELINE_STEPS);
+            (200, json!({"steps": steps, "truncated": truncated}))
+        }
+        Err(error) => (409, json!({"error": format!("{error:#}")})),
+    }
+}
+
+/// What a checkpoint holds, for the timeline's preview: where the run was,
+/// what it had produced, what was still queued, and which file version each
+/// instance was at.
+fn show_checkpoint(context: &Arc<Context_>, id: &str, checkpoint: &str) -> (u16, Value) {
+    let team = match lineage_team(context, id) {
+        Ok(team) => team,
+        Err(response) => return response,
+    };
+    let store = crate::checkpoint::Store::new(&crate::deploy::dir_for(
+        &context.omar_dir,
+        context.ea_id,
+        &team,
+    ));
+    let (manifest, state, _) = match store.load(checkpoint) {
+        Ok(loaded) => loaded,
+        Err(error) => return (404, json!({"error": format!("{error:#}")})),
+    };
+    let resume_point = store.resume_point().ok().flatten().map(|m| m.id);
+    let mut summary = checkpoint_summary(&manifest);
+    summary["is_resume_point"] = json!(resume_point.as_deref() == Some(manifest.id.as_str()));
+    summary["outputs"] = json!(state.outputs);
+    summary["state_vars"] = json!(state.state_vars);
+    summary["queue_len"] = json!(state.queue.len());
+    summary["queued_tags"] = json!(state
+        .queue
+        .iter()
+        .take(8)
+        .map(|tag| (tag.timestamp, tag.microstep))
+        .collect::<Vec<_>>());
+    summary["elapsed_ns"] = json!(manifest.elapsed_ns);
+    summary["workspaces"] = json!(manifest.workspaces);
+    summary["agents"] = json!(manifest.agents);
+    (200, summary)
+}
+
+#[derive(Debug, Deserialize)]
+struct RollbackRequest {
+    checkpoint: String,
+}
+
+/// Move a paused run's resume point to an older checkpoint. Nothing is
+/// deleted; the next resume continues from there with that checkpoint's
+/// files restored into new workspaces.
+fn rollback_run(context: &Arc<Context_>, id: &str, body: &[u8]) -> (u16, Value) {
+    // Serialised with admission and resume: a head change must not land
+    // after a resume has already read the old one.
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
+    let request: RollbackRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    let team = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) if record.status == RunStatus::Paused => record.team.clone(),
+            Some(record) => {
+                return (
+                    409,
+                    json!({"error": format!("run is {}; only a paused run can roll back", crate::diagram::wire_name(&record.status).unwrap_or_default())}),
+                )
+            }
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let store = crate::checkpoint::Store::new(&crate::deploy::dir_for(
+        &context.omar_dir,
+        context.ea_id,
+        &team,
+    ));
+    let manifest = match store.verify(&context.omar_dir, &request.checkpoint) {
+        Ok(manifest) => manifest,
+        Err(error) => return (409, json!({"error": format!("{error:#}")})),
+    };
+    match store.set_head(&manifest.id) {
+        Ok(head) => (
+            200,
+            json!({
+                "resume_point": head.checkpoint_id,
+                "abandoned": head.abandoned,
+                "checkpoint": checkpoint_summary(&manifest),
+            }),
+        ),
+        Err(error) => (500, json!({"error": format!("{error:#}")})),
+    }
+}
+
+/// Continue a paused run from its resume point, in this daemon, under the
+/// same run id. The program it was admitted with is still staged beside the
+/// run, so generated code lands where the original run put it.
+fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    // Serialised with admission: a fresh start's team check and this run's
+    // return to `Starting` must not interleave, or both would launch.
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
+    let team = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) if record.status == RunStatus::Paused => record.team.clone(),
+            Some(record) => {
+                return (
+                    409,
+                    json!({"error": format!("run is {}; only a paused run can resume", crate::diagram::wire_name(&record.status).unwrap_or_default())}),
+                )
+            }
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let program_path = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id)
+        .join("program.omar");
+    if !program_path.exists() {
+        return (
+            409,
+            json!({"error": format!("the run's program is no longer staged at {}", program_path.display())}),
+        );
+    }
+    {
+        let mut runs = context.runs.lock().expect("serve runs poisoned");
+        if let Some(active) = find_active_run(&runs, &team).filter(|other| other.run_id != id) {
+            return (409, team_held_error(active));
+        }
+        let Some(record) = runs.get_mut(id) else {
+            return (404, json!({"error": "unknown run"}));
+        };
+        record.status = RunStatus::Starting;
+        record.diagram_address = None;
+        record.finished_at = None;
+        record.error = None;
+        persist_run(context, record);
+    }
+    context.chat.lock().expect("chat poisoned").latest_run = Some(id.to_string());
+    let (ready_sender, ready_receiver) = mpsc::channel();
+    spawn_resume_thread(context, id, &team, program_path, ready_sender);
+    match ready_receiver.recv_timeout(DIAGRAM_READY_TIMEOUT) {
+        Ok(diagram_address) => {
+            let mut runs = context.runs.lock().expect("serve runs poisoned");
+            if let Some(record) = runs.get_mut(id) {
+                record.diagram_address = Some(diagram_address.to_string());
+                if record.status == RunStatus::Starting {
+                    record.status = RunStatus::Running;
+                }
+                return (200, json!(record));
+            }
+            (500, json!({"error": "run vanished"}))
+        }
+        Err(_) => {
+            let runs = context.runs.lock().expect("serve runs poisoned");
+            let message = runs
+                .get(id)
+                .and_then(|record| record.error.clone())
+                .unwrap_or_else(|| "the resumed run did not come up in time".to_string());
+            (502, json!({"error": message}))
+        }
+    }
+}
+
+/// A run's record on disk, beside its staged program. Written whenever the
+/// run parks or ends, so a paused run outlives the daemon that paused it.
+fn run_record_path(context: &Context_, run_id: &str) -> std::path::PathBuf {
+    crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(run_id)
+        .join("run.json")
+}
+
+fn persist_run(context: &Context_, record: &RunRecord) {
+    let path = run_record_path(context, &record.run_id);
+    // Replaced atomically: a torn record would strand the run at the next
+    // start. A failure is reported, since the run itself cannot stop for it.
+    if let Err(error) = topology::write_json_atomic(&path, record) {
+        eprintln!(
+            "warning: run {} record not saved at {}: {error:#}",
+            record.run_id,
+            path.display()
+        );
+    }
+}
+
+/// The paused runs an EA's staging holds: still resumable, so a daemon that
+/// starts over offers them again under their own ids. Each team's latest
+/// run is the one that can hold it; it counts as paused when its record says
+/// so, or when the daemon died between the deployment parking and the
+/// record saying so, which the deployment record settles.
+fn paused_runs(omar_dir: &Path, ea_id: EaId) -> BTreeMap<String, RunRecord> {
+    let staged = crate::ea::ea_state_dir(ea_id, omar_dir).join("serve");
+    let Ok(entries) = fs::read_dir(staged) else {
+        return BTreeMap::new();
+    };
+    let mut latest: BTreeMap<String, RunRecord> = BTreeMap::new();
+    for record in entries
+        .flatten()
+        .filter_map(|entry| fs::read(entry.path().join("run.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok())
+    {
+        let newer = latest
+            .get(&record.team)
+            .is_none_or(|held| record.started_at >= held.started_at);
+        if newer {
+            latest.insert(record.team.clone(), record);
+        }
+    }
+    latest
+        .into_values()
+        .filter_map(|mut record| {
+            let dir = crate::deploy::dir_for(omar_dir, ea_id, &record.team);
+            let deployment = crate::deploy::DeploymentRecord::load(&dir)
+                .ok()
+                .flatten()
+                .map(|d| d.state);
+            let parked = deployment == Some(crate::deploy::DeploymentState::Paused);
+            match record.status {
+                RunStatus::Paused if deployment.is_none() || parked => {}
+                RunStatus::Starting | RunStatus::Running | RunStatus::Pausing if parked => {
+                    record.status = RunStatus::Paused;
+                    record.finished_at = Some(now_unix());
+                }
+                _ => return None,
+            }
+            Some((record.run_id.clone(), record))
+        })
+        .collect()
+}
+
+/// A later run of the same team, if one has started since this one: the
+/// team's checkpoint directory then belongs to it, and this run's lineage
+/// sits archived beside it.
+fn superseded_by<'a>(runs: &'a BTreeMap<String, RunRecord>, id: &str) -> Option<&'a RunRecord> {
+    let this = runs.get(id)?;
+    runs.values()
+        .filter(|other| other.team == this.team && other.run_id != this.run_id)
+        .filter(|other| other.started_at >= this.started_at)
+        .max_by_key(|other| other.started_at)
+}
+
+/// Where a paused run's last diagram is kept: its server died with the loop,
+/// and a reload still has to show what was parked.
+fn snapshot_path(context: &Context_, run_id: &str) -> std::path::PathBuf {
+    crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(run_id)
+        .join("snapshot.json")
+}
+
+/// The diagram a paused run left behind, exactly as its server last served it.
+fn run_snapshot(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        if !runs.contains_key(id) {
+            return (404, json!({"error": "unknown run"}));
+        }
+    }
+    match fs::read(snapshot_path(context, id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    {
+        Some(snapshot) => (200, snapshot),
+        None => (404, json!({"error": "no snapshot kept for this run"})),
+    }
+}
+
+/// What the daemon records once a run's loop returns, however it returned.
+fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::RunOutcome>) {
+    // The run is over, so its invocation service is gone with it. Leaving
+    // the entry would let a panel offer work nothing can accept.
+    context
+        .panels
+        .lock()
+        .expect("serve panels poisoned")
+        .remove(run_id);
+    let mut runs = context.runs.lock().expect("serve runs poisoned");
+    if let Some(record) = runs.get_mut(run_id) {
+        record.finished_at = Some(now_unix());
+        match outcome {
+            Ok(outcome) => {
+                record.status = match outcome.end {
+                    topology::RunEnd::Completed => RunStatus::Completed,
+                    topology::RunEnd::Stopped => RunStatus::Stopped,
+                    topology::RunEnd::Paused => RunStatus::Paused,
+                };
+                record.outputs = outcome.outputs;
+                record.state = outcome.state;
+                if let (topology::RunEnd::Paused, Some(diagram)) = (outcome.end, &outcome.diagram) {
+                    let path = snapshot_path(context, run_id);
+                    let _ = fs::create_dir_all(path.parent().expect("run dir"));
+                    let _ = fs::write(path, serde_json::to_vec(diagram).unwrap_or_default());
+                }
+            }
+            Err(error) => {
+                record.status = RunStatus::Failed;
+                record.error = Some(format!("{error:#}"));
+            }
+        }
+        persist_run(context, record);
+    }
+}
+
+fn spawn_resume_thread(
+    context: &Arc<Context_>,
+    run_id: &str,
+    team: &str,
+    program_path: std::path::PathBuf,
+    ready_sender: mpsc::Sender<SocketAddr>,
+) {
+    // A resumed run answers web agents through the panel too: its credentials
+    // arrive on their own channel, stored as they come, as on a fresh start.
+    let (panel_sender, panel_receiver) = mpsc::channel();
+    {
+        let panels = context.panels.clone();
+        let id = run_id.to_string();
+        thread::spawn(move || {
+            if let Ok(access) = panel_receiver.recv() {
+                panels
+                    .lock()
+                    .expect("serve panels poisoned")
+                    .insert(id, access);
+            }
+        });
+    }
+    let context = context.clone();
+    let run_id = run_id.to_string();
+    let team = team.to_string();
+    thread::spawn(move || {
+        let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
+        let generated = topology::generated_dir(&program_path);
+        let outcome = topology::resume_topology(
+            TopologyRunConfig {
+                ea_id: context.ea_id,
+                omar_dir: &context.omar_dir,
+                generated: &generated,
+                base_prefix: &context.session_prefix,
+                health_idle_warning: context.health_idle_warning,
+                inputs: &[],
+                replace: true,
+                timeout: Duration::from_secs(default_timeout_seconds()),
+                pace: topology::Pace::RealTime,
+                diagram_address: Some(diagram_address),
+                diagram_ready: Some(ready_sender),
+                panel_ready: Some(panel_sender),
+                checkpoint_period: None,
+                program_path: Some(&program_path),
+            },
+            &team,
+        );
+        finish_run(&context, &run_id, outcome);
+    });
 }
 
 fn now_unix() -> u64 {
@@ -2658,6 +3326,7 @@ mod tests {
             started_at: 0,
             finished_at: None,
             error: None,
+            present: Vec::new(),
             outputs: BTreeMap::new(),
             state: BTreeMap::new(),
         }
@@ -2971,6 +3640,111 @@ mod tests {
         assert!(resumed.context.runs.lock().unwrap().is_empty());
     }
 
+    /// A paused run is durable state: the daemon that paused it may be gone
+    /// by the time it is resumed, so the next one offers it under its own
+    /// id, to the chat and to the CLI alike. A stopped one is not offered.
+    #[test]
+    fn a_paused_run_survives_a_runtime_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        for (id, team) in [("parked", "Cadence"), ("given-up", "Other")] {
+            server.context.runs.lock().unwrap().insert(
+                id.to_string(),
+                RunRecord {
+                    run_id: id.to_string(),
+                    team: team.to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 1,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                },
+            );
+            finish_run(
+                &server.context,
+                id,
+                Ok(topology::RunOutcome {
+                    end: topology::RunEnd::Paused,
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                    diagram: None,
+                }),
+            );
+        }
+        assert!(request(
+            server.address(),
+            "POST",
+            "/v1/runs/given-up/stop",
+            Some("{}")
+        )
+        .contains(" 200 "));
+        // The daemon died between the deployment parking and the record
+        // saying so: the deployment record settles it.
+        let mut mid = record("Mid", RunStatus::Pausing);
+        mid.run_id = "mid-pause".to_string();
+        mid.started_at = 2;
+        persist_run(&server.context, &mid);
+        let mut deployment = crate::deploy::DeploymentRecord::create("Mid", BTreeMap::new(), 1);
+        for state in [
+            crate::deploy::DeploymentState::Deploying,
+            crate::deploy::DeploymentState::Running,
+            crate::deploy::DeploymentState::Pausing,
+            crate::deploy::DeploymentState::Paused,
+        ] {
+            deployment.advance(state, None).unwrap();
+        }
+        let mid_dir = crate::deploy::dir_for(dir.path(), 0, "Mid");
+        fs::create_dir_all(&mid_dir).unwrap();
+        deployment.save(&mid_dir).unwrap();
+        drop(server);
+        let resumed = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let response = request(resumed.address(), "GET", "/v1/runs/parked", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"status\":\"paused\""),
+            "{response}"
+        );
+        assert!(request(resumed.address(), "GET", "/v1/runs/given-up", None).contains(" 404 "));
+        // The chat shows the latest parked run; both are listed for the CLI.
+        let listing = request(resumed.address(), "GET", "/v1/chats", None);
+        assert!(listing.contains("\"run_id\":\"mid-pause\""), "{listing}");
+        let mid = request(resumed.address(), "GET", "/v1/runs/mid-pause", None);
+        assert!(mid.contains("\"status\":\"paused\""), "{mid}");
+        assert_eq!(resumed.session_runs(Some(0)).len(), 2);
+        // A second chat on the same EA does not offer the runs twice.
+        assert!(request(resumed.address(), "POST", "/v1/chats", Some("{}")).contains(" 200 "));
+        assert_eq!(resumed.session_runs(None).len(), 2);
+    }
+
+    /// A later run of the team owns its live checkpoint directory; an
+    /// earlier run's listing says so instead of showing the newer lineage.
+    #[test]
+    fn a_superseded_run_does_not_list_the_new_lineage() {
+        let server = test_server();
+        let address = server.address();
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            let mut older = record("Cadence", RunStatus::Completed);
+            older.started_at = 1;
+            let mut newer = record("Cadence", RunStatus::Running);
+            newer.started_at = 2;
+            runs.insert("old".to_string(), older);
+            runs.insert("new".to_string(), newer);
+        }
+        let dir = crate::deploy::dir_for(&server.context.omar_dir, 0, "Cadence");
+        std::fs::create_dir_all(&dir).expect("deployment dir");
+        let response = request(address, "GET", "/v1/runs/old/checkpoints", None);
+        assert!(
+            response.contains(" 409 ") && response.contains("archived"),
+            "{response}"
+        );
+        assert!(request(address, "GET", "/v1/runs/old/checkpoints/x", None).contains(" 409 "));
+        assert!(request(address, "GET", "/v1/runs/new/checkpoints", None).contains(" 200 "));
+    }
+
     #[test]
     fn history_save_errors_are_returned_before_a_reply_is_published() {
         let server = test_server();
@@ -3117,6 +3891,226 @@ while True:
     /// The route's whole job is to leave the same control file `omar stop`
     /// leaves, in the directory the run is actually using — so the assertion
     /// worth making is that the file lands where the runner looks.
+    /// A pause is the same kind of request as a stop: a control file where
+    /// the runner looks, and a status the record carries until the boundary.
+    #[test]
+    fn pausing_a_run_leaves_the_request_and_resuming_needs_a_paused_run() {
+        let server = test_server();
+        let address = server.address();
+        let team = "Cadence";
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: team.to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                },
+            );
+        }
+        let dir = crate::deploy::dir_for(&server.context.omar_dir, 0, team);
+        std::fs::create_dir_all(&dir).expect("deployment dir");
+
+        // Not paused: nothing to resume.
+        let response = request(address, "POST", "/v1/runs/run-1/resume", Some("{}"));
+        assert!(response.contains(" 409 "), "{response}");
+        assert!(
+            response.contains("only a paused run can resume"),
+            "{response}"
+        );
+
+        let response = request(address, "POST", "/v1/runs/run-1/pause", Some("{}"));
+        assert!(response.contains(" 202 "), "{response}");
+        assert_eq!(
+            crate::deploy::pending_request(&dir),
+            Some(crate::deploy::ControlOp::Pause)
+        );
+        assert!(response.contains("\"status\":\"pausing\""), "{response}");
+        assert!(RunStatus::Pausing.is_active());
+
+        // A stop outranks the pending pause: the operator wants the run to
+        // end, and a capture that is held has no other way out.
+        let response = request(address, "POST", "/v1/runs/run-1/stop", Some("{}"));
+        assert!(
+            response.contains(" 202 ") && response.contains("\"status\":\"stopping\""),
+            "{response}"
+        );
+        assert_eq!(
+            crate::deploy::pending_request(&dir),
+            Some(crate::deploy::ControlOp::Stop)
+        );
+
+        // Paused, but the program the daemon staged is gone: refused before
+        // anything is launched, with the path it looked at.
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.get_mut("run-1").expect("run").status = RunStatus::Paused;
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/resume", Some("{}"));
+        assert!(response.contains(" 409 "), "{response}");
+        assert!(response.contains("no longer staged"), "{response}");
+        assert!(request(address, "POST", "/v1/runs/nobody/resume", Some("{}")).contains(" 404 "));
+    }
+
+    /// Mission Control lists a run's checkpoints and moves a paused run's
+    /// resume point; the store underneath is the one `omar rollback` uses.
+    #[test]
+    fn checkpoints_are_listed_and_a_paused_run_rolls_back() {
+        let server = test_server();
+        let address = server.address();
+        let team = "Cadence";
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: team.to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                },
+            );
+        }
+        let dir = crate::deploy::dir_for(&server.context.omar_dir, 0, team);
+        std::fs::create_dir_all(&dir).expect("deployment dir");
+        let response = request(address, "GET", "/v1/runs/run-1/checkpoints", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"checkpoints\":[]"),
+            "{response}"
+        );
+
+        // Two checkpoints with no file versions to verify, published the way
+        // the runtime publishes them.
+        let store = crate::checkpoint::Store::new(&dir);
+        let program = json!({"version": 1, "team": team, "instructions": [
+            {"op": "begin_plan", "team": team},
+            {"op": "define_port", "kind": "input", "name": "tick", "type": "int"},
+            {"op": "commit_plan"}]});
+        let mut ids = Vec::new();
+        for sequence in 1..=2u64 {
+            let state = crate::checkpoint::ExecutionState {
+                version: crate::checkpoint::FORMAT,
+                completed_tag: Some((sequence, 0)),
+                queue: Vec::new(),
+                outputs: BTreeMap::new(),
+                state_vars: BTreeMap::new(),
+                elapsed_ns: sequence,
+            };
+            let manifest = crate::checkpoint::Manifest {
+                version: crate::checkpoint::FORMAT,
+                id: Uuid::new_v4().to_string(),
+                sequence,
+                parent: ids.last().cloned(),
+                deployment_id: "d".into(),
+                team: team.into(),
+                ea_id: 0,
+                created_at: sequence,
+                completed_tag: state.completed_tag,
+                next_tag: None,
+                trigger: crate::checkpoint::Trigger::Manual,
+                policy: crate::checkpoint::Policy::default(),
+                pace: "fast".into(),
+                program_sha256: crate::checkpoint::sha256(&serde_json::to_vec(&program).unwrap()),
+                program_path: None,
+                state_sha256: crate::checkpoint::sha256(
+                    &serde_json::to_vec_pretty(&state).unwrap(),
+                ),
+                elapsed_ns: state.elapsed_ns,
+                workspaces: BTreeMap::new(),
+                agents: BTreeMap::new(),
+            };
+            store.publish(&manifest, &state, &program).expect("publish");
+            ids.push(manifest.id);
+        }
+        let response = request(address, "GET", "/v1/runs/run-1/checkpoints", None);
+        assert!(
+            response.contains(&format!("\"resume_point\":\"{}\"", ids[1])),
+            "{response}"
+        );
+        // The preview: what the checkpoint holds, and whether it is the resume point.
+        let response = request(
+            address,
+            "GET",
+            &format!("/v1/runs/run-1/checkpoints/{}", ids[0]),
+            None,
+        );
+        assert!(
+            response.contains(" 200 ") && response.contains("\"is_resume_point\":false"),
+            "{response}"
+        );
+        assert!(
+            response.contains("\"queue_len\":0") && response.contains("\"completed_tag\":[1,0]"),
+            "{response}"
+        );
+        assert!(request(address, "GET", "/v1/runs/run-1/checkpoints/nope", None).contains(" 404 "));
+
+        // The run's own timeline, from the bytecode staged beside its program.
+        let response = request(address, "GET", "/v1/runs/run-1/timeline", None);
+        assert!(
+            response.contains(" 409 ") && response.contains("no longer staged"),
+            "{response}"
+        );
+        let staged = crate::ea::ea_state_dir(0, &server.context.omar_dir)
+            .join("serve")
+            .join("run-1");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(
+            staged.join("program.json"),
+            serde_json::to_vec(&program).unwrap(),
+        )
+        .unwrap();
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.get_mut("run-1").expect("run").present = vec!["tick".to_string()];
+        }
+        let response = request(address, "GET", "/v1/runs/run-1/timeline", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"steps\":[{"),
+            "{response}"
+        );
+        assert!(response.contains("\"truncated\":false"), "{response}");
+
+        // Only a paused run rolls back.
+        let body = format!("{{\"checkpoint\":\"{}\"}}", ids[0]);
+        let response = request(address, "POST", "/v1/runs/run-1/rollback", Some(&body));
+        assert!(
+            response.contains(" 409 ") && response.contains("only a paused run"),
+            "{response}"
+        );
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.get_mut("run-1").expect("run").status = RunStatus::Paused;
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/rollback", Some(&body));
+        assert!(response.contains(" 200 "), "{response}");
+        assert!(
+            response.contains(&format!("\"abandoned\":\"{}\"", ids[1])),
+            "{response}"
+        );
+        assert_eq!(store.resume_point().unwrap().unwrap().id, ids[0]);
+        let response = request(
+            address,
+            "POST",
+            "/v1/runs/run-1/rollback",
+            Some("{\"checkpoint\":\"nope\"}"),
+        );
+        assert!(response.contains(" 409 "), "{response}");
+    }
+
     #[test]
     fn stopping_a_run_leaves_the_request_where_the_runner_reads_it() {
         let server = test_server();
@@ -3136,6 +4130,7 @@ while True:
                     started_at: 0,
                     finished_at: None,
                     error: None,
+                    present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
                 },
@@ -3243,6 +4238,99 @@ while True:
             find_active_run(&runs, "Sample").map(|record| record.status),
             Some(RunStatus::Starting)
         );
+        // A paused run holds its team too: a fresh run would overwrite the
+        // deployment record and checkpoints its resume needs.
+        runs.insert("c".to_string(), record("Sample", RunStatus::Paused));
+        let held = find_active_run(&runs, "Sample").expect("paused holds the team");
+        assert!(team_held_error(held)["error"]
+            .as_str()
+            .unwrap()
+            .contains("paused run"));
+    }
+
+    /// A paused run's diagram outlives its server: the record of the pause
+    /// keeps it, and the run's snapshot route serves it to a reload.
+    #[test]
+    fn a_paused_run_keeps_its_last_diagram() {
+        let server = test_server();
+        let address = server.address();
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: "Cadence".to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                },
+            );
+        }
+        assert!(request(address, "GET", "/v1/runs/run-1/snapshot", None).contains(" 404 "));
+        assert!(request(address, "GET", "/v1/runs/nobody/snapshot", None).contains(" 404 "));
+        let diagram = crate::diagram::DiagramSnapshot::from_vm_state(&sample_state());
+        finish_run(
+            &server.context,
+            "run-1",
+            Ok(topology::RunOutcome {
+                end: topology::RunEnd::Paused,
+                outputs: BTreeMap::new(),
+                state: BTreeMap::new(),
+                diagram: Some(diagram),
+            }),
+        );
+        let response = request(address, "GET", "/v1/runs/run-1/snapshot", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"team\":\"Sample\""),
+            "{response}"
+        );
+        assert!(request(address, "GET", "/v1/runs/run-1", None).contains("\"status\":\"paused\""));
+    }
+
+    /// A paused run has no runner to ask, so a stop gives it up in place,
+    /// which frees its team; it cannot be resumed afterwards.
+    #[test]
+    fn stopping_a_paused_run_discards_it() {
+        let server = test_server();
+        let address = server.address();
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: "Cadence".to_string(),
+                    status: RunStatus::Paused,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                },
+            );
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/stop", Some("{}"));
+        assert!(
+            response.contains(" 200 ") && response.contains("\"status\":\"stopped\""),
+            "{response}"
+        );
+        {
+            let runs = server.context.runs.lock().expect("runs");
+            assert!(
+                find_active_run(&runs, "Cadence").is_none(),
+                "the team is free again"
+            );
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/resume", Some("{}"));
+        assert!(response.contains(" 409 "), "{response}");
     }
 
     #[test]

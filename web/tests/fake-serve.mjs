@@ -81,6 +81,105 @@ export async function startFakeServe({
     if (
       request.method === "POST" &&
       url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/pause")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/pause".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      const active = ["starting", "running", "stopping", "pausing"].includes(entry.record.status);
+      if (!active) return json(response, 200, entry.record);
+      // Accepted, not done: the daemon checkpoints at the next tag boundary
+      // and only then parks. Held briefly so the waiting state is observable.
+      entry.record.status = "pausing";
+      // The walk parks at its next tag boundary, as the runtime does.
+      return json(response, 202, entry.record);
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/checkpoints")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/checkpoints".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return json(response, 200, { checkpoints: checkpointsOf(entry), resume_point: entry.resumePoint, unreadable: [] });
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/timeline")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/timeline".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      // The same strip the check route projects for a draft.
+      const steps = entry.snapshot.reactions.map((reaction, index) => ({
+        timestamp: 0,
+        microstep: index,
+        events: [],
+        reactions: [reaction.id],
+      }));
+      return json(response, 200, { steps, truncated: false });
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.includes("/checkpoints/")
+    ) {
+      const [id, checkpoint] = url.pathname.slice("/v1/runs/".length).split("/checkpoints/");
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      const found = checkpointsOf(entry).find((c) => c.id === checkpoint);
+      if (!found) return json(response, 404, { error: `no checkpoint '${checkpoint}'` });
+      return json(response, 200, {
+        ...found,
+        is_resume_point: entry.resumePoint === found.id,
+        outputs: { result: `value at #${found.sequence}` },
+        state_vars: { "leader.round": found.sequence },
+        queue_len: 1,
+        queued_tags: [found.next_tag],
+        elapsed_ns: found.sequence * 1_000_000_000,
+        workspaces: { leader: { workspace_id: "0123456789abcdef", snapshot_id: `snap-${found.sequence}-0000`, commit: "0".repeat(40) } },
+        agents: { "leader.agent": { backend: "stub", restoration: "fresh_conversation" } },
+      });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/rollback")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/rollback".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      if (entry.record.status !== "paused") {
+        return json(response, 409, { error: `run is ${entry.record.status}; only a paused run can roll back` });
+      }
+      const body = JSON.parse(await readBody(request));
+      const target = checkpointsOf(entry).find((c) => c.id === body.checkpoint);
+      if (!target) return json(response, 409, { error: `no checkpoint '${body.checkpoint}'` });
+      const abandoned = entry.resumePoint;
+      entry.resumePoint = target.id;
+      return json(response, 200, { resume_point: target.id, abandoned, checkpoint: target });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/resume")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/resume".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      if (entry.record.status !== "paused") {
+        return json(response, 409, { error: `run is ${entry.record.status}; only a paused run can resume` });
+      }
+      entry.record.status = "running";
+      entry.record.finished_at = null;
+      publish(entry, "run_started", {});
+      return json(response, 200, entry.record);
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
       url.pathname.endsWith("/stop")
     ) {
       const id = url.pathname.slice("/v1/runs/".length, -"/stop".length);
@@ -89,6 +188,12 @@ export async function startFakeServe({
       // A stopping run is still active, as on the daemon: it holds its sessions
       // until the tag closes.
       const active = ["starting", "running", "stopping"].includes(entry.record.status);
+      if (entry.record.status === "paused") {
+        // No runner to ask: the paused run is given up in place.
+        entry.record.status = "stopped";
+        entry.record.finished_at = Math.floor(Date.now() / 1000);
+        return json(response, 200, entry.record);
+      }
       if (!active) return json(response, 200, entry.record);
       // Accepted, not done: the daemon answers before the run has ended, and
       // records `stopping` so a client that reloads still sees it. Held briefly
@@ -139,6 +244,13 @@ export async function startFakeServe({
           });
         });
       }
+    }
+    if (request.method === "GET" && url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/snapshot")) {
+      // The picture a paused run left behind, as serve keeps it.
+      const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length, -"/snapshot".length));
+      return entry && entry.record.status === "paused"
+        ? json(response, 200, entry.snapshot)
+        : json(response, 404, { error: "no snapshot kept for this run" });
     }
     if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
       const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length));
@@ -611,6 +723,16 @@ export async function startFakeServe({
     }
   }
 
+  /** Two checkpoints at the fake timeline's first two tags; the newer is the resume point. */
+  function checkpointsOf(entry) {
+    entry.checkpoints ??= [
+      { id: "cp-1", sequence: 1, parent: null, trigger: "manual", completed_tag: [0, 0], next_tag: [0, 1], created_at: 1 },
+      { id: "cp-2", sequence: 2, parent: "cp-1", trigger: "pause", completed_tag: [0, 1], next_tag: [0, 2], created_at: 2 },
+    ];
+    entry.resumePoint ??= "cp-2";
+    return entry.checkpoints;
+  }
+
   function publish(entry, kind, payload, tag = null) {
     entry.sequence += 1;
     entry.snapshot.sequence = entry.sequence;
@@ -632,7 +754,25 @@ export async function startFakeServe({
     await wait();
     publish(entry, "run_started", {});
 
+    // A pause lands at a tag boundary: nothing in flight, a checkpoint
+    // announced, and the walk parked until a resume sets the run going.
+    const boundary = async () => {
+      if (entry.record.status !== "pausing") return;
+      // Held briefly, as the stop is, so the pausing state is one a test can
+      // observe before the boundary lands.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      entry.record.status = "paused";
+      entry.record.finished_at = Math.floor(Date.now() / 1000);
+      entry.snapshot.status = "paused";
+      publish(entry, "run_checkpointed", { checkpoint: "cp-2", trigger: "pause" }, { timestamp: 0, microstep: 1 });
+      publish(entry, "run_paused", { checkpoint: "cp-2" });
+      while (entry.record.status === "paused") await wait();
+      entry.snapshot.status = "running";
+      publish(entry, "run_started", {});
+    };
+
     for (const [index, reaction] of entry.snapshot.reactions.entries()) {
+      await boundary();
       // Nanoseconds, as the runtime sends them: a tag a second apart, each one
       // a fixed 250ms behind its logical time so the readout has something to
       // show that is neither zero nor a round second.
@@ -666,6 +806,7 @@ export async function startFakeServe({
       publish(entry, "reaction_completed", { reaction: reaction.id }, tag);
       await wait();
     }
+    await boundary();
 
     entry.snapshot.status = "completed";
     entry.record.status = "completed";

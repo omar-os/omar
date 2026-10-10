@@ -51,6 +51,8 @@ pub enum DiagramStatus {
     Running,
     Completed,
     Failed,
+    /// Checkpointed and parked; `omar resume` continues it.
+    Paused,
 }
 
 /// The name serde puts on the wire for a unit variant.
@@ -76,6 +78,9 @@ pub enum DiagramEventKind {
     ReactionCompleted,
     RunCompleted,
     RunFailed,
+    RunPaused,
+    /// A checkpoint was published at the tag the event carries.
+    RunCheckpointed,
 }
 
 impl std::fmt::Display for DiagramEventKind {
@@ -376,6 +381,11 @@ pub trait TopologyObserver: Send + Sync {
     }
     fn run_completed(&self, _outputs: &BTreeMap<String, Value>) {}
     fn run_failed(&self, _message: &str) {}
+    /// The run checkpointed and parked at a tag boundary; nothing more
+    /// happens until a resume.
+    fn run_paused(&self, _checkpoint: &str) {}
+    /// A checkpoint was published after `tag` completed; `trigger` says why.
+    fn checkpoint_published(&self, _checkpoint: &str, _trigger: &str, _tag: Option<(u64, u64)>) {}
 }
 
 pub struct NoopTopologyObserver;
@@ -559,6 +569,26 @@ impl TopologyObserver for DiagramPublisher {
             json!({ "message": message }),
         );
     }
+
+    fn run_paused(&self, checkpoint: &str) {
+        self.publish_status(
+            DiagramEventKind::RunPaused,
+            DiagramStatus::Paused,
+            json!({ "checkpoint": checkpoint }),
+        );
+    }
+
+    fn checkpoint_published(&self, checkpoint: &str, trigger: &str, tag: Option<(u64, u64)>) {
+        self.publish_with(
+            DiagramEventKind::RunCheckpointed,
+            tag.map(|(timestamp, microstep)| DiagramTag {
+                timestamp,
+                microstep,
+            }),
+            json!({ "checkpoint": checkpoint, "trigger": trigger }),
+            |_| {},
+        );
+    }
 }
 
 pub struct DiagramServer {
@@ -620,6 +650,15 @@ impl DiagramServer {
 
     pub fn publisher(&self) -> DiagramPublisher {
         self.publisher.clone()
+    }
+
+    /// The picture as it stands, for keeping once this server is gone.
+    pub fn snapshot(&self) -> DiagramSnapshot {
+        self.publisher
+            .snapshot
+            .read()
+            .expect("diagram snapshot poisoned")
+            .clone()
     }
 }
 

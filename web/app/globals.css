@@ -1676,13 +1676,179 @@ h2 {
   accent-color: var(--purple);
 }
 
+/* The slider, with a tick standing on its track wherever a checkpoint was
+   taken. The ticks overlay the input; each is its own button. */
+.timeline-rail {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  height: 28px;
+}
+
+.timeline-rail input[type="range"] {
+  width: 100%;
+}
+
+.timeline-ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* Above the slider and its thumb: a tick under the thumb must still take
+     the click. */
+  z-index: 1;
+}
+
+.timeline-controls .timeline-tick {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 12px;
+  margin-left: -1.5px;
+  padding: 0;
+  border: 0;
+  border-radius: 1.5px;
+  background: #4cc37a;
+  font-size: 0;
+  line-height: 0;
+  transform: translateY(-50%);
+  transition: height 120ms ease, width 120ms ease, background 120ms ease;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.timeline-controls .timeline-tick:hover,
+.timeline-controls .timeline-tick:focus-visible {
+  height: 24px;
+  width: 4px;
+  margin-left: -2px;
+  background: #7ef0a6;
+  z-index: 2;
+  outline: none;
+}
+
+.timeline-controls .timeline-tick.resume {
+  box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 3.5px #4cc37a;
+}
+
+.timeline-controls .timeline-tick.selected {
+  height: 24px;
+  width: 4px;
+  margin-left: -2px;
+  background: #7ef0a6;
+  z-index: 1;
+}
+
+.timeline-checkpoints {
+  color: #7ef0a6;
+}
+
+.timeline-run-controls {
+  margin-left: auto;
+  order: 9;
+}
+
+/* Pause, Stop and Resume ride with the strip, folded or not. */
+.run-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 6px;
+}
+
+.run-controls .primary-button,
+.run-controls .secondary-button {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.run-controls .secondary-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.timeline-handle-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  padding-right: 10px;
+}
+
+.timeline-handle-bar .timeline-handle {
+  border-top: 0;
+  flex: 1;
+}
+
+.timeline-preview {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #2f9e5f;
+  border-radius: 8px;
+  background: rgba(76, 195, 122, 0.06);
+  font-size: 11.5px;
+}
+
+.timeline-preview-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+  color: var(--text);
+}
+
+.timeline-preview-head span {
+  color: var(--muted);
+}
+
+.timeline-preview-body {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 12px;
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.timeline-preview-body dt {
+  color: var(--text);
+}
+
+.timeline-preview-body dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.timeline-preview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.timeline-preview-actions .primary-button {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 11.5px;
+}
+
+.timeline-preview-note {
+  color: var(--muted);
+}
+
 .timeline-close {
   font-size: 11px !important;
 }
 
 .timeline-readout {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 8px;
   font-size: 11px;

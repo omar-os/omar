@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::deploy::{self, DeploymentState};
+use crate::checkpoint::{self, ExecutionState, QueuedTag, Trigger};
+use crate::deploy::{self, ControlOp, DeploymentState};
 use crate::diagram::{DiagramServer, NoopTopologyObserver, TopologyObserver};
 use crate::manager::{self, McpLaunchContext, TopologyMcpContext};
 use crate::tmux::flatten_agent_name;
@@ -1759,6 +1760,11 @@ pub struct TopologyRunConfig<'a> {
     /// this the daemon cannot answer on a client's behalf, and a web-backed
     /// reaction would always sit until its deadline.
     pub panel_ready: Option<mpsc::Sender<PanelAccess>>,
+    /// How often the run checkpoints on its own; `None` is the default hour.
+    pub checkpoint_period: Option<Duration>,
+    /// The program file, recorded in checkpoints so a resume can place
+    /// generated code beside it. `None` for a program that arrived over HTTP.
+    pub program_path: Option<&'a Path>,
 }
 
 /// Where a run's invocations are answered, and the secret that authorises it.
@@ -1781,6 +1787,8 @@ pub struct PanelAccess {
 pub enum RunEnd {
     Completed,
     Stopped,
+    /// Ended at a checkpoint it can continue from.
+    Paused,
 }
 
 /// How a run ended, with the output ports and state variables it ended with.
@@ -1788,6 +1796,9 @@ pub struct RunOutcome {
     pub end: RunEnd,
     pub outputs: BTreeMap<String, Value>,
     pub state: BTreeMap<String, Value>,
+    /// The live diagram as the run left it, when one was served: a paused
+    /// run's picture outlives its diagram server.
+    pub diagram: Option<crate::diagram::DiagramSnapshot>,
 }
 
 /// Advance the shared record and persist it, as one step.
@@ -1846,8 +1857,338 @@ fn fail_deployment(
     let _ = deploy::clear_stop(dir);
 }
 
+/// The run's checkpoint controller: physical-time scheduling, each team
+/// instance's file version, and atomic publication, all keyed to one
+/// deployment. The event loop asks it at tag boundaries; it never interrupts
+/// a tag.
+struct RunCheckpointer<'a> {
+    omar_dir: &'a Path,
+    dir: PathBuf,
+    store: checkpoint::Store,
+    record: Arc<Mutex<deploy::DeploymentRecord>>,
+    workspaces: &'a BTreeMap<String, crate::workspace::Workspace>,
+    program: Value,
+    program_path: Option<String>,
+    team: String,
+    ea_id: u32,
+    pace: Pace,
+    agents: BTreeMap<String, checkpoint::AgentContext>,
+    schedule: Mutex<Schedule>,
+}
+
+struct Schedule {
+    policy: checkpoint::Policy,
+    next_due: Instant,
+    sequence: u64,
+    parent: Option<String>,
+}
+
+impl<'a> RunCheckpointer<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        omar_dir: &'a Path,
+        dir: &Path,
+        record: Arc<Mutex<deploy::DeploymentRecord>>,
+        workspaces: &'a BTreeMap<String, crate::workspace::Workspace>,
+        state: &VmState,
+        bytecode: &Bytecode,
+        config: &TopologyRunConfig<'_>,
+        resumed_from: Option<&checkpoint::Manifest>,
+    ) -> Result<Self> {
+        let store = checkpoint::Store::new(dir);
+        // A fresh run starts its own lineage: an earlier run's checkpoints
+        // are set aside, so a rollback can only choose from this run's.
+        if resumed_from.is_none() {
+            if let Some(archived) = store.archive()? {
+                println!(
+                    "Checkpoints of the previous run moved to {}",
+                    archived.display()
+                );
+            }
+        }
+        // An operator's live change outlives the runner that saw it; a launch
+        // override starts a fresh policy; otherwise the default hour.
+        let policy = match (config.checkpoint_period, deploy::read_policy(dir)?) {
+            (Some(period), _) => checkpoint::Policy {
+                period_secs: period.as_secs(),
+            },
+            (None, Some(saved)) if resumed_from.is_some() => saved,
+            (None, _) => resumed_from.map(|m| m.policy).unwrap_or_default(),
+        };
+        deploy::write_policy(dir, policy)?;
+        let (existing, problems) = store.list()?;
+        for problem in problems {
+            eprintln!("warning: ignoring unreadable checkpoint {problem}");
+        }
+        let sequence = existing.iter().map(|m| m.sequence).max().unwrap_or(0) + 1;
+        let next_due = Instant::now() + policy.period();
+        {
+            let mut guard = record
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
+            guard.next_checkpoint_at = Some(deploy::now_unix() + policy.period().as_secs());
+            guard.save(dir)?;
+        }
+        let program_path = config
+            .program_path
+            .map(|path| path.to_string_lossy().into_owned())
+            .or_else(|| resumed_from.and_then(|m| m.program_path.clone()));
+        Ok(Self {
+            omar_dir,
+            dir: dir.to_path_buf(),
+            store,
+            record,
+            workspaces,
+            program: serde_json::to_value(bytecode)?,
+            program_path,
+            team: state.team.clone(),
+            ea_id: config.ea_id,
+            pace: config.pace,
+            agents: state
+                .agents
+                .iter()
+                .map(|(name, agent)| {
+                    (
+                        name.clone(),
+                        checkpoint::AgentContext {
+                            backend: agent.backend.clone(),
+                            restoration: checkpoint::FRESH_CONVERSATION.to_string(),
+                        },
+                    )
+                })
+                .collect(),
+            schedule: Mutex::new(Schedule {
+                policy,
+                next_due,
+                sequence,
+                parent: resumed_from.map(|m| m.id.clone()),
+            }),
+        })
+    }
+
+    /// Pick up a period an operator changed while the run was going. The
+    /// next deadline is one new period from the change.
+    fn refresh_policy(&self, schedule: &mut Schedule) {
+        let Ok(Some(saved)) = deploy::read_policy(&self.dir) else {
+            return;
+        };
+        if saved == schedule.policy {
+            return;
+        }
+        schedule.policy = saved;
+        schedule.next_due = Instant::now() + saved.period();
+        if let Ok(mut guard) = self.record.lock() {
+            guard.next_checkpoint_at = Some(deploy::now_unix() + saved.period().as_secs());
+            let _ = guard.save(&self.dir);
+        }
+    }
+}
+
+impl Checkpointer for RunCheckpointer<'_> {
+    fn due(&self) -> bool {
+        let Ok(mut schedule) = self.schedule.lock() else {
+            return false;
+        };
+        self.refresh_policy(&mut schedule);
+        Instant::now() >= schedule.next_due
+    }
+
+    fn capture(&self, state: &ExecutionState, trigger: Trigger) -> Result<String> {
+        let mut schedule = self
+            .schedule
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint schedule lock poisoned"))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let kind = match trigger {
+            Trigger::Automatic => "automatic",
+            Trigger::Manual => "manual",
+            Trigger::Pause => "pause",
+        };
+        let label = format!("Checkpoint {} ({kind})", schedule.sequence);
+        // Each instance's files, as a version its own history keeps. The
+        // manifest names them; nothing is copied.
+        let mut artifacts = BTreeMap::new();
+        for (instance, workspace) in self.workspaces {
+            let snapshot = workspace
+                .snapshot(self.omar_dir, &label)
+                .with_context(|| format!("snapshot instance '{instance}' files"))?;
+            artifacts.insert(
+                instance.clone(),
+                checkpoint::ArtifactRef {
+                    workspace_id: workspace.id.clone(),
+                    snapshot_id: snapshot.id,
+                    commit: snapshot.commit,
+                },
+            );
+        }
+        let deployment_id = self
+            .record
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
+            .deployment_id
+            .clone();
+        let manifest = checkpoint::Manifest {
+            version: checkpoint::FORMAT,
+            id: id.clone(),
+            sequence: schedule.sequence,
+            parent: schedule.parent.clone(),
+            deployment_id,
+            team: self.team.clone(),
+            ea_id: self.ea_id,
+            created_at: deploy::now_unix(),
+            completed_tag: state.completed_tag,
+            next_tag: state.next_tag(),
+            trigger,
+            policy: schedule.policy,
+            pace: match self.pace {
+                Pace::RealTime => "real_time".to_string(),
+                Pace::Fast => "fast".to_string(),
+            },
+            program_sha256: checkpoint::sha256(&serde_json::to_vec(&self.program)?),
+            program_path: self.program_path.clone(),
+            state_sha256: checkpoint::sha256(&serde_json::to_vec_pretty(state)?),
+            elapsed_ns: state.elapsed_ns,
+            workspaces: artifacts,
+            agents: self.agents.clone(),
+        };
+        self.store.publish(&manifest, state, &self.program)?;
+        schedule.sequence += 1;
+        schedule.parent = Some(id.clone());
+        schedule.next_due = Instant::now() + schedule.policy.period();
+        {
+            let mut guard = self
+                .record
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
+            guard.checkpoint = Some(id.clone());
+            guard.checkpoint_error = None;
+            guard.next_checkpoint_at =
+                Some(deploy::now_unix() + schedule.policy.period().as_secs());
+            guard.save(&self.dir)?;
+        }
+        let at = state
+            .completed_tag
+            .map(|(t, m)| format!("({t}, {m})"))
+            .unwrap_or_else(|| "start".to_string());
+        println!("Checkpoint {id} published: {kind}, after tag {at}");
+        Ok(id)
+    }
+
+    fn capture_failed(&self, error: &anyhow::Error, attempt: u32, held: bool) {
+        eprintln!("warning: checkpoint attempt {attempt} failed: {error:#}");
+        // Only a held failure is the operator's to act on; a waiting
+        // `checkpoint create` must not read a retry in progress as final.
+        if !held {
+            return;
+        }
+        if let Ok(mut guard) = self.record.lock() {
+            guard.checkpoint_error = Some(format!("{error:#}"));
+            let _ = guard.save(&self.dir);
+        }
+    }
+}
+
+/// A checkpoint a run continues from, with its files already restored into
+/// fresh workspaces.
+struct ResumePlan {
+    manifest: checkpoint::Manifest,
+    state: ExecutionState,
+    workspaces: BTreeMap<String, crate::workspace::Workspace>,
+}
+
 pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunOutcome> {
     let state = verify(bytecode)?;
+    launch(&state, bytecode, config, None)
+}
+
+/// Continue a paused team from its resume point: the head a rollback chose,
+/// else its latest checkpoint. Files come back as new workspaces restored
+/// from the captured versions; agents start fresh conversations and are
+/// told so; the clock continues where the checkpoint left it.
+pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunOutcome> {
+    let runtime_dir = deploy::dir_for(config.omar_dir, config.ea_id, team);
+    let record = deploy::DeploymentRecord::load(&runtime_dir)?
+        .with_context(|| format!("no deployment '{team}'"))?;
+    if record.is_active() && record.pid != std::process::id() && record.runner_alive() {
+        bail!(
+            "deployment '{team}' is {} (pid {}); pause or stop it first",
+            record.state,
+            record.pid
+        );
+    }
+    // Only a paused run: a stopped one executed tags after its last
+    // checkpoint, and continuing from there would replay them.
+    anyhow::ensure!(
+        record.state == DeploymentState::Paused,
+        "deployment '{team}' is {}; only a paused run can resume",
+        record.state
+    );
+    let store = checkpoint::Store::new(&runtime_dir);
+    let point = store
+        .resume_point()?
+        .with_context(|| format!("deployment '{team}' has no complete checkpoint"))?;
+    let (manifest, exec, program) = store.load(&point.id)?;
+    let bytecode: Bytecode = serde_json::from_value(program)?;
+    let state = verify(&bytecode)?;
+    anyhow::ensure!(
+        state.team == team,
+        "checkpoint {} is for team {}, not {team}",
+        manifest.id,
+        state.team
+    );
+    // Every instance the program declares must have a captured version, and
+    // nothing else may be listed: a checkpoint that disagrees with its own
+    // program cannot stand in for the run.
+    let expected: BTreeSet<String> = crate::workspace::instance_owners(&state)
+        .into_keys()
+        .collect();
+    let captured: BTreeSet<String> = manifest.workspaces.keys().cloned().collect();
+    anyhow::ensure!(
+        expected == captured,
+        "checkpoint {} covers instances {:?}, program declares {:?}",
+        manifest.id,
+        captured,
+        expected
+    );
+    let mut workspaces = BTreeMap::new();
+    let result = (|| -> Result<()> {
+        for (instance, artifact) in &manifest.workspaces {
+            let source = crate::workspace::Workspace::load(config.omar_dir, &artifact.workspace_id)
+                .with_context(|| format!("instance '{instance}' workspace"))?;
+            let restored = source
+                .restore(config.omar_dir, &artifact.snapshot_id)
+                .with_context(|| format!("restore instance '{instance}' files"))?;
+            workspaces.insert(instance.clone(), restored);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for workspace in workspaces.values() {
+            if let Some(root) = workspace.worktree(config.omar_dir).parent() {
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+        return Err(error);
+    }
+    launch(
+        &state,
+        &bytecode,
+        config,
+        Some(ResumePlan {
+            manifest,
+            state: exec,
+            workspaces,
+        }),
+    )
+}
+
+fn launch(
+    state: &VmState,
+    bytecode: &Bytecode,
+    config: TopologyRunConfig<'_>,
+    resume: Option<ResumePlan>,
+) -> Result<RunOutcome> {
+    let state = state.clone();
     let runtime_dir = deploy::dir_for(config.omar_dir, config.ea_id, &state.team);
     fs::create_dir_all(&runtime_dir)?;
     // One live run per team: its sessions are named by team and agent, so a
@@ -1911,10 +2252,17 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         planned_sessions,
         config.timeout.as_secs(),
     )));
-    record
-        .lock()
-        .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
-        .save(&runtime_dir)?;
+    let (resumed_from, start_state, restored) = match resume {
+        Some(plan) => (Some(plan.manifest), Some(plan.state), Some(plan.workspaces)),
+        None => (None, None, None),
+    };
+    {
+        let mut guard = record
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
+        guard.resumed_from = resumed_from.as_ref().map(|m| m.id.clone());
+        guard.save(&runtime_dir)?;
+    }
     let diagram_server = config
         .diagram_address
         .map(|address| DiagramServer::start(&state, address))
@@ -1956,8 +2304,17 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
             .deployment_id
             .clone();
-        let workspaces =
-            crate::workspace::for_topology(config.omar_dir, config.ea_id, &deployment_id, &state)?;
+        // A resumed run's files were restored before launch; a fresh run's
+        // instances get new, empty workspaces.
+        let workspaces = match restored {
+            Some(workspaces) => workspaces,
+            None => crate::workspace::for_topology(
+                config.omar_dir,
+                config.ea_id,
+                &deployment_id,
+                &state,
+            )?,
+        };
         {
             let mut guard = record
                 .lock()
@@ -1977,8 +2334,15 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             &config,
             &workspaces,
             &mut spawned,
+            resumed_from.as_ref(),
         )?;
-        let inputs = parse_inputs(&state, config.inputs)?;
+        // A resumed run's inputs were consumed at its start tag; what it
+        // continues with is in the checkpoint's queue.
+        let inputs = if start_state.is_some() {
+            BTreeMap::new()
+        } else {
+            parse_inputs(&state, config.inputs)?
+        };
         Ok((invocation_server, inputs, reactions, workspaces))
     })();
     let (invocation_server, inputs, reactions, workspaces) = match prepared {
@@ -2027,9 +2391,27 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             web,
         },
     };
+    let checkpointer = match RunCheckpointer::new(
+        config.omar_dir,
+        &runtime_dir,
+        record.clone(),
+        &workspaces,
+        &state,
+        bytecode,
+        &config,
+        resumed_from.as_ref(),
+    ) {
+        Ok(checkpointer) => checkpointer,
+        Err(error) => {
+            observer.run_failed(&error.to_string());
+            fail_deployment(&record, &runtime_dir, &spawned, &error);
+            return Err(error);
+        }
+    };
     advance_record(&record, &runtime_dir, DeploymentState::Running, None)?;
-    // Flip RUNNING to STOPPING the moment a stop lands, even while the loop
-    // is blocked mid-tag, so an operator polling status sees it acknowledged.
+    // Flip RUNNING to STOPPING or PAUSING the moment a request lands, even
+    // while the loop is blocked mid-tag, so an operator polling status sees
+    // it acknowledged.
     let watcher_shutdown = Arc::new(AtomicBool::new(false));
     let watcher = {
         let record = record.clone();
@@ -2037,13 +2419,24 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         let shutdown = watcher_shutdown.clone();
         thread::spawn(move || {
             while !shutdown.load(Ordering::Acquire) {
-                if deploy::stop_requested(&dir) {
+                let acknowledged = match deploy::pending_request(&dir) {
+                    Some(ControlOp::Stop) => Some((
+                        DeploymentState::Stopping,
+                        "stop requested; waiting for the current tag to close",
+                    )),
+                    Some(ControlOp::Pause) => Some((
+                        DeploymentState::Pausing,
+                        "pause requested; checkpointing at the next tag boundary",
+                    )),
+                    _ => None,
+                };
+                if let Some((next, detail)) = acknowledged {
                     if let Ok(mut guard) = record.lock() {
-                        if guard.state == DeploymentState::Running {
-                            let _ = guard.advance(
-                                DeploymentState::Stopping,
-                                Some("stop requested; waiting for the current tag to close"),
-                            );
+                        if guard.state == DeploymentState::Running
+                            || (guard.state == DeploymentState::Pausing
+                                && next == DeploymentState::Stopping)
+                        {
+                            let _ = guard.advance(next, Some(detail));
                             let _ = guard.save(&dir);
                         }
                     }
@@ -2053,13 +2446,18 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             }
         })
     };
-    let outcome = run_event_loop_observed(
+    let start = match start_state {
+        Some(saved) => LoopStart::Resume(saved),
+        None => LoopStart::Fresh(inputs),
+    };
+    let outcome = run_event_loop_controlled(
         &state,
-        inputs,
+        start,
         &executor,
         observer,
         config.pace,
         Some(&runtime_dir),
+        Some(&checkpointer),
     );
     watcher_shutdown.store(true, Ordering::Release);
     let _ = watcher.join();
@@ -2075,22 +2473,73 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             return Err(error);
         }
     };
+    write_json_atomic(&runtime_dir.join("state.json"), &state)?;
+    let sessions = record
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
+        .sessions
+        .clone();
+    if let LoopEnd::Paused(paused) = end {
+        // The checkpoint is already published. What remains is to leave
+        // nothing running: agents are torn down, and the record says the
+        // run can continue from where it stands.
+        write_json_atomic(&deploy::outputs_path(&runtime_dir), &paused.outputs)?;
+        let cleanup_failures = cleanup_recorded_sessions(&record, &sessions, &runtime_dir);
+        for failure in &cleanup_failures {
+            eprintln!("warning: session not cleaned up: {failure}");
+        }
+        let checkpoint_id = {
+            let mut guard = record
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
+            if guard.state == DeploymentState::Running {
+                guard.advance(
+                    DeploymentState::Pausing,
+                    Some("pause honoured at a tag boundary"),
+                )?;
+            }
+            let id = guard.checkpoint.clone().unwrap_or_default();
+            guard.sessions_cleaned = cleanup_failures.is_empty();
+            guard.state_vars = paused.state_vars.clone();
+            guard.next_checkpoint_at = None;
+            guard.advance(
+                DeploymentState::Paused,
+                Some(&format!("paused at checkpoint {id}")),
+            )?;
+            guard.save(&runtime_dir)?;
+            id
+        };
+        deploy::clear_stop(&runtime_dir)?;
+        observer.run_paused(&checkpoint_id);
+        let next = paused
+            .next_tag()
+            .map(|(t, m)| format!("({t}, {m})"))
+            .unwrap_or_else(|| "none".to_string());
+        println!(
+            "Topology '{}' paused at checkpoint {checkpoint_id}; next tag {next}; resume with `omar resume {}`",
+            state.team, state.team
+        );
+        for (port, value) in &paused.outputs {
+            println!("Output {port} = {value}");
+        }
+        return Ok(RunOutcome {
+            end: RunEnd::Paused,
+            outputs: paused.outputs,
+            state: paused.state_vars,
+            diagram: diagram_server.as_ref().map(DiagramServer::snapshot),
+        });
+    }
     let (settled, stopped) = match end {
         LoopEnd::Completed(settled) => (settled, false),
         LoopEnd::Stopped(settled) => (settled, true),
+        LoopEnd::Paused(_) => unreachable!("handled above"),
     };
     let Settled {
         outputs,
         state_vars,
     } = settled;
     observer.run_completed(&outputs);
-    write_json_atomic(&runtime_dir.join("state.json"), &state)?;
     write_json_atomic(&deploy::outputs_path(&runtime_dir), &outputs)?;
-    let sessions = record
-        .lock()
-        .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
-        .sessions
-        .clone();
     let cleanup_failures = cleanup_recorded_sessions(&record, &sessions, &runtime_dir);
     for failure in &cleanup_failures {
         eprintln!("warning: session not cleaned up: {failure}");
@@ -2114,6 +2563,7 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         // the outputs, so a stopped run can be read back.
         guard.sessions_cleaned = cleanup_failures.is_empty();
         guard.state_vars = state_vars.clone();
+        guard.next_checkpoint_at = None;
         guard.advance(DeploymentState::Terminated, Some(detail))?;
         guard.save(&runtime_dir)?;
     }
@@ -2154,9 +2604,11 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         },
         outputs,
         state: state_vars,
+        diagram: diagram_server.as_ref().map(DiagramServer::snapshot),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_topology_agents(
     state: &VmState,
     client: &TmuxClient,
@@ -2165,10 +2617,25 @@ fn spawn_topology_agents(
     config: &TopologyRunConfig<'_>,
     workspaces: &BTreeMap<String, crate::workspace::Workspace>,
     spawned: &mut BTreeMap<String, String>,
+    resumed_from: Option<&checkpoint::Manifest>,
 ) -> Result<()> {
     // The line each agent was launched with, which is what says how it
     // proves readiness.
     let mut launched: BTreeMap<String, String> = BTreeMap::new();
+    // No backend restores a conversation at a recorded turn, so a resumed
+    // agent is told plainly that it continues a run it has no memory of.
+    let resumed = resumed_from
+        .map(|m| {
+            let at = m
+                .completed_tag
+                .map(|(t, s)| format!("logical tag ({t}, {s})"))
+                .unwrap_or_else(|| "its start".to_string());
+            format!(
+                "\n\nThis run resumed from checkpoint {} taken after {at}. Your earlier conversation was not restored; the files in your workspace are exactly as they were at that checkpoint. Continue from them.",
+                m.id
+            )
+        })
+        .unwrap_or_default();
     let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
     for (name, agent) in &state.agents {
         // A web agent is not spawned. There is no command to resolve, no pane
@@ -2197,7 +2664,7 @@ fn spawn_topology_agents(
         let worktree = workspace.worktree(config.omar_dir);
         let temp = workspace.temp(config.omar_dir);
         let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
-        fs::write(&prompt_file, format!("{protocol}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.\n", temp.display()))?;
+        fs::write(&prompt_file, format!("{protocol}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.{resumed}\n", temp.display()))?;
         let backend = canonical_backend(&agent.backend);
         let base_command = crate::backend::resolve(backend)
             .map(|backend| backend.default_command().to_string())
@@ -2712,11 +3179,151 @@ struct Settled {
     state_vars: BTreeMap<String, Value>,
 }
 
-/// How the loop ended: the queue drained, or a stop closed the run at a tag
-/// boundary. Either way what settled so far comes along.
+/// How the loop ended: the queue drained, a stop closed the run at a tag
+/// boundary, or a pause did with a checkpoint behind it. Either way what
+/// settled so far comes along.
 enum LoopEnd {
     Completed(Settled),
     Stopped(Settled),
+    Paused(ExecutionState),
+}
+
+/// Where a loop begins: the start tag seeded with the run's inputs, or the
+/// boundary a checkpoint captured.
+enum LoopStart {
+    Fresh(BTreeMap<String, Value>),
+    Resume(ExecutionState),
+}
+
+/// What the loop asks of the run's checkpoint controller at a boundary.
+/// Operator requests arrive through the deployment's control file; this is
+/// only the part that needs the run's own state.
+pub(crate) trait Checkpointer {
+    /// Whether an automatic capture is due now.
+    fn due(&self) -> bool;
+    /// Publish a checkpoint for `state`. Returns its id.
+    fn capture(&self, state: &ExecutionState, trigger: Trigger) -> Result<String>;
+    /// A capture attempt failed. `held` says the internal retries are spent
+    /// and the run now waits at its boundary for an operator.
+    fn capture_failed(&self, error: &anyhow::Error, attempt: u32, held: bool);
+}
+
+/// What a boundary decided.
+enum Boundary {
+    Continue,
+    Stop,
+    Pause(ExecutionState),
+}
+
+/// Bounded internal retries before a failed capture holds the run for an
+/// operator's `checkpoint retry`.
+const CAPTURE_RETRIES: u32 = 3;
+
+/// Honour whatever is owed at a tag boundary: an operator's stop, a capture
+/// that is due or was asked for, or a pause. Nothing is in flight here, so a
+/// capture describes exactly the queue as it stands.
+fn settle_boundary(
+    deployment_dir: Option<&Path>,
+    checkpointer: Option<&dyn Checkpointer>,
+    observer: &dyn TopologyObserver,
+    snapshot: &dyn Fn() -> ExecutionState,
+) -> Result<Boundary> {
+    let request = deployment_dir.and_then(deploy::pending_request);
+    let mut trigger = match request {
+        Some(ControlOp::Stop) => return Ok(Boundary::Stop),
+        Some(ControlOp::Pause) => Some(Trigger::Pause),
+        Some(ControlOp::Checkpoint) | Some(ControlOp::RetryCheckpoint) => Some(Trigger::Manual),
+        None => None,
+    };
+    let Some(checkpointer) = checkpointer else {
+        // A loop with nothing to checkpoint with cannot pause; the request
+        // stays for a runner that can. Tests and projections land here.
+        return Ok(Boundary::Continue);
+    };
+    if trigger.is_none() && checkpointer.due() {
+        trigger = Some(Trigger::Automatic);
+    }
+    let Some(mut trigger) = trigger else {
+        return Ok(Boundary::Continue);
+    };
+    let mut attempt = 0;
+    // The state that was captured is the state a pause hands back: one
+    // snapshot, so what the checkpoint says and what the runner reports agree
+    // to the nanosecond.
+    let mut captured;
+    loop {
+        captured = snapshot();
+        match checkpointer.capture(&captured, trigger) {
+            Ok(id) => {
+                let kind = match trigger {
+                    Trigger::Automatic => "automatic",
+                    Trigger::Manual => "manual",
+                    Trigger::Pause => "pause",
+                };
+                observer.checkpoint_published(&id, kind, captured.completed_tag);
+                break;
+            }
+            Err(error) => {
+                attempt += 1;
+                checkpointer.capture_failed(&error, attempt, attempt > CAPTURE_RETRIES);
+                if attempt <= CAPTURE_RETRIES {
+                    thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+                    continue;
+                }
+            }
+        }
+        // Held at the boundary: the previous checkpoint stands, the next tag
+        // does not run, and other topologies are unaffected. Only an operator
+        // moves this run again. The request that asked for this capture is
+        // consumed first (its trigger is kept), or the hold would answer it
+        // again at once and no retry could be admitted.
+        if let Some(dir) = deployment_dir {
+            if matches!(
+                deploy::pending_request(dir),
+                Some(ControlOp::Checkpoint | ControlOp::RetryCheckpoint | ControlOp::Pause)
+            ) {
+                deploy::clear_stop(dir)?;
+            }
+        }
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            match deployment_dir.and_then(deploy::pending_request) {
+                Some(ControlOp::Stop) => return Ok(Boundary::Stop),
+                Some(ControlOp::Pause) => {
+                    trigger = Trigger::Pause;
+                    break;
+                }
+                Some(ControlOp::Checkpoint) | Some(ControlOp::RetryCheckpoint) => break,
+                None => {}
+            }
+        }
+        attempt = 0;
+    }
+    if trigger == Trigger::Pause {
+        return Ok(Boundary::Pause(captured));
+    }
+    if let Some(dir) = deployment_dir {
+        // A manual request is answered; a stop or pause that lands later
+        // must not be mistaken for it.
+        if matches!(
+            deploy::pending_request(dir),
+            Some(ControlOp::Checkpoint) | Some(ControlOp::RetryCheckpoint)
+        ) {
+            deploy::clear_stop(dir)?;
+        }
+    }
+    Ok(Boundary::Continue)
+}
+
+fn queued(queue: &BTreeMap<Tag, BTreeMap<String, Value>>) -> Vec<QueuedTag> {
+    queue
+        .iter()
+        .map(|(tag, events)| QueuedTag {
+            timestamp: tag.timestamp,
+            microstep: tag.microstep,
+            events: events.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2734,9 +3341,11 @@ fn run_event_loop<E: ReactionExecutor>(
         None,
     )? {
         LoopEnd::Completed(settled) | LoopEnd::Stopped(settled) => Ok(settled.outputs),
+        LoopEnd::Paused(state) => Ok(state.outputs),
     }
 }
 
+#[cfg(test)]
 fn run_event_loop_observed<E: ReactionExecutor>(
     state: &VmState,
     inputs: BTreeMap<String, Value>,
@@ -2745,29 +3354,83 @@ fn run_event_loop_observed<E: ReactionExecutor>(
     pace: Pace,
     deployment_dir: Option<&Path>,
 ) -> Result<LoopEnd> {
-    // When the run's logical clock was started, which is what every tag's
-    // timestamp is measured from.
+    run_event_loop_controlled(
+        state,
+        LoopStart::Fresh(inputs),
+        executor,
+        observer,
+        pace,
+        deployment_dir,
+        None,
+    )
+}
+
+fn run_event_loop_controlled<E: ReactionExecutor>(
+    state: &VmState,
+    start: LoopStart,
+    executor: &E,
+    observer: &dyn TopologyObserver,
+    pace: Pace,
+    deployment_dir: Option<&Path>,
+    checkpointer: Option<&dyn Checkpointer>,
+) -> Result<LoopEnd> {
+    // When this process joined the run's logical clock. A resumed run has
+    // already spent `base_elapsed` on that clock, so time is measured from
+    // here plus that: the clock continues where the checkpoint left it, and
+    // time spent paused is not on it.
     let origin = Instant::now();
-    let mut queue = BTreeMap::from([(Tag::START, inputs)]);
-    // Arm every timer for its first firing. A timer's value is the timestamp it
-    // fired at, which is what makes `$(t)` in a prompt worth reading.
-    for (name, timer) in &state.timers {
-        queue
-            .entry(Tag {
-                timestamp: timer.offset,
-                microstep: 0,
-            })
-            .or_default()
-            .insert(name.clone(), json!(timer.offset));
-    }
-    let mut outputs = BTreeMap::new();
-    // Every state variable starts where the program said and lives here for
-    // the run: an invocation sees its instance's, and hands back what it set.
-    let mut store: BTreeMap<String, Value> = state
-        .state_vars
-        .iter()
-        .map(|(name, var)| (name.clone(), var.initial.clone()))
-        .collect();
+    let (mut queue, mut outputs, mut store, base_elapsed, mut completed) = match start {
+        LoopStart::Fresh(inputs) => {
+            let mut queue = BTreeMap::from([(Tag::START, inputs)]);
+            // Arm every timer for its first firing. A timer's value is the
+            // timestamp it fired at, which is what makes `$(t)` in a prompt
+            // worth reading.
+            for (name, timer) in &state.timers {
+                queue
+                    .entry(Tag {
+                        timestamp: timer.offset,
+                        microstep: 0,
+                    })
+                    .or_default()
+                    .insert(name.clone(), json!(timer.offset));
+            }
+            // Every state variable starts where the program said and lives
+            // here for the run: an invocation sees its instance's, and hands
+            // back what it set.
+            let store: BTreeMap<String, Value> = state
+                .state_vars
+                .iter()
+                .map(|(name, var)| (name.clone(), var.initial.clone()))
+                .collect();
+            (queue, BTreeMap::new(), store, Duration::ZERO, None)
+        }
+        LoopStart::Resume(saved) => {
+            // Timers are not re-armed from their declarations: their next
+            // firings are in the saved queue, and a one-shot already consumed
+            // has none there.
+            let queue = saved
+                .queue
+                .into_iter()
+                .map(|entry| {
+                    (
+                        Tag {
+                            timestamp: entry.timestamp,
+                            microstep: entry.microstep,
+                        },
+                        entry.events,
+                    )
+                })
+                .collect();
+            (
+                queue,
+                saved.outputs,
+                saved.state_vars,
+                Duration::from_nanos(saved.elapsed_ns),
+                saved.completed_tag,
+            )
+        }
+    };
+    let elapsed = || origin.elapsed() + base_elapsed;
 
     // No bound on how many tags a run may pass through. A loop that costs a
     // microstep somewhere -- through an action, or a connection written
@@ -2781,17 +3444,37 @@ fn run_event_loop_observed<E: ReactionExecutor>(
     // Fixed before the first tag: precedence follows from the wiring, and the
     // wiring does not change while a run is in flight.
     let layers = precedence_layers(state)?;
-    let stop_now = || deployment_dir.is_some_and(deploy::stop_requested);
 
-    while let Some((tag, events)) = queue.pop_first() {
-        // An operator's stop ends the run here, between tags: nothing is in
-        // flight at a boundary, so no invocation's contract is abandoned.
-        if stop_now() {
-            return Ok(LoopEnd::Stopped(Settled {
-                outputs,
-                state_vars: store,
-            }));
+    loop {
+        // A tag boundary: nothing is in flight, so this is where an
+        // operator's stop ends the run without abandoning any invocation's
+        // contract, and where a checkpoint describes the run exactly. The
+        // next tag is still queued, never popped before it runs, so a pause
+        // here loses nothing.
+        let settled = {
+            let snapshot = || ExecutionState {
+                version: checkpoint::FORMAT,
+                completed_tag: completed,
+                queue: queued(&queue),
+                outputs: outputs.clone(),
+                state_vars: store.clone(),
+                elapsed_ns: elapsed().as_nanos() as u64,
+            };
+            settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
+        };
+        match settled {
+            Boundary::Continue => {}
+            Boundary::Stop => {
+                return Ok(LoopEnd::Stopped(Settled {
+                    outputs,
+                    state_vars: store,
+                }))
+            }
+            Boundary::Pause(state) => return Ok(LoopEnd::Paused(state)),
         }
+        let Some((&tag, next_events)) = queue.first_key_value() else {
+            break;
+        };
         // A tag nothing is present at is not a moment the run passed through.
         // No reaction can fire at one -- enabling asks whether any trigger is
         // in `events`, which is false for every reaction when it is empty --
@@ -2799,36 +3482,57 @@ fn run_event_loop_observed<E: ReactionExecutor>(
         // would tell a client the run had advanced when nothing had. The only
         // way to reach one is a program admitted with no inputs, which seeds
         // the start tag with an empty map.
-        if events.is_empty() {
+        if next_events.is_empty() {
+            queue.pop_first();
             continue;
         }
+        let due = Duration::from_nanos(tag.timestamp);
+        if pace == Pace::RealTime {
+            // Microsteps carry no time, so only the timestamp is owed. A tag
+            // whose moment has already passed runs now rather than being
+            // pushed further out: being late is not a reason to be later.
+            // Sliced so a stop during a long wait is honoured within a beat,
+            // and so a checkpoint that falls due mid-wait is taken at this
+            // boundary, with the awaited tag still queued and unexecuted.
+            while let Some(remaining) = due.checked_sub(elapsed()) {
+                let settled = {
+                    let snapshot = || ExecutionState {
+                        version: checkpoint::FORMAT,
+                        completed_tag: completed,
+                        queue: queued(&queue),
+                        outputs: outputs.clone(),
+                        state_vars: store.clone(),
+                        elapsed_ns: elapsed().as_nanos() as u64,
+                    };
+                    settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
+                };
+                match settled {
+                    Boundary::Continue => {}
+                    Boundary::Stop => {
+                        return Ok(LoopEnd::Stopped(Settled {
+                            outputs,
+                            state_vars: store,
+                        }))
+                    }
+                    Boundary::Pause(state) => return Ok(LoopEnd::Paused(state)),
+                }
+                thread::sleep(remaining.min(Duration::from_millis(250)));
+            }
+        }
+        let Some((tag, events)) = queue.pop_first() else {
+            break;
+        };
         // Everything this tag knows. It grows as the tag settles: an
         // instantaneous connection or a reaction's effect joins it rather than
         // landing on a later tag, and the reactions downstream read it before
         // the tag is over.
         let mut events = events;
         let mut carried = BTreeSet::new();
-        let due = Duration::from_nanos(tag.timestamp);
-        if pace == Pace::RealTime {
-            // Microsteps carry no time, so only the timestamp is owed. A tag
-            // whose moment has already passed runs now rather than being
-            // pushed further out: being late is not a reason to be later.
-            // Sliced so a stop during a long wait is honoured within a beat.
-            while let Some(remaining) = due.checked_sub(origin.elapsed()) {
-                if stop_now() {
-                    return Ok(LoopEnd::Stopped(Settled {
-                        outputs,
-                        state_vars: store,
-                    }));
-                }
-                thread::sleep(remaining.min(Duration::from_millis(250)));
-            }
-        }
         // How far past its logical time this tag actually ran. Zero while the
         // run is on or ahead of schedule, and growing only when the work
         // outlasts the gap it was given -- which is the one number that says
         // whether a program is keeping the promise its delays make.
-        let lag = origin.elapsed().saturating_sub(due).as_nanos() as u64;
+        let lag = elapsed().saturating_sub(due).as_nanos() as u64;
         // Settle before observing, so what a tag reports includes the values
         // its connections carried into it rather than only what it was woken
         // with.
@@ -2899,7 +3603,7 @@ fn run_event_loop_observed<E: ReactionExecutor>(
 
             // Declaration order decides who wins a port two reactions in this
             // layer both write, which is the rule the language states.
-            let mut completed: Vec<_> = enabled
+            let mut completed_writes: Vec<_> = enabled
                 .iter()
                 .zip(invocation_ids)
                 .zip(results)
@@ -2914,8 +3618,8 @@ fn run_event_loop_observed<E: ReactionExecutor>(
                     (reaction.order, writes)
                 })
                 .collect();
-            completed.sort_by_key(|(order, _)| *order);
-            for (_, writes) in completed {
+            completed_writes.sort_by_key(|(order, _)| *order);
+            for (_, writes) in completed_writes {
                 for (port, value) in writes {
                     // A state variable's new value stays with its instance
                     // rather than travelling anywhere.
@@ -2948,6 +3652,7 @@ fn run_event_loop_observed<E: ReactionExecutor>(
                 outputs.insert(name.clone(), value.clone());
             }
         }
+        completed = Some((tag.timestamp, tag.microstep));
     }
     Ok(LoopEnd::Completed(Settled {
         outputs,
@@ -3161,6 +3866,7 @@ mod tests {
     fn loop_outputs(end: LoopEnd) -> BTreeMap<String, Value> {
         match end {
             LoopEnd::Completed(settled) | LoopEnd::Stopped(settled) => settled.outputs,
+            LoopEnd::Paused(state) => state.outputs,
         }
     }
 
@@ -5123,7 +5829,9 @@ mod tests {
     impl ReactionExecutor for StopWhileAnsweringExecutor {
         fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
             *self.calls.lock().unwrap() += 1;
-            crate::deploy::request_stop(&self.dir).unwrap();
+            // Filed once; a second invocation finds it pending and is refused,
+            // which is the rule, not a failure of this executor.
+            let _ = crate::deploy::request_stop(&self.dir);
             let port = invocation.allowed_effects.keys().next().unwrap().clone();
             Ok(BTreeMap::from([(port, json!("ping"))]))
         }
@@ -5191,7 +5899,7 @@ mod tests {
             LoopEnd::Completed(settled) => {
                 assert_eq!(settled.outputs.get("out"), Some(&json!("ping")))
             }
-            LoopEnd::Stopped(_) => panic!("nothing requested a stop"),
+            LoopEnd::Stopped(_) | LoopEnd::Paused(_) => panic!("nothing requested a stop"),
         }
         assert_eq!(*executor.calls.lock().unwrap(), 2);
     }
@@ -5219,6 +5927,323 @@ mod tests {
             }}"#
         ))
         .unwrap()
+    }
+
+    /// Counts invocations; pauses the run from inside the first one, the way
+    /// an operator's request lands while a tag is in flight.
+    struct PausingCounter {
+        calls: Mutex<usize>,
+        dir: Option<PathBuf>,
+    }
+    impl ReactionExecutor for PausingCounter {
+        fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+            let calls = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            if calls == 1 {
+                if let Some(dir) = &self.dir {
+                    deploy::request(dir, ControlOp::Pause).unwrap();
+                }
+            }
+            let count = invocation.state_values["c.count"].as_i64().unwrap() + 1;
+            let mut writes = BTreeMap::from([
+                ("c.count".to_string(), json!(count)),
+                ("c.total".to_string(), json!(count * 10)),
+            ]);
+            if count < 3 {
+                writes.insert("c.again".to_string(), json!(count));
+            }
+            Ok(writes)
+        }
+    }
+
+    /// Remembers what it captured; never due on its own unless told.
+    struct Recorder {
+        captures: Mutex<Vec<(Trigger, ExecutionState)>>,
+        due_once: Mutex<bool>,
+        fail_first: Mutex<u32>,
+        failures: Mutex<u32>,
+        expect_hold: Mutex<bool>,
+    }
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                captures: Mutex::new(Vec::new()),
+                due_once: Mutex::new(false),
+                fail_first: Mutex::new(0),
+                failures: Mutex::new(0),
+                expect_hold: Mutex::new(false),
+            }
+        }
+    }
+    impl Checkpointer for Recorder {
+        fn due(&self) -> bool {
+            std::mem::take(&mut *self.due_once.lock().unwrap())
+        }
+        fn capture(&self, state: &ExecutionState, trigger: Trigger) -> Result<String> {
+            let mut fail = self.fail_first.lock().unwrap();
+            if *fail > 0 {
+                *fail -= 1;
+                bail!("disk full");
+            }
+            self.captures.lock().unwrap().push((trigger, state.clone()));
+            Ok(format!("cp-{}", self.captures.lock().unwrap().len()))
+        }
+        fn capture_failed(&self, _error: &anyhow::Error, _attempt: u32, held: bool) {
+            assert!(
+                !held || *self.expect_hold.lock().unwrap(),
+                "one failure is retried internally, never held"
+            );
+            *self.failures.lock().unwrap() += 1;
+        }
+    }
+
+    /// A pause at a tag boundary captures the run exactly, and a loop resumed
+    /// from that capture runs only what was left: same final outputs as an
+    /// uninterrupted run, no invocation repeated, none lost.
+    #[test]
+    fn a_resumed_loop_continues_exactly_where_the_pause_left_it() {
+        let state = verify(&counter_bytecode("")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let first = PausingCounter {
+            calls: Mutex::new(0),
+            dir: Some(dir.path().to_path_buf()),
+        };
+        let recorder = Recorder::new();
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::from([("c.tick".to_string(), json!(1))])),
+            &first,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&recorder),
+        )
+        .unwrap();
+        let LoopEnd::Paused(captured) = end else {
+            panic!("the pause request was not honoured");
+        };
+        assert_eq!(
+            *first.calls.lock().unwrap(),
+            1,
+            "paused after the first tag"
+        );
+        assert_eq!(captured.completed_tag, Some((0, 0)));
+        assert_eq!(captured.state_vars["c.count"], json!(1));
+        assert_eq!(captured.outputs["c.total"], json!(10));
+        // The re-trigger through the action is queued, not lost: it is the
+        // whole of the run's remaining work.
+        assert_eq!(captured.queue.len(), 1);
+        assert_eq!(captured.next_tag(), Some((0, 1)));
+        assert!(captured.queue[0].events.contains_key("c.again"));
+        let captures = recorder.captures.lock().unwrap();
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].0, Trigger::Pause);
+        assert_eq!(captures[0].1, captured);
+        drop(captures);
+
+        // The operator's request is consumed by the runner that paused; a
+        // fresh process continues from the capture alone.
+        deploy::clear_stop(dir.path()).unwrap();
+        let second = PausingCounter {
+            calls: Mutex::new(0),
+            dir: None,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Resume(captured),
+            &second,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&Recorder::new()),
+        )
+        .unwrap();
+        let LoopEnd::Completed(settled) = end else {
+            panic!("the resumed run should drain its queue");
+        };
+        assert_eq!(settled.outputs["c.total"], json!(30));
+        assert_eq!(settled.state_vars["c.count"], json!(3));
+        assert_eq!(*second.calls.lock().unwrap(), 2, "two tags were left");
+    }
+
+    /// A timer's next firings travel in the queue, so a resumed run picks up
+    /// the cadence without re-arming from the declaration or firing a backlog.
+    #[test]
+    fn a_resumed_timer_keeps_its_cadence_and_repeats_nothing() {
+        struct Ticks {
+            fired: Mutex<Vec<u64>>,
+            dir: PathBuf,
+            pause_at: usize,
+            stop_at: usize,
+        }
+        impl ReactionExecutor for Ticks {
+            fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+                let at = invocation.trigger_values["t"].as_u64().unwrap();
+                let count = {
+                    let mut fired = self.fired.lock().unwrap();
+                    fired.push(at);
+                    fired.len()
+                };
+                if count == self.pause_at {
+                    deploy::request(&self.dir, ControlOp::Pause).unwrap();
+                }
+                if count == self.stop_at {
+                    deploy::request_stop(&self.dir).unwrap();
+                }
+                Ok(BTreeMap::from([("note".into(), json!("tick"))]))
+            }
+        }
+        let state = verify(&timer_bytecode(5, 10)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ticks = Ticks {
+            fired: Mutex::new(Vec::new()),
+            dir: dir.path().to_path_buf(),
+            pause_at: 2,
+            stop_at: 0,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::new()),
+            &ticks,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&Recorder::new()),
+        )
+        .unwrap();
+        let LoopEnd::Paused(captured) = end else {
+            panic!("expected a pause");
+        };
+        assert_eq!(*ticks.fired.lock().unwrap(), vec![5, 15]);
+        assert_eq!(captured.completed_tag, Some((15, 0)));
+        assert_eq!(
+            captured.next_tag(),
+            Some((25, 0)),
+            "the next firing is queued"
+        );
+        deploy::clear_stop(dir.path()).unwrap();
+        let later = Ticks {
+            fired: Mutex::new(Vec::new()),
+            dir: dir.path().to_path_buf(),
+            pause_at: 0,
+            stop_at: 2,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Resume(captured),
+            &later,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&Recorder::new()),
+        )
+        .unwrap();
+        assert!(matches!(end, LoopEnd::Stopped(_)));
+        assert_eq!(*later.fired.lock().unwrap(), vec![25, 35]);
+        deploy::clear_stop(dir.path()).unwrap();
+    }
+
+    /// An automatic deadline and a manual request both capture at a boundary
+    /// and let the run go on; a capture that fails is retried, and the
+    /// manual request file is cleared once answered.
+    #[test]
+    fn captures_at_boundaries_do_not_interrupt_the_run_and_failures_are_retried() {
+        let state = verify(&counter_bytecode("")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new();
+        *recorder.due_once.lock().unwrap() = true;
+        *recorder.fail_first.lock().unwrap() = 1;
+        deploy::request(dir.path(), ControlOp::Checkpoint).unwrap();
+        let executor = PausingCounter {
+            calls: Mutex::new(0),
+            dir: None,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::from([("c.tick".to_string(), json!(1))])),
+            &executor,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&recorder),
+        )
+        .unwrap();
+        assert!(matches!(end, LoopEnd::Completed(_)));
+        assert_eq!(
+            *executor.calls.lock().unwrap(),
+            3,
+            "the run went on to its end"
+        );
+        let captures = recorder.captures.lock().unwrap();
+        // The manual request was answered at the first boundary, before any
+        // tag; the automatic deadline fell due at the next one.
+        assert_eq!(captures[0].0, Trigger::Manual);
+        assert_eq!(captures[0].1.completed_tag, None);
+        assert_eq!(captures[0].1.next_tag(), Some((0, 0)));
+        assert_eq!(captures[1].0, Trigger::Automatic);
+        assert_eq!(captures[1].1.completed_tag, Some((0, 0)));
+        assert_eq!(captures.len(), 2);
+        assert_eq!(
+            *recorder.failures.lock().unwrap(),
+            1,
+            "one failed attempt, then success"
+        );
+        assert_eq!(
+            deploy::pending_request(dir.path()),
+            None,
+            "answered requests are cleared"
+        );
+    }
+
+    /// Once its retries are spent a capture holds the run, and only a new
+    /// request moves it: the one that asked for the capture is consumed, so
+    /// the hold neither answers it again nor blocks the retry.
+    #[test]
+    fn a_held_capture_waits_for_a_fresh_retry_request() {
+        let state = verify(&counter_bytecode("")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new();
+        *recorder.fail_first.lock().unwrap() = CAPTURE_RETRIES + 1;
+        *recorder.expect_hold.lock().unwrap() = true;
+        deploy::request(dir.path(), ControlOp::Checkpoint).unwrap();
+        let path = dir.path().to_path_buf();
+        let operator = thread::spawn(move || {
+            // The hold consumed the manual request; a retry is admitted.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while deploy::pending_request(&path).is_some() {
+                assert!(Instant::now() < deadline, "the request was never consumed");
+                thread::sleep(Duration::from_millis(20));
+            }
+            deploy::request(&path, ControlOp::RetryCheckpoint).unwrap();
+        });
+        let executor = PausingCounter {
+            calls: Mutex::new(0),
+            dir: None,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::from([("c.tick".to_string(), json!(1))])),
+            &executor,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&recorder),
+        )
+        .unwrap();
+        operator.join().unwrap();
+        assert!(matches!(end, LoopEnd::Completed(_)));
+        assert_eq!(*recorder.failures.lock().unwrap(), CAPTURE_RETRIES + 1);
+        let captures = recorder.captures.lock().unwrap();
+        assert_eq!(captures.len(), 1, "the retry captured once");
+        assert_eq!(
+            captures[0].0,
+            Trigger::Manual,
+            "the original trigger survives the hold"
+        );
+        assert_eq!(deploy::pending_request(dir.path()), None);
     }
 
     /// State a reaction hands back stays with its instance: it reaches the

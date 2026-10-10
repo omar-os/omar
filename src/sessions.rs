@@ -81,6 +81,10 @@ pub struct StartOptions {
     /// When this run creates a session, keep its state after it stops
     #[arg(long)]
     pub checkpoint: bool,
+    /// How often to checkpoint on physical time, e.g. `30m` or `2h`; default
+    /// 1h. Changeable while running with `omar checkpoint configure`.
+    #[arg(long)]
+    pub checkpoint_period: Option<String>,
 }
 #[derive(Subcommand, Debug)]
 pub enum EaAction {
@@ -778,6 +782,7 @@ pub fn validate_exec(cli: &Cli) -> Result<()> {
                     | Commands::List { .. }
                     | Commands::Kill { .. }
                     | Commands::Workspace { .. }
+                    | Commands::Checkpoint { .. }
                     | Commands::Ea {
                         action: EaAction::Event { .. }
                     }
@@ -907,6 +912,21 @@ fn handle_operation(server: &Serve, session: &mut Session, operation: Value) -> 
         "stop" => server.session_stop(
             target.id,
             operation["run"].as_str().context("run id required")?,
+        ),
+        "pause" => server.session_pause(
+            target.id,
+            operation["run"].as_str().context("run id required")?,
+        ),
+        "resume" => server.session_resume(
+            target.id,
+            operation["run"].as_str().context("run id required")?,
+        ),
+        "rollback" => server.session_rollback(
+            target.id,
+            operation["run"].as_str().context("run id required")?,
+            operation["checkpoint"]
+                .as_str()
+                .context("checkpoint id required")?,
         ),
         "exec" => {
             let args: Vec<String> = serde_json::from_value(operation["args"].clone())?;
@@ -1269,7 +1289,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             };
             let ea = ea_selector(cli);
             for input in &options.inputs { anyhow::ensure!(input.contains('='), "input must be NAME=VALUE"); }
-            let body=json!({"program":fs::read_to_string(&options.program)?,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast});
+            let body=json!({"program":fs::read_to_string(&options.program)?,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period});
             let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
             if owned { run["session"] = json!(s.name); }
             // One structured result: the admission record, or with --wait the terminal record.
@@ -1277,11 +1297,14 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             let state = loop {
                 let state=rpc(&s,json!({"op":"status","ea":ea,"run":run["run_id"]}),Duration::from_secs(5))?;
                 match state["status"].as_str() {
-                    Some("completed"|"stopped"|"failed") => break state,
+                    Some("completed"|"stopped"|"failed"|"paused") => break state,
                     _ => std::thread::sleep(Duration::from_millis(200)),
                 }
             };
-            if owned {
+            // A paused run is kept, not finished: its session stays up to resume it.
+            if owned && state["status"] == "paused" {
+                eprintln!("Session {} keeps the paused run; omar resume -s {} {} continues it", s.name, s.name, state["team"].as_str().unwrap_or(""));
+            } else if owned {
                 let _ = rpc(&s,json!({"op":"down","force":false}),Duration::from_secs(10));
                 let _ = wait_stopped(&s, Duration::from_secs(30));
             }
@@ -1295,7 +1318,22 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         Some(Commands::Runs { all_eas }) => target(cli).and_then(|s|rpc(&s,json!({"op":"runs","ea":ea_selector(cli),"all_eas":all_eas}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Status { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"status","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Stop { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"stop","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
-        Some(Commands::Spawn{..}|Commands::List{..}|Commands::Kill{..}|Commands::Workspace{..}|Commands::Ea{action:EaAction::Event{..}}) => target(cli).and_then(|s| {
+        Some(Commands::Pause { deployment, wait }) => target(cli).and_then(|s| {
+            let ea = ea_selector(cli);
+            let mut state = rpc(&s,json!({"op":"pause","ea":ea,"run":deployment}),Duration::from_secs(5))?;
+            // Bounded by the run's own invocation timeout: the longest a tag
+            // may take to close once the pause is seen.
+            let deadline = Instant::now() + Duration::from_secs(420);
+            while *wait && state["status"] == "pausing" && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(200));
+                state = rpc(&s,json!({"op":"status","ea":ea,"run":state["run_id"]}),Duration::from_secs(5))?;
+            }
+            if *wait { anyhow::ensure!(state["status"] == "paused", "run ended {} instead of pausing", state["status"]); }
+            print_value(state)
+        }),
+        Some(Commands::Resume { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"resume","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(120))).and_then(print_value),
+        Some(Commands::Rollback { deployment, checkpoint }) => target(cli).and_then(|s|rpc(&s,json!({"op":"rollback","ea":ea_selector(cli),"run":deployment,"checkpoint":checkpoint}),Duration::from_secs(10))).and_then(print_value),
+        Some(Commands::Spawn{..}|Commands::List{..}|Commands::Kill{..}|Commands::Workspace{..}|Commands::Checkpoint{..}|Commands::Ea{action:EaAction::Event{..}}) => target(cli).and_then(|s| {
             let args=strip_target_args(std::env::args().skip(1));
             let value=rpc(&s,json!({"op":"exec","ea":ea_selector(cli),"cwd":std::env::current_dir()?,"args":args}),Duration::from_secs(120))?;
             if cli.json { print_value(value) } else { print!("{}",value["stdout"].as_str().unwrap_or("")); eprint!("{}",value["stderr"].as_str().unwrap_or("")); Ok(()) }

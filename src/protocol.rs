@@ -87,6 +87,8 @@ fn vocabularies() -> Vec<Vocabulary> {
                 RunStatus::Stopping,
                 RunStatus::Completed,
                 RunStatus::Stopped,
+                RunStatus::Pausing,
+                RunStatus::Paused,
                 RunStatus::Failed,
             ],
         ),
@@ -99,6 +101,7 @@ fn vocabularies() -> Vec<Vocabulary> {
                 DiagramStatus::Running,
                 DiagramStatus::Completed,
                 DiagramStatus::Failed,
+                DiagramStatus::Paused,
             ],
         ),
         vocabulary(
@@ -134,6 +137,8 @@ fn vocabularies() -> Vec<Vocabulary> {
                 DiagramEventKind::ReactionCompleted,
                 DiagramEventKind::RunCompleted,
                 DiagramEventKind::RunFailed,
+                DiagramEventKind::RunPaused,
+                DiagramEventKind::RunCheckpointed,
             ],
         ),
         vocabulary(
@@ -236,7 +241,7 @@ mod tests {
     fn the_values_are_spelled_the_way_serde_spells_them() {
         let generated = generate();
         assert!(generated.contains(
-            r#"export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "failed"] as const;"#
+            r#"export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "pausing", "paused", "failed"] as const;"#
         ));
         assert!(
             generated.contains(r#"export const CHAT_ROLES = ["operator", "assistant"] as const;"#)

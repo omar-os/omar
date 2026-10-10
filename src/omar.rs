@@ -3,6 +3,7 @@ mod backend;
 mod backend_probe;
 mod backend_runner;
 mod chat_history;
+mod checkpoint;
 mod computer;
 mod config;
 mod deploy;
@@ -266,6 +267,39 @@ enum Commands {
         bare_tool_names: bool,
     },
 
+    /// Pause a running topology: checkpoint at the next tag boundary, then
+    /// stop its agents. `omar resume` continues it.
+    Pause {
+        /// Team name or run id
+        deployment: String,
+        /// Wait until the run is paused
+        #[arg(long)]
+        wait: bool,
+    },
+
+    /// Continue a paused topology from its resume point: the checkpoint a
+    /// rollback chose, else the latest. The run keeps its id.
+    Resume {
+        /// Team name or run id
+        deployment: String,
+    },
+
+    /// Move a paused topology's resume point back to an earlier checkpoint.
+    /// Nothing is deleted; `omar resume` then continues from there.
+    Rollback {
+        /// Team name or run id
+        deployment: String,
+        /// Checkpoint id, from `omar checkpoint list`
+        #[arg(long)]
+        checkpoint: String,
+    },
+
+    /// Request, inspect, verify, and configure runtime checkpoints
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
+    },
+
     /// Answer topology invocations without a model (test backend `stub`)
     #[command(hide = true)]
     StubAgent {
@@ -295,6 +329,32 @@ enum Commands {
         #[arg(long)]
         checkpoint: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum CheckpointAction {
+    /// Checkpoint a running topology now, at its next tag boundary
+    Create {
+        deployment: String,
+        /// Wait for the checkpoint to publish
+        #[arg(long)]
+        wait: bool,
+    },
+    /// List a topology's checkpoints, oldest first
+    List { deployment: String },
+    /// Print one checkpoint's manifest
+    Show { deployment: String, id: String },
+    /// Check that a checkpoint can be resumed from, without launching anything
+    Verify { deployment: String, id: String },
+    /// Change the automatic checkpoint period of a running topology
+    Configure {
+        deployment: String,
+        /// e.g. `30m`, `1h`, `2h`
+        #[arg(long)]
+        period: String,
+    },
+    /// Retry a capture that failed and holds the run at its boundary
+    Retry { deployment: String },
 }
 
 #[derive(Subcommand)]
@@ -446,6 +506,9 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Rm { .. }
             | Commands::Run(_)
             | Commands::Runs { .. }
+            | Commands::Pause { .. }
+            | Commands::Resume { .. }
+            | Commands::Rollback { .. }
             | Commands::SessionDaemon { .. }
             | Commands::SessionExec { .. }
             | Commands::Serve { .. },
@@ -583,6 +646,10 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             Some(path) => mcp::run_server_from_context_file(PathBuf::from(path), bare_tool_names),
             None => mcp::run_server_with_default_context(bare_tool_names),
         },
+        Some(Commands::Checkpoint { action }) => {
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            checkpoint_command(&omar_dir, target.id, action)
+        }
         Some(Commands::HookDrain { format }) => {
             // Always print valid JSON, even on misconfiguration: a hook that
             // writes nothing reads as a failure to the backend.
@@ -953,8 +1020,183 @@ fn status_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) ->
     for (name, value) in &record.state_vars {
         println!("  state {name} = {value}");
     }
+    if let Some(from) = &record.resumed_from {
+        println!("  resumed_from: {from}");
+    }
+    if let Some(id) = &record.checkpoint {
+        println!("  checkpoint: {id}");
+    }
+    if let Some(error) = &record.checkpoint_error {
+        println!("  checkpoint_error: {error}");
+    }
+    if let Some(policy) = deploy::read_policy(&dir)? {
+        println!("  checkpoint_period: {}s", policy.period_secs);
+    }
+    if let Some(at) = record.next_checkpoint_at {
+        println!("  next_checkpoint_at: {at}");
+    }
     println!("  files: {}", dir.display());
     Ok(())
+}
+
+/// A live runner to send a request to, or the reason there is none.
+fn live_record(dir: &std::path::Path, team: &str) -> Result<deploy::DeploymentRecord> {
+    let record = deploy::DeploymentRecord::load(dir)?
+        .ok_or_else(|| anyhow::anyhow!("no deployment '{}'", team))?;
+    anyhow::ensure!(
+        !record.state.is_terminal(),
+        "deployment '{}' is {}; nothing is running to act on",
+        team,
+        record.state
+    );
+    anyhow::ensure!(
+        record.runner_alive(),
+        "deployment '{}' is {} but its runner (pid {}) is gone; use 'omar kill {}' to clean up",
+        team,
+        record.state,
+        record.pid,
+        team
+    );
+    Ok(record)
+}
+
+fn checkpoint_command(
+    omar_dir: &std::path::Path,
+    ea_id: ea::EaId,
+    action: CheckpointAction,
+) -> Result<()> {
+    match action {
+        CheckpointAction::Create { deployment, wait } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let before = live_record(&dir, &deployment)?;
+            if let Some(pending) = deploy::pending_request(&dir) {
+                anyhow::bail!(
+                    "deployment '{deployment}' already has a pending {pending:?} request"
+                );
+            }
+            deploy::request(&dir, deploy::ControlOp::Checkpoint)?;
+            println!("Checkpoint requested; it publishes at the next tag boundary");
+            if !wait {
+                return Ok(());
+            }
+            let deadline = std::time::Instant::now()
+                + Duration::from_secs(before.timeout_seconds.saturating_add(120));
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(500));
+                let Some(current) = deploy::DeploymentRecord::load(&dir)? else {
+                    break;
+                };
+                if current.checkpoint != before.checkpoint {
+                    println!(
+                        "Checkpoint {} published",
+                        current.checkpoint.as_deref().unwrap_or("?")
+                    );
+                    return Ok(());
+                }
+                if let Some(error) = &current.checkpoint_error {
+                    anyhow::bail!("checkpoint failed: {error}; `omar checkpoint retry {deployment}` after fixing the cause");
+                }
+                if current.state.is_terminal() || !current.runner_alive() {
+                    anyhow::bail!(
+                        "deployment '{}' is {} before the checkpoint published",
+                        deployment,
+                        current.state
+                    );
+                }
+            }
+            anyhow::bail!("checkpoint did not publish within the wait; the run may be mid-tag")
+        }
+        CheckpointAction::List { deployment } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let store = checkpoint::Store::new(&dir);
+            let (manifests, problems) = store.list()?;
+            let head = store.resume_point()?.map(|m| m.id);
+            if manifests.is_empty() {
+                println!("No checkpoints for '{deployment}'");
+            }
+            for m in &manifests {
+                let tag = m
+                    .completed_tag
+                    .map(|(t, s)| format!("({t}, {s})"))
+                    .unwrap_or_else(|| "start".to_string());
+                let mark = if head.as_deref() == Some(m.id.as_str()) {
+                    " <- resume point"
+                } else {
+                    ""
+                };
+                println!(
+                    "#{:<3} {}  {:<9} after {:<14} at {}  instances {}{}",
+                    m.sequence,
+                    m.id,
+                    format!("{:?}", m.trigger).to_lowercase(),
+                    tag,
+                    m.created_at,
+                    m.workspaces.len(),
+                    mark
+                );
+            }
+            for problem in problems {
+                println!("unreadable: {problem}");
+            }
+            Ok(())
+        }
+        CheckpointAction::Show { deployment, id } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let (manifest, state, _) = checkpoint::Store::new(&dir).load(&id)?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+            println!(
+                "queued tags: {}; outputs: {}; state variables: {}",
+                state.queue.len(),
+                state.outputs.len(),
+                state.state_vars.len()
+            );
+            Ok(())
+        }
+        CheckpointAction::Verify { deployment, id } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let manifest = checkpoint::Store::new(&dir).verify(omar_dir, &id)?;
+            println!(
+                "Checkpoint {} verified: program, state, and {} instance file versions are intact",
+                manifest.id,
+                manifest.workspaces.len()
+            );
+            for (name, agent) in &manifest.agents {
+                println!("  agent {name} ({}): {}", agent.backend, agent.restoration);
+            }
+            Ok(())
+        }
+        CheckpointAction::Configure { deployment, period } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let period = checkpoint::parse_period(&period)?;
+            anyhow::ensure!(
+                deploy::DeploymentRecord::load(&dir)?.is_some(),
+                "no deployment '{deployment}'"
+            );
+            deploy::write_policy(
+                &dir,
+                checkpoint::Policy {
+                    period_secs: period.as_secs(),
+                },
+            )?;
+            println!(
+                "Checkpoint period of '{}' is now {}s; a running topology picks it up at its next boundary and schedules the next capture one period from then",
+                deployment,
+                period.as_secs()
+            );
+            Ok(())
+        }
+        CheckpointAction::Retry { deployment } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let record = live_record(&dir, &deployment)?;
+            anyhow::ensure!(
+                record.checkpoint_error.is_some(),
+                "deployment '{deployment}' has no failed checkpoint to retry"
+            );
+            deploy::request(&dir, deploy::ControlOp::RetryCheckpoint)?;
+            println!("Retry requested");
+            Ok(())
+        }
+    }
 }
 
 /// Force kill: the runner dies first, then its sessions, then the record says
