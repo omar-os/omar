@@ -154,6 +154,19 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
+    /// Replace the selected runtime with this build (or --executable), keeping
+    /// its name, URL and workloads: runs pause at a tag boundary, the new
+    /// runtime starts over the same state and resumes them
+    Upgrade {
+        /// The omar build to upgrade to; default is the one running this command
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        /// Seconds to wait for runs to pause, the runtime to stop, and to start
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    #[command(hide = true)]
+    UpgradeCheck { directory: PathBuf },
     /// Run a topology in the selected runtime, or in a new session when none is selected
     #[command(visible_alias = "start")]
     Run(sessions::StartOptions),
@@ -509,6 +522,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Pause { .. }
             | Commands::Resume { .. }
             | Commands::Rollback { .. }
+            | Commands::Upgrade { .. }
+            | Commands::UpgradeCheck { .. }
             | Commands::SessionDaemon { .. }
             | Commands::SessionExec { .. }
             | Commands::Serve { .. },
@@ -708,11 +723,23 @@ async fn async_main(mut cli: Cli) -> Result<()> {
 const HELP_SECTIONS: &[(&str, &[&str])] = &[
     (
         "Sessions",
-        &["up", "ls", "info", "attach", "logs", "down", "rm", "serve"],
+        &[
+            "up", "ls", "info", "attach", "logs", "down", "upgrade", "rm", "serve",
+        ],
     ),
     (
         "Topologies",
-        &["run", "runs", "status", "stop", "workspace"],
+        &[
+            "run",
+            "runs",
+            "status",
+            "stop",
+            "pause",
+            "resume",
+            "rollback",
+            "checkpoint",
+            "workspace",
+        ],
     ),
     (
         "Executive assistants and agents",
