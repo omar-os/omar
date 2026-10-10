@@ -2212,15 +2212,14 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     if let Err(error) = topology::parse_inputs(&state, &inputs) {
         return (400, json!({"error": format!("{error:#}")}));
     }
-    let checkpoint_period = match request
+    if let Err(error) = request
         .checkpoint_period
         .as_deref()
         .map(crate::checkpoint::parse_period)
         .transpose()
     {
-        Ok(period) => period,
-        Err(error) => return (400, json!({"error": format!("{error:#}")})),
-    };
+        return (400, json!({"error": format!("{error:#}")}));
+    }
 
     // Agent sessions are named `prefix + agent`, so two concurrent runs of one
     // team would fight over the same tmux sessions. Serialise per team.
@@ -2270,7 +2269,6 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         program_path,
         inputs,
         &request,
-        checkpoint_period,
         ready_sender,
     );
 
@@ -2540,7 +2538,6 @@ fn spawn_run_thread(
     program_path: std::path::PathBuf,
     inputs: Vec<String>,
     request: &StartRunRequest,
-    checkpoint_period: Option<Duration>,
     ready_sender: mpsc::Sender<SocketAddr>,
 ) {
     // The panel's credentials arrive on their own channel, and only for a run
@@ -2568,6 +2565,11 @@ fn spawn_run_thread(
     } else {
         topology::Pace::RealTime
     };
+    // Validated at admission, so a bad period was already a 400.
+    let checkpoint_period = request
+        .checkpoint_period
+        .as_deref()
+        .and_then(|period| crate::checkpoint::parse_period(period).ok());
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let outcome = topology::run_topology(
