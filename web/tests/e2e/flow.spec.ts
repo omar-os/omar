@@ -727,6 +727,8 @@ test("a run can be paused and resumed from the panel that shows it", async ({ pa
   // A pause lands at the next tag boundary, after a checkpoint, so the
   // button has to say it was heard.
   await expect(actions.getByRole("button", { name: "Pausing…" })).toBeDisabled();
+  // A stop still outranks it, in case the capture never lands.
+  await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
 
   // Parked: the picture stays, labelled paused, and what is left to offer is
   // to continue, or to give the run up (a paused run holds its team).

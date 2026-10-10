@@ -998,13 +998,15 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             className="secondary-button"
             onClick={() => void requestStop()}
             type="button"
-            disabled={isStopping || isPausing}
+            disabled={isStopping}
             title={
               isStopping
                 ? "The current tag has to close first"
                 : isPaused
                   ? "Gives the paused run up, which frees its team; its checkpoints stay on disk"
-                  : "Closes the current tag, then persists and tears down"
+                  : isPausing
+                    ? "Outranks the pause: the run stops at the next tag boundary instead"
+                    : "Closes the current tag, then persists and tears down"
             }
           >
             {isStopping ? "Stopping…" : "Stop"}

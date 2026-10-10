@@ -366,6 +366,20 @@ pub fn request_stop(dir: &Path) -> Result<()> {
     request(dir, ControlOp::Stop)
 }
 
+/// A stop that outranks a pending pause or capture: the operator changed
+/// their mind, and stopping abandons nothing mid-tag. Deliberate, where
+/// `request_stop` refuses to replace a request silently.
+pub fn override_with_stop(dir: &Path) -> Result<()> {
+    match pending_request(dir) {
+        Some(ControlOp::Stop) => Ok(()),
+        Some(_) => {
+            clear_stop(dir)?;
+            request(dir, ControlOp::Stop)
+        }
+        None => request(dir, ControlOp::Stop),
+    }
+}
+
 /// The request waiting for the runner, if any. Unreadable requests count as
 /// a stop: an operator reached for the control file, and stopping is the
 /// one answer that abandons nothing mid-tag.
@@ -583,6 +597,10 @@ mod tests {
             "{refused}"
         );
         assert_eq!(pending_request(dir.path()), Some(ControlOp::Pause));
+        // Unless the stop is meant to outrank it.
+        override_with_stop(dir.path()).unwrap();
+        assert_eq!(pending_request(dir.path()), Some(ControlOp::Stop));
+        override_with_stop(dir.path()).unwrap();
         clear_stop(dir.path()).unwrap();
         std::fs::write(dir.path().join("control.json"), b"{\"requested_at\":1}").unwrap();
         assert!(stop_requested(dir.path()));

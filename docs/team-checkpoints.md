@@ -58,6 +58,9 @@ between two instances' snapshots. A writer barrier is a follow-up (#277).
 - A paused run holds its team: a fresh run of the team is refused until the
   paused one is resumed or stopped. `stop` on a paused run gives it up in
   place (nothing to tear down); its checkpoints stay on disk.
+- `stop` outranks a pending pause (the run stops at the boundary instead),
+  which is also the way out of a capture that is held. A session `down`
+  waits for a pausing run to park.
 - `rollback Team --checkpoint ID`: paused run only. Moves the resume point;
   deletes nothing; the abandoned branch stays listed. External effects are
   not undone.
@@ -87,8 +90,11 @@ checkpoint" from that preview.
 and admitted inputs, so it exists without a draft behind it.
 `GET /v1/runs/<id>/snapshot` is the diagram a paused run left behind (its
 own server dies with the loop), so a reload shows the parked run.
-A paused run's record is kept beside its staged program, so a daemon that
-starts over still offers it under its own id, to the chat and to the CLI.
+A run's record is kept beside its staged program from admission on, so a
+daemon that starts over still offers a paused run under its own id, to the
+chat and to the CLI; the deployment record settles a run that parked just
+before its record said so. A run's checkpoint routes answer only while its
+lineage is the team's live one; after a later run starts, they say so.
 The live diagram reports `paused`.
 
 Not in this PR: checkpoint import into another session, input journalling
