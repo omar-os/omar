@@ -16,6 +16,7 @@ export function Resizer({
   collapsed,
   toward,
   onExpand,
+  onCollapse,
   onDragStart,
   onDelta,
   onStep,
@@ -25,6 +26,7 @@ export function Resizer({
   /** Which way the hidden panel reappears. */
   toward: "left" | "right";
   onExpand: () => void;
+  onCollapse?: () => void;
   onDragStart: () => void;
   onDelta: (deltaX: number) => void;
   onStep: (deltaX: number) => void;
@@ -85,8 +87,10 @@ export function Resizer({
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
       onKeyDown={handleKeyDown}
+      onDoubleClick={onExpand}
     >
       <i aria-hidden="true" />
+      {onCollapse ? <button type="button" className="resizer-collapse" aria-label={`Hide ${label}`} title={`Hide ${label}`} onPointerDown={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); onCollapse(); }}><span aria-hidden="true">{toward === "right" ? "‹" : "›"}</span></button> : null}
     </div>
   );
 }

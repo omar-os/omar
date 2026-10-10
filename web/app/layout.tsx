@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
+import "./workflow-design.css";
 
 export const metadata: Metadata = {
   title: "OMAR Mission Control",

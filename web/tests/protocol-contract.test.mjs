@@ -15,6 +15,7 @@ import test from "node:test";
 
 import { startFakeServe, INVALID_MARKER } from "./fake-serve.mjs";
 import { RUN_STATUSES, assertRunRecord, isRunFinished } from "../app/lib/protocol.ts";
+import { defaultRunTimeout, describeRunFailure } from "../app/lib/run-feedback.ts";
 
 const golden = JSON.parse(
   await readFile(new URL("./fixtures/diagram-snapshot.v1.json", import.meta.url), "utf8"),
@@ -301,4 +302,30 @@ test("scoped agent callbacks stay in their chat after another chat becomes activ
     assert.deepEqual((await get(`${base}/v1/chat`)).messages.map((message) => message.text), ["Background reply", "Background proposal"]);
     assert.deepEqual((await get("/v1/chat")).messages, []);
   } finally { await fake.close(); }
+});
+
+
+test("a manual handoff timeout explains the missing operator response", () => {
+  const error = "reaction 'prepare.reaction.0' invocation 'id': 'prepare.chatgpt' did not answer within 300s, and contract '( prepare.packet | prepare.blocked )' requires an effect";
+  const agents = [{ name: "prepare.chatgpt", backend: "Web" }];
+  const feedback = describeRunFailure(error, agents);
+  assert.match(feedback.summary, /No response was submitted for prepare.chatgpt within 5 minutes/);
+  assert.match(feedback.guidance, /manual Web step/);
+  assert.match(feedback.guidance, /response panel/);
+  assert.doesNotMatch(feedback.summary, /invocation|contract/);
+});
+
+test("automated and unknown failures do not ask for a manual handoff", () => {
+  const automated = describeRunFailure("'video.claude' did not answer within 1800s", [{ name: "video.claude", backend: "ClaudeCode" }]);
+  assert.match(automated.summary, /video.claude did not respond within 30 minutes/);
+  assert.match(automated.guidance, /terminal/);
+  assert.doesNotMatch(automated.guidance, /manual Web/);
+  const unknown = describeRunFailure("renderer exited with code 1", []);
+  assert.match(unknown.guidance, /error details/);
+});
+
+test("manual workflows have time for a handoff without changing automated defaults", () => {
+  assert.equal(defaultRunTimeout([]), 300);
+  assert.equal(defaultRunTimeout([{ backend: "ClaudeCode" }]), 300);
+  assert.equal(defaultRunTimeout([{ backend: "Codex" }, { backend: "web" }]), 3600);
 });

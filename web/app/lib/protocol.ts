@@ -205,6 +205,7 @@ export type RunRequest = {
   program: string;
   inputs: Record<string, unknown>;
   conversation_id?: string;
+  timeout_seconds?: number;
 };
 
 /**

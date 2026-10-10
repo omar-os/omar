@@ -20,6 +20,8 @@ export default defineConfig({
   publicDir: "../public",
   plugins: [react()],
   build: {
+    // Keep the bundled design font inside app.css for the embedded runtime.
+    assetsInlineLimit: 64 * 1024,
     outDir: "../dist/spa",
     emptyOutDir: true,
     rollupOptions: {
