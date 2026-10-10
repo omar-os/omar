@@ -188,6 +188,11 @@ pub struct Head {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abandoned: Option<String>,
     pub updated_at: u64,
+    /// The highest sequence that existed when this head was written. A
+    /// complete checkpoint above it whose parent is the head was published
+    /// after it: its own pointer never landed, and it is the resume point.
+    #[serde(default)]
+    pub sequence: u64,
 }
 
 pub fn sha256(bytes: &[u8]) -> String {
@@ -301,6 +306,7 @@ impl Store {
                     checkpoint_id: manifest.id.clone(),
                     abandoned: None,
                     updated_at: crate::deploy::now_unix(),
+                    sequence: manifest.sequence,
                 })?,
             )?;
             Ok(published)
@@ -442,10 +448,42 @@ impl Store {
     /// Which checkpoint a resume continues from: the head a rollback chose,
     /// else the latest.
     pub fn resume_point(&self) -> Result<Option<Manifest>> {
-        if let Some(head) = self.head()? {
-            return self.load(&head.checkpoint_id).map(|(m, _, _)| Some(m));
+        let Some(head) = self.head()? else {
+            return self.latest();
+        };
+        let (current, _, _) = self.load(&head.checkpoint_id)?;
+        // Publication renames the checkpoint before it moves the head, so a
+        // crash between the two leaves a complete child of the head above
+        // everything the head knew of. A rollback's abandoned children sit
+        // at or below that mark, so they are not mistaken for one.
+        let (manifests, _) = self.list()?;
+        Ok(Some(
+            manifests
+                .into_iter()
+                .filter(|m| m.parent.as_deref() == Some(current.id.as_str()))
+                .filter(|m| m.sequence > head.sequence)
+                .max_by_key(|m| m.sequence)
+                .unwrap_or(current),
+        ))
+    }
+
+    /// Set an earlier run's checkpoints aside before a fresh run of the team
+    /// starts its own lineage, so nothing from one run can be rolled back
+    /// into another. Nothing is deleted; the directory keeps its contents
+    /// under a dated name beside the live one.
+    pub fn archive(&self) -> Result<Option<PathBuf>> {
+        if !self.dir.exists() || fs::read_dir(&self.dir)?.next().is_none() {
+            return Ok(None);
         }
-        self.latest()
+        let stamp = crate::deploy::now_unix();
+        let mut target = self.dir.with_file_name(format!("checkpoints-{stamp}"));
+        let mut n = 1;
+        while target.exists() {
+            target = self.dir.with_file_name(format!("checkpoints-{stamp}-{n}"));
+            n += 1;
+        }
+        fs::rename(&self.dir, &target)?;
+        Ok(Some(target))
     }
 
     /// Roll the head back to `id`. The current head is recorded as abandoned,
@@ -460,6 +498,7 @@ impl Store {
             checkpoint_id: manifest.id,
             abandoned: previous,
             updated_at: crate::deploy::now_unix(),
+            sequence: self.list()?.0.iter().map(|m| m.sequence).max().unwrap_or(0),
         };
         write_pointer(&self.dir.join(HEAD), &serde_json::to_vec(&head)?)?;
         Ok(head)
@@ -633,5 +672,53 @@ mod tests {
         assert!(store.set_head("not-an-id").is_err());
         store.clear_head().unwrap();
         assert_eq!(store.resume_point().unwrap().unwrap().id, second.id);
+    }
+
+    /// A checkpoint whose head pointer never landed is still the resume
+    /// point, while a rollback's abandoned children are not.
+    #[test]
+    fn a_published_child_of_the_head_outranks_a_stale_head_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let program = json!({"version": 1});
+        let first = manifest(1, &state(1), &program);
+        let mut second = manifest(2, &state(2), &program);
+        second.parent = Some(first.id.clone());
+        store.publish(&first, &state(1), &program).unwrap();
+        store.publish(&second, &state(2), &program).unwrap();
+        // The crash: the second checkpoint is complete, the head still names the first.
+        let stale = Head {
+            checkpoint_id: first.id.clone(),
+            abandoned: None,
+            updated_at: 0,
+            sequence: 1,
+        };
+        write_pointer(
+            &dir.path().join("checkpoints").join(HEAD),
+            &serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(store.resume_point().unwrap().unwrap().id, second.id);
+        // A rollback to the first leaves the second behind for good.
+        store.set_head(&first.id).unwrap();
+        assert_eq!(store.resume_point().unwrap().unwrap().id, first.id);
+    }
+
+    #[test]
+    fn archiving_sets_a_lineage_aside_without_deleting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        assert!(store.archive().unwrap().is_none(), "nothing to archive");
+        let program = json!({"version": 1});
+        store
+            .publish(&manifest(1, &state(1), &program), &state(1), &program)
+            .unwrap();
+        let archived = store.archive().unwrap().unwrap();
+        assert!(
+            archived.join("manifest.json").exists()
+                || std::fs::read_dir(&archived).unwrap().count() > 0
+        );
+        assert!(store.list().unwrap().0.is_empty() && store.resume_point().unwrap().is_none());
+        assert!(Store::new(dir.path()).archive().unwrap().is_none());
     }
 }

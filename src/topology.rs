@@ -1893,6 +1893,16 @@ impl<'a> RunCheckpointer<'a> {
         resumed_from: Option<&checkpoint::Manifest>,
     ) -> Result<Self> {
         let store = checkpoint::Store::new(dir);
+        // A fresh run starts its own lineage: an earlier run's checkpoints
+        // are set aside, so a rollback can only choose from this run's.
+        if resumed_from.is_none() {
+            if let Some(archived) = store.archive()? {
+                println!(
+                    "Checkpoints of the previous run moved to {}",
+                    archived.display()
+                );
+            }
+        }
         // An operator's live change outlives the runner that saw it; a launch
         // override starts a fresh policy; otherwise the default hour.
         let policy = match (config.checkpoint_period, deploy::read_policy(dir)?) {
@@ -3255,7 +3265,17 @@ fn settle_boundary(
         }
         // Held at the boundary: the previous checkpoint stands, the next tag
         // does not run, and other topologies are unaffected. Only an operator
-        // moves this run again.
+        // moves this run again. The request that asked for this capture is
+        // consumed first (its trigger is kept), or the hold would answer it
+        // again at once and no retry could be admitted.
+        if let Some(dir) = deployment_dir {
+            if matches!(
+                deploy::pending_request(dir),
+                Some(ControlOp::Checkpoint | ControlOp::RetryCheckpoint | ControlOp::Pause)
+            ) {
+                deploy::clear_stop(dir)?;
+            }
+        }
         loop {
             thread::sleep(Duration::from_millis(250));
             match deployment_dir.and_then(deploy::pending_request) {
@@ -5936,6 +5956,7 @@ mod tests {
         due_once: Mutex<bool>,
         fail_first: Mutex<u32>,
         failures: Mutex<u32>,
+        expect_hold: Mutex<bool>,
     }
     impl Recorder {
         fn new() -> Self {
@@ -5944,6 +5965,7 @@ mod tests {
                 due_once: Mutex::new(false),
                 fail_first: Mutex::new(0),
                 failures: Mutex::new(0),
+                expect_hold: Mutex::new(false),
             }
         }
     }
@@ -5961,7 +5983,10 @@ mod tests {
             Ok(format!("cp-{}", self.captures.lock().unwrap().len()))
         }
         fn capture_failed(&self, _error: &anyhow::Error, _attempt: u32, held: bool) {
-            assert!(!held, "one failure is retried internally, never held");
+            assert!(
+                !held || *self.expect_hold.lock().unwrap(),
+                "one failure is retried internally, never held"
+            );
             *self.failures.lock().unwrap() += 1;
         }
     }
@@ -6162,6 +6187,54 @@ mod tests {
             None,
             "answered requests are cleared"
         );
+    }
+
+    /// Once its retries are spent a capture holds the run, and only a new
+    /// request moves it: the one that asked for the capture is consumed, so
+    /// the hold neither answers it again nor blocks the retry.
+    #[test]
+    fn a_held_capture_waits_for_a_fresh_retry_request() {
+        let state = verify(&counter_bytecode("")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new();
+        *recorder.fail_first.lock().unwrap() = CAPTURE_RETRIES + 1;
+        *recorder.expect_hold.lock().unwrap() = true;
+        deploy::request(dir.path(), ControlOp::Checkpoint).unwrap();
+        let path = dir.path().to_path_buf();
+        let operator = thread::spawn(move || {
+            // The hold consumed the manual request; a retry is admitted.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while deploy::pending_request(&path).is_some() {
+                assert!(Instant::now() < deadline, "the request was never consumed");
+                thread::sleep(Duration::from_millis(20));
+            }
+            deploy::request(&path, ControlOp::RetryCheckpoint).unwrap();
+        });
+        let executor = PausingCounter {
+            calls: Mutex::new(0),
+            dir: None,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::from([("c.tick".to_string(), json!(1))])),
+            &executor,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&recorder),
+        )
+        .unwrap();
+        operator.join().unwrap();
+        assert!(matches!(end, LoopEnd::Completed(_)));
+        assert_eq!(*recorder.failures.lock().unwrap(), CAPTURE_RETRIES + 1);
+        let captures = recorder.captures.lock().unwrap();
+        assert_eq!(captures.len(), 1, "the retry captured once");
+        assert_eq!(
+            captures[0].0,
+            Trigger::Manual,
+            "the original trigger survives the hold"
+        );
+        assert_eq!(deploy::pending_request(dir.path()), None);
     }
 
     /// State a reaction hands back stays with its instance: it reaches the

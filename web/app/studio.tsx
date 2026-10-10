@@ -987,7 +987,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             {isPausing ? "Pausing…" : "Pause"}
           </button>
         ) : null}
-        {phase === "observing" && run ? (
+        {(phase === "observing" || isPaused) && run ? (
           <button
             className="secondary-button"
             onClick={() => void requestStop()}
@@ -996,7 +996,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             title={
               isStopping
                 ? "The current tag has to close first"
-                : "Closes the current tag, then persists and tears down"
+                : isPaused
+                  ? "Gives the paused run up, which frees its team; its checkpoints stay on disk"
+                  : "Closes the current tag, then persists and tears down"
             }
           >
             {isStopping ? "Stopping…" : "Stop"}

@@ -192,6 +192,14 @@ impl RunStatus {
             Self::Starting | Self::Running | Self::Stopping | Self::Pausing
         )
     }
+
+    /// Whether the run still holds its team: its agents, or, paused, the
+    /// deployment record and checkpoints a resume needs. A fresh run of the
+    /// team would write over those, so a paused run blocks one until it is
+    /// resumed or stopped.
+    pub fn holds_team(self) -> bool {
+        self.is_active() || self == Self::Paused
+    }
 }
 
 /// One entry in the operator/EA conversation. `design` is set only on
@@ -453,7 +461,7 @@ impl Serve {
                 continue;
             }
             for run in context.runs.lock().unwrap().values() {
-                if run.run_id == selector || (run.team == selector && run.status.is_active()) {
+                if run.run_id == selector || (run.team == selector && run.status.holds_team()) {
                     matches.push((context.clone(), run.run_id.clone()));
                 }
             }
@@ -2226,13 +2234,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     {
         let runs = context.runs.lock().expect("serve runs poisoned");
         if let Some(active) = find_active_run(&runs, &state.team) {
-            return (
-                409,
-                json!({
-                    "error": format!("team '{}' already has an active run", state.team),
-                    "run_id": active.run_id,
-                }),
-            );
+            return (409, team_held_error(active));
         }
     }
 
@@ -2250,7 +2252,11 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         started_at: now_unix(),
         finished_at: None,
         error: None,
-        present: request.inputs.keys().cloned().collect(),
+        // From the combined list: a CLI start names its inputs in `raw_inputs`.
+        present: inputs
+            .iter()
+            .filter_map(|input| input.split_once('=').map(|(name, _)| name.to_string()))
+            .collect(),
         outputs: BTreeMap::new(),
         state: BTreeMap::new(),
     };
@@ -2619,7 +2625,20 @@ fn encode_inputs(state: &VmState, inputs: &BTreeMap<String, Value>) -> Result<Ve
 
 fn find_active_run<'a>(runs: &'a BTreeMap<String, RunRecord>, team: &str) -> Option<&'a RunRecord> {
     runs.values()
-        .find(|record| record.team == team && record.status.is_active())
+        .find(|record| record.team == team && record.status.holds_team())
+}
+
+/// Why a team cannot take a new run while this one holds it.
+fn team_held_error(active: &RunRecord) -> Value {
+    let error = if active.status == RunStatus::Paused {
+        format!(
+            "team '{}' has a paused run; resume it, or stop it to discard it",
+            active.team
+        )
+    } else {
+        format!("team '{}' already has an active run", active.team)
+    };
+    json!({ "error": error, "run_id": active.run_id })
 }
 
 /// Ask a run to stop at its next tag boundary.
@@ -2639,9 +2658,16 @@ fn find_active_run<'a>(runs: &'a BTreeMap<String, RunRecord>, team: &str) -> Opt
 /// finishing, and the outcome is the same either way.
 fn stop_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     let team = {
-        let runs = context.runs.lock().expect("serve runs poisoned");
-        match runs.get(id) {
+        let mut runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get_mut(id) {
             Some(record) if record.status.is_active() => record.team.clone(),
+            // Paused: no runner to ask. The run is given up, which frees the
+            // team; its checkpoints stay on disk for inspection.
+            Some(record) if record.status == RunStatus::Paused => {
+                record.status = RunStatus::Stopped;
+                record.finished_at = Some(now_unix());
+                return (200, json!(record));
+            }
             Some(record) => return (200, json!(record)),
             None => return (404, json!({"error": "unknown run"})),
         }
@@ -2892,14 +2918,8 @@ fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     }
     {
         let mut runs = context.runs.lock().expect("serve runs poisoned");
-        if let Some(active) = find_active_run(&runs, &team) {
-            return (
-                409,
-                json!({
-                    "error": format!("team '{team}' already has an active run"),
-                    "run_id": active.run_id,
-                }),
-            );
+        if let Some(active) = find_active_run(&runs, &team).filter(|other| other.run_id != id) {
+            return (409, team_held_error(active));
         }
         let Some(record) = runs.get_mut(id) else {
             return (404, json!({"error": "unknown run"}));
@@ -3930,6 +3950,54 @@ while True:
             find_active_run(&runs, "Sample").map(|record| record.status),
             Some(RunStatus::Starting)
         );
+        // A paused run holds its team too: a fresh run would overwrite the
+        // deployment record and checkpoints its resume needs.
+        runs.insert("c".to_string(), record("Sample", RunStatus::Paused));
+        let held = find_active_run(&runs, "Sample").expect("paused holds the team");
+        assert!(team_held_error(held)["error"]
+            .as_str()
+            .unwrap()
+            .contains("paused run"));
+    }
+
+    /// A paused run has no runner to ask, so a stop gives it up in place,
+    /// which frees its team; it cannot be resumed afterwards.
+    #[test]
+    fn stopping_a_paused_run_discards_it() {
+        let server = test_server();
+        let address = server.address();
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: "Cadence".to_string(),
+                    status: RunStatus::Paused,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                },
+            );
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/stop", Some("{}"));
+        assert!(
+            response.contains(" 200 ") && response.contains("\"status\":\"stopped\""),
+            "{response}"
+        );
+        {
+            let runs = server.context.runs.lock().expect("runs");
+            assert!(
+                find_active_run(&runs, "Cadence").is_none(),
+                "the team is free again"
+            );
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/resume", Some("{}"));
+        assert!(response.contains(" 409 "), "{response}");
     }
 
     #[test]

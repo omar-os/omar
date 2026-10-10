@@ -34,7 +34,16 @@ queued. Nothing is captured for time spent paused.
 
 If capture fails, the run holds at the boundary: previous checkpoint stands,
 `checkpoint_error` is in `omar status`, three internal retries, then
-`omar checkpoint retry Team`. Other topologies continue.
+`omar checkpoint retry Team` (the request that asked for the capture is
+consumed by the hold, its trigger kept). Other topologies continue.
+
+Publication renames the checkpoint before it moves the head pointer. A crash
+between the two is recovered on read: a complete checkpoint whose parent is
+the head, published after it, is the resume point.
+
+Instance files are snapshotted after the boundary's invocations complete;
+a background process an agent left writing can still change a worktree
+between two instances' snapshots. A writer barrier is a follow-up (#277).
 
 ## Pause / resume / rollback
 
@@ -46,9 +55,15 @@ If capture fails, the run holds at the boundary: previous checkpoint stands,
   they continue from (`restoration: fresh_conversation` in the manifest; no
   backend offers an immutable fork of a conversation). A resumed run uses the
   default timeout and real-time pace.
+- A paused run holds its team: a fresh run of the team is refused until the
+  paused one is resumed or stopped. `stop` on a paused run gives it up in
+  place (nothing to tear down); its checkpoints stay on disk.
 - `rollback Team --checkpoint ID`: paused run only. Moves the resume point;
   deletes nothing; the abandoned branch stays listed. External effects are
   not undone.
+- A fresh run starts its own lineage: the previous run's `checkpoints/` is
+  moved to `checkpoints-<unix>/` beside it, so a rollback can only pick from
+  the current run. Nothing is deleted.
 - `checkpoint list|show|verify`: inspect; `verify` checks program, state and
   every referenced file version without launching anything.
 

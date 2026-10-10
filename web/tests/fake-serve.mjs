@@ -188,6 +188,12 @@ export async function startFakeServe({
       // A stopping run is still active, as on the daemon: it holds its sessions
       // until the tag closes.
       const active = ["starting", "running", "stopping"].includes(entry.record.status);
+      if (entry.record.status === "paused") {
+        // No runner to ask: the paused run is given up in place.
+        entry.record.status = "stopped";
+        entry.record.finished_at = Math.floor(Date.now() / 1000);
+        return json(response, 200, entry.record);
+      }
       if (!active) return json(response, 200, entry.record);
       // Accepted, not done: the daemon answers before the run has ended, and
       // records `stopping` so a client that reloads still sees it. Held briefly

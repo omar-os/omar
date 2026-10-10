@@ -122,6 +122,7 @@ total = Some(self.count);
             run_id = json.loads(omar("run", str(program), "--input", "w.go=1", "--checkpoint-period", "2s"))["run_id"]
             wait_until(lambda: (deployment / "deployment.json").exists() and record()["state"] == "RUNNING",
                        "the run to start")
+            assert status()["present"] == ["w.go"], status()
             wait_until(lambda: len(log_lines(worktree())) >= 3, "three timer firings")
             omar("checkpoint", "create", "Ticker", "--wait")
             ids, listing = checkpoints()
@@ -156,6 +157,11 @@ total = Some(self.count);
             # Nothing in flight at the pause: the stub's greeting was recorded.
             assert json.loads((deployment / "outputs.json").read_text())["w.greeting"]
             assert paused_run["outputs"]["w.greeting"], paused_run
+            # A paused run holds its team: a fresh run would overwrite what a
+            # resume needs, so it is refused until the run is resumed or stopped.
+            refused = subprocess.run([str(BIN), "-s", runtime["name"], "run", str(program), "--input", "w.go=1"],
+                                     cwd=source, env=env, text=True, capture_output=True, timeout=60)
+            assert refused.returncode != 0 and "paused run" in refused.stderr, refused
 
             # 4. Resume under the same run id: files restored into a new
             #    workspace, the count continues, nothing repeats, the agent is back.
