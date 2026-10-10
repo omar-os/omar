@@ -392,6 +392,11 @@ pub fn reserved_name(qualified: &str) -> Option<&'static str> {
 }
 
 fn rust_type(ty: &str) -> Result<(&'static str, &'static str, &'static str)> {
+    // A refined string arrives as a plain String: what it admits was checked
+    // when it was written. A body may not write one — `verify` says so.
+    if crate::topology::string_enum(ty).is_some() {
+        return Ok(("String", "get_string", "put_string"));
+    }
     // (rust type, getter, putter)
     Ok(match ty {
         "int" => ("i64", "get_int", "put_int"),

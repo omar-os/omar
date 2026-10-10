@@ -1,0 +1,25 @@
+
+type Category from "./schemas/message-category.json"
+
+team Classifier[message_classifier : Codex] {
+    input message : string
+    output category : Category
+    output explanation : string
+
+    prompt message_classifier(message) -> category, explanation "
+        Classify this customer message:
+        $(message)
+
+        Use question if the customer asks for information.
+        Use complaint if the customer reports dissatisfaction.
+
+        Write exactly question or complaint to review.category.
+        Write one short sentence explaining your choice to review.explanation.
+        If a write is rejected, correct it and try again.
+        Complete the invocation after both outputs are accepted.
+    "
+}
+
+main MessageClassifierExample {
+    review = Classifier()
+}

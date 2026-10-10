@@ -822,6 +822,7 @@ mod tests {
             team: "Sample".to_string(),
             state_vars: BTreeMap::new(),
             params: BTreeMap::new(),
+            types: BTreeMap::new(),
             instances: BTreeMap::new(),
             timers: BTreeMap::new(),
             agents: BTreeMap::from([(
@@ -837,6 +838,7 @@ mod tests {
                     PortState {
                         kind: PortKind::Input,
                         ty: "string".to_string(),
+                        declared: None,
                         delay: None,
                         instance: String::new(),
                     },
@@ -846,6 +848,7 @@ mod tests {
                     PortState {
                         kind: PortKind::Output,
                         ty: "string".to_string(),
+                        declared: None,
                         delay: None,
                         instance: String::new(),
                     },
@@ -878,6 +881,7 @@ mod tests {
         let member = |instance: &str, kind, ty: &str| PortState {
             kind,
             ty: ty.to_string(),
+            declared: None,
             delay: None,
             instance: instance.to_string(),
         };
@@ -886,6 +890,7 @@ mod tests {
             team: "SimpleBrief".to_string(),
             state_vars: BTreeMap::new(),
             params: BTreeMap::new(),
+            types: BTreeMap::new(),
             timers: BTreeMap::new(),
             instances: BTreeMap::from([
                 (

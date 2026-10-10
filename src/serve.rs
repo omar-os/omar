@@ -107,6 +107,12 @@ pub struct RunRecord {
 #[derive(Debug, Deserialize)]
 struct StartRunRequest {
     program: String,
+    /// Files the program imports, by the relative path it imports them under:
+    /// `{"schemas/decision.json": "{...}"}` for
+    /// `type Decision from "schemas/decision.json"`. The compiler resolves an
+    /// import beside the source, and the source here is staged on its own.
+    #[serde(default)]
+    files: BTreeMap<String, String>,
     #[serde(default)]
     conversation_id: Option<String>,
     #[serde(default)]
@@ -1928,7 +1934,7 @@ fn compile_preview(context: &Arc<Context_>, program: &str) -> Result<VmState> {
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.omar", Uuid::new_v4()));
     fs::write(&path, program)?;
-    let bytecode = topology::load_program(&path)?;
+    let bytecode = topology::load_staged_program(&path)?;
     let state = topology::verify(&bytecode)?;
     let _ = fs::remove_file(&path);
     Ok(state)
@@ -2057,10 +2063,13 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": format!("failed to stage program: {error}")}),
         );
     }
+    if let Err(message) = stage_files(&run_dir, "program.omar", &request.files) {
+        return (400, json!({"error": message}));
+    }
 
     // Compile and validate synchronously so a bad program is a 400 rather than
     // a 201 followed by an asynchronous failure the caller has to poll for.
-    let bytecode = match topology::load_program(&program_path) {
+    let bytecode = match topology::load_staged_program(&program_path) {
         Ok(bytecode) => bytecode,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
@@ -2170,6 +2179,11 @@ struct CheckRequest {
     /// Must end in `.omar`, which is the compiler's own rule.
     #[serde(default)]
     filename: Option<String>,
+    /// Files the program imports, by the relative path it imports them under.
+    /// The compiler reads an import beside the source, and the source is
+    /// staged alone, so what it imports has to come with it.
+    #[serde(default)]
+    files: BTreeMap<String, String>,
     /// Whether to work out the tags the program would pass through.
     ///
     /// Off by default: a caller that only wants to know whether a program holds
@@ -2200,12 +2214,16 @@ fn check_program(body: &[u8]) -> (u16, Value) {
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
 
-    let staged = match stage_program(&request.program, request.filename.as_deref()) {
+    let staged = match stage_program(
+        &request.program,
+        request.filename.as_deref(),
+        &request.files,
+    ) {
         Ok(staged) => staged,
         Err(problem) => return problem,
     };
-    let outcome =
-        topology::load_program(&staged.path).and_then(|bytecode| topology::verify(&bytecode));
+    let outcome = topology::load_staged_program(&staged.path)
+        .and_then(|bytecode| topology::verify(&bytecode));
 
     match staged.finish(outcome) {
         Ok(state) => {
@@ -2255,10 +2273,58 @@ impl StagedProgram {
     }
 }
 
-/// Write a program out under the name the operator gave it.
+/// Write the files a program imports beside it, under the paths it uses.
+///
+/// A path is the program's own relative reference -- `schemas/decision.json`
+/// -- so it has to stay inside the program's directory: nothing absolute,
+/// nothing climbing out of it. And it is not the program: `program_name` is
+/// what the request's text was written to, and a file under that name would
+/// replace what the request said it was compiling.
+fn stage_files(
+    directory: &Path,
+    program_name: &str,
+    files: &BTreeMap<String, String>,
+) -> std::result::Result<(), String> {
+    use std::path::Component;
+    for (relative, contents) in files {
+        let path = Path::new(relative);
+        let inside = !relative.is_empty()
+            && !relative.contains('\\')
+            && path
+                .components()
+                .all(|part| matches!(part, Component::Normal(_) | Component::CurDir));
+        if !inside {
+            return Err(format!(
+                "'{relative}' is not a file a program can import: \
+                 it must be a relative path inside the program's own directory"
+            ));
+        }
+        let plain: PathBuf = path
+            .components()
+            .filter(|part| !matches!(part, Component::CurDir))
+            .collect();
+        if plain == Path::new(program_name) {
+            return Err(format!(
+                "'{relative}' is the program itself, not a file it imports"
+            ));
+        }
+        let target = directory.join(path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to stage '{relative}': {error}"))?;
+        }
+        fs::write(&target, contents)
+            .map_err(|error| format!("failed to stage '{relative}': {error}"))?;
+    }
+    Ok(())
+}
+
+/// Write a program out under the name the operator gave it, with the files it
+/// imports beside it.
 fn stage_program(
     program: &str,
     filename: Option<&str>,
+    files: &BTreeMap<String, String>,
 ) -> std::result::Result<StagedProgram, (u16, Value)> {
     let name = filename.unwrap_or("program.omar");
     // The compiler rejects any other extension, and saying so here names the
@@ -2283,6 +2349,10 @@ fn stage_program(
     if let Err(error) = fs::write(&path, program) {
         let _ = fs::remove_dir_all(&directory);
         return Err((500, json!({"error": format!("{error}")})));
+    }
+    if let Err(message) = stage_files(&directory, name, files) {
+        let _ = fs::remove_dir_all(&directory);
+        return Err((200, json!({"ok": false, "errors": [message]})));
     }
     Ok(StagedProgram { directory, path })
 }
@@ -2476,6 +2546,10 @@ fn encode_inputs(state: &VmState, inputs: &BTreeMap<String, Value>) -> Result<Ve
         );
         let raw = match (port.ty.as_str(), value) {
             ("path", Value::String(path)) => path.clone(),
+            // An enum string is typed bare on the command line and taken as
+            // it comes, so quoting it here would make the quotes part of the
+            // value and no value the port admits.
+            (ty, Value::String(text)) if topology::string_enum(ty).is_some() => text.clone(),
             _ => serde_json::to_string(value)?,
         };
         encoded.push(format!("{name}={raw}"));
@@ -2598,6 +2672,145 @@ fn write_asset(stream: &mut TcpStream, asset: &crate::web_assets::Asset) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checked_program_brings_the_schemas_it_imports() {
+        if !Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("lang/.lake/build/bin/omarc")
+            .exists()
+        {
+            eprintln!("skipping: omarc has not been built");
+            return;
+        }
+        let program = r#"
+            type Decision from "./schemas/decision.json"
+            team Review[reviewer : Stub] {
+                input request : string
+                output decision : Decision
+                prompt reviewer(request) -> decision "Review $(request)"
+            }
+            main { review = Review() }
+        "#;
+        let files = json!({
+            "schemas/decision.json": r#"{"type":"string","enum":["approved","needs_revision"]}"#
+        });
+        let body = json!({"program": program, "filename": "review.omar", "files": files});
+        let (status, answer) = check_program(body.to_string().as_bytes());
+        assert_eq!(status, 200);
+        assert_eq!(answer["ok"], json!(true), "{answer}");
+        assert_eq!(answer["team"], json!("review"));
+
+        // Without the file the check fails, naming the import rather than the
+        // scratch directory it was looked for in.
+        let body = json!({"program": program, "filename": "review.omar"});
+        let (status, answer) = check_program(body.to_string().as_bytes());
+        assert_eq!(status, 200);
+        assert_eq!(answer["ok"], json!(false), "{answer}");
+        let error = answer["errors"][0].as_str().unwrap();
+        assert!(error.contains("schemas/decision.json"), "{error}");
+        assert!(!error.contains("omar-check-"), "{error}");
+
+        // A path that is not the program's own relative reference is refused
+        // before anything is written.
+        for bad in [
+            "../decision.json",
+            "/etc/decision.json",
+            "",
+            "schemas\\decision.json",
+        ] {
+            let body = json!({
+                "program": program, "filename": "review.omar", "files": {bad: "{}"}
+            });
+            let (status, answer) = check_program(body.to_string().as_bytes());
+            assert_eq!(status, 200);
+            assert_eq!(answer["ok"], json!(false), "{bad:?}: {answer}");
+            let error = answer["errors"][0].as_str().unwrap();
+            assert!(error.contains("relative path"), "{bad:?}: {error}");
+        }
+
+        // Nor may a file replace the program the request said it was checking.
+        for name in ["review.omar", "./review.omar"] {
+            let body = json!({
+                "program": program, "filename": "review.omar",
+                "files": {name: "team Other { input x : string } main { o = Other() }"}
+            });
+            let (status, answer) = check_program(body.to_string().as_bytes());
+            assert_eq!(status, 200);
+            assert_eq!(answer["ok"], json!(false), "{name}: {answer}");
+            let error = answer["errors"][0].as_str().unwrap();
+            assert!(error.contains("the program itself"), "{name}: {error}");
+        }
+
+        // And the program's own imports are held to the same directory: a
+        // request cannot have the compiler read the host's files by naming
+        // them, however many files it brings.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = elsewhere.path().join("decision.json");
+        fs::write(
+            &outside,
+            r#"{"type":"string","enum":["approved","needs_revision"]}"#,
+        )
+        .unwrap();
+        for import in [
+            outside.display().to_string(),
+            "../decision.json".to_string(),
+        ] {
+            let program = program.replace("./schemas/decision.json", &import);
+            let body = json!({"program": program, "filename": "review.omar", "files": files});
+            let (status, answer) = check_program(body.to_string().as_bytes());
+            assert_eq!(status, 200);
+            assert_eq!(answer["ok"], json!(false), "{import}: {answer}");
+            let error = answer["errors"][0].as_str().unwrap();
+            assert!(
+                error.contains("inside the program's directory"),
+                "{import}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_enum_inputs_reach_the_port_unquoted() {
+        // One open input, so `parse_inputs` has nothing else to miss.
+        let bytecode: topology::Bytecode = serde_json::from_str(
+            r#"{
+              "version": 1,
+              "team": "Gate",
+              "instructions": [
+                {"op":"begin_plan","team":"Gate"},
+                {"op":"define_type","name":"Decision","type":"string in [\"continue\",\"stop\"]"},
+                {"op":"spawn_agent","name":"keeper","backend":"Codex"},
+                {"op":"define_port","kind":"input","name":"decision",
+                 "type":"string in [\"continue\",\"stop\"]","declared":"Decision"},
+                {"op":"define_port","kind":"output","name":"note","type":"string"},
+                {"op":"install_reaction","id":"reaction.0","agent":"keeper",
+                 "triggers":["decision"],"effects":["note"],"contract":"note","prompt":"p"},
+                {"op":"commit_plan"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let state = topology::verify(&bytecode).unwrap();
+        let encoded = encode_inputs(
+            &state,
+            &BTreeMap::from([("decision".to_string(), json!("stop"))]),
+        )
+        .expect("inputs encode");
+        assert_eq!(encoded, vec!["decision=stop".to_string()]);
+        // What the command line would have been handed, read back the same way.
+        let parsed = topology::parse_inputs(&state, &encoded).expect("inputs parse");
+        assert_eq!(parsed["decision"], json!("stop"));
+
+        let encoded = encode_inputs(
+            &state,
+            &BTreeMap::from([("decision".to_string(), json!("maybe"))]),
+        )
+        .expect("encoding does not judge membership");
+        let error = topology::parse_inputs(&state, &encoded)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("\"continue\""), "{error}");
+        assert!(error.contains("\"maybe\""), "{error}");
+    }
     use crate::topology::{AgentState, PortState};
 
     fn sample_state() -> VmState {
@@ -2606,6 +2819,7 @@ mod tests {
             team: "Sample".to_string(),
             state_vars: BTreeMap::new(),
             params: BTreeMap::new(),
+            types: BTreeMap::new(),
             instances: BTreeMap::new(),
             timers: BTreeMap::new(),
             agents: BTreeMap::from([(
@@ -2621,6 +2835,7 @@ mod tests {
                     PortState {
                         kind: PortKind::Input,
                         ty: "string".to_string(),
+                        declared: None,
                         delay: None,
                         instance: String::new(),
                     },
@@ -2630,6 +2845,7 @@ mod tests {
                     PortState {
                         kind: PortKind::Input,
                         ty: "path".to_string(),
+                        declared: None,
                         delay: None,
                         instance: String::new(),
                     },
@@ -2639,6 +2855,7 @@ mod tests {
                     PortState {
                         kind: PortKind::Output,
                         ty: "string".to_string(),
+                        declared: None,
                         delay: None,
                         instance: String::new(),
                     },

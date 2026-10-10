@@ -252,6 +252,9 @@ jobs:
           build: true
           test: true
 
+      - name: Test external schema imports
+        run: python3 tests/ci/schema_imports.py
+
       - name: Compile topology corpus to bytecode (offline)
         working-directory: lang
         run: |
@@ -318,6 +321,64 @@ jobs:
           echo "$output"
           grep -Fq 'Output n1.done = 6' <<<"$output"
 
+      # Two types imported from JSON Schema files, written by a stub and read
+      # by a code body. The stub answers with the first value each type
+      # admits, so the route is fixed by the schema files. No model call.
+      - name: Verify imported enum types end to end
+        env:
+          OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
+        run: |
+          output=$(cargo run --quiet --bin omar -- run \
+            tests/topology/src/SchemaEnum.omar --input review.request=hello \
+            --timeout-seconds 15 --replace --wait)
+          echo "$output"
+          grep -Fq 'Output review.decision = "continue"' <<<"$output"
+          grep -Fq 'Output review.priority = "high"' <<<"$output"
+          grep -Fq 'Output dispatch.route = "continue:high"' <<<"$output"
+
+      # Enum types inside list and option, crossing connections between two
+      # prompt teams. The stub writes one admitted value to a list and nothing
+      # to an option. No model call.
+      - name: Verify wrapped enum types end to end
+        env:
+          OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
+        run: |
+          output=$(cargo run --quiet --bin omar -- run \
+            tests/topology/src/SchemaNested.omar --input triage.request=hello \
+            --timeout-seconds 15 --replace --wait)
+          echo "$output"
+          grep -Fq 'Output triage.decisions = ["continue"]' <<<"$output"
+          grep -Fq 'Output triage.priority = null' <<<"$output"
+          grep -Fq 'Output summary.report = "stub"' <<<"$output"
+
+      # An enum input supplied on the command line. A value the type does not
+      # list is refused before anything runs, naming the values it does; one
+      # it lists reaches a prompt and a code body. No model call.
+      - name: Verify an enum input is checked at the door
+        env:
+          OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
+        run: |
+          if output=$(cargo run --quiet --bin omar -- run \
+              tests/topology/src/SchemaInput.omar --input gate.decision=maybe \
+              --timeout-seconds 15 --replace --wait 2>&1); then
+            echo "$output"
+            echo "a value outside the enum was accepted"
+            exit 1
+          fi
+          echo "$output"
+          # The refusal names the admitted values and the one it got; the
+          # quotes around them are escaped in the printed error.
+          refusal=$(grep -F 'expected one of' <<<"$output")
+          grep -Fq 'continue' <<<"$refusal"
+          grep -Fq 'stop' <<<"$refusal"
+          grep -Fq 'maybe' <<<"$refusal"
+          output=$(cargo run --quiet --bin omar -- run \
+            tests/topology/src/SchemaInput.omar --input gate.decision=stop \
+            --timeout-seconds 15 --replace --wait)
+          echo "$output"
+          grep -Fq 'Output gate.route = "routed stop"' <<<"$output"
+          grep -Fq 'Output gate.note = "stub"' <<<"$output"
+
       # No input at all: a timer starts it, and a state variable counts the
       # rounds. The count a run ends with is printed beside its outputs.
       - name: Verify state survives from one invocation to the next
@@ -366,7 +427,7 @@ jobs:
 
           field_rank = {
               "op": 0, "instance": 1, "kind": 2, "name": 3, "type": 4,
-              "delay": 5, "backend": 6, "team": 7
+              "declared": 5, "delay": 6, "backend": 7, "team": 8
           }
           reaction_order = [
               "op", "instance", "id", "agent", "triggers", "effects",
@@ -387,10 +448,17 @@ jobs:
                   ranked = [field_rank[key] for key in keys if key in field_rank]
                   assert ranked == sorted(ranked), (path, keys)
                   if instruction["op"] == "define_port":
+                      # `declared` is how the program spelled an imported
+                      # type, and is absent when it spelled the type itself.
                       assert keys in (
                           ["op", "instance", "kind", "name", "type"],
                           ["op", "instance", "kind", "name", "type", "delay"],
+                          ["op", "instance", "kind", "name", "type", "declared"],
+                          ["op", "instance", "kind", "name", "type", "declared", "delay"],
                       ), (path, keys)
+                  if instruction["op"] == "define_type":
+                      assert keys[:3] == ["op", "name", "type"], (path, keys)
+                      assert set(keys[3:]) <= {"title", "description"}, (path, keys)
                   if instruction["op"] == "declare_instance":
                       assert keys == ["op", "name", "parent", "team"], (path, keys)
                   if instruction["op"] == "declare_timer":

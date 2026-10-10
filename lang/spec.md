@@ -549,3 +549,83 @@ Important verification targets are:
 - bytecode never references an undefined component;
 - compatible retained agents are never unnecessarily restarted; and
 - equal compiler inputs produce equal bytecode.
+
+## External JSON Schema types
+
+Declare schema imports before teams:
+
+```omar
+type Decision from "./schemas/decision.json"
+team Review[reviewer : Codex] {
+    input request : string
+    output decision : Decision
+    prompt reviewer(request) -> decision "Review $(request)"
+}
+main { review = Review() }
+```
+
+The schema file contains `{"type":"string","enum":["approved","needs_revision"]}`.
+Paths resolve relative to the input `.omar` file, independent of the compiler's
+working directory. Imported schemas are read and validated at compile time and
+embedded as canonical string refinements in bytecode; deployment needs no schema
+file. `list<Decision>` and `option<Decision>` are supported too. Imports cannot
+shadow built-in types or repeat a name. A schema type is for ports: `state` and
+team parameters take built-in types only, because the runtime holds them in
+nothing else, and the compiler rejects a schema type in either position.
+
+A runtime compiles a program from the text it was sent and stages it on its
+own, so the files the program imports have to come with it: `/v1/programs/check`
+and `/v1/runs` take a `files` object mapping each import path to its contents,
+such as `{"schemas/decision.json": "{\"type\":\"string\",\"enum\":[...]}"}`, and
+stage each beside the program. `omar run` fills the map itself, reading each
+`type … from "…"` file from beside the program it was given. A path must be
+relative and stay inside the program's directory, and may not be the program
+file itself. A staged program's own imports are held to the same rule: the
+runtime compiles with `omarc --local-imports`, which refuses an absolute path or
+one that climbs out of the program's directory, so a program sent over the wire
+reads only what came with it, never the host's files. A program whose import is
+not supplied fails the check with an error naming the missing file. Mission
+Control's editor edits one file and sends no `files` yet, so a program typed
+there cannot import; the client API carries the map for callers that have the
+files.
+
+This version supports only a nonempty enum of unique strings. Optional
+`$schema`, `title`, and `description` string metadata is accepted. Other keywords
+are rejected, including `$ref` and object constraints, rather than ignored.
+Object schemas and general Pydantic-generated models are not yet supported.
+
+Named types are aliases: connections compare their expanded type strings, as
+existing OMAR types do. Identical enums with the same value order are compatible;
+different enum orderings are not normalized. The compiler emits internal string
+refinements; schemas are declared externally, not with inline `string in [...]`
+syntax in an OMAR source file. Runtime writes remain ordinary
+strings, not JSON-encoded string documents. The agent is told each enum port's
+type by name, the values it admits, and the schema's title and description, as
+described below. Illegal writes return the allowed values and do not satisfy
+the output contract. This validates vocabulary, not the correctness of a
+decision or its routing.
+
+A Rust code reaction may read an enum port: the value it receives was checked
+against the enum when it was written, and the body sees it as a `String`. It
+cannot write one, because the generated Rust `String` does not enforce enum
+membership; the compiler and the bytecode verifier both reject it. Write such a
+port from an agent prompt. A code reaction carries scalars only, so a `list` or
+`option` port, enum or not, cannot be its trigger or effect; the compiler says
+so rather than leaving it to the verifier.
+
+Each import is also emitted as a `define_type` instruction, before the ports,
+carrying the name, the expanded type, and the schema's `title` and
+`description` when present. A port whose type was written with an imported name
+carries that spelling in a `declared` field beside its expanded `type`, such as
+`"declared": "list<Decision>"`; the verifier checks that the spelling expands to
+the type. The VM checks values against `type` alone. The agent reads the
+spelling: an invocation lists its effects as the program declared them, such as
+`{"review.out":"Decision"}`, adds a `types` header line mapping each name used
+to the type the runtime checks, and describes each named type in prose before
+the prompt: the values it admits, then the title and description the schema
+gave it. Two imports with identical values are distinct names, and the agent is
+told the one the port was declared with.
+
+Pure compiler integrations can use `schemaImports` and
+`compileSourceWithSchemas`, supplying `(import path, JSON contents)` entries.
+`compileSource` remains filesystem-free and reports missing schema contents.

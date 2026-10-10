@@ -1,0 +1,6 @@
+{
+  "title": "Review decision",
+  "description": "Whether the request may go on",
+  "type": "string",
+  "enum": ["continue", "stop"]
+}

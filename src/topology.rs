@@ -53,10 +53,27 @@ pub enum Instruction {
         kind: PortKind,
         #[serde(rename = "type")]
         ty: String,
+        /// The type as the program spelled it, when that names an imported
+        /// type: `list<Decision>` where `ty` is the expanded refinement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        declared: Option<String>,
         #[serde(default)]
         delay: Option<u64>,
         #[serde(default)]
         instance: String,
+    },
+    /// `type Decision from "./schemas/decision.json"`: a name for a type the
+    /// program imported. Ports carry the expanded type, so this changes
+    /// nothing the VM checks; it is how an agent is told `Decision` rather
+    /// than the refinement spelled out, and what the schema said about it.
+    DefineType {
+        name: String,
+        #[serde(rename = "type")]
+        ty: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     /// `state round : int = 0`: a value a reaction keeps between
     /// invocations.
@@ -145,10 +162,27 @@ pub struct PortState {
     pub kind: PortKind,
     #[serde(rename = "type")]
     pub ty: String,
+    /// How the program spelled the type, when that differs from `ty`: the
+    /// name of an imported type, possibly inside `list` or `option`. The VM
+    /// checks `ty`; the agent is told this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<u64>,
     #[serde(default)]
     pub instance: String,
+}
+
+/// A named type the program imported, kept so an agent can be told the name
+/// and what the schema said about it. The VM itself only ever sees `ty`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeState {
+    #[serde(rename = "type")]
+    pub ty: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// `timer t(offset, period)`.
@@ -228,6 +262,9 @@ pub struct VmState {
     pub state_vars: BTreeMap<String, StateVarState>,
     #[serde(default)]
     pub params: BTreeMap<String, ParamState>,
+    /// Named types, by the name the program gave them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub types: BTreeMap<String, TypeState>,
 }
 
 pub fn load_bytecode(path: &std::path::Path) -> Result<Bytecode> {
@@ -237,15 +274,20 @@ pub fn load_bytecode(path: &std::path::Path) -> Result<Bytecode> {
         .with_context(|| format!("invalid bytecode JSON in {}", path.display()))
 }
 
-/// Compile and load an OMAR source program.
+/// Compile and load a program a runtime was sent.
 ///
 /// Installed builds find `omarc` beside the `omar` executable or on `PATH`;
 /// development builds also recognize the compiler built under `lang/.lake`.
-pub fn load_program(path: &Path) -> Result<Bytecode> {
-    load_program_with_compiler(path, None)
+///
+/// Every program a runtime compiles arrived as text: a client sent it, with
+/// the files it imports, and the runtime wrote them down together. What the
+/// program imports is confined to the directory it was written in, so a
+/// program sent over the wire cannot read the host's files by naming them.
+pub fn load_staged_program(path: &Path) -> Result<Bytecode> {
+    load_program_with(path, None)
 }
 
-fn load_program_with_compiler(path: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
+fn load_program_with(path: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("omar") {
         bail!(
             "OMAR programs must use the .omar extension: {}",
@@ -254,6 +296,80 @@ fn load_program_with_compiler(path: &Path, compiler: Option<&Path>) -> Result<By
     }
 
     compile_source(path, compiler)
+}
+
+/// The schema types a program imports: each `type Name from "path"`, with
+/// the path as the program spells it.
+///
+/// A client reads these from beside the program to send them with it. The
+/// compiler is the authority on the syntax; a declaration this scan misses
+/// is reported by the runtime as an import it was not sent.
+pub fn imports_of(source: &str) -> Vec<(String, String)> {
+    let mut imports = Vec::new();
+    for line in source.lines() {
+        let line = line.split("//").next().unwrap_or_default().trim();
+        let Some(rest) = line.strip_prefix("type") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (name, rest) = rest.split_at(name_end);
+        let Some(rest) = rest.trim_start().strip_prefix("from") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        imports.push((name.to_string(), rest[..end].to_string()));
+    }
+    imports
+}
+
+/// Whether an import names a file inside the program's own directory: a
+/// relative path with no `..` component, as `omarc --local-imports` accepts.
+pub fn is_local_import(path: &str) -> bool {
+    use std::path::Component;
+    if path.is_empty() || path.contains('\\') {
+        return false;
+    }
+    let mut named = false;
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(_) => named = true,
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    named
+}
+
+/// The files a program imports, read from beside it and keyed by the path it
+/// imports them under, ready to travel with its text to a runtime.
+///
+/// An import that leaves the program's directory is not read: the runtime
+/// refuses it, and says why.
+pub fn imported_files(program: &Path, source: &str) -> Result<BTreeMap<String, String>> {
+    let directory = program.parent().unwrap_or_else(|| Path::new("."));
+    let mut files = BTreeMap::new();
+    for (name, import) in imports_of(source) {
+        if !is_local_import(&import) {
+            continue;
+        }
+        let text = fs::read_to_string(directory.join(&import)).with_context(|| {
+            format!(
+                "schema type '{name}' imports '{import}', which is not beside {}",
+                program.display()
+            )
+        })?;
+        files.insert(import, text);
+    }
+    Ok(files)
 }
 
 /// Where a program's generated artifacts go.
@@ -337,6 +453,7 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
         .unwrap_or_else(resolve_omarc);
 
     let output = Command::new(&compiler)
+        .arg("--local-imports")
         .arg(source)
         .arg(&draft)
         .output()
@@ -452,6 +569,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
         reactions: BTreeMap::new(),
         state_vars: BTreeMap::new(),
         params: BTreeMap::new(),
+        types: BTreeMap::new(),
     };
     let mut committed = false;
 
@@ -524,6 +642,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 name,
                 kind,
                 ty,
+                declared,
                 delay,
                 instance,
             } => {
@@ -531,6 +650,20 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 check_instance(&state, "port", name, instance)?;
                 if ty.trim().is_empty() {
                     bail!("port '{name}' has an empty type");
+                }
+                check_type("port", name, ty)?;
+                // The spelling is shown to the agent in place of the type, so
+                // it has to be the type: every name in it a type this plan
+                // defined, expanding to exactly `ty`.
+                if let Some(declared) = declared {
+                    let definitions: BTreeMap<String, String> = state
+                        .types
+                        .iter()
+                        .map(|(name, defined)| (name.clone(), defined.ty.clone()))
+                        .collect();
+                    if rename_type(declared, &definitions) != *ty {
+                        bail!("port '{name}' is declared as '{declared}', which is not {ty}");
+                    }
                 }
                 if delay.is_some() && *kind != PortKind::Action {
                     bail!("only action ports may declare a fixed delay");
@@ -542,6 +675,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                         PortState {
                             kind: *kind,
                             ty: ty.clone(),
+                            declared: declared.clone(),
                             delay: *delay,
                             instance: instance.clone(),
                         },
@@ -549,6 +683,32 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                     .is_some()
                 {
                     bail!("duplicate port '{name}'");
+                }
+            }
+            Instruction::DefineType {
+                name,
+                ty,
+                title,
+                description,
+            } => {
+                require_identifier("type", name)?;
+                if ty.trim().is_empty() {
+                    bail!("type '{name}' has an empty definition");
+                }
+                check_type("type", name, ty)?;
+                if state
+                    .types
+                    .insert(
+                        name.clone(),
+                        TypeState {
+                            ty: ty.clone(),
+                            title: title.clone(),
+                            description: description.clone(),
+                        },
+                    )
+                    .is_some()
+                {
+                    bail!("duplicate type '{name}'");
                 }
             }
             Instruction::DeclareState {
@@ -819,6 +979,21 @@ fn reject_bodies_that_cannot_be_generated(state: &VmState) -> Result<()> {
                     .filter(|(_, param)| mine(&param.instance))
                     .map(|(name, param)| (name, &param.ty)),
             );
+
+        // A body may read a refined string: what arrives was already checked
+        // against the refinement when it was written. It may not write one,
+        // because the Rust `String` it would write through admits anything.
+        for effect in &reaction.effects {
+            if let Some(ty) = state.ports.get(effect).map(|port| &port.ty) {
+                if is_refined(ty) {
+                    bail!(
+                        "reaction '{id}' has a body and writes '{effect}', which is \
+                         {ty}; a body's String does not enforce the values it admits, \
+                         so an enum port is written by a prompt"
+                    );
+                }
+            }
+        }
 
         for (name, ty) in bound {
             if !crate::reaction::supports_type(ty) {
@@ -1411,7 +1586,64 @@ fn validate_invocation_owner(team: &str, agent: &str, invocation: &InvocationRec
     Ok(())
 }
 
+/// The values a refined string type admits, or `None` if `ty` is not one.
+///
+/// A refinement travels inside the flat type string -- `string in ["a","b"]` --
+/// rather than in a field of its own. Nothing downstream has to learn a new
+/// shape: the bytecode's `type` stays a string, and connection checking stays
+/// equality over the canonical spelling `omarc` emits.
+pub(crate) fn string_enum(ty: &str) -> Option<Vec<String>> {
+    serde_json::from_str(ty.strip_prefix("string in ")?).ok()
+}
+
+/// Whether `ty` is, or wraps, a refined string.
+fn is_refined(ty: &str) -> bool {
+    leaf_type(ty).starts_with("string in ")
+}
+
+/// `ty` with its `list` and `option` wrappers taken off.
+fn leaf_type(ty: &str) -> &str {
+    for outer in ["list", "option"] {
+        if let Some(inner) = generic_inner(ty, outer) {
+            return leaf_type(inner);
+        }
+    }
+    ty
+}
+
+/// `ty` with each leaf that `names` maps replaced, `list` and `option`
+/// wrappers kept: `list<string in ["a"]>` is `list<Decision>` under
+/// `{"string in [\"a\"]": "Decision"}`, and the reverse map turns it back.
+pub(crate) fn rename_type(ty: &str, names: &BTreeMap<String, String>) -> String {
+    for outer in ["list", "option"] {
+        if let Some(inner) = generic_inner(ty, outer) {
+            return format!("{outer}<{}>", rename_type(inner, names));
+        }
+    }
+    names.get(ty).cloned().unwrap_or_else(|| ty.to_string())
+}
+
 fn validate_value(ty: &str, value: &Value) -> Result<()> {
+    if let Some(allowed) = string_enum(ty) {
+        // The agent acts on this message, so it names every legal answer
+        // rather than only reporting that this one was wrong.
+        let text = value
+            .as_str()
+            .with_context(|| format!("expected {ty}, got {value}"))?;
+        // `omarc` rejects an empty refinement, so this is reachable only from
+        // hand-written bytecode. Say what is wrong with the port rather than
+        // offering the agent a choice of nothing.
+        if allowed.is_empty() {
+            bail!("port type {ty} admits no value");
+        }
+        if !allowed.iter().any(|option| option == text) {
+            // Quoted by serde rather than by hand: an admitted value may itself
+            // contain a quote or a newline, and the agent reads this message.
+            let options: Vec<String> = allowed.iter().map(|o| json!(o).to_string()).collect();
+            bail!("expected one of {}, got {value}", options.join(", "));
+        }
+        return Ok(());
+    }
     if let Some(inner) = generic_inner(ty, "list") {
         let values = value
             .as_array()
@@ -1442,6 +1674,50 @@ fn validate_value(ty: &str, value: &Value) -> Result<()> {
         bail!("expected {ty}, got {value}");
     }
     Ok(())
+}
+
+/// Reject a type the VM cannot check a value against, wherever the fault sits.
+///
+/// `validate_value` looks inside `list` and `option`, so this has to as well,
+/// or a nested fault would reach the agent and be reported against the value
+/// it wrote rather than against the port. A refinement that does not parse is
+/// a broken port, not a plain `string`; saying so once, here, keeps
+/// `string_enum` free to answer "not refined" everywhere downstream. And what
+/// the wrappers come off to has to be a type the VM knows: `list<string>>` is
+/// a list of nothing it can check.
+fn check_type(what: &str, name: &str, ty: &str) -> Result<()> {
+    for outer in ["list", "option"] {
+        if ty.starts_with(&format!("{outer}<")) {
+            let Some(inner) = generic_inner(ty, outer) else {
+                bail!("{what} '{name}' has an invalid type '{ty}'");
+            };
+            return check_type(what, name, inner);
+        }
+    }
+    if let Some(list) = ty.strip_prefix("string in ") {
+        return match serde_json::from_str::<Vec<String>>(list) {
+            Ok(values) if values.is_empty() => bail!("{what} '{name}' admits no value"),
+            Ok(values) => {
+                // `omarc` refuses a duplicate; so does the plan, or the bytecode
+                // is the one place the rule does not hold.
+                let mut seen = BTreeSet::new();
+                for value in &values {
+                    if !seen.insert(value) {
+                        bail!(
+                            "{what} '{name}' has a duplicate enum value {}",
+                            json!(value)
+                        );
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => bail!("{what} '{name}' has an invalid string refinement: {error}"),
+        };
+    }
+    match ty {
+        "signal" | "bool" | "int" | "float" | "string" | "path" | "bytes" => Ok(()),
+        _ => bail!("{what} '{name}' has an invalid type '{ty}'"),
+    }
 }
 
 fn generic_inner<'a>(ty: &'a str, outer: &str) -> Option<&'a str> {
@@ -1566,6 +1842,13 @@ struct InvocationSpec {
     agent: String,
     trigger_values: BTreeMap<String, Value>,
     allowed_effects: BTreeMap<String, String>,
+    /// Each effect's type as the program spelled it -- `Decision` where
+    /// `allowed_effects` has the refinement it expands to -- which is what the
+    /// agent is shown.
+    effect_names: BTreeMap<String, String>,
+    /// The named types those spellings use, so the agent is told what the
+    /// schema said about each.
+    types: BTreeMap<String, TypeState>,
     /// Its instance's state variables as they stand, which a code body reads
     /// as `self`.
     state_values: BTreeMap<String, Value>,
@@ -1636,14 +1919,7 @@ impl ReactionExecutor for AgentReactionExecutor {
         // follows is the same either way — a client answering is a slow agent,
         // and the registry does not care which kind it is waiting on.
         if !self.web.contains(&invocation.agent) {
-            let message = format!(
-                "OMAR INVOCATION\ninvocation_id: {}\ntriggers: {}\neffects: {}\ncontract: {}\n\n{}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. For a signal effect, set its value to null. Do not address another agent directly.",
-                invocation.id,
-                serde_json::to_string(&invocation.trigger_values)?,
-                serde_json::to_string(&invocation.allowed_effects)?,
-                invocation.contract,
-                rendered
-            );
+            let message = invocation_message(&invocation, &rendered)?;
             let session = self.client.session_for(&invocation.agent);
             if let Err(error) = self
                 .client
@@ -2319,6 +2595,12 @@ pub fn parse_inputs(state: &VmState, raw_inputs: &[String]) -> Result<BTreeMap<S
 }
 
 fn parse_input_value(ty: &str, value: &str) -> Result<Value> {
+    // A refined string is still supplied as bare text on the command line;
+    // whether it is one of the values the port admits is `validate_value`'s
+    // answer, not the parser's.
+    if string_enum(ty).is_some() {
+        return Ok(Value::String(value.to_string()));
+    }
     match ty {
         "bool" => Ok(Value::Bool(value.parse()?)),
         "int" => Ok(json!(value.parse::<i64>()?)),
@@ -2970,17 +3252,22 @@ fn invocation_spec(
                 .map(|value| (trigger.clone(), value.clone()))
         })
         .collect();
-    let allowed_effects = reaction
-        .effects
-        .iter()
-        .map(|effect| {
-            let port = state
-                .ports
-                .get(effect)
-                .with_context(|| format!("unknown effect port '{effect}'"))?;
-            Ok((effect.clone(), port.ty.clone()))
-        })
-        .collect::<Result<_>>()?;
+    let mut allowed_effects = BTreeMap::new();
+    let mut effect_names = BTreeMap::new();
+    for effect in &reaction.effects {
+        let port = state
+            .ports
+            .get(effect)
+            .with_context(|| format!("unknown effect port '{effect}'"))?;
+        allowed_effects.insert(effect.clone(), port.ty.clone());
+        // As the program spelled it, so the agent reads `Decision` rather
+        // than the refinement it expands to.
+        effect_names.insert(
+            effect.clone(),
+            port.declared.clone().unwrap_or_else(|| port.ty.clone()),
+        );
+    }
+    let types = types_for_effects(state, &effect_names);
     // Only its own instance's: a body reaches state through `self`.
     let state_values = state
         .state_vars
@@ -2994,11 +3281,91 @@ fn invocation_spec(
         agent: reaction.agent.clone(),
         trigger_values,
         allowed_effects,
+        effect_names,
+        types,
         state_values,
         contract: reaction.contract.clone(),
         prompt: reaction.prompt.clone(),
         within: reaction.within.map(Duration::from_nanos),
     })
+}
+
+/// The message an agent is handed, with `rendered` as its prompt.
+///
+/// The header is one `key: value` per line up to the first blank line, which
+/// is what the stub agent parses. Effects are spelled as the program declared
+/// them, and `types` maps each name used back to the type the runtime checks.
+/// What the schema said about a type follows the header, where the agent
+/// reads it as prose.
+fn invocation_message(invocation: &InvocationSpec, rendered: &str) -> Result<String> {
+    let mut header = format!(
+        "OMAR INVOCATION\ninvocation_id: {}\ntriggers: {}\neffects: {}\n",
+        invocation.id,
+        serde_json::to_string(&invocation.trigger_values)?,
+        serde_json::to_string(&invocation.effect_names)?,
+    );
+    let mut described = String::new();
+    if !invocation.types.is_empty() {
+        header.push_str(&format!(
+            "types: {}\n",
+            serde_json::to_string(&invocation.types)?
+        ));
+        for (name, declared) in &invocation.types {
+            described.push_str(&describe_type(name, declared));
+            described.push('\n');
+        }
+        described.push('\n');
+    }
+    header.push_str(&format!("contract: {}\n", invocation.contract));
+    Ok(format!(
+        "{header}\n{described}{rendered}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. For a signal effect, set its value to null. Do not address another agent directly."
+    ))
+}
+
+/// One line saying what a named type admits and what its schema said.
+fn describe_type(name: &str, declared: &TypeState) -> String {
+    let mut line = match string_enum(&declared.ty) {
+        Some(allowed) => {
+            // Quoted by serde: an admitted value may contain a quote.
+            let options: Vec<String> = allowed.iter().map(|o| json!(o).to_string()).collect();
+            format!("Type {name} is one of {}.", options.join(", "))
+        }
+        None => format!("Type {name} is {}.", declared.ty),
+    };
+    if let Some(title) = declared
+        .title
+        .as_deref()
+        .filter(|t| !t.is_empty() && *t != name)
+    {
+        line.push_str(&format!(" Title: {title}."));
+    }
+    if let Some(description) = declared.description.as_deref().filter(|d| !d.is_empty()) {
+        line.push_str(&format!(" {}", description.trim()));
+        if !description.trim().ends_with('.') {
+            line.push('.');
+        }
+    }
+    line
+}
+
+/// The named types the effects' spellings use.
+///
+/// By name, not by what the name expands to: two imports may define the same
+/// values, and the agent is told the one the program wrote.
+fn types_for_effects(
+    state: &VmState,
+    effect_names: &BTreeMap<String, String>,
+) -> BTreeMap<String, TypeState> {
+    let named: BTreeSet<&str> = effect_names
+        .values()
+        .map(|spelled| leaf_type(spelled))
+        .collect();
+    state
+        .types
+        .iter()
+        .filter(|(name, _)| named.contains(name.as_str()))
+        .map(|(name, defined)| (name.clone(), defined.clone()))
+        .collect()
 }
 
 fn render_prompt(template: &str, values: &BTreeMap<String, Value>) -> Result<String> {
@@ -3215,8 +3582,8 @@ mod tests {
         let bytecode_path = directory.path().join("workflow.json");
         fs::write(&bytecode_path, serde_json::to_vec(&program()).unwrap()).unwrap();
 
-        let error = load_program_with_compiler(&bytecode_path, Some(Path::new("missing-omarc")))
-            .unwrap_err();
+        let error =
+            load_program_with(&bytecode_path, Some(Path::new("missing-omarc"))).unwrap_err();
 
         assert!(error.to_string().contains("must use the .omar extension"));
     }
@@ -3230,14 +3597,208 @@ mod tests {
         let source_path = directory.path().join("workflow.omar");
         fs::write(&source_path, serde_json::to_vec(&program()).unwrap()).unwrap();
         let compiler_path = directory.path().join("omarc");
-        fs::write(&compiler_path, "#!/bin/sh\ncp \"$1\" \"$2\"\n").unwrap();
+        // omarc [options] <input> <output>: the files are the last two arguments.
+        fs::write(
+            &compiler_path,
+            "#!/bin/sh\nshift $(($# - 2))\ncp \"$1\" \"$2\"\n",
+        )
+        .unwrap();
         let mut permissions = fs::metadata(&compiler_path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&compiler_path, permissions).unwrap();
 
-        let loaded = load_program_with_compiler(&source_path, Some(&compiler_path)).unwrap();
+        let loaded = load_program_with(&source_path, Some(&compiler_path)).unwrap();
 
         assert_eq!(loaded.team, "Demo");
+    }
+
+    #[test]
+    fn external_schema_compiles_and_enforces_the_imported_enum() {
+        let compiler = Path::new(env!("CARGO_MANIFEST_DIR")).join("lang/.lake/build/bin/omarc");
+        if !compiler.exists() {
+            eprintln!("skipping: {} has not been built", compiler.display());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let schema = directory.path().join("decision.json");
+        let source = directory.path().join("review.omar");
+        fs::write(
+            &schema,
+            r#"{"type":"string","enum":["approved","needs_revision"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &source,
+            r#"
+            type Decision from "decision.json"
+            team Review[reviewer : Codex] {
+                input request : string
+                output decision : Decision
+                prompt reviewer(request) -> decision "Review $(request)"
+            }
+            main { review = Review() }
+        "#,
+        )
+        .unwrap();
+        let bytecode = load_program_with(&source, Some(&compiler)).unwrap();
+        let plan = verify(&bytecode).unwrap();
+        let ty = &plan.ports["review.decision"].ty;
+        assert_eq!(ty, r#"string in ["approved","needs_revision"]"#);
+        assert_eq!(
+            plan.ports["review.decision"].declared.as_deref(),
+            Some("Decision")
+        );
+        // The name survives to the plan, so the agent can be told it.
+        assert_eq!(
+            plan.types["Decision"],
+            TypeState {
+                ty: ty.clone(),
+                title: None,
+                description: None,
+            }
+        );
+        validate_value(ty, &json!("approved")).unwrap();
+        let error = validate_value(ty, &json!("approved with revisions"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs_revision"), "{error}");
+        assert!(validate_value(ty, &json!({"decision":"approved"})).is_err());
+        // The bytecode embeds constraints; deployed validation needs no file.
+        fs::remove_file(&schema).unwrap();
+        validate_value(ty, &json!("needs_revision")).unwrap();
+        let error = load_program_with(&source, Some(&compiler))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("decision.json"), "{error}");
+        fs::write(
+            &schema,
+            r#"{"type":"string","enum":["approved"],"minLength":20}"#,
+        )
+        .unwrap();
+        let error = load_program_with(&source, Some(&compiler))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported JSON Schema keyword"), "{error}");
+    }
+
+    #[test]
+    fn a_staged_program_imports_from_its_own_directory_only() {
+        let compiler = Path::new(env!("CARGO_MANIFEST_DIR")).join("lang/.lake/build/bin/omarc");
+        if !compiler.exists() {
+            eprintln!("skipping: {} has not been built", compiler.display());
+            return;
+        }
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("decision.json");
+        fs::write(
+            &elsewhere,
+            r#"{"type":"string","enum":["approved","needs_revision"]}"#,
+        )
+        .unwrap();
+        let directory = outside.path().join("staged");
+        fs::create_dir_all(directory.join("schemas")).unwrap();
+        fs::copy(&elsewhere, directory.join("schemas/decision.json")).unwrap();
+        let program = |import: &str| {
+            format!(
+                r#"
+                type Decision from "{import}"
+                team Review[reviewer : Codex] {{
+                    input request : string
+                    output decision : Decision
+                    prompt reviewer(request) -> decision "Review $(request)"
+                }}
+                main {{ review = Review() }}
+            "#
+            )
+        };
+        let source = directory.join("review.omar");
+
+        // A staged program reads only what came with it.
+        for import in [
+            elsewhere.display().to_string(),
+            "../decision.json".to_string(),
+            "schemas/../../decision.json".to_string(),
+            "schemas\\decision.json".to_string(),
+        ] {
+            fs::write(&source, program(&import)).unwrap();
+            let error = load_program_with(&source, Some(&compiler))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("inside the program's directory"),
+                "{import} gave {error}"
+            );
+        }
+        for import in ["schemas/decision.json", "./schemas/decision.json"] {
+            fs::write(&source, program(import)).unwrap();
+            load_program_with(&source, Some(&compiler)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_program_s_imports_are_read_from_beside_it_to_travel_with_it() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("schemas")).unwrap();
+        let decision = r#"{"type":"string","enum":["continue","stop"]}"#;
+        let priority = r#"{"type":"string","enum":["high","low"]}"#;
+        fs::write(directory.path().join("schemas/decision.json"), decision).unwrap();
+        fs::write(directory.path().join("priority.json"), priority).unwrap();
+        let program = directory.path().join("review.omar");
+        let source = r#"
+            // type Commented from "schemas/nowhere.json"
+            type Decision from "./schemas/decision.json" // the route
+            type   Priority   from   "priority.json"
+            type Elsewhere from "/etc/hostname"
+            type Above from "../decision.json"
+            team Review[reviewer : Codex] {
+                input request : string
+                output decision : Decision
+                prompt reviewer(request) -> decision "Review $(request)"
+            }
+            main { review = Review() }
+        "#;
+
+        assert_eq!(
+            imports_of(source),
+            vec![
+                (
+                    "Decision".to_string(),
+                    "./schemas/decision.json".to_string()
+                ),
+                ("Priority".to_string(), "priority.json".to_string()),
+                ("Elsewhere".to_string(), "/etc/hostname".to_string()),
+                ("Above".to_string(), "../decision.json".to_string()),
+            ]
+        );
+        // Imports outside the directory are left for the compiler to refuse.
+        let files = imported_files(&program, source).unwrap();
+        assert_eq!(
+            files,
+            BTreeMap::from([
+                ("./schemas/decision.json".to_string(), decision.to_string()),
+                ("priority.json".to_string(), priority.to_string()),
+            ])
+        );
+
+        let error = imported_files(&program, r#"type Missing from "schemas/missing.json""#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'Missing'"), "{error}");
+        assert!(error.contains("schemas/missing.json"), "{error}");
+        assert!(error.contains("review.omar"), "{error}");
+
+        for local in ["decision.json", "./a/b.json", "a/./b.json"] {
+            assert!(is_local_import(local), "{local}");
+        }
+        for foreign in [
+            "",
+            "/etc/hostname",
+            "../x.json",
+            "a/../../x.json",
+            "a\\b.json",
+        ] {
+            assert!(!is_local_import(foreign), "{foreign}");
+        }
     }
 
     #[test]
@@ -3248,11 +3809,327 @@ mod tests {
         assert_eq!(state.reactions.len(), 1);
     }
 
+    /// A plan with one named enum type and a body reaction that reads or
+    /// writes a port of it.
+    fn body_with_enum(kind: &str, triggers: &str, effects: &str) -> Bytecode {
+        serde_json::from_str(&format!(
+            r#"{{
+              "version": 1,
+              "team": "Desk",
+              "instructions": [
+                {{"op":"begin_plan","team":"Desk"}},
+                {{"op":"define_type","name":"Decision",
+                  "type":"string in [\"continue\",\"stop\"]",
+                  "description":"Whether to go on"}},
+                {{"op":"define_port","kind":"input","name":"token","type":"string"}},
+                {{"op":"define_port","kind":"{kind}","name":"decision",
+                  "type":"string in [\"continue\",\"stop\"]","declared":"Decision"}},
+                {{"op":"define_port","kind":"output","name":"memo","type":"string"}},
+                {{"op":"install_reaction","id":"reaction.0","agent":"",
+                 "triggers":{triggers},"effects":{effects},
+                 "contract":"","prompt":"","body":"memo = Some(String::new());"}},
+                {{"op":"commit_plan"}}
+              ]
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_body_may_read_an_enum_port_but_not_write_one() {
+        let plan = verify(&body_with_enum("input", r#"["decision"]"#, r#"["memo"]"#)).unwrap();
+        assert_eq!(
+            plan.types["Decision"].ty,
+            r#"string in ["continue","stop"]"#
+        );
+        assert_eq!(
+            plan.types["Decision"].description.as_deref(),
+            Some("Whether to go on")
+        );
+        assert!(crate::reaction::supports_type(
+            r#"string in ["continue","stop"]"#
+        ));
+
+        let error = verify(&body_with_enum("output", r#"["token"]"#, r#"["decision"]"#))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("writes 'decision'"), "{error}");
+        assert!(error.contains("does not enforce"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_duplicate_or_malformed_named_type() {
+        for (extra, expected) in [
+            (
+                r#"{"op":"define_type","name":"Decision","type":"string"}"#,
+                "duplicate type",
+            ),
+            (
+                r#"{"op":"define_type","name":"Broken","type":"string in [oops"}"#,
+                "invalid string refinement",
+            ),
+            (
+                r#"{"op":"define_type","name":"Blank","type":" "}"#,
+                "empty definition",
+            ),
+        ] {
+            let mut program = body_with_enum("input", r#"["decision"]"#, r#"["memo"]"#);
+            program
+                .instructions
+                .insert(2, serde_json::from_str(extra).unwrap());
+            let error = verify(&program).unwrap_err().to_string();
+            assert!(error.contains(expected), "{extra} gave {error}");
+        }
+    }
+
+    #[test]
+    fn a_declared_spelling_has_to_be_the_type() {
+        for (declared, expected) in [
+            ("Verdict", "declared as 'Verdict'"),
+            ("list<Decision>", "declared as 'list<Decision>'"),
+            ("string", "declared as 'string'"),
+        ] {
+            let mut program = body_with_enum("input", r#"["decision"]"#, r#"["memo"]"#);
+            let Instruction::DefinePort {
+                declared: spelled, ..
+            } = &mut program.instructions[3]
+            else {
+                panic!("fixture moved");
+            };
+            *spelled = Some(declared.to_string());
+            let error = verify(&program).unwrap_err().to_string();
+            assert!(error.contains(expected), "{declared} gave {error}");
+        }
+    }
+
+    #[test]
+    fn two_imports_of_the_same_values_keep_their_own_names() {
+        // `A` and `B` expand to one refinement. The agent is told the one the
+        // program wrote on the port, not whichever sorts last.
+        let bytecode: Bytecode = serde_json::from_str(
+            r#"{
+              "version": 1,
+              "team": "Desk",
+              "instructions": [
+                {"op":"begin_plan","team":"Desk"},
+                {"op":"define_type","name":"A","type":"string in [\"x\",\"y\"]","description":"the first"},
+                {"op":"define_type","name":"B","type":"string in [\"x\",\"y\"]","description":"the second"},
+                {"op":"spawn_agent","name":"clerk","backend":"Codex"},
+                {"op":"define_port","kind":"input","name":"topic","type":"string"},
+                {"op":"define_port","kind":"output","name":"out",
+                 "type":"string in [\"x\",\"y\"]","declared":"B"},
+                {"op":"install_reaction","id":"reaction.0","agent":"clerk",
+                 "triggers":["topic"],"effects":["out"],"contract":"out","prompt":"p"},
+                {"op":"commit_plan"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let plan = verify(&bytecode).unwrap();
+        let reaction = plan.reactions.get_key_value("reaction.0").unwrap();
+        let spec = invocation_spec(
+            &plan,
+            reaction,
+            &BTreeMap::from([("topic".to_string(), json!("t"))]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(spec.effect_names["out"], "B");
+        assert_eq!(spec.types.keys().collect::<Vec<_>>(), vec!["B"]);
+        let message = invocation_message(&spec, "p").unwrap();
+        assert!(message.contains(r#"effects: {"out":"B"}"#), "{message}");
+        assert!(
+            message.contains("Type B is one of \"x\", \"y\". the second."),
+            "{message}"
+        );
+        assert!(!message.contains("the first"), "{message}");
+    }
+
+    #[test]
+    fn an_agent_is_told_the_type_name_and_what_the_schema_said() {
+        let decision = TypeState {
+            ty: r#"string in ["continue","stop"]"#.into(),
+            title: Some("Review decision".into()),
+            description: Some("Whether the request may go on".into()),
+        };
+        let spec = InvocationSpec {
+            id: "inv-1".into(),
+            reaction_id: "reaction.0".into(),
+            agent: "clerk".into(),
+            trigger_values: BTreeMap::from([("topic".to_string(), json!("hi"))]),
+            allowed_effects: BTreeMap::from([
+                ("out".to_string(), decision.ty.clone()),
+                ("all".to_string(), format!("list<{}>", decision.ty)),
+                ("memo".to_string(), "string".to_string()),
+            ]),
+            effect_names: BTreeMap::from([
+                ("out".to_string(), "Decision".to_string()),
+                ("all".to_string(), "list<Decision>".to_string()),
+                ("memo".to_string(), "string".to_string()),
+            ]),
+            types: BTreeMap::from([("Decision".to_string(), decision.clone())]),
+            state_values: BTreeMap::new(),
+            contract: "out".into(),
+            prompt: "Decide.".into(),
+            within: None,
+        };
+        let message = invocation_message(&spec, "Decide.").unwrap();
+        let header: Vec<&str> = message
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .collect();
+        assert_eq!(header[0], "OMAR INVOCATION");
+        assert!(header.contains(&"invocation_id: inv-1"), "{message}");
+        assert!(
+            header
+                .contains(&r#"effects: {"all":"list<Decision>","memo":"string","out":"Decision"}"#),
+            "{message}"
+        );
+        assert!(
+            header.contains(&r#"types: {"Decision":{"type":"string in [\"continue\",\"stop\"]","title":"Review decision","description":"Whether the request may go on"}}"#),
+            "{message}"
+        );
+        assert!(header.contains(&"contract: out"), "{message}");
+        // The prose the agent reads comes after the header, before the prompt.
+        let body = &message[message.find("\n\n").unwrap() + 2..];
+        assert!(
+            body.starts_with(
+                "Type Decision is one of \"continue\", \"stop\". Title: Review decision. Whether the request may go on.\n\nDecide."
+            ),
+            "{body}"
+        );
+
+        // Only the types the effects use are mentioned, and a program with
+        // none reads as it always did.
+        let plain = InvocationSpec {
+            types: BTreeMap::new(),
+            allowed_effects: BTreeMap::from([("memo".to_string(), "string".to_string())]),
+            effect_names: BTreeMap::from([("memo".to_string(), "string".to_string())]),
+            ..spec
+        };
+        let message = invocation_message(&plain, "Decide.").unwrap();
+        assert!(!message.contains("types:"), "{message}");
+        assert!(
+            message.contains(
+                "effects: {\"memo\":\"string\"}\ncontract: out\n\nDecide.\n\nUse omar_set_port"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn only_types_the_effects_use_are_offered() {
+        let plan = verify(&body_with_enum("output", r#"["token"]"#, r#"["memo"]"#)).unwrap();
+        let reaction = plan.reactions.get_key_value("reaction.0").unwrap();
+        let spec = invocation_spec(
+            &plan,
+            reaction,
+            &BTreeMap::from([("token".to_string(), json!("t"))]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(spec.types.is_empty(), "{:?}", spec.types);
+    }
+
+    #[test]
+    fn rejects_a_port_whose_refinement_does_not_parse() {
+        // `omarc` cannot emit either of these. Hand-written bytecode can, and
+        // the port is what is wrong -- not the first value written to it.
+        for (ty, expected) in [
+            (r#"string in [oops"#, "invalid string refinement"),
+            (r#"string in [1,2]"#, "invalid string refinement"),
+            (r#"string in []"#, "admits no value"),
+            // `validate_value` looks inside these, so `verify` must too.
+            (r#"list<string in [oops>"#, "invalid string refinement"),
+            (r#"list<string in [oops"#, "invalid type"),
+            (r#"option<string in ["a"]"#, "invalid type"),
+            (r#"list<>"#, "invalid type"),
+            (r#"option<>"#, "invalid type"),
+            // One `>` too many leaves `string>`, which is not a type.
+            (r#"list<string>>"#, "invalid type"),
+            (r#"option<int>>"#, "invalid type"),
+            (r#"list<option<int>>>"#, "invalid type"),
+            (r#"list<strin>"#, "invalid type"),
+            (r#"text"#, "invalid type"),
+            (r#"string in ["a","a"]"#, "duplicate enum value"),
+            (r#"list<string in ["a","b","a"]>"#, "duplicate enum value"),
+            (r#"list<option<string in [oops>"#, "invalid type"),
+            (r#"option<string in []>"#, "admits no value"),
+            (
+                r#"list<option<string in [1,2]>>"#,
+                "invalid string refinement",
+            ),
+        ] {
+            let mut program = program();
+            program.instructions[2] = serde_json::from_str(&format!(
+                r#"{{"op":"define_port","kind":"input","name":"request","type":{}}}"#,
+                serde_json::to_string(ty).unwrap()
+            ))
+            .unwrap();
+            let error = verify(&program).unwrap_err().to_string();
+            assert!(error.contains(expected), "{ty} gave {error}");
+        }
+    }
+
     #[test]
     fn rejects_incomplete_topology() {
         let mut program = program();
         program.instructions.pop();
         assert!(verify(&program).is_err());
+    }
+
+    #[test]
+    fn a_refined_string_admits_only_what_it_lists() {
+        let ty = "string in [\"continue\",\"stop\"]";
+        validate_value(ty, &json!("continue")).unwrap();
+        validate_value(ty, &json!("stop")).unwrap();
+
+        // The failure the refinement exists for: a value that is a perfectly
+        // good string and not one of the answers the port accepts.
+        let rejected = validate_value(ty, &json!("this is a terminal record, not a forward"))
+            .unwrap_err()
+            .to_string();
+        assert!(rejected.contains("\"continue\""), "{rejected}");
+        assert!(rejected.contains("\"stop\""), "{rejected}");
+
+        assert!(validate_value(ty, &json!(1)).is_err());
+        validate_value("list<string in [\"a\",\"b\"]>", &json!(["a", "b"])).unwrap();
+        assert!(validate_value("list<string in [\"a\",\"b\"]>", &json!(["c"])).is_err());
+    }
+
+    #[test]
+    fn enum_cli_inputs_are_bare_text_and_still_validate_membership() {
+        let ty = r#"string in ["continue","stop"]"#;
+        let value = parse_input_value(ty, "continue").unwrap();
+        assert_eq!(value, json!("continue"));
+        validate_value(ty, &value).unwrap();
+        for raw in ["unknown", r#""continue""#] {
+            let value = parse_input_value(ty, raw).unwrap();
+            assert_eq!(value, json!(raw));
+            assert!(validate_value(ty, &value).is_err());
+        }
+        let nested = "list<string in [\"continue\",\"stop\"]>";
+        let value = parse_input_value(nested, r#"["continue","stop"]"#).unwrap();
+        validate_value(nested, &value).unwrap();
+        assert!(parse_input_value(nested, "continue").is_err());
+    }
+
+    #[test]
+    fn a_refinement_reports_awkward_values_readably() {
+        // An admitted value may contain a quote or a newline, and the agent
+        // reads the rejection, so the options are quoted by serde.
+        let ty = r#"string in ["say \"hi\"","two\nlines"]"#;
+        validate_value(ty, &json!("say \"hi\"")).unwrap();
+        let rejected = validate_value(ty, &json!("no")).unwrap_err().to_string();
+        assert!(rejected.contains(r#""say \"hi\"""#), "{rejected}");
+        assert!(rejected.contains(r#""two\nlines""#), "{rejected}");
+
+        // `omarc` rejects an empty refinement; hand-written bytecode can still
+        // carry one, and it is the port that is wrong, not the value.
+        let empty = validate_value("string in []", &json!("anything"))
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("admits no value"), "{empty}");
     }
 
     #[test]
@@ -3341,6 +4218,7 @@ mod tests {
             team: "HR".into(),
             state_vars: BTreeMap::new(),
             params: BTreeMap::new(),
+            types: BTreeMap::new(),
             instances: BTreeMap::new(),
             timers: BTreeMap::new(),
             agents: BTreeMap::from([
@@ -3383,6 +4261,7 @@ mod tests {
                 PortState {
                     kind,
                     ty: ty.into(),
+                    declared: None,
                     delay: None,
                     instance: String::new(),
                 },
@@ -5061,6 +5940,86 @@ mod tests {
         let writes = completion.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(writes["opinion"], json!("second"));
         server.registry.remove("invocation-1");
+    }
+
+    #[test]
+    fn a_rejected_refinement_can_be_corrected_over_the_invocation_protocol() {
+        let server = InvocationServer::start().unwrap();
+        let context = TopologyMcpContext {
+            team: "Recovery".into(),
+            agent: "worker".into(),
+            endpoint: server.endpoint.clone(),
+            token: server.token.clone(),
+        };
+        let completion = server
+            .registry
+            .register(InvocationRecord {
+                id: "retry-1".into(),
+                team: "Recovery".into(),
+                agent: "worker".into(),
+                reaction: "reaction.0".into(),
+                contract: "decision".into(),
+                allowed_effects: BTreeMap::from([(
+                    "decision".into(),
+                    r#"string in ["continue","stop"]"#.into(),
+                )]),
+                trigger_values: BTreeMap::new(),
+                prompt: "Choose a permitted decision.".into(),
+                writes: BTreeMap::new(),
+                completed: false,
+            })
+            .unwrap();
+
+        // Exercise the real socket path, not just validate_value.
+        let error = mcp_set_port(
+            &context,
+            json!({
+                "invocation_id": "retry-1", "port": "decision",
+                "value": "this is a terminal record, not a forward"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("decision"), "{error}");
+        assert!(error.contains("expected one of"), "{error}");
+        assert!(error.contains("\"continue\""), "{error}");
+        assert!(error.contains("\"stop\""), "{error}");
+
+        // Rejection must not satisfy the required output or release a result.
+        let error = mcp_complete(&context, json!({"invocation_id": "retry-1"}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("effect contract 'decision' is not satisfied"),
+            "{error}"
+        );
+        assert!(matches!(
+            completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(!server.registry.answered("retry-1"));
+
+        let response = mcp_set_port(
+            &context,
+            json!({
+                "invocation_id": "retry-1", "port": "decision", "value": "continue"
+            }),
+        )
+        .unwrap();
+        assert_eq!(response["status"], json!("buffered"));
+        assert!(matches!(
+            completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let response = mcp_complete(&context, json!({"invocation_id": "retry-1"})).unwrap();
+        assert_eq!(response["status"], json!("complete"));
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(1)).unwrap(),
+            BTreeMap::from([("decision".into(), json!("continue"))])
+        );
+        assert!(server.registry.answered("retry-1"));
+        server.registry.remove("retry-1");
     }
 
     #[test]

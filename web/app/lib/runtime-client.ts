@@ -206,7 +206,17 @@ export async function checkProgram(
   serveUrl: string,
   program: string,
   filename: string,
-  options: { timeline?: boolean; present?: string[] } = {},
+  options: {
+    timeline?: boolean;
+    present?: string[];
+    /**
+     * Files the program imports, by the relative path it imports them under.
+     * The daemon stages the program alone, so what it imports has to come
+     * with it. The editor has no second file to send yet; a caller that has
+     * one passes it here.
+     */
+    files?: Record<string, string>;
+  } = {},
   signal?: AbortSignal,
 ): Promise<ProgramCheck> {
   const base = normalizeRuntimeUrl(serveUrl);
@@ -216,6 +226,7 @@ export async function checkProgram(
     body: JSON.stringify({
       program,
       filename,
+      files: options.files ?? {},
       timeline: options.timeline ?? false,
       present: options.present ?? [],
     }),

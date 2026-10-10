@@ -38,7 +38,9 @@ impl Harness {
         // omarc is the Lean compiler, which a cargo test run does not build.
         // The program above is already bytecode, so a copy stands in.
         let omarc = home.path().join("omarc");
-        std::fs::write(&omarc, "#!/bin/sh\ncp \"$1\" \"$2\"\n").expect("write omarc");
+        // omarc [options] <input> <output>: the files are the last two arguments.
+        std::fs::write(&omarc, "#!/bin/sh\nshift $(($# - 2))\ncp \"$1\" \"$2\"\n")
+            .expect("write omarc");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

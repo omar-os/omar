@@ -129,6 +129,9 @@ export function openInputs(snapshot: DiagramSnapshot): DiagramPort[] {
  * shows as a problem with that field rather than sending and being refused.
  */
 export function parseInputValue(type: string, text: string): unknown | undefined {
+  // An enum string (`string in ["a","b"]`) is typed as bare text, like the CLI;
+  // whether it is an admitted value is the runtime's answer, not the parser's.
+  if (type.startsWith("string in ")) return text;
   const trimmed = text.trim();
   switch (type) {
     case "string":
@@ -205,6 +208,11 @@ export type RunRequest = {
   program: string;
   inputs: Record<string, unknown>;
   conversation_id?: string;
+  /**
+   * Files the program imports, by the relative path it imports them under.
+   * Staged beside the program; absent, the program imports nothing.
+   */
+  files?: Record<string, string>;
 };
 
 /**
