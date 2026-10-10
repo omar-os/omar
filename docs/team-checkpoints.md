@@ -19,6 +19,9 @@ Timers need no entry: a timer's next firing is a queued tag.
 
 Physical time, default every 1h, per run. Never per tag.
 
+Every command below targets a session (`-s NAME`, or the inherited one);
+the daemon owns the run, the CLI asks it.
+
 - `omar run prog.omar --checkpoint-period 30m` overrides at launch.
 - `omar checkpoint configure Team --period 2h` changes a running topology;
   next capture is one new period after the change.
@@ -36,20 +39,21 @@ If capture fails, the run holds at the boundary: previous checkpoint stands,
 ## Pause / resume / rollback
 
 - `pause`: finish the tag, checkpoint, tear agents down, record `PAUSED`.
-- `resume Team`: restore each instance's captured version into a **new**
-  workspace, respawn agents, continue the queue. The logical clock continues
-  from the captured elapsed time; a tag due later waits exactly the remainder.
-  Agents start fresh conversations and are told which checkpoint they continue
-  from (`restoration: fresh_conversation` in the manifest; no backend offers
-  an immutable fork of a conversation).
+- `resume Team`: same run id; restore each instance's captured version into
+  a **new** workspace, respawn agents, continue the queue. The logical clock
+  continues from the captured elapsed time; a tag due later waits exactly the
+  remainder. Agents start fresh conversations and are told which checkpoint
+  they continue from (`restoration: fresh_conversation` in the manifest; no
+  backend offers an immutable fork of a conversation). A resumed run uses the
+  default timeout and real-time pace.
 - `rollback Team --checkpoint ID`: paused run only. Moves the resume point;
   deletes nothing; the abandoned branch stays listed. External effects are
   not undone.
 - `checkpoint list|show|verify`: inspect; `verify` checks program, state and
   every referenced file version without launching anything.
 
-Resume reads the program path recorded at launch for generated code; pass
-`--program` if it moved.
+`omar run --wait` returns on a pause too; a session the run created for
+itself stays up so `omar resume` can continue it.
 
 Daemon: `POST /v1/runs/<id>/pause`, `POST /v1/runs/<id>/resume` (the run
 keeps its id and comes back `running` with a new diagram address),
@@ -66,14 +70,13 @@ preview of what it holds; a paused run commits with "Roll back to this
 checkpoint" from that preview.
 `GET /v1/runs/<id>/timeline` projects a run's strip from its staged bytecode
 and admitted inputs, so it exists without a draft behind it.
-The live diagram reports `paused`. A resumed daemon run uses the default
-timeout and real-time pace.
+The live diagram reports `paused`.
 
 Not in this PR: checkpoint import into another session, input journalling
 while paused, format migration, pruning, manual capture or period changes
 from Mission Control.
 
 Validation: `python3 tests/ci/team_checkpoints.py` (CI) runs a real-time
-timer topology with a Rust body and a stub agent: automatic and manual
-captures, live period change, pause, fresh-process resume with restored files
-and no repeated tag, rollback to an older checkpoint, stop.
+timer topology with a Rust body and a stub agent in one session: automatic
+and manual captures, live period change, pause, resume under the same run id
+with restored files and no repeated tag, rollback to an older checkpoint, stop.

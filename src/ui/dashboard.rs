@@ -438,8 +438,12 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap()
         .as_nanos() as u64;
 
+    let heading = match &app.session {
+        Some(session) => format!("OMAR {} ", session.name),
+        None => "OMAR ".to_string(),
+    };
     let mut status_spans = vec![
-        Span::styled("OMAR ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(heading, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("| Agents: "),
         Span::styled(format!("{}", total), Style::default().fg(Color::Reset)),
         Span::raw(" | "),
@@ -1260,7 +1264,7 @@ fn render_help_popup(frame: &mut Frame) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  Q           Quit and reset runtime state"),
+        Line::from("  Q           Stop this session's runtime (z detaches instead)"),
         Line::from("  ←/→, h/l   Switch panel (sidebar ↔ main)"),
         Line::from("  ↑/↓, j/k   Move selection up/down"),
         Line::from("  Tab         Drill into selected agent"),
@@ -1309,10 +1313,16 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, action: ConfirmAction) {
         }
         ConfirmAction::ResetQuit => (
             " Confirm Quit ",
-            "Quit omar?",
-            "This will kill ALL EA sessions and agents.".to_string(),
-            "Press z to walk away instead.".to_string(),
-            50,
+            "Stop this session?",
+            format!(
+                "Session {} shuts down: every EA, agent, and topology.",
+                app.session
+                    .as_ref()
+                    .map(|session| session.name.as_str())
+                    .unwrap_or("?")
+            ),
+            "Press z to detach instead.".to_string(),
+            60,
         ),
         ConfirmAction::DeleteEa => {
             let ea_name = app

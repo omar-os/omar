@@ -182,10 +182,7 @@ impl Default for AgentConfig {
 impl Config {
     /// Default config path: ~/.omar/config.toml
     pub fn default_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".omar")
-            .join("config.toml")
+        crate::sessions::state_root().join("config.toml")
     }
 
     /// Resolve a config path from CLI input, expanding `~/`.

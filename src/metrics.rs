@@ -17,9 +17,7 @@ fn enabled() -> bool {
 }
 
 fn sink_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar")
+    crate::sessions::state_root()
         .join("metrics")
         .join("spawn_metrics.jsonl")
 }
@@ -86,18 +84,6 @@ pub fn record_backend_bootstrap(backend: &str) {
         "backend_bootstrap",
         serde_json::json!({
             "backend": backend
-        }),
-    );
-}
-
-pub fn record_manager_start(ea_id: u32, session: &str, ready: bool, startup_ms: u64) {
-    write_metric(
-        "manager_start",
-        serde_json::json!({
-            "ea_id": ea_id,
-            "session": session,
-            "ready": ready,
-            "startup_ms": startup_ms
         }),
     );
 }

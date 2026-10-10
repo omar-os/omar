@@ -1,11 +1,10 @@
 //! Deployment lifecycle integration tests: the real binary, a stub-backed
-//! never-ending program, an isolated tmux server per test.
+//! never-ending program, a runtime session (and its tmux server) per test.
 
+use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
-
-use uuid::Uuid;
 
 const TEAM: &str = "Pulse";
 
@@ -27,8 +26,8 @@ const PROGRAM: &str = r#"{
 struct Harness {
     home: tempfile::TempDir,
     program: PathBuf,
-    tmux_server: String,
     omarc: PathBuf,
+    session: Value,
 }
 
 impl Harness {
@@ -47,51 +46,100 @@ impl Harness {
             permissions.set_mode(0o755);
             std::fs::set_permissions(&omarc, permissions).expect("chmod omarc");
         }
+        // One runtime session per harness, on its own tmux server.
+        let mut up = Command::new(env!("CARGO_BIN_EXE_omar"));
+        for key in [
+            "TMUX",
+            "TMUX_PANE",
+            "OMAR_SESSION_ID",
+            "OMAR_STATE_DIR",
+            "OMAR_TMUX_SERVER",
+            "OMAR_HOME",
+        ] {
+            up.env_remove(key);
+        }
+        let output = up
+            .args(["up", "--no-ea", "--json"])
+            .env("HOME", home.path())
+            .env("OMARC_BIN", &omarc)
+            .current_dir(home.path())
+            .output()
+            .expect("run omar up");
+        assert!(
+            output.status.success(),
+            "omar up failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let session: Value = serde_json::from_slice(&output.stdout).expect("session record");
         Self {
             home,
             program,
-            tmux_server: format!("omar-deploy-test-{}", Uuid::new_v4()),
             omarc,
+            session,
         }
+    }
+
+    fn id(&self) -> &str {
+        self.session["name"].as_str().expect("session name")
+    }
+
+    fn tmux_server(&self) -> &str {
+        self.session["tmux_server"].as_str().expect("tmux server")
     }
 
     fn omar(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_omar"));
-        cmd.env("HOME", self.home.path())
-            .env("OMAR_TMUX_SERVER", &self.tmux_server)
+        for key in [
+            "TMUX",
+            "TMUX_PANE",
+            "OMAR_SESSION_ID",
+            "OMAR_STATE_DIR",
+            "OMAR_TMUX_SERVER",
+            "OMAR_HOME",
+        ] {
+            cmd.env_remove(key);
+        }
+        cmd.args(["-s", self.id()])
+            .env("HOME", self.home.path())
             .env("OMARC_BIN", &self.omarc);
         cmd
     }
 
-    fn start_run(&self) -> Child {
-        self.omar()
-            .args(["run", self.program.to_str().unwrap()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn omar run")
+    /// Admit the program; the runtime runs it in the background.
+    fn start_run(&self) -> Value {
+        let output = self
+            .omar()
+            .args(["--json", "run", self.program.to_str().unwrap()])
+            .output()
+            .expect("run omar run");
+        assert!(
+            output.status.success(),
+            "run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("run record")
     }
 
-    /// stdout of `omar status <TEAM>`, tolerating a record not written yet.
-    fn status(&self) -> String {
+    /// The run record of `omar status <TEAM>`, or null before it exists.
+    fn status(&self) -> Value {
         let output = self
             .omar()
             .args(["status", TEAM])
             .output()
             .expect("run omar status");
-        String::from_utf8_lossy(&output.stdout).into_owned()
+        serde_json::from_slice(&output.stdout).unwrap_or(Value::Null)
     }
 
-    fn wait_for_state(&self, state: &str, timeout: Duration) {
+    fn wait_for_status(&self, status: &str, timeout: Duration) {
         let start = Instant::now();
         while start.elapsed() < timeout {
-            if self.status().contains(&format!("state: {state}")) {
+            if self.status()["status"] == status {
                 return;
             }
             std::thread::sleep(Duration::from_millis(250));
         }
         panic!(
-            "deployment never reached {state}; last status:\n{}",
+            "run never reached {status}; last status:\n{}",
             self.status()
         );
     }
@@ -100,7 +148,7 @@ impl Harness {
         let output = Command::new("tmux")
             .args([
                 "-L",
-                &self.tmux_server,
+                self.tmux_server(),
                 "list-sessions",
                 "-F",
                 "#{session_name}",
@@ -119,9 +167,7 @@ impl Harness {
 
     fn deployment_dir(&self) -> PathBuf {
         // The default EA is created on first use with id 0.
-        self.home
-            .path()
-            .join(".omar")
+        PathBuf::from(self.session["directory"].as_str().expect("directory"))
             .join("ea")
             .join("0")
             .join("topologies")
@@ -133,10 +179,26 @@ impl Harness {
             .expect("read deployment record")
     }
 
+    fn down(&self, force: bool) -> std::process::Output {
+        let mut cmd = self.omar();
+        cmd.args(["down", "--timeout", "30"]);
+        if force {
+            cmd.arg("--force");
+        }
+        cmd.output().expect("run omar down")
+    }
+
     fn kill_server(&self) {
         let _ = Command::new("tmux")
-            .args(["-L", &self.tmux_server, "kill-server"])
+            .args(["-L", self.tmux_server(), "kill-server"])
             .output();
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = self.down(true);
+        self.kill_server();
     }
 }
 
@@ -146,6 +208,18 @@ fn agent_sessions(harness: &Harness) -> Vec<String> {
         .into_iter()
         .filter(|name| name.contains("-w"))
         .collect()
+}
+
+/// A run is admitted before its agent panes exist; wait for them.
+fn wait_for_agents(harness: &Harness) {
+    let start = Instant::now();
+    while agent_sessions(harness).is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "agent session never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn assert_dir_has(dir: &Path, name: &str) {
@@ -163,12 +237,9 @@ fn stop_terminates_gracefully_and_leaves_no_orphans() {
         return;
     }
     let harness = Harness::new();
-    let mut run = harness.start_run();
-    harness.wait_for_state("RUNNING", Duration::from_secs(30));
-    assert!(
-        !agent_sessions(&harness).is_empty(),
-        "agent session never appeared"
-    );
+    harness.start_run();
+    harness.wait_for_status("running", Duration::from_secs(30));
+    wait_for_agents(&harness);
 
     // A second run of the same team is refused while the first is alive.
     let duplicate = harness
@@ -177,7 +248,7 @@ fn stop_terminates_gracefully_and_leaves_no_orphans() {
         .output()
         .expect("run duplicate");
     assert!(!duplicate.status.success());
-    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("stop it first"));
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already has an active run"));
 
     let stop = harness
         .omar()
@@ -189,10 +260,7 @@ fn stop_terminates_gracefully_and_leaves_no_orphans() {
         "stop failed: {}",
         String::from_utf8_lossy(&stop.stderr)
     );
-    assert!(String::from_utf8_lossy(&stop.stdout).contains("TERMINATED"));
-
-    let exit = run.wait().expect("wait for run");
-    assert!(exit.success(), "run should exit cleanly after a stop");
+    harness.wait_for_status("stopped", Duration::from_secs(30));
     assert!(harness.record().contains("TERMINATED"));
     assert!(agent_sessions(&harness).is_empty(), "orphan agent session");
 
@@ -200,65 +268,90 @@ fn stop_terminates_gracefully_and_leaves_no_orphans() {
     assert_dir_has(&dir, "outputs.json");
     assert_dir_has(&dir, "state.json");
     assert_dir_has(&dir.join("logs"), "w.txt");
-    harness.kill_server();
+    let down = harness.down(false);
+    assert!(
+        down.status.success(),
+        "{}",
+        String::from_utf8_lossy(&down.stderr)
+    );
 }
 
 #[test]
-fn kill_cancels_and_sweeps_sessions() {
+fn forced_shutdown_sweeps_a_running_topology() {
     if Command::new("tmux").arg("-V").output().is_err() {
         eprintln!("tmux not installed; skipping");
         return;
     }
     let harness = Harness::new();
-    let mut run = harness.start_run();
-    harness.wait_for_state("RUNNING", Duration::from_secs(30));
+    harness.start_run();
+    harness.wait_for_status("running", Duration::from_secs(30));
+    wait_for_agents(&harness);
 
+    // `kill` is for standalone agents; a runtime-owned topology ends with
+    // `stop`, or with the whole runtime.
     let kill = harness
         .omar()
         .args(["kill", TEAM])
         .output()
         .expect("run omar kill");
-    assert!(
-        kill.status.success(),
-        "kill failed: {}",
-        String::from_utf8_lossy(&kill.stderr)
-    );
-    assert!(String::from_utf8_lossy(&kill.stdout).contains("CANCELLED"));
+    assert!(!kill.status.success());
+    assert!(String::from_utf8_lossy(&kill.stderr).contains("use stop"));
 
-    run.wait().expect("wait for run");
-    assert!(harness.record().contains("CANCELLED"));
+    let down = harness.down(true);
+    assert!(
+        down.status.success(),
+        "{}",
+        String::from_utf8_lossy(&down.stderr)
+    );
     assert!(agent_sessions(&harness).is_empty(), "orphan agent session");
-    harness.kill_server();
+    assert!(
+        harness.sessions().is_empty(),
+        "the runtime's tmux server outlived it"
+    );
 }
 
 #[test]
-fn a_crashed_runner_is_reported_and_cleaned_up() {
+fn a_dead_runtime_is_reported_and_never_signalled_blindly() {
     if Command::new("tmux").arg("-V").output().is_err() {
         eprintln!("tmux not installed; skipping");
         return;
     }
     let harness = Harness::new();
-    let mut run = harness.start_run();
-    harness.wait_for_state("RUNNING", Duration::from_secs(30));
+    harness.start_run();
+    harness.wait_for_status("running", Duration::from_secs(30));
+    wait_for_agents(&harness);
 
-    // A hard kill of the runner is a crash: nothing writes an ending.
-    run.kill().expect("kill runner");
-    run.wait().expect("wait for runner");
-
-    let status = harness.status();
-    assert!(status.contains("state: FAILED"), "status was:\n{status}");
-    assert!(status.contains("runner process died"));
+    // A hard kill of the runtime is a crash: nothing writes an ending.
+    let pid = harness.session["pid"].as_u64().expect("pid");
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    let start = Instant::now();
+    let state = loop {
+        let output = harness
+            .omar()
+            .args(["ls", "--json"])
+            .output()
+            .expect("run omar ls");
+        let listed: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        let state = listed
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|s| s["name"] == harness.session["name"])
+            .map(|s| s["state"].as_str().unwrap_or_default().to_string())
+            .unwrap_or_default();
+        if state == "stale" || start.elapsed() > Duration::from_secs(10) {
+            break state;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(state, "stale");
     assert!(
         !agent_sessions(&harness).is_empty(),
-        "a crash leaves sessions behind; that is what kill sweeps"
+        "a crash leaves sessions behind"
     );
-
-    let kill = harness
-        .omar()
-        .args(["kill", TEAM])
-        .output()
-        .expect("run omar kill");
-    assert!(kill.status.success());
-    assert!(agent_sessions(&harness).is_empty(), "orphan agent session");
+    // A stale record is never permission to signal a pid.
+    let down = harness.down(false);
+    assert!(!down.status.success());
     harness.kill_server();
+    assert!(agent_sessions(&harness).is_empty(), "orphan agent session");
 }

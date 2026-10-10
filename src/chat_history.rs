@@ -142,6 +142,21 @@ impl History {
         chats
     }
 
+    /// Allocate an EA's chat without changing any client's selection.
+    pub fn chat_for_ea(&mut self, ea_id: crate::ea::EaId) -> Result<String> {
+        if let Some(chat) = self.conversations.iter().find(|c| c.ea_id == Some(ea_id)) {
+            return Ok(chat.id.clone());
+        }
+        let mut next = self.clone();
+        let mut chat = Conversation::new();
+        chat.ea_id = Some(ea_id);
+        let id = chat.id.clone();
+        next.conversations.push(chat);
+        next.save()?;
+        *self = next;
+        Ok(id)
+    }
+
     pub fn select(&mut self, id: Option<&str>) -> Result<()> {
         let mut next = self.clone();
         match id {

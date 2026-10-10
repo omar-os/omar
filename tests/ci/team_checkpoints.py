@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Durable checkpoints across processes: automatic and manual capture, pause,
-resume in a fresh runner, rollback, and the tags that run exactly once.
+"""Durable checkpoints in a runtime session: automatic and manual capture,
+pause, resume under the same run id, rollback, and the tags that run exactly
+once.
 
 No model or Lean compiler: a compiler fixture emits fixed bytecode, a Rust
 body does the work, and the built-in stub backend answers the one agent
-reaction. Every tmux command uses a private server.
+reaction. One session runs everything, on its own tmux server.
 """
 import json
 import os
@@ -13,7 +14,6 @@ import shutil
 import subprocess
 import tempfile
 import time
-import uuid
 
 REPO = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get("OMAR_BIN", REPO / "target/debug/omar")).resolve()
@@ -22,20 +22,20 @@ TICK_NS = 400_000_000  # 0.4s between timer firings, in logical nanoseconds
 
 def main():
     assert shutil.which("tmux"), "tmux is required"
-    with tempfile.TemporaryDirectory(prefix="omar-checkpoints-", dir="/tmp") as directory:
+    with tempfile.TemporaryDirectory(prefix="omar-checkpoints-", dir="/tmp", ignore_cleanup_errors=True) as directory:
         root = Path(directory)
         home, source, shims = root / "home", root / "source", root / "bin"
         for path in (home, source, shims):
             path.mkdir()
-        server = "omar-checkpoint-" + uuid.uuid4().hex[:12]
-        env = dict(os.environ, HOME=str(home), OMAR_TMUX_SERVER=server,
+        env = dict(os.environ, HOME=str(home),
                    PATH=str(shims) + os.pathsep + os.environ["PATH"],
                    CARGO_HOME=os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")),
                    RUSTUP_HOME=os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")))
-        state_root = home / ".omar"
+        for key in ("TMUX", "TMUX_PANE", "OMAR_TMUX_SERVER", "OMAR_SESSION_ID", "OMAR_STATE_DIR", "OMAR_HOME", "OMAR_EA_ID"):
+            env.pop(key, None)
 
         # Every firing appends its count to log.txt and raises the state
-        # variable, so continuity across processes is readable from both.
+        # variable, so continuity across resumes is readable from both.
         body = '''
 self.count += 1;
 use std::io::Write;
@@ -67,7 +67,12 @@ total = Some(self.count);
                             f"shutil.copyfile({str(bytecode)!r}, sys.argv[2])\n")
         compiler.chmod(0o700)
         env["OMARC_BIN"] = str(compiler)
-        # The EA id is whatever a fresh home allocates; find the record by name.
+        runtime = json.loads(subprocess.run([str(BIN), "up", "--no-ea", "--name", "checkpoints", "--json"], cwd=source,
+                                            env=env, text=True, capture_output=True, timeout=90, check=True).stdout)
+        server = runtime["tmux_server"]
+        state_root = Path(runtime["directory"])
+
+        # The EA id is whatever a fresh session allocates; find the record by name.
         class Deployment:
             def __truediv__(self, name):
                 found = list(state_root.glob("ea/*/topologies/Ticker"))
@@ -76,16 +81,16 @@ total = Some(self.count);
         deployment = Deployment()
 
         def omar(*args, timeout=120):
-            result = subprocess.run([str(BIN), *args], cwd=source, env=env, text=True,
+            result = subprocess.run([str(BIN), "-s", runtime["name"], *args], cwd=source, env=env, text=True,
                                     capture_output=True, timeout=timeout)
             assert result.returncode == 0, f"{args}: {result.stdout}\n{result.stderr}"
             return result.stdout
 
+        def status():
+            return json.loads(omar("status", "Ticker"))
+
         def record():
             return json.loads((deployment / "deployment.json").read_text())
-
-        def runner_logs():
-            return "\n".join(f"--- {p.name}\n{p.read_text()[-4000:]}" for p in sorted(root.glob("runner-*.log")))
 
         def checkpoints():
             lines = [l for l in omar("checkpoint", "list", "Ticker").splitlines() if l.startswith("#")]
@@ -106,26 +111,15 @@ total = Some(self.count);
                 time.sleep(0.2)
             raise AssertionError(f"timed out waiting for {what}")
 
-        def start(*args):
-            log = open(root / f"runner-{uuid.uuid4().hex[:6]}.log", "w")
-            return subprocess.Popen([str(BIN), *args], cwd=source, env=env, stdout=log, stderr=log, text=True), log
-
-        def finish(process, log, what):
-            try:
-                code = process.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                raise AssertionError(f"{what}: runner did not exit")
-            log.close()
-            text = Path(log.name).read_text()
-            assert code == 0, f"{what}: exit {code}\n{text}"
-            return text
+        def agent_alive():
+            return subprocess.run(["tmux", "-L", server, "has-session", "-t", record()["sessions"]["w.agent"]],
+                                  capture_output=True).returncode == 0
 
         try:
           try:
             # 1. A run that checkpoints on its own every 2s of physical time,
             #    and takes a manual checkpoint on request while running.
-            runner, log = start("run", str(program), "--input", "w.go=1", "--checkpoint-period", "2s")
+            run_id = json.loads(omar("run", str(program), "--input", "w.go=1", "--checkpoint-period", "2s"))["run_id"]
             wait_until(lambda: (deployment / "deployment.json").exists() and record()["state"] == "RUNNING",
                        "the run to start")
             wait_until(lambda: len(log_lines(worktree())) >= 3, "three timer firings")
@@ -147,10 +141,9 @@ total = Some(self.count);
             omar("checkpoint", "configure", "Ticker", "--period", "1h")
             wait_until(lambda: record().get("next_checkpoint_at", 0) > time.time() + 3000, "the new period")
 
-            # 3. Pause: checkpoint, tear agents down, exit with the run resumable.
-            omar("pause", "Ticker", "--wait")
-            text = finish(runner, log, "pause")
-            assert "paused at checkpoint" in text, text
+            # 3. Pause: checkpoint, tear agents down, keep the run resumable.
+            paused_run = json.loads(omar("pause", "Ticker", "--wait"))
+            assert paused_run["status"] == "paused" and paused_run["run_id"] == run_id, paused_run
             paused = record()
             assert paused["state"] == "PAUSED" and paused["sessions_cleaned"], paused
             pause_id = paused["checkpoint"]
@@ -159,14 +152,15 @@ total = Some(self.count);
             assert before == list(range(1, len(before) + 1)), before
             paused_state = json.loads((next((deployment / "checkpoints").glob(f"*-{pause_id}")) / "state.json").read_text())
             assert paused_state["state_vars"]["w.count"] == len(before), (paused_state, before)
-            assert subprocess.run(["tmux", "-L", server, "has-session", "-t", paused["sessions"]["w.agent"]],
-                                  capture_output=True).returncode != 0, "agent survived the pause"
+            assert not agent_alive(), "agent survived the pause"
             # Nothing in flight at the pause: the stub's greeting was recorded.
             assert json.loads((deployment / "outputs.json").read_text())["w.greeting"]
+            assert paused_run["outputs"]["w.greeting"], paused_run
 
-            # 4. Resume in a fresh process: files restored into a new workspace,
-            #    the count continues, nothing repeats, the agent is back.
-            runner, log = start("resume", "Ticker")
+            # 4. Resume under the same run id: files restored into a new
+            #    workspace, the count continues, nothing repeats, the agent is back.
+            resumed = json.loads(omar("resume", "Ticker"))
+            assert resumed["run_id"] == run_id and resumed["status"] == "running", resumed
             wait_until(lambda: record()["state"] == "RUNNING" and record().get("resumed_from") == pause_id,
                        "the resumed run")
             resumed_tree = worktree()
@@ -178,10 +172,8 @@ total = Some(self.count);
             assert log_lines(paused_tree) == before, "the paused workspace was written to"
             prompt = (deployment / "agents" / "w.agent" / "system.md").read_text()
             assert f"resumed from checkpoint {pause_id}" in prompt, prompt
-            assert subprocess.run(["tmux", "-L", server, "has-session", "-t", record()["sessions"]["w.agent"]],
-                                  capture_output=True).returncode == 0, "agent not respawned"
+            assert agent_alive(), "agent not respawned"
             omar("pause", "Ticker", "--wait")
-            finish(runner, log, "second pause")
             second = record()
             assert second["state"] == "PAUSED" and second["checkpoint"] != pause_id
             ids, listing = checkpoints()
@@ -192,12 +184,12 @@ total = Some(self.count);
             # 5. Roll back to the manual checkpoint and resume from it: the
             #    files and the count are those of that moment, the later
             #    checkpoints stay on disk, and the run continues from there.
-            text = omar("rollback", "Ticker", "--checkpoint", manual_id)
-            assert "stay on disk" in text, text
+            rolled_back = json.loads(omar("rollback", "Ticker", "--checkpoint", manual_id))
+            assert rolled_back["resume_point"] == manual_id and rolled_back["abandoned"], rolled_back
             ids_after, listing = checkpoints()
             assert ids_after == ids, "rollback deleted a checkpoint"
             assert next(l for l in listing if manual_id in l).endswith("<- resume point"), listing
-            runner, log = start("resume", "Ticker")
+            omar("resume", "Ticker")
             wait_until(lambda: record()["state"] == "RUNNING" and record().get("resumed_from") == manual_id,
                        "the rolled-back run")
             rolled_tree = worktree()
@@ -206,7 +198,7 @@ total = Some(self.count);
             assert rolled[:manual_count] == list(range(1, manual_count + 1)), rolled
             assert rolled[manual_count] == manual_count + 1, f"did not continue from the rolled-back count: {rolled}"
             omar("stop", "Ticker")
-            finish(runner, log, "stop")
+            wait_until(lambda: status()["status"] == "stopped", "the stop")
             final = record()
             assert final["state"] == "TERMINATED" and final["state_vars"]["w.count"] == len(log_lines(rolled_tree))
             # A stop captures nothing, so the resume point is still the
@@ -214,12 +206,15 @@ total = Some(self.count);
             final_ids, listing = checkpoints()
             assert final_ids == ids, listing
             assert next(l for l in listing if manual_id in l).endswith("<- resume point"), listing
-            print("PASS: automatic and manual checkpoints, live period change, pause, fresh-process resume "
+            print("PASS: automatic and manual checkpoints, live period change, pause, resume under one run id "
                   "with restored files and no repeated tag, agent respawn, rollback to an older checkpoint, stop")
-          except Exception:
-            print(runner_logs())
+          except BaseException:
+            log = state_root / "logs" / "runtime.log"
+            if log.exists():
+                print("runtime.log:", log.read_text()[-4000:])
             raise
         finally:
+            subprocess.run([str(BIN), "down", "-s", runtime["name"], "--force", "--timeout", "5"], env=env, capture_output=True)
             subprocess.run(["tmux", "-L", server, "kill-server"], capture_output=True)
 
 

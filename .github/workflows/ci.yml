@@ -115,9 +115,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Build compiler for independent-session integration
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lang
+          test: false
+
       - name: Verify legacy supervision through MCP and tmux
         run: |
           cargo build -p omar
+          python3 tests/ci/independent_sessions.py
           python3 tests/ci/team_workspaces.py
           python3 tests/ci/team_checkpoints.py
           python3 tests/ci/legacy_supervision.py
@@ -287,7 +294,7 @@ jobs:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
         run: |
           output=$(cargo run --quiet --bin omar -- run \
-            tests/ci/direct_run.omar --input run.request=hello --replace)
+            tests/ci/direct_run.omar --input run.request=hello --replace --wait)
           echo "$output"
           grep -Fq 'Output run.result = "hello"' <<<"$output"
 
@@ -297,7 +304,7 @@ jobs:
         run: |
           output=$(cargo run --quiet --bin omar -- run \
             tests/ci/side_channel_stub.omar --input run.request=go \
-            --timeout-seconds 15 --replace)
+            --timeout-seconds 15 --replace --wait)
           echo "$output"
           grep -Fq 'Output run.result = "stub"' <<<"$output"
 
@@ -308,7 +315,7 @@ jobs:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
         run: |
           output=$(cargo run --quiet --bin omar -- run \
-            tests/topology/src/RingCode.omar --input n1.token=0 --replace)
+            tests/topology/src/RingCode.omar --input n1.token=0 --replace --wait)
           echo "$output"
           grep -Fq 'Output n1.done = 6' <<<"$output"
 
@@ -319,7 +326,7 @@ jobs:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
         run: |
           output=$(cargo run --quiet --bin omar -- run \
-            tests/topology/src/RingLeader.omar --replace)
+            tests/topology/src/RingLeader.omar --replace --wait)
           echo "$output"
           grep -Fq 'Output leader.done = true' <<<"$output"
           grep -Fq 'State leader.round = 10' <<<"$output"
@@ -696,7 +703,7 @@ jobs:
         run: |
           mv lang/.lake "$RUNNER_TEMP/lake-aside"
           output=$(env -u OMARC_BIN "$RUNNER_TEMP/bin/omar" run \
-            tests/ci/direct_run.omar --input run.request=hello --replace)
+            tests/ci/direct_run.omar --input run.request=hello --replace --wait)
           echo "$output"
           grep -Fq 'Output run.result = "hello"' <<<"$output"
           mv "$RUNNER_TEMP/lake-aside" lang/.lake

@@ -392,11 +392,15 @@ fn read_claim(path: &Path) -> String {
 /// Tells one compile's draft from another's in the same process.
 static DRAFTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn resolve_omarc() -> PathBuf {
+pub(crate) fn resolve_omarc() -> PathBuf {
     if let Some(path) = std::env::var_os("OMARC_BIN") {
         return PathBuf::from(path);
     }
 
+    resolve_build_omarc()
+}
+
+pub(crate) fn resolve_build_omarc() -> PathBuf {
     let executable_name = format!("omarc{}", std::env::consts::EXE_SUFFIX);
     if let Ok(current_executable) = std::env::current_exe() {
         if let Some(directory) = current_executable.parent() {
@@ -1787,6 +1791,13 @@ pub enum RunEnd {
     Paused,
 }
 
+/// How a run ended, with the output ports and state variables it ended with.
+pub struct RunOutcome {
+    pub end: RunEnd,
+    pub outputs: BTreeMap<String, Value>,
+    pub state: BTreeMap<String, Value>,
+}
+
 /// Advance the shared record and persist it, as one step.
 fn advance_record(
     record: &Arc<Mutex<deploy::DeploymentRecord>>,
@@ -2071,30 +2082,16 @@ struct ResumePlan {
     workspaces: BTreeMap<String, crate::workspace::Workspace>,
 }
 
-pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunEnd> {
+pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunOutcome> {
     let state = verify(bytecode)?;
     launch(&state, bytecode, config, None)
-}
-
-/// The program a team's resume point was captured from, so the caller can
-/// place generated code beside it the way `omar run` does.
-pub fn resume_program_path(
-    omar_dir: &Path,
-    ea_id: crate::ea::EaId,
-    team: &str,
-) -> Result<Option<PathBuf>> {
-    let store = checkpoint::Store::new(&deploy::dir_for(omar_dir, ea_id, team));
-    Ok(store
-        .resume_point()?
-        .and_then(|m| m.program_path)
-        .map(PathBuf::from))
 }
 
 /// Continue a paused team from its resume point: the head a rollback chose,
 /// else its latest checkpoint. Files come back as new workspaces restored
 /// from the captured versions; agents start fresh conversations and are
 /// told so; the clock continues where the checkpoint left it.
-pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunEnd> {
+pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunOutcome> {
     let runtime_dir = deploy::dir_for(config.omar_dir, config.ea_id, team);
     let record = deploy::DeploymentRecord::load(&runtime_dir)?
         .with_context(|| format!("no deployment '{team}'"))?;
@@ -2176,7 +2173,7 @@ fn launch(
     bytecode: &Bytecode,
     config: TopologyRunConfig<'_>,
     resume: Option<ResumePlan>,
-) -> Result<RunEnd> {
+) -> Result<RunOutcome> {
     let state = state.clone();
     let runtime_dir = deploy::dir_for(config.omar_dir, config.ea_id, &state.team);
     fs::create_dir_all(&runtime_dir)?;
@@ -2508,7 +2505,11 @@ fn launch(
         for (port, value) in &paused.outputs {
             println!("Output {port} = {value}");
         }
-        return Ok(RunEnd::Paused);
+        return Ok(RunOutcome {
+            end: RunEnd::Paused,
+            outputs: paused.outputs,
+            state: paused.state_vars,
+        });
     }
     let (settled, stopped) = match end {
         LoopEnd::Completed(settled) => (settled, false),
@@ -2571,16 +2572,20 @@ fn launch(
     } else {
         println!("Topology '{}' completed", state.team);
     }
-    for (port, value) in outputs {
+    for (port, value) in &outputs {
         println!("Output {port} = {value}");
     }
-    for (name, value) in state_vars {
+    for (name, value) in &state_vars {
         println!("State {name} = {value}");
     }
-    Ok(if stopped {
-        RunEnd::Stopped
-    } else {
-        RunEnd::Completed
+    Ok(RunOutcome {
+        end: if stopped {
+            RunEnd::Stopped
+        } else {
+            RunEnd::Completed
+        },
+        outputs,
+        state: state_vars,
     })
 }
 

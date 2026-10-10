@@ -77,10 +77,13 @@ cd omar && make install
 #### Step 1: Launch Mission Control
 
 ```bash
-$ omar serve --ui
+$ omar up --name dev
+$ omar attach -s dev --web
 ```
 
-Serves the web UI from the daemon's own address and opens it in your browser.
+Starts an independent background runtime, then opens its web UI. Closing the
+browser leaves the runtime and its topologies running. Stop it with `omar down -s dev`.
+See [session commands and lifecycle](docs/sessions.md).
 
 #### Step 2: Describe a workflow
 
@@ -89,15 +92,25 @@ the topology it compiles to.
 Nothing runs until you press **Confirm deploy**,
 then the diagram goes live.
 
-### Terminal UI (Legacy)
+### Terminal client
 
-Note: The legacy terminal UI does not yet implement the deterministic model in the mission control.
+Run `omar attach -s dev --tui` (`--ea NAME` picks an EA), or `omar up --tui` to
+start and attach in one go. The terminal dashboard opens
+inside the session's tmux server. `z` detaches and the runtime keeps every
+workload running; `Q` stops the session after confirmation.
 
-#### Step 1: Launch `omar`
+### Terminal UI
+
+Note: The terminal UI does not yet implement the deterministic model in the mission control.
+
+#### Step 1: Start a session and attach the terminal UI
 
 ```bash
-$ omar
+$ omar up --tui
 ```
+
+Or attach to a running session with `omar attach -s <session> --tui`. `z`
+detaches and the runtime keeps every workload running; `Q` stops the session.
 
 Go [here](#supported-agent-backends) to see how to launch with specific agent backends.
 
@@ -123,17 +136,19 @@ Shutdown the test project and its agents.
 
 | Backend | How to launch |
 |---------|---------------|
-| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar -a claude` (default) |
-| [Codex CLI](https://developers.openai.com/codex/cli) | `omar -a codex` |
-| [Cursor CLI](https://cursor.com/cli) | `omar -a cursor` |
-| [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode` |
-| [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy` |
-| [Pi](https://pi.dev) | `omar -a pi` |
+| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar -a claude up` (default) |
+| [Codex CLI](https://developers.openai.com/codex/cli) | `omar -a codex up` |
+| [Cursor CLI](https://cursor.com/cli) | `omar -a cursor up` |
+| [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode up` |
+| [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy up` |
+| [Pi](https://pi.dev) | `omar -a pi up` |
 
-Each `omar -a <backend>` launch creates a new EA, named with its new EA number.
-Use `omar -a codex --ea Research` to give the new EA a semantic name. An existing
-name is rejected rather than replacing its manager. Run `omar --ea <id-or-name>`
-without `-a` to open an existing EA.
+Each `omar -a <backend> up` starts a new independent session with EA 0.
+Add `--name dev` to name it, `--tui` or `--web` to attach at once, and
+`--checkpoint` to keep its state after `omar down` (otherwise nothing is left). Add another EA inside it
+with `omar --session dev ea create --name Research --agent codex`.
+Target it with `omar --session dev --ea Research ...`; this does not change
+another client's selection.
 
 Codex launch commands no longer disable the alternate screen. OMAR does not
 add `--no-alt-screen`; an explicit flag in a custom command is still respected.

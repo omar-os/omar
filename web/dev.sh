@@ -114,7 +114,9 @@ if ((needs_install)); then
 fi
 
 printf 'Starting omar serve on %s...\n' "$serve_address"
-"$repo_root/target/debug/omar" serve --address "$serve_address" &
+serve_args=(serve --address "$serve_address")
+[[ ${OMAR_DEV_NO_EA:-0} == 1 ]] && serve_args+=(--no-ea)
+"$repo_root/target/debug/omar" "${serve_args[@]}" &
 serve_pid=$!
 wait_for "http://$serve_address/health" "omar serve" "$serve_pid"
 

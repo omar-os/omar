@@ -124,5 +124,13 @@ export type RunRecord = { run_id: string, team: string, status: RunStatus, diagr
  * Input ports the run was admitted with, so its timeline can be
  * projected again later from the same starting point.
  */
-present?: Array<string>, };
+present?: Array<string>, 
+/**
+ * Output ports a finished run ended with.
+ */
+outputs?: Record<string, unknown>, 
+/**
+ * State variables a finished run ended with.
+ */
+state?: Record<string, unknown>, };
 

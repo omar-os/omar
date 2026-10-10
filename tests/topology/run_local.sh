@@ -208,7 +208,7 @@ run_case() {
 
   printf '\n[%s] running with local agents\n' "$name"
   if run_with_timeout "$case_timeout" "$log" "$name" \
-    "$omar" run "$source" --replace \
+    "$omar" run "$source" --wait --checkpoint --replace \
     --timeout-seconds "$invocation_timeout" "$@"; then
     case_passed=$((case_passed + 1))
   else
@@ -222,8 +222,11 @@ run_case() {
     case_failed=$((case_failed + 1))
   fi
 
-  # Teardown persists pane transcripts; keep them with the case results.
-  cp -R "$HOME/.omar/ea/0/topologies/$team/logs" "$results_dir/$name-agents" 2>/dev/null || true
+  # Teardown persists pane transcripts; keep them with the case results. The
+  # run created its own session, named on stderr, and shut it down afterwards.
+  local session_id
+  session_id=$(grep -o 'Started session [^ ;]*' "$log" | awk '{print $3}' | tail -1)
+  [[ -n $session_id ]] && cp -R "$HOME/.omar/sessions/$session_id/ea/0/topologies/$team/logs" "$results_dir/$name-agents" 2>/dev/null || true
 
   if grep -Fq "Topology '$team' completed" "$log"; then
     case_passed=$((case_passed + 1))
