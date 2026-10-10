@@ -1926,7 +1926,7 @@ impl<'a> RunCheckpointer<'a> {
             let mut guard = record
                 .lock()
                 .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
-            guard.next_checkpoint_at = Some(deploy::now_unix() + policy.period_secs);
+            guard.next_checkpoint_at = Some(deploy::now_unix() + policy.period().as_secs());
             guard.save(dir)?;
         }
         let program_path = config
@@ -1978,7 +1978,7 @@ impl<'a> RunCheckpointer<'a> {
         schedule.policy = saved;
         schedule.next_due = Instant::now() + saved.period();
         if let Ok(mut guard) = self.record.lock() {
-            guard.next_checkpoint_at = Some(deploy::now_unix() + saved.period_secs);
+            guard.next_checkpoint_at = Some(deploy::now_unix() + saved.period().as_secs());
             let _ = guard.save(&self.dir);
         }
     }
@@ -2062,7 +2062,8 @@ impl Checkpointer for RunCheckpointer<'_> {
                 .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
             guard.checkpoint = Some(id.clone());
             guard.checkpoint_error = None;
-            guard.next_checkpoint_at = Some(deploy::now_unix() + schedule.policy.period_secs);
+            guard.next_checkpoint_at =
+                Some(deploy::now_unix() + schedule.policy.period().as_secs());
             guard.save(&self.dir)?;
         }
         let at = state

@@ -21,6 +21,9 @@ use uuid::Uuid;
 
 pub const FORMAT: u32 = 1;
 pub const DEFAULT_PERIOD: Duration = Duration::from_secs(60 * 60);
+/// The longest period either clock can be advanced by without overflow:
+/// a hundred years, which is "never" for any run that exists.
+pub const MAX_PERIOD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 /// One queued tag: its moment and everything present at it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +84,8 @@ impl Default for Policy {
 
 impl Policy {
     pub fn period(self) -> Duration {
-        Duration::from_secs(self.period_secs)
+        // A hand-edited policy file is not a reason to panic the run thread.
+        Duration::from_secs(self.period_secs).min(MAX_PERIOD)
     }
 }
 
@@ -122,6 +126,10 @@ pub fn parse_period(text: &str) -> Result<Duration> {
         "checkpoint period '{text}' needs a unit (s, m, h, d)"
     );
     anyhow::ensure!(total > 0, "checkpoint period '{text}' must be positive");
+    anyhow::ensure!(
+        total <= MAX_PERIOD.as_secs(),
+        "checkpoint period '{text}' is longer than 100 years"
+    );
     Ok(Duration::from_secs(total))
 }
 
@@ -604,10 +612,26 @@ mod tests {
         assert_eq!(parse_period("30m").unwrap(), Duration::from_secs(1800));
         assert_eq!(parse_period("1h30m").unwrap(), Duration::from_secs(5400));
         assert_eq!(parse_period(" 90s ").unwrap(), Duration::from_secs(90));
-        for bad in ["", "0m", "10", "m", "5x", "99999999999999999999h", "-1h"] {
+        for bad in [
+            "",
+            "0m",
+            "10",
+            "m",
+            "5x",
+            "99999999999999999999h",
+            "-1h",
+            "18446744073709551615s",
+            "36501d",
+        ] {
             assert!(parse_period(bad).is_err(), "{bad:?} should be refused");
         }
         assert_eq!(Policy::default().period(), DEFAULT_PERIOD);
+        // Neither clock overflows on a period a file could still carry.
+        let huge = Policy {
+            period_secs: u64::MAX,
+        };
+        let _ = std::time::Instant::now() + huge.period();
+        assert_eq!(huge.period(), MAX_PERIOD);
     }
 
     #[test]
