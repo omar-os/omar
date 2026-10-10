@@ -2431,7 +2431,10 @@ fn launch(
                 };
                 if let Some((next, detail)) = acknowledged {
                     if let Ok(mut guard) = record.lock() {
-                        if guard.state == DeploymentState::Running {
+                        if guard.state == DeploymentState::Running
+                            || (guard.state == DeploymentState::Pausing
+                                && next == DeploymentState::Stopping)
+                        {
                             let _ = guard.advance(next, Some(detail));
                             let _ = guard.save(&dir);
                         }

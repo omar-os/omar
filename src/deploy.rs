@@ -46,10 +46,11 @@ impl DeploymentState {
         match next {
             Deploying => self == Created,
             Running => self == Deploying,
-            Stopping => self == Running,
+            // A stop may abort a pause whose capture is held at the boundary.
+            Stopping => matches!(self, Running | Pausing),
             Pausing => self == Running,
             Paused => self == Pausing,
-            Terminated => matches!(self, Running | Stopping),
+            Terminated => matches!(self, Running | Stopping | Pausing),
             Failed | Cancelled => true,
             Created => false,
         }
@@ -496,7 +497,8 @@ mod tests {
         assert!(Stopping.may_become(Terminated));
         assert!(Running.may_become(Pausing));
         assert!(Pausing.may_become(Paused));
-        assert!(!Pausing.may_become(Terminated));
+        assert!(Pausing.may_become(Stopping), "a stop aborts a held pause");
+        assert!(Pausing.may_become(Terminated));
         assert!(!Stopping.may_become(Paused));
         for state in [Created, Deploying, Running, Stopping, Pausing] {
             assert!(state.may_become(Failed));

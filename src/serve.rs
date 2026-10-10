@@ -85,7 +85,7 @@ impl Drop for WindowConnection {
     }
 }
 
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct RunRecord {
     pub run_id: String,
     pub team: String,
@@ -619,6 +619,11 @@ impl Serve {
         history.assign_ea(&conversation_id, workspace_ea)?;
         let history = Arc::new(Mutex::new(history));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let parked = paused_runs(omar_dir, workspace_ea);
+        let latest_parked = parked
+            .values()
+            .max_by_key(|run| run.started_at)
+            .map(|run| run.run_id.clone());
         let context = Arc::new(Context_ {
             history: history.clone(),
             conversation_id: conversation_id.clone(),
@@ -627,10 +632,10 @@ impl Serve {
             session_prefix: config.dashboard.session_prefix.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
-            runs: Runs::default(),
+            runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
-                latest_run: None,
+                latest_run: latest_parked,
                 subscribers: Vec::new(),
                 busy: false,
                 needs_context: has_history,
@@ -1766,6 +1771,16 @@ impl Workspaces {
                 ea_id
             }
         };
+        // The EA's parked runs, unless a chat already offers them.
+        let mut parked = paused_runs(&self.root.omar_dir, ea_id);
+        for other in contexts.values() {
+            let held = other.runs.lock().expect("runs poisoned");
+            parked.retain(|run_id, _| !held.contains_key(run_id));
+        }
+        let latest_parked = parked
+            .values()
+            .max_by_key(|run| run.started_at)
+            .map(|run| run.run_id.clone());
         let context = Arc::new(Context_ {
             history: self.history.clone(),
             conversation_id: id.to_string(),
@@ -1774,10 +1789,10 @@ impl Workspaces {
             session_prefix: self.root.session_prefix.clone(),
             default_workdir: self.root.default_workdir.clone(),
             health_idle_warning: self.root.health_idle_warning,
-            runs: Runs::default(),
+            runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
-                latest_run: None,
+                latest_run: latest_parked,
                 subscribers: Vec::new(),
                 busy: false,
                 needs_context: has_history,
@@ -2672,6 +2687,7 @@ fn stop_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
             Some(record) if record.status == RunStatus::Paused => {
                 record.status = RunStatus::Stopped;
                 record.finished_at = Some(now_unix());
+                persist_run(context, record);
                 return (200, json!(record));
             }
             Some(record) => return (200, json!(record)),
@@ -2946,6 +2962,7 @@ fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
         record.diagram_address = None;
         record.finished_at = None;
         record.error = None;
+        persist_run(context, record);
     }
     context.chat.lock().expect("chat poisoned").latest_run = Some(id.to_string());
     let (ready_sender, ready_receiver) = mpsc::channel();
@@ -2971,6 +2988,45 @@ fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
             (502, json!({"error": message}))
         }
     }
+}
+
+/// A run's record on disk, beside its staged program. Written whenever the
+/// run parks or ends, so a paused run outlives the daemon that paused it.
+fn run_record_path(context: &Context_, run_id: &str) -> std::path::PathBuf {
+    crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(run_id)
+        .join("run.json")
+}
+
+fn persist_run(context: &Context_, record: &RunRecord) {
+    let path = run_record_path(context, &record.run_id);
+    let _ = fs::create_dir_all(path.parent().expect("run dir"));
+    let _ = fs::write(path, serde_json::to_vec(record).unwrap_or_default());
+}
+
+/// The paused runs an EA's staging holds: still resumable, so a daemon that
+/// starts over offers them again under their own ids. A run whose team
+/// deployment has since moved on is not one of them.
+fn paused_runs(omar_dir: &Path, ea_id: EaId) -> BTreeMap<String, RunRecord> {
+    let staged = crate::ea::ea_state_dir(ea_id, omar_dir).join("serve");
+    let Ok(entries) = fs::read_dir(staged) else {
+        return BTreeMap::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| fs::read(entry.path().join("run.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok())
+        .filter(|record| record.status == RunStatus::Paused)
+        .filter(|record| {
+            let dir = crate::deploy::dir_for(omar_dir, ea_id, &record.team);
+            match crate::deploy::DeploymentRecord::load(&dir) {
+                Ok(Some(deployment)) => deployment.state == crate::deploy::DeploymentState::Paused,
+                _ => true,
+            }
+        })
+        .map(|record| (record.run_id.clone(), record))
+        .collect()
 }
 
 /// Where a paused run's last diagram is kept: its server died with the loop,
@@ -3031,6 +3087,7 @@ fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::R
                 record.error = Some(format!("{error:#}"));
             }
         }
+        persist_run(context, record);
     }
 }
 
@@ -3520,6 +3577,64 @@ mod tests {
         assert_eq!(resumed.workspaces.get(&first).unwrap().ea_id, 0);
         assert_eq!(resumed.workspaces.get(&second).unwrap().ea_id, second_ea);
         assert!(resumed.context.runs.lock().unwrap().is_empty());
+    }
+
+    /// A paused run is durable state: the daemon that paused it may be gone
+    /// by the time it is resumed, so the next one offers it under its own
+    /// id, to the chat and to the CLI alike. A stopped one is not offered.
+    #[test]
+    fn a_paused_run_survives_a_runtime_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        for (id, team) in [("parked", "Cadence"), ("given-up", "Other")] {
+            server.context.runs.lock().unwrap().insert(
+                id.to_string(),
+                RunRecord {
+                    run_id: id.to_string(),
+                    team: team.to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 1,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                },
+            );
+            finish_run(
+                &server.context,
+                id,
+                Ok(topology::RunOutcome {
+                    end: topology::RunEnd::Paused,
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                    diagram: None,
+                }),
+            );
+        }
+        assert!(request(
+            server.address(),
+            "POST",
+            "/v1/runs/given-up/stop",
+            Some("{}")
+        )
+        .contains(" 200 "));
+        drop(server);
+        let resumed = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let response = request(resumed.address(), "GET", "/v1/runs/parked", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"status\":\"paused\""),
+            "{response}"
+        );
+        assert!(request(resumed.address(), "GET", "/v1/runs/given-up", None).contains(" 404 "));
+        let listing = request(resumed.address(), "GET", "/v1/chats", None);
+        assert!(listing.contains("\"run_id\":\"parked\""), "{listing}");
+        assert_eq!(resumed.session_runs(Some(0)).len(), 1);
+        // A second chat on the same EA does not offer the run twice.
+        assert!(request(resumed.address(), "POST", "/v1/chats", Some("{}")).contains(" 200 "));
+        assert_eq!(resumed.session_runs(None).len(), 1);
     }
 
     #[test]

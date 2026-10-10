@@ -87,6 +87,8 @@ checkpoint" from that preview.
 and admitted inputs, so it exists without a draft behind it.
 `GET /v1/runs/<id>/snapshot` is the diagram a paused run left behind (its
 own server dies with the loop), so a reload shows the parked run.
+A paused run's record is kept beside its staged program, so a daemon that
+starts over still offers it under its own id, to the chat and to the CLI.
 The live diagram reports `paused`.
 
 Not in this PR: checkpoint import into another session, input journalling
