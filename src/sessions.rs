@@ -570,6 +570,11 @@ fn executable_on_path(path: PathBuf) -> Result<PathBuf> {
     }
     bail!("executable {} was not found", path.display())
 }
+fn file_digest(path: &Path) -> Result<String> {
+    let mut hash = Sha256::new();
+    std::io::copy(&mut File::open(path)?, &mut hash)?;
+    Ok(format!("{:x}", hash.finalize()))
+}
 fn pin_executable(source: &Path, dest: &Path) -> Result<String> {
     let mut input = File::open(source)?;
     let mut output = OpenOptions::new().write(true).create_new(true).open(dest)?;
@@ -581,7 +586,9 @@ fn pin_executable(source: &Path, dest: &Path) -> Result<String> {
     std::io::copy(&mut File::open(dest)?, &mut hash)?;
     Ok(format!("{:x}", hash.finalize()))
 }
-fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
+/// Start a session. Returns the stopped record it replaced when `--name`
+/// restarted an existing session, so the caller can say what changed.
+fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, Option<Session>)> {
     anyhow::ensure!(
         cli.session.is_none(),
         "up creates a new session; --session selects an existing one"
@@ -599,10 +606,33 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
     let name = match options.name {
         Some(name) => {
             validate_name(&name)?;
-            anyhow::ensure!(
-                !existing.iter().any(|s| s.name == name),
-                "session '{name}' already exists; omar rm -s {name} removes a stopped one"
-            );
+            if let Some(stopped) = existing.iter().find(|s| s.name == name) {
+                // A stopped session that kept its state starts again where
+                // it was, on this build, like `docker start`.
+                anyhow::ensure!(
+                    matches!(stopped.state.as_str(), "stopped" | "failed" | "stale")
+                        && stopped.directory.join("launch.json").exists(),
+                    "session '{name}' already exists; omar rm -s {name} removes a stopped one"
+                );
+                anyhow::ensure!(
+                    !foreground && cli.config.is_none() && cli.agent.is_none(),
+                    "a session restarts with the configuration it was created with"
+                );
+                drop(_lock);
+                let source = fs::canonicalize(std::env::current_exe()?)?;
+                let compiler = executable_on_path(crate::topology::resolve_omarc()).ok();
+                let address =
+                    (options.address != UpOptions::default().address).then_some(options.address);
+                return relaunch(
+                    stopped,
+                    Some(&source),
+                    compiler.as_deref(),
+                    address,
+                    options.checkpoint,
+                    options.startup_timeout,
+                )
+                .map(|started| (started, Some(stopped.clone())));
+            }
             name
         }
         None => generate_name(&existing),
@@ -683,36 +713,6 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
             json: foreground && cli.json,
         },
     )?;
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(directory.join("logs/runtime.log"))?;
-    let mut command = Command::new(&session.executable);
-    command
-        .arg("session-daemon")
-        .arg(&directory)
-        .current_dir(&workdir)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("OMAR_")
-            || key == "TMUX"
-            || key == "TMUX_PANE"
-            || key == "OMARC_BIN"
-        {
-            command.env_remove(key);
-        }
-    }
-    command.env("OMAR_HOME", home_root());
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
     if foreground {
         session.pid = std::process::id();
         publish(&session)?;
@@ -735,11 +735,54 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
         foreground.env("OMAR_HOME", home_root());
         return Err(foreground.exec().into());
     }
+    spawn_daemon(session, &workdir, _lock, options.startup_timeout).map(|s| (s, None))
+}
+
+/// Start the pinned runtime for `session` in the background and wait until
+/// it answers `ready`. The registry lock is released once the process owns
+/// its record.
+fn spawn_daemon(
+    mut session: Session,
+    workdir: &Path,
+    lock: RegistryLock,
+    startup_timeout: u64,
+) -> Result<Session> {
+    let directory = session.directory.clone();
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join("logs/runtime.log"))?;
+    let mut command = Command::new(&session.executable);
+    command
+        .arg("session-daemon")
+        .arg(&directory)
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("OMAR_")
+            || key == "TMUX"
+            || key == "TMUX_PANE"
+            || key == "OMARC_BIN"
+        {
+            command.env_remove(key);
+        }
+    }
+    command.env("OMAR_HOME", home_root());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = command.spawn()?;
     session.pid = child.id();
     publish(&session)?;
-    drop(_lock);
-    let deadline = Instant::now() + Duration::from_secs(options.startup_timeout);
+    drop(lock);
+    let deadline = Instant::now() + Duration::from_secs(startup_timeout);
     loop {
         if let Some(status) = child.try_wait()? {
             session.state = "failed".into();
@@ -771,6 +814,94 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<Session> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Replace a pinned executable in one rename. Returns the new build id.
+fn repin_executable(source: &Path, dest: &Path) -> Result<String> {
+    let next = dest.with_extension("next");
+    let _ = fs::remove_file(&next);
+    let build_id = pin_executable(source, &next)?;
+    fs::rename(&next, dest)?;
+    Ok(build_id)
+}
+
+/// Start a stopped session again over its own state directory, on the given
+/// build. The registry record keeps its name, URL and directory; the runtime
+/// is a new incarnation. `address` None keeps the port the session had, so
+/// clients that know its URL find it again.
+fn relaunch(
+    stopped: &Session,
+    executable: Option<&Path>,
+    compiler: Option<&Path>,
+    address: Option<SocketAddr>,
+    checkpoint: bool,
+    startup_timeout: u64,
+) -> Result<Session> {
+    let lock = RegistryLock::acquire()?;
+    let current = resolve(&stopped.name)?;
+    anyhow::ensure!(
+        matches!(current.state.as_str(), "stopped" | "failed" | "stale"),
+        "session '{}' is {}",
+        current.name,
+        current.state
+    );
+    let directory = current.directory.clone();
+    let mut launch: Launch = serde_json::from_slice(&fs::read(directory.join("launch.json"))?)?;
+    let (source_executable, build_id) = match executable {
+        Some(executable) => {
+            let source = fs::canonicalize(executable)?;
+            let build_id = repin_executable(&source, &directory.join("bin/omar"))?;
+            (source, build_id)
+        }
+        None => (
+            current.source_executable.clone(),
+            file_digest(&directory.join("bin/omar"))?,
+        ),
+    };
+    if let Some(compiler) = compiler {
+        repin_executable(compiler, &directory.join("bin/omarc"))?;
+    }
+    let version = Command::new(directory.join("bin/omar"))
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .last()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_else(|| current.version.clone());
+    let mut session = current.clone();
+    session.incarnation = Uuid::new_v4().to_string();
+    session.state = "starting".into();
+    session.pid = 0;
+    session.source_executable = source_executable;
+    session.build_id = build_id;
+    session.version = version;
+    // The tmux server is per session; a stale server from the last run
+    // would answer for agents that are gone.
+    let _ = Command::new("tmux")
+        .args(["-L", &session.tmux_server, "kill-server"])
+        .output();
+    let _ = fs::remove_file(&session.socket);
+    launch.session = session.clone();
+    launch.address = match address {
+        Some(address) => address,
+        None => current
+            .url
+            .trim_start_matches("http://")
+            .parse()
+            .unwrap_or(launch.address),
+    };
+    launch.checkpoint |= checkpoint;
+    launch.json = false;
+    write_json(&directory.join("launch.json"), &launch)?;
+    let config = Config::load(directory.join("config.toml").to_str())?;
+    let workdir = PathBuf::from(&config.agent.default_workdir);
+    spawn_daemon(session, &workdir, lock, startup_timeout)
 }
 
 pub fn validate_exec(cli: &Cli) -> Result<()> {
@@ -842,13 +973,14 @@ fn begin_shutdown(
     Ok(json!({"status":"stopping"}))
 }
 
-/// Graceful stop requests may wait behind an in-flight admission, so they run
-/// off the request (acknowledged at once) and off the daemon loop.
+/// Graceful shutdown pauses every active run at its next tag boundary. The
+/// requests may wait behind an in-flight admission, so they run off the
+/// request (acknowledged at once) and off the daemon loop.
 fn request_stops(server: &Arc<Serve>) {
     let server = server.clone();
     std::thread::spawn(move || {
         if let Err(error) = server.session_stopping() {
-            eprintln!("graceful stop requests failed: {error:#}");
+            eprintln!("graceful pause requests failed: {error:#}");
         }
     });
 }
@@ -1053,7 +1185,7 @@ async fn daemon(directory: &Path) -> Result<()> {
     session.url = format!("http://{}", server.address());
     session.state = "ready".into();
     publish(&session)?;
-    print_started(&session, launch.json)?;
+    print_started(&session, None, launch.json)?;
     let session = Arc::new(Mutex::new(session));
     let force = Arc::new(AtomicBool::new(false));
     let operations = Arc::new(Mutex::new(()));
@@ -1078,6 +1210,7 @@ async fn daemon(directory: &Path) -> Result<()> {
                     });
                     let _operation = (!direct).then(|| operations.lock().unwrap());
                     let mut record = session.lock().unwrap().clone();
+                    let before = record.state.clone();
                     let result = request.and_then(|request| {
                         anyhow::ensure!(
                             request.protocol == PROTOCOL
@@ -1091,7 +1224,7 @@ async fn daemon(directory: &Path) -> Result<()> {
                         }
                         handle_operation(&server, &mut record, request.operation)
                     });
-                    if record.state == "stopping" {
+                    if record.state != before {
                         *session.lock().unwrap() = record.clone();
                     }
                     let response = match result {
@@ -1129,6 +1262,9 @@ async fn daemon(directory: &Path) -> Result<()> {
         }
     }
     scheduler_task.abort();
+    // Runs that are paused, or were cut off by a forced shutdown, are worth
+    // keeping: `omar up --name` starts the session again with them in place.
+    let keep = launch.checkpoint || server.session_holds_runs();
     for bridge in &mut bridges {
         crate::kill_child_gracefully(bridge, Duration::from_secs(3));
     }
@@ -1136,7 +1272,7 @@ async fn daemon(directory: &Path) -> Result<()> {
     let mut session = session.lock().unwrap();
     session.state = "stopped".into();
     publish(&session)?;
-    if !launch.checkpoint {
+    if !keep {
         // Like a tmux session: once it is over, nothing is left to list.
         let _ = fs::remove_file(registry().join(format!("{}.json", session.name)));
         let _ = fs::remove_dir_all(directory);
@@ -1173,14 +1309,138 @@ fn print_value(value: Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
-fn print_started(session: &Session, json_output: bool) -> Result<()> {
-    if json_output {
-        return print_value(json!(session));
+/// The session's runs: asked of a running runtime, read from the state
+/// directory of a stopped one.
+fn session_runs(session: &Session) -> Vec<Value> {
+    if session.state == "ready" {
+        return rpc(
+            session,
+            json!({"op":"runs","ea":"0","all_eas":true}),
+            Duration::from_secs(5),
+        )
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
     }
+    crate::serve::stored_runs(&session.directory)
+}
+
+/// `2 paused`, `1 running, 1 paused`, or `-`. A stopped session's run that
+/// was still executing when the runtime went is `interrupted`: its restart
+/// pauses it at its last checkpoint.
+fn runs_summary(session: &Session, runs: &[Value]) -> String {
+    let (mut running, mut paused, mut interrupted) = (0, 0, 0);
+    for run in runs {
+        match run["status"].as_str() {
+            Some("paused") => paused += 1,
+            Some("starting" | "running" | "stopping" | "pausing") if session.state == "ready" => {
+                running += 1
+            }
+            Some("starting" | "running" | "stopping" | "pausing") => interrupted += 1,
+            _ => (),
+        }
+    }
+    let parts: Vec<String> = [
+        (running, "running"),
+        (paused, "paused"),
+        (interrupted, "interrupted"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, what)| format!("{count} {what}"))
+    .collect();
+    if parts.is_empty() {
+        "-".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn describe_age(seconds: u64) -> String {
+    match seconds {
+        0..=89 => format!("{seconds}s ago"),
+        90..=5399 => format!("{} min ago", seconds / 60),
+        5400..=129_599 => format!("{} h ago", seconds / 3600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
+
+/// `Started session NAME` with how to reach it; after a restart, what build
+/// it moved to and which paused workflows wait for `omar resume`.
+fn print_started(session: &Session, previous: Option<&Session>, json_output: bool) -> Result<()> {
+    let Some(previous) = previous else {
+        if json_output {
+            return print_value(json!(session));
+        }
+        println!(
+            "Started session {}\nURL:    {}\nTUI:    omar attach -s {} --tui\nWeb:    omar attach -s {} --web\nStop:   omar down -s {}",
+            session.name, session.url, session.name, session.name, session.name
+        );
+        return Ok(());
+    };
+    let paused: Vec<Value> = session_runs(session)
+        .into_iter()
+        .filter(|run| run["status"] == "paused")
+        .collect();
+    if json_output {
+        let mut value = json!(session);
+        value["previous_build"] =
+            json!({"version": previous.version, "build_id": previous.build_id});
+        value["paused_runs"] = json!(paused);
+        return print_value(value);
+    }
+    let build = if session.build_id == previous.build_id {
+        format!(
+            "build {} ({})",
+            &session.build_id[..12.min(session.build_id.len())],
+            session.version
+        )
+    } else {
+        format!(
+            "build {} ({}), was {} ({})",
+            &session.build_id[..12.min(session.build_id.len())],
+            session.version,
+            &previous.build_id[..12.min(previous.build_id.len())],
+            previous.version
+        )
+    };
     println!(
-        "Started session {}\nURL:    {}\nTUI:    omar attach -s {} --tui\nWeb:    omar attach -s {} --web\nStop:   omar down -s {}",
-        session.name, session.url, session.name, session.name, session.name
+        "Restarted session {} on {build}\nURL:    {}",
+        session.name, session.url
     );
+    if paused.is_empty() {
+        println!("No paused workflows.");
+        return Ok(());
+    }
+    println!("Paused workflows:");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    for run in &paused {
+        let team = run["team"].as_str().unwrap_or("?");
+        let age = run["finished_at"]
+            .as_u64()
+            .map(|at| describe_age(now.saturating_sub(at)))
+            .unwrap_or_default();
+        let checkpoint = run["ea_id"]
+            .as_u64()
+            .and_then(|ea| {
+                crate::checkpoint::Store::new(&crate::deploy::dir_for(
+                    &session.directory,
+                    ea as u32,
+                    team,
+                ))
+                .resume_point()
+                .ok()
+                .flatten()
+            })
+            .map(|manifest| format!(" at checkpoint #{}", manifest.sequence))
+            .unwrap_or_default();
+        println!("  {team:<20} paused {age}{checkpoint}");
+    }
+    let first = paused[0]["team"].as_str().unwrap_or("TEAM");
+    println!("Resume: omar resume {first} -s {}", session.name);
     Ok(())
 }
 fn strip_target_args(args: impl Iterator<Item = String>) -> Vec<String> {
@@ -1226,8 +1486,8 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         },
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
         None => Err(anyhow::anyhow!("a command is required; see omar --help")),
-        Some(Commands::Up(options)) => launch(cli, options.clone(), false).and_then(|s| {
-            print_started(&s, cli.json)?;
+        Some(Commands::Up(options)) => launch(cli, options.clone(), false).and_then(|(s, previous)| {
+            print_started(&s, previous.as_ref(), cli.json)?;
             if options.web { crate::open_browser(&s.url); }
             if options.tui {
                 // A fresh process attaches: the dashboard selects its session before Tokio starts.
@@ -1237,13 +1497,16 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             Ok(())
         }),
         Some(Commands::Ls) => discover().and_then(|sessions| {
-            if cli.json { return print_value(json!(sessions)); }
-            println!("{:<20} {:<12} {:<26} BUILD", "NAME", "STATUS", "URL");
-            for s in sessions { println!("{:<20} {:<12} {:<26} {} {}",s.name,s.state,s.url,s.version,&s.build_id[..12.min(s.build_id.len())]); }
+            let listed: Vec<(Session, Vec<Value>)> = sessions.into_iter().map(|s| { let runs = session_runs(&s); (s, runs) }).collect();
+            if cli.json {
+                return print_value(json!(listed.iter().map(|(s, runs)| { let mut v = json!(s); v["runs"] = json!(runs); v }).collect::<Vec<_>>()));
+            }
+            println!("{:<20} {:<12} {:<22} {:<26} BUILD", "NAME", "STATUS", "WORKFLOWS", "URL");
+            for (s, runs) in &listed { println!("{:<20} {:<12} {:<22} {:<26} {} {}",s.name,s.state,runs_summary(s, runs),s.url,s.version,&s.build_id[..12.min(s.build_id.len())]); }
             Ok(())
         }),
         Some(Commands::Info) => target(cli).and_then(|s| {
-            if matches!(s.state.as_str(), "stopped" | "failed" | "stale") { Ok(json!({"session":s})) }
+            if matches!(s.state.as_str(), "stopped" | "failed" | "stale") { Ok(json!({"session":s, "runs": crate::serve::stored_runs(&s.directory)})) }
             else { rpc(&s,json!({"op":"overview"}),Duration::from_secs(5)) }
         }).and_then(print_value),
         Some(Commands::Attach { web: true, print_url, .. }) => target(cli).and_then(|s| {
@@ -1274,7 +1537,13 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             if s.state == "stopped" { return Ok(()); }
             rpc(&s,json!({"op":"down","force":force}),Duration::from_secs(10))?;
             let saved = wait_stopped(&s, Duration::from_secs(*timeout))?;
-            if cli.json { print_value(json!(saved)) } else { println!("Stopped session {}",s.name); Ok(()) }
+            let kept = registry().join(format!("{}.json", s.name)).exists();
+            let runs = if kept { crate::serve::stored_runs(&saved.directory) } else { Vec::new() };
+            if cli.json { let mut v = json!(saved); v["kept"] = json!(kept); v["runs"] = json!(runs); return print_value(v); }
+            let summary = runs_summary(&saved, &runs);
+            if kept && summary != "-" { println!("Stopped session {}; {summary} workflow(s) kept. omar up --name {} restarts it", s.name, s.name); }
+            else { println!("Stopped session {}", s.name); }
+            Ok(())
         }),
         Some(Commands::Run(options)) => (|| {
             // No runtime selected: this run gets a session of its own, shut
@@ -1286,7 +1555,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
                     (s, false)
                 }
                 Err(_) if cli.session.is_none() && std::env::var_os("OMAR_SESSION_ID").is_none() => {
-                    let s = launch(cli, UpOptions { no_ea: true, checkpoint: options.checkpoint, ..UpOptions::default() }, false)?;
+                    let (s, _) = launch(cli, UpOptions { no_ea: true, checkpoint: options.checkpoint, ..UpOptions::default() }, false)?;
                     if !cli.json { eprintln!("Started session {}; omar down -s {} stops it", s.name, s.name); }
                     (s, true)
                 }

@@ -115,7 +115,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create a new independent background runtime
+    /// Create a new independent background runtime, or restart a stopped one by name on this build
     Up(sessions::UpOptions),
     /// List independently addressable runtime sessions
     Ls,
@@ -147,7 +147,7 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Shut down one runtime and its owned workloads
+    /// Shut down one runtime: running workflows pause at their next tag boundary, and a session with paused workflows keeps its state so `up --name` restarts it
     Down {
         #[arg(long)]
         force: bool,
@@ -712,7 +712,17 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "Topologies",
-        &["run", "runs", "status", "stop", "workspace"],
+        &[
+            "run",
+            "runs",
+            "status",
+            "stop",
+            "pause",
+            "resume",
+            "rollback",
+            "checkpoint",
+            "workspace",
+        ],
     ),
     (
         "Executive assistants and agents",

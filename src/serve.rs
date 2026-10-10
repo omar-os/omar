@@ -59,6 +59,13 @@ struct Presence {
 }
 
 impl Presence {
+    /// Why a new run cannot be admitted right now, if it cannot.
+    fn refusal(&self) -> Option<&'static str> {
+        self.stopping.then_some("runtime is shutting down")
+    }
+}
+
+impl Presence {
     fn connect(&mut self) -> Result<()> {
         anyhow::ensure!(!self.stopping, "runtime is shutting down");
         self.clients += 1;
@@ -404,11 +411,14 @@ impl Serve {
     }
 
     pub(crate) fn session_start(&self, ea: EaId, body: Value) -> Result<Value> {
-        let _admission = self.workspaces.presence.lock().unwrap();
+        let admission = self.workspaces.presence.lock().unwrap();
         anyhow::ensure!(
             !self.workspaces.shutdown.load(Ordering::SeqCst),
             "runtime is stopping"
         );
+        if let Some(refusal) = admission.refusal() {
+            bail!("{refusal}");
+        }
         let id = self.workspaces.history.lock().unwrap().chat_for_ea(ea)?;
         let context = self.workspaces.get(&id)?;
         let (status, value) = start_run(&context, &serde_json::to_vec(&body)?);
@@ -496,6 +506,9 @@ impl Serve {
     pub(crate) fn session_resume(&self, ea: EaId, selector: &str) -> Result<Value> {
         let (context, id) =
             self.session_find(ea, selector, |run| run.status == RunStatus::Paused)?;
+        if let Some(refusal) = self.workspaces.presence.lock().unwrap().refusal() {
+            bail!("{refusal}");
+        }
         let (status, value) = resume_run(&context, &id);
         anyhow::ensure!(status < 400, "{}", value["error"]);
         Ok(value)
@@ -523,6 +536,10 @@ impl Serve {
         selector: &str,
         eligible: impl Fn(&RunRecord) -> bool,
     ) -> Result<(Arc<Context_>, String)> {
+        // The EA's chat context is where its parked runs are offered again
+        // after a restart; it exists once something asks for the EA.
+        let id = self.workspaces.history.lock().unwrap().chat_for_ea(ea)?;
+        self.workspaces.get(&id)?;
         let contexts = self
             .workspaces
             .contexts
@@ -556,29 +573,57 @@ impl Serve {
         self.workspaces.shutdown.store(true, Ordering::SeqCst);
     }
 
+    /// A graceful shutdown parks the session's work rather than ending it:
+    /// every active run pauses at its next tag boundary, so the session
+    /// restarts later with the runs where they were. A run that cannot pause
+    /// (it has not started executing yet) is stopped instead.
     pub(crate) fn session_stopping(&self) -> Result<()> {
         // Admission uses this same mutex when checking shutdown and inserting a run.
         let mut presence = self.workspaces.presence.lock().unwrap();
         presence.stopping = true;
         self.workspaces.shutdown.store(true, Ordering::SeqCst);
-        for context in self.workspaces.contexts.lock().unwrap().values() {
-            for run in context
-                .runs
-                .lock()
-                .unwrap()
-                .values()
-                // A pausing run is about to park on its own; asking it to
-                // stop would be refused while its pause request waits.
+        let contexts = self
+            .workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for context in contexts {
+            let runs: Vec<RunRecord> = context.runs.lock().unwrap().values().cloned().collect();
+            // A pausing run is about to park on its own; asking again would
+            // be refused while its pause request waits.
+            for run in runs
+                .iter()
                 .filter(|r| r.status.is_active() && r.status != RunStatus::Pausing)
             {
-                crate::deploy::request_stop(&crate::deploy::dir_for(
-                    &context.omar_dir,
-                    context.ea_id,
-                    &run.team,
-                ))?;
+                let (status, value) = pause_run(&context, &run.run_id);
+                if status >= 400 {
+                    eprintln!(
+                        "run {} ({}) cannot pause for shutdown ({}); stopping it",
+                        run.run_id, run.team, value["error"]
+                    );
+                    crate::deploy::request_stop(&crate::deploy::dir_for(
+                        &context.omar_dir,
+                        context.ea_id,
+                        &run.team,
+                    ))?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Whether any run still holds its team: active, or paused and waiting
+    /// to be resumed. A session with such runs keeps its state when it stops.
+    pub(crate) fn session_holds_runs(&self) -> bool {
+        self.session_runs(None).iter().any(|r| {
+            matches!(
+                r["status"].as_str(),
+                Some("starting" | "running" | "stopping" | "pausing" | "paused")
+            )
+        })
     }
 
     pub(crate) fn session_has_work(&self) -> bool {
@@ -1220,8 +1265,8 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
                 // The idle check and run admission must be indivisible: a
                 // closing window cannot stop a deployment being admitted.
                 let presence = workspaces.presence.lock().expect("presence poisoned");
-                if presence.stopping {
-                    (503, json!({"error": "runtime is shutting down"}))
+                if let Some(refusal) = presence.refusal() {
+                    (503, json!({"error": refusal}))
                 } else {
                     start_run(&context, &read_body(content_length)?)
                 }
@@ -1346,8 +1391,8 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
             } else {
                 let _ = read_body(content_length)?;
                 let presence = workspaces.presence.lock().expect("presence poisoned");
-                if presence.stopping {
-                    (503, json!({"error": "runtime is shutting down"}))
+                if let Some(refusal) = presence.refusal() {
+                    (503, json!({"error": refusal}))
                 } else {
                     resume_run(&context, &id)
                 }
@@ -3144,11 +3189,64 @@ fn persist_run(context: &Context_, record: &RunRecord) {
     }
 }
 
-/// The paused runs an EA's staging holds: still resumable, so a daemon that
-/// starts over offers them again under their own ids. Each team's latest
-/// run is the one that can hold it; it counts as paused when its record says
-/// so, or when the daemon died between the deployment parking and the
-/// record saying so, which the deployment record settles.
+/// The runs a stopped session's state holds, as `omar ls` reports them
+/// without starting it: each team's latest run, read-only. A run whose
+/// runtime exited while it was executing is reported under its last recorded
+/// status; a restart settles it (see `paused_runs`).
+pub fn stored_runs(omar_dir: &Path) -> Vec<Value> {
+    let mut found = Vec::new();
+    // Every EA directory, registered or not: a session started with
+    // `--no-ea` still runs topologies under EA 0.
+    let ea_ids: Vec<EaId> = fs::read_dir(omar_dir.join("ea"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    for ea_id in ea_ids {
+        let staged = crate::ea::ea_state_dir(ea_id, omar_dir).join("serve");
+        let Ok(entries) = fs::read_dir(staged) else {
+            continue;
+        };
+        let mut latest: BTreeMap<String, RunRecord> = BTreeMap::new();
+        for record in entries
+            .flatten()
+            .filter_map(|entry| fs::read(entry.path().join("run.json")).ok())
+            .filter_map(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok())
+        {
+            let newer = latest
+                .get(&record.team)
+                .is_none_or(|held| record.started_at >= held.started_at);
+            if newer {
+                latest.insert(record.team.clone(), record);
+            }
+        }
+        for mut record in latest.into_values() {
+            let dir = crate::deploy::dir_for(omar_dir, ea_id, &record.team);
+            let state = crate::deploy::DeploymentRecord::load(&dir)
+                .ok()
+                .flatten()
+                .map(|d| d.state);
+            if record.status.is_active() && state == Some(crate::deploy::DeploymentState::Paused) {
+                record.status = RunStatus::Paused;
+            }
+            let mut value = json!(record);
+            value["ea_id"] = json!(ea_id);
+            found.push(value);
+        }
+    }
+    found
+}
+
+/// The runs an EA's staging holds that a daemon starting over must offer
+/// again under their own ids. Each team's latest run is the one that can
+/// hold it. It counts as paused when its record says so, or when the daemon
+/// died between the deployment parking and the record saying so, which the
+/// deployment record settles. A run the daemon was still executing is
+/// interrupted: with a checkpoint it is paused there, resumable at the cost
+/// of the tags since; without one it has failed.
 fn paused_runs(omar_dir: &Path, ea_id: EaId) -> BTreeMap<String, RunRecord> {
     let staged = crate::ea::ea_state_dir(ea_id, omar_dir).join("serve");
     let Ok(entries) = fs::read_dir(staged) else {
@@ -3171,16 +3269,40 @@ fn paused_runs(omar_dir: &Path, ea_id: EaId) -> BTreeMap<String, RunRecord> {
         .into_values()
         .filter_map(|mut record| {
             let dir = crate::deploy::dir_for(omar_dir, ea_id, &record.team);
-            let deployment = crate::deploy::DeploymentRecord::load(&dir)
-                .ok()
-                .flatten()
-                .map(|d| d.state);
-            let parked = deployment == Some(crate::deploy::DeploymentState::Paused);
+            let deployment = crate::deploy::DeploymentRecord::load(&dir).ok().flatten();
+            let state = deployment.as_ref().map(|d| d.state);
+            let parked = state == Some(crate::deploy::DeploymentState::Paused);
+            let unfinished = state.is_some_and(|state| !state.is_terminal());
             match record.status {
                 RunStatus::Paused if deployment.is_none() || parked => {}
                 RunStatus::Starting | RunStatus::Running | RunStatus::Pausing if parked => {
                     record.status = RunStatus::Paused;
                     record.finished_at = Some(now_unix());
+                }
+                status if status.is_active() && unfinished => {
+                    let mut deployment = deployment?;
+                    if deployment.started_at < record.started_at {
+                        // The deployment predates this run: it never got as
+                        // far as one, so there is nothing to continue.
+                        return None;
+                    }
+                    let (status, error) = recovered_status(&mut deployment, &dir);
+                    eprintln!(
+                        "Recovered run {} ({}): {}",
+                        record.run_id,
+                        record.team,
+                        crate::diagram::wire_name(&status).unwrap_or_default()
+                    );
+                    record.status = status;
+                    record.error = error;
+                    record.finished_at = deployment.finished_at;
+                    record.state = deployment.state_vars.clone();
+                    record.diagram_address = None;
+                    let path = crate::ea::ea_state_dir(ea_id, omar_dir)
+                        .join("serve")
+                        .join(&record.run_id)
+                        .join("run.json");
+                    let _ = topology::write_json_atomic(&path, &record);
                 }
                 _ => return None,
             }
@@ -3312,6 +3434,79 @@ fn spawn_resume_thread(
         );
         finish_run(&context, &run_id, outcome);
     });
+}
+
+/// The status a recovered run reports, settling an interrupted record on disk.
+fn recovered_status(
+    record: &mut crate::deploy::DeploymentRecord,
+    dir: &Path,
+) -> (RunStatus, Option<String>) {
+    use crate::deploy::DeploymentState;
+    match record.state {
+        DeploymentState::Paused => (RunStatus::Paused, None),
+        DeploymentState::Failed => (RunStatus::Failed, record.error.clone()),
+        DeploymentState::Cancelled => (RunStatus::Stopped, None),
+        DeploymentState::Terminated => {
+            let stopped = record
+                .history
+                .last()
+                .and_then(|event| event.detail.as_deref())
+                .is_some_and(|detail| detail.starts_with("stopped"));
+            (
+                if stopped {
+                    RunStatus::Stopped
+                } else {
+                    RunStatus::Completed
+                },
+                None,
+            )
+        }
+        _ if record.pid != std::process::id() && record.runner_alive() => {
+            // Another live process owns it; leave it alone and say so.
+            (
+                RunStatus::Failed,
+                Some(format!(
+                    "run is owned by another process (pid {})",
+                    record.pid
+                )),
+            )
+        }
+        _ => {
+            let now = crate::deploy::now_unix();
+            record.finished_at = Some(now);
+            // The panes belonged to the runtime that is gone, on a tmux server
+            // that was killed before this one started; nothing is left to
+            // tear down, and a resume must not go looking for it.
+            record.sessions_cleaned = true;
+            let (state, status, note) = match &record.checkpoint {
+                Some(checkpoint) => (
+                    DeploymentState::Paused,
+                    RunStatus::Paused,
+                    format!(
+                        "runtime exited mid-run; resume continues from checkpoint {checkpoint}, work after it is lost"
+                    ),
+                ),
+                None => (
+                    DeploymentState::Failed,
+                    RunStatus::Failed,
+                    "runtime exited mid-run with no checkpoint to continue from".to_string(),
+                ),
+            };
+            record.state = state;
+            record.history.push(crate::deploy::TransitionEvent {
+                state,
+                at: now,
+                detail: Some(note.clone()),
+            });
+            if status == RunStatus::Failed {
+                record.error = Some(note.clone());
+            }
+            if let Err(error) = record.save(dir) {
+                eprintln!("warning: could not settle interrupted run: {error:#}");
+            }
+            (status, Some(note))
+        }
+    }
 }
 
 fn now_unix() -> u64 {

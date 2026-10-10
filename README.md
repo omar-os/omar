@@ -150,6 +150,31 @@ with `omar --session dev ea create --name Research --agent codex`.
 Target it with `omar --session dev --ea Research ...`; this does not change
 another client's selection.
 
+### Upgrading omar with sessions running
+
+The package manager replaces the binary; omar has no upgrade command. A
+running session keeps executing the build it started with, so moving it to
+the new build is a restart of that session, with its workflows paused across
+it:
+
+```
+omar pause Ticker --wait -s dev   # checkpoint and park the workflows you care about
+brew upgrade omar                 # or the install script
+omar down -s dev                  # workflows still running pause at their next tag boundary
+omar up --name dev                # the same session, on the new build, at its previous URL
+omar resume Ticker -s dev         # continues from the checkpoint; the run keeps its id
+```
+
+`omar ls` shows each session's workflows (`1 running, 1 paused`), for stopped
+sessions too. A session that stops with paused workflows keeps its state
+whether or not it was started with `--checkpoint`; one with nothing to keep
+leaves nothing behind, and `omar rm` removes a kept one. `omar up --name` on
+a stopped session reports the build it moved to and the paused workflows
+waiting for `omar resume`; nothing resumes on its own. A forced stop (`down
+--force`, a crash) leaves a workflow interrupted mid-run: the restart pauses
+it at its last checkpoint, and the tags since are lost. Other sessions are
+never touched.
+
 Codex launch commands no longer disable the alternate screen. OMAR does not
 add `--no-alt-screen`; an explicit flag in a custom command is still respected.
 Remove that flag from an existing `default_command` to try the alternate screen,

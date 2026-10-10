@@ -231,11 +231,15 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             os.close(master)
         record = Path(env["OMAR_HOME"]) / "registry" / f"{inner['name']}.json"
         deadline = time.monotonic() + 20
-        # A session without a checkpoint removes its record as it stops.
-        while record.exists() and json.loads(record.read_text())["state"] != "stopped":
+        while json.loads(record.read_text())["state"] != "stopped":
             assert time.monotonic() < deadline, record.read_text()
             time.sleep(.2)
         wait_status("outer", run_a, "running")
+        # A graceful stop pauses the session's running workflow and keeps the
+        # session for `up --name`; ls lists it, stopped, with the paused run.
+        listed = {s["name"]: s for s in json.loads(cli("ls", "--json"))}
+        assert listed["inner"]["state"] == "stopped" and {r["run_id"]: r["status"] for r in listed["inner"]["runs"]} == {run_b: "paused"}, listed["inner"]
+        cli("rm", "-s", "inner")
         assert "inner" not in {s["name"] for s in json.loads(cli("ls", "--json"))}
         cli("--session", "outer", "stop", run_a)
         wait_status("outer", run_a, "stopped")
