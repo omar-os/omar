@@ -356,6 +356,23 @@ export async function fetchCheckpoints(
 }
 
 /** The logical timeline of a run the daemon admitted, projected from its program and inputs. */
+/**
+ * The diagram a paused run left behind. Its own server died with the loop,
+ * so this is what a reload shows until the run is resumed.
+ */
+export async function fetchRunSnapshot(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<DiagramSnapshot> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/snapshot`, { signal });
+  if (!response.ok) {
+    throw new Error(`Runtime returned HTTP ${response.status}.`);
+  }
+  return assertDiagramSnapshot(await response.json());
+}
+
 export async function fetchRunTimeline(
   serveUrl: string,
   runId: string,

@@ -245,6 +245,13 @@ export async function startFakeServe({
         });
       }
     }
+    if (request.method === "GET" && url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/snapshot")) {
+      // The picture a paused run left behind, as serve keeps it.
+      const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length, -"/snapshot".length));
+      return entry && entry.record.status === "paused"
+        ? json(response, 200, entry.snapshot)
+        : json(response, 404, { error: "no snapshot kept for this run" });
+    }
     if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
       const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length));
       return entry

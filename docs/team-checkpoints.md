@@ -85,6 +85,8 @@ preview of what it holds; a paused run commits with "Roll back to this
 checkpoint" from that preview.
 `GET /v1/runs/<id>/timeline` projects a run's strip from its staged bytecode
 and admitted inputs, so it exists without a draft behind it.
+`GET /v1/runs/<id>/snapshot` is the diagram a paused run left behind (its
+own server dies with the loop), so a reload shows the parked run.
 The live diagram reports `paused`.
 
 Not in this PR: checkpoint import into another session, input journalling

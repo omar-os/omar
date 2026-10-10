@@ -1796,6 +1796,9 @@ pub struct RunOutcome {
     pub end: RunEnd,
     pub outputs: BTreeMap<String, Value>,
     pub state: BTreeMap<String, Value>,
+    /// The live diagram as the run left it, when one was served: a paused
+    /// run's picture outlives its diagram server.
+    pub diagram: Option<crate::diagram::DiagramSnapshot>,
 }
 
 /// Advance the shared record and persist it, as one step.
@@ -2519,6 +2522,7 @@ fn launch(
             end: RunEnd::Paused,
             outputs: paused.outputs,
             state: paused.state_vars,
+            diagram: diagram_server.as_ref().map(DiagramServer::snapshot),
         });
     }
     let (settled, stopped) = match end {
@@ -2596,6 +2600,7 @@ fn launch(
         },
         outputs,
         state: state_vars,
+        diagram: diagram_server.as_ref().map(DiagramServer::snapshot),
     })
 }
 

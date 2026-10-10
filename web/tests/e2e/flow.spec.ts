@@ -736,6 +736,12 @@ test("a run can be paused and resumed from the panel that shows it", async ({ pa
   await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
   await expect(actions.getByRole("button", { name: "Pause" })).toHaveCount(0);
 
+  // A reload finds the parked run as it was: its diagram server is gone,
+  // but serve kept the picture, so the controls and the timeline come back.
+  await page.reload();
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  await expect(actions.getByRole("button", { name: "Resume" })).toBeVisible();
+
   // A paused run rolls back from the timeline: checkpoints are marks at the
   // tags they completed, a mark opens a preview of what it holds, and the
   // preview is where "continue from here" is committed.

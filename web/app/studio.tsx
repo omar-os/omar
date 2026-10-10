@@ -39,6 +39,7 @@ import {
   checkServeHealth,
   diagramUrlFor,
   fetchDiagram,
+  fetchRunSnapshot,
   fetchPanel,
   fetchRun,
   checkProgram,
@@ -645,11 +646,16 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         buffered = [];
         const restore = async () => {
           const activeRun = conversation.run && !isRunFinished(conversation.run.status);
+          // Parked, not over: a paused run keeps its controls and its timeline.
+          const parkedRun = conversation.run?.status === "paused";
           // Keep the current chat on screen while its replacement is replayed
           // and its live snapshot is fetched. Commit them in one React batch.
+          // A paused run's diagram server is gone; serve kept its last picture.
           const liveSnapshot = activeRun && conversation.run?.diagram_address
             ? await fetchDiagram(diagramUrlFor(conversation.run), abort.signal).catch(() => null)
-            : null;
+            : conversation.run?.status === "paused"
+              ? await fetchRunSnapshot(serveUrl, conversation.run.run_id, abort.signal).catch(() => null)
+              : null;
           if (!connected || currentRevision !== revision || conversation.id !== subscribedId) return;
           restoreConversation(conversation);
           runRef.current = conversation.run ?? null;
@@ -676,12 +682,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           setAssistantBusy(conversation.busy);
           // A finished run must not override the proposal restored from the
           // transcript. Only a live topology owns the diagram and its controls.
-          if (replayedProposal && !activeRun) {
+          if (replayedProposal && !activeRun && !parkedRun) {
             runRef.current = null;
             setRun(null);
             setTab("source");
             setPhase("review");
-          } else if (conversation.busy && !activeRun) {
+          } else if (conversation.busy && !activeRun && !parkedRun) {
             setPhase("drafting");
           }
           // Replies received during the snapshot fetch are newer than the

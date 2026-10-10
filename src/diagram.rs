@@ -651,6 +651,15 @@ impl DiagramServer {
     pub fn publisher(&self) -> DiagramPublisher {
         self.publisher.clone()
     }
+
+    /// The picture as it stands, for keeping once this server is gone.
+    pub fn snapshot(&self) -> DiagramSnapshot {
+        self.publisher
+            .snapshot
+            .read()
+            .expect("diagram snapshot poisoned")
+            .clone()
+    }
 }
 
 impl Drop for DiagramServer {

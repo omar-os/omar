@@ -1265,6 +1265,12 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         }
         // Before the run-record route, which would otherwise take the suffix
         // for part of the id.
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/snapshot") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/snapshot");
+            run_snapshot(&context, id)
+        }
         ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/timeline") => {
             let id = rest
                 .trim_start_matches("/v1/runs/")
@@ -2850,6 +2856,12 @@ struct RollbackRequest {
 /// deleted; the next resume continues from there with that checkpoint's
 /// files restored into new workspaces.
 fn rollback_run(context: &Arc<Context_>, id: &str, body: &[u8]) -> (u16, Value) {
+    // Serialised with admission and resume: a head change must not land
+    // after a resume has already read the old one.
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     let request: RollbackRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
@@ -2893,6 +2905,12 @@ fn rollback_run(context: &Arc<Context_>, id: &str, body: &[u8]) -> (u16, Value) 
 /// same run id. The program it was admitted with is still staged beside the
 /// run, so generated code lands where the original run put it.
 fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    // Serialised with admission: a fresh start's team check and this run's
+    // return to `Starting` must not interleave, or both would launch.
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     let team = {
         let runs = context.runs.lock().expect("serve runs poisoned");
         match runs.get(id) {
@@ -2955,6 +2973,32 @@ fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     }
 }
 
+/// Where a paused run's last diagram is kept: its server died with the loop,
+/// and a reload still has to show what was parked.
+fn snapshot_path(context: &Context_, run_id: &str) -> std::path::PathBuf {
+    crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(run_id)
+        .join("snapshot.json")
+}
+
+/// The diagram a paused run left behind, exactly as its server last served it.
+fn run_snapshot(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        if !runs.contains_key(id) {
+            return (404, json!({"error": "unknown run"}));
+        }
+    }
+    match fs::read(snapshot_path(context, id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    {
+        Some(snapshot) => (200, snapshot),
+        None => (404, json!({"error": "no snapshot kept for this run"})),
+    }
+}
+
 /// What the daemon records once a run's loop returns, however it returned.
 fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::RunOutcome>) {
     // The run is over, so its invocation service is gone with it. Leaving
@@ -2976,6 +3020,11 @@ fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::R
                 };
                 record.outputs = outcome.outputs;
                 record.state = outcome.state;
+                if let (topology::RunEnd::Paused, Some(diagram)) = (outcome.end, &outcome.diagram) {
+                    let path = snapshot_path(context, run_id);
+                    let _ = fs::create_dir_all(path.parent().expect("run dir"));
+                    let _ = fs::write(path, serde_json::to_vec(diagram).unwrap_or_default());
+                }
             }
             Err(error) => {
                 record.status = RunStatus::Failed;
@@ -2992,6 +3041,21 @@ fn spawn_resume_thread(
     program_path: std::path::PathBuf,
     ready_sender: mpsc::Sender<SocketAddr>,
 ) {
+    // A resumed run answers web agents through the panel too: its credentials
+    // arrive on their own channel, stored as they come, as on a fresh start.
+    let (panel_sender, panel_receiver) = mpsc::channel();
+    {
+        let panels = context.panels.clone();
+        let id = run_id.to_string();
+        thread::spawn(move || {
+            if let Ok(access) = panel_receiver.recv() {
+                panels
+                    .lock()
+                    .expect("serve panels poisoned")
+                    .insert(id, access);
+            }
+        });
+    }
     let context = context.clone();
     let run_id = run_id.to_string();
     let team = team.to_string();
@@ -3011,7 +3075,7 @@ fn spawn_resume_thread(
                 pace: topology::Pace::RealTime,
                 diagram_address: Some(diagram_address),
                 diagram_ready: Some(ready_sender),
-                panel_ready: None,
+                panel_ready: Some(panel_sender),
                 checkpoint_period: None,
                 program_path: Some(&program_path),
             },
@@ -3958,6 +4022,51 @@ while True:
             .as_str()
             .unwrap()
             .contains("paused run"));
+    }
+
+    /// A paused run's diagram outlives its server: the record of the pause
+    /// keeps it, and the run's snapshot route serves it to a reload.
+    #[test]
+    fn a_paused_run_keeps_its_last_diagram() {
+        let server = test_server();
+        let address = server.address();
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: "Cadence".to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                },
+            );
+        }
+        assert!(request(address, "GET", "/v1/runs/run-1/snapshot", None).contains(" 404 "));
+        assert!(request(address, "GET", "/v1/runs/nobody/snapshot", None).contains(" 404 "));
+        let diagram = crate::diagram::DiagramSnapshot::from_vm_state(&sample_state());
+        finish_run(
+            &server.context,
+            "run-1",
+            Ok(topology::RunOutcome {
+                end: topology::RunEnd::Paused,
+                outputs: BTreeMap::new(),
+                state: BTreeMap::new(),
+                diagram: Some(diagram),
+            }),
+        );
+        let response = request(address, "GET", "/v1/runs/run-1/snapshot", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"team\":\"Sample\""),
+            "{response}"
+        );
+        assert!(request(address, "GET", "/v1/runs/run-1", None).contains("\"status\":\"paused\""));
     }
 
     /// A paused run has no runner to ask, so a stop gives it up in place,
