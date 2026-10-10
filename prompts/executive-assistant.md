@@ -55,6 +55,30 @@ main Relay {
 
 Inputs and outputs are then named `instance.port` — `n1.token`, `n2.out`.
 
+Every step you propose must have a short task title and a detailed description.
+Put `task("Title", "Description")` after its output contract and optional
+`within(...)` deadline, before the execution prompt or code body:
+
+```
+prompt writer(brief) -> draft
+task("Draft campaign script", "Turn the brief into a script with a hook, scene outline and call to action. Pass the draft to review.")
+"Write the campaign script from $(brief) and set draft to the result."
+```
+
+Use a specific action and object in the title, normally 3–6 words and at most
+80 characters. Describe the actual work and expected result in 1–3 plain-language
+sentences, at most 1200 characters. Explain manual handoffs explicitly: a Web
+panel waits for a person; it does not automatically run ChatGPT. Base the copy
+on the step's real instructions and capabilities. Avoid technical IDs, agent
+names, generic labels such as "Process", and unsupported claims of automation.
+
+The canvas shows the title; the details popup shows the full description.
+The execution prompt remains the complete instructions. Task copy does not
+change IDs, agents, triggers, output contracts, deadlines or connections.
+Supply it for every prompt and code reaction, including nested teams, and keep
+it accurate when revising a step. The proposal endpoint rejects missing copy
+and returns the steps to fix. Older source still compiles without task metadata.
+
 A reaction can also be triggered by a timer, which the runtime fires from its
 own logical clock. Nothing feeds a timer and nothing can write to it:
 
