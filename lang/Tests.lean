@@ -410,6 +410,153 @@ def testNamedMain : IO Unit :=
   | .ok program => assertEqual "named main" program.team "Payroll"
   | .error message => throw (IO.userError s!"named main: {message}")
 
+
+def testExternalSchemas : IO Unit := do
+  let schema := "{\"type\":\"string\",\"enum\":[\"approved\",\"needs_revision\"]}"
+  let source := "type Decision from \"schemas/decision.json\"\n" ++
+    "team Review[Decision : Codex] { input Decision : Decision " ++
+    "output out : list<option<Decision>> prompt Decision(Decision) -> out \"Review $(Decision)\" } " ++
+    "main { review = Review() }"
+  let bytecode ← match compileSourceWithSchemas "Review" source #[ ("schemas/decision.json", schema) ] with
+    | .ok bytecode => pure bytecode
+    | .error error => throw (IO.userError s!"external schema: {error}")
+  let json ← match Json.parse bytecode with
+    | .ok json => pure json
+    | .error error => throw (IO.userError error)
+  let instructions ← match json.getObjVal? "instructions" >>= Json.getArr? with
+    | .ok instructions => pure instructions
+    | .error error => throw (IO.userError error)
+  for expected in ["string in [\"approved\",\"needs_revision\"]",
+      "list<option<string in [\"approved\",\"needs_revision\"]>>"] do
+    assertEqual "schema type emitted"
+      (instructions.any (fun item => (item.getObjValAs? String "type").toOption == some expected)) true
+  -- The spelling travels beside the expanded type, and only where a name was used.
+  for expected in ["Decision", "list<option<Decision>>"] do
+    assertEqual s!"declared spelling {expected}"
+      (instructions.any (fun item => (item.getObjValAs? String "declared").toOption == some expected)) true
+  assertEqual "a built-in type has no declared spelling"
+    (instructions.any (fun item => (item.getObjValAs? String "type").toOption == some "string" &&
+      (item.getObjValAs? String "declared").toOption.isSome)) false
+  assertEqual "schema name does not rewrite agent"
+    (instructions.any (fun item => (item.getObjValAs? String "name").toOption == some "review.Decision")) true
+  for invalid in [
+      "{}", "[]", "{\"type\":\"object\",\"enum\":[\"a\"]}",
+      "{\"type\":\"string\",\"enum\":[]}",
+      "{\"type\":\"string\",\"enum\":[1]}",
+      "{\"type\":\"string\",\"enum\":[\"a\",\"a\"]}",
+      "{\"type\":\"string\",\"enum\":[\"a\"],\"minLength\":2}",
+      "{\"type\":\"string\",\"enum\":[\"a\"],\"$ref\":\"remote.json\"}",
+      "{\"type\":\"string\",\"enum\":[\"a\"],\"title\":1}", "not json"] do
+    match compileSourceWithSchemas "Review" source #[ ("schemas/decision.json", invalid) ] with
+    | .error error => assertEqual "schema diagnostic has type context" (error.startsWith "schema type 'Decision' from 'schemas/decision.json':") true
+    | .ok _ => throw (IO.userError s!"accepted unsupported schema: {invalid}")
+  match compileSource "Review" source with
+  | .error _ => pure ()
+  | .ok _ => throw (IO.userError "accepted missing schema contents")
+  for invalidSource in [
+      "type string from \"a.json\" team T {} main { t = T() }",
+      "type D from \"a.json\" type D from \"a.json\" team T {} main { t = T() }",
+      "type D from \"\" team T {} main { t = T() }"] do
+    match schemaImports invalidSource with
+    | .error _ => pure ()
+    | .ok _ => throw (IO.userError "accepted invalid schema declaration")
+  let escaped := "{\"type\":\"string\",\"enum\":[\"quote\\\"\",\"line\\nend\",\"雪\",\"\"]}"
+  match compileSourceWithSchemas "Escaped"
+      "type E from \"e.json\" team T { input token : E } main { t = T() }"
+      #[ ("e.json", escaped) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"escaped schema values: {error}")
+  -- A body may read an enum port: what arrives was checked when it was
+  -- written. It may not write one: its Rust String admits anything.
+  let readsEnum := "input token : Decision output out : string reaction(token) -> out {= out = token; =}"
+  match compileSourceWithSchemas "CodeEnum"
+      ("type Decision from \"schemas/decision.json\" team T { " ++ readsEnum ++ " } main { t = T() }")
+      #[ ("schemas/decision.json", schema) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"enum trigger blocked code reaction: {error}")
+  let writesEnum := "input token : string output out : Decision reaction(token) -> out {= out = token; =}"
+  match compileSourceWithSchemas "CodeEnum"
+      ("type Decision from \"schemas/decision.json\" team T { " ++ writesEnum ++ " } main { t = T() }")
+      #[ ("schemas/decision.json", schema) ] with
+  | .error error =>
+    assertEqual "code enum effect rejected during compilation" (decide ((error.splitOn "cannot write enum port").length > 1)) true
+  | .ok _ => throw (IO.userError "accepted enum port as code reaction effect")
+  -- A body carries scalars only, so a wrapped port is out of its reach whether
+  -- or not it is an enum -- and the compiler says so, not the verifier.
+  for declarations in [
+      "input token : list<Decision> output out : string reaction(token) -> out {= out = None; =}",
+      "input token : string output out : option<Decision> reaction(token) -> out {= out = None; =}",
+      "input token : list<string> output out : string reaction(token) -> out {= out = None; =}"] do
+    let coded := "type Decision from \"schemas/decision.json\" team T { " ++ declarations ++ " } main { t = T() }"
+    match compileSourceWithSchemas "CodeEnum" coded #[ ("schemas/decision.json", schema) ] with
+    | .error error =>
+      assertEqual "wrapped port rejected for code reaction" (decide ((error.splitOn "cannot use port").length > 1)) true
+    | .ok _ => throw (IO.userError s!"accepted wrapped port in code reaction: {declarations}")
+  -- The runtime holds state and parameters in built-in types only.
+  for (source, what) in [
+      ("type Decision from \"s.json\" team T { state last : Decision = \"approved\" } main { t = T() }", "state"),
+      ("type Decision from \"s.json\" team T(default : Decision) { input token : string } main { t = T(\"approved\") }", "parameter")] do
+    match compileSourceWithSchemas "Scalar" source #[ ("s.json", schema) ] with
+    | .error error =>
+      assertEqual s!"schema type rejected for {what}" (decide ((error.splitOn s!"{what} ").length > 1 && (error.splitOn "cannot have schema type").length > 1)) true
+    | .ok _ => throw (IO.userError s!"accepted schema type for {what}")
+  -- The name and what the schema said about it reach the bytecode, so the
+  -- agent can be told `Decision` rather than the refinement spelled out.
+  let described := "{\"type\":\"string\",\"enum\":[\"approved\",\"needs_revision\"]," ++
+    "\"title\":\"Review decision\",\"description\":\"A canonical review decision\"}"
+  let bytecode ← match compileSourceWithSchemas "Review" source #[ ("schemas/decision.json", described) ] with
+    | .ok bytecode => pure bytecode
+    | .error error => throw (IO.userError s!"described schema: {error}")
+  let instructions ← match Json.parse bytecode >>= (·.getObjVal? "instructions") >>= Json.getArr? with
+    | .ok instructions => pure instructions
+    | .error error => throw (IO.userError error)
+  let declared := instructions.filter fun item => (item.getObjValAs? String "op").toOption == some "define_type"
+  assertEqual "one define_type per import" declared.size 1
+  for (field, expected) in [("name", "Decision"), ("type", "string in [\"approved\",\"needs_revision\"]"),
+      ("title", "Review decision"), ("description", "A canonical review decision")] do
+    assertEqual s!"define_type {field}" ((declared[0]!.getObjValAs? String field).toOption) (some expected)
+  assertEqual "define_type precedes the ports" ((instructions.toList.map fun item =>
+    (item.getObjValAs? String "op").toOption.getD "").take 2) ["begin_plan", "define_type"]
+  -- Absent metadata is absent, not an empty string.
+  match compileSourceWithSchemas "Review" source #[ ("schemas/decision.json", schema) ] with
+  | .ok bytecode =>
+      assertEqual "no title without one" (decide ((bytecode.splitOn "\"title\"").length > 1)) false
+  | .error error => throw (IO.userError s!"external schema: {error}")
+  -- An enum elsewhere in the same topology does not disable ordinary Rust bodies.
+  let mixed := "type Decision from \"schemas/decision.json\" team T { " ++
+    "input decision : Decision input token : string output out : string " ++
+    "reaction(token) -> out {= out = token; =} } main { t = T() }"
+  match compileSourceWithSchemas "Mixed" mixed #[ ("schemas/decision.json", schema) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"unrelated enum blocked code reaction: {error}")
+  IO.println "external JSON Schema tests passed"
+
+
+
+def testSchemaTypeResolution : IO Unit := do
+  let contents := "{\"type\":\"string\",\"enum\":[\"continue\",\"stop\"]}"
+  -- A schema and a backend occupy distinct namespaces.
+  let collision := "type Codex from \"s.json\"; team T[worker : Codex] { " ++
+    "input token : Codex output out : Codex prompt worker(token) -> out \"Forward\" } main { t = T() }"
+  match compileSourceWithSchemas "Names" collision #[ ("s.json", contents) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"schema/backend collision: {error}")
+  let connected := "type Decision from \"s.json\" " ++
+    "team A { output out : Decision } team B { input token : Decision } " ++
+    "main { a = A() b = B() a.out -> b.token }"
+  match compileSourceWithSchemas "Connected" connected #[ ("s.json", contents) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"shared schema connection: {error}")
+  for source in [
+      "type Decision from \"s.json\" team T { input token : Unknown } main { t = T() }",
+      "type Decision from \"s.json\" team A { output out : Decision } " ++
+        "team B { input token : string } main { a = A() b = B() a.out -> b.token }",
+      "team T { input token : string in [\"continue\",\"stop\"] } main { t = T() }"] do
+    match compileSourceWithSchemas "Invalid" source #[ ("s.json", contents) ] with
+    | .error _ => pure ()
+    | .ok _ => throw (IO.userError "accepted unknown, incompatible, or inline schema type")
+  IO.println "schema type resolution tests passed"
+
 def main : IO UInt32 := do
   try
     for test in topologyCases do
@@ -422,6 +569,8 @@ def main : IO UInt32 := do
     testDelayUnits
     testStateLiterals
     testCodeTerminator
+    testExternalSchemas
+    testSchemaTypeResolution
     IO.println "compiler rejection tests passed"
     pure 0
   catch error =>

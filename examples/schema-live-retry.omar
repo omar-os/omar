@@ -1,0 +1,21 @@
+type Decision from "./schemas/decision.json"
+
+team Review[schema_tester : Codex] {
+    input request : string
+    output decision : Decision
+    output explanation : string
+    prompt schema_tester(request) -> decision, explanation "
+        This is an integration test of the decision schema, not a production review.
+        Request: $(request)
+        First call omar_set_port for review.decision with the exact invalid value
+        approved with required revisions. This deliberate invalid attempt must be rejected.
+        Read the actual tool error. Then call omar_set_port again for decision
+        with approved, which is the correct decision for this harmless request.
+        Write a brief JSON string to review.explanation reporting the attempted invalid value,
+        the actual validation error you received, and the corrected value.
+        Do not claim you tested rejection without actually making the invalid tool call.
+        Complete the invocation only after both required ports have accepted writes.
+    "
+}
+
+main SchemaLiveRetryCase { review = Review() }

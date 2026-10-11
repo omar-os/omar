@@ -63,8 +63,9 @@ total = Some(self.count);
         program = source / "ticker.omar"
         program.write_text("// Compiler-fixture input; the test exercises the runtime, not parsing.\n")
         compiler = shims / "omarc"
+        # omarc [options] <input> <output>: the output is the last argument.
         compiler.write_text("#!/usr/bin/env python3\nimport shutil, sys\n"
-                            f"shutil.copyfile({str(bytecode)!r}, sys.argv[2])\n")
+                            f"shutil.copyfile({str(bytecode)!r}, sys.argv[-1])\n")
         compiler.chmod(0o700)
         env["OMARC_BIN"] = str(compiler)
         runtime = json.loads(subprocess.run([str(BIN), "up", "--no-ea", "--name", "checkpoints", "--json"], cwd=source,

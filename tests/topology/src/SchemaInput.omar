@@ -1,0 +1,27 @@
+// OMAR topology integration source.
+// An imported enum type on an input the operator supplies. The value arrives
+// as bare text on the command line, and the run is refused at the door for one
+// the type does not list, naming the values it does. One it lists reaches a
+// prompt and a code body alike: the body reads the checked value as a plain
+// String, which is the one thing a body may do with an enum port.
+type Decision from "./schemas/decision.json"
+
+team Gate[keeper : Stub]
+{
+    input decision : Decision
+    output note : string
+    output route : string
+
+    prompt keeper(decision) -> note
+    "
+        The decision is $(decision). Write a short note to note.
+    "
+
+    reaction(decision) -> route {=
+        route = decision.map(|d| format!("routed {d}"));
+    =}
+}
+
+main {
+    gate = Gate()
+}

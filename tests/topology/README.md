@@ -18,6 +18,15 @@ Coverage:
   same source. Plain connections cost nothing, so both are decided at one tag
   and it fires once. Stub.
 - `EffectContracts.omar`: alternatives, optional groups, signals, constants.
+- `SchemaEnum.omar`: two types imported from the JSON Schema files under
+  `src/schemas/`, one with a title and description. A prompt writes both enum
+  ports and a code body reads them. Stub, so the route it reports is fixed by
+  the schema files.
+- `SchemaNested.omar`: the same imported types inside `list` and `option`,
+  written by one prompt and read by another across connections. Stub.
+- `SchemaInput.omar`: an imported enum type on an operator-supplied input,
+  read by a prompt and a code body. CI also runs it with a value outside the
+  enum and checks the run is refused, naming the admitted values. Stub.
 - `OrderedWrites.omar`: shared-effect ordering, optional writes, last writer wins.
 - `Recurrence.omar`: self-triggered action flow across logical microsteps.
 - `Ring.omar`: team parameters, and a `main` block instantiating one team three

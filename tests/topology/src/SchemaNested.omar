@@ -1,0 +1,44 @@
+// OMAR topology integration source.
+// Imported enum types inside `list` and `option`, written by one prompt and
+// read by another across connections. The wrappers travel with the type: the
+// list admits only listed values, the option admits them or nothing, and both
+// teams are told the type by the name the program used. The stub answers a
+// list with one admitted value and an option with nothing, so what the
+// outputs show is fixed by the schema files.
+type Decision from "./schemas/decision.json"
+type Priority from "./schemas/priority.json"
+
+team Triage[triager : Stub]
+{
+    input request : string
+    output decisions : list<Decision>
+    output priority : option<Priority>
+
+    prompt triager(request) -> decisions, priority
+    "
+        Triage this request: $(request)
+        Write every decision it calls for to decisions, and a priority if one
+        is warranted. Each admits only the values its type lists.
+    "
+}
+
+team Summary[writer : Stub]
+{
+    input decisions : list<Decision>
+    input priority : option<Priority>
+    output report : string
+
+    prompt writer(decisions, priority) -> report
+    "
+        Decisions: $(decisions). Priority: $(priority).
+        Write a one-line report to report.
+    "
+}
+
+main {
+    triage = Triage()
+    summary = Summary()
+
+    triage.decisions -> summary.decisions
+    triage.priority -> summary.priority
+}

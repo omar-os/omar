@@ -1,0 +1,46 @@
+// OMAR topology integration source.
+// Two types imported from JSON Schema files beside this source, one with a
+// title and description and one bare. A prompt writes both enum ports, and a
+// code reaction reads them: a body may read an enum port, since what arrives
+// was checked against the enum when it was written, though it may not write
+// one. The stub answers each effect with the first value its type admits, so
+// the route it reports is fixed by the schema files, not by the prompt.
+type Decision from "./schemas/decision.json"
+type Priority from "./schemas/priority.json"
+
+team Review[reviewer : Stub]
+{
+    input request : string
+    output decision : Decision
+    output priority : Priority
+
+    prompt reviewer(request) -> decision, priority
+    "
+        Review this request: $(request)
+        Write a decision and a priority. Each port admits only the values its
+        type lists; a write outside them is rejected and can be corrected.
+    "
+}
+
+team Dispatch
+{
+    input decision : Decision
+    input priority : Priority
+    output route : string
+
+    reaction(decision, priority) -> route {=
+        route = Some(format!(
+            "{}:{}",
+            decision.unwrap_or_default(),
+            priority.unwrap_or_default()
+        ));
+    =}
+}
+
+main {
+    review = Review()
+    dispatch = Dispatch()
+
+    review.decision -> dispatch.decision
+    review.priority -> dispatch.priority
+}

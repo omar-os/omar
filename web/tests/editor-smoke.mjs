@@ -21,7 +21,7 @@ const bytecode = {version:1, team:'Artifacts', instructions:[
   {op:'install_reaction',id:'writer.report',instance:'writer',agent:'',triggers:['writer.tick'],effects:['writer.out'],contract:'writer.out',prompt:'',body:'std::fs::write("report.md", "# Agent report\\nCreated by the topology.\\n").unwrap(); out = Some("done".to_string());'},
   {op:'commit_plan'},
 ]};
-await writeFile(compiler, `#!${process.execPath}\nrequire('fs').writeFileSync(process.argv[3], ${JSON.stringify(JSON.stringify(bytecode))});\n`, {mode:0o700});
+await writeFile(compiler, `#!${process.execPath}\nrequire('fs').writeFileSync(process.argv.at(-1), ${JSON.stringify(JSON.stringify(bytecode))});\n`, {mode:0o700});
 const program = join(root,'artifacts.omar'); await writeFile(program,'// Compiler fixture\n');
 const env = {...process.env,HOME:home,OMARC_BIN:compiler,CARGO_HOME:process.env.CARGO_HOME||join(homedir(),'.cargo'),RUSTUP_HOME:process.env.RUSTUP_HOME||join(homedir(),'.rustup')};
 const runtime = spawn(binary,['serve','--name','editor-smoke','--address','127.0.0.1:0','--no-ea'],{cwd:source,env});
