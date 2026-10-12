@@ -36,8 +36,9 @@ const listed=spawnSync(binary,['ls','--json'],{env,encoding:'utf8'});
 const session=JSON.parse(listed.stdout||'[]').find(s=>s.name==='editor-smoke');
 assert.ok(session,listed.stdout+listed.stderr);
 const state=session.directory;
-// The topology runs inside that session, so its workspaces are the ones served.
-const result = spawnSync(binary,['-s',session.name,'run',program,'--input','writer.tick=1','--fast','--wait'],{cwd:source,env,encoding:'utf8',timeout:180000});
+// The topology runs inside that session, so its workspaces are the ones served;
+// kept past its end, since the editor opens on them after the run.
+const result = spawnSync(binary,['-s',session.name,'run',program,'--input','writer.tick=1','--fast','--wait','--keep-workspaces'],{cwd:source,env,encoding:'utf8',timeout:180000});
 assert.equal(result.status,0,result.stderr+result.stdout);
 await writeFile(join(root,'topology.log'),result.stdout+result.stderr);
 const api=async(path,body)=>{
