@@ -1259,6 +1259,37 @@ test("every edge runs on an axis", async ({ page }) => {
   expect(tilted).toHaveLength(0);
 });
 
+test("a wrapped team never strands a port in a row of its own", async ({
+  page,
+}) => {
+  // ELK wraps a long chain into rows, and it layers a team's ports like
+  // anything else: inputs first, outputs last. A cut right before the output
+  // left it in a row by itself, and the edge into it ran back across the box
+  // to reach a port that sits on the border anyway.
+  await fake.close();
+  fake = (await startFakeServe({
+    stepMs: 30,
+    port: FAKE_SERVE_PORT,
+    snapshot: "diagram-chain.v1.json",
+  })) as FakeServe;
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await expect(page.locator(".omar-reaction")).toHaveCount(4);
+
+  // The chain is wider than the panel, so the team does wrap.
+  const team = (await page.locator(".omar-team-body").first().boundingBox())!;
+  const reaction = (await page.locator(".omar-reaction").first().boundingBox())!;
+  expect(team.height).toBeGreaterThan(reaction.height * 3);
+
+  // But the edges on its own ports still run forward.
+  const ports = ["trigger::pipe.in::pipe.reaction.0", "effect::pipe.reaction.3::pipe.out"];
+  for (const id of ports) {
+    const d = (await page.locator(`.omar-edge[data-id="${id}"]`).getAttribute("d"))!;
+    const backwards = pathSegments(d).filter((run) => run.a[0] - run.b[0] > 0.6);
+    expect(backwards, `${id} should not run leftward`).toHaveLength(0);
+  }
+});
+
 test("a program wider than the panel still fits in it", async ({ page }) => {
   // The fit was clamped by the same floor as the zoom buttons, so a large
   // topology could not be shrunk enough to see whole.

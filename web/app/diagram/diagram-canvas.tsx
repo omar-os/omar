@@ -36,6 +36,8 @@ type ElkSection = {
 
 type ElkEdge = {
   id: string;
+  sources?: string[];
+  targets?: string[];
   sections?: ElkSection[];
 };
 
@@ -528,6 +530,7 @@ async function runElk(
   snapshot: DiagramSnapshot,
   containers: ContainerView[],
   aspectRatio: number | null,
+  unwrapped: ReadonlySet<string> = new Set(),
 ): Promise<ElkNode> {
   const labels = reactionLabels(snapshot);
   const wrapping: Record<string, string> =
@@ -665,7 +668,7 @@ async function runElk(
           "elk.spacing.edgeNode": "22",
           "elk.layered.spacing.edgeNodeBetweenLayers": "22",
           "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
-          ...wrapping,
+          ...(unwrapped.has(container.id) ? {} : wrapping),
         },
         ports: ports.map((port) => ({
           id: port.id,
@@ -1060,6 +1063,16 @@ async function computeGeometry(
     let scale: number;
     try {
       candidate = await runElk(factory, snapshot, declared, aspectRatio);
+      const stranded = strandedPorts(candidate);
+      if (stranded.size > 0) {
+        candidate = await runElk(
+          factory,
+          snapshot,
+          declared,
+          aspectRatio,
+          stranded,
+        );
+      }
       scale = fitScale(buildLayout(snapshot, declared, candidate), size);
     } catch {
       // Wrapping is an optimisation, and ELK throws on some graphs — cyclic
@@ -1072,6 +1085,38 @@ async function computeGeometry(
     }
   }
   return { declared, elk: best };
+}
+
+/**
+ * Containers whose wrap left one of their own ports in a row by itself.
+ *
+ * ELK wraps a container by cutting its layering into rows, and its ports are
+ * layered like anything else: inputs first, outputs last. A cut right before
+ * the outputs puts them in a row of their own, and the edge into one leaves
+ * its reaction, drops a row, runs back across the box and comes forward
+ * again to a port that is drawn on the border anyway. That row buys nothing,
+ * so such a container is laid out unwrapped instead. The tell is an edge
+ * between a container and its own port with a leftward run in it: with the
+ * ports on the outer layers nothing else can send one backwards.
+ */
+function strandedPorts(node: ElkNode, into = new Set<string>()): Set<string> {
+  const own = new Set((node.ports ?? []).map((port) => port.id));
+  const backwards = (section: ElkSection) =>
+    [section.startPoint, ...(section.bendPoints ?? []), section.endPoint].some(
+      (point, index, points) =>
+        index > 0 && point.x < points[index - 1].x - AXIS_EPSILON,
+    );
+  for (const edge of node.edges ?? []) {
+    const touchesOwn = [...(edge.sources ?? []), ...(edge.targets ?? [])].some(
+      (end) => own.has(end),
+    );
+    if (touchesOwn && (edge.sections ?? []).some(backwards)) {
+      into.add(node.id);
+      break;
+    }
+  }
+  for (const child of node.children ?? []) strandedPorts(child, into);
+  return into;
 }
 
 /**
