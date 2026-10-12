@@ -213,6 +213,10 @@ export type RunRequest = {
    * Staged beside the program; absent, the program imports nothing.
    */
   files?: Record<string, string>;
+  /** Keep the instances' workspaces when the run ends; off, they go with it. */
+  keep_workspaces?: boolean;
+  /** `off`, `tag`, `30m` (physical) or `logical:30m`; the daemon's default is an hour. */
+  checkpoint_period?: string;
 };
 
 /**

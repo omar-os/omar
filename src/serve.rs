@@ -136,9 +136,13 @@ struct StartRunRequest {
     /// a delay means for everyone else's.
     #[serde(default)]
     fast: bool,
-    /// How often to checkpoint on physical time, e.g. `30m`; default 1h.
+    /// How often to checkpoint: `off`, `tag`, `30m` (physical), or
+    /// `logical:30m`; default every physical hour.
     #[serde(default)]
     checkpoint_period: Option<String>,
+    /// Keep the instances' workspaces when the run ends; off, they go with it.
+    #[serde(default)]
+    keep_workspaces: bool,
 }
 
 fn default_replace() -> bool {
@@ -1284,6 +1288,12 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
                 .trim_end_matches("/snapshot");
             run_snapshot(&context, id)
         }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/workspaces") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/workspaces");
+            run_workspaces(&context, id)
+        }
         ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/timeline") => {
             let id = rest
                 .trim_start_matches("/v1/runs/")
@@ -2255,7 +2265,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     if let Err(error) = request
         .checkpoint_period
         .as_deref()
-        .map(crate::checkpoint::parse_period)
+        .map(crate::checkpoint::parse_policy)
         .transpose()
     {
         return (400, json!({"error": format!("{error:#}")}));
@@ -2665,11 +2675,12 @@ fn spawn_run_thread(
     } else {
         topology::Pace::RealTime
     };
-    // Validated at admission, so a bad period was already a 400.
-    let checkpoint_period = request
+    // Validated at admission, so a bad cadence was already a 400.
+    let checkpoint_policy = request
         .checkpoint_period
         .as_deref()
-        .and_then(|period| crate::checkpoint::parse_period(period).ok());
+        .and_then(|period| crate::checkpoint::parse_policy(period).ok());
+    let keep_workspaces = request.keep_workspaces;
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let outcome = topology::run_topology(
@@ -2687,7 +2698,8 @@ fn spawn_run_thread(
                 diagram_address: Some(diagram_address),
                 diagram_ready: Some(ready_sender),
                 panel_ready: Some(panel_sender),
-                checkpoint_period,
+                checkpoint_policy,
+                keep_workspaces,
                 program_path: Some(&program_path),
             },
         );
@@ -2856,6 +2868,30 @@ fn lineage_team(context: &Arc<Context_>, id: &str) -> Result<String, (u16, Value
         ));
     }
     Ok(record.team.clone())
+}
+
+/// The workspaces one run owns, for the file viewer: its instances' current
+/// ones, the ones its checkpoints keep, and copies restored from any of them.
+/// Not the whole EA's history.
+fn run_workspaces(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let team = match lineage_team(context, id) {
+        Ok(team) => team,
+        Err(response) => return response,
+    };
+    let dir = crate::deploy::dir_for(&context.omar_dir, context.ea_id, &team);
+    let record = match crate::deploy::DeploymentRecord::load(&dir) {
+        Ok(Some(record)) => record,
+        Ok(None) => return (200, json!({"workspaces": []})),
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    let manifests = crate::checkpoint::Store::new(&dir)
+        .list()
+        .map(|(manifests, _)| manifests)
+        .unwrap_or_default();
+    match crate::workspace::lineage(&context.omar_dir, context.ea_id, &record, &manifests, true) {
+        Ok(workspaces) => (200, json!({"workspaces": workspaces})),
+        Err(error) => (500, json!({"error": format!("{error:#}")})),
+    }
 }
 
 /// A run's checkpoints, oldest first, and which one a resume continues from.
@@ -3268,7 +3304,8 @@ fn spawn_resume_thread(
                 diagram_address: Some(diagram_address),
                 diagram_ready: Some(ready_sender),
                 panel_ready: Some(panel_sender),
-                checkpoint_period: None,
+                checkpoint_policy: None,
+                keep_workspaces: false,
                 program_path: Some(&program_path),
             },
             &team,
@@ -3934,6 +3971,48 @@ mod tests {
         // A second chat on the same EA does not offer the runs twice.
         assert!(request(resumed.address(), "POST", "/v1/chats", Some("{}")).contains(" 200 "));
         assert_eq!(resumed.session_runs(None).len(), 2);
+    }
+
+    /// The file viewer sees one run's workspaces, not every workspace the
+    /// EA ever had: the deployment's own, plus copies restored from them.
+    #[test]
+    fn a_run_lists_only_its_own_workspaces() {
+        let server = test_server();
+        let address = server.address();
+        let root = &server.context.omar_dir;
+        let mine = crate::workspace::Workspace::create(root, 0, "d1", "leader", None).unwrap();
+        let _earlier = crate::workspace::Workspace::create(root, 0, "d0", "leader", None).unwrap();
+        let snapshot = mine.snapshot(root, "v").unwrap();
+        let copy = mine.restore(root, &snapshot.id).unwrap();
+        let mut deployment = crate::deploy::DeploymentRecord::create("Cadence", BTreeMap::new(), 1);
+        deployment
+            .workspaces
+            .insert("leader".into(), mine.id.clone());
+        let dir = crate::deploy::dir_for(root, 0, "Cadence");
+        std::fs::create_dir_all(&dir).unwrap();
+        deployment.save(&dir).unwrap();
+        server
+            .context
+            .runs
+            .lock()
+            .unwrap()
+            .insert("run-1".into(), record("Cadence", RunStatus::Running));
+        let response = request(address, "GET", "/v1/runs/run-1/workspaces", None);
+        assert!(response.contains(" 200 "), "{response}");
+        let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let listed: std::collections::BTreeSet<&str> = body["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            listed,
+            [mine.id.as_str(), copy.id.as_str()].into_iter().collect()
+        );
+        assert!(request(address, "GET", "/v1/runs/nobody/workspaces", None).contains(" 404 "));
+        // Still every workspace for the EA-wide listing the CLI uses.
+        assert_eq!(crate::workspace::list(root, 0).unwrap().len(), 3);
     }
 
     /// A later run of the team owns its live checkpoint directory; an

@@ -19,7 +19,7 @@ session. TUI/browser clients can disconnect without stopping any workload.
 | `omar down -s SESSION [--timeout SECONDS]` | Reject new work, finish current tags, clean owned processes |
 | `omar down -s SESSION --force` | Terminate owned workloads without waiting for tag boundaries |
 | `omar serve [--name NAME] [--address 127.0.0.1:PORT]` | New independent foreground runtime; SIGINT/SIGTERM requests graceful shutdown |
-| `omar run FILE [-s SESSION] [--ea EA] [--input NAME=VALUE] [--wait]` | Run a topology in the selected runtime, or in a new session when none is selected; `--wait` prints its outputs and final state, and shuts down a session it created. `start` is an alias |
+| `omar run FILE [-s SESSION] [--ea EA] [--input NAME=VALUE] [--wait] [--keep-workspaces] [--checkpoint-period SPEC]` | Run a topology in the selected runtime, or in a new session when none is selected; `--wait` prints its outputs and final state, and shuts down a session it created. `start` is an alias |
 | `omar -s SESSION [--ea EA] runs [--all-eas]` | List topology runs |
 | `omar -s SESSION [--ea EA] status RUN-OR-TEAM` | Inspect one run; ambiguous names require a run ID |
 | `omar -s SESSION [--ea EA] stop RUN-OR-TEAM` | Stop one topology at a tag boundary |

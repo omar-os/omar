@@ -27,9 +27,14 @@ snapshot metadata, and locks live in `~/.omar/workspace-history/<workspace-id>/`
 remotes are copied. Workspace Git commits/staging and OMAR snapshots are separate:
 OMAR uses its own temporary index and immutable snapshot refs.
 
-An initial file version is recorded at deployment, and a final version after a
-successful completion or graceful stop. Workspaces survive termination and
-redeployment. Deployment records retain the instance-to-workspace mapping.
+An initial file version is recorded at deployment. When the run ends
+(completed or stopped) its workspaces go with it by default: the current ones
+and the ones its checkpoints kept for a rollback; copies an operator restored
+stay. `omar run --keep-workspaces`, or the checkbox on Mission Control's deploy
+confirmation, keeps them instead, with a final version recorded. A paused run
+keeps its workspaces either way, since a resume needs them; the choice carries
+over to the resumed run. Deployment records retain the instance-to-workspace
+mapping either way.
 Before a new run replaces `deployment.json`, the previous record is archived in
 `topologies/<team>/deployments/<deployment-id>.json`. Snapshot guards consult
 both current and historical records. Force cleanup uses the recorded tmux server,
@@ -70,8 +75,10 @@ not undo external actions such as sent messages or database writes.
 
 ## Browse and edit in Mission Control
 
-Use **Files & versions** in the chat to select a team workspace, browse text and
-raster images, or compare saved files with the current worktree. HTML, SVG and
+Use **Files & versions** in the chat to select a team instance of the chat's
+current run (its workspaces, the ones its checkpoints keep, and copies restored
+from them; never another run's), browse text and raster images, or compare
+saved files with the current worktree. HTML, SVG and
 Markdown previews are shown as text; symlinks are not followed. Previews are limited to
 512 KiB and directory listings to 2,000 entries. **Refresh** reads new agent or
 editor changes. Historical versions are read-only; **Restore as new workspace**

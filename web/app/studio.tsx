@@ -4,7 +4,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { ChatMessage as ChatMessageView } from "./chat-message";
 import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
 import { Artifacts } from "./artifacts";
-import { DeployConfirmation } from "./deploy-confirmation";
+import { DeployConfirmation, type DeployOptions } from "./deploy-confirmation";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
@@ -709,7 +709,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     };
   }, [agent, restoreConversation, observe, loadPanel, serveUrl, historyUrl, onSelect]);
 
-  async function confirmDesign() {
+  async function confirmDesign(options: DeployOptions) {
     if (!design || phase !== "review") return;
     setConfirming(false);
     setPhase("spawning");
@@ -722,6 +722,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         program: source,
         inputs: design.inputs,
         conversation_id: conversationIdRef.current ?? undefined,
+        keep_workspaces: options.keepWorkspaces,
+        checkpoint_period: options.checkpointPeriod,
       });
       if (scope !== scopeRef.current) return;
       setSnapshot((current) => (current ? { ...current, team: record.team } : current));
@@ -1390,7 +1392,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           team={snapshot?.team ?? "this topology"}
           disabled={!canRun}
           onCancel={() => setConfirming(false)}
-          onConfirm={() => void confirmDesign()}
+          onConfirm={(options) => void confirmDesign(options)}
         />
       ) : null}
 
@@ -1405,7 +1407,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         />
       ) : null}
 
-      {filesOpen ? <Artifacts key={serveUrl} serveUrl={serveUrl} onClose={() => setFilesOpen(false)} /> : null}
+      {filesOpen ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} onClose={() => setFilesOpen(false)} /> : null}
       {terminalAgent ? (
         <AgentTerminal
           serveUrl={serveUrl}

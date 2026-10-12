@@ -24,7 +24,7 @@ function Content({ preview }: { preview: Preview }) {
   return <p>{preview.size.toLocaleString()} bytes · {preview.kind === "large" ? "Too large for the 512 KiB preview limit." : "Binary file."} Open the worktree in the editor to inspect it.</p>;
 }
 
-export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: () => void }) {
+export function Artifacts({ serveUrl, runId, onClose }: { serveUrl: string; runId: string | null; onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [selected, setSelected] = useState("");
@@ -39,7 +39,8 @@ export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: ()
   const [compare, setCompare] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(true);
+  // Nothing to load without a run; the listing is the run's own.
+  const [loading, setLoading] = useState(Boolean(runId));
   const [revision, setRevision] = useState(0);
   const [notice, setNotice] = useState("");
   const [editorUrl, setEditorUrl] = useState("");
@@ -52,14 +53,24 @@ export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: ()
     return () => { alive.current = false; current?.close(); previous?.focus(); };
   }, []);
   useEffect(() => {
+    // The run's own instances, not every workspace the chat ever had: the
+    // daemon lists a run's current workspaces, the ones its checkpoints keep,
+    // and copies restored from them.
+    if (!runId) return;
     const controller = new AbortController();
-    void request<{workspaces: Workspace[]}>(serveUrl, "", undefined, controller.signal).then((data) => {
-      setWorkspaces(data.workspaces);
-      setSelected((current) => data.workspaces.some((w) => w.id === current) ? current : data.workspaces[0]?.id || "");
-      setLoading(false);
-    }).catch((e) => { if (!controller.signal.aborted) { setError(e.message); setLoading(false); } });
+    void fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/runs/${encodeURIComponent(runId)}/workspaces`, { signal: controller.signal })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        return data as { workspaces: Workspace[] };
+      })
+      .then((data) => {
+        setWorkspaces(data.workspaces);
+        setSelected((current) => data.workspaces.some((w) => w.id === current) ? current : data.workspaces[0]?.id || "");
+        setLoading(false);
+      }).catch((e) => { if (!controller.signal.aborted) { setError(e.message); setLoading(false); } });
     return () => controller.abort();
-  }, [serveUrl, revision]);
+  }, [serveUrl, runId, revision]);
   useEffect(() => {
     if (!selected) return;
     const controller = new AbortController();
@@ -131,7 +142,7 @@ export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: ()
     {editorUrl ? <p><a href={editorUrl} target="_blank" rel="noreferrer">Reopen editor ↗</a> · <button className="artifact-link" disabled={busy} onClick={() => { setBusy(true); void request(serveUrl, `/${selected}/editor/stop`, {}).then(() => { if (alive.current) { setEditorUrl(""); setNotice("Editor stopped. Topology state is unchanged."); } }).catch((e) => { if (alive.current) setError(e.message); }).finally(() => { if (alive.current) setBusy(false); }); }}>Stop editor</button></p> : null}
     {error ? <p className="connection-error" role="alert">{error}</p> : null}
     {notice ? <p role="status">{notice}</p> : null}
-    {!selected ? <p>{loading ? "Loading workspaces…" : "No workspaces in this chat yet. Deploy a topology to create one."}</p> : <div className="artifact-body">
+    {!selected ? <p>{loading ? "Loading workspaces…" : runId ? "This run has no workspaces left; they went with it when it ended." : "No run in this chat yet. Deploy a topology to create its workspaces."}</p> : <div className="artifact-body">
       <nav aria-label="Workspace files">
         <div className="artifact-path">worktree/{directory}</div>
         {directory ? <button onClick={() => { setDirectory(directory.split("/").slice(0, -1).join("/")); setEntries([]); clearFile(); }}>↰ Parent directory</button> : null}

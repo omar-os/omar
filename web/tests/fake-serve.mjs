@@ -245,6 +245,24 @@ export async function startFakeServe({
         });
       }
     }
+    if (request.method === "GET" && url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/workspaces")) {
+      const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length, -"/workspaces".length));
+      return entry ? json(response, 200, { workspaces: entry.workspaces }) : json(response, 404, { error: "unknown run" });
+    }
+    if (request.method === "GET" && url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/options")) {
+      // Test-only: what the admission carried.
+      const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length, -"/options".length));
+      return entry ? json(response, 200, entry.options) : json(response, 404, { error: "unknown run" });
+    }
+    if (url.pathname.startsWith("/v1/workspaces/")) {
+      // Enough of the workspace surface for the viewer to open on a run.
+      const [id, action = ""] = url.pathname.slice("/v1/workspaces/".length).split("/");
+      const owner = [...chat.runs.values()].find((entry) => entry.workspaces.some((w) => w.id === id));
+      if (!owner) return json(response, 404, { error: "unknown workspace" });
+      if (request.method === "GET" && action === "") return json(response, 200, { workspace: owner.workspaces[0], snapshots: [] });
+      if (action === "browse") return json(response, 200, { entries: [{ name: "notes.txt", kind: "file", size: 12 }], truncated: false });
+      return json(response, 404, { error: "unsupported in the fake" });
+    }
     if (request.method === "GET" && url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/snapshot")) {
       // The picture a paused run left behind, as serve keeps it.
       const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length, -"/snapshot".length));
@@ -676,6 +694,14 @@ export async function startFakeServe({
         finished_at: null,
         error: null,
       },
+      // What the operator chose at the confirmation, so a test can read it back.
+      options: {
+        keep_workspaces: request.keep_workspaces === true,
+        checkpoint_period: typeof request.checkpoint_period === "string" ? request.checkpoint_period : null,
+      },
+      // One workspace per instance, named after the run: the file viewer
+      // shows a run's own, never another run's.
+      workspaces: [{ id: runId.replaceAll("-", "").slice(0, 32), instance: "leader", deployment_id: runId, restored_from: null }],
       snapshot,
       subscribers: new Set(),
       sequence: 0,

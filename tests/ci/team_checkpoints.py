@@ -204,17 +204,27 @@ total = Some(self.count);
             rolled = log_lines(rolled_tree)
             assert rolled[:manual_count] == list(range(1, manual_count + 1)), rolled
             assert rolled[manual_count] == manual_count + 1, f"did not continue from the rolled-back count: {rolled}"
+            # The viewer's listing is this run's lineage: the current
+            # workspace and the two its checkpoints keep for a rollback.
+            listed = json.loads(omar("workspace", "list"))
+            assert {w["id"] for w in listed} == {paused_tree.parent.name, resumed_tree.parent.name, rolled_tree.parent.name}, listed
             omar("stop", "Ticker")
             wait_until(lambda: status()["status"] == "stopped", "the stop")
             final = record()
-            assert final["state"] == "TERMINATED" and final["state_vars"]["w.count"] == len(log_lines(rolled_tree))
+            assert final["state"] == "TERMINATED" and final["state_vars"]["w.count"] >= len(rolled)
+            # Not asked to keep them, the run took its workspaces with it:
+            # every one in its lineage, not only the one it ended in.
+            for tree in (paused_tree, resumed_tree, rolled_tree):
+                assert not tree.exists(), f"{tree} outlived its run"
+            assert json.loads(omar("workspace", "list")) == []
             # A stop captures nothing, so the resume point is still the
             # checkpoint the rollback chose; every checkpoint is still listed.
             final_ids, listing = checkpoints()
             assert final_ids == ids, listing
             assert next(l for l in listing if manual_id in l).endswith("<- resume point"), listing
             print("PASS: automatic and manual checkpoints, live period change, pause, resume under one run id "
-                  "with restored files and no repeated tag, agent respawn, rollback to an older checkpoint, stop")
+                  "with restored files and no repeated tag, agent respawn, rollback to an older checkpoint, stop, "
+                  "workspaces removed with the run")
           except BaseException:
             log = state_root / "logs" / "runtime.log"
             if log.exists():

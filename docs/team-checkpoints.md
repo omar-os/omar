@@ -17,14 +17,25 @@ Timers need no entry: a timer's next firing is a queued tag.
 
 ## When
 
-Physical time, default every 1h, per run. Never per tag.
+Default: physical time, every 1h, per run. Chosen per run, at launch or
+live:
+
+- `off`: only `pause` and `checkpoint create` capture.
+- `tag`: every tag boundary the run passes.
+- `30m`, `1h30m`: physical time, so a `--fast` run captures as often.
+- `logical:30m`: the tags' own timestamps crossing each period, so two runs
+  of one program capture at the same tags however fast they go.
+
+Mission Control's deploy confirmation offers the same: off, every logical
+tick, every physical hour, or a custom period on either clock (days, hours,
+minutes, seconds; not all zero).
 
 Every command below targets a session (`-s NAME`, or the inherited one);
 the daemon owns the run, the CLI asks it.
 
-- `omar run prog.omar --checkpoint-period 30m` overrides at launch.
-- `omar checkpoint configure Team --period 2h` changes a running topology;
-  next capture is one new period after the change.
+- `omar run prog.omar --checkpoint-period SPEC` sets it at launch.
+- `omar checkpoint configure Team --period SPEC` changes a running topology;
+  a physical period counts anew from the change.
 - `omar checkpoint create Team [--wait]` captures now, run continues.
 - `omar pause Team [--wait]` always captures first.
 
@@ -58,6 +69,8 @@ between two instances' snapshots. A writer barrier is a follow-up (#277).
 - A paused run holds its team: a fresh run of the team is refused until the
   paused one is resumed or stopped. `stop` on a paused run gives it up in
   place (nothing to tear down); its checkpoints stay on disk.
+- When a run ends, its workspaces go with it unless it was started with
+  `--keep-workspaces` (see team-workspaces.md); a paused run keeps them.
 - `stop` outranks a pending pause (the run stops at the boundary instead),
   which is also the way out of a capture that is held. A session `down`
   waits for a pausing run to park.

@@ -81,10 +81,15 @@ pub struct StartOptions {
     /// When this run creates a session, keep its state after it stops
     #[arg(long)]
     pub checkpoint: bool,
-    /// How often to checkpoint on physical time, e.g. `30m` or `2h`; default
-    /// 1h. Changeable while running with `omar checkpoint configure`.
+    /// How often to checkpoint: `off`, `tag` (every tag), `30m` (physical
+    /// time), or `logical:30m` (the tags' own time); default every physical
+    /// hour. Changeable while running with `omar checkpoint configure`.
     #[arg(long)]
     pub checkpoint_period: Option<String>,
+    /// Keep the instances' workspaces when the run ends. Without this they
+    /// go with the run; a paused run keeps them either way.
+    #[arg(long)]
+    pub keep_workspaces: bool,
 }
 #[derive(Subcommand, Debug)]
 pub enum EaAction {
@@ -1292,7 +1297,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             // The runtime compiles what it is sent, so a program's imports go with it.
             let program = fs::read_to_string(&options.program)?;
             let files = crate::topology::imported_files(&options.program, &program)?;
-            let body=json!({"program":program,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period});
+            let body=json!({"program":program,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces});
             let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
             if owned { run["session"] = json!(s.name); }
             // One structured result: the admission record, or with --wait the terminal record.

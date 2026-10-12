@@ -2037,7 +2037,10 @@ pub struct TopologyRunConfig<'a> {
     /// reaction would always sit until its deadline.
     pub panel_ready: Option<mpsc::Sender<PanelAccess>>,
     /// How often the run checkpoints on its own; `None` is the default hour.
-    pub checkpoint_period: Option<Duration>,
+    pub checkpoint_policy: Option<checkpoint::Policy>,
+    /// Keep the instances' workspaces when the run ends; otherwise they go
+    /// with it. A resume takes the paused run's choice.
+    pub keep_workspaces: bool,
     /// The program file, recorded in checkpoints so a resume can place
     /// generated code beside it. `None` for a program that arrived over HTTP.
     pub program_path: Option<&'a Path>,
@@ -2154,9 +2157,39 @@ struct RunCheckpointer<'a> {
 
 struct Schedule {
     policy: checkpoint::Policy,
-    next_due: Instant,
+    /// When the next physical-time capture is due; none without a period.
+    next_due: Option<Instant>,
+    /// The tag the last capture of any kind described, so a logical cadence
+    /// counts from it and a boundary revisited mid-wait is not captured twice.
+    last_captured_tag: Option<(u64, u64)>,
     sequence: u64,
     parent: Option<String>,
+}
+
+impl Schedule {
+    /// Whether an automatic capture is due at a boundary that completed
+    /// `state.completed_tag`: the physical deadline passed, or the tags
+    /// crossed into a new logical period since the last capture.
+    fn due(&self, now: Instant, state: &ExecutionState) -> bool {
+        if self.next_due.is_some_and(|at| now >= at) {
+            return true;
+        }
+        let Some(completed) = state.completed_tag else {
+            return false;
+        };
+        if self.last_captured_tag == Some(completed) {
+            return false;
+        }
+        if self.policy.every_tag {
+            return true;
+        }
+        let period = self.policy.logical_period_ns;
+        if period == 0 {
+            return false;
+        }
+        let last = self.last_captured_tag.map_or(0, |(t, _)| t / period);
+        completed.0 / period > last
+    }
 }
 
 impl<'a> RunCheckpointer<'a> {
@@ -2184,10 +2217,8 @@ impl<'a> RunCheckpointer<'a> {
         }
         // An operator's live change outlives the runner that saw it; a launch
         // override starts a fresh policy; otherwise the default hour.
-        let policy = match (config.checkpoint_period, deploy::read_policy(dir)?) {
-            (Some(period), _) => checkpoint::Policy {
-                period_secs: period.as_secs(),
-            },
+        let policy = match (config.checkpoint_policy, deploy::read_policy(dir)?) {
+            (Some(policy), _) => policy,
             (None, Some(saved)) if resumed_from.is_some() => saved,
             (None, _) => resumed_from.map(|m| m.policy).unwrap_or_default(),
         };
@@ -2197,12 +2228,14 @@ impl<'a> RunCheckpointer<'a> {
             eprintln!("warning: ignoring unreadable checkpoint {problem}");
         }
         let sequence = existing.iter().map(|m| m.sequence).max().unwrap_or(0) + 1;
-        let next_due = Instant::now() + policy.period();
+        let next_due = policy.physical().map(|period| Instant::now() + period);
         {
             let mut guard = record
                 .lock()
                 .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
-            guard.next_checkpoint_at = Some(deploy::now_unix() + policy.period().as_secs());
+            guard.next_checkpoint_at = policy
+                .physical()
+                .map(|period| deploy::now_unix() + period.as_secs());
             guard.save(dir)?;
         }
         let program_path = config
@@ -2236,6 +2269,7 @@ impl<'a> RunCheckpointer<'a> {
             schedule: Mutex::new(Schedule {
                 policy,
                 next_due,
+                last_captured_tag: resumed_from.and_then(|m| m.completed_tag),
                 sequence,
                 parent: resumed_from.map(|m| m.id.clone()),
             }),
@@ -2252,21 +2286,23 @@ impl<'a> RunCheckpointer<'a> {
             return;
         }
         schedule.policy = saved;
-        schedule.next_due = Instant::now() + saved.period();
+        schedule.next_due = saved.physical().map(|period| Instant::now() + period);
         if let Ok(mut guard) = self.record.lock() {
-            guard.next_checkpoint_at = Some(deploy::now_unix() + saved.period().as_secs());
+            guard.next_checkpoint_at = saved
+                .physical()
+                .map(|period| deploy::now_unix() + period.as_secs());
             let _ = guard.save(&self.dir);
         }
     }
 }
 
 impl Checkpointer for RunCheckpointer<'_> {
-    fn due(&self) -> bool {
+    fn due(&self, state: &ExecutionState) -> bool {
         let Ok(mut schedule) = self.schedule.lock() else {
             return false;
         };
         self.refresh_policy(&mut schedule);
-        Instant::now() >= schedule.next_due
+        schedule.due(Instant::now(), state)
     }
 
     fn capture(&self, state: &ExecutionState, trigger: Trigger) -> Result<String> {
@@ -2330,7 +2366,11 @@ impl Checkpointer for RunCheckpointer<'_> {
         self.store.publish(&manifest, state, &self.program)?;
         schedule.sequence += 1;
         schedule.parent = Some(id.clone());
-        schedule.next_due = Instant::now() + schedule.policy.period();
+        schedule.next_due = schedule
+            .policy
+            .physical()
+            .map(|period| Instant::now() + period);
+        schedule.last_captured_tag = state.completed_tag;
         {
             let mut guard = self
                 .record
@@ -2338,8 +2378,10 @@ impl Checkpointer for RunCheckpointer<'_> {
                 .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
             guard.checkpoint = Some(id.clone());
             guard.checkpoint_error = None;
-            guard.next_checkpoint_at =
-                Some(deploy::now_unix() + schedule.policy.period().as_secs());
+            guard.next_checkpoint_at = schedule
+                .policy
+                .physical()
+                .map(|period| deploy::now_unix() + period.as_secs());
             guard.save(&self.dir)?;
         }
         let at = state
@@ -2446,6 +2488,9 @@ pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunO
         }
         return Err(error);
     }
+    // The paused run's choice carries over: a resume is the same run.
+    let mut config = config;
+    config.keep_workspaces = record.keep_workspaces;
     launch(
         &state,
         &bytecode,
@@ -2537,6 +2582,7 @@ fn launch(
             .lock()
             .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
         guard.resumed_from = resumed_from.as_ref().map(|m| m.id.clone());
+        guard.keep_workspaces = config.keep_workspaces;
         guard.save(&runtime_dir)?;
     }
     let diagram_server = config
@@ -2844,21 +2890,39 @@ fn launch(
         guard.save(&runtime_dir)?;
     }
     deploy::clear_stop(&runtime_dir)?;
-    // File versions are independent of runtime checkpoints. Agents have
-    // been torn down; keep their final artifacts without reusing the directory.
-    for workspace in workspaces.values() {
-        if !cleanup_failures.is_empty() {
-            eprintln!(
-                "warning: skipped final snapshot of {} because agent cleanup failed",
-                workspace.id
-            );
-            continue;
+    if !cleanup_failures.is_empty() {
+        // Something may still be writing: neither a final version nor a
+        // removal can be trusted.
+        eprintln!("warning: workspaces left as they are because agent cleanup failed");
+    } else if config.keep_workspaces {
+        // File versions are independent of runtime checkpoints. Agents have
+        // been torn down; keep their final artifacts without reusing the directory.
+        for workspace in workspaces.values() {
+            if let Err(error) = workspace.snapshot(config.omar_dir, "Final topology files") {
+                eprintln!(
+                    "warning: could not snapshot workspace {}: {error:#}",
+                    workspace.id
+                );
+            }
         }
-        if let Err(error) = workspace.snapshot(config.omar_dir, "Final topology files") {
-            eprintln!(
-                "warning: could not snapshot workspace {}: {error:#}",
-                workspace.id
-            );
+    } else {
+        // The run is over and nothing can resume it, so its files go with
+        // it: the current workspaces and the ones its checkpoints kept for a
+        // rollback. Copies an operator restored stay theirs.
+        let record = record
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
+            .clone();
+        let (manifests, _) = checkpoint::Store::new(&runtime_dir).list()?;
+        for workspace in
+            crate::workspace::lineage(config.omar_dir, config.ea_id, &record, &manifests, false)?
+        {
+            if let Err(error) = workspace.remove(config.omar_dir) {
+                eprintln!(
+                    "warning: could not remove workspace {}: {error:#}",
+                    workspace.id
+                );
+            }
         }
     }
     if stopped {
@@ -3481,8 +3545,9 @@ enum LoopStart {
 /// Operator requests arrive through the deployment's control file; this is
 /// only the part that needs the run's own state.
 pub(crate) trait Checkpointer {
-    /// Whether an automatic capture is due now.
-    fn due(&self) -> bool;
+    /// Whether an automatic capture is due at this boundary, which completed
+    /// `state.completed_tag`.
+    fn due(&self, state: &ExecutionState) -> bool;
     /// Publish a checkpoint for `state`. Returns its id.
     fn capture(&self, state: &ExecutionState, trigger: Trigger) -> Result<String>;
     /// A capture attempt failed. `held` says the internal retries are spent
@@ -3522,7 +3587,7 @@ fn settle_boundary(
         // stays for a runner that can. Tests and projections land here.
         return Ok(Boundary::Continue);
     };
-    if trigger.is_none() && checkpointer.due() {
+    if trigger.is_none() && checkpointer.due(&snapshot()) {
         trigger = Some(Trigger::Automatic);
     }
     let Some(mut trigger) = trigger else {
@@ -6938,7 +7003,7 @@ mod tests {
         }
     }
     impl Checkpointer for Recorder {
-        fn due(&self) -> bool {
+        fn due(&self, _state: &ExecutionState) -> bool {
             std::mem::take(&mut *self.due_once.lock().unwrap())
         }
         fn capture(&self, state: &ExecutionState, trigger: Trigger) -> Result<String> {
@@ -7155,6 +7220,67 @@ mod tests {
             None,
             "answered requests are cleared"
         );
+    }
+
+    /// A cadence decides at a boundary: physical by the clock, every tag by a
+    /// new completed tag, logical by the tags crossing a period; and never
+    /// twice for one tag, which a wait revisits every slice.
+    #[test]
+    fn cadences_fall_due_on_the_clock_on_every_tag_or_on_logical_periods() {
+        let at = |tag: Option<(u64, u64)>| ExecutionState {
+            version: checkpoint::FORMAT,
+            completed_tag: tag,
+            queue: Vec::new(),
+            outputs: BTreeMap::new(),
+            state_vars: BTreeMap::new(),
+            elapsed_ns: 0,
+        };
+        let now = Instant::now();
+        let mut schedule = Schedule {
+            policy: checkpoint::Policy::OFF,
+            next_due: None,
+            last_captured_tag: None,
+            sequence: 1,
+            parent: None,
+        };
+        assert!(!schedule.due(now, &at(Some((5, 0)))), "off never falls due");
+        schedule.next_due = Some(now + Duration::from_secs(60));
+        assert!(!schedule.due(now, &at(None)));
+        assert!(
+            schedule.due(now + Duration::from_secs(61), &at(None)),
+            "physical: by the clock"
+        );
+        schedule.next_due = None;
+        schedule.policy.every_tag = true;
+        assert!(!schedule.due(now, &at(None)), "no tag completed yet");
+        assert!(schedule.due(now, &at(Some((1, 0)))));
+        schedule.last_captured_tag = Some((1, 0));
+        assert!(
+            !schedule.due(now, &at(Some((1, 0)))),
+            "a boundary revisited mid-wait"
+        );
+        assert!(
+            schedule.due(now, &at(Some((1, 1)))),
+            "a microstep is a tag too"
+        );
+        schedule.policy = checkpoint::Policy {
+            logical_period_ns: 10,
+            ..checkpoint::Policy::OFF
+        };
+        schedule.last_captured_tag = None;
+        assert!(!schedule.due(now, &at(Some((9, 0)))));
+        assert!(
+            schedule.due(now, &at(Some((10, 0)))),
+            "first period crossed"
+        );
+        schedule.last_captured_tag = Some((10, 0));
+        assert!(!schedule.due(now, &at(Some((19, 3)))));
+        assert!(
+            schedule.due(now, &at(Some((25, 0)))),
+            "a later period, however far"
+        );
+        schedule.last_captured_tag = Some((25, 0));
+        assert!(!schedule.due(now, &at(Some((29, 0)))));
     }
 
     /// Once its retries are spent a capture holds the run, and only a new

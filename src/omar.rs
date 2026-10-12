@@ -349,7 +349,7 @@ enum CheckpointAction {
     /// Change the automatic checkpoint period of a running topology
     Configure {
         deployment: String,
-        /// e.g. `30m`, `1h`, `2h`
+        /// `off`, `tag` (every tag), `30m` (physical), or `logical:30m`
         #[arg(long)]
         period: String,
     },
@@ -1030,7 +1030,7 @@ fn status_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) ->
         println!("  checkpoint_error: {error}");
     }
     if let Some(policy) = deploy::read_policy(&dir)? {
-        println!("  checkpoint_period: {}s", policy.period_secs);
+        println!("  checkpoints: {}", policy.describe());
     }
     if let Some(at) = record.next_checkpoint_at {
         println!("  next_checkpoint_at: {at}");
@@ -1167,21 +1167,16 @@ fn checkpoint_command(
         }
         CheckpointAction::Configure { deployment, period } => {
             let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
-            let period = checkpoint::parse_period(&period)?;
+            let policy = checkpoint::parse_policy(&period)?;
             anyhow::ensure!(
                 deploy::DeploymentRecord::load(&dir)?.is_some(),
                 "no deployment '{deployment}'"
             );
-            deploy::write_policy(
-                &dir,
-                checkpoint::Policy {
-                    period_secs: period.as_secs(),
-                },
-            )?;
+            deploy::write_policy(&dir, policy)?;
             println!(
-                "Checkpoint period of '{}' is now {}s; a running topology picks it up at its next boundary and schedules the next capture one period from then",
+                "Checkpoints of '{}' are now {}; a running topology picks it up at its next boundary",
                 deployment,
-                period.as_secs()
+                policy.describe()
             );
             Ok(())
         }

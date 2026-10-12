@@ -67,26 +67,120 @@ pub enum Trigger {
     Pause,
 }
 
-/// How often a run checkpoints on its own: physical time, so a run paced by
-/// its logical clock and one run `--fast` both capture hourly.
+/// How often a run checkpoints on its own. Physical time is the default: a
+/// run paced by its logical clock and one run `--fast` both capture hourly.
+/// A logical cadence follows the tags instead, so two runs of one program
+/// checkpoint at the same points however fast they go; every tag is the
+/// finest of those. All zero is off: only `pause` and `checkpoint create`
+/// capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
+    /// Physical seconds between captures; 0 for none on physical time.
+    #[serde(default)]
     pub period_secs: u64,
+    /// Logical nanoseconds between captures, on the tags' own timestamps;
+    /// 0 for none on logical time.
+    #[serde(default)]
+    pub logical_period_ns: u64,
+    /// Capture at every tag boundary the run passes.
+    #[serde(default)]
+    pub every_tag: bool,
 }
 
 impl Default for Policy {
     fn default() -> Self {
         Self {
             period_secs: DEFAULT_PERIOD.as_secs(),
+            logical_period_ns: 0,
+            every_tag: false,
         }
     }
 }
 
 impl Policy {
-    pub fn period(self) -> Duration {
-        // A hand-edited policy file is not a reason to panic the run thread.
-        Duration::from_secs(self.period_secs).min(MAX_PERIOD)
+    pub const OFF: Policy = Policy {
+        period_secs: 0,
+        logical_period_ns: 0,
+        every_tag: false,
+    };
+
+    /// The physical period, when there is one. A hand-edited policy file is
+    /// not a reason to panic the run thread, so it is bounded here too.
+    pub fn physical(self) -> Option<Duration> {
+        (self.period_secs > 0).then(|| Duration::from_secs(self.period_secs).min(MAX_PERIOD))
     }
+
+    /// `off`, `every tag`, `every 30m (physical)`, `every 2h (logical)`.
+    pub fn describe(self) -> String {
+        let mut parts = Vec::new();
+        if self.every_tag {
+            parts.push("every tag".to_string());
+        }
+        if self.period_secs > 0 {
+            parts.push(format!(
+                "every {} (physical)",
+                format_secs(self.period_secs)
+            ));
+        }
+        if self.logical_period_ns > 0 {
+            parts.push(format!(
+                "every {} (logical)",
+                format_secs(self.logical_period_ns / 1_000_000_000)
+            ));
+        }
+        if parts.is_empty() {
+            "off".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
+fn format_secs(total: u64) -> String {
+    let (d, h, m, s) = (
+        total / 86_400,
+        total % 86_400 / 3600,
+        total % 3600 / 60,
+        total % 60,
+    );
+    let mut out = String::new();
+    for (n, unit) in [(d, 'd'), (h, 'h'), (m, 'm'), (s, 's')] {
+        if n > 0 {
+            out.push_str(&format!("{n}{unit}"));
+        }
+    }
+    if out.is_empty() {
+        out.push_str("0s");
+    }
+    out
+}
+
+/// Parse a cadence: `off`, `tag` (every tag boundary), `30m` or `1h30m`
+/// (physical time), `logical:30m` (the tags' own time).
+pub fn parse_policy(text: &str) -> Result<Policy> {
+    let text = text.trim();
+    match text {
+        "off" | "none" => return Ok(Policy::OFF),
+        "tag" | "every-tag" | "tick" => {
+            return Ok(Policy {
+                every_tag: true,
+                ..Policy::OFF
+            })
+        }
+        _ => {}
+    }
+    if let Some(rest) = text.strip_prefix("logical:") {
+        let period = parse_period(rest)?;
+        return Ok(Policy {
+            logical_period_ns: period.as_secs() * 1_000_000_000,
+            ..Policy::OFF
+        });
+    }
+    let period = parse_period(text)?;
+    Ok(Policy {
+        period_secs: period.as_secs(),
+        ..Policy::OFF
+    })
 }
 
 /// Parse `30m`, `1h`, `90s`, `1h30m`. Zero, missing units, and overflow are
@@ -625,13 +719,36 @@ mod tests {
         ] {
             assert!(parse_period(bad).is_err(), "{bad:?} should be refused");
         }
-        assert_eq!(Policy::default().period(), DEFAULT_PERIOD);
+        assert_eq!(Policy::default().physical(), Some(DEFAULT_PERIOD));
         // Neither clock overflows on a period a file could still carry.
         let huge = Policy {
             period_secs: u64::MAX,
+            ..Policy::OFF
         };
-        let _ = std::time::Instant::now() + huge.period();
-        assert_eq!(huge.period(), MAX_PERIOD);
+        let _ = std::time::Instant::now() + huge.physical().unwrap();
+        assert_eq!(huge.physical(), Some(MAX_PERIOD));
+        assert_eq!(Policy::OFF.physical(), None);
+    }
+
+    #[test]
+    fn a_cadence_spec_names_physical_logical_every_tag_or_off() {
+        assert_eq!(parse_policy("off").unwrap(), Policy::OFF);
+        assert_eq!(Policy::OFF.describe(), "off");
+        let tag = parse_policy("tag").unwrap();
+        assert!(tag.every_tag && tag.period_secs == 0 && tag.logical_period_ns == 0);
+        assert_eq!(tag.describe(), "every tag");
+        let physical = parse_policy("1h30m").unwrap();
+        assert_eq!(physical.period_secs, 5400);
+        assert_eq!(physical.describe(), "every 1h30m (physical)");
+        let logical = parse_policy("logical:2d").unwrap();
+        assert_eq!(logical.logical_period_ns, 2 * 86_400 * 1_000_000_000);
+        assert_eq!(logical.describe(), "every 2d (logical)");
+        assert!(parse_policy("logical:0s").is_err());
+        assert!(parse_policy("logical:").is_err());
+        assert!(parse_policy("sometimes").is_err());
+        // An old policy file names only the physical period.
+        let old: Policy = serde_json::from_str("{\"period_secs\":90}").unwrap();
+        assert_eq!(old, parse_policy("90s").unwrap());
     }
 
     #[test]

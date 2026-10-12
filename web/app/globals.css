@@ -2387,6 +2387,15 @@ h2 {
 .deploy-confirmation h2 { margin: 12px 0 20px; font-size: 22px; }
 .deploy-confirmation p { margin: 12px 0; line-height: 1.6; font-size: 14px; }
 .deploy-confirmation-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px; }
+.deploy-options { margin: 16px 0 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; }
+.deploy-options legend { padding: 0 6px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.deploy-check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.deploy-field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); margin-top: 10px; }
+.deploy-field select, .deploy-field input { font: inherit; color: var(--text); background: var(--panel-raised, var(--panel)); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.deploy-period { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.deploy-period input { width: 100%; }
+.deploy-hint { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+.deploy-invalid { color: var(--danger, #e5484d); }
 
 /* Workspace artifacts are a full-width inspector; editing opens separately. */
 .workspace-file-action { display: flex; justify-content: flex-end; padding: 12px 18px 0; }

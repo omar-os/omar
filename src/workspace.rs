@@ -166,9 +166,32 @@ impl Workspace {
             .truncate(false)
             .write(true)
             .open(self.admin(root).join("lock"))?;
-        file.try_lock()
-            .context("workspace versioning operation already in progress")?;
-        Ok(file)
+        // A child forked by another thread holds every open descriptor until
+        // it execs, the lock with them; that window is milliseconds, and not
+        // an operation in progress. Only a lock still held after a moment is.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(error) if std::time::Instant::now() < deadline => {
+                    let _ = error;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => {
+                    return Err(error).context("workspace versioning operation already in progress")
+                }
+            }
+        }
+    }
+    /// Remove the workspace: its files and its whole version history. For a
+    /// run that ends without keeping its workspaces; nothing else calls it.
+    pub fn remove(&self, root: &Path) -> Result<()> {
+        for path in [self.root(root), self.admin(root)] {
+            if path.exists() {
+                fs::remove_dir_all(&path).with_context(|| format!("remove {}", path.display()))?;
+            }
+        }
+        Ok(())
     }
     pub fn snapshot(&self, root: &Path, label: &str) -> Result<Snapshot> {
         let _lock = self.lock(root)?;
@@ -468,6 +491,49 @@ pub fn list(root: &Path, ea_id: u32) -> Result<Vec<Workspace>> {
     Ok(result)
 }
 
+/// The workspaces one run owns: those its deployment record names, those its
+/// checkpoints reference (a resumed run restores into new ones, and the old
+/// ones stay for a rollback), and, when asked, copies an operator restored
+/// from any of them. Workspaces already removed are skipped.
+pub fn lineage(
+    root: &Path,
+    ea_id: u32,
+    record: &crate::deploy::DeploymentRecord,
+    manifests: &[crate::checkpoint::Manifest],
+    include_restored: bool,
+) -> Result<Vec<Workspace>> {
+    let mut owned: std::collections::BTreeSet<String> =
+        record.workspaces.values().cloned().collect();
+    owned.extend(
+        manifests
+            .iter()
+            .flat_map(|m| m.workspaces.values().map(|a| a.workspace_id.clone())),
+    );
+    let all = list(root, ea_id)?;
+    if include_restored {
+        // A copy of a copy is still this run's; iterate to a fixed point.
+        loop {
+            let before = owned.len();
+            for ws in &all {
+                if let Some((source, _)) = &ws.restored_from {
+                    if owned.contains(source) {
+                        owned.insert(ws.id.clone());
+                    }
+                }
+            }
+            if owned.len() == before {
+                break;
+            }
+        }
+    }
+    let mut result: Vec<Workspace> = all
+        .into_iter()
+        .filter(|ws| owned.contains(&ws.id))
+        .collect();
+    result.sort_by(|a, b| (&a.instance, &a.id).cmp(&(&b.instance, &b.id)));
+    Ok(result)
+}
+
 /// Which instances own a workspace, and their parents. Legacy bytecode with
 /// agents or reactions outside any instance gets one root workspace.
 pub fn instance_owners(state: &crate::topology::VmState) -> BTreeMap<String, Option<String>> {
@@ -633,6 +699,48 @@ mod tests {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(path).args(args);
         output(cmd, None).unwrap()
+    }
+
+    #[test]
+    fn a_run_owns_its_workspaces_their_checkpointed_ancestors_and_restored_copies() {
+        let (_dir, root) = setup();
+        let mine = Workspace::create(&root, 7, "d1", "a", None).unwrap();
+        let other = Workspace::create(&root, 7, "d2", "a", None).unwrap();
+        let older = Workspace::create(&root, 7, "d0", "a", None).unwrap();
+        let snapshot = mine.snapshot(&root, "v").unwrap();
+        let copy = mine.restore(&root, &snapshot.id).unwrap();
+        let copy_of_copy = copy
+            .restore(&root, &copy.snapshots(&root).unwrap()[0].id)
+            .unwrap();
+        let mut record = crate::deploy::DeploymentRecord::create("T", BTreeMap::new(), 1);
+        record.workspaces.insert("a".into(), mine.id.clone());
+        let mut manifest: crate::checkpoint::Manifest =
+            serde_json::from_value(serde_json::json!({
+                "version": crate::checkpoint::FORMAT, "id": "x", "sequence": 1, "parent": null,
+                "deployment_id": "d0", "team": "T", "ea_id": 7, "created_at": 0,
+                "completed_tag": null, "next_tag": null, "trigger": "manual",
+                "policy": {"period_secs": 1}, "pace": "fast", "program_sha256": "", "program_path": null,
+                "state_sha256": "", "elapsed_ns": 0, "workspaces": {}, "agents": {}
+            }))
+            .unwrap();
+        manifest.workspaces.insert(
+            "a".into(),
+            crate::checkpoint::ArtifactRef {
+                workspace_id: older.id.clone(),
+                snapshot_id: String::new(),
+                commit: String::new(),
+            },
+        );
+        let ids = |ws: Vec<Workspace>| ws.into_iter().map(|w| w.id).collect::<Vec<_>>();
+        let owned = ids(lineage(&root, 7, &record, &[manifest.clone()], false).unwrap());
+        assert!(owned.contains(&mine.id) && owned.contains(&older.id));
+        assert!(!owned.contains(&other.id) && !owned.contains(&copy.id));
+        let shown = ids(lineage(&root, 7, &record, &[manifest], true).unwrap());
+        assert!(shown.contains(&copy.id) && shown.contains(&copy_of_copy.id));
+        assert!(!shown.contains(&other.id));
+        mine.remove(&root).unwrap();
+        assert!(!mine.worktree(&root).exists() && Workspace::load(&root, &mine.id).is_err());
+        assert_eq!(list(&root, 7).unwrap().len(), 4);
     }
 
     #[test]

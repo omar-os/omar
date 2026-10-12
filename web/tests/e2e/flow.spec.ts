@@ -770,6 +770,66 @@ test("a run can be paused and resumed from the panel that shows it", async ({ pa
   await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
 });
 
+test("the confirmation chooses what the run keeps and how it checkpoints", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  // Defaults: files go with the run, a checkpoint every physical hour.
+  const keep = dialog.getByRole("checkbox", { name: "Keep workspace files after the run ends" });
+  await expect(keep).not.toBeChecked();
+  const auto = dialog.getByRole("checkbox", { name: "Checkpoint automatically" });
+  await expect(auto).toBeChecked();
+  const cadence = dialog.getByLabel("Checkpoint cadence");
+  await expect(cadence).toHaveValue("hour");
+  // A custom period that adds up to nothing cannot be confirmed.
+  await cadence.selectOption("custom");
+  await expect(dialog.getByRole("alert")).toContainText("above zero");
+  await expect(dialog.getByRole("button", { name: "Confirm deploy" })).toBeDisabled();
+  await dialog.getByLabel("Checkpoint clock").selectOption("logical");
+  await dialog.getByLabel("Period hours").fill("2");
+  await dialog.getByLabel("Period minutes").fill("30");
+  await expect(dialog.getByRole("alert")).toHaveCount(0);
+  await keep.check();
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  // What the daemon was asked for.
+  const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
+  const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
+  expect(options).toEqual({ keep_workspaces: true, checkpoint_period: "logical:2h30m" });
+});
+
+test("switching checkpoints off sends off", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  await dialog.getByRole("checkbox", { name: "Checkpoint automatically" }).uncheck();
+  await expect(dialog.getByLabel("Checkpoint cadence")).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
+  const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
+  expect(options).toEqual({ keep_workspaces: false, checkpoint_period: "off" });
+});
+
+test("the file viewer shows the current run's instances only", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  // Before a run there is nothing of this chat's to show, whatever the EA holds.
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  const viewer = page.getByRole("dialog", { name: "Files & versions" });
+  await expect(viewer).toContainText("No run in this chat yet");
+  await viewer.getByRole("button", { name: "Close files" }).click();
+  await deploy(page);
+  await expect(page.locator(".connection")).toContainText("observing");
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  const instances = viewer.getByLabel("Team workspace");
+  await expect(instances.locator("option")).toHaveCount(1);
+  await expect(instances.locator("option")).toContainText("leader");
+  await expect(viewer.getByRole("navigation", { name: "Workspace files" })).toContainText("notes.txt");
+});
+
 test("a run can be stopped from the panel that shows it", async ({ page }) => {
   // Until now the only way to end a run started from the UI was to leave the
   // UI and type `omar stop` in a terminal.

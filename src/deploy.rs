@@ -117,9 +117,14 @@ pub struct DeploymentRecord {
     /// read back and, once there is a resume, continued.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub state_vars: BTreeMap<String, serde_json::Value>,
-    /// Instance name to stable workspace id; retained after the run ends.
+    /// Instance name to stable workspace id; retained after the run ends,
+    /// whether or not the directories were.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspaces: BTreeMap<String, String>,
+    /// Keep the instances' workspaces when the run ends. Off, they go with
+    /// the run; a paused run keeps them either way, since a resume needs them.
+    #[serde(default)]
+    pub keep_workspaces: bool,
     /// The last checkpoint this run published.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
@@ -177,6 +182,7 @@ impl DeploymentRecord {
             }],
             state_vars: BTreeMap::new(),
             workspaces: BTreeMap::new(),
+            keep_workspaces: false,
             checkpoint: None,
             checkpoint_error: None,
             next_checkpoint_at: None,
@@ -607,7 +613,14 @@ mod tests {
         clear_stop(dir.path()).unwrap();
         assert_eq!(pending_request(dir.path()), None);
         assert!(read_policy(dir.path()).unwrap().is_none());
-        write_policy(dir.path(), crate::checkpoint::Policy { period_secs: 90 }).unwrap();
+        write_policy(
+            dir.path(),
+            crate::checkpoint::Policy {
+                period_secs: 90,
+                ..crate::checkpoint::Policy::OFF
+            },
+        )
+        .unwrap();
         assert_eq!(read_policy(dir.path()).unwrap().unwrap().period_secs, 90);
     }
 
