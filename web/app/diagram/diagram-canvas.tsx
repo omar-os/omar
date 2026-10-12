@@ -9,7 +9,12 @@ import {
   useRef,
   useState,
 } from "react";
-import { formatDuration, webAgents, type DiagramSnapshot } from "../lib/protocol";
+import {
+  formatCountdown,
+  formatDuration,
+  webAgents,
+  type DiagramSnapshot,
+} from "../lib/protocol";
 
 /**
  * Lingua Franca renders reactors as labelled containers whose ports sit on the
@@ -73,6 +78,13 @@ const ACTION_SIZE = { width: 26, height: 26 };
 const CLOCK_SIZE = { width: 34, height: 34 };
 const PORT_SIZE = { width: 12, height: 12 };
 const TEAM_PADDING = { top: 30, right: 78, bottom: 30, left: 78 };
+/**
+ * Room under a clock for its captions, which hang below the box ELK sees:
+ * name, schedule and, on a live run, the countdown. Reserved whenever the
+ * container holds a timer rather than only while counting, so starting the
+ * run does not move the boxes.
+ */
+const CLOCK_CAPTIONS = 14;
 const CANVAS_MARGIN = 28;
 /** Feedback edges leave and re-enter horizontally before dropping to a lane. */
 /**
@@ -125,6 +137,11 @@ type TimerView = {
   phase: number;
   /** True on the tag it fired at, which is when the face pulses. */
   firing: boolean;
+  /**
+   * When it fires next, in the run's own time, or null for a one-shot that
+   * has fired and has nothing left to wait for.
+   */
+  next: number | null;
   center: Point;
 };
 
@@ -655,7 +672,7 @@ async function runElk(
           "elk.spacing.portPort": `${PORT_GAP}`,
           "elk.padding": `[top=${TEAM_PADDING.top},left=${
             TEAM_PADDING.left + room("input")
-          },bottom=${TEAM_PADDING.bottom},right=${
+          },bottom=${TEAM_PADDING.bottom + (timers.length > 0 ? CLOCK_CAPTIONS : 0)},right=${
             TEAM_PADDING.right + room("output")
           }]`,
           // In-layer (vertical) spacing only. Kept generous because an action's
@@ -778,6 +795,8 @@ function buildLayout(
       // or spent, so the hand sits at the top rather than creeping round.
       phase: timer.period > 0 ? (since % timer.period) / timer.period : 0,
       firing: fired !== null && fired === now,
+      next:
+        fired === null ? timer.offset : timer.period > 0 ? fired + timer.period : null,
       center: {
         x: (box?.x ?? 0) + (box?.width ?? CLOCK_SIZE.width) / 2,
         y: (box?.y ?? 0) + (box?.height ?? CLOCK_SIZE.height) / 2,
@@ -1113,6 +1132,12 @@ export function componentName(id: string): string {
   return separator === -1 ? id : id.slice(separator + 2);
 }
 
+/** `in 1 m 30 s` until the firing, then `due` until the run gets to it. */
+function countdownLabel(remaining: number): string {
+  const left = formatCountdown(remaining);
+  return left === "due" ? left : `in ${left}`;
+}
+
 export function DiagramCanvas({
   snapshot,
   selection = [],
@@ -1147,6 +1172,32 @@ export function DiagramCanvas({
   // A click that panned the canvas is not a click on what sits under it.
   const draggedRef = useRef(false);
   const selected = useMemo(() => new Set(selection), [selection]);
+
+  // A countdown is the one reading on the canvas that moves between tags,
+  // which is exactly when nothing else does: the hand steps with logical time,
+  // but a timer fires on the physical clock, and that is what an operator
+  // waiting for it wants to see. The run's clock is read as the current tag
+  // plus the lag it was published with, and wall time carries it on from the
+  // moment that snapshot arrived. Only a live run has a clock to read.
+  const counting =
+    snapshot.status === "running" &&
+    snapshot.timers.some((timer) => timer.last_tag === null || timer.period > 0);
+  const tag = snapshot.current_tag;
+  const published = `${snapshot.sequence}|${tag?.timestamp ?? ""}|${tag?.microstep ?? ""}`;
+  const [arrival, setArrival] = useState(() => ({ published, at: Date.now() }));
+  const [wall, setWall] = useState(() => Date.now());
+  useEffect(() => {
+    if (!counting) return;
+    const tick = setInterval(() => setWall(Date.now()), 250);
+    return () => clearInterval(tick);
+  }, [counting]);
+  // The arrival time is a fact about this snapshot, so it is re-read when the
+  // snapshot is a new one, in the tick rather than in an effect of its own.
+  const arrivedAt = arrival.published === published ? arrival.at : wall;
+  if (arrival.published !== published) setArrival({ published, at: wall });
+  /** The run's physical clock as this render sees it, in nanoseconds. */
+  const runClock =
+    (tag?.timestamp ?? 0) + (snapshot.lag ?? 0) + Math.max(0, wall - arrivedAt) * 1_000_000;
 
   // Reads the drag flag when the click happens, never during render.
   function handleNodeClick(component: string) {
@@ -1522,6 +1573,18 @@ export function DiagramCanvas({
                         ? `${formatDuration(timer.offset)}, every ${formatDuration(timer.period)}`
                         : `once at ${formatDuration(timer.offset)}`}
                     </text>
+                    {/* Physical time to its next firing, counting down while
+                        the run is live. A spent one-shot has nothing to wait
+                        for and shows none. */}
+                    {counting && timer.next !== null ? (
+                      <text
+                        className="omar-timer-countdown"
+                        y={radius + 32}
+                        textAnchor="middle"
+                      >
+                        {countdownLabel(timer.next - runClock)}
+                      </text>
+                    ) : null}
                   </g>
                 );
               })}

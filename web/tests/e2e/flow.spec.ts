@@ -1829,6 +1829,12 @@ test("a timer is drawn as a clock, not as a port", async ({ page }) => {
   // The snapshot's tag is the tag it last fired at, so the face reads as
   // firing rather than idling.
   await expect(timer).toHaveClass(/firing/);
+
+  // The run is live, so physical time to the next firing is counted down
+  // under the schedule. This one fires every 10ns, which is long past by the
+  // time anything is drawn, so the reading is that it is due.
+  await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("LIVE TOPOLOGY");
+  await expect(timer.locator(".omar-timer-countdown")).toHaveText("due");
 });
 
 test("a team inside a team is drawn as a box inside a box", async ({ page }) => {

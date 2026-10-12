@@ -794,6 +794,15 @@ h2 {
   font-size: 9.5px;
 }
 
+/* Physical time to the next firing. Purple like a firing face, so it reads as
+   something happening rather than another line of schedule; tabular digits so
+   it does not jitter as it counts. */
+.omar-timer-countdown {
+  fill: #6b56a4;
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .omar-timer-hand {
     transition: none;

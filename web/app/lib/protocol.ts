@@ -89,6 +89,33 @@ export function formatDuration(nanos: number): string {
   return `${nanos / scale}${unit}`;
 }
 
+/**
+ * Time left before something fires, read at a glance.
+ *
+ * Coarser than `formatDuration` on purpose. A schedule is a fact of the
+ * program and is shown exactly; a countdown is a moving reading, so it is
+ * shown in the largest units that still say something: `1 m 30 s`, never
+ * milliseconds once there is a whole second to show, never seconds left out
+ * because a minute happens to divide them. Rounded up, so it reads `1 s`
+ * right until the firing and never shows a zero that is not yet true. At or
+ * past the firing it reads `due`.
+ */
+export function formatCountdown(nanos: number): string {
+  if (!Number.isFinite(nanos)) return "—";
+  if (nanos <= 0) return "due";
+  const millis = Math.ceil(nanos / 1_000_000);
+  if (millis < 1000) return `${millis} ms`;
+  const seconds = Math.ceil(nanos / 1_000_000_000);
+  const parts: string[] = [];
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  if (hours > 0) parts.push(`${hours} h`);
+  if (minutes > 0) parts.push(`${minutes} m`);
+  if (rest > 0) parts.push(`${rest} s`);
+  return parts.join(" ");
+}
+
 /** One invocation a `Web` agent is waiting on, as the daemon reports it. */
 export type PendingInvocation = {
   invocation_id: string;
