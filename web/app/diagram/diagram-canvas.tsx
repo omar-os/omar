@@ -12,6 +12,7 @@ import {
 import {
   formatCountdown,
   formatDuration,
+  runClockAt,
   webAgents,
   type DiagramSnapshot,
 } from "../lib/protocol";
@@ -1176,28 +1177,28 @@ export function DiagramCanvas({
   // A countdown is the one reading on the canvas that moves between tags,
   // which is exactly when nothing else does: the hand steps with logical time,
   // but a timer fires on the physical clock, and that is what an operator
-  // waiting for it wants to see. The run's clock is read as the current tag
-  // plus the lag it was published with, and wall time carries it on from the
-  // moment that snapshot arrived. Only a live run has a clock to read.
+  // waiting for it wants to see. The run's clock is the current tag plus the
+  // lag it advanced with, carried on by wall time from when it advanced (see
+  // `runClockAt`). Only a live run has a clock to read.
   const counting =
     snapshot.status === "running" &&
     snapshot.timers.some((timer) => timer.last_tag === null || timer.period > 0);
   const tag = snapshot.current_tag;
-  const published = `${snapshot.sequence}|${tag?.timestamp ?? ""}|${tag?.microstep ?? ""}`;
-  const [arrival, setArrival] = useState(() => ({ published, at: Date.now() }));
+  // When this client first saw the current tag: the fallback origin for a
+  // runtime that does not say when the tag advanced. Keyed on the tag alone,
+  // so the events published within it do not restart the reading.
+  const tagKey = `${tag?.timestamp ?? ""}|${tag?.microstep ?? ""}`;
+  const [seen, setSeen] = useState(() => ({ tagKey, at: Date.now() }));
   const [wall, setWall] = useState(() => Date.now());
   useEffect(() => {
     if (!counting) return;
     const tick = setInterval(() => setWall(Date.now()), 250);
     return () => clearInterval(tick);
   }, [counting]);
-  // The arrival time is a fact about this snapshot, so it is re-read when the
-  // snapshot is a new one, in the tick rather than in an effect of its own.
-  const arrivedAt = arrival.published === published ? arrival.at : wall;
-  if (arrival.published !== published) setArrival({ published, at: wall });
+  const firstSeen = seen.tagKey === tagKey ? seen.at : wall;
+  if (seen.tagKey !== tagKey) setSeen({ tagKey, at: wall });
   /** The run's physical clock as this render sees it, in nanoseconds. */
-  const runClock =
-    (tag?.timestamp ?? 0) + (snapshot.lag ?? 0) + Math.max(0, wall - arrivedAt) * 1_000_000;
+  const runClock = runClockAt(snapshot, wall, firstSeen);
 
   // Reads the drag flag when the click happens, never during render.
   function handleNodeClick(component: string) {

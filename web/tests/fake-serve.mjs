@@ -806,6 +806,7 @@ export async function startFakeServe({
       const lag = 250_000_000;
       entry.snapshot.current_tag = tag;
       entry.snapshot.lag = lag;
+      entry.snapshot.tag_at = Date.now();
       publish(entry, "tag_advanced", { lag }, tag);
       await wait();
 

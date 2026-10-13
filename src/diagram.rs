@@ -199,6 +199,13 @@ pub struct DiagramSnapshot {
     /// published; this says whether the run is keeping its promises.
     #[serde(default)]
     pub lag: Option<u64>,
+    /// Unix milliseconds at which `current_tag` advanced, so a client can
+    /// carry the run's physical clock forward from `lag` on its own wall
+    /// clock, whatever has been published since and whenever it connected.
+    /// `None` before the first tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tag_at: Option<u64>,
     /// The containers to draw. Empty for a program compiled before instances
     /// were carried through, which is how a client tells the difference.
     pub instances: Vec<DiagramInstance>,
@@ -327,6 +334,7 @@ impl DiagramSnapshot {
             status: DiagramStatus::Ready,
             current_tag: None,
             lag: None,
+            tag_at: None,
             instances,
             agents,
             ports,
@@ -474,6 +482,7 @@ impl TopologyObserver for DiagramPublisher {
             |snapshot| {
                 snapshot.current_tag = Some(tag);
                 snapshot.lag = Some(lag);
+                snapshot.tag_at = Some(crate::deploy::now_unix_millis());
                 for (name, value) in ports {
                     if let Some(port) = snapshot.ports.iter_mut().find(|port| port.name == *name) {
                         port.value = Some(value.clone());

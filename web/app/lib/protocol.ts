@@ -116,6 +116,32 @@ export function formatCountdown(nanos: number): string {
   return parts.join(" ");
 }
 
+/**
+ * The run's physical clock as of `now` (wall milliseconds), in the
+ * nanoseconds of run time a tag is stamped in.
+ *
+ * A tag advanced at logical time T when physical time stood at T + lag, and
+ * the runtime says when that was (`tag_at`); from there wall time carries the
+ * clock on. So a timer due two minutes after a tag that was a minute late
+ * reads one minute away, and nothing published in between (reactions
+ * starting and finishing, a checkpoint landing) moves the reading, because
+ * none of that moves the tag. A runtime that sends no `tag_at` is read from
+ * when this client first saw the tag instead, which is right unless the
+ * client connected mid-tag.
+ */
+export function runClockAt(
+  snapshot: Pick<DiagramSnapshot, "current_tag" | "lag" | "tag_at">,
+  now: number,
+  firstSeen: number,
+): number {
+  const since = snapshot.tag_at ?? firstSeen;
+  return (
+    (snapshot.current_tag?.timestamp ?? 0) +
+    (snapshot.lag ?? 0) +
+    Math.max(0, now - since) * 1_000_000
+  );
+}
+
 /** One invocation a `Web` agent is waiting on, as the daemon reports it. */
 export type PendingInvocation = {
   invocation_id: string;

@@ -86,6 +86,13 @@ export type DiagramSnapshot = { protocol_version: number, team: string, sequence
  */
 lag: number | null, 
 /**
+ * Unix milliseconds at which `current_tag` advanced, so a client can
+ * carry the run's physical clock forward from `lag` on its own wall
+ * clock, whatever has been published since and whenever it connected.
+ * `None` before the first tag.
+ */
+tag_at?: number, 
+/**
  * The containers to draw. Empty for a program compiled before instances
  * were carried through, which is how a client tells the difference.
  */
