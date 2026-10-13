@@ -38,7 +38,9 @@ export function DeployConfirmation({ team, disabled, onCancel, onConfirm }: {
   const ref = useRef<HTMLDialogElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
   const [keepWorkspaces, setKeepWorkspaces] = useState(false);
-  const [checkpointing, setCheckpointing] = useState(true);
+  // Off unless asked for: a checkpoint is a snapshot of every instance's
+  // files, and not every run wants that kept.
+  const [checkpointing, setCheckpointing] = useState(false);
   const [cadence, setCadence] = useState<Cadence>("hour");
   const [clock, setClock] = useState<Clock>("physical");
   const [parts, setParts] = useState<Parts>({ days: 0, hours: 0, minutes: 0, seconds: 0 });
@@ -94,7 +96,7 @@ export function DeployConfirmation({ team, disabled, onCancel, onConfirm }: {
         <legend>Checkpoints</legend>
         <label className="deploy-check">
           <input type="checkbox" checked={checkpointing} onChange={(event) => setCheckpointing(event.target.checked)} />
-          Checkpoint automatically
+          Enable checkpoints
         </label>
         {checkpointing ? (
           <label className="deploy-field">
@@ -130,7 +132,7 @@ export function DeployConfirmation({ team, disabled, onCancel, onConfirm }: {
             )}
           </div>
         ) : null}
-        {!checkpointing ? <p className="deploy-hint">Only Pause and a manual checkpoint will capture the run.</p> : null}
+        {!checkpointing ? <p className="deploy-hint">Only Pause and a manual checkpoint will capture the run; enable to capture on a cadence.</p> : null}
       </fieldset>
       <div className="deploy-confirmation-actions">
         <button ref={cancel} type="button" className="secondary-button" onClick={onCancel}>Cancel</button>

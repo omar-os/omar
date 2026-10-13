@@ -26,9 +26,9 @@ live:
 - `logical:30m`: the tags' own timestamps crossing each period, so two runs
   of one program capture at the same tags however fast they go.
 
-Mission Control's deploy confirmation offers the same: off, every logical
-tick, every physical hour, or a custom period on either clock (days, hours,
-minutes, seconds; not all zero).
+Mission Control's deploy confirmation has **Enable checkpoints**, off by
+default; enabled, it offers every logical tick, every physical hour, or a
+custom period on either clock (days, hours, minutes, seconds; not all zero).
 
 Every command below targets a session (`-s NAME`, or the inherited one);
 the daemon owns the run, the CLI asks it.

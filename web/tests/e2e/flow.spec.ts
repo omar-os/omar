@@ -779,11 +779,14 @@ test("the confirmation chooses what the run keeps and how it checkpoints", async
   await draftUntilProposed(page);
   await page.getByRole("button", { name: "Deploy", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: /Deploy/ });
-  // Defaults: files go with the run, a checkpoint every physical hour.
+  // Defaults: files go with the run, and no checkpoints until enabled.
   const keep = dialog.getByRole("checkbox", { name: "Keep workspace files after the run ends" });
   await expect(keep).not.toBeChecked();
-  const auto = dialog.getByRole("checkbox", { name: "Checkpoint automatically" });
-  await expect(auto).toBeChecked();
+  const enable = dialog.getByRole("checkbox", { name: "Enable checkpoints" });
+  await expect(enable).not.toBeChecked();
+  await expect(dialog.getByLabel("Checkpoint cadence")).toHaveCount(0);
+  // Enabled, the cadence starts at every physical hour.
+  await enable.check();
   const cadence = dialog.getByLabel("Checkpoint cadence");
   await expect(cadence).toHaveValue("hour");
   // A custom period that adds up to nothing cannot be confirmed.
@@ -803,13 +806,12 @@ test("the confirmation chooses what the run keeps and how it checkpoints", async
   expect(options).toEqual({ keep_workspaces: true, checkpoint_period: "logical:2h30m" });
 });
 
-test("switching checkpoints off sends off", async ({ page }) => {
+test("checkpoints are off unless enabled", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);
   await page.getByRole("button", { name: "Deploy", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: /Deploy/ });
-  await dialog.getByRole("checkbox", { name: "Checkpoint automatically" }).uncheck();
-  await expect(dialog.getByLabel("Checkpoint cadence")).toHaveCount(0);
+  await expect(dialog.getByRole("checkbox", { name: "Enable checkpoints" })).not.toBeChecked();
   await dialog.getByRole("button", { name: "Confirm deploy" }).click();
   await expect(page.locator(".connection")).toContainText("observing");
   const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
