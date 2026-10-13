@@ -1638,6 +1638,10 @@ h2 {
    drawing is what exists, this is when it happens. */
 .timeline {
   flex: none;
+  /* The diagram keeps most of the column; a preview that outgrows this
+     scrolls within the strip instead of pushing its actions out of view. */
+  max-height: 45%;
+  overflow-y: auto;
   border-top: 1px solid var(--line);
   background: var(--panel-2);
   padding: 10px 14px;

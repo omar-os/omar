@@ -25,8 +25,9 @@ import { formatDuration } from "./lib/protocol";
  * Checkpoints live on the same strip, because a checkpoint is a tag: the state
  * after that tag completed, with every instance's files as they were. A green
  * tick stands on the track where one was taken; it grows under the pointer,
- * and clicking it previews what it holds, from where a paused run can be
- * rolled back to it. Rolling back is choosing a tag to continue from, which
+ * and clicking it says which tag it completed and what was queued next, from
+ * where a paused run can be rolled back to it. The files it holds are the
+ * viewer's business, not the strip's. Rolling back is choosing a tag to continue from, which
  * is why it belongs on the timeline and not in a list — the same determinism
  * that lets the strip predict what will happen is what makes "continue from
  * here" a precise instruction. Pause, Stop and Resume sit here for the same
@@ -223,43 +224,6 @@ export function Timeline({
                   {detail.is_resume_point ? " · resume point" : ""}
                 </span>
               </div>
-              <dl className="timeline-preview-body">
-                <dt>Files</dt>
-                <dd>
-                  {Object.entries(detail.workspaces).length === 0
-                    ? "no instance files"
-                    : Object.entries(detail.workspaces)
-                        .map(
-                          ([instance, ws]) =>
-                            `${instance || "root"} → workspace ${ws.workspace_id.slice(0, 8)}, version ${ws.snapshot_id.slice(0, 8)}`,
-                        )
-                        .join(" · ")}
-                </dd>
-                <dt>State</dt>
-                <dd>
-                  {Object.entries(detail.state_vars).length === 0
-                    ? "none"
-                    : Object.entries(detail.state_vars)
-                        .map(([name, value]) => `${name} = ${JSON.stringify(value)}`)
-                        .join(" · ")}
-                </dd>
-                <dt>Outputs</dt>
-                <dd>
-                  {Object.entries(detail.outputs).length === 0
-                    ? "none yet"
-                    : Object.entries(detail.outputs)
-                        .map(([name, value]) => `${name} = ${JSON.stringify(value)}`)
-                        .join(" · ")}
-                </dd>
-                <dt>Agents</dt>
-                <dd>
-                  {Object.entries(detail.agents).length === 0
-                    ? "none"
-                    : Object.entries(detail.agents)
-                        .map(([name, agent]) => `${name} (${agent.backend}): ${agent.restoration.replaceAll("_", " ")}`)
-                        .join(" · ")}
-                </dd>
-              </dl>
               <div className="timeline-preview-actions">
                 {detail.is_resume_point ? (
                   <span className="timeline-preview-note">

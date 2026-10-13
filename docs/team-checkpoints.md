@@ -97,8 +97,9 @@ bottom, folded or open, because they act on where the run is on its logical
 timeline. Each checkpoint is a green tick on the timeline track at the tag it
 completed (the diagram stream announces `run_checkpointed` as they land); it
 grows under the pointer, and clicking it scrubs to that tag and opens a
-preview of what it holds; a paused run commits with "Roll back to this
-checkpoint" from that preview.
+preview (the tag it completed, what was queued next); a paused run commits
+with "Roll back to this checkpoint" from that preview. Its files are in
+Files & versions.
 `GET /v1/runs/<id>/timeline` projects a run's strip from its staged bytecode
 and admitted inputs, so it exists without a draft behind it.
 `GET /v1/runs/<id>/snapshot` is the diagram a paused run left behind (its

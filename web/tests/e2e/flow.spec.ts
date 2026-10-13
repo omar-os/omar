@@ -754,9 +754,13 @@ test("a run can be paused and resumed from the panel that shows it", async ({ pa
   await timeline.getByRole("button", { name: "Checkpoint #1" }).click();
   const preview = timeline.getByLabel("Checkpoint preview");
   await expect(preview).toContainText("Checkpoint #1 · manual");
-  await expect(preview).toContainText("leader.round = 1");
+  await expect(preview).toContainText("after tag");
+  // What it holds stays in the file viewer; the preview is the tag and the
+  // way back to it, which must be on screen without scrolling the panel.
+  await expect(preview).not.toContainText("workspace");
   const rollback = preview.getByRole("button", { name: "Roll back to this checkpoint" });
   await expect(rollback).toBeEnabled();
+  await expect(rollback).toBeInViewport();
   await rollback.click();
   // Committed: this checkpoint is now where a resume continues from, and
   // the newer one is still listed — nothing was deleted.
