@@ -8,6 +8,7 @@ import { DeployConfirmation, type DeployOptions } from "./deploy-confirmation";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
+import { SettingsMenu } from "./settings-menu";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
 import { PortPanel } from "./port-panel";
@@ -1115,7 +1116,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               </button>
             </div>
           ) : null}
-          {!isDemo ? <div className="workspace-file-action"><button className="secondary-button" disabled={switchingChat || daemon.state !== "live"} onClick={() => setFilesOpen(true)}>Files & versions</button></div> : null}
+          <div className="workspace-file-action">
+            {!isDemo ? <button className="secondary-button" disabled={switchingChat || daemon.state !== "live"} onClick={() => setFilesOpen(true)}>Files & versions</button> : null}
+            <SettingsMenu />
+          </div>
           <div className="messages" ref={threadRef}>
             {messages.length === 0 && snapshot ? (
               <p className="builder-status">

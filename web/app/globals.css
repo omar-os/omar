@@ -5,12 +5,131 @@
   --panel: #101013;
   --panel-2: #15151a;
   --line: #292831;
+  --line-2: #3b3844;
   --muted: #96939f;
   --text: #f5f2fa;
+  --text-2: #cbc7d2;
+  --text-3: #9d97a8;
+  --accent-text: #d8caff;
+  --link: #b49cff;
+  --code-bg: #201f26;
+  --code-text: #d9cffb;
+  --pre-bg: #131318;
+  --glass: rgba(12, 12, 15, 0.86);
+  --glow: rgba(140, 99, 242, 0.16);
+  --bubble: #242329;
+  --bubble-text: #aaa6b0;
   --purple: rgb(140, 99, 242);
   --purple-soft: rgba(140, 99, 242, 0.16);
   color-scheme: dark;
+
+  /* The diagram. Dark like the rest of the shell; light mode swaps these for
+     the paper it was first drawn on. */
+  --dia-paper: #121215;
+  --dia-grid: rgba(255, 255, 255, 0.045);
+  --dia-heading: rgba(18, 18, 21, 0.94);
+  --dia-heading-line: #292831;
+  --dia-heading-text: #f0edf5;
+  --dia-stats: #cfcbd6;
+  --dia-stats-muted: #8c8894;
+  --dia-team-shadow: rgba(0, 0, 0, 0.4);
+  --dia-team: #1b1b21;
+  --dia-team-line: #4e4c56;
+  --dia-team-name: #f0edf5;
+  --dia-team-kind: #96939f;
+  --dia-port: #e9e6ef;
+  --dia-label: #dcd8e3;
+  --dia-node: #24242b;
+  --dia-node-line: #a5a2ad;
+  --dia-node-line-soft: #7b7983;
+  --dia-edge: #9a97a2;
+  --dia-edge-delay: #b4b0bc;
+  --dia-reaction: #2b2b33;
+  --dia-reaction-line: #6f6d77;
+  --dia-badge: #1b1b21;
+  --dia-badge-line: #5a585f;
+  --dia-index: #cfcbd6;
+  --dia-name: #f0edf5;
+  --dia-meta: #a39fab;
+  --dia-done: #1c3328;
+  --dia-done-meta: #8fcaa8;
+  --dia-live: #2a2347;
+  --dia-live-meta: #b4a4f0;
+  --dia-chrome: rgba(24, 24, 28, 0.94);
+  --dia-chrome-line: #3b3844;
+  --dia-chrome-text: #c4c0cb;
+  --dia-chrome-hover: #2a2a31;
+  --dia-chrome-shadow: rgba(0, 0, 0, 0.4);
 }
+
+/* Light is chosen from the settings menu and kept in local storage; the
+   layout applies the attribute before paint. */
+:root[data-theme="light"] {
+  --ink: #f6f5f9;
+  --panel: #ffffff;
+  --panel-2: #f1f0f5;
+  --line: #dcd9e3;
+  --line-2: #cfccd8;
+  --muted: #6a6675;
+  --text: #17161b;
+  --text-2: #2c2a33;
+  --text-3: #6a6675;
+  --accent-text: #5b3fd1;
+  --link: #6b4fd8;
+  --code-bg: #eeecf4;
+  --code-text: #4b3a8f;
+  --pre-bg: #f5f4f8;
+  --glass: rgba(255, 255, 255, 0.86);
+  --glow: rgba(140, 99, 242, 0.1);
+  --bubble: #e9e7ee;
+  --bubble-text: #5d5966;
+  color-scheme: light;
+
+  --dia-paper: #f6f6f4;
+  --dia-grid: rgba(54, 52, 58, 0.055);
+  --dia-heading: rgba(246, 246, 244, 0.94);
+  --dia-heading-line: #d8d7d3;
+  --dia-heading-text: #242326;
+  --dia-stats: #343237;
+  --dia-stats-muted: #807d84;
+  --dia-team-shadow: rgba(31, 30, 34, 0.07);
+  --dia-team: #ffffff;
+  --dia-team-line: #8e8c92;
+  --dia-team-name: #1b1a1e;
+  --dia-team-kind: #7d7a82;
+  --dia-port: #17161a;
+  --dia-label: #2c2b30;
+  --dia-node: #ffffff;
+  --dia-node-line: #4b4950;
+  --dia-node-line-soft: #85838b;
+  --dia-edge: #6a686f;
+  --dia-edge-delay: #5f5c66;
+  --dia-reaction: #e9e8ec;
+  --dia-reaction-line: #85838b;
+  --dia-badge: #ffffff;
+  --dia-badge-line: #b3b1b8;
+  --dia-index: #55535a;
+  --dia-name: #1b1a1e;
+  --dia-meta: #7d7a82;
+  --dia-done: #e2f1e8;
+  --dia-done-meta: #4c7a63;
+  --dia-live: #ece5ff;
+  --dia-live-meta: #6553a0;
+  --dia-chrome: rgba(255, 255, 255, 0.94);
+  --dia-chrome-line: #d5d3cf;
+  --dia-chrome-text: #55535a;
+  --dia-chrome-hover: #f0efec;
+  --dia-chrome-shadow: rgba(31, 29, 34, 0.08);
+}
+
+/* Source highlighting was tuned for a dark pane. */
+:root[data-theme="light"] .omar-tok-comment { color: #8a8794; }
+:root[data-theme="light"] .omar-tok-type { color: #1f7f8a; }
+:root[data-theme="light"] .omar-tok-agent { color: #9a6a10; }
+:root[data-theme="light"] .omar-tok-string { color: #2f7d32; }
+:root[data-theme="light"] .omar-tok-interpolation { color: #b4376b; }
+:root[data-theme="light"] .omar-tok-number { color: #8a3fb0; }
+:root[data-theme="light"] .omar-tok-punctuation { color: #6f6a7a; }
 
 * {
   box-sizing: border-box;
@@ -47,7 +166,7 @@ button {
   flex-direction: column;
   overflow: hidden;
   background:
-    radial-gradient(circle at 52% -20%, rgba(140, 99, 242, 0.16), transparent 30rem),
+    radial-gradient(circle at 52% -20%, var(--glow), transparent 30rem),
     var(--ink);
 }
 
@@ -105,8 +224,8 @@ button {
 
 .secondary-button {
   border: 1px solid var(--line);
-  background: #151519;
-  color: #bbb7c3;
+  background: var(--panel-2);
+  color: var(--text-2);
 }
 
 .primary-button:disabled {
@@ -141,13 +260,13 @@ button {
   margin-bottom: 22px;
   border: 0;
   background: transparent;
-  color: #9d97a8;
+  color: var(--text-3);
   font-size: 11px;
   text-decoration: underline;
 }
 
 .waiting-inspect:hover {
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .waiting-verb {
@@ -278,7 +397,7 @@ button {
   flex-direction: column;
   overflow: hidden;
   border-right: 1px solid var(--line);
-  background: rgba(12, 12, 15, 0.86);
+  background: var(--glass);
 }
 
 .diagram-heading {
@@ -350,20 +469,20 @@ h2 {
   place-items: center;
   border-radius: 8px;
   background: var(--purple-soft);
-  color: #c9b5ff;
+  color: var(--link);
   font-size: 10px;
   font-weight: 750;
 }
 
 .message.user > span {
-  background: #242329;
-  color: #aaa6b0;
+  background: var(--bubble);
+  color: var(--bubble-text);
   font-size: 8px;
 }
 
 .message p {
   margin: 2px 0 0;
-  color: #cbc7d2;
+  color: var(--text-2);
   font-size: 16px;
   line-height: 1.75;
 }
@@ -371,7 +490,7 @@ h2 {
 /* Assistant messages are rendered markdown. */
 .message-body {
   min-width: 0;
-  color: #cbc7d2;
+  color: var(--text-2);
   font-size: 16px;
   line-height: 1.75;
 }
@@ -394,11 +513,11 @@ h2 {
 }
 
 .message-body em {
-  color: #d6d1de;
+  color: var(--text);
 }
 
 .message-body a {
-  color: #b49cff;
+  color: var(--link);
 }
 
 /* The Tailwind preflight strips list markers, so restore them explicitly. */
@@ -418,7 +537,7 @@ h2 {
 }
 
 .message-body li::marker {
-  color: #7d7a86;
+  color: var(--muted);
 }
 
 .message-body li {
@@ -428,8 +547,8 @@ h2 {
 .message-body code {
   padding: 1px 5px;
   border-radius: 5px;
-  background: #201f26;
-  color: #d9cffb;
+  background: var(--code-bg);
+  color: var(--code-text);
   font: 14px ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -437,15 +556,15 @@ h2 {
   margin: 0 0 10px;
   overflow-x: auto;
   padding: 11px 13px;
-  border: 1px solid #2a2932;
+  border: 1px solid var(--line);
   border-radius: 9px;
-  background: #131318;
+  background: var(--pre-bg);
 }
 
 .message-body pre code {
   padding: 0;
   background: none;
-  color: #bfb8cd;
+  color: var(--text-2);
   font-size: 14px;
   line-height: 1.6;
 }
@@ -453,8 +572,8 @@ h2 {
 .message-body blockquote {
   margin: 0 0 10px;
   padding-left: 11px;
-  border-left: 2px solid #3a3844;
-  color: #a9a4b4;
+  border-left: 2px solid var(--line-2);
+  color: var(--text-3);
 }
 
 .message-body h1,
@@ -475,21 +594,21 @@ h2 {
 .message-body th,
 .message-body td {
   padding: 5px 9px;
-  border: 1px solid #2a2932;
+  border: 1px solid var(--line);
   text-align: left;
 }
 
 .message-body hr {
   margin: 12px 0;
   border: 0;
-  border-top: 1px solid #2a2932;
+  border-top: 1px solid var(--line);
 }
 
 .prompt-box {
   margin: 16px;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 13px;
-  background: #151519;
+  background: var(--panel-2);
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.2);
 }
 
@@ -513,7 +632,7 @@ h2 {
 .prompt-box > div {
   justify-content: space-between;
   padding: 0 10px 10px 14px;
-  color: #77737f;
+  color: var(--muted);
   font-size: 10px;
 }
 
@@ -532,17 +651,17 @@ h2 {
   flex-direction: column;
   overflow: hidden;
   background:
-    linear-gradient(rgba(54, 52, 58, 0.055) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(54, 52, 58, 0.055) 1px, transparent 1px),
-    #f6f6f4;
+    linear-gradient(var(--dia-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--dia-grid) 1px, transparent 1px),
+    var(--dia-paper);
   background-size: 24px 24px;
 }
 
 .diagram-heading {
   justify-content: space-between;
-  border-bottom-color: #d8d7d3;
-  background: rgba(246, 246, 244, 0.94);
-  color: #242326;
+  border-bottom-color: var(--dia-heading-line);
+  background: var(--dia-heading);
+  color: var(--dia-heading-text);
 }
 
 .run-stats {
@@ -557,13 +676,13 @@ h2 {
   display: grid;
   gap: 4px;
   min-width: 46px;
-  color: #343237;
+  color: var(--dia-stats);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
 }
 
 .run-stats small {
-  color: #807d84;
+  color: var(--dia-stats-muted);
   font: 9px ui-sans-serif, system-ui, sans-serif;
   letter-spacing: 0.12em;
 }
@@ -641,13 +760,13 @@ h2 {
 
 /* Reactor container: white body with a soft offset plate behind it. */
 .omar-team-shadow {
-  fill: rgba(31, 30, 34, 0.07);
+  fill: var(--dia-team-shadow);
   stroke: none;
 }
 
 .omar-team-body {
-  fill: #ffffff;
-  stroke: #8e8c92;
+  fill: var(--dia-team);
+  stroke: var(--dia-team-line);
   stroke-width: 1;
 }
 
@@ -656,14 +775,14 @@ h2 {
 }
 
 .omar-team-name {
-  fill: #1b1a1e;
+  fill: var(--dia-team-name);
   font-size: 15px;
   font-weight: 650;
   letter-spacing: -0.01em;
 }
 
 .omar-team-kind {
-  fill: #7d7a82;
+  fill: var(--dia-team-kind);
   font-size: 10px;
   font-weight: 500;
   letter-spacing: 0.09em;
@@ -672,22 +791,22 @@ h2 {
 
 /* Ports: small filled triangles centred on the reactor boundary. */
 .omar-port {
-  fill: #17161a;
-  stroke: #17161a;
+  fill: var(--dia-port);
+  stroke: var(--dia-port);
   stroke-width: 1;
   stroke-linejoin: round;
 }
 
 .omar-port-label {
-  fill: #2c2b30;
+  fill: var(--dia-label);
   font-size: 11.5px;
   font-weight: 600;
 }
 
 /* Actions: hollow rhombus, filled once they carry a value. */
 .omar-action {
-  fill: #ffffff;
-  stroke: #4b4950;
+  fill: var(--dia-node);
+  stroke: var(--dia-node-line);
   stroke-width: 1.4;
   stroke-linejoin: round;
 }
@@ -698,7 +817,7 @@ h2 {
 }
 
 .omar-action-label {
-  fill: #2c2b30;
+  fill: var(--dia-label);
   font-size: 11px;
   font-weight: 600;
 }
@@ -728,13 +847,13 @@ h2 {
 
 /* Timers: a clock face, because nothing feeds one — it fires on its own. */
 .omar-timer-face {
-  fill: #ffffff;
-  stroke: #4b4950;
+  fill: var(--dia-node);
+  stroke: var(--dia-node-line);
   stroke-width: 1.4;
 }
 
 .omar-timer-hand {
-  stroke: #4b4950;
+  stroke: var(--dia-node-line);
   stroke-width: 1.6;
   stroke-linecap: round;
   /* The hand steps between logical tags rather than sweeping continuously:
@@ -744,7 +863,7 @@ h2 {
 }
 
 .omar-timer-pin {
-  fill: #4b4950;
+  fill: var(--dia-node-line);
 }
 
 /* Firing sweeps the hand a full turn: it overshoots the top by a few degrees
@@ -786,13 +905,13 @@ h2 {
 }
 
 .omar-timer-label {
-  fill: #2c2b30;
+  fill: var(--dia-label);
   font-size: 11px;
   font-weight: 600;
 }
 
 .omar-timer-meta {
-  fill: #85838b;
+  fill: var(--dia-node-line-soft);
   font-size: 9.5px;
 }
 
@@ -817,8 +936,8 @@ h2 {
 
 /* Reactions: six-point chevrons, greyscale by default, coloured by run state. */
 .omar-reaction-body {
-  fill: #e9e8ec;
-  stroke: #85838b;
+  fill: var(--dia-reaction);
+  stroke: var(--dia-reaction-line);
   stroke-width: 1;
   stroke-linejoin: round;
 }
@@ -838,31 +957,31 @@ h2 {
 
 
 .omar-reaction-badge {
-  fill: #ffffff;
-  stroke: #b3b1b8;
+  fill: var(--dia-badge);
+  stroke: var(--dia-badge-line);
   stroke-width: 1;
 }
 
 .omar-reaction-index {
-  fill: #55535a;
+  fill: var(--dia-index);
   font-size: 10.5px;
   font-weight: 700;
 }
 
 .omar-reaction-name {
-  fill: #1b1a1e;
+  fill: var(--dia-name);
   font-size: 12.5px;
   font-weight: 640;
 }
 
 .omar-reaction-meta {
-  fill: #7d7a82;
+  fill: var(--dia-meta);
   font-size: 9.5px;
   font-weight: 500;
 }
 
 .omar-reaction.completed .omar-reaction-body {
-  fill: #e2f1e8;
+  fill: var(--dia-done);
   stroke: #5d9c7b;
 }
 
@@ -876,11 +995,11 @@ h2 {
 }
 
 .omar-reaction.completed .omar-reaction-meta {
-  fill: #4c7a63;
+  fill: var(--dia-done-meta);
 }
 
 .omar-reaction.running .omar-reaction-body {
-  fill: #ece5ff;
+  fill: var(--dia-live);
   stroke: #6f55c4;
   stroke-width: 1.6;
 }
@@ -895,7 +1014,7 @@ h2 {
 }
 
 .omar-reaction.running .omar-reaction-meta {
-  fill: #6553a0;
+  fill: var(--dia-live-meta);
 }
 
 .omar-reaction.running {
@@ -915,7 +1034,7 @@ h2 {
 /* Connections: orthogonal, directed. */
 .omar-edge {
   fill: none;
-  stroke: #6a686f;
+  stroke: var(--dia-edge);
   stroke-width: 1.3;
   stroke-linecap: round;
 }
@@ -925,7 +1044,7 @@ h2 {
    than encoded in the stroke, which could only ever say "some delay" and never
    which. The line breaks around the number instead of running through it. */
 .omar-edge-delay {
-  fill: #5f5c66;
+  fill: var(--dia-edge-delay);
   font: 9px ui-monospace, SFMono-Regular, Menlo, monospace;
   font-weight: 600;
   letter-spacing: 0.01em;
@@ -947,10 +1066,10 @@ h2 {
   bottom: 16px;
   display: flex;
   overflow: hidden;
-  border: 1px solid #d5d3cf;
+  border: 1px solid var(--dia-chrome-line);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.94);
-  box-shadow: 0 4px 16px rgba(31, 29, 34, 0.08);
+  background: var(--dia-chrome);
+  box-shadow: 0 4px 16px var(--dia-chrome-shadow);
 }
 
 .diagram-zoom button {
@@ -958,9 +1077,9 @@ h2 {
   height: 28px;
   padding: 0 8px;
   border: 0;
-  border-left: 1px solid #e4e2df;
+  border-left: 1px solid var(--dia-chrome-line);
   background: transparent;
-  color: #55535a;
+  color: var(--dia-chrome-text);
   font-size: 11px;
   font-weight: 600;
 }
@@ -970,7 +1089,7 @@ h2 {
 }
 
 .diagram-zoom button:hover {
-  background: #f0efec;
+  background: var(--dia-chrome-hover);
 }
 
 .diagram-legend {
@@ -980,12 +1099,12 @@ h2 {
   display: flex;
   gap: 14px;
   padding: 8px 11px;
-  border: 1px solid #d5d3cf;
+  border: 1px solid var(--dia-chrome-line);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.94);
-  color: #68656b;
+  background: var(--dia-chrome);
+  color: var(--dia-chrome-text);
   font-size: 10px;
-  box-shadow: 0 4px 16px rgba(31, 29, 34, 0.08);
+  box-shadow: 0 4px 16px var(--dia-chrome-shadow);
 }
 
 .diagram-legend span {
@@ -1001,7 +1120,7 @@ h2 {
 }
 
 .diagram-legend .running {
-  fill: #ece5ff;
+  fill: var(--dia-live);
   stroke: #6f55c4;
 }
 
@@ -1027,7 +1146,7 @@ h2 {
   flex-direction: column;
   overflow: hidden;
   border-left: 1px solid var(--line);
-  background: #0e0e11;
+  background: var(--panel);
 }
 
 .tabs {
@@ -1042,13 +1161,13 @@ h2 {
   border-bottom: 2px solid transparent;
   padding: 0 18px;
   background: transparent;
-  color: #77737e;
+  color: var(--muted);
   font-size: 11px;
 }
 
 .tabs button.active {
   border-bottom-color: var(--purple);
-  color: #e4ddee;
+  color: var(--text);
 }
 
 .source-title {
@@ -1056,8 +1175,8 @@ h2 {
   justify-content: space-between;
   height: 38px;
   padding: 0 14px;
-  border-bottom: 1px solid #222126;
-  color: #908b98;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
   font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -1072,7 +1191,7 @@ h2 {
 }
 
 .omar-tok-keyword {
-  color: #b49cff;
+  color: var(--link);
   font-weight: 600;
 }
 
@@ -1108,7 +1227,7 @@ h2 {
   margin: 0;
   overflow: auto;
   padding: 16px;
-  color: #bbb3c8;
+  color: var(--text-2);
   font: 10.5px/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
   tab-size: 2;
   white-space: pre-wrap;
@@ -1452,8 +1571,8 @@ h2 {
   border: 0;
   border-left: 1px solid var(--line);
   border-right: 1px solid var(--line);
-  background: #17161c;
-  color: #9d97a8;
+  background: var(--panel-2);
+  color: var(--text-3);
   font-size: 15px;
   line-height: 1;
   transition: background 140ms ease, color 140ms ease;
@@ -1462,7 +1581,7 @@ h2 {
 .resizer-handle:hover,
 .resizer-handle:focus-visible {
   background: var(--purple-soft);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 /* What is left here acts on the message being written. */
@@ -1546,12 +1665,12 @@ h2 {
 
 .message.progress > span {
   background: transparent;
-  color: #6a6672;
+  color: var(--muted);
   font-size: 8px;
 }
 
 .message.progress .message-body {
-  color: #8b8695;
+  color: var(--text-3);
   font-size: 14px;
 }
 
@@ -1582,13 +1701,13 @@ h2 {
   margin-left: auto;
   border: 0;
   background: transparent;
-  color: #9d97a8;
+  color: var(--text-3);
   font-size: 11px;
   text-decoration: underline;
 }
 
 .selection-clear:hover {
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 /* The team panel is a backdrop. Left hit-testable it swallows clicks aimed at
@@ -1662,7 +1781,7 @@ h2 {
 }
 
 .timeline-handle:hover {
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .timeline-controls {
@@ -1886,7 +2005,7 @@ h2 {
 /* Following a run rather than predicting one. */
 .timeline-mode.live {
   border-color: var(--purple);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .timeline-detail,
@@ -1965,13 +2084,13 @@ h2 {
 .input-panel-close {
   border: 0;
   background: transparent;
-  color: #9d97a8;
+  color: var(--text-3);
   font-size: 11px;
   text-decoration: underline;
 }
 
 .input-panel-close:hover {
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .input-panel-note {
@@ -2115,16 +2234,16 @@ h2 {
   margin-left: auto;
   height: 26px;
   padding: 0 12px;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 7px;
   background: transparent;
-  color: #cbc6d6;
+  color: var(--text-2);
   font-size: 11.5px;
 }
 
 .terminal-heading button:hover {
   border-color: var(--purple);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 /* The screen reflows to the panel and the session is told to match, so the
@@ -2169,17 +2288,17 @@ h2 {
   gap: 6px;
   height: 36px;
   padding: 0 8px;
-  border: 1px solid #302d39;
+  border: 1px solid var(--line);
   border-radius: 7px;
   background: transparent;
-  color: #9d97a8;
+  color: var(--text-3);
   font-size: 14px;
 }
 
 .backend-trigger:hover,
 .backend-trigger[aria-expanded="true"] {
   border-color: var(--purple);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .backend-options {
@@ -2189,9 +2308,9 @@ h2 {
   z-index: 20;
   min-width: 190px;
   overflow: hidden;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 9px;
-  background: #17161c;
+  background: var(--panel-2);
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
 }
 
@@ -2204,24 +2323,24 @@ h2 {
   padding: 7px 11px;
   border: 0;
   background: transparent;
-  color: #cbc6d6;
+  color: var(--text-2);
   font-size: 14px;
   text-align: left;
 }
 
 .backend-options > button:hover {
   background: var(--purple-soft);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .backend-options > button.current {
-  color: #9d97a8;
+  color: var(--text-3);
 }
 
 .backend-confirm {
   width: 230px;
   padding: 10px 11px;
-  color: #cbc6d6;
+  color: var(--text-2);
   font-size: 14px;
 }
 
@@ -2238,10 +2357,10 @@ h2 {
 .backend-confirm button {
   height: 32px;
   padding: 0 10px;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 7px;
   background: transparent;
-  color: #cbc6d6;
+  color: var(--text-2);
   font-size: 14px;
 }
 
@@ -2413,7 +2532,59 @@ h2 {
 .deploy-invalid { color: var(--danger, #e5484d); }
 
 /* Workspace artifacts are a full-width inspector; editing opens separately. */
-.workspace-file-action { display: flex; justify-content: flex-end; padding: 12px 18px 0; }
+.workspace-file-action { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 18px 0; }
+
+.settings-menu { position: relative; }
+.settings-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text-3);
+}
+.settings-trigger:hover,
+.settings-trigger[aria-expanded="true"] { border-color: var(--purple); color: var(--accent-text); }
+.settings-options {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  min-width: 150px;
+  overflow: hidden;
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: var(--panel-2);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.3);
+}
+.settings-heading {
+  display: block;
+  padding: 8px 11px 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.settings-options > button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 11px;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 14px;
+  text-align: left;
+}
+.settings-options > button:hover { background: var(--purple-soft); color: var(--accent-text); }
+.settings-options > button.current { color: var(--text-3); }
 .artifacts-dialog { margin: auto; width: min(1160px, 94vw); max-height: 90vh; padding: 24px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface, #17151d); color: var(--text, #eee); overflow: auto; }
 .artifacts-dialog::backdrop { background: #08060dcc; }
 .artifacts-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }

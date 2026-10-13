@@ -1430,6 +1430,50 @@ test("a wrapped team never strands a port in a row of its own", async ({
   }
 });
 
+test("settings switch the theme between light and dark, and remember it", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await expect(page.locator(".omar-team-body").first()).toBeVisible();
+
+  // Relative luminance of a computed colour, 0 for black and 1 for white.
+  // Polled, because fills and backgrounds ease over 260ms.
+  const luminance = (selector: string, property = "background-color") =>
+    page.locator(selector).first().evaluate((el, property) => {
+      const value = getComputedStyle(el).getPropertyValue(property);
+      const [r, g, b] = (value.match(/[\d.]+/g) ?? []).map(Number);
+      return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    }, property);
+
+  // Dark is the default, and it covers the diagram as well as the chat: the
+  // heading, the paper, and the team boxes are all dark.
+  await expect(page.locator("html")).not.toHaveAttribute("data-theme", "light");
+  await expect.poll(() => luminance(".builder-panel")).toBeLessThan(0.2);
+  await expect.poll(() => luminance(".diagram-panel")).toBeLessThan(0.2);
+  await expect.poll(() => luminance(".diagram-heading")).toBeLessThan(0.2);
+  await expect.poll(() => luminance(".omar-team-body", "fill")).toBeLessThan(0.2);
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("menuitemradio", { name: "Light" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect.poll(() => luminance(".builder-panel")).toBeGreaterThan(0.8);
+  await expect.poll(() => luminance(".prompt-box")).toBeGreaterThan(0.8);
+  await expect.poll(() => luminance(".diagram-panel")).toBeGreaterThan(0.8);
+  await expect.poll(() => luminance(".diagram-heading")).toBeGreaterThan(0.8);
+  await expect.poll(() => luminance(".omar-team-body", "fill")).toBeGreaterThan(0.8);
+
+  // The choice outlives the page, and is applied before React mounts.
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect.poll(() => luminance(".builder-panel")).toBeGreaterThan(0.8);
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark" }).click();
+  await expect(page.locator("html")).not.toHaveAttribute("data-theme", "light");
+  await expect.poll(() => luminance(".builder-panel")).toBeLessThan(0.2);
+});
+
 test("a program wider than the panel still fits in it", async ({ page }) => {
   // The fit was clamped by the same floor as the zoom buttons, so a large
   // topology could not be shrunk enough to see whole.
