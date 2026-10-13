@@ -81,6 +81,9 @@ pub enum DiagramEventKind {
     RunPaused,
     /// A checkpoint was published at the tag the event carries.
     RunCheckpointed,
+    /// The run's clock started: the payload's `clock_origin` is the unix
+    /// millisecond its logical time zero stands at.
+    ClockStarted,
 }
 
 impl std::fmt::Display for DiagramEventKind {
@@ -199,13 +202,14 @@ pub struct DiagramSnapshot {
     /// published; this says whether the run is keeping its promises.
     #[serde(default)]
     pub lag: Option<u64>,
-    /// Unix milliseconds at which `current_tag` advanced, so a client can
-    /// carry the run's physical clock forward from `lag` on its own wall
-    /// clock, whatever has been published since and whenever it connected.
-    /// `None` before the first tag.
+    /// The unix millisecond the run's logical time zero stands at, so a
+    /// client can read the run's physical clock off its own wall clock,
+    /// before the first tag and whenever it connected. A resume moves it
+    /// back by the time the run had already spent. `None` until the loop
+    /// starts its clock, which is after the agents are up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub tag_at: Option<u64>,
+    pub clock_origin: Option<u64>,
     /// The containers to draw. Empty for a program compiled before instances
     /// were carried through, which is how a client tells the difference.
     pub instances: Vec<DiagramInstance>,
@@ -334,7 +338,7 @@ impl DiagramSnapshot {
             status: DiagramStatus::Ready,
             current_tag: None,
             lag: None,
-            tag_at: None,
+            clock_origin: None,
             instances,
             agents,
             ports,
@@ -392,6 +396,10 @@ pub trait TopologyObserver: Send + Sync {
     /// The run checkpointed and parked at a tag boundary; nothing more
     /// happens until a resume.
     fn run_paused(&self, _checkpoint: &str) {}
+    /// The loop started its clock: `origin_unix_millis` is where logical
+    /// time zero stands on the wall clock (a resume puts it in the past by
+    /// the time already spent). Nothing fires before this.
+    fn clock_started(&self, _origin_unix_millis: u64) {}
     /// A checkpoint was published after `tag` completed; `trigger` says why.
     fn checkpoint_published(&self, _checkpoint: &str, _trigger: &str, _tag: Option<(u64, u64)>) {}
 }
@@ -482,7 +490,6 @@ impl TopologyObserver for DiagramPublisher {
             |snapshot| {
                 snapshot.current_tag = Some(tag);
                 snapshot.lag = Some(lag);
-                snapshot.tag_at = Some(crate::deploy::now_unix_millis());
                 for (name, value) in ports {
                     if let Some(port) = snapshot.ports.iter_mut().find(|port| port.name == *name) {
                         port.value = Some(value.clone());
@@ -584,6 +591,15 @@ impl TopologyObserver for DiagramPublisher {
             DiagramEventKind::RunPaused,
             DiagramStatus::Paused,
             json!({ "checkpoint": checkpoint }),
+        );
+    }
+
+    fn clock_started(&self, origin_unix_millis: u64) {
+        self.publish_with(
+            DiagramEventKind::ClockStarted,
+            None,
+            json!({ "clock_origin": origin_unix_millis }),
+            |snapshot| snapshot.clock_origin = Some(origin_unix_millis),
         );
     }
 

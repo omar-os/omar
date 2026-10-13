@@ -3778,6 +3778,10 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
         }
     };
     let elapsed = || origin.elapsed() + base_elapsed;
+    // Where logical time zero stands on the wall clock, for anything that
+    // counts down to a tag: agents are up, so from here the clock is real.
+    observer
+        .clock_started(deploy::now_unix_millis().saturating_sub(base_elapsed.as_millis() as u64));
 
     // No bound on how many tags a run may pass through. A loop that costs a
     // microstep somewhere -- through an action, or a connection written

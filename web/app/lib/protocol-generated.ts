@@ -25,7 +25,7 @@ export const PORT_KINDS = ["input", "output", "action"] as const;
 export type PortKind = (typeof PORT_KINDS)[number];
 
 /** What happened, as the event stream names it. */
-export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed"] as const;
+export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started"] as const;
 export type DiagramEventKind = (typeof DIAGRAM_EVENT_KINDS)[number];
 
 /** Who spoke. */
@@ -86,12 +86,13 @@ export type DiagramSnapshot = { protocol_version: number, team: string, sequence
  */
 lag: number | null, 
 /**
- * Unix milliseconds at which `current_tag` advanced, so a client can
- * carry the run's physical clock forward from `lag` on its own wall
- * clock, whatever has been published since and whenever it connected.
- * `None` before the first tag.
+ * The unix millisecond the run's logical time zero stands at, so a
+ * client can read the run's physical clock off its own wall clock,
+ * before the first tag and whenever it connected. A resume moves it
+ * back by the time the run had already spent. `None` until the loop
+ * starts its clock, which is after the agents are up.
  */
-tag_at?: number, 
+clock_origin?: number, 
 /**
  * The containers to draw. Empty for a program compiled before instances
  * were carried through, which is how a client tells the difference.

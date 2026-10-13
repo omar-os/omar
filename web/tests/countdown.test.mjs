@@ -29,23 +29,29 @@ test("whole seconds are never shown as milliseconds", () => {
   assert.equal(formatCountdown(10), "1 ms");
 });
 
-test("the reading is to the next physical firing, lag included", () => {
-  // A timer every 2 minutes fired at logical 10 min, a minute late: physical
-  // time then stood at 11 min, so the next firing is 1 minute away, not 2.
-  const tagAt = 1_700_000_000_000;
-  const snapshot = { current_tag: { timestamp: 10 * MINUTE, microstep: 0 }, lag: MINUTE, tag_at: tagAt };
+test("the reading is to the next physical firing, from the run's clock origin", () => {
+  // The runtime's logical zero stood at wall time T0. A timer every 2 minutes
+  // fired at logical 10 min, a minute late, so physical time then stood at
+  // 11 min: the next firing is a minute away, not two.
+  const T0 = 1_700_000_000_000;
+  const snapshot = { current_tag: { timestamp: 10 * MINUTE, microstep: 0 }, lag: MINUTE, clock_origin: T0 };
   const next = 12 * MINUTE;
-  assert.equal(formatCountdown(next - runClockAt(snapshot, tagAt, tagAt)), "1 m");
-  assert.equal(formatCountdown(next - runClockAt(snapshot, tagAt + 1000, tagAt)), "59 s");
-  assert.equal(formatCountdown(next - runClockAt(snapshot, tagAt + 2000, tagAt)), "58 s");
-  assert.equal(formatCountdown(next - runClockAt(snapshot, tagAt + 60_000, tagAt)), "due");
-  // Events published within the tag do not move the reading: the origin is
-  // when the tag advanced, however late this client saw the snapshot.
-  assert.equal(runClockAt(snapshot, tagAt + 30_000, tagAt + 30_000), runClockAt(snapshot, tagAt + 30_000, tagAt));
-  // Without `tag_at` the client's first sight of the tag stands in.
+  const at = (ms) => formatCountdown(next - runClockAt(snapshot, T0 + ms, 0));
+  assert.equal(at(11 * 60_000), "1 m");
+  assert.equal(at(11 * 60_000 + 1000), "59 s");
+  assert.equal(at(11 * 60_000 + 2000), "58 s");
+  assert.equal(at(12 * 60_000), "due");
+  // Before the first tag the clock is still wall time since the origin: a
+  // timer with a 1 min offset, 30 s after the clock started, is 30 s away,
+  // however long before that the picture was first drawn.
+  const fresh = { current_tag: null, lag: null, clock_origin: T0 };
+  assert.equal(formatCountdown(MINUTE - runClockAt(fresh, T0 + 30_000, T0 - 60_000)), "30 s");
+  // Events published within a tag do not move the reading: nothing the
+  // client saw later changes where the origin stands.
+  assert.equal(runClockAt(snapshot, T0 + 30_000, T0 + 30_000), runClockAt(snapshot, T0 + 30_000, T0));
+  // Without an origin the client's first sight of the tag stands in.
   const older = { current_tag: snapshot.current_tag, lag: MINUTE };
-  assert.equal(formatCountdown(next - runClockAt(older, tagAt + 1000, tagAt)), "59 s");
-  // Before the first tag the clock is just the lag-free wall time since.
+  assert.equal(formatCountdown(next - runClockAt(older, T0 + 1000, T0)), "59 s");
   assert.equal(runClockAt({ current_tag: null, lag: null }, 5000, 0), 5 * SECOND);
 });
 

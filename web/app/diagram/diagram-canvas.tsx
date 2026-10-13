@@ -1184,16 +1184,16 @@ export function DiagramCanvas({
   // A countdown is the one reading on the canvas that moves between tags,
   // which is exactly when nothing else does: the hand steps with logical time,
   // but a timer fires on the physical clock, and that is what an operator
-  // waiting for it wants to see. The run's clock is the current tag plus the
-  // lag it advanced with, carried on by wall time from when it advanced (see
-  // `runClockAt`). Only a live run has a clock to read.
+  // waiting for it wants to see. The run's clock is wall time since the
+  // origin the runtime announced (see `runClockAt`). Only a live run has a
+  // clock to read.
   const counting =
     snapshot.status === "running" &&
     snapshot.timers.some((timer) => timer.last_tag === null || timer.period > 0);
   const tag = snapshot.current_tag;
   // When this client first saw the current tag: the fallback origin for a
-  // runtime that does not say when the tag advanced. Keyed on the tag alone,
-  // so the events published within it do not restart the reading.
+  // runtime that has not announced its clock. Keyed on the tag alone, so the
+  // events published within it do not restart the reading.
   const tagKey = `${tag?.timestamp ?? ""}|${tag?.microstep ?? ""}`;
   const [seen, setSeen] = useState(() => ({ tagKey, at: Date.now() }));
   const [wall, setWall] = useState(() => Date.now());

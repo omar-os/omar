@@ -120,25 +120,30 @@ export function formatCountdown(nanos: number): string {
  * The run's physical clock as of `now` (wall milliseconds), in the
  * nanoseconds of run time a tag is stamped in.
  *
- * A tag advanced at logical time T when physical time stood at T + lag, and
- * the runtime says when that was (`tag_at`); from there wall time carries the
- * clock on. So a timer due two minutes after a tag that was a minute late
- * reads one minute away, and nothing published in between (reactions
- * starting and finishing, a checkpoint landing) moves the reading, because
- * none of that moves the tag. A runtime that sends no `tag_at` is read from
- * when this client first saw the tag instead, which is right unless the
- * client connected mid-tag.
+ * The runtime says where its logical time zero stands on the wall clock
+ * (`clock_origin`, announced when the loop starts its clock, after the agents
+ * are up, and set back on a resume by the time already spent), so the clock
+ * is simply wall time since then. That is right before the first tag, which
+ * is where a timer's offset is counted from, and nothing published within a
+ * tag moves it. A timer due two minutes after a tag that was a minute late
+ * reads one minute away, since the tag's lag is in that elapsed time too.
+ *
+ * A runtime that has not announced its origin is read as the current tag
+ * plus its lag, carried on from when this client first saw that tag: right
+ * unless the client connected mid-tag.
  */
 export function runClockAt(
-  snapshot: Pick<DiagramSnapshot, "current_tag" | "lag" | "tag_at">,
+  snapshot: Pick<DiagramSnapshot, "current_tag" | "lag" | "clock_origin">,
   now: number,
   firstSeen: number,
 ): number {
-  const since = snapshot.tag_at ?? firstSeen;
+  if (typeof snapshot.clock_origin === "number") {
+    return Math.max(0, now - snapshot.clock_origin) * 1_000_000;
+  }
   return (
     (snapshot.current_tag?.timestamp ?? 0) +
     (snapshot.lag ?? 0) +
-    Math.max(0, now - since) * 1_000_000
+    Math.max(0, now - firstSeen) * 1_000_000
   );
 }
 
@@ -408,6 +413,12 @@ export function applyDiagramEvent(
       // A checkpoint is a fact about the run's history, not its picture; the
       // timeline draws it from the listing it refetches on this event.
       return snapshot;
+    case "clock_started": {
+      // Where the run's logical time zero stands on the wall clock; what a
+      // countdown measures from.
+      const origin = (event.payload as { clock_origin?: unknown }).clock_origin;
+      return typeof origin === "number" ? { ...snapshot, clock_origin: origin } : snapshot;
+    }
     case "run_paused":
       // A pause lands at a tag boundary, where nothing is in flight: whatever
       // was painted as running has finished, and the run waits for a resume.

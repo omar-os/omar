@@ -175,6 +175,7 @@ export async function startFakeServe({
       entry.record.status = "running";
       entry.record.finished_at = null;
       publish(entry, "run_started", {});
+      startClock(entry);
       return json(response, 200, entry.record);
     }
     if (
@@ -774,11 +775,18 @@ export async function startFakeServe({
     for (const subscriber of entry.subscribers) subscriber.write(frame);
   }
 
+  /** The loop's clock starts once the agents are up: a beat after the run. */
+  function startClock(entry) {
+    entry.snapshot.clock_origin = Date.now();
+    publish(entry, "clock_started", { clock_origin: entry.snapshot.clock_origin });
+  }
+
   /** Walk the captured topology the way a real run would. */
   async function driveRun(entry) {
     const wait = () => new Promise((resolve) => setTimeout(resolve, stepMs));
     await wait();
     publish(entry, "run_started", {});
+    startClock(entry);
 
     // A pause lands at a tag boundary: nothing in flight, a checkpoint
     // announced, and the walk parked until a resume sets the run going.
@@ -795,6 +803,7 @@ export async function startFakeServe({
       while (entry.record.status === "paused") await wait();
       entry.snapshot.status = "running";
       publish(entry, "run_started", {});
+      startClock(entry);
     };
 
     for (const [index, reaction] of entry.snapshot.reactions.entries()) {
@@ -806,7 +815,6 @@ export async function startFakeServe({
       const lag = 250_000_000;
       entry.snapshot.current_tag = tag;
       entry.snapshot.lag = lag;
-      entry.snapshot.tag_at = Date.now();
       publish(entry, "tag_advanced", { lag }, tag);
       await wait();
 
