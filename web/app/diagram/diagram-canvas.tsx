@@ -905,7 +905,20 @@ function buildLayout(
 
     const from = anchorBox(edge.source);
     const to = anchorBox(edge.target);
-    if (from && to && to.x + to.width <= from.x + from.width) {
+    // Two kinds of edge have their target left of their source. One ELK had
+    // to reverse to break a cycle, and draws backwards: out of the source's
+    // left, into the target's right. The other joins one wrapped row to the
+    // next, and ELK already draws it forwards: out of the right, down the gap
+    // between the rows, in from the left. Only the first needs the lane; the
+    // second would be dragged under the whole team by it.
+    const first = routed[0];
+    const last = routed[routed.length - 1];
+    const backwards =
+      from &&
+      to &&
+      (first.x < from.x + from.width - AXIS_EPSILON ||
+        last.x > to.x + AXIS_EPSILON);
+    if (from && to && to.x + to.width <= from.x + from.width && backwards) {
       // Stagger lanes so several feedback edges do not sit on top of each other.
       const span = {
         left: to.x - WRAP_STUB,

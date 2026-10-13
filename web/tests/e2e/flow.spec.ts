@@ -1288,6 +1288,20 @@ test("a wrapped team never strands a port in a row of its own", async ({
     const backwards = pathSegments(d).filter((run) => run.a[0] - run.b[0] > 0.6);
     expect(backwards, `${id} should not run leftward`).toHaveLength(0);
   }
+
+  // And the edges joining one row to the next run in the gap between them,
+  // the way ELK drew them, rather than looping under the whole team.
+  const lowest = Math.max(
+    ...(await page.locator(".omar-reaction").evaluateAll((els) =>
+      els.map((el) => el.getBoundingClientRect().bottom),
+    )),
+  );
+  const edgeBottoms = await page
+    .locator(".omar-edge")
+    .evaluateAll((els) => els.map((el) => el.getBoundingClientRect().bottom));
+  for (const bottom of edgeBottoms) {
+    expect(bottom).toBeLessThanOrEqual(lowest + 2);
+  }
 });
 
 test("a program wider than the panel still fits in it", async ({ page }) => {
