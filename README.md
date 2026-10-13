@@ -33,7 +33,7 @@ Terminal UI
 - **Full control**: Talk to and control any subagent you want.
 - **Life span**: Long-running or ephemeral agents, your choice.
 - **Customization**: Support all `tmux` commands you love.
-- **Team workspaces**: Each topology team instance gets a versioned `worktree/` and disposable `temp/`. [Inspect and restore file versions](docs/team-workspaces.md).
+- **Team workspaces**: Each topology team instance gets a versioned `worktree/` and disposable `temp/`; inspect and restore file versions from Mission Control or `omar workspace`.
 
 Other features include messaging systems integration (e.g., Slack), computer use, and more.
 
@@ -83,7 +83,7 @@ $ omar attach -s dev --web
 
 Starts an independent background runtime, then opens its web UI. Closing the
 browser leaves the runtime and its topologies running. Stop it with `omar down -s dev`.
-See [session commands and lifecycle](docs/sessions.md).
+`omar --help` lists the session commands.
 
 #### Step 2: Describe a workflow
 
