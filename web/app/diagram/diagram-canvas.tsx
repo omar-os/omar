@@ -139,6 +139,12 @@ type TimerView = {
   /** True on the tag it fired at, which is when the face pulses. */
   firing: boolean;
   /**
+   * The tag it last fired at, as a string: the hand is keyed on it, so each
+   * firing is a fresh hand and its sweep plays again, even when the timer
+   * fires on consecutive tags and the face never stops reading as firing.
+   */
+  firedKey: string;
+  /**
    * When it fires next, in the run's own time, or null for a one-shot that
    * has fired and has nothing left to wait for.
    */
@@ -796,6 +802,7 @@ function buildLayout(
       // or spent, so the hand sits at the top rather than creeping round.
       phase: timer.period > 0 ? (since % timer.period) / timer.period : 0,
       firing: fired !== null && fired === now,
+      firedKey: timer.last_tag ? `${timer.last_tag.timestamp}:${timer.last_tag.microstep}` : "",
       next:
         fired === null ? timer.offset : timer.period > 0 ? fired + timer.period : null,
       center: {
@@ -1530,8 +1537,8 @@ export function DiagramCanvas({
             <g className="omar-timers">
               {layout.timers.map((timer) => {
                 const radius = CLOCK_SIZE.width / 2;
-                // The long hand sweeps the period; the short one is a fixed
-                // dial mark, so a face still reads as a clock when stopped.
+                // One hand, at how far through its period the timer is; it
+                // points straight up on the tag it fires at.
                 const angle = timer.phase * Math.PI * 2 - Math.PI / 2;
                 const hand = {
                   x: Math.cos(angle) * (radius - 8),
@@ -1547,22 +1554,22 @@ export function DiagramCanvas({
                     transform={`translate(${timer.center.x},${timer.center.y})`}
                   >
                     <circle className="omar-timer-face" r={radius} />
-                    {/* Grouped so the fire animation turns both hands about
-                        the pin rather than each about its own end. */}
-                    <g className="omar-timer-hands">
+                    {/* Keyed on the firing so the sweep replays each time.
+                        The invisible circle gives the group a bounding box
+                        centred on the pin, which is what the sweep turns
+                        about; a lone hand's box would be centred on itself. */}
+                    <g
+                      key={timer.firedKey}
+                      className="omar-timer-hands"
+                      data-fired={timer.firedKey || undefined}
+                    >
+                      <circle r={radius - 8} fill="none" stroke="none" />
                       <line
                         className="omar-timer-hand"
                         x1={0}
                         y1={0}
                         x2={hand.x}
                         y2={hand.y}
-                      />
-                      <line
-                        className="omar-timer-hand short"
-                        x1={0}
-                        y1={0}
-                        x2={0}
-                        y2={-(radius - 12)}
                       />
                     </g>
                     <circle className="omar-timer-pin" r={1.8} />
@@ -1736,7 +1743,6 @@ export function DiagramCanvas({
           <svg viewBox="0 0 12 12" aria-hidden="true">
             <circle className="omar-timer-face" cx="6" cy="6" r="5" />
             <line className="omar-timer-hand" x1="6" y1="6" x2="6" y2="2.5" />
-            <line className="omar-timer-hand short" x1="6" y1="6" x2="8.5" y2="6" />
           </svg>
           timer
         </span>

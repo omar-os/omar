@@ -1831,8 +1831,13 @@ test("a timer is drawn as a clock, not as a port", async ({ page }) => {
   expect(edges).toBeGreaterThan(0);
 
   // The snapshot's tag is the tag it last fired at, so the face reads as
-  // firing rather than idling.
+  // firing rather than idling, and its one hand sweeps a full turn: the hand
+  // is keyed on the firing tag so the sweep plays once per firing.
   await expect(timer).toHaveClass(/firing/);
+  await expect(timer.locator(".omar-timer-hand")).toHaveCount(1);
+  const hands = timer.locator(".omar-timer-hands");
+  await expect(hands).toHaveAttribute("data-fired", /^\d+:\d+$/);
+  expect(await hands.evaluate((node) => getComputedStyle(node).animationName)).toBe("omar-timer-sweep");
 
   // The run is live, so physical time to the next firing is counted down
   // under the schedule. This one fires every 10ns, which is long past by the
