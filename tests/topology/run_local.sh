@@ -336,8 +336,9 @@ run_case SuperdenseTime SuperdenseTime time.fixed_result,time.connected_result \
 # `Heartbeat` and `Bureau` are deliberately absent. `Heartbeat`'s timer has a
 # non-zero period, so the program never finishes and has no completion marker to
 # wait for. `Bureau` is 32 agents across eight sequential stages, and a release
-# gate is not the place to discover whether that fits in a case timeout. Both are
-# compiled and backend-checked like every other source, just never run here.
+# gate is not the place to discover whether that fits in a case timeout.
+# `WorldNews` never finishes either, and fetches from the internet besides. All
+# three are compiled and backend-checked like every other source, never run here.
 
 if ((passed_cases + failed_cases == 0)); then
   printf 'No topology case named %s\n' "$case_filter" >&2

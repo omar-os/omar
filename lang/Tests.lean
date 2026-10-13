@@ -61,7 +61,10 @@ def topologyCases : Array TopologyCase := #[
   { file := "SameAgentSerial.omar", team := "SameAgentSerial", agents := 2, ports := 4,
     reactions := 3, instructions := 12 },
   { file := "SuperdenseTime.omar", team := "SuperdenseTime", agents := 3, ports := 6,
-    connections := 1, reactions := 3, instructions := 16 }
+    connections := 1, reactions := 3, instructions := 16 },
+  -- `main WorldNewsEveryTwoMinutes` names the program; a 2min periodic timer.
+  { file := "WorldNews.omar", team := "WorldNewsEveryTwoMinutes", agents := 2, ports := 3,
+    connections := 1, reactions := 2, instructions := 13 }
 ]
 
 def testTopology (test : TopologyCase) : IO Unit := do
@@ -105,6 +108,10 @@ def testTopology (test : TopologyCase) : IO Unit := do
         (mentions (reaction.body.getD "") "$(idx)") false
     assertEqual "body keeps its braces"
       (program.reactions.all (fun r => mentions (r.body.getD "") "out = Some(token + 1)")) true
+  if test.file == "WorldNews.omar" then
+    -- `2min` is two minutes of logical time, in nanoseconds, every tick.
+    assertEqual "timer period"
+      (mentions bytecode "\"name\": \"fetch.tick\", \"offset\": 0, \"period\": 120000000000") true
   if test.file == "RingLeader.omar" then
     -- State is qualified like a port, typed as OMAR's int, and starts at 0.
     let var ← match program.states[0]? with

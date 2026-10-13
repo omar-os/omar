@@ -44,6 +44,13 @@ Coverage:
 - `Heartbeat.omar`: a periodic timer driving a program that never finishes.
   Compiled and checked, never run: `run_local.sh` waits for a completion
   marker this program does not produce.
+- `WorldNews.omar`: a 2-minute timer; each tick a Codex researcher fetches the
+  news of that moment and a writer replaces `world-news-summary.txt` in its
+  workspace. For trying checkpoints by hand: every tick differs, the file is
+  state on disk, so pause, roll back to an earlier tick and resume, and the
+  file is that tick's summary again while the clock continues from there
+  (see `docs/team-checkpoints.md`). Compiled and checked, never run: it never
+  finishes and it reaches the internet.
 
 Every program declares its teams and then instantiates them in a `main` block,
 so ports are named `instance.port` and each program takes its source file's

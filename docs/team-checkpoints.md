@@ -115,6 +115,10 @@ Not in this PR: checkpoint import into another session, input journalling
 while paused, format migration, pruning, manual capture or period changes
 from Mission Control.
 
+By hand: `tests/topology/src/WorldNews.omar` (a 2-minute news timer whose
+writer keeps a summary file) is made for pausing, rolling back a tick and
+resuming; the file comes back as that tick's.
+
 Validation: `python3 tests/ci/team_checkpoints.py` (CI) runs a real-time
 timer topology with a Rust body and a stub agent in one session: automatic
 and manual captures, live period change, pause, resume under the same run id
