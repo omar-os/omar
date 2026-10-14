@@ -1140,12 +1140,6 @@ async fn daemon(directory: &Path) -> Result<()> {
     crate::metrics::configure(config.metrics.spawn_metrics_enabled);
     ea::ensure_default_ea(directory)?;
     let server = Arc::new(Serve::start(launch.address, &config, directory, 0)?);
-    // Slack and computer integrations belong to the runtime, never to a client.
-    let mut bridges: Vec<std::process::Child> =
-        [crate::spawn_slack_bridge(), crate::spawn_computer_bridge()]
-            .into_iter()
-            .flatten()
-            .collect();
     match server.attach_ea(&config, directory, 0, false, !launch.no_ea)? {
         crate::serve::AttachEa::Attached(_) if launch.no_ea => {}
         crate::serve::AttachEa::Attached(session) => eprintln!("Executive assistant running in {session}"),
@@ -1247,9 +1241,6 @@ async fn daemon(directory: &Path) -> Result<()> {
         }
     }
     scheduler_task.abort();
-    for bridge in &mut bridges {
-        crate::kill_child_gracefully(bridge, Duration::from_secs(3));
-    }
     cleanup.cleanup();
     let mut session = session.lock().unwrap();
     // Stopped is a state, not an ending: like a container, the session keeps

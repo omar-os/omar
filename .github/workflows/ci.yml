@@ -851,8 +851,6 @@ jobs:
           name: omar-${{ matrix.os }}
           path: |
             target/release/omar
-            target/release/omar-computer
-            target/release/omar-slack
 
   # Ensure all jobs pass before allowing merge
   ci-success:

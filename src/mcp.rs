@@ -32,7 +32,7 @@ const INITIAL_PROMPT_DELIVERY_STATUS_TIMEOUT: Duration = Duration::from_millis(1
 const SERVER_INSTRUCTIONS: &str = concat!(
     "OMAR provides orchestration tools for executive assistant and worker sessions. ",
     "Use these tools for agent delegation, project tracking, scheduled wake-ups, ",
-    "manager notes, action logs, Slack replies, and shared computer control. ",
+    "manager notes, action logs, and shared computer control. ",
     "Tracked tasks have durable runtime supervision: use finish_task for results, ",
     "get_task to read them, and acknowledge_task with result_revision to consume them. ",
     "Call coordination_state after context loss. Do not schedule child polling timers. ",
@@ -477,7 +477,7 @@ fn apply_context_environment(context: &McpLaunchContext) {
 }
 
 /// Run an MCP server without a pre-built context file. Used by peer
-/// processes (e.g. the Slack bridge) that aren't spawned by a specific
+/// processes that aren't spawned by a specific
 /// backend launch and need a default context derived from the current
 /// config + active EA.
 pub fn run_server_with_default_context(bare_tool_names: bool) -> Result<()> {
@@ -510,7 +510,7 @@ pub fn run_server_with_default_context(bare_tool_names: bool) -> Result<()> {
 }
 
 /// Pick the EA id for a default-context server. Honors `OMAR_EA_ID` so
-/// peer processes (e.g. the Slack bridge) can pin a child to a specific
+/// a peer process can pin a child to a specific
 /// EA without mutating the global active-EA pointer the dashboard reads.
 fn resolve_default_context_ea(omar_dir: &Path, registered: &[ea::EaInfo]) -> Result<ea::EaId> {
     if let Some(raw) = std::env::var_os("OMAR_EA_ID") {
@@ -758,7 +758,6 @@ impl OmarMcpServer {
                 "list_events" => self.list_events(),
                 "cancel_event" => self.cancel_event(call.arguments),
                 "log_justification" => self.log_justification(call.arguments),
-                "slack_reply" => self.slack_reply(call.arguments),
                 "computer_status" => self.computer_status(),
                 "computer_lock_acquire" => self.computer_lock_acquire(call.arguments),
                 "computer_lock_release" => self.computer_lock_release(call.arguments),
@@ -1759,46 +1758,6 @@ impl OmarMcpServer {
         }))
     }
 
-    /// Queue a Slack reply for the `omar-slack-bridge` peer to pick up and
-    /// post to Slack. File-based rendezvous via `{omar_dir}/slack_outbox/`
-    /// keeps the MCP surface free of loopback HTTP and survives a bridge
-    /// that's momentarily down — the bridge drains the outbox on restart.
-    fn slack_reply(&self, args: Value) -> Result<Value> {
-        #[derive(Deserialize)]
-        struct Args {
-            channel: String,
-            #[serde(default)]
-            thread_ts: Option<String>,
-            text: String,
-        }
-        let args: Args = serde_json::from_value(args)?;
-        if args.channel.trim().is_empty() {
-            return Err(anyhow!("slack_reply requires a non-empty channel"));
-        }
-        if args.text.is_empty() {
-            return Err(anyhow!("slack_reply requires a non-empty text"));
-        }
-        let dir = self.context.omar_dir.join("slack_outbox");
-        fs::create_dir_all(&dir).context("Failed to create slack outbox directory")?;
-        let id = Uuid::new_v4();
-        let tmp = dir.join(format!("{}.json.tmp", id));
-        // Prefix filename with timestamp so the bridge delivers messages in
-        // the order they were queued even under heavy fan-out.
-        let final_path = dir.join(format!("{}-{}.json", now_ns(), id));
-        let payload = serde_json::to_vec(&json!({
-            "channel": args.channel,
-            "thread_ts": args.thread_ts,
-            "text": args.text,
-            "queued_at": now_rfc3339(),
-        }))?;
-        fs::write(&tmp, &payload).context("Failed to stage slack reply")?;
-        fs::rename(&tmp, &final_path).context("Failed to commit slack reply")?;
-        Ok(json!({
-            "status": "queued",
-            "path": final_path,
-        }))
-    }
-
     fn log_justification(&self, args: Value) -> Result<Value> {
         #[derive(Deserialize)]
         struct Args {
@@ -2486,20 +2445,6 @@ fn tool_definitions() -> Vec<Value> {
                     "justification":{"type":"string","description":"Why this action serves the user's goal."}
                 },
                 "required":["agent_name","action","justification"],
-                "additionalProperties":false
-            }),
-        ),
-        tool(
-            "slack_reply",
-            "Queue a reply for the omar-slack-bridge to post to Slack. Use only in response to a Slack-originated request and pass channel/thread_ts from the inbound [SLACK MESSAGE] event. Side effect: writes an outbox file that the bridge may post. Not retry-safe because duplicate files can post duplicate messages. Fails if channel or text is empty.",
-            json!({
-                "type":"object",
-                "properties":{
-                    "channel":{"type":"string","description":"From the inbound [SLACK MESSAGE] event."},
-                    "thread_ts":{"type":"string","description":"From the inbound [SLACK MESSAGE] event. Omit to start a new thread."},
-                    "text":{"type":"string"}
-                },
-                "required":["channel","text"],
                 "additionalProperties":false
             }),
         ),
@@ -3317,47 +3262,6 @@ mod tests {
             std::env::var("OMAR_TMUX_SERVER").as_deref(),
             Ok("isolated-test-server")
         );
-    }
-
-    #[test]
-    fn slack_reply_queues_file_in_outbox() {
-        let server = OmarMcpServer::new(test_context());
-        let outbox = server.context.omar_dir.join("slack_outbox");
-
-        let result = server
-            .slack_reply(json!({
-                "channel": "C123",
-                "thread_ts": "1700000000.001",
-                "text": "hello from test",
-            }))
-            .expect("slack_reply should succeed");
-
-        assert_eq!(result["status"], json!("queued"));
-        assert!(outbox.is_dir(), "outbox dir must exist");
-
-        let entries: Vec<_> = std::fs::read_dir(&outbox)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
-            .collect();
-        assert_eq!(entries.len(), 1, "exactly one outbox file");
-
-        let body = std::fs::read_to_string(entries[0].path()).unwrap();
-        let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["channel"], json!("C123"));
-        assert_eq!(parsed["thread_ts"], json!("1700000000.001"));
-        assert_eq!(parsed["text"], json!("hello from test"));
-    }
-
-    #[test]
-    fn slack_reply_rejects_empty_channel_or_text() {
-        let server = OmarMcpServer::new(test_context());
-        assert!(server
-            .slack_reply(json!({"channel": "", "text": "x"}))
-            .is_err());
-        assert!(server
-            .slack_reply(json!({"channel": "C1", "text": ""}))
-            .is_err());
     }
 
     #[test]

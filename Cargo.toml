@@ -1,6 +1,6 @@
 [workspace]
-members = [".", "bridges/slack", "bridges/computer"]
-default-members = [".", "bridges/slack", "bridges/computer"]
+members = ["."]
+default-members = ["."]
 
 [workspace.package]
 rust-version = "1.89"

@@ -5,7 +5,7 @@ Debug the omar TUI dashboard visually using plain Claude Code (not running insid
 ## Prerequisites
 
 - Omar running in a tmux session on an X11 display.
-- The `omar-computer` bridge available (auto-spawned by omar on Linux when `DISPLAY` is set).
+- `xdotool` and ImageMagick's `import` installed; the `computer_*` tools drive them in-process.
 - A Claude Code session in a separate terminal, with OMAR registered as an MCP server (`claude mcp add omar <path-to-omar> mcp-server`).
 
 ## Setup
@@ -16,7 +16,7 @@ Debug the omar TUI dashboard visually using plain Claude Code (not running insid
    tmux new-session -d -s omar-demo "DISPLAY=:1 omar"
    ```
 
-2. Verify the computer bridge is up via the `computer_status` MCP tool:
+2. Verify computer control is available via the `computer_status` MCP tool:
 
    ```
    computer_status({})
