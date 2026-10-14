@@ -66,7 +66,7 @@ def main():
             # Everything below reads workspaces back after their run ended,
             # which only a run asked to keep them allows.
             if args[0] == "run":
-                args = (*args, "--wait", "--keep-workspaces")
+                args = (*args, "--fg", "--keep-workspaces")
             result = omar(*args)
             assert result.returncode == 0, f"{args}: {result.stdout}\n{result.stderr}"
             return result.stdout
@@ -112,7 +112,7 @@ out = Some(cwd.display().to_string());
             # By default a run's workspaces go with it when it ends: the
             # record still names them, the directories are gone.
             gone = omar("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
-                        "--input", "right.tick=1", "--fast", "--wait")
+                        "--input", "right.tick=1", "--fast", "--fg")
             assert gone.returncode == 0, gone.stderr
             assert json.loads(run("workspace", "list")) == [], "a run kept workspaces it was not asked to keep"
             root_state = Path(runtime["directory"])
@@ -220,7 +220,7 @@ out = Some(cwd.display().to_string());
             records[0].write_text(json.dumps(replaced))
             fault(KILL_FAIL=True)
             refused = omar("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
-                           "--input", "right.tick=1", "--replace", "--fast", "--wait", timeout=60)
+                           "--input", "right.tick=1", "--replace", "--fast", "--fg", timeout=60)
             assert refused.returncode != 0 and "cannot replace deployment" in refused.stderr, refused
             assert json.loads(records[0].read_text()) == replaced, "failed cleanup retired the old run"
             fault()
@@ -244,7 +244,7 @@ out = Some(cwd.display().to_string());
             for args in [("kill", "Workspaces"),
                          ("workspace", "snapshot", legacy["workspaces"]["left"]),
                          ("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
-                          "--input", "right.tick=1", "--replace", "--fast", "--wait")]:
+                          "--input", "right.tick=1", "--replace", "--fast", "--fg")]:
                 refused = omar(*args, timeout=60)
                 assert refused.returncode != 0 and "no recorded tmux server" in refused.stderr, refused
                 assert json.loads(records[0].read_text()) == legacy

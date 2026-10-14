@@ -69,13 +69,10 @@ pub struct StartOptions {
     pub timeout_seconds: u64,
     #[arg(long)]
     pub fast: bool,
-    /// Wait for completion; disconnecting this client never stops the run.
+    /// Stay in the foreground until the run ends and print its final record.
+    /// Ctrl-C detaches; the run keeps going in its session.
     #[arg(long)]
-    pub wait: bool,
-    /// When this run creates a session, keep it after a --wait run ends
-    /// instead of removing it
-    #[arg(long)]
-    pub checkpoint: bool,
+    pub fg: bool,
     /// How often to checkpoint: `off`, `tag` (every tag), `30m` (physical
     /// time), or `logical:30m` (the tags' own time); default every physical
     /// hour. Changeable while running with `omar checkpoint configure`.
@@ -1276,6 +1273,22 @@ fn remove_session(session: &Session) -> Result<()> {
         }
     })
 }
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+extern "C" fn note_interrupt(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+/// Turn Ctrl-C into a flag the foreground loop checks, instead of the exit
+/// the default disposition would be. Blocking calls restart after it.
+fn watch_interrupt() {
+    // SAFETY: the handler only stores to an atomic, and `signal` is called
+    // once from the main thread before the loop that reads the flag.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+    }
+}
 /// The registry record once the daemon has published `stopped`.
 fn wait_stopped(session: &Session, timeout: Duration) -> Result<Session> {
     let deadline = Instant::now() + timeout;
@@ -1539,8 +1552,8 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             Ok(())
         }),
         Some(Commands::Run(options)) => (|| {
-            // No runtime selected: this run gets a session of its own, shut
-            // down again after a --wait run ends.
+            // No runtime selected: this run gets a session of its own, removed
+            // again after a foreground run ends.
             let (s, owned) = match target(cli) {
                 Ok(s) => {
                     anyhow::ensure!(cli.config.is_none() && cli.agent.is_none() && !cli.spawn_metrics,
@@ -1562,9 +1575,17 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             let body=json!({"program":program,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces});
             let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
             if owned { run["session"] = json!(s.name); }
-            // One structured result: the admission record, or with --wait the terminal record.
-            if !options.wait { return print_value(run); }
+            // One structured result: the admission record, or with --fg the terminal record.
+            if !options.fg { return print_value(run); }
+            let team = run["team"].as_str().unwrap_or("").to_string();
+            watch_interrupt();
             let state = loop {
+                // Ctrl-C ends the watching, never the run: a foreground run is
+                // still the session's, and a reflex should not lose it.
+                if INTERRUPTED.load(Ordering::SeqCst) {
+                    eprintln!("\nDetached; {team} keeps running in session {}. omar status {team} -s {} shows it, omar stop {team} -s {} stops it", s.name, s.name, s.name);
+                    return Ok(());
+                }
                 let state=rpc(&s,json!({"op":"status","ea":ea,"run":run["run_id"]}),Duration::from_secs(5))?;
                 match state["status"].as_str() {
                     Some("completed"|"stopped"|"failed"|"paused") => break state,
@@ -1575,10 +1596,9 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             if owned && state["status"] == "paused" {
                 eprintln!("Session {} keeps the paused run; omar resume -s {} {} continues it", s.name, s.name, state["team"].as_str().unwrap_or(""));
             } else if owned {
-                // A session made for one run goes with it, unless asked to stay.
+                // A session made for one run goes with it.
                 let _ = rpc(&s,json!({"op":"down","force":false}),Duration::from_secs(10));
-                let stopped = wait_stopped(&s, Duration::from_secs(30))?;
-                if !options.checkpoint { remove_session(&stopped)?; }
+                remove_session(&wait_stopped(&s, Duration::from_secs(30))?)?;
             }
             if state["status"] == "failed" { bail!("topology failed: {}", state["error"]); }
             if cli.json { return print_value(state); }

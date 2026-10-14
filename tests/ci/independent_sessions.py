@@ -174,14 +174,29 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         program.write_text('team Clock { timer tick(0, 1s) output stamp : int reaction(tick) -> stamp {= stamp = Some(1); =} }\nmain ClockRun { clock = Clock() }\n')
         once = root / "once.omar"
         once.write_text('team Once { timer tick(1ns, 0) output done : int reaction(tick) -> done {= done = Some(1); =} }\nmain OnceRun { once = Once() }\n')
-        # --wait prints exactly one structured result: the terminal record.
-        assert json.loads(cli("--json", "--session", "outer", "start", str(once), "--wait"))["status"] == "completed"
+        # --fg prints exactly one structured result: the terminal record.
+        assert json.loads(cli("--json", "--session", "outer", "start", str(once), "--fg"))["status"] == "completed"
         # Without a selected runtime, run creates a session, prints the summary, and shuts it down.
-        summary = subprocess.run([str(BIN), "run", str(once), "--wait"], cwd=root, env=env, text=True, capture_output=True, timeout=120)
+        summary = subprocess.run([str(BIN), "run", str(once), "--fg"], cwd=root, env=env, text=True, capture_output=True, timeout=120)
         assert summary.returncode == 0 and "Topology 'OnceRun' completed" in summary.stdout and "Output once.done = 1" in summary.stdout, summary
         created = re.search(r"Started session (\S+);", summary.stderr)
         assert created, summary.stderr
-        assert created.group(1) not in {s["name"] for s in json.loads(cli("ls", "--json"))}, "run --wait left its own session behind"
+        assert created.group(1) not in {s["name"] for s in json.loads(cli("ls", "--json"))}, "run --fg left its own session behind"
+        # Ctrl-C on a foreground run detaches from it; the run goes on in its session.
+        ticking = root / "ticking.omar"
+        ticking.write_text('team Ticking { timer tick(0, 1s) output stamp : int reaction(tick) -> stamp {= stamp = Some(1); =} }\nmain TickRun { t = Ticking() }\n')
+        foreground_run = subprocess.Popen([str(BIN), "--session", "outer", "run", str(ticking), "--fg"], cwd=root, env=env,
+                                          text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + 30
+        while not any(r["team"] == "TickRun" for r in json.loads(cli("--session", "outer", "runs"))):
+            assert time.monotonic() < deadline, "the foreground run was never admitted"
+            time.sleep(.2)
+        wait_status("outer", "TickRun", "running")
+        foreground_run.send_signal(signal.SIGINT)
+        out, err = foreground_run.communicate(timeout=30)
+        assert foreground_run.returncode == 0 and "Detached" in err and "omar stop TickRun -s outer" in err, (out, err)
+        assert json.loads(cli("--session", "outer", "status", "TickRun"))["status"] == "running", "Ctrl-C stopped the run"
+        cli("--session", "outer", "stop", "TickRun")
         run_a = json.loads(cli("--session", "outer", "start", str(program)))["run_id"]
         run_b = json.loads(cli("--session", "inner", "start", str(program)))["run_id"]
         wait_status("outer", run_a, "running")

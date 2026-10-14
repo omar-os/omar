@@ -150,7 +150,12 @@ Sessions work like containers: `omar down` stops one and keeps its state,
 is killed first). Add another EA inside it
 with `omar --session dev ea create --name Research --agent codex`.
 Target it with `omar --session dev --ea Research ...`; this does not change
-another client's selection.
+another client's selection. `omar run team.omar -s dev` admits a workflow and
+returns; `--fg` keeps it in the foreground until it ends and prints the final
+record, and Ctrl-C detaches without stopping it. Without a session, `run`
+creates one for the workflow and removes it again when a foreground run ends.
+Checkpointing belongs to the workflow: `--checkpoint-period` on `run`, and
+the `omar checkpoint` commands while it runs.
 
 ### Upgrading omar with sessions running
 
