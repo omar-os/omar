@@ -9,6 +9,10 @@ import tty
 
 backend, log_path = sys.argv[1:]
 log = Path(log_path)
+# A TUI that drops the first Escape, as one still wiring up its input can.
+stubborn = backend == 'codex-stubborn'
+if stubborn:
+    backend = 'codex'
 tty.setraw(sys.stdin.fileno())
 if backend == 'claude':
     dialog = ("Accessing workspace:\r\n/tmp/team/worktree\r\n"
@@ -48,6 +52,13 @@ if backend == 'claude':
     sys.stdout.flush()
 while len(data) < len(expected):
     data += os.read(sys.stdin.fileno(), 1024)
+if stubborn:
+    if data != b'\x1b':
+        raise RuntimeError(f'Wrong first choice: {data!r}')
+    # Swallow it and keep the dialog up until the retry picks Skip by number.
+    expected = b'\x1b2'
+    while len(data) < len(expected):
+        data += os.read(sys.stdin.fileno(), 1024)
 log.write_bytes(data)
 if data != expected:
     raise RuntimeError(f'Wrong choice for {backend}: {data!r}')

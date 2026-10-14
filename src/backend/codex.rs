@@ -30,9 +30,31 @@ impl Backend for Codex {
         {
             // Codex maps Escape to NotNow, exactly like plain Skip. It does
             // not persist a version dismissal or change update preferences.
+            // `2` picks Skip outright, for an Escape that never arrived.
             Some(super::StartupGate {
                 id: "update",
                 keys: &["Escape"],
+                again: &["2"],
+                confirms: true,
+            })
+        } else if screen.contains("Background server has incompatible feature settings")
+            && screen.contains("1. Run without daemon this time")
+        {
+            // Another Codex client owns the shared daemon. Restarting it would
+            // interrupt that client's work; running without it costs nothing.
+            Some(super::StartupGate {
+                id: "daemon",
+                keys: &["1"],
+                again: &["1"],
+                confirms: true,
+            })
+        } else if screen.contains("Trust this folder?") && screen.contains("1. Trust and continue")
+        {
+            // The same decision the Claude gate makes for its workspace dialog.
+            Some(super::StartupGate {
+                id: "folder-trust",
+                keys: &["1"],
+                again: &["1"],
                 confirms: true,
             })
         } else {
@@ -603,11 +625,21 @@ mod tests {
         ] {
             let screen =
                 format!("Update available · 1.0 → 2.0\n{options}\nenter continue · esc skip");
-            assert_eq!(super::Codex.startup_gate(&screen).unwrap().keys, ["Escape"]);
+            let gate = super::Codex.startup_gate(&screen).unwrap();
+            assert_eq!(gate.keys, ["Escape"]);
+            assert_eq!(gate.again, ["2"]);
         }
         assert!(super::Codex
             .startup_gate("Update available! See release notes")
             .is_none());
+        let daemon = "Background server has incompatible feature settings\n\
+                      This session requires api_key_model_discovery to be disabled\n\
+                      › 1. Run without daemon this time\n  2. Restart with these settings\n  3. Cancel";
+        assert_eq!(super::Codex.startup_gate(daemon).unwrap().id, "daemon");
+        let trust =
+            "Folder access\n/tmp\nTrust this folder? Codex can read, edit, and run files here.\n\
+                     › 1. Trust and continue\n  2. Quit\n  enter continue · esc quit";
+        assert_eq!(super::Codex.startup_gate(trust).unwrap().id, "folder-trust");
         assert!(super::Codex
             .startup_gate("OpenAI Codex\n› draft about Skip until next version")
             .is_none());

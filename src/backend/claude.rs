@@ -48,6 +48,7 @@ impl Backend for Claude {
             id: "workspace-trust",
             confirms: keys == ["Enter"],
             keys,
+            again: &[],
         })
     }
 
