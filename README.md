@@ -144,8 +144,10 @@ Shutdown the test project and its agents.
 | [Pi](https://pi.dev) | `omar -a pi up` |
 
 Each `omar -a <backend> up` starts a new independent session with EA 0.
-Add `--name dev` to name it, `--tui` or `--web` to attach at once, and
-`--checkpoint` to keep its state after `omar down` (otherwise nothing is left). Add another EA inside it
+Add `--name dev` to name it, and `--tui` or `--web` to attach at once.
+Sessions work like containers: `omar down` stops one and keeps its state,
+`omar up --name dev` starts it again, and `omar rm` removes it (a running one
+is killed first). Add another EA inside it
 with `omar --session dev ea create --name Research --agent codex`.
 Target it with `omar --session dev --ea Research ...`; this does not change
 another client's selection.
@@ -166,11 +168,9 @@ omar resume Ticker -s dev         # continues from the checkpoint; the run keeps
 ```
 
 `omar ls` shows each session's workflows (`1 running, 1 paused`), for stopped
-sessions too. A session that stops with paused workflows keeps its state
-whether or not it was started with `--checkpoint`; one with nothing to keep
-leaves nothing behind, and `omar rm` removes a kept one. `omar up --name` on
-a stopped session reports the build it moved to and the paused workflows
-waiting for `omar resume`; nothing resumes on its own. A forced stop (`down
+sessions too. `omar up --name` on a stopped session reports the build it
+moved to and the paused workflows waiting for `omar resume`; nothing resumes
+on its own. A forced stop (`down
 --force`, a crash) leaves a workflow interrupted mid-run: the restart pauses
 it at its last checkpoint, and the tags since are lost. Other sessions are
 never touched.

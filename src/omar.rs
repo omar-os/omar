@@ -141,13 +141,9 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         tail: usize,
     },
-    /// Remove a stopped session's record and state
-    Rm {
-        /// Take a running session down first, like `docker rm -f`
-        #[arg(long)]
-        force: bool,
-    },
-    /// Shut down one runtime: running workflows pause at their next tag boundary, and a session with paused workflows keeps its state so `up --name` restarts it
+    /// Remove a session and everything it kept; a running one is killed first
+    Rm,
+    /// Stop one runtime: running workflows pause at their next tag boundary, and the stopped session keeps its state until `rm`, so `up --name` restarts it
     Down {
         #[arg(long)]
         force: bool,
@@ -325,9 +321,6 @@ enum Commands {
         /// Insist on the bundled Mission Control, served from this same address
         #[arg(long)]
         ui: bool,
-        /// Keep the session's state after it stops
-        #[arg(long)]
-        checkpoint: bool,
     },
 }
 
@@ -503,7 +496,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Attach { .. }
             | Commands::Logs { .. }
             | Commands::Down { .. }
-            | Commands::Rm { .. }
+            | Commands::Rm
             | Commands::Run(_)
             | Commands::Runs { .. }
             | Commands::Pause { .. }

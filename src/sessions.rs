@@ -44,11 +44,6 @@ pub struct UpOptions {
     /// Attach the terminal dashboard once the runtime is ready
     #[arg(long)]
     pub tui: bool,
-    /// Keep the session's state after it stops, so `ls` still lists it and
-    /// its logs, chats and workspaces can be inspected. Without this a
-    /// stopped session leaves nothing behind.
-    #[arg(long)]
-    pub checkpoint: bool,
 }
 impl Default for UpOptions {
     fn default() -> Self {
@@ -60,7 +55,6 @@ impl Default for UpOptions {
             startup_timeout: 60,
             web: false,
             tui: false,
-            checkpoint: false,
         }
     }
 }
@@ -78,7 +72,8 @@ pub struct StartOptions {
     /// Wait for completion; disconnecting this client never stops the run.
     #[arg(long)]
     pub wait: bool,
-    /// When this run creates a session, keep its state after it stops
+    /// When this run creates a session, keep it after a --wait run ends
+    /// instead of removing it
     #[arg(long)]
     pub checkpoint: bool,
     /// How often to checkpoint: `off`, `tag` (every tag), `30m` (physical
@@ -136,9 +131,6 @@ struct Launch {
     session: Session,
     address: SocketAddr,
     no_ea: bool,
-    /// Keep the state directory and registry record after shutdown.
-    #[serde(default)]
-    checkpoint: bool,
     /// Foreground startup prints the session record in the requested mode.
     #[serde(default)]
     json: bool,
@@ -233,7 +225,7 @@ pub fn discover() -> Result<Vec<Session>> {
         if path.extension().is_none_or(|s| s != "json") {
             continue;
         }
-        // A session without a checkpoint removes its record as it stops.
+        // `omar rm` can take a record away between the listing and the read.
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -628,7 +620,6 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
                     Some(&source),
                     compiler.as_deref(),
                     address,
-                    options.checkpoint,
                     options.startup_timeout,
                 )
                 .map(|started| (started, Some(stopped.clone())));
@@ -709,7 +700,6 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
             session: session.clone(),
             address: options.address,
             no_ea: options.no_ea,
-            checkpoint: options.checkpoint,
             json: foreground && cli.json,
         },
     )?;
@@ -834,7 +824,6 @@ fn relaunch(
     executable: Option<&Path>,
     compiler: Option<&Path>,
     address: Option<SocketAddr>,
-    checkpoint: bool,
     startup_timeout: u64,
 ) -> Result<Session> {
     let lock = RegistryLock::acquire()?;
@@ -896,7 +885,6 @@ fn relaunch(
             .parse()
             .unwrap_or(launch.address),
     };
-    launch.checkpoint |= checkpoint;
     launch.json = false;
     write_json(&directory.join("launch.json"), &launch)?;
     let config = Config::load(directory.join("config.toml").to_str())?;
@@ -1262,22 +1250,31 @@ async fn daemon(directory: &Path) -> Result<()> {
         }
     }
     scheduler_task.abort();
-    // Runs that are paused, or were cut off by a forced shutdown, are worth
-    // keeping: `omar up --name` starts the session again with them in place.
-    let keep = launch.checkpoint || server.session_holds_runs();
     for bridge in &mut bridges {
         crate::kill_child_gracefully(bridge, Duration::from_secs(3));
     }
     cleanup.cleanup();
     let mut session = session.lock().unwrap();
+    // Stopped is a state, not an ending: like a container, the session keeps
+    // its record, logs, chats and workflows until `omar rm`, and `omar up
+    // --name` starts it again with them in place.
     session.state = "stopped".into();
     publish(&session)?;
-    if !keep {
-        // Like a tmux session: once it is over, nothing is left to list.
-        let _ = fs::remove_file(registry().join(format!("{}.json", session.name)));
-        let _ = fs::remove_dir_all(directory);
-    }
     Ok(())
+}
+/// Remove a stopped session: its tmux server, record and state directory.
+fn remove_session(session: &Session) -> Result<()> {
+    let _ = Command::new("tmux")
+        .args(["-L", &session.tmux_server, "kill-server"])
+        .output();
+    let _ = fs::remove_file(registry().join(format!("{}.json", session.name)));
+    fs::remove_dir_all(&session.directory).or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error.into())
+        }
+    })
 }
 /// The registry record once the daemon has published `stopped`.
 fn wait_stopped(session: &Session, timeout: Duration) -> Result<Session> {
@@ -1285,7 +1282,7 @@ fn wait_stopped(session: &Session, timeout: Duration) -> Result<Session> {
     loop {
         let saved: Session = match fs::read(registry().join(format!("{}.json", session.name))) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
-            // Gone: a session without a checkpoint removed itself on shutdown.
+            // Gone: `omar rm` removed it while this waited.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut gone = session.clone();
                 gone.state = "stopped".into();
@@ -1479,10 +1476,10 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         return Some(attach_dashboard().await);
     }
     let result = match &cli.command {
-        Some(Commands::Serve { name, address, no_ea, ui, checkpoint }) => {
+        Some(Commands::Serve { name, address, no_ea, ui }) => {
             // The runtime serves Mission Control whenever the build has it; `--ui` insists on it.
             if *ui && !crate::web_assets::is_bundled() { return Some(Err(anyhow::anyhow!("{}", crate::web_assets::MISSING))); }
-            launch(cli, UpOptions { name: name.clone(), address: address.unwrap_or_else(|| UpOptions::default().address), no_ea: *no_ea, checkpoint: *checkpoint, ..UpOptions::default() }, true).map(|_| ())
+            launch(cli, UpOptions { name: name.clone(), address: address.unwrap_or_else(|| UpOptions::default().address), no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
         },
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
         None => Err(anyhow::anyhow!("a command is required; see omar --help")),
@@ -1520,29 +1517,25 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             if *follow { command.arg("-f"); }
             anyhow::ensure!(command.arg(s.directory.join("logs/runtime.log")).status()?.success(),"reading logs failed"); Ok(())
         }),
-        Some(Commands::Rm { force }) => target(cli).and_then(|s| {
+        Some(Commands::Rm) => target(cli).and_then(|s| {
+            // The destructive command: a running session is killed, not
+            // paused, since nothing of it is kept.
             if !matches!(s.state.as_str(), "stopped" | "failed" | "stale") {
-                // A running session is only removed on request, and then it
-                // goes down the forced way: its work is not waited for.
-                anyhow::ensure!(*force, "session '{}' is {}; omar down -s {} first, or rm --force", s.name, s.state, s.name);
                 rpc(&s, json!({"op":"down","force":true}), Duration::from_secs(10))?;
                 wait_stopped(&s, Duration::from_secs(30))?;
             }
-            let _ = Command::new("tmux").args(["-L", &s.tmux_server, "kill-server"]).output();
-            let _ = fs::remove_file(registry().join(format!("{}.json", s.name)));
-            fs::remove_dir_all(&s.directory).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })?;
+            remove_session(&s)?;
             if cli.json { print_value(json!({"name": s.name, "removed": true})) } else { println!("Removed session {}", s.name); Ok(()) }
         }),
         Some(Commands::Down { force, timeout }) => target(cli).and_then(|s| {
             if s.state == "stopped" { return Ok(()); }
             rpc(&s,json!({"op":"down","force":force}),Duration::from_secs(10))?;
             let saved = wait_stopped(&s, Duration::from_secs(*timeout))?;
-            let kept = registry().join(format!("{}.json", s.name)).exists();
-            let runs = if kept { crate::serve::stored_runs(&saved.directory) } else { Vec::new() };
-            if cli.json { let mut v = json!(saved); v["kept"] = json!(kept); v["runs"] = json!(runs); return print_value(v); }
+            let runs = crate::serve::stored_runs(&saved.directory);
+            if cli.json { let mut v = json!(saved); v["runs"] = json!(runs); return print_value(v); }
             let summary = runs_summary(&saved, &runs);
-            if kept && summary != "-" { println!("Stopped session {}; {summary} workflow(s) kept. omar up --name {} restarts it", s.name, s.name); }
-            else { println!("Stopped session {}", s.name); }
+            let kept = if summary == "-" { String::new() } else { format!(" {summary} workflow(s) kept.") };
+            println!("Stopped session {};{kept} omar up --name {} restarts it, omar rm -s {} removes it", s.name, s.name, s.name);
             Ok(())
         }),
         Some(Commands::Run(options)) => (|| {
@@ -1555,7 +1548,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
                     (s, false)
                 }
                 Err(_) if cli.session.is_none() && std::env::var_os("OMAR_SESSION_ID").is_none() => {
-                    let (s, _) = launch(cli, UpOptions { no_ea: true, checkpoint: options.checkpoint, ..UpOptions::default() }, false)?;
+                    let (s, _) = launch(cli, UpOptions { no_ea: true, ..UpOptions::default() }, false)?;
                     if !cli.json { eprintln!("Started session {}; omar down -s {} stops it", s.name, s.name); }
                     (s, true)
                 }
@@ -1582,8 +1575,10 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             if owned && state["status"] == "paused" {
                 eprintln!("Session {} keeps the paused run; omar resume -s {} {} continues it", s.name, s.name, state["team"].as_str().unwrap_or(""));
             } else if owned {
+                // A session made for one run goes with it, unless asked to stay.
                 let _ = rpc(&s,json!({"op":"down","force":false}),Duration::from_secs(10));
-                let _ = wait_stopped(&s, Duration::from_secs(30));
+                let stopped = wait_stopped(&s, Duration::from_secs(30))?;
+                if !options.checkpoint { remove_session(&stopped)?; }
             }
             if state["status"] == "failed" { bail!("topology failed: {}", state["error"]); }
             if cli.json { return print_value(state); }

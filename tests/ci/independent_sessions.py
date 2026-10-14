@@ -38,8 +38,8 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         assert (result.returncode == 0) == ok, (args, result.stdout, result.stderr)
         return result.stdout if ok else result.stderr
 
-    def up(name, context=None, checkpoint=False):
-        result = json.loads(cli("up", "--name", name, "--no-ea", "--json", *(["--checkpoint"] if checkpoint else []), context=context))
+    def up(name, context=None):
+        result = json.loads(cli("up", "--name", name, "--no-ea", "--json", context=context))
         sessions.append(result)
         assert result["state"] == "ready"
         assert hashlib.sha256(Path(result["executable"]).read_bytes()).hexdigest() == result["build_id"]
@@ -115,18 +115,17 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
                                   env=env, text=True, capture_output=True, timeout=90), range(2)))
         assert sorted(p.returncode == 0 for p in results) == [False, True]
         sessions.append(json.loads(next(p.stdout for p in results if p.returncode == 0)))
-        cli("down", "-s", "race")
-        # Without --checkpoint a stopped session is gone, like a tmux session.
-        assert "race" not in {s["name"] for s in json.loads(cli("ls", "--json"))}
-        kept = up("kept", checkpoint=True)
-        cli("down", "-s", "kept")
-        assert info("kept")["session"]["state"] == "stopped" and Path(kept["directory"]).is_dir()
-        # rm frees a stopped session's name; on a running one only --force does, taking it down first.
-        cli("rm", "-s", "kept")
-        assert not Path(kept["directory"]).exists() and "kept" not in {s["name"] for s in json.loads(cli("ls", "--json"))}
-        doomed = up("doomed", checkpoint=True)
-        assert "rm --force" in cli("rm", "-s", "doomed", ok=False)
-        cli("rm", "-s", "doomed", "--force")
+        race = next(s for s in sessions if s["name"] == "race")
+        text = cli("down", "-s", "race")
+        # Like a container: down stops a session and keeps it; only rm removes it.
+        assert "omar rm -s race removes it" in text, text
+        assert info("race")["session"]["state"] == "stopped" and Path(race["directory"]).is_dir()
+        assert "race" in {s["name"] for s in json.loads(cli("ls", "--json"))}
+        cli("rm", "-s", "race")
+        assert not Path(race["directory"]).exists() and "race" not in {s["name"] for s in json.loads(cli("ls", "--json"))}
+        # rm on a running session kills it first, no flag needed.
+        doomed = up("doomed")
+        cli("rm", "-s", "doomed")
         assert not Path(doomed["directory"]).exists() and "doomed" not in {s["name"] for s in json.loads(cli("ls", "--json"))}
         sessions.remove(doomed)
         # Foreground serve honours --json for its startup record.

@@ -6,7 +6,7 @@ The operator pauses what they want kept (`omar down` pauses the rest), the
 new build restarts the session by name at the same URL, and `omar resume`
 continues each workflow from its checkpoint. A second build of omar (the
 same binary with bytes appended, so its build id differs) stands in for the
-upgrade. A session with nothing to keep still leaves nothing behind; one
+upgrade. A stopped session stays listed until `omar rm`, like a container; one
 whose runtime was killed mid-run comes back paused at its last checkpoint; a
 build that cannot start leaves the session restartable on a build that can.
 """
@@ -194,11 +194,11 @@ def main():
             refused("alpha", "upgrade")
 
             # 1. `omar down` pauses the workflow still running at its next tag
-            #    boundary and keeps the session's state, --checkpoint or not.
+            #    boundary; the stopped session keeps its state, like a container.
             lines_before = log_lines(worktree("alpha", "Ticker", "w"))
             paused_tree = worktree("alpha", "Ticker", "w")
             text = omar("alpha", "down")
-            assert "2 paused workflow(s) kept" in text and "omar up --name alpha" in text, text
+            assert "2 paused workflow(s) kept" in text and "omar up --name alpha" in text and "omar rm -s alpha" in text, text
             stopped = ls()["alpha"]
             assert stopped["state"] == "stopped", stopped
             assert listed_runs("alpha") == {"Ticker": "paused", "Sleeper": "paused"}, stopped
@@ -254,12 +254,15 @@ def main():
             assert status("beta", "Ticker")["status"] == "running"
             assert all(event["state"] != "PAUSING" for event in record("beta", "Ticker")["history"]), record("beta", "Ticker")
 
-            # 4. A session with nothing to keep leaves nothing behind, as before:
-            #    beta's workflow is stopped for good, then the session goes.
+            # 4. A stopped session stays listed even with no workflows left;
+            #    only `rm` removes it, and `rm` kills a running one.
             omar("beta", "stop", "Ticker")
             wait_until(lambda: status("beta", "Ticker")["status"] == "stopped", "beta's ticker to stop")
             text = omar("beta", "down")
-            assert "kept" not in text, text
+            assert "kept" not in text and "omar rm -s beta removes it" in text, text
+            assert ls()["beta"]["state"] == "stopped" and Path(beta["directory"]).is_dir()
+            assert any(l.startswith("beta") and "stopped" in l and " - " in l for l in ls_text().splitlines()), ls_text()
+            omar("beta", "rm")
             assert "beta" not in ls(), ls()
             assert not Path(beta["directory"]).exists()
             del sessions["beta"]
@@ -316,7 +319,7 @@ def main():
             assert json.loads(omar("gamma", "resume", "Sleeper"))["status"] == "running"
             print("PASS: down pauses running workflows and keeps the session; a new build restarts it by name at the same URL "
                   "listing the paused workflows; resume continues each from its checkpoint; other sessions untouched; "
-                  "a session with nothing to keep leaves nothing; a forced stop comes back paused at the last checkpoint; "
+                  "a stopped session stays until rm; a forced stop comes back paused at the last checkpoint; "
                   "a build that cannot start leaves the session restartable")
           except Exception:
             for name, record_ in sessions.items():

@@ -615,17 +615,6 @@ impl Serve {
         Ok(())
     }
 
-    /// Whether any run still holds its team: active, or paused and waiting
-    /// to be resumed. A session with such runs keeps its state when it stops.
-    pub(crate) fn session_holds_runs(&self) -> bool {
-        self.session_runs(None).iter().any(|r| {
-            matches!(
-                r["status"].as_str(),
-                Some("starting" | "running" | "stopping" | "pausing" | "paused")
-            )
-        })
-    }
-
     pub(crate) fn session_has_work(&self) -> bool {
         self.session_runs(None).iter().any(|r| {
             matches!(
