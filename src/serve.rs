@@ -942,6 +942,41 @@ fn workspace_request(
     if method == "GET" && path == "/v1/workspaces" {
         return Ok(json!({"workspaces": crate::workspace::list(root, context.ea_id)?}));
     }
+    if method == "POST" && path == "/v1/workspaces/workflow" {
+        let _operation = context
+            .chat_operation
+            .lock()
+            .expect("chat operation poisoned");
+        let request: CheckRequest = serde_json::from_slice(body)?;
+        let key = format!(
+            "workflow:{}",
+            crate::checkpoint::sha256(&serde_json::to_vec(
+                &json!({"program": request.program, "files": request.files})
+            )?)
+        );
+        if let Some(ws) = crate::workspace::list(root, context.ea_id)?
+            .into_iter()
+            .find(|ws| ws.deployment_id == key)
+        {
+            return Ok(json!({"workspace": ws}));
+        }
+        let staged = stage_program(&request.program, None, &request.files)
+            .map_err(|(_, error)| anyhow::anyhow!("{error}"))?;
+        let ws = crate::workspace::Workspace::create(root, context.ea_id, &key, "Workflow", None)?;
+        let result = (|| -> Result<()> {
+            fs::write(ws.worktree(root).join("program.omar"), &request.program)?;
+            stage_files(&ws.worktree(root), "program.omar", &request.files)
+                .map_err(anyhow::Error::msg)?;
+            ws.snapshot(root, "Workflow files")?;
+            Ok(())
+        })();
+        let _ = staged.finish(Ok(()));
+        if let Err(error) = result {
+            let _ = ws.remove(root);
+            return Err(error);
+        }
+        return Ok(json!({"workspace": ws}));
+    }
     let rest = path
         .strip_prefix("/v1/workspaces/")
         .context("unknown workspace route")?;
@@ -951,6 +986,66 @@ fn workspace_request(
         ws.ea_id == context.ea_id,
         "workspace belongs to another chat"
     );
+    if method == "GET" && action == "workflow" {
+        anyhow::ensure!(
+            ws.deployment_id.starts_with("workflow:"),
+            "not a workflow workspace"
+        );
+        let mut files = BTreeMap::new();
+        let mut pending = vec![String::new()];
+        let mut bytes = 0usize;
+        let mut entries_seen = 0usize;
+        while let Some(path) = pending.pop() {
+            let listing = crate::artifacts::browse(
+                &ws,
+                root,
+                &crate::artifacts::Selection {
+                    path: path.clone(),
+                    snapshot: None,
+                },
+            )?;
+            anyhow::ensure!(listing["truncated"] != true, "too many workflow files");
+            for entry in listing["entries"].as_array().context("invalid listing")? {
+                let name = entry["name"].as_str().context("invalid file name")?;
+                let file = if path.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{path}/{name}")
+                };
+                entries_seen += 1;
+                anyhow::ensure!(entries_seen <= 2000, "too many workflow files");
+                match entry["kind"].as_str() {
+                    Some("directory") => pending.push(file),
+                    Some("file") => {
+                        let preview = crate::artifacts::preview(
+                            &ws,
+                            root,
+                            &crate::artifacts::Selection {
+                                path: file.clone(),
+                                snapshot: None,
+                            },
+                        )?;
+                        anyhow::ensure!(
+                            preview["kind"] == "text",
+                            "workflow file {file} must be text under 512 KiB"
+                        );
+                        let text = preview["text"]
+                            .as_str()
+                            .context("invalid file contents")?
+                            .to_string();
+                        bytes += text.len();
+                        anyhow::ensure!(bytes <= 4 * 1024 * 1024, "workflow exceeds 4 MiB");
+                        files.insert(file, text);
+                    }
+                    _ => bail!("workflow contains unsupported file {file}"),
+                }
+            }
+        }
+        let program = files
+            .remove("program.omar")
+            .context("program.omar is missing")?;
+        return Ok(json!({"program": program, "files": files}));
+    }
     if method == "GET" && action.is_empty() {
         return Ok(
             json!({"workspace":ws, "worktree":ws.worktree(root), "snapshots":ws.snapshots(root)?}),
@@ -2521,9 +2616,11 @@ fn stage_files(
         let path = Path::new(relative);
         let inside = !relative.is_empty()
             && !relative.contains('\\')
-            && path
-                .components()
-                .all(|part| matches!(part, Component::Normal(_) | Component::CurDir));
+            && path.components().all(|part| match part {
+                Component::Normal(name) => !name.to_string_lossy().eq_ignore_ascii_case(".git"),
+                Component::CurDir => true,
+                _ => false,
+            });
         if !inside {
             return Err(format!(
                 "'{relative}' is not a file a program can import: \
@@ -3807,6 +3904,59 @@ mod tests {
             0,
         )
         .expect("server starts")
+    }
+
+    #[test]
+    fn workflow_editor_workspace_preserves_edits_and_imports_saved_files() {
+        let server = test_server();
+        let body = json!({"program": "main Review {}", "files": {"schemas/decision.json": "{\"type\":\"string\"}"}});
+        let create = || {
+            workspace_request(
+                &server.workspaces,
+                &server.context,
+                "POST",
+                "/v1/workspaces/workflow",
+                &serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap()
+        };
+        let created = create();
+        let id = created["workspace"]["id"].as_str().unwrap();
+        let ws = crate::workspace::Workspace::load(&server.context.omar_dir, id).unwrap();
+        let tree = ws.worktree(&server.context.omar_dir);
+        assert_eq!(
+            fs::read_to_string(tree.join("schemas/decision.json")).unwrap(),
+            "{\"type\":\"string\"}"
+        );
+        fs::write(tree.join("program.omar"), "main Edited {}").unwrap();
+        fs::write(tree.join("extra.json"), "{}").unwrap();
+        assert_eq!(
+            create()["workspace"]["id"],
+            id,
+            "reopening must keep saved edits"
+        );
+        let route = format!("/v1/workspaces/{id}/workflow");
+        let imported =
+            workspace_request(&server.workspaces, &server.context, "GET", &route, &[]).unwrap();
+        assert_eq!(imported["program"], "main Edited {}");
+        assert_eq!(imported["files"]["extra.json"], "{}");
+        assert_eq!(
+            imported["files"]["schemas/decision.json"],
+            body["files"]["schemas/decision.json"]
+        );
+        let malicious = json!({"program": "main Review {}", "files": {"../escape": "bad"}});
+        assert!(workspace_request(
+            &server.workspaces,
+            &server.context,
+            "POST",
+            "/v1/workspaces/workflow",
+            &serde_json::to_vec(&malicious).unwrap()
+        )
+        .is_err());
+        std::os::unix::fs::symlink("/etc/passwd", tree.join("link")).unwrap();
+        assert!(
+            workspace_request(&server.workspaces, &server.context, "GET", &route, &[]).is_err()
+        );
     }
 
     #[test]

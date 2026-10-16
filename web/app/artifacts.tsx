@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { normalizeRuntimeUrl } from "./lib/runtime-client";
 
 type Workspace = { id: string; instance: string; deployment_id: string; restored_from: [string, string] | null };
@@ -24,7 +24,11 @@ function Content({ preview }: { preview: Preview }) {
   return <p>{preview.size.toLocaleString()} bytes · {preview.kind === "large" ? "Too large for the 512 KiB preview limit." : "Binary file."} Open the worktree in the editor to inspect it.</p>;
 }
 
-export function Artifacts({ serveUrl, runId, proposal, onClose }: { serveUrl: string; runId: string | null; proposal?: { program: string; files?: Record<string, string> } | null; onClose: () => void }) {
+export function Artifacts({ serveUrl, runId, proposal, onWorkflowChange, onClose }: { serveUrl: string; runId: string | null; proposal?: { program: string; files?: Record<string, string> } | null; onWorkflowChange?: (workflow: {program: string; files: Record<string, string>}) => void; onClose: () => void }) {
+  const tabsId = useId();
+  const [workflowWorkspace, setWorkflowWorkspace] = useState("");
+  const [workflowEditorUrl, setWorkflowEditorUrl] = useState("");
+  const [workflowError, setWorkflowError] = useState("");
   const [viewProposal, setViewProposal] = useState(Boolean(proposal && !runId));
   const [proposalFile, setProposalFile] = useState("program.omar");
   const proposalFiles: Record<string, string> = { "program.omar": proposal?.program ?? "", ...proposal?.files };
@@ -118,6 +122,30 @@ export function Artifacts({ serveUrl, runId, proposal, onClose }: { serveUrl: st
     } catch (e) { tab?.close(); if (alive.current) setError((e as Error).message); }
     finally { if (alive.current) setBusy(false); }
   }
+  async function openWorkflowEditor() {
+    if (!proposal) return;
+    const tab = window.open("about:blank", "_blank");
+    if (tab) tab.opener = null;
+    setBusy(true); setWorkflowError("");
+    try {
+      const workspace = workflowWorkspace ? {id: workflowWorkspace} : (await request<{workspace: Workspace}>(serveUrl, "/workflow", proposal)).workspace;
+      if (!alive.current) { tab?.close(); return; }
+      setWorkflowWorkspace(workspace.id);
+      const {url} = await request<{url: string}>(serveUrl, `/${workspace.id}/editor`, {});
+      if (!alive.current) { tab?.close(); return; }
+      setWorkflowEditorUrl(url);
+      if (tab) tab.location.replace(url);
+    } catch (error) { tab?.close(); if (alive.current) setWorkflowError((error as Error).message); }
+    finally { if (alive.current) setBusy(false); }
+  }
+  async function applyWorkflowEdits() {
+    setBusy(true); setWorkflowError("");
+    try {
+      const workflow = await request<{program: string; files: Record<string, string>}>(serveUrl, `/${workflowWorkspace}/workflow`);
+      if (alive.current) onWorkflowChange?.(workflow);
+    } catch (error) { if (alive.current) setWorkflowError((error as Error).message); }
+    finally { if (alive.current) setBusy(false); }
+  }
   async function restore() {
     setBusy(true); setError("");
     try {
@@ -134,11 +162,32 @@ export function Artifacts({ serveUrl, runId, proposal, onClose }: { serveUrl: st
     if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) onClose();
   }}>
     <header><div><span className="eyebrow">PROGRAM & TEAM FILES</span><h2 id="artifacts-title">Files & versions</h2></div><button className="secondary-button" onClick={onClose} aria-label="Close files">Close</button></header>
-    {proposal ? <div className="artifact-controls"><button className="secondary-button" aria-pressed={viewProposal} onClick={() => setViewProposal(true)}>Proposed program</button><button className="secondary-button" aria-pressed={!viewProposal} onClick={() => setViewProposal(false)}>Run workspaces & versions</button></div> : null}
-    {viewProposal && proposal ? <div className="artifact-body">
-      <nav aria-label="Proposed program files">{Object.keys(proposalFiles).sort().map((path) => <button key={path} aria-current={proposalFile === path ? "true" : undefined} onClick={() => setProposalFile(path)}>{path}</button>)}</nav>
+    {proposal ? <div className="artifact-tabs" role="tablist" aria-label="File views">
+      {[true, false].map((workflow) => <button key={String(workflow)} type="button" role="tab" id={`${tabsId}-${workflow ? "workflow" : "run"}-tab`} aria-controls={`${tabsId}-${workflow ? "workflow" : "run"}-panel`} aria-selected={viewProposal === workflow} tabIndex={viewProposal === workflow ? 0 : -1} onClick={() => setViewProposal(workflow)} onKeyDown={(event) => {
+        if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+          event.preventDefault();
+          const next = event.key === "Home" ? true : event.key === "End" ? false : !workflow;
+          setViewProposal(next);
+          document.getElementById(`${tabsId}-${next ? "workflow" : "run"}-tab`)?.focus();
+        }
+      }}>{workflow ? "Workflow" : "Run workspaces & versions"}</button>)}
+    </div> : null}
+    <div role="tabpanel" id={`${tabsId}-${viewProposal ? "workflow" : "run"}-panel`} aria-labelledby={proposal ? `${tabsId}-${viewProposal ? "workflow" : "run"}-tab` : undefined}>
+    {viewProposal && proposal ? <>
+      <div className="artifact-controls workflow-editor-controls">
+        <button className="primary-button" disabled={busy} onClick={() => void openWorkflowEditor()}>{busy ? "Working…" : "Open in Web VS Code"}</button>
+        {workflowWorkspace && onWorkflowChange ? <button className="secondary-button" disabled={busy} onClick={() => void applyWorkflowEdits()}>Apply saved changes</button> : null}
+        {workflowEditorUrl ? <><a href={workflowEditorUrl} target="_blank" rel="noreferrer">Reopen editor ↗</a><button className="artifact-link" disabled={busy} onClick={() => {
+          setBusy(true); setWorkflowError("");
+          void request(serveUrl, `/${workflowWorkspace}/editor/stop`, {}).then(() => { if (alive.current) setWorkflowEditorUrl(""); }).catch((error) => { if (alive.current) setWorkflowError(error.message); }).finally(() => { if (alive.current) setBusy(false); });
+        }}>Stop editor</button></> : null}
+      </div>
+      <p className="artifact-guidance">Save your files in VS Code, then apply saved changes to update the workflow for validation and deployment.</p>
+      {workflowError ? <p className="connection-error" role="alert">{workflowError}</p> : null}
+      <div className="artifact-body">
+      <nav aria-label="Workflow files">{Object.keys(proposalFiles).sort().map((path) => <button key={path} aria-current={proposalFile === path ? "true" : undefined} onClick={() => setProposalFile(path)}>{path}</button>)}</nav>
       <section aria-label="File preview" className="artifact-preview"><strong>{proposalFile}</strong><Content preview={{kind: "text", text: proposalFiles[proposalFile], size: (proposalFiles[proposalFile] ?? "").length}} /></section>
-    </div> : <>
+    </div></> : <>
     <div className="artifact-controls">
       <label>Team instance<select aria-label="Team workspace" disabled={busy} value={selected} onChange={(e) => selectWorkspace(e.target.value)}>
         {workspaces.map((w) => <option key={w.id} value={w.id}>{w.instance || "Root team"} · {w.id.slice(0, 8)}{w.restored_from ? " · restored" : ""}</option>)}
@@ -173,5 +222,6 @@ export function Artifacts({ serveUrl, runId, proposal, onClose }: { serveUrl: st
       </section>
     </div>}
     </>}
+    </div>
   </dialog>;
 }
