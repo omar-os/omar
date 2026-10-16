@@ -484,6 +484,16 @@ impl TmuxClient {
             .unwrap_or_default();
         let mut answered_gate = self.startup_state(session, "@omar_startup_answered");
         loop {
+            if backend.startup_ready(self.session_delivery(session).as_deref())? {
+                self.run(&[
+                    "set-option",
+                    "-u",
+                    "-t",
+                    exact_session_target(session).trim_start_matches('='),
+                    SESSION_STARTUP_VAR,
+                ])?;
+                return Ok(());
+            }
             // Current viewport only: scrollback may contain old dialogs.
             let screen = self.run(&["capture-pane", "-p", "-t", &target])?;
             use std::hash::{Hash, Hasher};

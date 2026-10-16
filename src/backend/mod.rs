@@ -213,6 +213,11 @@ pub trait Backend: Send + Sync {
     fn readiness_markers(&self) -> &'static [&'static str] {
         &[]
     }
+    /// Read-only protocol proof that startup has completed. Check before
+    /// interpreting terminal output, which may now be conversation text.
+    fn startup_ready(&self, _stamp: Option<&str>) -> Result<bool> {
+        Ok(false)
+    }
     /// How a caller learns that a launched pane can take work. A launch under
     /// OMAR's protocol runner has no banner: the runner's socket is the proof,
     /// and delivery waits on it. Otherwise the backend's banner, or nothing

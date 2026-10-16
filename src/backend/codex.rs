@@ -137,6 +137,22 @@ impl Backend for Codex {
         Ok(setup)
     }
 
+    fn startup_ready(&self, stamp: Option<&str>) -> Result<bool> {
+        let Some(socket) = stamp.and_then(from_stamp) else {
+            return Ok(false);
+        };
+        // A socket or initialize response alone does not prove that the TUI
+        // has passed its startup dialogs and loaded a conversation.
+        let Ok(mut session) = CodexSession::open(&socket) else {
+            return Ok(false);
+        };
+        match session.only_thread() {
+            Ok(_) => Ok(true),
+            Err(error) if error.is::<NotReady>() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn provision(&self, _session: &str, command: &str) -> Result<Option<String>> {
         if let Some(stamp) = managed::stamp(command) {
             return Ok(Some(stamp));
@@ -831,6 +847,35 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn startup_protocol_proof_requires_one_loaded_thread_and_never_sends_a_turn() {
+        for threads in [vec![], vec!["one"], vec!["one", "two"]] {
+            let dir = short_tempdir();
+            let socket = dir.path().join("app.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let count = threads.len();
+            let server = std::thread::spawn(move || fake_app_server(listener, threads));
+            let result = Codex.startup_ready(Some(&format!("codex:{}", socket.display())));
+            match count {
+                0 => assert!(!result.unwrap()),
+                1 => assert!(result.unwrap()),
+                _ => assert!(result.is_err()),
+            }
+            let methods: Vec<String> = server
+                .join()
+                .unwrap()
+                .iter()
+                .map(|body| {
+                    let request: serde_json::Value = serde_json::from_str(body).unwrap();
+                    request["method"].as_str().unwrap().to_owned()
+                })
+                .collect();
+            assert_eq!(methods, ["initialize", "initialized", "thread/loaded/list"]);
+        }
+        assert!(!Codex.startup_ready(None).unwrap());
+        assert!(!Codex.startup_ready(Some("spool:legacy")).unwrap());
     }
 
     #[test]

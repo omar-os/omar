@@ -16,8 +16,10 @@ if args[0] == 'show-environment':
         sys.exit(1)
     print(args[-1] + '=' + value)
 elif args[0] == 'show-options':
-    # An existing pane has no pending startup handshake.
-    sys.exit(0)
+    print(state.get('options', {}).get(args[-1], ''))
+elif args[0] == 'set-option' and '-u' in args:
+    state.setdefault('options', {}).pop(args[-1], None)
+    path.write_text(json.dumps(state))
 elif args[0] == 'display-message' and args[-1] == '#{pane_pid}':
     print(1)
 else:
