@@ -110,7 +110,11 @@ timers: Array<DiagramTimer>, reactions: Array<DiagramReaction>, edges: Array<Dia
 
 export type DiagramEvent = { protocol_version: number, sequence: number, team: string, tag: DiagramTag | null, kind: DiagramEventKind, payload: Record<string, unknown>, };
 
-export type ProposedDesign = { program: string, inputs: Record<string, unknown>, 
+export type ProposedDesign = { program: string, 
+/**
+ * Companion files relative to program.omar.
+ */
+files?: Record<string, string>, inputs: Record<string, unknown>, 
 /**
  * The compiled topology, so the operator sees what they are approving
  * before any run exists.

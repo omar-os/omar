@@ -238,6 +238,10 @@ pub struct ChatMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct ProposedDesign {
     pub program: String,
+    /// Companion files relative to program.omar.
+    #[serde(default)]
+    #[ts(optional, type = "Record<string, string>")]
+    pub files: BTreeMap<String, String>,
     #[serde(default)]
     #[ts(type = "Record<string, unknown>")]
     pub inputs: BTreeMap<String, Value>,
@@ -258,6 +262,8 @@ struct AgentReply {
 struct AgentProposal {
     token: String,
     program: String,
+    #[serde(default)]
+    files: BTreeMap<String, String>,
     summary: String,
     #[serde(default)]
     inputs: BTreeMap<String, Value>,
@@ -2066,7 +2072,9 @@ fn mission_control_envelope(text: &str, selection: &[String]) -> String {
          print here reaches nobody. Every question, status update, and answer must go \
          through `omar_reply`.\n\
          To offer a workflow, call the MCP tool `omar_propose_design` with a complete \
-         OMAR program. The operator approves and runs it; you do not.\n\n\
+         OMAR program. Include companion files in `files`, keyed by their relative paths \
+         (for example schemas/decision.json), so imported types compile. The entry \
+         source is program.omar. The operator approves and runs it; you do not.\n\n\
          {selected}{text}"
     )
 }
@@ -2121,7 +2129,7 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     // Compile before publishing. The operator never sees an unbuildable
     // program, and the EA gets the compiler's diagnostic back as its tool
     // result, so it can correct the program itself.
-    let state = match compile_preview(context, &proposal.program) {
+    let state = match compile_preview(&proposal.program, &proposal.files) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
@@ -2131,6 +2139,7 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         false,
         Some(ProposedDesign {
             program: proposal.program,
+            files: proposal.files,
             inputs: proposal.inputs,
             preview: crate::diagram::DiagramSnapshot::from_vm_state(&state),
         }),
@@ -2140,15 +2149,12 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     (202, json!({"status": "proposed"}))
 }
 
-fn compile_preview(context: &Arc<Context_>, program: &str) -> Result<VmState> {
-    let dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir).join("proposals");
-    fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.omar", Uuid::new_v4()));
-    fs::write(&path, program)?;
-    let bytecode = topology::load_staged_program(&path)?;
-    let state = topology::verify(&bytecode)?;
-    let _ = fs::remove_file(&path);
-    Ok(state)
+fn compile_preview(program: &str, files: &BTreeMap<String, String>) -> Result<VmState> {
+    let staged =
+        stage_program(program, None, files).map_err(|(_, problem)| anyhow::anyhow!("{problem}"))?;
+    let outcome = topology::load_staged_program(&staged.path)
+        .and_then(|bytecode| topology::verify(&bytecode));
+    staged.finish(outcome).map_err(anyhow::Error::msg)
 }
 
 fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&str>) -> Result<()> {
@@ -3583,6 +3589,24 @@ mod tests {
         let files = json!({
             "schemas/decision.json": r#"{"type":"string","enum":["approved","needs_revision"]}"#
         });
+        let companions: BTreeMap<String, String> = serde_json::from_value(files.clone()).unwrap();
+        assert!(compile_preview(program, &companions).is_ok());
+        assert!(compile_preview(program, &BTreeMap::new()).is_err());
+        let server = test_server();
+        let proposal = json!({
+            "token": server.agent_token, "program": program, "files": files,
+            "summary": "Review with a decision schema", "inputs": {"review.request": "hello"}
+        })
+        .to_string();
+        let response = request(
+            server.address(),
+            "POST",
+            "/v1/agent/proposals",
+            Some(&proposal),
+        );
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        let saved = request(server.address(), "GET", "/v1/chat", None);
+        assert!(saved.contains("schemas/decision.json"), "{saved}");
         let body = json!({"program": program, "filename": "review.omar", "files": files});
         let (status, answer) = check_program(body.to_string().as_bytes());
         assert_eq!(status, 200);
@@ -3645,6 +3669,9 @@ mod tests {
             "../decision.json".to_string(),
         ] {
             let program = program.replace("./schemas/decision.json", &import);
+            let companions: BTreeMap<String, String> =
+                serde_json::from_value(files.clone()).unwrap();
+            assert!(compile_preview(&program, &companions).is_err());
             let body = json!({"program": program, "filename": "review.omar", "files": files});
             let (status, answer) = check_program(body.to_string().as_bytes());
             assert_eq!(status, 200);
@@ -4306,6 +4333,10 @@ while True:
             )
             .unwrap();
         let proposal = ProposedDesign {
+            files: BTreeMap::from([(
+                "schemas/decision.json".into(),
+                "{\"type\":\"string\"}".into(),
+            )]),
             program: include_str!("../web/tests/fixtures/review-flow.omar").into(),
             inputs: BTreeMap::from([("flow.request".into(), json!("release evidence"))]),
             preview: serde_json::from_str(include_str!(
@@ -4327,7 +4358,9 @@ while True:
         let resumed = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
         let body = request(resumed.address(), "GET", "/v1/chat", None);
         assert!(
-            body.contains("Saved proposal") && body.contains("release evidence"),
+            body.contains("Saved proposal")
+                && body.contains("release evidence")
+                && body.contains("schemas/decision.json"),
             "{body}"
         );
         assert_eq!(resumed.context.history.lock().unwrap().active_id, first_id);

@@ -335,6 +335,7 @@ export async function startFakeServe({
           preview.team = String(payload.program ?? "").match(/\bmain\s+([A-Za-z_]\w*)/)?.[1] ?? preview.team;
           publishChat("assistant", String(payload.summary ?? ""), {
             program: String(payload.program ?? ""),
+            files: payload.files ?? {},
             inputs: payload.inputs ?? {},
             preview,
           }, false, [], chat);

@@ -24,7 +24,10 @@ function Content({ preview }: { preview: Preview }) {
   return <p>{preview.size.toLocaleString()} bytes · {preview.kind === "large" ? "Too large for the 512 KiB preview limit." : "Binary file."} Open the worktree in the editor to inspect it.</p>;
 }
 
-export function Artifacts({ serveUrl, runId, onClose }: { serveUrl: string; runId: string | null; onClose: () => void }) {
+export function Artifacts({ serveUrl, runId, proposal, onClose }: { serveUrl: string; runId: string | null; proposal?: { program: string; files?: Record<string, string> } | null; onClose: () => void }) {
+  const [viewProposal, setViewProposal] = useState(Boolean(proposal && !runId));
+  const [proposalFile, setProposalFile] = useState("program.omar");
+  const proposalFiles: Record<string, string> = { "program.omar": proposal?.program ?? "", ...proposal?.files };
   const dialog = useRef<HTMLDialogElement>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [selected, setSelected] = useState("");
@@ -130,7 +133,12 @@ export function Artifacts({ serveUrl, runId, onClose }: { serveUrl: string; runI
     const bounds = event.currentTarget.getBoundingClientRect();
     if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) onClose();
   }}>
-    <header><div><span className="eyebrow">TEAM WORKSPACES</span><h2 id="artifacts-title">Files & versions</h2></div><button className="secondary-button" onClick={onClose} aria-label="Close files">Close</button></header>
+    <header><div><span className="eyebrow">PROGRAM & TEAM FILES</span><h2 id="artifacts-title">Files & versions</h2></div><button className="secondary-button" onClick={onClose} aria-label="Close files">Close</button></header>
+    {proposal ? <div className="artifact-controls"><button className="secondary-button" aria-pressed={viewProposal} onClick={() => setViewProposal(true)}>Proposed program</button><button className="secondary-button" aria-pressed={!viewProposal} onClick={() => setViewProposal(false)}>Run workspaces & versions</button></div> : null}
+    {viewProposal && proposal ? <div className="artifact-body">
+      <nav aria-label="Proposed program files">{Object.keys(proposalFiles).sort().map((path) => <button key={path} aria-current={proposalFile === path ? "true" : undefined} onClick={() => setProposalFile(path)}>{path}</button>)}</nav>
+      <section aria-label="File preview" className="artifact-preview"><strong>{proposalFile}</strong><Content preview={{kind: "text", text: proposalFiles[proposalFile], size: (proposalFiles[proposalFile] ?? "").length}} /></section>
+    </div> : <>
     <div className="artifact-controls">
       <label>Team instance<select aria-label="Team workspace" disabled={busy} value={selected} onChange={(e) => selectWorkspace(e.target.value)}>
         {workspaces.map((w) => <option key={w.id} value={w.id}>{w.instance || "Root team"} · {w.id.slice(0, 8)}{w.restored_from ? " · restored" : ""}</option>)}
@@ -164,5 +172,6 @@ export function Artifacts({ serveUrl, runId, onClose }: { serveUrl: string; runI
           : <p>Select a file to preview it. Use Web VS Code to edit the current worktree.</p>}
       </section>
     </div>}
+    </>}
   </dialog>;
 }

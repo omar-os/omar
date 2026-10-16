@@ -2582,3 +2582,28 @@ test("workspace files refresh, preview snapshots, and dismiss on backdrop or Esc
   await page.keyboard.press("Escape");
   await expect(modal).toBeHidden();
 });
+
+
+test("companion proposal files can be viewed and reach checks and deployment", async ({ page, request }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const files = { "schemas/decision.json": '{"type":"string","enum":["approved"]}' };
+  const result = await request.post(`${fake.url}/v1/agent/proposals`, { data: {
+    token: fake.agentToken, program: "team Review[worker : Stub] { input request : string output result : string task worker(request) -> result \"Review\" } main ReviewRun { review = Review() }",
+    files, summary: "A proposal with a schema", inputs: { "review.request": "hello" },
+  } });
+  expect(result.ok()).toBeTruthy();
+  await expect(page.getByText("A proposal with a schema", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  const dialog = page.getByRole("dialog", { name: "Files & versions" });
+  await dialog.getByRole("button", { name: "schemas/decision.json", exact: true }).click();
+  await expect(dialog.getByLabel("File preview")).toContainText(files["schemas/decision.json"]);
+  await dialog.getByRole("button", { name: "Close files" }).click();
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+  const check = page.waitForRequest((r) => r.url().endsWith("/v1/programs/check") && r.postDataJSON()?.files?.["schemas/decision.json"] === files["schemas/decision.json"]);
+  await page.getByLabel("OMAR program").fill("team Review[worker : Stub] { input request : string output result : string task worker(request) -> result \"Edited\" } main ReviewRun { review = Review() }");
+  await check;
+  const deployment = page.waitForRequest((r) => r.url().endsWith("/v1/runs") && r.method() === "POST");
+  await deploy(page);
+  expect((await deployment).postDataJSON().files).toEqual(files);
+});

@@ -30,7 +30,7 @@ nobody. Reply only through these two OMAR **MCP tools**, on the MCP server named
 
 - `omar_reply` — everything you want the operator to read: questions, reasoning,
   status. There is no other channel to them.
-- `omar_propose_design` — submit a complete OMAR program for approval.
+- `omar_propose_design` — submit a complete OMAR program for approval. Put the entry source in `program` (staged as `program.omar`) and companion files in `files`, keyed by relative path, such as `{"schemas/decision.json": "...JSON schema text..."}`. Include every imported schema; the proposal is compiled with these files and the operator can inspect them in Files & versions.
 
 A program declares teams and then instantiates them in a `main` block. Agents
 go in brackets, parameters in parentheses, and a program without `main` does
