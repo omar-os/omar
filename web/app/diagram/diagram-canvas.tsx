@@ -571,8 +571,8 @@ function BackendMark({ backend }: { backend: string }) {
 
 function reactionWidth(labels: ReactionLabels, within: number | null): number {
   const widest = Math.max(
-    textWidth(labels.name, 6.9),
-    textWidth(labels.meta, 5.2) + 22,
+    textWidth(labels.name, 8.1),
+    textWidth(labels.meta, 6.4) + 22,
   );
   // A deadline is drawn between the text and the point, so the node has to be
   // wider for it rather than the stopwatch sitting on top of the name.
@@ -666,7 +666,7 @@ async function runElk(
   const labelRoom = (names: string[]) =>
     names.length === 0
       ? 0
-      : Math.ceil(Math.max(...names.map((name) => textWidth(name, 6.4))));
+      : Math.ceil(Math.max(...names.map((name) => textWidth(name, 7.5))));
 
   // ELK expresses an edge's route relative to the deepest node containing both
   // of its ends, whatever node the edge was declared on. Declaring each edge
@@ -1092,7 +1092,7 @@ function buildLayout(
         : edge.delay === 0
           ? "\u03bcstep"
           : formatDuration(edge.delay);
-    const split = text ? breakForLabel(drawn, textWidth(text, 5.6) + 8) : null;
+    const split = text ? breakForLabel(drawn, textWidth(text, 6.7) + 8) : null;
     return [
       {
         id: edge.id,
@@ -1846,7 +1846,7 @@ export function DiagramCanvas({
                     {reaction.name}
                   </text>
                   <text className="omar-reaction-description" x={REACTION_TEXT_X} y={46}>
-                    {fitText(reaction.summary, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING, 5.6)}
+                    {fitText(reaction.summary, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING, 6.7)}
                   </text>
                   <rect className="omar-model-badge" x={REACTION_TEXT_X} y={57} width={16} height={16} rx={5} />
                   <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 59) scale(0.5)`}>

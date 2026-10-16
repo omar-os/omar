@@ -142,7 +142,7 @@ test("the diagram reflects live reaction state from the run", async ({ page }) =
   const first = reactions.first();
   await expect(first.locator(".omar-reaction-index")).toHaveText("01");
   await expect(first.locator(".omar-reaction-name")).toHaveText("planner");
-  await expect(first.locator(".omar-reaction-description")).toHaveText(/^Draft a release plan for.*…$/);
+  await expect(first.locator(".omar-reaction-description")).toHaveText(/^Draft a release plan.*…$/);
   await expect(reactions.nth(1).locator(".omar-reaction-description")).toHaveText("Critique the plan: plan");
   // Reactions are anonymous in OMAR, so the agent is the headline.
   await expect(page.locator(".omar-reactions")).toContainText("planner");
@@ -666,7 +666,7 @@ test("the studio opens on a centred prompt, then settles into a thread", async (
   // window size, with room for the larger chat text.
   expect(opening.width).toBe(500);
   expect(opening.height).toBeLessThan(130);
-  await expect(composer.locator("textarea")).toHaveCSS("font-size", "14px");
+  await expect(composer.locator("textarea")).toHaveCSS("font-size", "16px");
 
   await composer.getByLabel("Describe a workflow").fill("Review the release plan");
   await page.keyboard.press("Enter");
@@ -674,8 +674,8 @@ test("the studio opens on a centred prompt, then settles into a thread", async (
   // Once there is a conversation it belongs at the bottom, under the thread.
   await expect(page.locator(".messages")).toContainText("Review the release plan");
   await expect(page.locator(".builder-panel")).not.toHaveClass(/opening/);
-  await expect(page.locator(".message-content > p").first()).toHaveCSS("font-size", "13px");
-  await expect(page.locator(".message.assistant:not(.progress) .message-body").first()).toHaveCSS("font-size", "13px");
+  await expect(page.locator(".message-content > p").first()).toHaveCSS("font-size", "16px");
+  await expect(page.locator(".message.assistant:not(.progress) .message-body").first()).toHaveCSS("font-size", "16px");
   const threaded = (await composer.boundingBox())!;
   expect(threaded.y).toBeGreaterThan(opening.y + 100);
   // The compact size belongs to the opening screen only; in a thread the box
