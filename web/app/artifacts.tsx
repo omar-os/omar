@@ -161,7 +161,8 @@ export function Artifacts({ serveUrl, runId, proposal, onWorkflowChange, onClose
     const bounds = event.currentTarget.getBoundingClientRect();
     if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) onClose();
   }}>
-    <header><div><span className="eyebrow">PROGRAM & TEAM FILES</span><h2 id="artifacts-title">Files & versions</h2></div><button className="secondary-button" onClick={onClose} aria-label="Close files">Close</button></header>
+    <header><div><span className="eyebrow">PROGRAM & TEAM FILES</span><h2 id="artifacts-title">Files</h2></div><button className="secondary-button" onClick={onClose} aria-label="Close files">Close</button></header>
+    <div className="artifact-toolbar">
     {proposal ? <div className="artifact-tabs" role="tablist" aria-label="File views">
       {[true, false].map((workflow) => <button key={String(workflow)} type="button" role="tab" id={`${tabsId}-${workflow ? "workflow" : "run"}-tab`} aria-controls={`${tabsId}-${workflow ? "workflow" : "run"}-panel`} aria-selected={viewProposal === workflow} tabIndex={viewProposal === workflow ? 0 : -1} onClick={() => setViewProposal(workflow)} onKeyDown={(event) => {
         if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
@@ -172,10 +173,11 @@ export function Artifacts({ serveUrl, runId, proposal, onWorkflowChange, onClose
         }
       }}>{workflow ? "Workflow" : "Run workspaces & versions"}</button>)}
     </div> : null}
+    <button className="primary-button artifact-editor-button" disabled={busy || (!(viewProposal && proposal) && (!selected || Boolean(version)))} onClick={() => void (viewProposal && proposal ? openWorkflowEditor() : openEditor())}>{busy ? "Starting editor…" : "Open in Web VS Code"}</button>
+    </div>
     <div role="tabpanel" id={`${tabsId}-${viewProposal ? "workflow" : "run"}-panel`} aria-labelledby={proposal ? `${tabsId}-${viewProposal ? "workflow" : "run"}-tab` : undefined}>
     {viewProposal && proposal ? <>
       <div className="artifact-controls workflow-editor-controls">
-        <button className="primary-button" disabled={busy} onClick={() => void openWorkflowEditor()}>{busy ? "Working…" : "Open in Web VS Code"}</button>
         {workflowWorkspace && onWorkflowChange ? <button className="secondary-button" disabled={busy} onClick={() => void applyWorkflowEdits()}>Apply saved changes</button> : null}
         {workflowEditorUrl ? <><a href={workflowEditorUrl} target="_blank" rel="noreferrer">Reopen editor ↗</a><button className="artifact-link" disabled={busy} onClick={() => {
           setBusy(true); setWorkflowError("");
@@ -197,8 +199,7 @@ export function Artifacts({ serveUrl, runId, proposal, onWorkflowChange, onClose
         {[...snapshots].reverse().map((s) => <option key={s.id} value={s.id}>#{s.sequence} {s.label} · {new Date(s.created_at * 1000).toLocaleString()}</option>)}
       </select></label>
       <button className="secondary-button" disabled={busy || loading} onClick={() => { setLoading(true); setError(""); setPreview(null); setComparison(null); setRevision((r) => r + 1); }}>{loading ? "Refreshing…" : "Refresh"}</button>
-      {version ? <button className="primary-button" disabled={busy} onClick={() => void restore()}>Restore as new workspace</button>
-        : <button className="primary-button" disabled={!selected || busy} onClick={() => void openEditor()}>{busy ? "Starting editor…" : "Open in Web VS Code"}</button>}
+      {version ? <button className="primary-button" disabled={busy} onClick={() => void restore()}>Restore as new workspace</button> : null}
     </div>
     <p className="artifact-guidance">{version ? "Saved version · read-only. Restore a copy to edit it." : "Edits save directly to this worktree. Agents may also be writing; stop the topology before making conflicting changes. Unsaved editor buffers are not included in snapshots."}</p>
     {editorUrl ? <p><a href={editorUrl} target="_blank" rel="noreferrer">Reopen editor ↗</a> · <button className="artifact-link" disabled={busy} onClick={() => { setBusy(true); void request(serveUrl, `/${selected}/editor/stop`, {}).then(() => { if (alive.current) { setEditorUrl(""); setNotice("Editor stopped. Topology state is unchanged."); } }).catch((e) => { if (alive.current) setError(e.message); }).finally(() => { if (alive.current) setBusy(false); }); }}>Stop editor</button></p> : null}

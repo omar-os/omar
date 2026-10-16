@@ -2626,7 +2626,9 @@ h2 {
 .diagram-heading { flex-wrap: wrap; }
 .diagram-heading > div:first-child { min-width: 0; overflow-wrap: anywhere; }
 
-.artifact-tabs { display: flex; gap: 24px; border-bottom: 1px solid var(--line); margin: 0 0 20px; }
+.artifact-toolbar { display: flex; align-items: center; gap: 20px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+.artifact-tabs { display: flex; gap: 24px; min-width: 0; }
+.artifact-editor-button { margin-left: auto; flex-shrink: 0; margin-bottom: 6px; }
 .artifact-tabs [role="tab"] { appearance: none; border: 0; border-bottom: 3px solid transparent; border-radius: 0; background: transparent; color: var(--text-2, #b1a6bd); padding: 12px 0; font: inherit; font-size: 13px; cursor: pointer; }
 .artifact-tabs [role="tab"][aria-selected="true"] { color: var(--accent-text, #c4a7ff); border-bottom-color: var(--accent, #8b5cf6); font-weight: 600; }
 .artifact-tabs [role="tab"]:hover { color: var(--text, #eee); }
