@@ -835,9 +835,11 @@ test("checkpoints are off unless enabled", async ({ page }) => {
 test("the file viewer shows the current run's instances only", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);
-  // Before a run there is nothing of this chat's to show, whatever the EA holds.
+  // The workflow is available before deployment; run workspaces are still empty.
   await page.getByRole("button", { name: "Files" }).click();
   const viewer = page.getByRole("dialog", { name: "Files" });
+  await expect(viewer.getByRole("tab", { name: "Workflow", exact: true })).toHaveAttribute("aria-selected", "true");
+  await viewer.getByRole("tab", { name: "Run workspaces & versions" }).click();
   await expect(viewer).toContainText("No run in this chat yet");
   await viewer.getByRole("button", { name: "Close files" }).click();
   await deploy(page);
@@ -2570,7 +2572,6 @@ test("workspace files refresh, preview snapshots, and dismiss on backdrop or Esc
   await expect(modal).toContainText("Saved version · read-only");
   await modal.getByRole("button", { name: /CLAUDE.md/ }).click();
   await expect(modal.getByLabel("File preview")).toContainText("Saved instructions");
-  await page.screenshot({ path: "/tmp/omar-checkpoint-files.png", fullPage: true, animations: "disabled" });
   await modal.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(modal.getByRole("button", { name: "Refreshing…" })).toBeDisabled();
   releaseRefresh?.();
@@ -2607,10 +2608,8 @@ main ReviewRun { review = Review() }`;
   const dialog = page.getByRole("dialog", { name: "Files" });
   await dialog.getByRole("button", { name: "schemas/decision.json", exact: true }).click();
   await expect(dialog.getByLabel("File preview")).toContainText(files["schemas/decision.json"]);
-  await page.screenshot({ path: "/tmp/omar-proposal-schema.png", fullPage: true, animations: "disabled" });
   await dialog.getByRole("button", { name: "program.omar", exact: true }).click();
   await expect(dialog.getByLabel("File preview")).toContainText("main ReviewRun");
-  await page.screenshot({ path: "/tmp/omar-proposal-source.png", fullPage: true, animations: "disabled" });
   await dialog.getByRole("button", { name: "Close files" }).click();
   await page.getByRole("button", { name: "Show the source pane" }).click();
   const check = page.waitForRequest((r) => r.url().endsWith("/v1/programs/check") && r.postDataJSON()?.files?.["schemas/decision.json"] === files["schemas/decision.json"]);
