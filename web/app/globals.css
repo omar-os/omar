@@ -686,7 +686,7 @@ h2 {
 
 .run-stats small {
   color: var(--dia-stats-muted);
-  font: 9px ui-sans-serif, system-ui, sans-serif;
+  font: 0.75rem ui-sans-serif, system-ui, sans-serif;
   letter-spacing: 0.12em;
 }
 
@@ -1048,7 +1048,7 @@ h2 {
    which. The line breaks around the number instead of running through it. */
 .omar-edge-delay {
   fill: var(--dia-edge-delay);
-  font: 9px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
   font-weight: 600;
   letter-spacing: 0.01em;
 }
@@ -1180,7 +1180,7 @@ h2 {
   padding: 0 14px;
   border-bottom: 1px solid var(--line);
   color: var(--muted);
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .source-title span:last-child {
@@ -1231,7 +1231,7 @@ h2 {
   overflow: auto;
   padding: 16px;
   color: var(--text-2);
-  font: 10.5px/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font: 0.75rem/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
   tab-size: 2;
   white-space: pre-wrap;
 }
@@ -1255,7 +1255,7 @@ h2 {
   margin: 0;
   padding: 16px;
   border: 0;
-  font: 10.5px/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font: 0.75rem/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
   tab-size: 2;
   white-space: pre-wrap;
   overflow-wrap: break-word;
@@ -1423,7 +1423,7 @@ h2 {
 .port-waiting-contract {
   margin: 0;
   color: #77727e;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field {
@@ -1435,12 +1435,12 @@ h2 {
 
 .port-field-name {
   color: #d8d4e0;
-  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field-type {
   color: #77727e;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field input {
@@ -1450,7 +1450,7 @@ h2 {
   border-radius: 5px;
   background: #131118;
   color: #e6e2ee;
-  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field.invalid input {
@@ -1469,7 +1469,7 @@ h2 {
   gap: 2px 8px;
   padding: 8px 0;
   border-bottom: 1px solid #211f25;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-row-name {
@@ -1509,7 +1509,7 @@ h2 {
   padding: 8px 0;
   border-bottom: 1px solid #211f25;
   color: #77727e;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .event-strip b {

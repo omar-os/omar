@@ -282,13 +282,13 @@ button:focus-visible, select:focus-visible { outline-offset: 3px; }
 .workspace-notice { margin: 12px 28px 0; padding-bottom: 14px; font-size: 0.8125rem; line-height: 1.5; }
 .file-browser { display: grid; min-height: 0; flex: 1; grid-template-columns: 240px minmax(0,1fr); margin: 0 28px 26px; }
 .file-tree { min-height: 0; overflow-y: auto; padding: 18px 15px 18px 0; border-right: 1px solid #2c2932; }
-.tree-root { margin: 0 8px 11px; color: #aaa5b0; font: 11px ui-monospace, monospace; overflow-wrap: anywhere; }
-.file-tree button { display: flex; width: 100%; min-height: 36px; align-items: center; gap: 8px; overflow: hidden; padding: 0 8px; border: 0; border-radius: 7px; color: #b1a6bd; background: transparent; font: 11px ui-monospace, monospace; text-align: left; }
+.tree-root { margin: 0 8px 11px; color: #aaa5b0; font: 0.75rem ui-monospace, monospace; overflow-wrap: anywhere; }
+.file-tree button { display: flex; width: 100%; min-height: 36px; align-items: center; gap: 8px; overflow: hidden; padding: 0 8px; border: 0; border-radius: 7px; color: #b1a6bd; background: transparent; font: 0.75rem ui-monospace, monospace; text-align: left; }
 .file-tree button[aria-current="true"] { color: #eeeaf2; background: #292330; }
-.file-type { display: grid; width: 26px; height: 23px; flex-shrink: 0; place-items: center; border-radius: 5px; color: #bca6ef; background: #302541; font: 7px ui-sans-serif, sans-serif; }
+.file-type { display: grid; width: 26px; height: 23px; flex-shrink: 0; place-items: center; border-radius: 5px; color: #bca6ef; background: #302541; font: 0.75rem ui-sans-serif, sans-serif; }
 .file-preview { min-width: 0; min-height: 0; overflow: auto; padding: 18px; }
-.preview-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid #2b2931; font: 11px ui-monospace, monospace; }
-.preview-header small { color: #aba0b4; font: 10px ui-sans-serif, sans-serif; }
+.preview-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid #2b2931; font: 0.75rem ui-monospace, monospace; }
+.preview-header small { color: #aba0b4; font: 0.75rem ui-sans-serif, sans-serif; }
 .file-preview pre { padding: 18px 0; margin: 0; color: #bbb5c3; font: 12px/1.7 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .file-empty { padding-top: 16px; color: var(--muted); font-size: 0.9375rem; line-height: 1.6; }
 @media (max-width: 1300px) {
