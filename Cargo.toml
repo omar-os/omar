@@ -7,7 +7,7 @@ rust-version = "1.89"
 
 [package]
 name = "omar"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 rust-version.workspace = true
 description = "Agent dashboard for tmux"
