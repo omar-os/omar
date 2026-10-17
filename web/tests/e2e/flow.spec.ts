@@ -316,6 +316,9 @@ test("Enter sends, modified Enter writes a new line", async ({ page }) => {
   await composer.press("Enter");
   await expect(composer).toHaveValue("");
   await expect(page.locator(".messages")).toContainText("first line second line");
+  // The sent message keeps its line break rather than collapsing it.
+  const sent = page.locator(".message.operator p").last();
+  expect(await sent.evaluate((el) => (el as HTMLElement).innerText)).toBe("first line\nsecond line");
 });
 
 test("waiting holds one verb per turn and changes between turns", async ({

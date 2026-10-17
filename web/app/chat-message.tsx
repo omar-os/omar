@@ -31,7 +31,8 @@ export function ChatMessage({ message }: { message: ChatMessageModel }) {
             <Markdown remarkPlugins={[remarkGfm]}>{message.text}</Markdown>
           </div>
         ) : (
-          <p>{message.text}</p>
+          // Plain text, so its line breaks are the operator's formatting.
+          <p className="message-text">{message.text}</p>
         )}
       </div>
     </article>
