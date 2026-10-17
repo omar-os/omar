@@ -19,11 +19,6 @@
 Web UI
 </p>
 
-<p align="center">
-<img src="./img/demo.gif" alt="Terminal UI" valign="middle"/>
-Terminal UI
-</p>
-
 </div>
 
 ## Features
