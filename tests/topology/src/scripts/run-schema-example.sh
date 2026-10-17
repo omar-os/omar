@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."
 export PATH="$PWD/target/debug:$PWD/lang/.lake/build/bin:$PATH"
 export OMARC_BIN="$PWD/lang/.lake/build/bin/omarc"
 # Noninteractive WSL shells may not load an existing nvm installation.

@@ -1,4 +1,5 @@
-
+// Classifies a customer message into a schema-imported category with Codex.
+// Live run: bash tests/topology/src/scripts/run-message-classifier.sh "message"
 type Category from "./schemas/message-category.json"
 
 team Classifier[message_classifier : Codex] {

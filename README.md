@@ -35,7 +35,7 @@ Terminal UI
 - **Customization**: Support all `tmux` commands you love.
 - **Team workspaces**: Each topology team instance gets a versioned `worktree/` and disposable `temp/`; inspect and restore file versions from Mission Control or `omar workspace`.
 
-Other features include messaging systems integration (e.g., Slack), computer use, and more.
+Other features include computer use and more.
 
 ## Installation
 

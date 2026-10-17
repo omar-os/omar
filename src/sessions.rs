@@ -23,6 +23,17 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Runtime identity must not leak into a new session, but adapter settings
+/// are user configuration and must survive foreground/background launches.
+fn runtime_environment_key(key: &std::ffi::OsStr) -> bool {
+    (key.to_string_lossy().starts_with("OMAR_")
+        && key != "OMAR_JEV_MODEL"
+        && key != "OMAR_JEV_ON_ERROR")
+        || key == "TMUX"
+        || key == "TMUX_PANE"
+        || key == "OMARC_BIN"
+}
+
 const PROTOCOL: u32 = 1;
 const MAX_FRAME: u64 = 8 * 1024 * 1024;
 
@@ -315,6 +326,16 @@ fn read_frame(stream: impl Read) -> Result<Value> {
     );
     Ok(serde_json::from_str(&raw)?)
 }
+/// Accepted sockets inherit the listener's nonblocking flag on macOS.
+/// A complete schema bundle may arrive in several writes, so the reader must
+/// wait for the bounded frame rather than treating a temporary gap as EOF.
+fn read_control_request(stream: &UnixStream) -> Result<Request> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    Ok(serde_json::from_value(read_frame(stream)?)?)
+}
+
 pub fn rpc(session: &Session, operation: Value, timeout: Duration) -> Result<Value> {
     anyhow::ensure!(
         session.protocol == PROTOCOL,
@@ -711,11 +732,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
             .arg(&directory)
             .current_dir(&workdir);
         for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("OMAR_")
-                || key == "TMUX"
-                || key == "TMUX_PANE"
-                || key == "OMARC_BIN"
-            {
+            if runtime_environment_key(&key) {
                 foreground.env_remove(key);
             }
         }
@@ -748,11 +765,7 @@ fn spawn_daemon(
         .stdout(log.try_clone()?)
         .stderr(log);
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("OMAR_")
-            || key == "TMUX"
-            || key == "TMUX_PANE"
-            || key == "OMARC_BIN"
-        {
+        if runtime_environment_key(&key) {
             command.env_remove(key);
         }
     }
@@ -1140,12 +1153,6 @@ async fn daemon(directory: &Path) -> Result<()> {
     crate::metrics::configure(config.metrics.spawn_metrics_enabled);
     ea::ensure_default_ea(directory)?;
     let server = Arc::new(Serve::start(launch.address, &config, directory, 0)?);
-    // Slack and computer integrations belong to the runtime, never to a client.
-    let mut bridges: Vec<std::process::Child> =
-        [crate::spawn_slack_bridge(), crate::spawn_computer_bridge()]
-            .into_iter()
-            .flatten()
-            .collect();
     match server.attach_ea(&config, directory, 0, false, !launch.no_ea)? {
         crate::serve::AttachEa::Attached(_) if launch.no_ea => {}
         crate::serve::AttachEa::Attached(session) => eprintln!("Executive assistant running in {session}"),
@@ -1185,10 +1192,7 @@ async fn daemon(directory: &Path) -> Result<()> {
                 let force = force.clone();
                 let operations = operations.clone();
                 std::thread::spawn(move || {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-                    let request =
-                        read_frame(&stream).and_then(|v| Ok(serde_json::from_value::<Request>(v)?));
+                    let request = read_control_request(&stream);
                     // `down` must not queue behind a stuck operation it exists to end.
                     let direct = request.as_ref().is_ok_and(|r| {
                         matches!(r.operation["op"].as_str(), Some("hello" | "down"))
@@ -1247,9 +1251,6 @@ async fn daemon(directory: &Path) -> Result<()> {
         }
     }
     scheduler_task.abort();
-    for bridge in &mut bridges {
-        crate::kill_child_gracefully(bridge, Duration::from_secs(3));
-    }
     cleanup.cleanup();
     let mut session = session.lock().unwrap();
     // Stopped is a state, not an ending: like a container, the session keeps
@@ -1650,6 +1651,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adapter_settings_survive_new_sessions_but_runtime_identity_does_not() {
+        for name in [
+            "OMAR_JEV_MODEL",
+            "OMAR_JEV_ON_ERROR",
+            "TYPESAFE_API_KEY",
+            "PATH",
+        ] {
+            assert!(
+                !runtime_environment_key(std::ffi::OsStr::new(name)),
+                "{name}"
+            );
+        }
+        for name in [
+            "OMAR_HOME",
+            "OMAR_SESSION_ID",
+            "OMAR_STATE_DIR",
+            "OMARC_BIN",
+            "TMUX",
+            "TMUX_PANE",
+        ] {
+            assert!(
+                runtime_environment_key(std::ffi::OsStr::new(name)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn help_is_hierarchical_without_session_resolution() {
         for (group, children) in [
             ("workspace", vec!["list", "show", "snapshot", "restore"]),
@@ -1688,6 +1717,30 @@ mod tests {
             strip_target_args(args.into_iter().map(String::from)),
             ["spawn", "worker", "--", "--session=payload"]
         );
+    }
+
+    #[test]
+    fn a_fragmented_schema_bundle_survives_a_nonblocking_accepted_socket() {
+        let (receiver, mut sender) = UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let files = json!({"schemas/decision.json": "x".repeat(65536)});
+        let operation = json!({"op":"start", "request":{"files": files}});
+        let frame = serde_json::to_vec(&Request {
+            protocol: PROTOCOL,
+            id: "test".into(),
+            incarnation: "test".into(),
+            operation: operation.clone(),
+        })
+        .unwrap();
+        let writer = std::thread::spawn(move || {
+            sender.write_all(&frame[..128]).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            sender.write_all(&frame[128..]).unwrap();
+            sender.write_all(b"\n").unwrap();
+        });
+        let request = read_control_request(&receiver).unwrap();
+        writer.join().unwrap();
+        assert_eq!(request.operation, operation);
     }
 
     #[test]

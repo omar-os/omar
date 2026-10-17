@@ -302,6 +302,9 @@ jobs:
           echo "$output"
           grep -Fq 'Output run.result = "hello"' <<<"$output"
 
+      - name: Verify registered Jev backend (mock HTTP, no API key)
+        run: python3 tests/ci/jev_backend.py -v
+
       - name: Verify agent invocations use side-channel delivery
         env:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
@@ -411,7 +414,7 @@ jobs:
 
           # `[name : Backend, other : Backend]` on a team. A port's type is
           # lowercase (`inp : string`), so naming the backends keeps ports out.
-          BACKENDS = "ClaudeCode|Claude|Codex|Cursor|OpenCode|Agy|Stub|Web"
+          BACKENDS = "ClaudeCode|Claude|Codex|Cursor|OpenCode|Agy|Jev|Stub|Web"
           declaration = re.compile(rf"\b(\w+)\s*:\s*({BACKENDS})\b")
 
           def declared_backends(name):
@@ -851,8 +854,6 @@ jobs:
           name: omar-${{ matrix.os }}
           path: |
             target/release/omar
-            target/release/omar-computer
-            target/release/omar-slack
 
   # Ensure all jobs pass before allowing merge
   ci-success:

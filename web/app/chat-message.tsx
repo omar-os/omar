@@ -35,7 +35,7 @@ export function ChatMessage({ message }: { message: ChatMessageModel }) {
         ) : (
           <>
             {quote ? <blockquote className="message-quote">{quote}</blockquote> : null}
-            <p>{body}</p>
+            <p className="message-text">{body}</p>
           </>
         )}
       </div>

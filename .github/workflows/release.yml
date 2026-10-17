@@ -84,8 +84,6 @@ jobs:
         run: |
           mkdir omar-${{ matrix.suffix }}
           cp target/${{ matrix.target }}/release/omar \
-             target/${{ matrix.target }}/release/omar-slack \
-             target/${{ matrix.target }}/release/omar-computer \
              lang/.lake/build/bin/omarc \
              omar-${{ matrix.suffix }}/
           tar czf omar-${{ matrix.suffix }}.tar.gz omar-${{ matrix.suffix }}/

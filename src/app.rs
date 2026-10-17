@@ -1996,7 +1996,6 @@ mod tests {
                 default_workdir: ".".to_string(),
             },
             metrics: MetricsConfig::default(),
-            slack_bridge: crate::config::SlackBridgeConfig::default(),
         }
     }
 

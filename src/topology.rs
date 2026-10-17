@@ -1981,6 +1981,31 @@ struct DispatchExecutor<'a, E: ReactionExecutor> {
 
 impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+        if let Some(backend) = self
+            .state
+            .agents
+            .get(&invocation.agent)
+            .and_then(|agent| crate::backend::by_name(&agent.backend))
+            .filter(|backend| backend.topology_only())
+        {
+            let rendered = render_prompt(&invocation.prompt, &invocation.trigger_values)?;
+            let writes = backend.invoke_topology(&crate::backend::TopologyInvocation {
+                effects: &invocation.allowed_effects,
+                triggers: &invocation.trigger_values,
+                instructions: &rendered,
+                timeout: invocation.within.unwrap_or(self.timeout),
+            })?;
+            validate_contract(&invocation.contract, &writes)?;
+            for (port, value) in &writes {
+                let port_type = self
+                    .state
+                    .ports
+                    .get(port)
+                    .context("backend wrote an unknown port")?;
+                validate_value(&port_type.ty, value)?;
+            }
+            return Ok(writes);
+        }
         if let Some(code) = &self.code {
             if code.handles(&invocation.reaction_id) {
                 let deadline = invocation.within.unwrap_or(self.timeout);
@@ -2565,7 +2590,7 @@ fn launch(
     let planned_sessions: BTreeMap<String, String> = state
         .agents
         .iter()
-        .filter(|(_, agent)| !is_web_backend(&agent.backend))
+        .filter(|(_, agent)| needs_agent_process(&agent.backend))
         .map(|(name, _)| (name.clone(), client.session_for(name)))
         .collect();
     let record = Arc::new(Mutex::new(deploy::DeploymentRecord::create(
@@ -2981,7 +3006,7 @@ fn spawn_topology_agents(
         // A web agent is not spawned. There is no command to resolve, no pane
         // to put it in, and no readiness to wait for — the agent exists as a
         // name in the topology and an inbox in the registry.
-        if is_web_backend(&agent.backend) {
+        if !needs_agent_process(&agent.backend) {
             continue;
         }
         let session = client.session_for(name);
@@ -3045,7 +3070,7 @@ fn spawn_topology_agents(
     }
 
     for (name, agent) in &state.agents {
-        if is_web_backend(&agent.backend) {
+        if !needs_agent_process(&agent.backend) {
             continue;
         }
         let Some(backend) = crate::backend::by_name(canonical_backend(&agent.backend)) else {
@@ -4262,12 +4287,13 @@ fn require_identifier(kind: &str, value: &str) -> Result<()> {
     }
 }
 
-/// Whether a backend is answered by a web client rather than a spawned process.
-///
-/// Nothing is spawned for one, so it has no pane, no readiness marker and no
-/// command to resolve — the difference has to be known before any of that is
-/// attempted. It names what answers the reaction, not how the bytes get there:
-/// the transport is the panel's business, not the program's.
+/// Whether this agent needs a launched coding-agent process.
+fn needs_agent_process(backend: &str) -> bool {
+    !is_web_backend(backend)
+        && !crate::backend::by_name(backend).is_some_and(|backend| backend.topology_only())
+}
+
+/// Web agents are answered by a client through the invocation registry.
 fn is_web_backend(backend: &str) -> bool {
     canonical_backend(backend) == "web"
 }
@@ -5560,6 +5586,16 @@ mod tests {
         assert!(truncated);
         assert_eq!(steps.len(), 8);
         assert_eq!(steps[0].timestamp, 0);
+    }
+
+    #[test]
+    fn direct_topology_backends_have_no_agent_process() {
+        assert!(!needs_agent_process("Jev"));
+        assert!(!needs_agent_process(" JeV "));
+        assert!(!needs_agent_process("Web"));
+        assert!(needs_agent_process("Codex"));
+        assert!(needs_agent_process("ClaudeCode"));
+        assert!(needs_agent_process("Stub"));
     }
 
     #[test]

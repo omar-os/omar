@@ -1192,7 +1192,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
             <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
-            <div className="conversation-actions"><button type="button" className="secondary-button files-button" disabled={isDemo || switchingChat || daemon.state !== "live"} onClick={() => setFilesOpen(true)} aria-haspopup="dialog">Files</button><SettingsMenu />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+            <div className="conversation-actions"><SettingsMenu />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
           </header>
           <div className="messages" ref={threadRef}>
             {messages.length > 0 ? <div className="date-divider">Conversation</div> : null}
@@ -1282,6 +1282,17 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                     aria-haspopup="dialog"
                   >
                     Inspect terminal
+                  </button>
+                ) : null}
+                {!isDemo ? (
+                  <button
+                    type="button"
+                    className="terminal-button"
+                    onClick={() => setFilesOpen(true)}
+                    disabled={switchingChat || daemon.state !== "live"}
+                    aria-haspopup="dialog"
+                  >
+                    Files & versions
                   </button>
                 ) : null}
               </div>

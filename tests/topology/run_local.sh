@@ -89,7 +89,7 @@ if peek_agents:
                 match.group(1)
                 for match in re.finditer(
                     r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*"
-                    r"(?:Codex|Claude|ClaudeCode|OpenCode|Cursor|Agy)\b",
+                    r"(?:Codex|Claude|ClaudeCode|OpenCode|Cursor|Agy|Jev)\b",
                     source,
                     re.IGNORECASE,
                 )

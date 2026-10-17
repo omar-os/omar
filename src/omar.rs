@@ -252,8 +252,8 @@ enum Commands {
     McpServer {
         /// Path to a serialized MCP server context JSON file. When omitted,
         /// the server builds a default context from the current config and
-        /// active EA — used by peer processes (e.g. the Slack bridge) that
-        /// aren't spawned by a specific backend launch.
+        /// active EA — used by peer processes that aren't spawned by a
+        /// specific backend launch.
         #[arg(long)]
         context_file: Option<String>,
         /// List tools without their `omar_` prefix, for clients that prefix
@@ -1494,123 +1494,6 @@ fn setup_tmux() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Locate the `omar-slack` binary. Checks next to the current executable
-/// first, then falls back to a PATH lookup.
-fn find_slack_binary() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("omar-slack");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    // Fall back to PATH lookup
-    Some(PathBuf::from("omar-slack"))
-}
-
-/// Spawn the Slack bridge binary if SLACK_BOT_TOKEN and SLACK_APP_TOKEN are set.
-fn spawn_slack_bridge() -> Option<std::process::Child> {
-    if std::env::var("SLACK_BOT_TOKEN").is_err() || std::env::var("SLACK_APP_TOKEN").is_err() {
-        return None;
-    }
-
-    let binary = find_slack_binary()?;
-    match std::process::Command::new(&binary)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => {
-            eprintln!("[omar] Slack bridge started (pid {})", child.id());
-            Some(child)
-        }
-        Err(e) => {
-            eprintln!("[omar] Failed to start Slack bridge: {}", e);
-            None
-        }
-    }
-}
-
-/// Locate the `omar-computer` binary. Checks next to the current executable
-/// first, then falls back to a PATH lookup.
-fn find_computer_binary() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("omar-computer");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    // Fall back to PATH lookup
-    Some(PathBuf::from("omar-computer"))
-}
-
-/// Spawn the computer-use bridge binary on Linux when an X11 display is
-/// available. The bridge wraps xdotool / ImageMagick `import`, which are
-/// X11-only tools, so skip it entirely on non-Linux platforms — an
-/// XQuartz `DISPLAY` on macOS would otherwise trigger a noisy spawn of a
-/// bridge that cannot do anything useful there.
-fn spawn_computer_bridge() -> Option<std::process::Child> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    // Treat both unset and empty DISPLAY as "no X11 session". A bare
-    // `export DISPLAY=` in a shell profile would otherwise satisfy
-    // `is_err() == false` and still trigger a useless bridge spawn.
-    let display_ok = std::env::var("DISPLAY")
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty());
-    if !display_ok {
-        return None;
-    }
-
-    let binary = find_computer_binary()?;
-    match std::process::Command::new(&binary)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => {
-            eprintln!("[omar] Computer bridge started (pid {})", child.id());
-            Some(child)
-        }
-        Err(e) => {
-            eprintln!("[omar] Failed to start computer bridge: {}", e);
-            None
-        }
-    }
-}
-
-/// Kill a child process gracefully: SIGTERM first, then SIGKILL after timeout.
-fn kill_child_gracefully(child: &mut std::process::Child, timeout: Duration) {
-    // Send SIGTERM
-    let _ = std::process::Command::new("kill")
-        .arg(child.id().to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    // Wait for the process to exit
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            _ => {
-                if start.elapsed() >= timeout {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
-
-    // Force kill if still running
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// The dashboard is a client of one runtime: the daemon owns the event loop,

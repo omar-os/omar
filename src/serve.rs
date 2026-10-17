@@ -3907,6 +3907,42 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires omarc"]
+    fn builder_proposals_compile_and_preserve_imported_schema_files() {
+        let server = test_server();
+        let program = "type Decision from \"./schemas/decision.json\"\nteam Review[reviewer : Jev] { input request : string output out : Decision task reviewer(request) -> out \"Choose.\" }\nmain SchemaProposal { review = Review() }";
+        let files = BTreeMap::from([(
+            "schemas/decision.json".to_string(),
+            "{\"type\":\"string\",\"enum\":[\"continue\",\"stop\",\"defer\"]}".to_string(),
+        )]);
+        let token = server.context.agent_token.lock().unwrap().clone();
+        let proposal = json!({"token": token, "program": program, "files": files, "inputs":{"review.request":"Complete input"}, "summary":"Schema flow"});
+        let (status, response) =
+            agent_proposal(&server.context, &serde_json::to_vec(&proposal).unwrap());
+        assert_eq!(status, 202, "{response}");
+        let history = server.context.history.lock().unwrap();
+        let conversation = history.conversation(&server.context.conversation_id);
+        let design = conversation
+            .messages
+            .last()
+            .unwrap()
+            .design
+            .as_ref()
+            .unwrap();
+        assert_eq!(design.files, files);
+        assert_eq!(design.preview.team, "SchemaProposal");
+        drop(history);
+        assert!(compile_preview(program, &BTreeMap::new()).is_err());
+        let escaped = BTreeMap::from([("../decision.json".into(), "{}".into())]);
+        assert!(compile_preview(program, &escaped).is_err());
+        let invalid = BTreeMap::from([(
+            "schemas/decision.json".into(),
+            "{\"type\":\"object\"}".into(),
+        )]);
+        assert!(compile_preview(program, &invalid).is_err());
+    }
+
+    #[test]
     fn workflow_editor_workspace_preserves_edits_and_imports_saved_files() {
         let server = test_server();
         let body = json!({"program": "main Review {}", "files": {"schemas/decision.json": "{\"type\":\"string\"}"}});

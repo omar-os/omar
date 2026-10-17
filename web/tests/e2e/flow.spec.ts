@@ -316,6 +316,9 @@ test("Enter sends, modified Enter writes a new line", async ({ page }) => {
   await composer.press("Enter");
   await expect(composer).toHaveValue("");
   await expect(page.locator(".messages")).toContainText("first line second line");
+  // The sent message keeps its line break rather than collapsing it.
+  const sent = page.locator(".message.operator p").last();
+  expect(await sent.evaluate((el) => (el as HTMLElement).innerText)).toBe("first line\nsecond line");
 });
 
 test("waiting holds one verb per turn and changes between turns", async ({
@@ -896,7 +899,7 @@ test("the file viewer shows the current run's instances only", async ({ page }) 
   await useFakeServe(page);
   await draftUntilProposed(page);
   // The workflow is available before deployment; run workspaces are still empty.
-  await page.getByRole("button", { name: "Files" }).click();
+  await page.getByRole("button", { name: "Files & versions" }).click();
   const viewer = page.getByRole("dialog", { name: "Files" });
   await expect(viewer.getByRole("tab", { name: "Workflow", exact: true })).toHaveAttribute("aria-selected", "true");
   await viewer.getByRole("tab", { name: "Run workspaces & versions" }).click();
@@ -904,7 +907,7 @@ test("the file viewer shows the current run's instances only", async ({ page }) 
   await viewer.getByRole("button", { name: "Close files" }).click();
   await deploy(page);
   await expect(page.locator(".connection")).toContainText("observing");
-  await page.getByRole("button", { name: "Files" }).click();
+  await page.getByRole("button", { name: "Files & versions" }).click();
   const instances = viewer.getByLabel("Team workspace");
   await expect(instances.locator("option")).toHaveCount(1);
   await expect(instances.locator("option")).toContainText("leader");
@@ -1681,6 +1684,14 @@ test("the assistant terminal remains available before and after a topology opens
   const inspect = page.getByRole("button", { name: "Inspect terminal" });
   await expect(inspect).toBeEnabled();
   await expect(page.locator(".composer-tools").getByRole("button", { name: "Inspect terminal" })).toBeVisible();
+  // Files & versions sits beside it, in the same row and at the same height.
+  const files = page.locator(".composer-tools").getByRole("button", { name: "Files & versions" });
+  await expect(files).toBeEnabled();
+  const inspectBounds = (await inspect.boundingBox())!;
+  const filesBounds = (await files.boundingBox())!;
+  expect(filesBounds.y).toBe(inspectBounds.y);
+  expect(filesBounds.height).toBe(inspectBounds.height);
+  expect(filesBounds.x).toBeGreaterThan(inspectBounds.x);
   await expect(page.locator(".topbar, .panel-heading, .history-footnote")).toHaveCount(0);
   await expect(page.getByRole("img", { name: "Omar", exact: true })).toBeVisible();
   const backendBounds = (await page.locator(".backend-trigger").boundingBox())!;
@@ -2624,7 +2635,7 @@ test("workspace files refresh, preview snapshots, and dismiss on backdrop or Esc
   await draftUntilProposed(page);
   await deploy(page);
   await expect(page.locator(".connection")).toContainText("observing");
-  await page.getByRole("button", { name: "Files" }).click();
+  await page.getByRole("button", { name: "Files & versions" }).click();
   const modal = page.getByRole("dialog", { name: "Files" });
   await modal.getByRole("button", { name: /CLAUDE.md/ }).click();
   await expect(modal.getByLabel("File preview")).toContainText("Current instructions");
@@ -2639,8 +2650,8 @@ test("workspace files refresh, preview snapshots, and dismiss on backdrop or Esc
   await page.screenshot({ path: "/tmp/omar-spec-files.png" });
   await page.mouse.click(5, 5);
   await expect(modal).toBeHidden();
-  await expect(page.getByRole("button", { name: "Files" })).toBeFocused();
-  await page.getByRole("button", { name: "Files" }).click();
+  await expect(page.getByRole("button", { name: "Files & versions" })).toBeFocused();
+  await page.getByRole("button", { name: "Files & versions" }).click();
   await page.keyboard.press("Escape");
   await expect(modal).toBeHidden();
 });
@@ -2664,7 +2675,7 @@ main ReviewRun { review = Review() }`;
   } });
   expect(result.ok()).toBeTruthy();
   await expect(page.getByText("A proposal with a schema", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Files" }).click();
+  await page.getByRole("button", { name: "Files & versions" }).click();
   const dialog = page.getByRole("dialog", { name: "Files" });
   await dialog.getByRole("button", { name: "schemas/decision.json", exact: true }).click();
   await expect(dialog.getByLabel("File preview")).toContainText(files["schemas/decision.json"]);
@@ -2692,7 +2703,7 @@ test("workflow tabs support keyboard navigation and saved VS Code edits reach de
   await page.route("**/v1/workspaces/workflow-test/workflow", (route) => route.fulfill({ json: { program: workspacePayload!.program, files: savedFiles } }));
   await useFakeServe(page);
   await draftUntilProposed(page);
-  await page.getByRole("button", { name: "Files" }).click();
+  await page.getByRole("button", { name: "Files & versions" }).click();
   const dialog = page.getByRole("dialog", { name: "Files" });
   const workflow = dialog.getByRole("tab", { name: "Workflow", exact: true });
   const workspaces = dialog.getByRole("tab", { name: "Run workspaces & versions" });

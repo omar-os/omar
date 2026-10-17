@@ -583,12 +583,19 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
                 reactions,
             }));
         }
+        // JSON inspection is opt-in for bodies that name serde_json. Its sources
+        // are already cached by building OMAR, so reaction builds stay offline.
+        let dependencies = if source.contains("serde_json::") {
+            "serde_json = \"1\"\n"
+        } else {
+            ""
+        };
         // An empty [workspace] keeps the crate standalone wherever it lands.
         std::fs::write(
             dir.join("Cargo.toml"),
             format!(
                 "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
-                 [dependencies]\n\n[workspace]\n"
+                 [dependencies]\n{dependencies}\n[workspace]\n"
             ),
         )?;
         // Leaving an unchanged file untouched is what lets cargo skip the work

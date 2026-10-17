@@ -54,7 +54,7 @@ try {
   context.setDefaultTimeout(30000);
   console.log('Runtime:',base);
   const page=await context.newPage();await page.goto(base);
-  await page.getByRole('button',{name:'Files',exact:true}).click();
+  await page.getByRole('button',{name:'Files & versions',exact:true}).click();
   await page.getByRole('button',{name:'· report.md',exact:true}).click();
   await page.getByLabel('File preview').getByText('Created by the topology.',{exact:false}).waitFor();
   await page.screenshot({path:join(root,'01-artifacts.png')});

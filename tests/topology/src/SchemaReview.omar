@@ -1,4 +1,4 @@
-type Decision from "./schemas/decision.json"
+type Decision from "./schemas/approval.json"
 
 team Review[reviewer : Codex] {
     input request : string

@@ -1,6 +1,6 @@
 .PHONY: build install uninstall test-topology dev web-bundle omarc check-elan
 
-BINARIES := omar omar-computer omar-slack
+BINARIES := omar
 INSTALL_DIR := $(HOME)/.cargo/bin
 OMARC := lang/.lake/build/bin/omarc
 
