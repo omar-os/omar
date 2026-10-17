@@ -203,11 +203,23 @@ fn codex_startup_case(mode: &'static str) -> (bool, usize, usize) {
         (connections, sends)
     });
     let pane = Pane::new(Some("codex"), Some(&format!("codex:{}", socket.display())));
+    if mode.starts_with("stale") {
+        let path = pane.0.path().join("state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        state["options"] = serde_json::json!({"@omar_startup_pending": "1"});
+        // The banner has scrolled away. Even dialog text in the conversation
+        // must not cause a capture or keystroke (the fixture forbids both).
+        state["screen"] = serde_json::json!("Trust this directory?\ncompleted turn");
+        std::fs::write(path, state.to_string()).unwrap();
+    }
     let result = TmuxClient::new("").deliver_prompt(
         "pane",
         "startup event",
         &DeliveryOptions {
-            startup_timeout: if mode == "empty" {
+            startup_timeout: if mode == "stale-zero" {
+                Duration::ZERO
+            } else if mode == "empty" {
                 // Each attempt launches several Python tmux doubles; allow
                 // slow hosts enough time to exercise more than one poll.
                 Duration::from_secs(1)
@@ -220,6 +232,13 @@ fn codex_startup_case(mode: &'static str) -> (bool, usize, usize) {
     done.store(true, Ordering::SeqCst);
     let (connections, sends) = server.join().unwrap();
     pane.assert_untouched();
+    if mode.starts_with("stale") {
+        let state: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(pane.0.path().join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(state["options"].get("@omar_startup_pending").is_none());
+    }
     (result.is_ok(), connections, sends)
 }
 
@@ -256,4 +275,10 @@ fn passive_legacy_hooks_do_not_claim_to_wake_an_idle_agent() {
         assert!(crate::backend::spool::drain_spool(&spool).is_empty());
         pane.assert_untouched();
     }
+}
+
+#[test]
+fn codex_stale_startup_flag_uses_protocol_when_banner_has_scrolled_away() {
+    assert_eq!(codex_startup_case("stale"), (true, 2, 1));
+    assert_eq!(codex_startup_case("stale-zero"), (true, 2, 1));
 }
