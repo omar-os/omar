@@ -18,14 +18,14 @@ team DeadlineProbe[punctual : ClaudeCode, tardy : ClaudeCode, reporter : ClaudeC
     action missed : string
     output report : string
 
-    prompt punctual(start) -> met within(10min)
+    task punctual(start) -> met within(10min)
     "
         The timer fired at logical time $(start).
         Your deadline is 10 minutes, far more than you need.
         Set `met` to exactly: punctual
     "
 
-    prompt tardy(start) -> missed? within(1ms)
+    task tardy(start) -> missed? within(1ms)
     "
         The timer fired at logical time $(start).
         This invocation has a deadline of 1ms, which has almost certainly
@@ -34,7 +34,7 @@ team DeadlineProbe[punctual : ClaudeCode, tardy : ClaudeCode, reporter : ClaudeC
         is written, which is the expected outcome.
     "
 
-    prompt reporter(met, missed) -> report
+    task reporter(met, missed) -> report
     "
         Two reactions ran under `within` deadlines at the same tag.
         The generous one reported: $(met)

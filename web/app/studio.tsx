@@ -4,14 +4,19 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { ChatMessage as ChatMessageView } from "./chat-message";
 import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
 import { Artifacts } from "./artifacts";
-import { DeployConfirmation } from "./deploy-confirmation";
+import { DeployConfirmation, type DeployOptions } from "./deploy-confirmation";
+import { defaultRunTimeout, describeRunFailure } from "./lib/run-feedback";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
+import { SettingsMenu } from "./settings-menu";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
 import { PortPanel } from "./port-panel";
 import { Resizer } from "./resizer";
+import { useWorkflowNames } from "./lib/workflow-names";
+import { WorkflowIcon } from "./workflow-icon";
+import { StepInspector } from "./step-inspector";
 import { Waiting } from "./waiting";
 import {
   eaDesignAgent,
@@ -39,9 +44,18 @@ import {
   checkServeHealth,
   diagramUrlFor,
   fetchDiagram,
+  fetchRunSnapshot,
   fetchPanel,
   fetchRun,
   checkProgram,
+  fetchCheckpoint,
+  fetchCheckpoints,
+  fetchRunTimeline,
+  pauseRun,
+  resumeRun,
+  rollbackRun,
+  type CheckpointDetail,
+  type CheckpointSummary,
   startRun,
   stopRun,
   subscribeToDiagram,
@@ -77,7 +91,7 @@ const HEALTH_POLL_MS = 5000;
 const MIN_BUILDER = 300;
 const MIN_INSPECTOR = 260;
 const MIN_DIAGRAM = 320;
-const DEFAULT_BUILDER = 380;
+const DEFAULT_BUILDER = 520;
 const DEFAULT_INSPECTOR = 400;
 /** Drag past this fraction of a panel's minimum and it collapses. */
 const COLLAPSE_AT = 0.6;
@@ -90,6 +104,7 @@ type StudioProps = { serveUrl?: string; designAgent?: DesignAgent };
 
 export function Studio({ serveUrl = "", designAgent }: StudioProps) {
   const [selected, setSelected] = useState<string | null>(null);
+  const [restoredUrl, setRestoredUrl] = useState<string | null>(null);
   const select = useCallback((conversation: ConversationSummary) => {
     setSelected(conversation.id);
     sessionStorage.setItem(`omar-chat:${serveUrl}`, conversation.id);
@@ -97,13 +112,17 @@ export function Studio({ serveUrl = "", designAgent }: StudioProps) {
   useEffect(() => {
     if (!serveUrl) return;
     const saved = sessionStorage.getItem(`omar-chat:${serveUrl}`);
-    if (!saved) return;
     const abort = new AbortController();
     void fetchConversations(serveUrl, abort.signal).then((history) => {
-      if (!abort.signal.aborted && history.conversations.some((chat) => chat.id === saved)) setSelected(saved);
-    }).catch(() => {});
+      if (abort.signal.aborted) return;
+      if (saved && history.conversations.some((chat) => chat.id === saved)) setSelected(saved);
+      setRestoredUrl(serveUrl);
+    }).catch(() => { if (!abort.signal.aborted) setRestoredUrl(serveUrl); });
     return () => abort.abort();
   }, [serveUrl]);
+  // Resolve the tab's saved selection before subscribing to the daemon's
+  // default chat. Otherwise its initial replay can overwrite this tab's choice.
+  if (serveUrl && restoredUrl !== serveUrl) return <main className="studio-shell"><p className="workspace-loading" role="status">Opening your workflows…</p></main>;
   const scopedUrl = selected ? `${serveUrl.replace(/\/$/, "")}/chats/${encodeURIComponent(selected)}` : serveUrl;
   return <StudioWorkspace serveUrl={scopedUrl} historyUrl={serveUrl}
     designAgent={designAgent} selectedId={selected} onSelect={select} />;
@@ -125,6 +144,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     isDemo ? reviewWorkflow : null,
   );
   const [source, setSource] = useState(isDemo ? reviewProgram : "");
+  const sourceRef = useRef(source);
+  useEffect(() => { sourceRef.current = source; }, [source]);
   /** What the program is called. Named for the team it declares until the
       operator says otherwise. */
   const [filename, setFilename] = useState(
@@ -133,6 +154,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   /** What the compiler said about the source as it stands. */
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [checking, setChecking] = useState(false);
+  const [applyingConfiguration, setApplyingConfiguration] = useState(false);
   /** Every tag the program passes through, projected or observed. */
   const [steps, setSteps] = useState<TimelineStep[]>([]);
   const [truncated, setTruncated] = useState(false);
@@ -147,7 +169,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [pending, setPending] = useState<PendingInvocation[]>([]);
   const [answering, setAnswering] = useState(false);
   const [builderWidth, setBuilderWidth] = useState(DEFAULT_BUILDER);
-  const [inspectorWidth, setInspectorWidth] = useState(DEFAULT_INSPECTOR);
+  const [inspectorWidth, setInspectorWidth] = useState(0);
   // The first design splits the window down the middle. After that the widths
   // are the operator's, so this only ever fires once.
   const arrangedRef = useRef(isDemo);
@@ -169,17 +191,29 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [design, setDesign] = useState<ProposedDesign | null>(null);
   const [run, setRun] = useState<RunRecord | null>(null);
   const [error, setError] = useState("");
+  // The run's checkpoints, drawn on the timeline; the one a resume would
+  // continue from; and the one whose preview is open.
+  const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>([]);
+  const [resumePoint, setResumePoint] = useState<string | null>(null);
+  // The pick is remembered with the run it was made in, so a new run starts
+  // with none without an effect having to clear it.
+  const [checkpointPick, setCheckpointPick] = useState<{ run: string; id: string } | null>(null);
+  const [checkpointDetail, setCheckpointDetail] = useState<CheckpointDetail | null>(null);
+  // Bumped whenever the run says a checkpoint landed, so the listing refetches.
+  const [checkpointEpoch, setCheckpointEpoch] = useState(0);
   const [prompt, setPrompt] = useState("");
   /** Diagram components the operator has highlighted for the next message. */
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
-  const [filesOpen, setFilesOpen] = useState(false);
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [historyRevision, setHistoryRevision] = useState(0);
+  const [filesOpen, setFilesOpen] = useState(false);
+  const [inspected, setInspected] = useState<string | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const historyButtonRef = useRef<HTMLButtonElement>(null);
-    const historyRailButtonRef = useRef<HTMLButtonElement>(null);
+  const historyRailButtonRef = useRef<HTMLButtonElement>(null);
   const historyDrawer = useHistoryDrawer();
   useEffect(() => {
     if (historyDrawer && !switchingChat && serveUrl !== historyUrl) historyButtonRef.current?.focus();
@@ -190,7 +224,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     else setHistoryOpen(false);
     historyButtonRef.current?.focus();
   }
-    function openHistory() {
+  function openHistory() {
     if (historyDrawer) setDrawerOpen(true);
     else setHistoryOpen(true);
   }
@@ -200,6 +234,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
 
   const conversationIdRef = useRef<string | null>(null);
   const [conversationId, setConversationId] = useState("");
+  const workflowNames = useWorkflowNames(historyUrl);
   const [conversationTitle, setConversationTitle] = useState("What should the team do?");
   /** The web agent whose port panel is open. A program may declare several,
       each with its own ports and prompts, so this names one rather than
@@ -316,9 +351,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     setDesign(null);
     setSnapshot(null);
     setSource("");
+    setApplyingConfiguration(false);
     setFilename("program.omar");
     setSourceErrors([]);
     setSelection([]);
+    setInspected(null);
+    setFilesOpen(false);
     setConfirming(false);
     setPhase("idle");
     setPrompt("");
@@ -365,7 +403,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     async (runId: string) => {
       try {
         const next = await fetchPanel(serveUrl, runId);
-        if (runRef.current?.run_id === runId) setPending(next);
+        if (runRef.current?.run_id === runId && !isRunFinished(runRef.current.status)) setPending(next);
       } catch {
         // A panel that cannot be read is not a run that has failed. The next
         // event asks again.
@@ -408,7 +446,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
 
       const refresh = async () => {
         const next = await fetchDiagram(diagramUrl);
-        if (connected) setSnapshot(next);
+        if (connected && !isRunFinished(runRef.current?.status ?? record.status)) setSnapshot(next);
       };
       void refresh().catch(() => {
         /* the SSE stream reports connection loss */
@@ -430,6 +468,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             // finished; only `failed` is a failure. A still-running record
             // must not undo a terminal event while persistence catches up.
             setPhase(latest.status === "failed" ? "failed" : "finished");
+            setPending([]);
+            if (latest.status === "failed") setPanelAgent(null);
             if (latest.error) setError(latest.error);
             return;
           }
@@ -482,10 +522,23 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             setPending([]);
             void settle();
           }
+          if (event.kind === "run_checkpointed" || event.kind === "run_paused") {
+            // A new mark for the timeline: refetch the listing it draws.
+            setCheckpointEpoch((n) => n + 1);
+          }
+          if (event.kind === "run_paused") {
+            // Checkpointed and parked at a tag boundary: the picture stays,
+            // labelled paused, and nothing is owed until `omar resume`.
+            setPhase("finished");
+            setPending([]);
+            void settle();
+          }
           if (event.kind === "run_failed") {
             runRef.current = { ...record, status: "failed" };
             setRun(runRef.current);
             setPhase("failed");
+            setPending([]);
+            setPanelAgent(null);
             const message = (event.payload as { message?: unknown }).message;
             setError(typeof message === "string" ? message : "The run failed.");
             void settle();
@@ -589,7 +642,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         const available = workspaceRef.current?.clientWidth ?? 0;
         // Conversation and diagram side by side; the source pane starts
         // collapsed behind its handle rather than crowding the first look.
-        if (available) setBuilderWidth(Math.round(available / 2));
+        if (available) setBuilderWidth(Math.min(DEFAULT_BUILDER, Math.round(available / 2)));
         setInspectorWidth(0);
       }
       setPhase(runRef.current && !isRunFinished(runRef.current.status) ? "observing" : "review");
@@ -616,11 +669,16 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         buffered = [];
         const restore = async () => {
           const activeRun = conversation.run && !isRunFinished(conversation.run.status);
+          // Parked, not over: a paused run keeps its controls and its timeline.
+          const parkedRun = conversation.run?.status === "paused";
           // Keep the current chat on screen while its replacement is replayed
           // and its live snapshot is fetched. Commit them in one React batch.
+          // A paused run's diagram server is gone; serve kept its last picture.
           const liveSnapshot = activeRun && conversation.run?.diagram_address
             ? await fetchDiagram(diagramUrlFor(conversation.run), abort.signal).catch(() => null)
-            : null;
+            : conversation.run?.status === "paused"
+              ? await fetchRunSnapshot(serveUrl, conversation.run.run_id, abort.signal).catch(() => null)
+              : null;
           if (!connected || currentRevision !== revision || conversation.id !== subscribedId) return;
           restoreConversation(conversation);
           runRef.current = conversation.run ?? null;
@@ -647,12 +705,15 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           setAssistantBusy(conversation.busy);
           // A finished run must not override the proposal restored from the
           // transcript. Only a live topology owns the diagram and its controls.
-          if (replayedProposal && !activeRun) {
+          if (replayedProposal && !activeRun && !parkedRun) {
             runRef.current = null;
-            setRun(null);
+            // Keep a failed record visible beside the restored proposal.
+            // The proposal owns the source; the record explains the last run.
+            setRun(conversation.run?.status === "failed" ? conversation.run : null);
+            if (conversation.run?.status === "failed") setError(conversation.run.error ?? "The run failed.");
             setTab("source");
             setPhase("review");
-          } else if (conversation.busy && !activeRun) {
+          } else if (conversation.busy && !activeRun && !parkedRun) {
             setPhase("drafting");
           }
           // Replies received during the snapshot fetch are newer than the
@@ -674,8 +735,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     };
   }, [agent, restoreConversation, observe, loadPanel, serveUrl, historyUrl, onSelect]);
 
-  async function confirmDesign() {
-    if (!design || phase !== "review") return;
+  async function confirmDesign(options: DeployOptions) {
+    if (!design || !["review", "finished", "failed"].includes(phase)) return;
     setConfirming(false);
     setPhase("spawning");
     const scope = scopeRef.current;
@@ -685,8 +746,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       // they are looking at is what they are deploying.
       const record = await startRun(serveUrl, {
         program: source,
+        files: design.files,
         inputs: design.inputs,
+        timeout_seconds: options.timeoutSeconds,
         conversation_id: conversationIdRef.current ?? undefined,
+        keep_workspaces: options.keepWorkspaces,
+        checkpoint_period: options.checkpointPeriod,
       });
       if (scope !== scopeRef.current) return;
       setSnapshot((current) => (current ? { ...current, team: record.team } : current));
@@ -727,6 +792,73 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     }
   }
 
+  async function applyStepConfiguration(nextSource: string) {
+    if (applyingConfiguration) throw new Error("Another configuration update is being validated.");
+    const scope = scopeRef.current;
+    const original = source;
+    if (daemon.state !== "live" || (run && !isRunFinished(run.status))) throw new Error("Wait until the workflow is idle before editing its configuration.");
+    setApplyingConfiguration(true);
+    try {
+      const checked = await checkProgram(serveUrl, nextSource, filename, { files: design?.files });
+      if (scope !== scopeRef.current || sourceRef.current !== original) throw new Error("The workflow changed during validation. Reopen this step and try again.");
+      if (runRef.current && !isRunFinished(runRef.current.status)) throw new Error("The workflow started during validation. Apply these changes after it finishes.");
+      if (!checked.ok) throw new Error((checked.errors ?? ["The configuration did not compile."]).join("\n"));
+      setSource(nextSource);
+      setSourceErrors([]);
+      if (checked.preview && !runRef.current) setSnapshot(checked.preview);
+    } finally {
+      if (scope === scopeRef.current) setApplyingConfiguration(false);
+    }
+  }
+
+  /** Ask the run to checkpoint and park at its next tag boundary. */
+  async function requestPause() {
+    if (!run || isStopping || isPausing) return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const record = await pauseRun(serveUrl, run.run_id);
+      if (scope === scopeRef.current) setRun(record);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  /** Move the resume point of a paused run back to the checkpoint picked on the timeline. */
+  async function requestRollback(checkpoint: string) {
+    if (!run || run.status !== "paused" || checkpoint === resumePoint) return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const point = await rollbackRun(serveUrl, run.run_id, checkpoint);
+      if (scope !== scopeRef.current) return;
+      setResumePoint(point);
+      setCheckpointEpoch((n) => n + 1);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  /** Continue a paused run: the daemon restores its files and agents, then the panel watches it again. */
+  async function requestResume() {
+    if (!run || run.status !== "paused") return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const record = await resumeRun(serveUrl, run.run_id);
+      if (scope !== scopeRef.current) return;
+      runRef.current = record;
+      setRun(record);
+      setPhase("observing");
+      observe(record);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
   /** Click a component to include it in the next message, click it again to drop it. */
   function toggleComponent(component: string) {
     setSelection((current) =>
@@ -737,11 +869,16 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   }
 
   function discardDesign() {
+    disconnectRef.current?.();
+    disconnectRef.current = null;
     setTab("source");
     setConfirming(false);
     setDesign(null);
+    setRun(null);
+    runRef.current = null;
     // The diagram those names pointed at is going away with the design.
     setSelection([]);
+    setInspected(null);
     // Discarding puts the studio back where it was before the proposal —
     // leaving the topology on screen implies a design is still in play.
     setSnapshot(isDemo ? reviewWorkflow : null);
@@ -762,6 +899,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   // messages, which told an operator nothing they wanted to know.
   const lag = typeof snapshot?.lag === "number" ? formatDuration(snapshot.lag) : "—";
   const canRun = daemon.state === "live";
+  const retrying = run !== null && isRunFinished(run.status);
+  const canConfirm = design !== null && ["review", "finished", "failed"].includes(phase);
+  const failedRun = run?.status === "failed";
+  const failureDetails = failedRun ? (run.error || error || "The run failed.") : "";
+  const failure = failedRun ? describeRunFailure(failureDetails, snapshot?.agents ?? []) : null;
+  const manualStep = phase === "observing" ? pending[0] : undefined;
   // The compiler answers on every pause in typing. Debounced because a check
   // compiles a real program on disk, and aborted on the next keystroke so a
   // stale answer cannot land after a newer one.
@@ -789,6 +932,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         filename,
         {
           timeline: true,
+          files: design?.files,
           present: presentKey ? presentKey.split("\u0000") : [],
         },
         abort.signal,
@@ -801,7 +945,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           // every transient error would make it flicker for the whole of an
           // edit. And only until a run exists, after which the diagram belongs
           // to what is running rather than to what has since been typed.
-          if (result.ok && result.preview && runRef.current === null) {
+          if (result.ok && result.preview && (runRef.current === null || (phase === "review" && isRunFinished(runRef.current.status)))) {
             setSnapshot(result.preview);
           }
           setSteps(result.steps ?? []);
@@ -822,12 +966,115 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       clearTimeout(timer);
       abort.abort();
     };
-  }, [source, filename, serveUrl, canRun, presentKey, switchingChat]);
+  }, [source, filename, serveUrl, canRun, presentKey, switchingChat, phase, design?.files]);
 
   const isDeployed = run !== null;
   // The daemon's own word for it. Every terminal status replaces it, so the
   // state cannot outlive the run it was asked of.
   const isStopping = run?.status === "stopping";
+  const isPausing = run?.status === "pausing";
+  const isPaused = run?.status === "paused";
+
+  // The run's checkpoints, for the timeline. Keyed on the run's id rather
+  // than the record object, which every poll replaces; refetched when the
+  // run reports a new checkpoint, pauses, or rolls back.
+  const runId = run?.run_id;
+  const selectedCheckpoint =
+    checkpointPick && checkpointPick.run === runId ? checkpointPick.id : null;
+  useEffect(() => {
+    if (!runId) return;
+    const scope = scopeRef.current;
+    void fetchCheckpoints(serveUrl, runId)
+      .then((listing) => {
+        if (scope !== scopeRef.current) return;
+        setCheckpoints(listing.checkpoints);
+        setResumePoint(listing.resume_point);
+      })
+      .catch(() => {});
+  }, [runId, serveUrl, checkpointEpoch]);
+
+  // A run observed without a draft behind it (admitted over the API, or the
+  // page reloaded) still gets its timeline: the daemon projects it from the
+  // program it staged, so checkpoints have tags to sit on.
+  const stepsMissing = steps.length === 0;
+  useEffect(() => {
+    if (!runId || !stepsMissing) return;
+    const scope = scopeRef.current;
+    void fetchRunTimeline(serveUrl, runId)
+      .then((projection) => {
+        if (scope !== scopeRef.current || projection.steps.length === 0) return;
+        setSteps(projection.steps);
+        setTruncated(projection.truncated);
+      })
+      .catch(() => {});
+  }, [runId, serveUrl, stepsMissing]);
+
+  // The preview of the checkpoint picked on the timeline. Shown only while
+  // it matches the pick, so a stale detail never describes another one.
+  useEffect(() => {
+    if (!runId || !selectedCheckpoint) return;
+    const scope = scopeRef.current;
+    void fetchCheckpoint(serveUrl, runId, selectedCheckpoint)
+      .then((detail) => {
+        if (scope === scopeRef.current) setCheckpointDetail(detail);
+      })
+      .catch(() => {});
+  }, [runId, serveUrl, selectedCheckpoint, checkpointEpoch]);
+  const shownDetail =
+    selectedCheckpoint && checkpointDetail?.id === selectedCheckpoint ? checkpointDetail : null;
+
+  // Pause, Stop and Resume act on the run's timeline — a pause lands at a tag
+  // boundary, a resume continues from a checkpointed tag — so they live with
+  // the strip rather than in the heading, and stay reachable when it is folded.
+  const runControls =
+    (phase === "observing" && run) || (isPaused && run) ? (
+      <span className="run-controls" role="group" aria-label="Run controls">
+        {isPaused && run ? (
+          <button
+            className="primary-button"
+            onClick={() => void requestResume()}
+            type="button"
+            title="Restores the resume point's files and agents, then continues the queue"
+          >
+            Resume
+          </button>
+        ) : null}
+        {phase === "observing" && run ? (
+          <button
+            className="secondary-button"
+            onClick={() => void requestPause()}
+            type="button"
+            disabled={isStopping || isPausing}
+            title={
+              isPausing
+                ? "The current tag has to close first"
+                : "Checkpoints at the next tag boundary, then parks the run"
+            }
+          >
+            {isPausing ? "Pausing…" : "Pause"}
+          </button>
+        ) : null}
+        {(phase === "observing" || isPaused) && run ? (
+          <button
+            className="secondary-button"
+            onClick={() => void requestStop()}
+            type="button"
+            disabled={isStopping}
+            title={
+              isStopping
+                ? "The current tag has to close first"
+                : isPaused
+                  ? "Gives the paused run up, which frees its team; its checkpoints stay on disk"
+                  : isPausing
+                    ? "Outranks the pause: the run stops at the next tag boundary instead"
+                    : "Closes the current tag, then persists and tears down"
+            }
+          >
+            {isStopping ? "Stopping…" : "Stop"}
+          </button>
+        ) : null}
+      </span>
+    ) : null;
 
   // Widths are clamped against the workspace so the diagram always keeps a
   // usable column, whichever divider is being dragged. Below a panel's minimum
@@ -863,6 +1110,19 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     ? `${builderWidth}px auto minmax(0, 1fr) auto ${inspectorWidth}px`
     : "minmax(0, 1fr)";
 
+  function editSource() {
+    setFilesOpen(false);
+    setInspected(null);
+    setTab("source");
+    setInspector(DEFAULT_INSPECTOR);
+  }
+
+  function askAboutStep(request: string) {
+    setPrompt(request);
+    if (builderWidth === 0) setBuilder(DEFAULT_BUILDER);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
   return (
     <main className="studio-shell">
       <div className="visually-hidden" aria-live="polite">
@@ -873,7 +1133,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       </div>
 
       <div className="studio-content">
-        {isDemo ? <aside className="history-rail" aria-label="Omar"><OmarLogo /></aside> : null}
+        {isDemo ? <aside className="chat-history demo-history" aria-label="Workflow navigation"><header><div className="brand-lockup"><OmarLogo /><strong>OMAR</strong></div></header><div className="sidebar-heading"><div><span className="eyebrow">WORKSPACE</span><h2>Workflows</h2></div><span className="workflow-count">1</span></div><div className="history-label">DEMO WORKFLOW</div><ul><li><button type="button" aria-current="true" onClick={() => composerRef.current?.focus()}><span className="workflow-name">Review workflow <WorkflowIcon name="chevron" size={14} /></span><span className="workflow-description">Plan, review, and refine a release</span><span className="workflow-meta"><small className="workflow-status status-draft"><i />Demo</small></span></button></li></ul></aside> : null}
         {!isDemo && (!historyDrawer || drawerOpen) ? (
           <ChatHistory
             serveUrl={historyUrl}
@@ -881,14 +1141,26 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             onSwitchingChange={setSelectingChat}
             mobile={historyDrawer}
             revision={`${historyRevision}:${messages.length}`}
-                        collapsed={!historyDrawer && !historyOpen}
+            collapsed={!historyDrawer && !historyOpen}
             onClose={closeHistory}
-                        onOpen={openHistory}
-            railButtonRef={historyRailButtonRef}
             onSelect={(conversation) => {
               onSelect(conversation);
               if (historyDrawer) setDrawerOpen(false);
             }}
+          />
+        ) : null}
+        {!isDemo && !historyDrawer ? (
+          <Resizer
+            label="the workflow list"
+            collapsed={!historyOpen}
+            toward="right"
+            fixed
+            handleRef={historyRailButtonRef}
+            onExpand={openHistory}
+            onCollapse={closeHistory}
+            onDragStart={() => {}}
+            onDelta={() => {}}
+            onStep={() => {}}
           />
         ) : null}
       <section
@@ -910,28 +1182,19 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             .filter(Boolean)
             .join(" ")}
         >
-          <h1 className="visually-hidden">{conversationTitle}</h1>
-          {!isDemo && historyDrawer ? (
-            <div className="chat-mobile-controls">
-              <button
-                type="button"
-                ref={historyButtonRef}
-                className="history-button"
-                onClick={() => setDrawerOpen((open) => !open)}
-                aria-expanded={historyVisible}
-                aria-controls="chat-history"
-                aria-haspopup="dialog"
-                aria-label="Open chat history"
-              >
-                <SidebarIcon direction="open" />
-              </button>
-            </div>
-          ) : null}
+          <h1 className="visually-hidden">{workflowNames[conversationId]?.name ?? conversationTitle}</h1>
+          <header className="conversation-header">
+            {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
+            <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
+            <div className="conversation-actions"><SettingsMenu />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+          </header>
           <div className="messages" ref={threadRef}>
+            {messages.length > 0 ? <div className="date-divider">Conversation</div> : null}
             {messages.length === 0 && snapshot ? (
               <p className="builder-status">
-                Describe a workflow. The assistant drafts an OMAR program for
-                you to confirm before anything runs.
+                Describe a workflow you want to automate — from development to
+                marketing and beyond. The assistant will draft an implementation
+                for you to review and run.
               </p>
             ) : null}
             {messages.map((message) => (
@@ -952,7 +1215,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               <button
                 type="button"
                 className="selection-clear"
-                onClick={() => setSelection([])}
+                onClick={() => { setSelection([]); setInspected(null); }}
               >
                 Clear
               </button>
@@ -961,6 +1224,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
 
           <form className="prompt-box" onSubmit={(event) => void submitPrompt(event)}>
             <textarea
+              ref={composerRef}
               disabled={switchingChat || (!isDemo && !conversationId)}
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
@@ -972,7 +1236,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
               }}
-              placeholder="Describe a workflow…  Enter to send, Shift+Enter for a new line"
+              placeholder={snapshot ? "Ask OMAR to update this workflow…" : "Describe a workflow you want to automate…"}
+              title="Enter to send, Shift+Enter for a new line"
               aria-label="Describe a workflow"
             />
             <div>
@@ -1003,7 +1268,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                     disabled={daemon.state !== "live" || switchingChat || !conversationId}
                     aria-haspopup="dialog"
                   >
-                    Inspect on terminal
+                    Inspect terminal
                   </button>
                 ) : null}
                 {!isDemo ? (
@@ -1028,11 +1293,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                   aria-label="Draft workflow"
                   disabled={(switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning"}
                 >
-                  ↑
+                  <WorkflowIcon name="send" size={19} />
                 </button>
               </div>
             </div>
           </form>
+          <p className="composer-footnote">OMAR can make mistakes. Review changes before running.</p>
         </aside>
 
         {snapshot ? (
@@ -1041,6 +1307,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             collapsed={builderWidth === 0}
             toward="right"
             onExpand={() => setBuilder(DEFAULT_BUILDER)}
+            onCollapse={() => setBuilder(0)}
             onDragStart={() => {
               dragOriginRef.current.builder = builderWidth;
             }}
@@ -1056,18 +1323,18 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               {/* The panel draws a proposal before a run and the run after it,
                   so it has to say which one is on screen. */}
               <span className="eyebrow">
-                {snapshot.status === "ready" ? "PROPOSED TOPOLOGY" : "LIVE TOPOLOGY"}
+                {snapshot.status === "ready" ? "PROPOSED TOPOLOGY" : "WORKFLOW TOPOLOGY"}
               </span>
               <h2>{snapshot?.team}</h2>
             </div>
             <div className="run-stats">
-              <span><small>STATUS</small>{snapshot?.status}</span>
+              <span><small>{phase === "review" && failedRun ? "LAST RUN" : "STATUS"}</small>{run?.status ?? snapshot?.status}</span>
               <span><small>TAG</small>{tag}</span>
               <span><small>LAG</small>{lag}</span>
             </div>
-            {(phase === "review" && design) || (phase === "observing" && run) ? (
+            {canConfirm ? (
             <div className="workflow-actions">
-              {phase === "review" && design ? (
+              {canConfirm ? (
                 <span role="group" aria-label="Deploy design">
                   <button className="secondary-button" onClick={discardDesign} type="button">
                     Discard
@@ -1076,35 +1343,42 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                     className="primary-button"
                     onClick={() => setConfirming(true)}
                     type="button"
-                    disabled={!canRun}
+                    // Not disabled during the background compiler check: it
+                    // runs on a debounce after every proposal, and a button
+                    // that blinks off for it drops the click that was already
+                    // on its way. The confirmation's own button still waits.
+                    disabled={!canRun || applyingConfiguration || switchingChat || sourceErrors.length > 0}
                     aria-haspopup="dialog"
+                    aria-label={retrying ? "Run again" : "Deploy"}
                   >
-                    Deploy
+                    <WorkflowIcon name="arrow" size={14} /> {retrying ? "Run again" : "Run workflow"}
                   </button>
                 </span>
-              ) : null}
-              {phase === "observing" && run ? (
-                <button
-                  className="secondary-button"
-                  onClick={() => void requestStop()}
-                  type="button"
-                  disabled={isStopping}
-                  title={
-                    isStopping
-                      ? "The current tag has to close first"
-                      : "Closes the current tag, then persists and tears down"
-                  }
-                >
-                  {isStopping ? "Stopping…" : "Stop"}
-                </button>
               ) : null}
             </div>
             ) : null}
           </div>
+          {failure ? (
+            <div className="run-feedback run-failure" role="alert">
+              <strong>Last run failed</strong>
+              <p>{failure.summary}</p>
+              <p>{failure.guidance}</p>
+              <details><summary>Error details</summary><pre>{failureDetails}</pre></details>
+            </div>
+          ) : null}
+          {manualStep ? (
+            <div className="run-feedback run-waiting" role="status">
+              <strong>Waiting for your response · {manualStep.agent}</strong>
+              <p>This Web step needs a response from you. Open the response panel to read the task and submit its result.</p>
+              <button type="button" className="primary-button" onClick={() => setPanelAgent(manualStep.agent)}>Open response panel</button>
+            </div>
+          ) : null}
+          <div className="topology-body">
           <DiagramCanvas
             snapshot={snapshot}
             selection={selection}
             onToggleComponent={toggleComponent}
+            onInspectComponent={(component) => setInspected((current) => current === component ? null : component)}
             // Agents outlive the run that spawned them, so a finished run can
             // still be opened; before a run there is nothing behind the node.
             highlight={timelineOpen ? highlighted : undefined}
@@ -1113,12 +1387,29 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             // answered through instead, which is the only thing there is.
             onOpenPanel={run ? setPanelAgent : undefined}
           />
+          {inspected ? <StepInspector key={`${serveUrl}:${inspected}`} component={inspected} snapshot={snapshot} source={source} editable={canRun && !switchingChat && (!run || isRunFinished(run.status))} onApply={applyStepConfiguration} onClose={() => setInspected(null)} onEdit={editSource} onAsk={askAboutStep} /> : null}
+          </div>
           {timelineOpen ? (
             <Timeline
               steps={steps}
               index={stepIndex}
               live={following && phase === "observing"}
               truncated={truncated}
+              controls={runControls}
+              checkpoints={runId ? checkpoints : []}
+              resumePoint={runId ? resumePoint : null}
+              selected={selectedCheckpoint}
+              detail={shownDetail}
+              canRollBack={isPaused}
+              rollBackHint={
+                run && !isPaused
+                  ? "Pause the run first; a rollback picks the tag a paused run continues from."
+                  : undefined
+              }
+              onSelectCheckpoint={(id) =>
+                setCheckpointPick(id && runId ? { run: runId, id } : null)
+              }
+              onRollBack={(id) => void requestRollback(id)}
               onScrub={(next) => {
                 // Scrubbing takes the strip off the run: the operator is
                 // looking at a tag, not at where execution has reached.
@@ -1128,13 +1419,16 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               onClose={() => setTimelineOpen(false)}
             />
           ) : (
-            <button
-              type="button"
-              className="timeline-handle"
-              onClick={() => setTimelineOpen(true)}
-            >
-              ▲ Timeline
-            </button>
+            <div className="timeline-handle-bar">
+              <button
+                type="button"
+                className="timeline-handle"
+                onClick={() => setTimelineOpen(true)}
+              >
+                <span><WorkflowIcon name="chevron" size={13} /> Run timeline</span><small>{events.length ? `${events.length} events` : `${steps.length} projected steps`}</small>
+              </button>
+              {runControls}
+            </div>
           )}
         </section>
         ) : null}
@@ -1145,6 +1439,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             collapsed={inspectorWidth === 0}
             toward="left"
             onExpand={() => setInspector(DEFAULT_INSPECTOR)}
+            onCollapse={() => setInspector(0)}
             onDragStart={() => {
               dragOriginRef.current.inspector = inspectorWidth;
             }}
@@ -1178,6 +1473,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           </div>
 
           {tab === "source" ? (
+            <>
+            {Object.keys(design?.files ?? {}).length > 0 ? <button className="secondary-button" onClick={() => setFilesOpen(true)}>View companion files ({Object.keys(design?.files ?? {}).length})</button> : null}
             <OmarEditor
               source={source}
               filename={filename}
@@ -1187,6 +1484,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               onSourceChange={setSource}
               onFilenameChange={setFilename}
             />
+            </>
           ) : (
             <div className="event-strip" role="tabpanel">
               {events.length ? (
@@ -1206,12 +1504,17 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       </section>
       </div>
 
-      {confirming && phase === "review" && design ? (
+      {confirming && canConfirm ? (
         <DeployConfirmation
           team={snapshot?.team ?? "this topology"}
-          disabled={!canRun}
+          // The background check does not gate this either: the daemon
+          // compiles what it is sent and refuses a bad program itself.
+          disabled={!canRun || applyingConfiguration || switchingChat || sourceErrors.length > 0}
+          retry={retrying}
+          manual={snapshot?.agents.some((agent) => agent.backend.toLowerCase() === "web")}
+          initialTimeoutSeconds={defaultRunTimeout(snapshot?.agents ?? [])}
           onCancel={() => setConfirming(false)}
-          onConfirm={() => void confirmDesign()}
+          onConfirm={(options) => void confirmDesign(options)}
         />
       ) : null}
 
@@ -1226,7 +1529,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         />
       ) : null}
 
-      {filesOpen ? <Artifacts key={serveUrl} serveUrl={serveUrl} onClose={() => setFilesOpen(false)} /> : null}
+      {filesOpen ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); }} onClose={() => setFilesOpen(false)} /> : null}
       {terminalAgent ? (
         <AgentTerminal
           serveUrl={serveUrl}

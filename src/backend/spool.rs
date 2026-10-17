@@ -93,9 +93,7 @@ pub(crate) fn reset_spool(session: &str) {
 }
 
 pub(crate) fn spool_path(session: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar")
+    crate::sessions::state_root()
         .join("events")
         .join(format!("{}.jsonl", session))
 }

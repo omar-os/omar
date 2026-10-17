@@ -82,7 +82,8 @@
       "contract": "plan",
       "status": "idle",
       "invocation_id": null,
-      "instance": "flow"
+      "instance": "flow",
+      "prompt": "Draft a release plan for $(request). Keep it to five numbered steps."
     },
     {
       "id": "reaction::flow.reaction.1",
@@ -99,7 +100,8 @@
       "status": "idle",
       "invocation_id": null,
       "instance": "flow",
-      "within": 300000000000
+      "within": 300000000000,
+      "prompt": "Critique the plan: $(plan). List the risks the author missed and the ones that are overstated, then say which to fix first."
     },
     {
       "id": "reaction::flow.reaction.2",
@@ -115,7 +117,8 @@
       "contract": "result",
       "status": "idle",
       "invocation_id": null,
-      "instance": "flow"
+      "instance": "flow",
+      "prompt": "Return the final result from $(critique)."
     }
   ],
   "edges": [

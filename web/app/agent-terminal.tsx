@@ -38,7 +38,7 @@ export function AgentTerminal({
       convertEol: false,
       cursorBlink: true,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-      fontSize: 13,
+      fontSize: 15,
       theme: { background: "#0b0b0e", foreground: "#d8d5e0" },
     });
     const fit = new FitAddon();

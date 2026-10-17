@@ -130,12 +130,20 @@ test("the diagram reflects live reaction state from the run", async ({ page }) =
     timeout: 30_000,
   });
 
-  // Every reaction ends completed, so the renderer should show no idle chevrons
-  // and the diagram should carry one per reaction in the captured topology.
+  // A task is completed at the tag it ran at and idle again at the next, so
+  // only the last tag's task ends green; the diagram carries one card per
+  // task in the captured topology.
   const reactions = page.locator(".omar-reaction");
   await expect(reactions).toHaveCount(3);
-  await expect(page.locator(".omar-reaction.completed")).toHaveCount(3);
-  await expect(page.locator(".omar-reaction.idle")).toHaveCount(0);
+  await expect(page.locator(".omar-reaction.completed")).toHaveCount(1);
+  await expect(page.locator(".omar-reaction.idle")).toHaveCount(2);
+  // Numbered within the team instance, named by the agent alone, summarised
+  // by the prompt in one line that never widens the card.
+  const first = reactions.first();
+  await expect(first.locator(".omar-reaction-index")).toHaveText("01");
+  await expect(first.locator(".omar-reaction-name")).toHaveText("planner");
+  await expect(first.locator(".omar-reaction-description")).toHaveText(/^Draft a release plan.*…$/);
+  await expect(reactions.nth(1).locator(".omar-reaction-description")).toHaveText("Critique the plan: plan");
   // Reactions are anonymous in OMAR, so the agent is the headline.
   await expect(page.locator(".omar-reactions")).toContainText("planner");
   await expect(page.locator(".omar-reactions")).toContainText("reviewer");
@@ -193,8 +201,8 @@ test("a reaction's deadline is drawn as a stopwatch on its chevron", async ({
   // The chevron widens for it rather than the stopwatch landing on the name.
   const marked = page.locator(".omar-reaction", { has: deadlines });
   const plain = page.locator(".omar-reaction").first();
-  const markedBox = (await marked.locator("polygon").boundingBox())!;
-  const plainBox = (await plain.locator("polygon").boundingBox())!;
+  const markedBox = (await marked.locator(".omar-reaction-body").boundingBox())!;
+  const plainBox = (await plain.locator(".omar-reaction-body").boundingBox())!;
   expect(markedBox.width).toBeGreaterThan(plainBox.width);
 });
 
@@ -215,7 +223,12 @@ test("a web component's panel opens from the diagram, and answers it", async ({
   await deploy(page);
 
   const panel = page.getByRole("dialog", { name: /Port panel for/ });
-  // Not docked anywhere: nothing is on screen until the component is opened.
+  // The handoff stays visible even when its dialog is closed.
+  await expect(panel).toBeHidden();
+  await expect(page.locator(".run-waiting")).toContainText("Waiting for your response");
+  await page.getByRole("button", { name: "Open response panel" }).click();
+  await expect(panel).toBeVisible();
+  await panel.getByRole("button", { name: "Close", exact: true }).click();
   await expect(panel).toBeHidden();
 
   // Drawn as reachable before it is touched: exactly one reaction on the
@@ -303,6 +316,9 @@ test("Enter sends, modified Enter writes a new line", async ({ page }) => {
   await composer.press("Enter");
   await expect(composer).toHaveValue("");
   await expect(page.locator(".messages")).toContainText("first line second line");
+  // The sent message keeps its line break rather than collapsing it.
+  const sent = page.locator(".message.operator p").last();
+  expect(await sent.evaluate((el) => (el as HTMLElement).innerText)).toBe("first line\nsecond line");
 });
 
 test("waiting holds one verb per turn and changes between turns", async ({
@@ -705,10 +721,137 @@ test("the workflow's buttons sit with the workflow", async ({ page }) => {
 
   // And the stats did not get stranded in the middle by the third child.
   const stats = (await page.locator(".run-stats").boundingBox())!;
-  expect(stats.x).toBeGreaterThan(
+  expect(stats.x).toBeGreaterThanOrEqual(
     (await page.locator(".diagram-heading h2").boundingBox())!.x,
   );
   expect(stats.x + stats.width).toBeLessThanOrEqual(first.x + 1);
+});
+
+test("a run can be paused and resumed from the panel that shows it", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  // The run's controls live with its timeline, not in the heading: a pause
+  // lands at a tag, a resume continues from one. Before a run, none.
+  const actions = page.getByRole("group", { name: "Run controls" });
+  await expect(actions).toHaveCount(0);
+
+  await deploy(page);
+  const pause = actions.getByRole("button", { name: "Pause" });
+  await expect(pause).toBeEnabled();
+  await pause.click();
+
+  // A pause lands at the next tag boundary, after a checkpoint, so the
+  // button has to say it was heard.
+  await expect(actions.getByRole("button", { name: "Pausing…" })).toBeDisabled();
+  // A stop still outranks it, in case the capture never lands.
+  await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
+
+  // Parked: the picture stays, labelled paused, and what is left to offer is
+  // to continue, or to give the run up (a paused run holds its team).
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  const resume = actions.getByRole("button", { name: "Resume" });
+  await expect(resume).toBeVisible();
+  await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
+  await expect(actions.getByRole("button", { name: "Pause" })).toHaveCount(0);
+
+  // A reload finds the parked run as it was: its diagram server is gone,
+  // but serve kept the picture, so the controls and the timeline come back.
+  await page.reload();
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  await expect(actions.getByRole("button", { name: "Resume" })).toBeVisible();
+
+  // A paused run rolls back from the timeline: checkpoints are marks at the
+  // tags they completed, a mark opens a preview of what it holds, and the
+  // preview is where "continue from here" is committed.
+  await page.getByRole("button", { name: /Run timeline/ }).click();
+  const timeline = page.getByLabel("Logical timeline");
+  // Ticks stand on the track itself, one per checkpoint.
+  await expect(timeline.getByLabel("Checkpoints").getByRole("button")).toHaveCount(2);
+  await timeline.getByRole("button", { name: "Checkpoint #1" }).click();
+  const preview = timeline.getByLabel("Checkpoint preview");
+  await expect(preview).toContainText("Checkpoint #1 · manual");
+  await expect(preview).toContainText("after tag");
+  // What it holds stays in the file viewer; the preview is the tag and the
+  // way back to it, which must be on screen without scrolling the panel.
+  await expect(preview).not.toContainText("workspace");
+  const rollback = preview.getByRole("button", { name: "Roll back to this checkpoint" });
+  await expect(rollback).toBeEnabled();
+  await expect(rollback).toBeInViewport();
+  await rollback.click();
+  // Committed: this checkpoint is now where a resume continues from, and
+  // the newer one is still listed — nothing was deleted.
+  await expect(preview).toContainText("A resume continues from here.");
+  await expect(timeline.getByLabel("Checkpoints").getByRole("button")).toHaveCount(2);
+
+  await resume.click();
+  // Back to a live run, with its controls beside the open timeline.
+  await expect(actions.getByRole("button", { name: "Pause" })).toBeEnabled();
+  await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
+  await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
+});
+
+test("the confirmation chooses what the run keeps and how it checkpoints", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  // Defaults: files go with the run, and no checkpoints until enabled.
+  const keep = dialog.getByRole("checkbox", { name: "Keep workspace files after the run ends" });
+  await expect(keep).not.toBeChecked();
+  const enable = dialog.getByRole("checkbox", { name: "Enable checkpoints" });
+  await expect(enable).not.toBeChecked();
+  await expect(dialog.getByLabel("Checkpoint cadence")).toHaveCount(0);
+  // Enabled, the cadence starts at every physical hour.
+  await enable.check();
+  const cadence = dialog.getByLabel("Checkpoint cadence");
+  await expect(cadence).toHaveValue("hour");
+  // A custom period that adds up to nothing cannot be confirmed.
+  await cadence.selectOption("custom");
+  await expect(dialog.getByRole("alert")).toContainText("above zero");
+  await expect(dialog.getByRole("button", { name: "Confirm deploy" })).toBeDisabled();
+  await dialog.getByLabel("Checkpoint clock").selectOption("logical");
+  await dialog.getByLabel("Period hours").fill("2");
+  await dialog.getByLabel("Period minutes").fill("30");
+  await expect(dialog.getByRole("alert")).toHaveCount(0);
+  await keep.check();
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  // What the daemon was asked for.
+  const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
+  const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
+  expect(options).toEqual({ keep_workspaces: true, checkpoint_period: "logical:2h30m" });
+});
+
+test("checkpoints are off unless enabled", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  await expect(dialog.getByRole("checkbox", { name: "Enable checkpoints" })).not.toBeChecked();
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
+  const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
+  expect(options).toEqual({ keep_workspaces: false, checkpoint_period: "off" });
+});
+
+test("the file viewer shows the current run's instances only", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  // The workflow is available before deployment; run workspaces are still empty.
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  const viewer = page.getByRole("dialog", { name: "Files" });
+  await expect(viewer.getByRole("tab", { name: "Workflow", exact: true })).toHaveAttribute("aria-selected", "true");
+  await viewer.getByRole("tab", { name: "Run workspaces & versions" }).click();
+  await expect(viewer).toContainText("No run in this chat yet");
+  await viewer.getByRole("button", { name: "Close files" }).click();
+  await deploy(page);
+  await expect(page.locator(".connection")).toContainText("observing");
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  const instances = viewer.getByLabel("Team workspace");
+  await expect(instances.locator("option")).toHaveCount(1);
+  await expect(instances.locator("option")).toContainText("leader");
+  await expect(viewer.getByRole("navigation", { name: "Workspace files" })).toContainText("notes.txt");
 });
 
 test("a run can be stopped from the panel that shows it", async ({ page }) => {
@@ -719,11 +862,12 @@ test("a run can be stopped from the panel that shows it", async ({ page }) => {
 
   // The eyebrow says which topology is on screen: this one has not run.
   await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("PROPOSED TOPOLOGY");
-  const actions = page.locator(".diagram-heading .workflow-actions");
+  // Stop belongs to the run's timeline, where a stop lands on a tag.
+  const actions = page.getByRole("group", { name: "Run controls" });
   await expect(actions.getByRole("button", { name: "Stop" })).toHaveCount(0);
 
   await deploy(page);
-  await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("LIVE TOPOLOGY");
+  await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("WORKFLOW TOPOLOGY");
 
   const stop = actions.getByRole("button", { name: "Stop" });
   await expect(stop).toBeEnabled();
@@ -955,9 +1099,10 @@ test("a finished run leaves nothing running and still opens a terminal", async (
   await expect(page.locator(".omar-reaction.running")).toHaveCount(0);
   const reactions = page.locator(".omar-reaction");
   await expect(reactions).not.toHaveCount(0);
-  for (const reaction of await reactions.all()) {
-    await expect(reaction).toContainText("completed");
-  }
+  // Completed is a fact about the tag a task ran at: the last tag's task
+  // reads completed, the earlier ones read idle again.
+  await expect(reactions.last()).toContainText("completed");
+  await expect(reactions.first()).toContainText("idle");
 
   // The agents outlive the run, so their terminals are still reachable.
   await page.locator(".omar-reaction .omar-reaction-body").first().dblclick();
@@ -1259,6 +1404,95 @@ test("every edge runs on an axis", async ({ page }) => {
   expect(tilted).toHaveLength(0);
 });
 
+test("a wrapped team never strands a port in a row of its own", async ({
+  page,
+}) => {
+  // ELK wraps a long chain into rows, and it layers a team's ports like
+  // anything else: inputs first, outputs last. A cut right before the output
+  // left it in a row by itself, and the edge into it ran back across the box
+  // to reach a port that sits on the border anyway.
+  await fake.close();
+  fake = (await startFakeServe({
+    stepMs: 30,
+    port: FAKE_SERVE_PORT,
+    snapshot: "diagram-chain.v1.json",
+  })) as FakeServe;
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await expect(page.locator(".omar-reaction")).toHaveCount(4);
+
+  // The chain is wider than the panel, so the team does wrap.
+  const team = (await page.locator(".omar-team-body").first().boundingBox())!;
+  const reaction = (await page.locator(".omar-reaction").first().boundingBox())!;
+  expect(team.height).toBeGreaterThan(reaction.height * 3);
+
+  // But the edges on its own ports still run forward.
+  const ports = ["trigger::pipe.in::pipe.reaction.0", "effect::pipe.reaction.3::pipe.out"];
+  for (const id of ports) {
+    const d = (await page.locator(`.omar-edge[data-id="${id}"]`).getAttribute("d"))!;
+    const backwards = pathSegments(d).filter((run) => run.a[0] - run.b[0] > 0.6);
+    expect(backwards, `${id} should not run leftward`).toHaveLength(0);
+  }
+
+  // And the edges joining one row to the next run in the gap between them,
+  // the way ELK drew them, rather than looping under the whole team.
+  const lowest = Math.max(
+    ...(await page.locator(".omar-reaction").evaluateAll((els) =>
+      els.map((el) => el.getBoundingClientRect().bottom),
+    )),
+  );
+  const edgeBottoms = await page
+    .locator(".omar-edge")
+    .evaluateAll((els) => els.map((el) => el.getBoundingClientRect().bottom));
+  for (const bottom of edgeBottoms) {
+    expect(bottom).toBeLessThanOrEqual(lowest + 2);
+  }
+});
+
+test("settings switch the theme between light and dark, and remember it", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await expect(page.locator(".omar-team-body").first()).toBeVisible();
+
+  // Relative luminance of a computed colour, 0 for black and 1 for white.
+  // Polled, because fills and backgrounds ease over 260ms.
+  const luminance = (selector: string, property = "background-color") =>
+    page.locator(selector).first().evaluate((el, property) => {
+      const value = getComputedStyle(el).getPropertyValue(property);
+      const [r, g, b] = (value.match(/[\d.]+/g) ?? []).map(Number);
+      return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    }, property);
+
+  // Dark is the default, and it covers the diagram as well as the chat: the
+  // heading, the paper, and the team boxes are all dark.
+  await expect(page.locator("html")).not.toHaveAttribute("data-theme", "light");
+  await expect.poll(() => luminance(".builder-panel")).toBeLessThan(0.2);
+  await expect.poll(() => luminance(".diagram-panel")).toBeLessThan(0.2);
+  await expect.poll(() => luminance(".diagram-heading")).toBeLessThan(0.2);
+  await expect.poll(() => luminance(".omar-team-body", "fill")).toBeLessThan(0.2);
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("menuitemradio", { name: "Light" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect.poll(() => luminance(".builder-panel")).toBeGreaterThan(0.8);
+  await expect.poll(() => luminance(".prompt-box")).toBeGreaterThan(0.8);
+  await expect.poll(() => luminance(".diagram-panel")).toBeGreaterThan(0.8);
+  await expect.poll(() => luminance(".diagram-heading")).toBeGreaterThan(0.8);
+  await expect.poll(() => luminance(".omar-team-body", "fill")).toBeGreaterThan(0.8);
+
+  // The choice outlives the page, and is applied before React mounts.
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect.poll(() => luminance(".builder-panel")).toBeGreaterThan(0.8);
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark" }).click();
+  await expect(page.locator("html")).not.toHaveAttribute("data-theme", "light");
+  await expect.poll(() => luminance(".builder-panel")).toBeLessThan(0.2);
+});
+
 test("a program wider than the panel still fits in it", async ({ page }) => {
   // The fit was clamped by the same floor as the zoom buttons, so a large
   // topology could not be shrunk enough to see whole.
@@ -1291,7 +1525,7 @@ test("an edge into a reaction actually reaches it", async ({ page }) => {
   const strays = async () => {
     const found: string[] = [];
     for (const reaction of reactions) {
-      const id = await reaction.locator(".omar-reaction-name").textContent();
+      const id = (await reaction.getAttribute("aria-label"))?.replace(/^Inspect /, "");
       const box = (await reaction.boundingBox())!;
       const edges = page.locator(`[data-id$="${id}"]`);
       if ((await edges.count()) === 0) found.push(`${id}: no edge`);
@@ -1317,7 +1551,7 @@ test("the timeline projects a program before anything is deployed", async ({
   await useFakeServe(page);
   await draftUntilProposed(page);
 
-  await page.getByRole("button", { name: "▲ Timeline" }).click();
+  await page.getByRole("button", { name: /Run timeline/ }).click();
   const timeline = page.getByLabel("Logical timeline");
   await expect(timeline).toBeVisible();
 
@@ -1387,9 +1621,9 @@ test("the diagram follows the text", async ({ page }) => {
 
 test("the assistant terminal remains available before and after a topology opens", async ({ page }) => {
   await useFakeServe(page);
-  const inspect = page.getByRole("button", { name: "Inspect on terminal" });
+  const inspect = page.getByRole("button", { name: "Inspect terminal" });
   await expect(inspect).toBeEnabled();
-  await expect(page.locator(".composer-tools").getByRole("button", { name: "Inspect on terminal" })).toBeVisible();
+  await expect(page.locator(".composer-tools").getByRole("button", { name: "Inspect terminal" })).toBeVisible();
   // Files & versions sits beside it, in the same row and at the same height.
   const files = page.locator(".composer-tools").getByRole("button", { name: "Files & versions" });
   await expect(files).toBeEnabled();
@@ -1473,7 +1707,7 @@ test("Escape reaches the terminal and only the explicit close chord detaches", a
   page.on("websocket", (socket) => socket.on("framesent", (frame) => {
     if (Buffer.isBuffer(frame.payload)) keys.push(frame.payload);
   }));
-  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await page.getByRole("button", { name: "Inspect terminal" }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toContainText("attached");
   await page.keyboard.press("Escape");
@@ -1484,7 +1718,7 @@ test("Escape reaches the terminal and only the explicit close chord detaches", a
   await page.keyboard.press("Control+Shift+Escape");
   await expect(dialog).toBeHidden();
   expect(Buffer.concat(keys).toString()).toBe("\x1bstill here");
-  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await page.getByRole("button", { name: "Inspect terminal" }).click();
   await expect(dialog).toBeVisible();
   await page.getByRole("button", { name: "Close terminal" }).click();
   await expect(dialog).toBeHidden();
@@ -1499,7 +1733,7 @@ test("an alternate-screen terminal draws at the initial and resized geometry wit
     const url = new URL(socket.url());
     initial = { cols: Number(url.searchParams.get("cols")), rows: Number(url.searchParams.get("rows")) };
   });
-  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await page.getByRole("button", { name: "Inspect terminal" }).click();
   const rows = page.locator(".xterm-rows");
   await expect(rows).toContainText("BOTTOM");
   expect(initial.cols).toBeGreaterThan(80);
@@ -1552,7 +1786,7 @@ test("a drag resizes the view every frame and the session once", async ({
 
   await page.getByLabel("Describe a workflow").fill("Review the release plan");
   await page.keyboard.press("Enter");
-  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await page.getByRole("button", { name: "Inspect terminal" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
   await expect(page.getByRole("dialog")).toContainText("attached");
 
@@ -1599,7 +1833,7 @@ test("the terminal fits the panel and reflows to it", async ({ page }) => {
   await useFakeServe(page);
   await page.getByLabel("Describe a workflow").fill("Review the release plan");
   await page.keyboard.press("Enter");
-  await page.getByRole("button", { name: "Inspect on terminal" }).click();
+  await page.getByRole("button", { name: "Inspect terminal" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
 
   const inside = async () => {
@@ -1715,8 +1949,19 @@ test("a timer is drawn as a clock, not as a port", async ({ page }) => {
   expect(edges).toBeGreaterThan(0);
 
   // The snapshot's tag is the tag it last fired at, so the face reads as
-  // firing rather than idling.
+  // firing rather than idling, and its one hand sweeps a full turn: the hand
+  // is keyed on the firing tag so the sweep plays once per firing.
   await expect(timer).toHaveClass(/firing/);
+  await expect(timer.locator(".omar-timer-hand")).toHaveCount(1);
+  const hands = timer.locator(".omar-timer-hands");
+  await expect(hands).toHaveAttribute("data-fired", /^\d+:\d+$/);
+  expect(await hands.evaluate((node) => getComputedStyle(node).animationName)).toBe("omar-timer-sweep");
+
+  // The run is live, so physical time to the next firing is counted down
+  // under the schedule. This one fires every 10ns, which is long past by the
+  // time anything is drawn, so the reading is that it is due.
+  await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("WORKFLOW TOPOLOGY");
+  await expect(timer.locator(".omar-timer-countdown")).toHaveText("due");
 });
 
 test("a team inside a team is drawn as a box inside a box", async ({ page }) => {
@@ -1782,7 +2027,7 @@ test("chat history restores messages and proposals after switching and reloading
   expect(sidebarBounds.x + sidebarBounds.width).toBeLessThanOrEqual(workspaceBounds.x);
   await expect(page.getByRole("dialog", { name: "Chat history" })).toHaveCount(0);
   await expect(history.getByRole("list", { name: "Saved chats" })).toContainText("Review the release plan");
-  await history.getByRole("button", { name: "New chat" }).click();
+  await history.getByRole("button", { name: "New workflow" }).click();
   await expect(history).toBeVisible();
   await expect(page.locator(".messages")).not.toContainText("Review the release plan");
   await expect(page.getByRole("group", { name: "Deploy design" })).toBeHidden();
@@ -1793,7 +2038,7 @@ test("chat history restores messages and proposals after switching and reloading
   await expect(page.locator(".messages")).toContainText("Prepare a product launch");
   await expect(page.locator(".messages")).not.toContainText("Review the release plan");
 
-  await history.getByLabel("Search chats").fill("release");
+  await history.getByLabel("Search workflows").fill("release");
   await expect(history.getByRole("listitem")).toHaveCount(1);
   await history.getByRole("button", { name: /Review the release plan/ }).click();
   await expect(page.locator(".messages")).toContainText("The planner");
@@ -1811,12 +2056,15 @@ test("chat history restores messages and proposals after switching and reloading
   await page.getByLabel("Draft workflow").click();
   await expect(page.locator(".messages")).toContainText("Keep the same requirements");
   await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
-      await history.getByRole("button", { name: "Fold chat history" }).click();
-  const rail = page.getByRole("navigation", { name: "Chat navigation" });
-    await expect(history).toHaveCount(0);
-  await expect(rail).toBeVisible();
-    await expect(rail.getByRole("button", { name: "Open chat history" })).toBeFocused();
-    await rail.getByRole("button", { name: "Open chat history" }).click();
+  // The list folds from its divider, like the other columns, and leaves a
+  // handle at the edge that brings it back.
+  const divider = page.getByRole("separator", { name: "the workflow list" });
+  await divider.hover();
+  await divider.getByRole("button", { name: "Hide the workflow list" }).click();
+  await expect(history).toHaveCount(0);
+  const handle = page.getByRole("button", { name: "Show the workflow list" });
+  await expect(handle).toBeFocused();
+  await handle.click();
   await expect(history).toBeVisible();
   await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
 });
@@ -1830,7 +2078,7 @@ test("chat history reports load failures and allows switching during a reply", a
   await page.getByLabel("Draft workflow").click();
   await page.getByRole("button", { name: "Open chat history" }).click();
   const history = page.getByRole("dialog", { name: "Chat history" });
-  await expect(history.getByRole("button", { name: "New chat" })).toBeEnabled();
+  await expect(history.getByRole("button", { name: "New workflow" })).toBeEnabled();
   await expect(history).toContainText("Thinking");
   const bounds = (await history.boundingBox())!;
   expect(bounds.x).toBeGreaterThanOrEqual(0);
@@ -1856,17 +2104,17 @@ test("chat history keeps tab selections independent and refreshes background cha
   const second = await context.newPage();
   try {
     await useFakeServe(second);
-    await second.getByRole("complementary", { name: "Chat history" }).getByRole("button", { name: "+ New chat", exact: true }).click();
+    await second.getByRole("complementary", { name: "Chat history" }).getByRole("button", { name: "New workflow", exact: true }).click();
     await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
     await expect(page.locator(".messages")).toContainText("Review the release plan");
     await second.getByLabel("Describe a workflow").fill("Plan the next release");
     await second.getByLabel("Draft workflow").click();
     await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
     await expect(history.getByRole("listitem").first()).toContainText("Plan the next release");
-    await expect(history.getByRole("listitem").first()).not.toContainText(/messages|Current/);
-    await history.getByLabel("Search chats").fill("nothing matches");
-    await expect(history).toContainText("No chats found");
-    await history.getByLabel("Search chats").fill("");
+    await expect(history.getByRole("listitem").first()).not.toContainText(/Current/);
+    await history.getByLabel("Search workflows").fill("nothing matches");
+    await expect(history).toContainText("No workflows found");
+    await history.getByLabel("Search workflows").fill("");
     await expect(history.getByRole("listitem")).toHaveCount(2);
     await page.reload();
     await expect(history.locator('[aria-current="true"]')).toContainText("Review the release plan");
@@ -1885,7 +2133,7 @@ test("chat history drawer closes after selecting a chat and responds to viewport
   expect(bounds.width).toBeLessThan(390);
   await expect(drawer.getByRole("list", { name: "Saved chats" })).not.toBeEmpty();
   await page.screenshot({ path: "/tmp/omar-history-sidebar-mobile.png" });
-  await drawer.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await drawer.getByRole("button", { name: "New workflow", exact: true }).click();
   await expect(drawer).toBeHidden();
   await expect(page.getByRole("button", { name: "Open chat history" })).toBeFocused();
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -1904,7 +2152,7 @@ test("switching chats while thinking preserves both replies", async ({ page }) =
   await page.getByLabel("Draft workflow").click();
   const history = page.getByRole("complementary", { name: "Chat history" });
   await expect(page.locator(".connection")).toContainText("drafting");
-  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await history.getByRole("button", { name: "New workflow", exact: true }).click();
   await expect(page.locator(".messages")).not.toContainText("First workspace");
   await page.getByLabel("Describe a workflow").fill("Second workspace");
   await page.getByLabel("Draft workflow").click();
@@ -1934,7 +2182,7 @@ test("two chats keep live topologies when switching and reloading", async ({ pag
     await expect(page.locator(".connection")).toContainText("observing");
   };
   await draft("Topology A");
-  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await history.getByRole("button", { name: "New workflow", exact: true }).click();
   await draft("Topology B");
   await page.getByLabel("Describe a workflow").fill("Continue monitoring B");
   await page.getByLabel("Draft workflow").click();
@@ -1977,8 +2225,8 @@ test("two chats keep live topologies when switching and reloading", async ({ pag
   await expect(page.locator(".messages")).not.toContainText("Topology A");
   await expect(history.getByRole("button", { name: /Topology A/ })).toContainText("Running");
   await expect(page.locator(".omar-reaction")).not.toHaveCount(0);
-  await expect(history.locator(".chat-running").first()).toHaveCSS("font-weight", "700");
-  await expect(history.locator(".chat-running").first()).toHaveCSS("color", "rgb(196, 181, 253)");
+  await expect(history.locator(".workflow-status.status-running").first()).toHaveCSS("font-weight", "650");
+  await expect(history.locator(".workflow-status.status-running").first()).toHaveCSS("color", "rgb(175, 141, 255)");
   await page.screenshot({ path: "/tmp/omar-live-chats.png" });
 });
 
@@ -1993,7 +2241,7 @@ test("an undeployed proposal remains actionable after a finished run and chat sw
   const controls = page.getByRole("group", { name: "Deploy design" });
   await expect(controls).toBeVisible();
   const history = page.getByRole("complementary", { name: "Chat history" });
-  await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+  await history.getByRole("button", { name: "New workflow", exact: true }).click();
   await history.getByRole("button", { name: /Review the release plan/ }).click();
   await expect(controls).toBeVisible();
   await expect(controls.getByRole("button", { name: "Deploy", exact: true })).toBeEnabled();
@@ -2075,7 +2323,7 @@ test("a delayed deploy response cannot replace the chat selected afterward", asy
   await admission;
   try {
     const history = page.getByRole("complementary", { name: "Chat history" });
-    await history.getByRole("button", { name: "+ New chat", exact: true }).click();
+    await history.getByRole("button", { name: "New workflow", exact: true }).click();
     await expect(page.locator(".workspace")).toHaveAttribute("aria-busy", "false");
     await expect(page.locator(".messages")).not.toContainText("Review the release plan");
     release();
@@ -2088,4 +2336,341 @@ test("a delayed deploy response cannot replace the chat selected afterward", asy
   } finally {
     release();
   }
+});
+
+
+test("failed manual handoffs explain the cause and can restart after reload", async ({ page }) => {
+  await fake.close();
+  fake = (await startFakeServe({
+    stepMs: 120,
+    port: FAKE_SERVE_PORT,
+    snapshot: "diagram-web.v1.json",
+    webFailure: "'flow.reviewer' did not answer within 300s, and contract 'critique' requires an effect",
+  })) as FakeServe;
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+  const feedback = page.locator(".run-failure");
+  await expect(feedback).toContainText("No response was submitted for flow.reviewer within 5 minutes");
+  await expect(page.locator(".omar-reaction.running")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Open response panel" })).toBeHidden();
+  await dragDivider(page, "Resize the conversation", -600);
+  await expect(feedback).toBeVisible();
+  const again = page.getByRole("button", { name: "Run again", exact: true });
+  await again.click();
+  const dialog = page.getByRole("dialog", { name: /Run ReviewFlow again/ });
+  await expect(dialog).toContainText("from the beginning");
+  await expect(dialog.getByLabel("Default step timeout")).toHaveValue("3600");
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(again).toBeFocused();
+  const previous = (await (await page.request.get(`${fake.url}/v1/runs`)).json()).runs;
+  expect(previous).toHaveLength(1);
+  await page.reload();
+  await expect(feedback).toBeVisible();
+  await again.click();
+  await dialog.getByLabel("Default step timeout").selectOption("7200");
+  const admission = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/v1/runs"));
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  const body = (await admission).postDataJSON();
+  expect(body.timeout_seconds).toBe(7200);
+  expect(body.inputs["flow.request"]).toBe("Review the release plan");
+  await expect(feedback).toBeVisible();
+  const restarted = (await (await page.request.get(`${fake.url}/v1/runs`)).json()).runs;
+  expect(restarted).toHaveLength(2);
+  expect(restarted[1].run_id).not.toBe(previous[0].run_id);
+});
+
+for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
+  test(`workflow sorting menu orders real rows and supports keyboard dismissal at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    const browserErrors: string[] = [];
+    page.on("pageerror", (error) => browserErrors.push(error.message));
+    const fixtures = [
+      { title: "Zulu running", status: "running" },
+      { title: "Bravo failed", status: "failed" },
+      { title: "alpha draft", status: "draft" },
+      { title: "Delta paused", status: "paused" },
+      { title: "Echo completed", status: "completed" },
+      { title: "Omega running", status: "running" },
+      { title: "Foxtrot stopped", status: "stopped" },
+    ];
+    await page.route("**/v1/chats", async (route) => {
+      if (route.request().method() !== "GET") return route.continue();
+      const response = await route.fetch();
+      const data = await response.json();
+      const template = data.conversations[0];
+      data.conversations = fixtures.map((fixture, index) => ({
+        ...template,
+        id: `sort-${index}`,
+        title: fixture.title,
+        updated_at: Date.UTC(2026, 9, 6, 12, index),
+        busy: false,
+        run: fixture.status === "draft" ? null : { id: `run-${index}`, team: "Review flow", status: fixture.status },
+      }));
+      await route.fulfill({ response, json: data });
+    });
+    await useFakeServe(page);
+    if (viewport.width < 900) await page.getByRole("button", { name: "Open chat history" }).click();
+    const history = page.getByRole(viewport.width < 900 ? "dialog" : "complementary", { name: "Chat history" });
+    const titles = history.locator(".workflow-title");
+    const trigger = history.getByRole("button", { name: "Sort workflows", exact: true });
+    const menu = history.getByRole("menu", { name: "Sort workflows" });
+    await expect(titles).toHaveText(["Foxtrot stopped", "Omega running", "Echo completed", "Delta paused", "alpha draft", "Bravo failed", "Zulu running"]);
+    await trigger.click();
+    await expect(menu.getByRole("menuitemradio", { name: "Recent activity" })).toHaveAttribute("aria-checked", "true");
+    await menu.getByRole("menuitemradio", { name: "Name A–Z" }).click();
+    await expect(menu).toBeHidden();
+    await expect(trigger).toBeFocused();
+    await expect(titles).toHaveText(["alpha draft", "Bravo failed", "Delta paused", "Echo completed", "Foxtrot stopped", "Omega running", "Zulu running"]);
+    await trigger.press("ArrowDown");
+    await expect(menu.getByRole("menuitemradio", { name: "Name A–Z" })).toBeFocused();
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Enter");
+    await expect(titles).toHaveText(["Omega running", "Zulu running", "Bravo failed", "alpha draft", "Delta paused", "Foxtrot stopped", "Echo completed"]);
+    await trigger.click();
+    await expect(menu.getByRole("menuitemradio", { name: "Status", exact: true })).toHaveAttribute("aria-checked", "true");
+    const menuBox = (await menu.boundingBox())!;
+    expect(menuBox.x).toBeGreaterThanOrEqual(0);
+    expect(menuBox.x + menuBox.width).toBeLessThanOrEqual(viewport.width);
+    await page.screenshot({ path: `/tmp/omar-sort-menu-${viewport.width}.png` });
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
+    await expect(history).toBeVisible();
+    await expect(trigger).toBeFocused();
+    await trigger.click();
+    await history.getByRole("textbox", { name: "Search workflows" }).click();
+    await expect(menu).toBeHidden();
+    await history.getByRole("textbox", { name: "Search workflows" }).fill("running");
+    await expect(titles).toHaveText(["Omega running", "Zulu running"]);
+    await history.getByRole("textbox", { name: "Search workflows" }).fill("");
+    fixtures[5].status = "failed";
+    await expect(titles).toHaveText(["Zulu running", "Omega running", "Bravo failed", "alpha draft", "Delta paused", "Foxtrot stopped", "Echo completed"]);
+    await trigger.click();
+    await menu.getByRole("menuitemradio", { name: "Recent activity" }).click();
+    await expect(titles).toHaveText(["Foxtrot stopped", "Omega running", "Echo completed", "Delta paused", "alpha draft", "Bravo failed", "Zulu running"]);
+    expect(browserErrors).toEqual([]);
+  });
+}
+
+test("workflow names save on Enter or blur, cancel on Escape, and survive reload", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  await history.locator(".workflow-title").dblclick();
+  const name = history.getByRole("textbox", { name: "Workflow name", exact: true });
+  const longTitle = "Set up Raisi Wire as ChatGPT → Claude Code → ChatGPT";
+  await name.fill(longTitle);
+  await name.press("Enter");
+  const title = history.locator(".workflow-title");
+  await expect(title).toHaveText(longTitle);
+  for (const width of [1512, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect(title).toHaveCSS("text-overflow", "ellipsis");
+    expect(await title.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
+    expect(await history.getByRole("list", { name: "Saved chats" }).evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  }
+  await title.dblclick();
+  await expect(name).toHaveValue(longTitle);
+  const editor = (await name.boundingBox())!;
+  const chevron = (await history.locator(".workflow-name svg").boundingBox())!;
+  expect(editor.x + editor.width).toBeLessThan(chevron.x);
+  await name.fill("Launch review");
+  await name.press("Enter");
+  await expect(history.locator(".workflow-title")).toHaveText("Launch review");
+  await expect(page.locator(".conversation-crumb")).toContainText("Launch review");
+  await history.locator(".workflow-title").dblclick();
+  await name.fill("Cancelled title");
+  await name.press("Escape");
+  await expect(history.locator(".workflow-title")).toHaveText("Launch review");
+  await history.locator(".workflow-title").dblclick();
+  await name.fill("Launch approvals");
+  await history.getByRole("textbox", { name: "Search workflows" }).click();
+  await expect(history.locator(".workflow-title")).toHaveText("Launch approvals");
+  await page.reload();
+  await expect(history.locator(".workflow-title")).toHaveText("Launch approvals");
+  await history.getByRole("textbox", { name: "Search workflows" }).fill("approvals");
+  await expect(history.locator(".workflow-title")).toHaveCount(1);
+  await history.getByRole("textbox", { name: "Search workflows" }).fill("absent");
+  await expect(history).toContainText("No workflows found");
+});
+
+test("splitter hover collapse and double-click reset keep the composer reachable", async ({ page }) => {
+  await page.setViewportSize({ width: 1512, height: 900 });
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const divider = page.getByRole("separator", { name: "Resize the conversation" });
+  const before = (await page.locator(".builder-panel").boundingBox())!;
+  await dragDivider(page, "Resize the conversation", 90);
+  await divider.dblclick({ position: { x: 2, y: 20 } });
+  await expect.poll(async () => (await page.locator(".builder-panel").boundingBox())!.width).toBeCloseTo(before.width, 0);
+  await divider.hover();
+  await divider.getByRole("button", { name: "Hide the conversation" }).click();
+  await expect(page.getByRole("button", { name: "Show the conversation" })).toBeVisible();
+  await page.getByRole("button", { name: "Show the conversation" }).click();
+  await expect(page.getByLabel("Describe a workflow")).toBeVisible();
+});
+
+test("step configuration validates real source edits and never starts a run", async ({ page }) => {
+  await page.setViewportSize({ width: 1512, height: 900 });
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  let admissions = 0;
+  page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/v1/runs")) admissions++; });
+  await page.locator(".omar-reaction").first().press("Enter");
+  const inspector = page.getByRole("complementary", { name: "Step details" });
+  await expect(inspector.getByLabel("Step prompt")).toHaveValue(/Draft a concrete plan/);
+  let releaseValidation: (() => void) | undefined;
+  await page.route("**/v1/programs/check", async (route) => {
+    if (String(route.request().postDataJSON().program).includes("ClaudeCode") && !releaseValidation) await new Promise<void>((resolve) => { releaseValidation = resolve; });
+    return route.continue();
+  });
+  await inspector.getByLabel("Step execution agent").selectOption("ClaudeCode");
+  await inspector.getByLabel("Step prompt").fill('Read $(request), then produce a "reviewed" plan.');
+  await inspector.getByRole("button", { name: "Apply configuration" }).click();
+  await expect(page.getByRole("button", { name: "Deploy", exact: true })).toBeDisabled();
+  releaseValidation?.();
+  await expect(inspector.getByRole("button", { name: "Apply configuration", exact: true })).toBeDisabled();
+  await expect(inspector.getByLabel("Step prompt")).toHaveValue('Read $(request), then produce a "reviewed" plan.');
+  await inspector.getByRole("button", { name: "Edit prompt & backend in source" }).click();
+  const program = page.getByRole("textbox", { name: "OMAR program", exact: true });
+  await expect(program).toHaveValue(/planner\s+: ClaudeCode/);
+  await expect(program).toHaveValue(/\\"reviewed\\"/);
+  await page.getByRole("separator", { name: "Resize the source pane" }).hover();
+  await page.getByRole("button", { name: "Hide the source pane" }).click();
+  await page.route("**/v1/programs/check", (route) => {
+    if (String(route.request().postDataJSON().program).includes("Rejected edit")) return route.fulfill({ json: { ok: false, errors: ["The selected input is not declared."] } });
+    return route.continue();
+  });
+  await page.locator(".omar-reaction").first().press("Enter");
+  await inspector.getByLabel("Step prompt").fill("Rejected edit");
+  await inspector.getByRole("button", { name: "Apply configuration" }).click();
+  await expect(inspector.getByRole("alert")).toContainText("not declared");
+  await inspector.getByRole("button", { name: "Add connection", exact: true }).click();
+  await inspector.getByLabel("Input connection").selectOption("critique");
+  await inspector.getByRole("button", { name: "Add selected connection" }).click();
+  await expect(inspector.getByRole("button", { name: "Remove input critique" })).toBeVisible();
+  await inspector.getByRole("button", { name: "Remove input critique" }).click();
+  await expect(page.locator(".connection")).toHaveText("review");
+  expect(admissions).toBe(0);
+  await page.screenshot({ path: "/tmp/omar-spec-configuration.png" });
+});
+
+test("workspace files refresh, preview snapshots, and dismiss on backdrop or Escape", async ({ page }) => {
+  let refreshes = 0;
+  let releaseRefresh: (() => void) | undefined;
+  // The viewer lists the current run's workspaces, not the chat's history.
+  await page.route("**/v1/runs/*/workspaces", async (route) => {
+    refreshes++;
+    if (refreshes === 2) await new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    return route.fulfill({ json: { workspaces: [{ id: "work-one", instance: "flow", deployment_id: "test", restored_from: null }] } });
+  });
+  await page.route("**/v1/workspaces/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/work-one")) return route.fulfill({ json: { snapshots: [{ id: "snap-one", label: "Initial workspace", created_at: 1700000000, sequence: 1 }] } });
+    if (path.endsWith("/browse")) return route.fulfill({ json: { entries: [{ name: "CLAUDE.md", kind: "file", size: 32 }], truncated: false } });
+    if (path.endsWith("/preview")) return route.fulfill({ json: { kind: "text", text: route.request().postDataJSON().snapshot ? "Saved instructions" : "Current instructions", size: 32 } });
+    return route.fulfill({ status: 404, json: { error: "Unexpected workspace operation" } });
+  });
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+  await expect(page.locator(".connection")).toContainText("observing");
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  const modal = page.getByRole("dialog", { name: "Files" });
+  await modal.getByRole("button", { name: /CLAUDE.md/ }).click();
+  await expect(modal.getByLabel("File preview")).toContainText("Current instructions");
+  await modal.getByLabel("File version").selectOption("snap-one");
+  await expect(modal).toContainText("Saved version · read-only");
+  await modal.getByRole("button", { name: /CLAUDE.md/ }).click();
+  await expect(modal.getByLabel("File preview")).toContainText("Saved instructions");
+  await modal.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(modal.getByRole("button", { name: "Refreshing…" })).toBeDisabled();
+  releaseRefresh?.();
+  await expect(modal.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
+  await page.screenshot({ path: "/tmp/omar-spec-files.png" });
+  await page.mouse.click(5, 5);
+  await expect(modal).toBeHidden();
+  await expect(page.getByRole("button", { name: "Files & versions" })).toBeFocused();
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  await page.keyboard.press("Escape");
+  await expect(modal).toBeHidden();
+});
+
+test("companion proposal files can be viewed and reach checks and deployment", async ({ page, request }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const files = { "schemas/decision.json": '{"type":"string","enum":["approved"]}' };
+  const program = `type Decision from "./schemas/decision.json"
+
+team Review[worker : Stub] {
+  input request : string
+  output result : Decision
+  task worker(request) -> result "Review $(request)"
+}
+
+main ReviewRun { review = Review() }`;
+  const result = await request.post(`${fake.url}/v1/agent/proposals`, { data: {
+    token: fake.agentToken, program,
+    files, summary: "A proposal with a schema", inputs: { "review.request": "hello" },
+  } });
+  expect(result.ok()).toBeTruthy();
+  await expect(page.getByText("A proposal with a schema", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  const dialog = page.getByRole("dialog", { name: "Files" });
+  await dialog.getByRole("button", { name: "schemas/decision.json", exact: true }).click();
+  await expect(dialog.getByLabel("File preview")).toContainText(files["schemas/decision.json"]);
+  await dialog.getByRole("button", { name: "program.omar", exact: true }).click();
+  await expect(dialog.getByLabel("File preview")).toContainText("main ReviewRun");
+  await dialog.getByRole("button", { name: "Close files" }).click();
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+  const check = page.waitForRequest((r) => r.url().endsWith("/v1/programs/check") && r.postDataJSON()?.files?.["schemas/decision.json"] === files["schemas/decision.json"]);
+  await page.getByLabel("OMAR program").fill(program.replace('"Review $(request)"', '"Edited $(request)"'));
+  await check;
+  const deployment = page.waitForRequest((r) => r.url().endsWith("/v1/runs") && r.method() === "POST");
+  await deploy(page);
+  expect((await deployment).postDataJSON().files).toEqual(files);
+});
+
+
+test("workflow tabs support keyboard navigation and saved VS Code edits reach deployment", async ({ page }) => {
+  let workspacePayload: {program: string; files?: Record<string, string>} | undefined;
+  const savedFiles = { "schemas/edited.json": '{"type":"string"}' };
+  await page.route("**/v1/workspaces/workflow", (route) => {
+    workspacePayload = route.request().postDataJSON();
+    return route.fulfill({ json: { workspace: { id: "workflow-test" } } });
+  });
+  await page.route("**/v1/workspaces/workflow-test/editor", (route) => route.fulfill({ json: { url: "about:blank" } }));
+  await page.route("**/v1/workspaces/workflow-test/workflow", (route) => route.fulfill({ json: { program: workspacePayload!.program, files: savedFiles } }));
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  const dialog = page.getByRole("dialog", { name: "Files" });
+  const workflow = dialog.getByRole("tab", { name: "Workflow", exact: true });
+  const workspaces = dialog.getByRole("tab", { name: "Run workspaces & versions" });
+  await expect(workflow).toHaveAttribute("aria-selected", "true");
+  const editorButton = dialog.getByRole("button", { name: "Open in Web VS Code", exact: true });
+  const before = await editorButton.boundingBox();
+  expect(before).not.toBeNull();
+  await workflow.press("ArrowRight");
+  await expect(editorButton).toBeVisible();
+  const after = await editorButton.boundingBox();
+  expect(after?.x).toBeCloseTo(before!.x, 0);
+  expect(after?.y).toBeCloseTo(before!.y, 0);
+  await expect(workspaces).toBeFocused();
+  await expect(workspaces).toHaveAttribute("aria-selected", "true");
+  await workspaces.press("ArrowLeft");
+  await expect(workflow).toBeFocused();
+  const popup = page.waitForEvent("popup");
+  await dialog.getByRole("button", { name: "Open in Web VS Code", exact: true }).click();
+  const editor = await popup;
+  await expect(dialog.getByRole("link", { name: "Reopen editor" })).toBeVisible();
+  expect(workspacePayload?.program).toContain("main");
+  await dialog.getByRole("button", { name: "Apply saved changes" }).click();
+  await dialog.getByRole("button", { name: "schemas/edited.json", exact: true }).click();
+  await expect(dialog.getByLabel("File preview")).toContainText(savedFiles["schemas/edited.json"]);
+  await editor.close();
+  await dialog.getByRole("button", { name: "Close files" }).click();
+  const deployment = page.waitForRequest((r) => r.url().endsWith("/v1/runs") && r.method() === "POST");
+  await deploy(page);
+  expect((await deployment).postDataJSON().files).toEqual(savedFiles);
 });

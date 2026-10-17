@@ -1,0 +1,217 @@
+{
+ "protocol_version": 1,
+ "team": "Pipeline",
+ "sequence": 0,
+ "status": "ready",
+ "current_tag": null,
+ "instances": [
+  {
+   "id": "instance::pipe",
+   "name": "pipe",
+   "team": "Pipe"
+  }
+ ],
+ "agents": [
+  {
+   "id": "agent::pipe.a0",
+   "name": "pipe.a0",
+   "backend": "Codex",
+   "instance": "pipe"
+  },
+  {
+   "id": "agent::pipe.a1",
+   "name": "pipe.a1",
+   "backend": "Codex",
+   "instance": "pipe"
+  },
+  {
+   "id": "agent::pipe.a2",
+   "name": "pipe.a2",
+   "backend": "Codex",
+   "instance": "pipe"
+  },
+  {
+   "id": "agent::pipe.a3",
+   "name": "pipe.a3",
+   "backend": "Codex",
+   "instance": "pipe"
+  }
+ ],
+ "ports": [
+  {
+   "id": "port::pipe.in",
+   "name": "pipe.in",
+   "kind": "input",
+   "type": "string",
+   "delay": null,
+   "value": null,
+   "last_tag": null,
+   "instance": "pipe"
+  },
+  {
+   "id": "port::pipe.out",
+   "name": "pipe.out",
+   "kind": "output",
+   "type": "string",
+   "delay": null,
+   "value": null,
+   "last_tag": null,
+   "instance": "pipe"
+  },
+  {
+   "id": "port::pipe.s1",
+   "name": "pipe.s1",
+   "kind": "action",
+   "type": "string",
+   "delay": null,
+   "value": null,
+   "last_tag": null,
+   "instance": "pipe"
+  },
+  {
+   "id": "port::pipe.s2",
+   "name": "pipe.s2",
+   "kind": "action",
+   "type": "string",
+   "delay": null,
+   "value": null,
+   "last_tag": null,
+   "instance": "pipe"
+  },
+  {
+   "id": "port::pipe.s3",
+   "name": "pipe.s3",
+   "kind": "action",
+   "type": "string",
+   "delay": null,
+   "value": null,
+   "last_tag": null,
+   "instance": "pipe"
+  }
+ ],
+ "timers": [],
+ "reactions": [
+  {
+   "id": "reaction::pipe.reaction.0",
+   "name": "pipe.reaction.0",
+   "agent": "agent::pipe.a0",
+   "order": 0,
+   "triggers": [
+    "port::pipe.in"
+   ],
+   "effects": [
+    "port::pipe.s1"
+   ],
+   "contract": "port::pipe.s1",
+   "status": "idle",
+   "invocation_id": null,
+   "instance": "pipe"
+  },
+  {
+   "id": "reaction::pipe.reaction.1",
+   "name": "pipe.reaction.1",
+   "agent": "agent::pipe.a1",
+   "order": 1,
+   "triggers": [
+    "port::pipe.s1"
+   ],
+   "effects": [
+    "port::pipe.s2"
+   ],
+   "contract": "port::pipe.s2",
+   "status": "idle",
+   "invocation_id": null,
+   "instance": "pipe"
+  },
+  {
+   "id": "reaction::pipe.reaction.2",
+   "name": "pipe.reaction.2",
+   "agent": "agent::pipe.a2",
+   "order": 2,
+   "triggers": [
+    "port::pipe.s2"
+   ],
+   "effects": [
+    "port::pipe.s3"
+   ],
+   "contract": "port::pipe.s3",
+   "status": "idle",
+   "invocation_id": null,
+   "instance": "pipe"
+  },
+  {
+   "id": "reaction::pipe.reaction.3",
+   "name": "pipe.reaction.3",
+   "agent": "agent::pipe.a3",
+   "order": 3,
+   "triggers": [
+    "port::pipe.s3"
+   ],
+   "effects": [
+    "port::pipe.out"
+   ],
+   "contract": "port::pipe.out",
+   "status": "idle",
+   "invocation_id": null,
+   "instance": "pipe"
+  }
+ ],
+ "edges": [
+  {
+   "id": "trigger::pipe.in::pipe.reaction.0",
+   "kind": "trigger",
+   "source": "port::pipe.in",
+   "target": "reaction::pipe.reaction.0",
+   "delay": null
+  },
+  {
+   "id": "effect::pipe.reaction.0::pipe.s1",
+   "kind": "effect",
+   "source": "reaction::pipe.reaction.0",
+   "target": "port::pipe.s1",
+   "delay": null
+  },
+  {
+   "id": "trigger::pipe.s1::pipe.reaction.1",
+   "kind": "trigger",
+   "source": "port::pipe.s1",
+   "target": "reaction::pipe.reaction.1",
+   "delay": null
+  },
+  {
+   "id": "effect::pipe.reaction.1::pipe.s2",
+   "kind": "effect",
+   "source": "reaction::pipe.reaction.1",
+   "target": "port::pipe.s2",
+   "delay": null
+  },
+  {
+   "id": "trigger::pipe.s2::pipe.reaction.2",
+   "kind": "trigger",
+   "source": "port::pipe.s2",
+   "target": "reaction::pipe.reaction.2",
+   "delay": null
+  },
+  {
+   "id": "effect::pipe.reaction.2::pipe.s3",
+   "kind": "effect",
+   "source": "reaction::pipe.reaction.2",
+   "target": "port::pipe.s3",
+   "delay": null
+  },
+  {
+   "id": "trigger::pipe.s3::pipe.reaction.3",
+   "kind": "trigger",
+   "source": "port::pipe.s3",
+   "target": "reaction::pipe.reaction.3",
+   "delay": null
+  },
+  {
+   "id": "effect::pipe.reaction.3::pipe.out",
+   "kind": "effect",
+   "source": "reaction::pipe.reaction.3",
+   "target": "port::pipe.out",
+   "delay": null
+  }
+ ]
+}

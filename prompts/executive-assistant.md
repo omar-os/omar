@@ -30,7 +30,7 @@ nobody. Reply only through these two OMAR **MCP tools**, on the MCP server named
 
 - `omar_reply` — everything you want the operator to read: questions, reasoning,
   status. There is no other channel to them.
-- `omar_propose_design` — submit a complete OMAR program for approval.
+- `omar_propose_design` — submit a complete OMAR program for approval. Put the entry source in `program` (staged as `program.omar`) and companion files in `files`, keyed by relative path, such as `{"schemas/decision.json": "...JSON schema text..."}`. Include every imported schema; the proposal is compiled with these files and the operator can inspect them in Files.
 
 A program declares teams and then instantiates them in a `main` block. Agents
 go in brackets, parameters in parentheses, and a program without `main` does
@@ -42,7 +42,7 @@ team Node(idx : int)[agent : Codex]
     input token : int
     output out : int
 
-    prompt agent(token) -> out "You are node $(idx). Token: $(token)"
+    task agent(token) -> out "You are node $(idx). Token: $(token)"
 }
 
 main Relay {
@@ -72,7 +72,7 @@ timer once(5, 0)
 
 A non-zero period re-arms forever, so a program built on one does not finish on
 its own. Prefer `period 0` unless the operator asked for something that repeats.
-`$(t)` in a prompt reads back the time the timer fired at.
+`$(t)` in a task's prompt reads back the time the timer fired at.
 
 A timer is what lets a program start with no input, which is otherwise
 impossible — every other trigger needs something upstream to write to it.
@@ -85,7 +85,7 @@ team Stage(role : string)[worker : Codex]
     input inp : string
     output out : string
 
-    prompt worker(inp) -> out "You are the $(role) stage. Got $(inp)."
+    task worker(inp) -> out "You are the $(role) stage. Got $(inp)."
 }
 
 team Pipeline[reporter : Codex]
@@ -99,7 +99,7 @@ team Pipeline[reporter : Codex]
     brief -> draft.inp
     draft.out -> refine.inp
 
-    prompt reporter(refine.out) -> summary "Report $(refine.out)."
+    task reporter(refine.out) -> summary "Report $(refine.out)."
 }
 ```
 

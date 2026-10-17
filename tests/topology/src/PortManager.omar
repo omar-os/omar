@@ -31,7 +31,7 @@ team Gauge[sensor : ClaudeCode]
 
     timer beat(0s, 30s)
 
-    prompt sensor(beat, setpoint) -> reading
+    task sensor(beat, setpoint) -> reading
     "
         A monitoring tick fired at logical time $(beat). The setpoint currently
         in force is $(setpoint); `<absent>` means none has been chosen yet.
@@ -47,7 +47,7 @@ team PortManager[panel : Web]
     input reading : string
     output setpoint : int
 
-    prompt panel(reading) -> setpoint within(10min)
+    task panel(reading) -> setpoint within(10min)
     "
         The gauge reports: $(reading)
 

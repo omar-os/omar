@@ -33,9 +33,9 @@ Terminal UI
 - **Full control**: Talk to and control any subagent you want.
 - **Life span**: Long-running or ephemeral agents, your choice.
 - **Customization**: Support all `tmux` commands you love.
-- **Team workspaces**: Each topology team instance gets a versioned `worktree/` and disposable `temp/`. [Inspect and restore file versions](docs/team-workspaces.md).
+- **Team workspaces**: Each topology team instance gets a versioned `worktree/` and disposable `temp/`; inspect and restore file versions from Mission Control or `omar workspace`.
 
-Other features include messaging systems integration (e.g., Slack), computer use, and more.
+Other features include computer use and more.
 
 ## Installation
 
@@ -77,10 +77,13 @@ cd omar && make install
 #### Step 1: Launch Mission Control
 
 ```bash
-$ omar serve --ui
+$ omar up --name dev
+$ omar attach -s dev --web
 ```
 
-Serves the web UI from the daemon's own address and opens it in your browser.
+Starts an independent background runtime, then opens its web UI. Closing the
+browser leaves the runtime and its topologies running. Stop it with `omar down -s dev`.
+`omar --help` lists the session commands.
 
 #### Step 2: Describe a workflow
 
@@ -89,15 +92,25 @@ the topology it compiles to.
 Nothing runs until you press **Confirm deploy**,
 then the diagram goes live.
 
-### Terminal UI (Legacy)
+### Terminal client
 
-Note: The legacy terminal UI does not yet implement the deterministic model in the mission control.
+Run `omar attach -s dev --tui` (`--ea NAME` picks an EA), or `omar up --tui` to
+start and attach in one go. The terminal dashboard opens
+inside the session's tmux server. `z` detaches and the runtime keeps every
+workload running; `Q` stops the session after confirmation.
 
-#### Step 1: Launch `omar`
+### Terminal UI
+
+Note: The terminal UI does not yet implement the deterministic model in the mission control.
+
+#### Step 1: Start a session and attach the terminal UI
 
 ```bash
-$ omar
+$ omar up --tui
 ```
+
+Or attach to a running session with `omar attach -s <session> --tui`. `z`
+detaches and the runtime keeps every workload running; `Q` stops the session.
 
 Go [here](#supported-agent-backends) to see how to launch with specific agent backends.
 
@@ -123,17 +136,49 @@ Shutdown the test project and its agents.
 
 | Backend | How to launch |
 |---------|---------------|
-| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar -a claude` (default) |
-| [Codex CLI](https://developers.openai.com/codex/cli) | `omar -a codex` |
-| [Cursor CLI](https://cursor.com/cli) | `omar -a cursor` |
-| [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode` |
-| [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy` |
-| [Pi](https://pi.dev) | `omar -a pi` |
+| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar -a claude up` (default) |
+| [Codex CLI](https://developers.openai.com/codex/cli) | `omar -a codex up` |
+| [Cursor CLI](https://cursor.com/cli) | `omar -a cursor up` |
+| [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode up` |
+| [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy up` |
+| [Pi](https://pi.dev) | `omar -a pi up` |
 
-Each `omar -a <backend>` launch creates a new EA, named with its new EA number.
-Use `omar -a codex --ea Research` to give the new EA a semantic name. An existing
-name is rejected rather than replacing its manager. Run `omar --ea <id-or-name>`
-without `-a` to open an existing EA.
+Each `omar -a <backend> up` starts a new independent session with EA 0.
+Add `--name dev` to name it, and `--tui` or `--web` to attach at once.
+Sessions work like containers: `omar down` stops one and keeps its state,
+`omar up --name dev` starts it again, and `omar rm` removes it (a running one
+is killed first). Add another EA inside it
+with `omar --session dev ea create --name Research --agent codex`.
+Target it with `omar --session dev --ea Research ...`; this does not change
+another client's selection. `omar run team.omar -s dev` admits a workflow and
+returns; `--fg` keeps it in the foreground until it ends and prints the final
+record, and Ctrl-C detaches without stopping it. Without a session, `run`
+creates one for the workflow and removes it again when a foreground run ends.
+Checkpointing belongs to the workflow: `--checkpoint-period` on `run`, and
+the `omar checkpoint` commands while it runs.
+
+### Upgrading omar with sessions running
+
+The package manager replaces the binary; omar has no upgrade command. A
+running session keeps executing the build it started with, so moving it to
+the new build is a restart of that session, with its workflows paused across
+it:
+
+```
+omar pause Ticker --wait -s dev   # checkpoint and park the workflows you care about
+brew upgrade omar                 # or the install script
+omar down -s dev                  # workflows still running pause at their next tag boundary
+omar up --name dev                # the same session, on the new build, at its previous URL
+omar resume Ticker -s dev         # continues from the checkpoint; the run keeps its id
+```
+
+`omar ls` shows each session's workflows (`1 running, 1 paused`), for stopped
+sessions too. `omar up --name` on a stopped session reports the build it
+moved to and the paused workflows waiting for `omar resume`; nothing resumes
+on its own. A forced stop (`down
+--force`, a crash) leaves a workflow interrupted mid-run: the restart pauses
+it at its last checkpoint, and the tags since are lost. Other sessions are
+never touched.
 
 Codex launch commands no longer disable the alternate screen. OMAR does not
 add `--no-alt-screen`; an explicit flag in a custom command is still respected.

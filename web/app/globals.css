@@ -5,12 +5,134 @@
   --panel: #101013;
   --panel-2: #15151a;
   --line: #292831;
+  --line-2: #3b3844;
   --muted: #96939f;
   --text: #f5f2fa;
+  --text-2: #cbc7d2;
+  --text-3: #9d97a8;
+  --accent-text: #d8caff;
+  --link: #b49cff;
+  --code-bg: #201f26;
+  --code-text: #d9cffb;
+  --pre-bg: #131318;
+  --glass: rgba(12, 12, 15, 0.86);
+  --glow: rgba(140, 99, 242, 0.16);
+  --bubble: #242329;
+  --bubble-text: #aaa6b0;
   --purple: rgb(140, 99, 242);
   --purple-soft: rgba(140, 99, 242, 0.16);
   color-scheme: dark;
+
+  /* The diagram. Dark like the rest of the shell; light mode swaps these for
+     the paper it was first drawn on. */
+  --dia-paper: #121215;
+  --dia-grid: rgba(255, 255, 255, 0.045);
+  --dia-heading: rgba(18, 18, 21, 0.94);
+  --dia-heading-line: #292831;
+  --dia-heading-text: #f0edf5;
+  --dia-stats: #cfcbd6;
+  --dia-stats-muted: #8c8894;
+  --dia-team-shadow: rgba(0, 0, 0, 0.4);
+  --dia-team: #1b1b21;
+  --dia-team-line: #4e4c56;
+  --dia-team-name: #f0edf5;
+  --dia-team-kind: #96939f;
+  --dia-port: #e9e6ef;
+  --dia-label: #dcd8e3;
+  --dia-node: #24242b;
+  --dia-node-line: #a5a2ad;
+  --dia-node-line-soft: #7b7983;
+  --dia-edge: #9a97a2;
+  --dia-edge-delay: #b4b0bc;
+  --dia-reaction: #2b2b33;
+  --dia-reaction-line: #6f6d77;
+  --dia-badge: #1b1b21;
+  --dia-badge-line: #5a585f;
+  --dia-index: #cfcbd6;
+  --dia-name: #f0edf5;
+  --dia-meta: #a39fab;
+  --dia-done: #1c3328;
+  --dia-done-meta: #8fcaa8;
+  --dia-live: #2a2347;
+  --dia-live-meta: #b4a4f0;
+  /* A selected node's label: it keeps reading on the card it sits on. */
+  --dia-selected-text: #e9e1ff;
+  --dia-chrome: rgba(24, 24, 28, 0.94);
+  --dia-chrome-line: #3b3844;
+  --dia-chrome-text: #c4c0cb;
+  --dia-chrome-hover: #2a2a31;
+  --dia-chrome-shadow: rgba(0, 0, 0, 0.4);
 }
+
+/* Light is chosen from the settings menu and kept in local storage; the
+   layout applies the attribute before paint. */
+:root[data-theme="light"] {
+  --ink: #f6f5f9;
+  --panel: #ffffff;
+  --panel-2: #f1f0f5;
+  --line: #dcd9e3;
+  --line-2: #cfccd8;
+  --muted: #6a6675;
+  --text: #17161b;
+  --text-2: #2c2a33;
+  --text-3: #6a6675;
+  --accent-text: #5b3fd1;
+  --link: #6b4fd8;
+  --code-bg: #eeecf4;
+  --code-text: #4b3a8f;
+  --pre-bg: #f5f4f8;
+  --glass: rgba(255, 255, 255, 0.86);
+  --glow: rgba(140, 99, 242, 0.1);
+  --bubble: #e9e7ee;
+  --bubble-text: #5d5966;
+  color-scheme: light;
+
+  --dia-paper: #f6f6f4;
+  --dia-grid: rgba(54, 52, 58, 0.055);
+  --dia-heading: rgba(246, 246, 244, 0.94);
+  --dia-heading-line: #d8d7d3;
+  --dia-heading-text: #242326;
+  --dia-stats: #343237;
+  --dia-stats-muted: #807d84;
+  --dia-team-shadow: rgba(31, 30, 34, 0.07);
+  --dia-team: #ffffff;
+  --dia-team-line: #8e8c92;
+  --dia-team-name: #1b1a1e;
+  --dia-team-kind: #7d7a82;
+  --dia-port: #17161a;
+  --dia-label: #2c2b30;
+  --dia-node: #ffffff;
+  --dia-node-line: #4b4950;
+  --dia-node-line-soft: #85838b;
+  --dia-edge: #6a686f;
+  --dia-edge-delay: #5f5c66;
+  --dia-reaction: #e9e8ec;
+  --dia-reaction-line: #85838b;
+  --dia-badge: #ffffff;
+  --dia-badge-line: #b3b1b8;
+  --dia-index: #55535a;
+  --dia-name: #1b1a1e;
+  --dia-meta: #7d7a82;
+  --dia-done: #e2f1e8;
+  --dia-done-meta: #4c7a63;
+  --dia-live: #ece5ff;
+  --dia-live-meta: #6553a0;
+  --dia-selected-text: #4a2ba0;
+  --dia-chrome: rgba(255, 255, 255, 0.94);
+  --dia-chrome-line: #d5d3cf;
+  --dia-chrome-text: #55535a;
+  --dia-chrome-hover: #f0efec;
+  --dia-chrome-shadow: rgba(31, 29, 34, 0.08);
+}
+
+/* Source highlighting was tuned for a dark pane. */
+:root[data-theme="light"] .omar-tok-comment { color: #8a8794; }
+:root[data-theme="light"] .omar-tok-type { color: #1f7f8a; }
+:root[data-theme="light"] .omar-tok-agent { color: #9a6a10; }
+:root[data-theme="light"] .omar-tok-string { color: #2f7d32; }
+:root[data-theme="light"] .omar-tok-interpolation { color: #b4376b; }
+:root[data-theme="light"] .omar-tok-number { color: #8a3fb0; }
+:root[data-theme="light"] .omar-tok-punctuation { color: #6f6a7a; }
 
 * {
   box-sizing: border-box;
@@ -47,7 +169,7 @@ button {
   flex-direction: column;
   overflow: hidden;
   background:
-    radial-gradient(circle at 52% -20%, rgba(140, 99, 242, 0.16), transparent 30rem),
+    radial-gradient(circle at 52% -20%, var(--glow), transparent 30rem),
     var(--ink);
 }
 
@@ -58,7 +180,7 @@ button {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
-  font-size: 14px;
+  font-size: 1rem;
   white-space: nowrap;
 }
 
@@ -83,7 +205,7 @@ button {
 }
 
 .eyebrow {
-  font-size: 10px;
+  font-size: 0.75rem;
   letter-spacing: 0.14em;
   color: var(--muted);
 }
@@ -93,7 +215,7 @@ button {
   height: 34px;
   padding: 0 14px;
   border-radius: 8px;
-  font-size: 12px;
+  font-size: 0.875rem;
   font-weight: 650;
 }
 
@@ -105,8 +227,8 @@ button {
 
 .secondary-button {
   border: 1px solid var(--line);
-  background: #151519;
-  color: #bbb7c3;
+  background: var(--panel-2);
+  color: var(--text-2);
 }
 
 .primary-button:disabled {
@@ -117,7 +239,7 @@ button {
 .builder-status {
   margin: 0;
   color: var(--muted);
-  font-size: 14px;
+  font-size: 1rem;
 }
 
 .waiting {
@@ -127,7 +249,7 @@ button {
   margin: 0 0 22px;
   padding-left: 38px;
   color: var(--muted);
-  font-size: 14px;
+  font-size: 1rem;
 }
 
 /* The wait, and the way into the session doing the waiting. */
@@ -141,13 +263,13 @@ button {
   margin-bottom: 22px;
   border: 0;
   background: transparent;
-  color: #9d97a8;
-  font-size: 11px;
+  color: var(--text-3);
+  font-size: 0.8125rem;
   text-decoration: underline;
 }
 
 .waiting-inspect:hover {
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .waiting-verb {
@@ -157,7 +279,7 @@ button {
 .waiting-elapsed {
   color: #6f6b78;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: 0.8125rem;
   font-variant-numeric: tabular-nums;
 }
 
@@ -278,7 +400,7 @@ button {
   flex-direction: column;
   overflow: hidden;
   border-right: 1px solid var(--line);
-  background: rgba(12, 12, 15, 0.86);
+  background: var(--glass);
 }
 
 .diagram-heading {
@@ -305,7 +427,7 @@ button {
 .workflow-actions .secondary-button {
   height: 30px;
   padding: 0 12px;
-  font-size: 11.5px;
+  font-size: 0.84375rem;
   white-space: nowrap;
 }
 
@@ -319,7 +441,7 @@ button {
 h1,
 h2 {
   margin: 6px 0 0;
-  font-size: 17px;
+  font-size: 1.1875rem;
   font-weight: 620;
   letter-spacing: -0.02em;
 }
@@ -350,29 +472,36 @@ h2 {
   place-items: center;
   border-radius: 8px;
   background: var(--purple-soft);
-  color: #c9b5ff;
-  font-size: 10px;
+  color: var(--link);
+  font-size: 0.75rem;
   font-weight: 750;
 }
 
 .message.user > span {
-  background: #242329;
-  color: #aaa6b0;
-  font-size: 8px;
+  background: var(--bubble);
+  color: var(--bubble-text);
+  font-size: 0.75rem;
 }
 
 .message p {
   margin: 2px 0 0;
-  color: #cbc7d2;
-  font-size: 16px;
+  color: var(--text-2);
+  font-size: 1.125rem;
   line-height: 1.75;
+}
+
+/* The operator's own message is plain text: keep its line breaks, and break
+   a long unbroken token rather than overflow the column. */
+.message-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* Assistant messages are rendered markdown. */
 .message-body {
   min-width: 0;
-  color: #cbc7d2;
-  font-size: 16px;
+  color: var(--text-2);
+  font-size: 1.125rem;
   line-height: 1.75;
 }
 
@@ -394,11 +523,11 @@ h2 {
 }
 
 .message-body em {
-  color: #d6d1de;
+  color: var(--text);
 }
 
 .message-body a {
-  color: #b49cff;
+  color: var(--link);
 }
 
 /* The Tailwind preflight strips list markers, so restore them explicitly. */
@@ -418,7 +547,7 @@ h2 {
 }
 
 .message-body li::marker {
-  color: #7d7a86;
+  color: var(--muted);
 }
 
 .message-body li {
@@ -428,8 +557,8 @@ h2 {
 .message-body code {
   padding: 1px 5px;
   border-radius: 5px;
-  background: #201f26;
-  color: #d9cffb;
+  background: var(--code-bg);
+  color: var(--code-text);
   font: 14px ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -437,31 +566,31 @@ h2 {
   margin: 0 0 10px;
   overflow-x: auto;
   padding: 11px 13px;
-  border: 1px solid #2a2932;
+  border: 1px solid var(--line);
   border-radius: 9px;
-  background: #131318;
+  background: var(--pre-bg);
 }
 
 .message-body pre code {
   padding: 0;
   background: none;
-  color: #bfb8cd;
-  font-size: 14px;
+  color: var(--text-2);
+  font-size: 1rem;
   line-height: 1.6;
 }
 
 .message-body blockquote {
   margin: 0 0 10px;
   padding-left: 11px;
-  border-left: 2px solid #3a3844;
-  color: #a9a4b4;
+  border-left: 2px solid var(--line-2);
+  color: var(--text-3);
 }
 
 .message-body h1,
 .message-body h2,
 .message-body h3 {
   margin: 12px 0 6px;
-  font-size: 18px;
+  font-size: 1.25rem;
   font-weight: 650;
   letter-spacing: 0;
 }
@@ -469,27 +598,27 @@ h2 {
 .message-body table {
   margin-bottom: 10px;
   border-collapse: collapse;
-  font-size: 14px;
+  font-size: 1rem;
 }
 
 .message-body th,
 .message-body td {
   padding: 5px 9px;
-  border: 1px solid #2a2932;
+  border: 1px solid var(--line);
   text-align: left;
 }
 
 .message-body hr {
   margin: 12px 0;
   border: 0;
-  border-top: 1px solid #2a2932;
+  border-top: 1px solid var(--line);
 }
 
 .prompt-box {
   margin: 16px;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 13px;
-  background: #151519;
+  background: var(--panel-2);
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.2);
 }
 
@@ -506,15 +635,15 @@ h2 {
   padding: 14px;
   background: transparent;
   color: var(--text);
-  font-size: 16px;
+  font-size: 1.125rem;
   line-height: 1.5;
 }
 
 .prompt-box > div {
   justify-content: space-between;
   padding: 0 10px 10px 14px;
-  color: #77737f;
-  font-size: 10px;
+  color: var(--muted);
+  font-size: 0.75rem;
 }
 
 .send-button {
@@ -524,7 +653,7 @@ h2 {
   border-radius: 8px;
   background: var(--purple);
   color: white;
-  font-size: 18px;
+  font-size: 1.25rem;
 }
 
 .diagram-panel {
@@ -532,17 +661,17 @@ h2 {
   flex-direction: column;
   overflow: hidden;
   background:
-    linear-gradient(rgba(54, 52, 58, 0.055) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(54, 52, 58, 0.055) 1px, transparent 1px),
-    #f6f6f4;
+    linear-gradient(var(--dia-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--dia-grid) 1px, transparent 1px),
+    var(--dia-paper);
   background-size: 24px 24px;
 }
 
 .diagram-heading {
   justify-content: space-between;
-  border-bottom-color: #d8d7d3;
-  background: rgba(246, 246, 244, 0.94);
-  color: #242326;
+  border-bottom-color: var(--dia-heading-line);
+  background: var(--dia-heading);
+  color: var(--dia-heading-text);
 }
 
 .run-stats {
@@ -557,14 +686,14 @@ h2 {
   display: grid;
   gap: 4px;
   min-width: 46px;
-  color: #343237;
+  color: var(--dia-stats);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: 0.8125rem;
 }
 
 .run-stats small {
-  color: #807d84;
-  font: 9px ui-sans-serif, system-ui, sans-serif;
+  color: var(--dia-stats-muted);
+  font: 0.75rem ui-sans-serif, system-ui, sans-serif;
   letter-spacing: 0.12em;
 }
 
@@ -641,13 +770,13 @@ h2 {
 
 /* Reactor container: white body with a soft offset plate behind it. */
 .omar-team-shadow {
-  fill: rgba(31, 30, 34, 0.07);
+  fill: var(--dia-team-shadow);
   stroke: none;
 }
 
 .omar-team-body {
-  fill: #ffffff;
-  stroke: #8e8c92;
+  fill: var(--dia-team);
+  stroke: var(--dia-team-line);
   stroke-width: 1;
 }
 
@@ -656,15 +785,15 @@ h2 {
 }
 
 .omar-team-name {
-  fill: #1b1a1e;
-  font-size: 15px;
+  fill: var(--dia-team-name);
+  font-size: 1.0625rem;
   font-weight: 650;
   letter-spacing: -0.01em;
 }
 
 .omar-team-kind {
-  fill: #7d7a82;
-  font-size: 10px;
+  fill: var(--dia-team-kind);
+  font-size: 0.75rem;
   font-weight: 500;
   letter-spacing: 0.09em;
   text-transform: uppercase;
@@ -672,22 +801,22 @@ h2 {
 
 /* Ports: small filled triangles centred on the reactor boundary. */
 .omar-port {
-  fill: #17161a;
-  stroke: #17161a;
+  fill: var(--dia-port);
+  stroke: var(--dia-port);
   stroke-width: 1;
   stroke-linejoin: round;
 }
 
 .omar-port-label {
-  fill: #2c2b30;
-  font-size: 11.5px;
+  fill: var(--dia-label);
+  font-size: 0.84375rem;
   font-weight: 600;
 }
 
 /* Actions: hollow rhombus, filled once they carry a value. */
 .omar-action {
-  fill: #ffffff;
-  stroke: #4b4950;
+  fill: var(--dia-node);
+  stroke: var(--dia-node-line);
   stroke-width: 1.4;
   stroke-linejoin: round;
 }
@@ -698,8 +827,8 @@ h2 {
 }
 
 .omar-action-label {
-  fill: #2c2b30;
-  font-size: 11px;
+  fill: var(--dia-label);
+  font-size: 0.8125rem;
   font-weight: 600;
 }
 
@@ -721,20 +850,20 @@ h2 {
 
 .omar-within-meta {
   fill: #c0392b;
-  font-size: 9px;
+  font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.02em;
 }
 
 /* Timers: a clock face, because nothing feeds one — it fires on its own. */
 .omar-timer-face {
-  fill: #ffffff;
-  stroke: #4b4950;
+  fill: var(--dia-node);
+  stroke: var(--dia-node-line);
   stroke-width: 1.4;
 }
 
 .omar-timer-hand {
-  stroke: #4b4950;
+  stroke: var(--dia-node-line);
   stroke-width: 1.6;
   stroke-linecap: round;
   /* The hand steps between logical tags rather than sweeping continuously:
@@ -743,30 +872,32 @@ h2 {
   transition: all 220ms cubic-bezier(0.34, 1.2, 0.64, 1);
 }
 
-.omar-timer-hand.short {
-  stroke: #85838b;
-  stroke-width: 1.3;
-}
-
 .omar-timer-pin {
-  fill: #4b4950;
+  fill: var(--dia-node-line);
 }
 
-/* Firing sweeps the hands a full turn.
+/* Firing sweeps the hand a full turn: it overshoots the top by a few degrees
+   and settles back upright, the way a real second hand lands.
    This is an event animation, not a claim about elapsed time: logical time
    only moves when the runtime moves it, so a hand creeping round between
-   fires would be inventing a clock the run does not have. */
+   fires would be inventing a clock the run does not have. It plays once per
+   firing because the hand is remounted for each one. */
 @keyframes omar-timer-sweep {
-  from {
+  0% {
     transform: rotate(0deg);
+    animation-timing-function: cubic-bezier(0.45, 0, 0.25, 1);
   }
-  to {
+  78% {
+    transform: rotate(365deg);
+    animation-timing-function: cubic-bezier(0.2, 0.8, 0.4, 1);
+  }
+  100% {
     transform: rotate(360deg);
   }
 }
 
 .omar-timer-group.firing .omar-timer-hands {
-  animation: omar-timer-sweep 700ms cubic-bezier(0.4, 0, 0.2, 1);
+  animation: omar-timer-sweep 950ms both;
   transform-origin: center;
   transform-box: fill-box;
 }
@@ -784,14 +915,23 @@ h2 {
 }
 
 .omar-timer-label {
-  fill: #2c2b30;
-  font-size: 11px;
+  fill: var(--dia-label);
+  font-size: 0.8125rem;
   font-weight: 600;
 }
 
 .omar-timer-meta {
-  fill: #85838b;
-  font-size: 9.5px;
+  fill: var(--dia-node-line-soft);
+  font-size: 0.75rem;
+}
+
+/* Physical time to the next firing. Purple like a firing face, so it reads as
+   something happening rather than another line of schedule; tabular digits so
+   it does not jitter as it counts. */
+.omar-timer-countdown {
+  fill: #6b56a4;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -806,8 +946,8 @@ h2 {
 
 /* Reactions: six-point chevrons, greyscale by default, coloured by run state. */
 .omar-reaction-body {
-  fill: #e9e8ec;
-  stroke: #85838b;
+  fill: var(--dia-reaction);
+  stroke: var(--dia-reaction-line);
   stroke-width: 1;
   stroke-linejoin: round;
 }
@@ -827,31 +967,31 @@ h2 {
 
 
 .omar-reaction-badge {
-  fill: #ffffff;
-  stroke: #b3b1b8;
+  fill: var(--dia-badge);
+  stroke: var(--dia-badge-line);
   stroke-width: 1;
 }
 
 .omar-reaction-index {
-  fill: #55535a;
-  font-size: 10.5px;
+  fill: var(--dia-index);
+  font-size: 0.78125rem;
   font-weight: 700;
 }
 
 .omar-reaction-name {
-  fill: #1b1a1e;
-  font-size: 12.5px;
+  fill: var(--dia-name);
+  font-size: 0.90625rem;
   font-weight: 640;
 }
 
 .omar-reaction-meta {
-  fill: #7d7a82;
-  font-size: 9.5px;
+  fill: var(--dia-meta);
+  font-size: 0.75rem;
   font-weight: 500;
 }
 
 .omar-reaction.completed .omar-reaction-body {
-  fill: #e2f1e8;
+  fill: var(--dia-done);
   stroke: #5d9c7b;
 }
 
@@ -865,11 +1005,11 @@ h2 {
 }
 
 .omar-reaction.completed .omar-reaction-meta {
-  fill: #4c7a63;
+  fill: var(--dia-done-meta);
 }
 
 .omar-reaction.running .omar-reaction-body {
-  fill: #ece5ff;
+  fill: var(--dia-live);
   stroke: #6f55c4;
   stroke-width: 1.6;
 }
@@ -884,7 +1024,7 @@ h2 {
 }
 
 .omar-reaction.running .omar-reaction-meta {
-  fill: #6553a0;
+  fill: var(--dia-live-meta);
 }
 
 .omar-reaction.running {
@@ -904,7 +1044,7 @@ h2 {
 /* Connections: orthogonal, directed. */
 .omar-edge {
   fill: none;
-  stroke: #6a686f;
+  stroke: var(--dia-edge);
   stroke-width: 1.3;
   stroke-linecap: round;
 }
@@ -914,8 +1054,8 @@ h2 {
    than encoded in the stroke, which could only ever say "some delay" and never
    which. The line breaks around the number instead of running through it. */
 .omar-edge-delay {
-  fill: #5f5c66;
-  font: 9px ui-monospace, SFMono-Regular, Menlo, monospace;
+  fill: var(--dia-edge-delay);
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
   font-weight: 600;
   letter-spacing: 0.01em;
 }
@@ -936,10 +1076,10 @@ h2 {
   bottom: 16px;
   display: flex;
   overflow: hidden;
-  border: 1px solid #d5d3cf;
+  border: 1px solid var(--dia-chrome-line);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.94);
-  box-shadow: 0 4px 16px rgba(31, 29, 34, 0.08);
+  background: var(--dia-chrome);
+  box-shadow: 0 4px 16px var(--dia-chrome-shadow);
 }
 
 .diagram-zoom button {
@@ -947,10 +1087,10 @@ h2 {
   height: 28px;
   padding: 0 8px;
   border: 0;
-  border-left: 1px solid #e4e2df;
+  border-left: 1px solid var(--dia-chrome-line);
   background: transparent;
-  color: #55535a;
-  font-size: 11px;
+  color: var(--dia-chrome-text);
+  font-size: 0.8125rem;
   font-weight: 600;
 }
 
@@ -959,7 +1099,7 @@ h2 {
 }
 
 .diagram-zoom button:hover {
-  background: #f0efec;
+  background: var(--dia-chrome-hover);
 }
 
 .diagram-legend {
@@ -969,12 +1109,12 @@ h2 {
   display: flex;
   gap: 14px;
   padding: 8px 11px;
-  border: 1px solid #d5d3cf;
+  border: 1px solid var(--dia-chrome-line);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.94);
-  color: #68656b;
-  font-size: 10px;
-  box-shadow: 0 4px 16px rgba(31, 29, 34, 0.08);
+  background: var(--dia-chrome);
+  color: var(--dia-chrome-text);
+  font-size: 0.75rem;
+  box-shadow: 0 4px 16px var(--dia-chrome-shadow);
 }
 
 .diagram-legend span {
@@ -990,7 +1130,7 @@ h2 {
 }
 
 .diagram-legend .running {
-  fill: #ece5ff;
+  fill: var(--dia-live);
   stroke: #6f55c4;
 }
 
@@ -999,7 +1139,7 @@ h2 {
   color: #fecaca;
   background: rgba(127, 29, 29, 0.25);
   border: 1px solid rgba(248, 113, 113, 0.3);
-  font-size: 14px;
+  font-size: 1rem;
 }
 
 .diagram-error {
@@ -1016,7 +1156,7 @@ h2 {
   flex-direction: column;
   overflow: hidden;
   border-left: 1px solid var(--line);
-  background: #0e0e11;
+  background: var(--panel);
 }
 
 .tabs {
@@ -1031,13 +1171,13 @@ h2 {
   border-bottom: 2px solid transparent;
   padding: 0 18px;
   background: transparent;
-  color: #77737e;
-  font-size: 11px;
+  color: var(--muted);
+  font-size: 0.8125rem;
 }
 
 .tabs button.active {
   border-bottom-color: var(--purple);
-  color: #e4ddee;
+  color: var(--text);
 }
 
 .source-title {
@@ -1045,9 +1185,9 @@ h2 {
   justify-content: space-between;
   height: 38px;
   padding: 0 14px;
-  border-bottom: 1px solid #222126;
-  color: #908b98;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .source-title span:last-child {
@@ -1061,7 +1201,7 @@ h2 {
 }
 
 .omar-tok-keyword {
-  color: #b49cff;
+  color: var(--link);
   font-weight: 600;
 }
 
@@ -1097,8 +1237,8 @@ h2 {
   margin: 0;
   overflow: auto;
   padding: 16px;
-  color: #bbb3c8;
-  font: 10.5px/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  color: var(--text-2);
+  font: 0.75rem/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
   tab-size: 2;
   white-space: pre-wrap;
 }
@@ -1122,7 +1262,7 @@ h2 {
   margin: 0;
   padding: 16px;
   border: 0;
-  font: 10.5px/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font: 0.75rem/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
   tab-size: 2;
   white-space: pre-wrap;
   overflow-wrap: break-word;
@@ -1174,7 +1314,7 @@ h2 {
   background: rgba(194, 96, 122, 0.08);
   color: #e7a9b8;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: 0.8125rem;
   line-height: 1.6;
 }
 
@@ -1224,7 +1364,7 @@ h2 {
 
 .port-panel-head h2 {
   margin: 3px 0 0;
-  font-size: 15px;
+  font-size: 1.0625rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -1235,7 +1375,7 @@ h2 {
   padding: 5px 10px;
   background: var(--panel-2);
   color: var(--muted);
-  font-size: 11px;
+  font-size: 0.8125rem;
 }
 
 .port-panel-close:hover {
@@ -1253,7 +1393,7 @@ h2 {
 .port-panel-idle {
   margin: 0 0 16px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.875rem;
   line-height: 1.6;
 }
 
@@ -1276,13 +1416,13 @@ h2 {
 .port-waiting-head h3 {
   margin: 2px 0 0;
   color: #d8d4e0;
-  font-size: 13px;
+  font-size: 0.9375rem;
 }
 
 .port-waiting-prompt {
   margin: 0;
   color: #a5a0ae;
-  font-size: 11px;
+  font-size: 0.8125rem;
   line-height: 1.5;
   white-space: pre-wrap;
 }
@@ -1290,7 +1430,7 @@ h2 {
 .port-waiting-contract {
   margin: 0;
   color: #77727e;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field {
@@ -1302,12 +1442,12 @@ h2 {
 
 .port-field-name {
   color: #d8d4e0;
-  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field-type {
   color: #77727e;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field input {
@@ -1317,7 +1457,7 @@ h2 {
   border-radius: 5px;
   background: #131118;
   color: #e6e2ee;
-  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field.invalid input {
@@ -1327,7 +1467,7 @@ h2 {
 .port-field-problem {
   grid-column: 1 / -1;
   color: #c0392b;
-  font-size: 10px;
+  font-size: 0.75rem;
 }
 
 .port-row {
@@ -1336,7 +1476,7 @@ h2 {
   gap: 2px 8px;
   padding: 8px 0;
   border-bottom: 1px solid #211f25;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-row-name {
@@ -1376,7 +1516,7 @@ h2 {
   padding: 8px 0;
   border-bottom: 1px solid #211f25;
   color: #77727e;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .event-strip b {
@@ -1386,7 +1526,7 @@ h2 {
 
 .event-strip p {
   color: #77727e;
-  font-size: 11px;
+  font-size: 0.8125rem;
   line-height: 1.5;
 }
 
@@ -1441,9 +1581,9 @@ h2 {
   border: 0;
   border-left: 1px solid var(--line);
   border-right: 1px solid var(--line);
-  background: #17161c;
-  color: #9d97a8;
-  font-size: 15px;
+  background: var(--panel-2);
+  color: var(--text-3);
+  font-size: 1.0625rem;
   line-height: 1;
   transition: background 140ms ease, color 140ms ease;
 }
@@ -1451,7 +1591,7 @@ h2 {
 .resizer-handle:hover,
 .resizer-handle:focus-visible {
   background: var(--purple-soft);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 /* What is left here acts on the message being written. */
@@ -1471,7 +1611,7 @@ h2 {
 .composer-actions .secondary-button {
   height: 30px;
   padding: 0 12px;
-  font-size: 11.5px;
+  font-size: 0.84375rem;
 }
 
 .composer-status {
@@ -1535,13 +1675,13 @@ h2 {
 
 .message.progress > span {
   background: transparent;
-  color: #6a6672;
-  font-size: 8px;
+  color: var(--muted);
+  font-size: 0.75rem;
 }
 
 .message.progress .message-body {
-  color: #8b8695;
-  font-size: 14px;
+  color: var(--text-3);
+  font-size: 1rem;
 }
 
 /* The operator names components by clicking them, so the message can say
@@ -1556,7 +1696,7 @@ h2 {
   border-radius: 9px;
   background: rgba(140, 99, 242, 0.1);
   color: #cbbdf6;
-  font-size: 11.5px;
+  font-size: 0.84375rem;
 }
 
 .selection-label {
@@ -1571,13 +1711,13 @@ h2 {
   margin-left: auto;
   border: 0;
   background: transparent;
-  color: #9d97a8;
-  font-size: 11px;
+  color: var(--text-3);
+  font-size: 0.8125rem;
   text-decoration: underline;
 }
 
 .selection-clear:hover {
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 /* The team panel is a backdrop. Left hit-testable it swallows clicks aimed at
@@ -1610,7 +1750,7 @@ h2 {
 .omar-port-group.selected .omar-port-label,
 .omar-action-group.selected .omar-action-label,
 .omar-reaction.selected .omar-reaction-name {
-  fill: #4a2ba0;
+  fill: var(--dia-selected-text);
   font-weight: 600;
 }
 
@@ -1618,7 +1758,7 @@ h2 {
   margin-bottom: 4px;
   color: #9d8fd0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10.5px;
+  font-size: 0.78125rem;
 }
 
 /* A terminal attached to a running agent. It sits over the studio rather than
@@ -1629,6 +1769,10 @@ h2 {
    drawing is what exists, this is when it happens. */
 .timeline {
   flex: none;
+  /* The diagram keeps most of the column; a preview that outgrows this
+     scrolls within the strip instead of pushing its actions out of view. */
+  max-height: 45%;
+  overflow-y: auto;
   border-top: 1px solid var(--line);
   background: var(--panel-2);
   padding: 10px 14px;
@@ -1640,14 +1784,14 @@ h2 {
   border-top: 1px solid var(--line);
   background: var(--panel-2);
   color: var(--muted);
-  font-size: 11px;
+  font-size: 0.8125rem;
   letter-spacing: 0.04em;
   padding: 6px 14px;
   text-align: left;
 }
 
 .timeline-handle:hover {
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .timeline-controls {
@@ -1661,7 +1805,7 @@ h2 {
   border-radius: 6px;
   background: var(--ink);
   color: var(--text);
-  font-size: 13px;
+  font-size: 0.9375rem;
   line-height: 1;
   padding: 4px 9px;
 }
@@ -1676,16 +1820,182 @@ h2 {
   accent-color: var(--purple);
 }
 
+/* The slider, with a tick standing on its track wherever a checkpoint was
+   taken. The ticks overlay the input; each is its own button. */
+.timeline-rail {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  height: 28px;
+}
+
+.timeline-rail input[type="range"] {
+  width: 100%;
+}
+
+.timeline-ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* Above the slider and its thumb: a tick under the thumb must still take
+     the click. */
+  z-index: 1;
+}
+
+.timeline-controls .timeline-tick {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 12px;
+  margin-left: -1.5px;
+  padding: 0;
+  border: 0;
+  border-radius: 1.5px;
+  background: #4cc37a;
+  font-size: 0;
+  line-height: 0;
+  transform: translateY(-50%);
+  transition: height 120ms ease, width 120ms ease, background 120ms ease;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.timeline-controls .timeline-tick:hover,
+.timeline-controls .timeline-tick:focus-visible {
+  height: 24px;
+  width: 4px;
+  margin-left: -2px;
+  background: #7ef0a6;
+  z-index: 2;
+  outline: none;
+}
+
+.timeline-controls .timeline-tick.resume {
+  box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 3.5px #4cc37a;
+}
+
+.timeline-controls .timeline-tick.selected {
+  height: 24px;
+  width: 4px;
+  margin-left: -2px;
+  background: #7ef0a6;
+  z-index: 1;
+}
+
+.timeline-checkpoints {
+  color: #7ef0a6;
+}
+
+.timeline-run-controls {
+  margin-left: auto;
+  order: 9;
+}
+
+/* Pause, Stop and Resume ride with the strip, folded or not. */
+.run-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 6px;
+}
+
+.run-controls .primary-button,
+.run-controls .secondary-button {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+.run-controls .secondary-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.timeline-handle-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  padding-right: 10px;
+}
+
+.timeline-handle-bar .timeline-handle {
+  border-top: 0;
+  flex: 1;
+}
+
+.timeline-preview {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #2f9e5f;
+  border-radius: 8px;
+  background: rgba(76, 195, 122, 0.06);
+  font-size: 0.84375rem;
+}
+
+.timeline-preview-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+  color: var(--text);
+}
+
+.timeline-preview-head span {
+  color: var(--muted);
+}
+
+.timeline-preview-body {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 12px;
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.timeline-preview-body dt {
+  color: var(--text);
+}
+
+.timeline-preview-body dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.timeline-preview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.timeline-preview-actions .primary-button {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 0.84375rem;
+}
+
+.timeline-preview-note {
+  color: var(--muted);
+}
+
 .timeline-close {
-  font-size: 11px !important;
+  font-size: 0.8125rem !important;
 }
 
 .timeline-readout {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 8px;
-  font-size: 11px;
+  font-size: 0.8125rem;
   color: var(--muted);
 }
 
@@ -1705,7 +2015,7 @@ h2 {
 /* Following a run rather than predicting one. */
 .timeline-mode.live {
   border-color: var(--purple);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .timeline-detail,
@@ -1717,7 +2027,7 @@ h2 {
 
 .timeline-truncated {
   margin: 6px 0 0;
-  font-size: 11px;
+  font-size: 0.8125rem;
   color: var(--muted);
 }
 
@@ -1778,25 +2088,25 @@ h2 {
 
 .input-panel-head h2 {
   margin: 2px 0 0;
-  font-size: 15px;
+  font-size: 1.0625rem;
 }
 
 .input-panel-close {
   border: 0;
   background: transparent;
-  color: #9d97a8;
-  font-size: 11px;
+  color: var(--text-3);
+  font-size: 0.8125rem;
   text-decoration: underline;
 }
 
 .input-panel-close:hover {
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .input-panel-note {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.875rem;
   line-height: 1.6;
 }
 
@@ -1827,14 +2137,14 @@ h2 {
 
 .input-port-name {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
+  font-size: 0.875rem;
   color: var(--text);
   overflow-wrap: anywhere;
 }
 
 .input-port-type {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: 0.8125rem;
   color: var(--muted);
 }
 
@@ -1846,7 +2156,7 @@ h2 {
   border-radius: 6px;
   background: var(--ink);
   color: var(--text);
-  font-size: 13px;
+  font-size: 0.9375rem;
 }
 
 .input-port input:focus {
@@ -1863,13 +2173,13 @@ h2 {
 .input-port-problem {
   grid-column: 1 / -1;
   color: #d98aa0;
-  font-size: 11px;
+  font-size: 0.8125rem;
 }
 
 .input-panel-empty {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.875rem;
 }
 
 /* An open input is the operator's to set, so it reads as actionable rather
@@ -1917,7 +2227,7 @@ h2 {
 
 .terminal-heading h2 {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 13px;
+  font-size: 0.9375rem;
   font-weight: 600;
 }
 
@@ -1927,23 +2237,23 @@ h2 {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: #8b8695;
-  font-size: 11px;
+  font-size: 0.8125rem;
 }
 
 .terminal-heading button {
   margin-left: auto;
   height: 26px;
   padding: 0 12px;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 7px;
   background: transparent;
-  color: #cbc6d6;
-  font-size: 11.5px;
+  color: var(--text-2);
+  font-size: 0.84375rem;
 }
 
 .terminal-heading button:hover {
   border-color: var(--purple);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 /* The screen reflows to the panel and the session is told to match, so the
@@ -1969,7 +2279,7 @@ h2 {
   padding: 8px 14px;
   border-top: 1px solid #26242d;
   color: #6f6b78;
-  font-size: 10.5px;
+  font-size: 0.78125rem;
 }
 
 /* Which assistant is answering. It sits at the bottom of the composer, so the
@@ -1988,17 +2298,17 @@ h2 {
   gap: 6px;
   height: 36px;
   padding: 0 8px;
-  border: 1px solid #302d39;
+  border: 1px solid var(--line);
   border-radius: 7px;
   background: transparent;
-  color: #9d97a8;
-  font-size: 14px;
+  color: var(--text-3);
+  font-size: 1rem;
 }
 
 .backend-trigger:hover,
 .backend-trigger[aria-expanded="true"] {
   border-color: var(--purple);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .backend-options {
@@ -2008,9 +2318,9 @@ h2 {
   z-index: 20;
   min-width: 190px;
   overflow: hidden;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 9px;
-  background: #17161c;
+  background: var(--panel-2);
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
 }
 
@@ -2023,25 +2333,25 @@ h2 {
   padding: 7px 11px;
   border: 0;
   background: transparent;
-  color: #cbc6d6;
-  font-size: 14px;
+  color: var(--text-2);
+  font-size: 1rem;
   text-align: left;
 }
 
 .backend-options > button:hover {
   background: var(--purple-soft);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .backend-options > button.current {
-  color: #9d97a8;
+  color: var(--text-3);
 }
 
 .backend-confirm {
   width: 230px;
   padding: 10px 11px;
-  color: #cbc6d6;
-  font-size: 14px;
+  color: var(--text-2);
+  font-size: 1rem;
 }
 
 .backend-confirm p {
@@ -2057,11 +2367,11 @@ h2 {
 .backend-confirm button {
   height: 32px;
   padding: 0 10px;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 7px;
   background: transparent;
-  color: #cbc6d6;
-  font-size: 14px;
+  color: var(--text-2);
+  font-size: 1rem;
 }
 
 .backend-confirm button:first-child {
@@ -2075,7 +2385,7 @@ h2 {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: #e0777f;
-  font-size: 14px;
+  font-size: 1rem;
 }
 
 /* Saved conversations share the runtime's scope, including across reloads. */
@@ -2088,7 +2398,7 @@ h2 {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
-  font-size: 12px;
+  font-size: 0.875rem;
   white-space: nowrap;
 }
 
@@ -2106,8 +2416,8 @@ h2 {
   border-right: 1px solid var(--line);
 }
 .chat-history header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
-.chat-history h2 { margin: 0 0 16px; font-size: 16px; }
-.chat-history p, .chat-history small { color: var(--muted); font-size: 13px; }
+.chat-history h2 { margin: 0 0 16px; font-size: 1.125rem; }
+.chat-history p, .chat-history small { color: var(--muted); font-size: 0.9375rem; }
 .chat-history button, .chat-history input {
   color: var(--text);
   background: var(--panel-2);
@@ -2115,16 +2425,16 @@ h2 {
   border-radius: 8px;
   padding: 10px 12px;
 }
-.chat-history header button { padding: 4px 10px; font-size: 18px; }
+.chat-history header button { padding: 4px 10px; font-size: 1.25rem; }
 .chat-history button:disabled { opacity: 0.5; cursor: default; }
 .chat-history button:hover:not(:disabled), .history-button:hover { border-color: var(--purple); }
 .history-actions { display: grid; gap: 10px; }
-.history-actions input { width: 100%; min-width: 0; font-size: 14px; }
-.history-actions button { text-align: left; font-size: 14px; }
+.history-actions input { width: 100%; min-width: 0; font-size: 1rem; }
+.history-actions button { text-align: left; font-size: 1rem; }
 .chat-history ul { flex: 1; min-height: 0; overflow-y: auto; list-style: none; padding: 0; margin: 18px 0 0; }
 .chat-history li + li { margin-top: 6px; }
 .chat-history li button { width: 100%; text-align: left; display: grid; gap: 6px; background: transparent; border-color: transparent; }
-.chat-history li span { overflow-wrap: anywhere; font-size: 14px; }
+.chat-history li span { overflow-wrap: anywhere; font-size: 1rem; }
 .chat-history [aria-current="true"] { border-color: var(--purple); background: var(--purple-soft); }
 .chat-history .history-error p { color: #ffb4b4; }
 .history-drawer {
@@ -2218,19 +2528,80 @@ h2 {
   box-shadow: 0 24px 80px #0006;
 }
 .deploy-confirmation::backdrop { background: #080b12aa; }
-.deploy-confirmation h2 { margin: 12px 0 20px; font-size: 22px; }
-.deploy-confirmation p { margin: 12px 0; line-height: 1.6; font-size: 14px; }
+.deploy-confirmation h2 { margin: 12px 0 20px; font-size: 1.5rem; }
+.deploy-confirmation p { margin: 12px 0; line-height: 1.6; font-size: 1rem; }
 .deploy-confirmation-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px; }
+.deploy-options { margin: 16px 0 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; }
+.deploy-options legend { padding: 0 6px; font-size: 0.875rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.deploy-check { display: flex; align-items: center; gap: 8px; font-size: 1rem; }
+.deploy-field { display: flex; flex-direction: column; gap: 4px; font-size: 0.9375rem; color: var(--muted); margin-top: 10px; }
+.deploy-field select, .deploy-field input { font: inherit; color: var(--text); background: var(--panel-raised, var(--panel)); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.deploy-period { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.deploy-period input { width: 100%; }
+.deploy-hint { margin: 8px 0 0; font-size: 0.875rem; color: var(--muted); }
+.deploy-invalid { color: var(--danger, #e5484d); }
 
 /* Workspace artifacts are a full-width inspector; editing opens separately. */
+
+.settings-menu { position: relative; }
+.settings-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text-3);
+}
+.settings-trigger:hover,
+.settings-trigger[aria-expanded="true"] { border-color: var(--purple); color: var(--accent-text); }
+.settings-options {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  min-width: 150px;
+  overflow: hidden;
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: var(--panel-2);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.3);
+}
+.settings-heading {
+  display: block;
+  padding: 8px 11px 4px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.settings-options > button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 11px;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 1rem;
+  text-align: left;
+}
+.settings-options > button:hover { background: var(--purple-soft); color: var(--accent-text); }
+.settings-options > button.current { color: var(--text-3); }
 .artifacts-dialog { margin: auto; width: min(1160px, 94vw); max-height: 90vh; padding: 24px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface, #17151d); color: var(--text, #eee); overflow: auto; }
 .artifacts-dialog::backdrop { background: #08060dcc; }
 .artifacts-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .artifacts-dialog h2 { margin: 4px 0 20px; }
 .artifact-controls { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
-.artifact-controls label { display: grid; gap: 6px; font-size: 12px; flex: 1; min-width: 180px; }
+.artifact-controls label { display: grid; gap: 6px; font-size: 0.875rem; flex: 1; min-width: 180px; }
 .artifact-controls select { width: 100%; padding: 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel, #25212e); color: inherit; }
-.artifact-guidance { font-size: 12px; line-height: 1.6; opacity: .75; }
+.artifact-guidance { font-size: 0.875rem; line-height: 1.6; opacity: .75; }
 .artifact-body { display: grid; grid-template-columns: 230px minmax(0, 1fr); min-height: 360px; border-top: 1px solid var(--line); }
 .artifact-body nav { border-right: 1px solid var(--line); padding: 12px 10px 12px 0; overflow: auto; max-height: 55vh; }
 .artifact-path { overflow-wrap: anywhere; font: 12px var(--font-mono, monospace); opacity: .7; padding: 8px; }
@@ -2238,10 +2609,34 @@ h2 {
 .artifact-body nav button:hover { background: #a78bfa22; }
 .artifact-body nav button:disabled { opacity: .45; cursor: default; }
 .artifact-preview { padding: 16px; min-width: 0; overflow: auto; max-height: 55vh; }
-.artifact-preview-title { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; font-size: 12px; }
+.artifact-preview-title { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; font-size: 0.875rem; }
 .artifact-text { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.7 var(--font-mono, monospace); margin: 0; }
 .artifact-image { max-width: 100%; max-height: 400px; object-fit: contain; }
 .artifact-comparison { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
-.artifact-comparison h3 { font-size: 12px; color: #bca4f5; }
+.artifact-comparison h3 { font-size: 0.875rem; color: #bca4f5; }
 .artifact-link { border: none; padding: 0; background: none; color: inherit; text-decoration: underline; cursor: pointer; }
 @media (max-width: 700px) { .artifact-body { grid-template-columns: 1fr; } .artifact-body nav { max-height: 180px; border-right: 0; } .artifact-comparison { grid-template-columns: 1fr; } .artifacts-dialog { padding: 16px; } }
+
+/* Keep run recovery and manual handoffs visible when the chat is collapsed. */
+.run-feedback { overflow-wrap: anywhere; flex-shrink: 0; padding: 14px 24px; border-bottom: 1px solid #d6d1c8; font-size: 0.9375rem; color: #28242f; }
+.run-feedback p { margin: 6px 0; line-height: 1.5; }
+.run-failure { background: #fff0ee; }
+.run-waiting { background: #f1edff; }
+.run-feedback details { margin-top: 8px; }
+.run-feedback summary { cursor: pointer; }
+.run-feedback pre { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.8125rem; }
+.run-waiting button { margin-top: 6px; }
+.deploy-timeout { display: grid; gap: 8px; margin-top: 20px; font-size: 1rem; }
+.deploy-timeout select { padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); font: inherit; }
+
+.diagram-heading { flex-wrap: wrap; }
+.diagram-heading > div:first-child { min-width: 0; overflow-wrap: anywhere; }
+
+.artifact-toolbar { display: flex; align-items: center; gap: 20px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+.artifact-tabs { display: flex; gap: 24px; min-width: 0; }
+.artifact-editor-button { margin-left: auto; flex-shrink: 0; margin-bottom: 6px; }
+.artifact-tabs [role="tab"] { appearance: none; border: 0; border-bottom: 3px solid transparent; border-radius: 0; background: transparent; color: var(--text-2, #b1a6bd); padding: 12px 0; font: inherit; font-size: 13px; cursor: pointer; }
+.artifact-tabs [role="tab"][aria-selected="true"] { color: var(--accent-text, #c4a7ff); border-bottom-color: var(--accent, #8b5cf6); font-weight: 600; }
+.artifact-tabs [role="tab"]:hover { color: var(--text, #eee); }
+.artifact-tabs [role="tab"]:focus-visible { outline: 2px solid var(--accent, #8b5cf6); outline-offset: 3px; }
+.workflow-editor-controls { align-items: center; }

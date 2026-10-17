@@ -241,26 +241,6 @@ pub(crate) fn remove_omar_antigravity_mcp_config(ea_id: EaId) -> Result<()> {
     rewrite_antigravity_manifest_without(|name| name != key)
 }
 
-pub(crate) fn remove_all_omar_antigravity_mcp_configs() -> Result<()> {
-    let Some(config_dir) = antigravity_config_dir() else {
-        return Ok(());
-    };
-    let plugins_dir = config_dir.join("plugins");
-    if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_str()
-                .map(|name| name.starts_with("omar-ea-"))
-                .unwrap_or(false)
-            {
-                std::fs::remove_dir_all(entry.path())?;
-            }
-        }
-    }
-    rewrite_antigravity_manifest_without(|name| !name.starts_with("omar-ea-"))
-}
-
 /// Install OMAR's hook so antigravity will collect events before each turn.
 ///
 /// Hooks are a map of named hooks that the CLI merges, so OMAR claims one name
@@ -338,41 +318,6 @@ mod tests {
         let imports = manifest["imports"].as_array().unwrap();
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0]["name"], "other-plugin");
-    }
-
-    #[test]
-    fn test_remove_all_omar_antigravity_mcp_configs_preserves_user_plugins() {
-        let _env_lock = global_home_env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let _home = EnvVarGuard::set("HOME", dir.path());
-        let plugins_dir = dir.path().join(".gemini/config/plugins");
-        std::fs::create_dir_all(plugins_dir.join("omar-ea-1")).unwrap();
-        std::fs::create_dir_all(plugins_dir.join("omar-ea-2")).unwrap();
-        std::fs::create_dir_all(plugins_dir.join("user-plugin")).unwrap();
-        let manifest_path = dir.path().join(".gemini/config/import_manifest.json");
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "imports": [
-                    {"name": "omar-ea-1", "source": "local-install"},
-                    {"name": "omar-ea-2", "source": "local-install"},
-                    {"name": "user-plugin", "source": "local-install"}
-                ]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        remove_all_omar_antigravity_mcp_configs().unwrap();
-
-        assert!(!plugins_dir.join("omar-ea-1").exists());
-        assert!(!plugins_dir.join("omar-ea-2").exists());
-        assert!(plugins_dir.join("user-plugin").exists());
-        let manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
-        let imports = manifest["imports"].as_array().unwrap();
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0]["name"], "user-plugin");
     }
 
     #[test]

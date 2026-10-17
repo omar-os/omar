@@ -12,25 +12,25 @@ team FanOutFanIn[dispatcher : Codex,
     action analysis : string
     action criticism : string
 
-    prompt dispatcher(request) -> brief
+    task dispatcher(request) -> brief
     "
         Turn this request into a one-sentence brief and set `brief`:
         $(request)
     "
 
-    prompt analyst(brief) -> analysis
+    task analyst(brief) -> analysis
     "
         Produce a concise constructive analysis of this brief and set `analysis`:
         $(brief)
     "
 
-    prompt critic(brief) -> criticism
+    task critic(brief) -> criticism
     "
         Identify the most important risk in this brief and set `criticism`:
         $(brief)
     "
 
-    prompt aggregator(analysis, criticism) -> answer
+    task aggregator(analysis, criticism) -> answer
     "
         The tag barrier delivers both parallel results together.
         Analysis: $(analysis)

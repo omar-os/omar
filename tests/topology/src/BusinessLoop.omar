@@ -25,7 +25,7 @@ typed action and each QA cycle as feedback through a prior reaction.
 As in LF, effects preserve logical time but advance the microstep, so the full
 tag is (logical time, microstep). A and C originate from the same input and keep
 the same logical time, but their unequal paths and independent QA recurrences
-do not guarantee the same microstep. A direct `prompt d(a_ready, c_ready)` would
+do not guarantee the same microstep. A direct `task d(a_ready, c_ready)` would
 therefore fire under OR semantics when the first result arrives instead of
 waiting for the other one.
 
@@ -76,7 +76,7 @@ team BusinessLoop[a_builder : Codex,
     action sync_closed
 
     // Scatter the business brief into two independent upstream workstreams.
-    prompt d_integrator(brief) -> scatter_a, scatter_b
+    task d_integrator(brief) -> scatter_a, scatter_b
     "
         Split this business brief into two complementary assignments:
         $(brief)
@@ -87,7 +87,7 @@ team BusinessLoop[a_builder : Codex,
     "
 
     // Team A iterates locally until its independent QA gate approves it.
-    prompt a_builder(scatter_a, a_rework) -> a_candidate
+    task a_builder(scatter_a, a_rework) -> a_candidate
     "
         Team A assignment: $(scatter_a)
         QA rework request: $(a_rework)
@@ -101,7 +101,7 @@ team BusinessLoop[a_builder : Codex,
         success metric. Do not add headings or commentary.
     "
 
-    prompt a_qa(a_candidate) -> (a_rework | a_ready)
+    task a_qa(a_candidate) -> (a_rework | a_ready)
     "
         QA this team A proposal:
         $(a_candidate)
@@ -112,7 +112,7 @@ team BusinessLoop[a_builder : Codex,
     "
 
     // Keep the approved A result available until D acknowledges it.
-    prompt a_qa(a_ready, a_offer, stop_a) -> a_offer?
+    task a_qa(a_ready, a_offer, stop_a) -> a_offer?
     "
         Approved A result: $(a_ready)
         Previous A offer: $(a_offer)
@@ -124,7 +124,7 @@ team BusinessLoop[a_builder : Codex,
     "
 
     // Team B also iterates locally. Its approved result starts team C.
-    prompt b_builder(scatter_b, b_rework) -> b_candidate
+    task b_builder(scatter_b, b_rework) -> b_candidate
     "
         Team B assignment: $(scatter_b)
         QA rework request: $(b_rework)
@@ -138,7 +138,7 @@ team BusinessLoop[a_builder : Codex,
         and one concrete mitigation. Do not add headings or commentary.
     "
 
-    prompt b_qa(b_candidate) -> (b_rework | b_ready)
+    task b_qa(b_candidate) -> (b_rework | b_ready)
     "
         QA this team B assessment:
         $(b_candidate)
@@ -149,7 +149,7 @@ team BusinessLoop[a_builder : Codex,
     "
 
     // Team C is downstream of B and performs its own build/QA recurrence.
-    prompt c_builder(b_ready, c_rework) -> c_candidate
+    task c_builder(b_ready, c_rework) -> c_candidate
     "
         Approved B assessment: $(b_ready)
         Team C QA rework request: $(c_rework)
@@ -163,7 +163,7 @@ team BusinessLoop[a_builder : Codex,
         verification criterion. Do not add headings or commentary.
     "
 
-    prompt c_qa(c_candidate) -> (c_rework | c_ready)
+    task c_qa(c_candidate) -> (c_rework | c_ready)
     "
         QA this team C implementation plan:
         $(c_candidate)
@@ -174,7 +174,7 @@ team BusinessLoop[a_builder : Codex,
     "
 
     // Keep the approved C result available until D acknowledges it.
-    prompt c_qa(c_ready, c_offer, stop_c) -> c_offer?
+    task c_qa(c_ready, c_offer, stop_c) -> c_offer?
     "
         Approved C result: $(c_ready)
         Previous C offer: $(c_offer)
@@ -187,7 +187,7 @@ team BusinessLoop[a_builder : Codex,
     // D is the synchronization point. A partial offer produces no effects.
     // Once both offers coexist, D closes the handshake and begins integration.
     // Later d_rework events iterate only D's candidate through its local QA.
-    prompt d_integrator(a_offer, c_offer, d_rework, sync_closed)
+    task d_integrator(a_offer, c_offer, d_rework, sync_closed)
         -> d_candidate?, stop_a?, stop_c?, sync_closed?
     "
         Team A offer: $(a_offer)
@@ -211,7 +211,7 @@ team BusinessLoop[a_builder : Codex,
     "
 
     // Team D has its own iterative QA loop before external delivery.
-    prompt d_qa(d_candidate) -> (d_rework | delivery)
+    task d_qa(d_candidate) -> (d_rework | delivery)
     "
         QA the integrated delivery package:
         $(d_candidate)

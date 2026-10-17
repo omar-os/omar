@@ -5,11 +5,11 @@
 // generator exists to make impossible.
 
 /** Every status `omar serve` can report a run in. */
-export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "failed"] as const;
+export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "pausing", "paused", "failed"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
 /** Where a drawing stands. `ready` is compiled but never run, which is what a proposal's preview is. */
-export const DIAGRAM_STATUSES = ["ready", "running", "completed", "failed"] as const;
+export const DIAGRAM_STATUSES = ["ready", "running", "completed", "failed", "paused"] as const;
 export type DiagramStatus = (typeof DIAGRAM_STATUSES)[number];
 
 /** Where one reaction stands. */
@@ -25,7 +25,7 @@ export const PORT_KINDS = ["input", "output", "action"] as const;
 export type PortKind = (typeof PORT_KINDS)[number];
 
 /** What happened, as the event stream names it. */
-export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed"] as const;
+export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started"] as const;
 export type DiagramEventKind = (typeof DIAGRAM_EVENT_KINDS)[number];
 
 /** Who spoke. */
@@ -68,7 +68,12 @@ export type DiagramReaction = { id: string, name: string, agent: string, order: 
  * the run. Carried so a client can draw the bound rather than leaving the
  * operator to read it out of the source.
  */
-within: number | null, };
+within: number | null, 
+/**
+ * The task's prompt, for a one-line summary on its card. `None` for a
+ * code reaction.
+ */
+prompt?: string, };
 
 export type DiagramEdge = { id: string, kind: EdgeKind, source: string, target: string, 
 /**
@@ -86,6 +91,14 @@ export type DiagramSnapshot = { protocol_version: number, team: string, sequence
  */
 lag: number | null, 
 /**
+ * The unix millisecond the run's logical time zero stands at, so a
+ * client can read the run's physical clock off its own wall clock,
+ * before the first tag and whenever it connected. A resume moves it
+ * back by the time the run had already spent. `None` until the loop
+ * starts its clock, which is after the agents are up.
+ */
+clock_origin?: number, 
+/**
  * The containers to draw. Empty for a program compiled before instances
  * were carried through, which is how a client tells the difference.
  */
@@ -97,7 +110,11 @@ timers: Array<DiagramTimer>, reactions: Array<DiagramReaction>, edges: Array<Dia
 
 export type DiagramEvent = { protocol_version: number, sequence: number, team: string, tag: DiagramTag | null, kind: DiagramEventKind, payload: Record<string, unknown>, };
 
-export type ProposedDesign = { program: string, inputs: Record<string, unknown>, 
+export type ProposedDesign = { program: string, 
+/**
+ * Companion files relative to program.omar.
+ */
+files?: Record<string, string>, inputs: Record<string, unknown>, 
 /**
  * The compiled topology, so the operator sees what they are approving
  * before any run exists.
@@ -119,5 +136,18 @@ export type Conversation = { id: string, title: string, ea_id: number | null, cr
 
 export type ConversationSummary = { id: string, title: string, created_at: number, updated_at: number, message_count: number, ea_id: number | null, busy: boolean, run: RunRecord | null, };
 
-export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number, finished_at: number | null, error: string | null, };
+export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number, finished_at: number | null, error: string | null, 
+/**
+ * Input ports the run was admitted with, so its timeline can be
+ * projected again later from the same starting point.
+ */
+present?: Array<string>, 
+/**
+ * Output ports a finished run ended with.
+ */
+outputs?: Record<string, unknown>, 
+/**
+ * State variables a finished run ended with.
+ */
+state?: Record<string, unknown>, };
 

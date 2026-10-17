@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Real sockets + isolated tmux: last-window shutdown, child cleanup, native resume.
+"""Real sockets + isolated tmux: windows come and go, explicit shutdown, relaunch.
 
-No model calls. Run with OMAR_BIN pointing at a freshly built runtime.
+Each foreground `serve` is its own session; resuming a chat across runtimes
+belongs to a later milestone. No model calls. Run with OMAR_BIN pointing at a
+freshly built runtime.
 """
 import http.client
 import json
@@ -31,8 +33,9 @@ def eventually(check, seconds=15):
 
 with tempfile.TemporaryDirectory(prefix="omar-window-") as temporary:
     root = Path(temporary)
-    server = root.name
-    env = {**os.environ, "HOME": temporary, "OMAR_TMUX_SERVER": server}
+    env = {**os.environ, "HOME": temporary}
+    for key in ("TMUX", "TMUX_PANE", "OMAR_TMUX_SERVER", "OMAR_SESSION_ID", "OMAR_STATE_DIR", "OMAR_HOME", "OMAR_EA_ID"):
+        env.pop(key, None)
     log = root / "launches.jsonl"
     fake = root / "claude"
     fake.write_text(f'''#!/usr/bin/env python3
@@ -48,13 +51,12 @@ while True: time.sleep(1)
     fake.chmod(0o700)
     config = root / "config.toml"
     config.write_text('[agent]\ndefault_command = ' + json.dumps(str(fake)) + '\n')
-    subprocess.run(["tmux", "-L", server, "-f", "/dev/null", "new-session", "-d", "-s", "harness"], check=True)
-    subprocess.run(["tmux", "-L", server, "set-option", "-g", "default-shell", "/bin/sh"], check=True)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     address = f"127.0.0.1:{port}"
     daemons = []
+    sessions = []
     streams = []
 
     def api(method, path, body=None):
@@ -84,10 +86,16 @@ while True: time.sleep(1)
 
     def launch():
         output = open(root / f"daemon-{len(daemons)}.log", "w")
-        daemon = subprocess.Popen([BINARY, "--config", str(config), "serve", "--address", address], env=env, stdout=output, stderr=output)
+        name = f"mc{len(daemons)}"
+        daemon = subprocess.Popen([BINARY, "--config", str(config), "serve", "--name", name, "--address", address], env=env, stdout=output, stderr=output)
         output.close()
         daemons.append(daemon)
         eventually(lambda: api("GET", "/health"))
+        def listed():
+            return json.loads(subprocess.run([BINARY, "ls", "--json"], env=env, capture_output=True, text=True, check=True).stdout)
+        # Health answers while the assistant is still starting; the runtime is
+        # addressable once the registry says ready.
+        sessions.append(eventually(lambda: next((s for s in listed() if s["name"] == name and s["state"] == "ready"), None), seconds=60))
         try:
             eventually(lambda: len(launches()) == len(daemons))
         except AssertionError:
@@ -101,7 +109,7 @@ while True: time.sleep(1)
 
     try:
         first = launch()
-        token = json.loads((root / ".omar/mcp/ea-0/context.json").read_text())["serve"]["token"]
+        token = json.loads((Path(sessions[0]["directory"]) / "mcp/ea-0/context.json").read_text())["serve"]["token"]
         api("POST", "/v1/agent/reply", {"token": token, "text": "Saved before closing"})
         before = api("GET", "/v1/chat")
         one, two = window(), window()
@@ -109,31 +117,32 @@ while True: time.sleep(1)
         time.sleep(1)
         assert first.poll() is None, "closing one of two windows stopped the daemon"
         close(two)
-        time.sleep(4)
+        # A runtime outlives its browser windows: no window for longer than the
+        # old grace period leaves it running, and a new window finds the same chat.
+        time.sleep(12)
+        assert first.poll() is None, "closing the last window stopped the runtime"
         reloaded = window()
-        time.sleep(7)
-        assert first.poll() is None, "reconnect did not cancel the original grace period"
-        closed_at = time.monotonic()
+        assert api("GET", "/v1/chat")["id"] == before["id"]
         close(reloaded)
+        # Shutdown is explicit, and takes the EA and its child with it.
+        down = subprocess.run([BINARY, "down", "-s", sessions[0]["name"], "--timeout", "30"], env=env, capture_output=True, text=True)
+        assert down.returncode == 0, down.stderr
         assert first.wait(timeout=15) == 0
-        assert time.monotonic() - closed_at >= 9.5, "shutdown skipped the grace period"
         original = launches()[0]
         eventually(lambda: dead(original["pid"]) and dead(original["child"]))
-        assert subprocess.run(["tmux", "-L", server, "has-session", "-t", "=omar-agent-ea-0"], capture_output=True).returncode != 0
+        assert subprocess.run(["tmux", "-L", sessions[0]["tmux_server"], "has-session", "-t", "=omar-agent-ea-0"], capture_output=True).returncode != 0
         second = launch()
         reopened = window()
         after = api("GET", "/v1/chat")
-        assert before["id"] == after["id"]
-        assert after["messages"] == before["messages"]
-        resumed = launches()[1]["args"]
-        native_id = original["args"][original["args"].index("--session-id") + 1]
-        assert resumed[resumed.index("--resume") + 1] == native_id
+        assert after["id"] != before["id"], "a new runtime is a new session with its own chat"
         time.sleep(1)
         assert len(launches()) == 2, "opening the chat launched a second EA"
         close(reopened)
+        down = subprocess.run([BINARY, "down", "-s", sessions[1]["name"], "--timeout", "30"], env=env, capture_output=True, text=True)
+        assert down.returncode == 0, down.stderr
         assert second.wait(timeout=15) == 0
         eventually(lambda: all(dead(item["pid"]) and dead(item["child"]) for item in launches()))
-        print("PASS: multiple windows, refresh grace, EA + child + runtime cleanup, saved chat + native resume")
+        print("PASS: multiple windows, runtime outlives its windows, explicit shutdown cleans EA + child, relaunch")
     finally:
         for stream in streams:
             stream.close()
@@ -146,4 +155,5 @@ while True: time.sleep(1)
                 for key in ("pid", "child"):
                     if not dead(item[key]):
                         os.kill(item[key], signal.SIGKILL)
-        subprocess.run(["tmux", "-L", server, "kill-server"], capture_output=True)
+        for session in sessions:
+            subprocess.run(["tmux", "-L", session["tmux_server"], "kill-server"], capture_output=True)

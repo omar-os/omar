@@ -69,7 +69,7 @@ function mcpError(response) {
  *
  * OMAR accepts both MCP Content-Length framing and JSONL. JSONL is the least
  * fragile contract for an extension because it works with Node's readline and
- * is also the framing used by the repository's Slack bridge.
+ * needs no length bookkeeping.
  */
 export class OmarMcpClient {
   constructor({

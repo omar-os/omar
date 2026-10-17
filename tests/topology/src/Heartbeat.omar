@@ -17,7 +17,7 @@ team Pulse[monitor : ClaudeCode]
     timer tick(0, 10ns)
     output reading : string
 
-    prompt monitor(tick) -> reading
+    task monitor(tick) -> reading
     "
         Tick at logical time $(tick).
 
@@ -35,7 +35,7 @@ team Watch[watcher : ClaudeCode]
     input reading : string
     output verdict : string
 
-    prompt watcher(reading) -> verdict
+    task watcher(reading) -> verdict
     "
         $(reading)
 

@@ -10,7 +10,7 @@ team HR[manager   : Codex,
     action opinion2 : string
     action log : string
     
-    prompt manager(resume)
+    task manager(resume)
         -> (triage | hired = false), log? // can optionally not log, but must either triage or reject. Giving semantics to outputs seems useful.
     "
         We're hiring new employees and are looking for
@@ -24,7 +24,7 @@ team HR[manager   : Codex,
         You may also set `log`.
     "
 
-    prompt reviewer1(triage) -> opinion1
+    task reviewer1(triage) -> opinion1
     "
         Review the resume as a senior engineer.
         The manager's initial assessment is: $(triage)
@@ -32,7 +32,7 @@ team HR[manager   : Codex,
         Write a concise opinion in `opinion1`.
     "
 
-    prompt reviewer2(triage) -> opinion2
+    task reviewer2(triage) -> opinion2
     "
         Review the resume as a hiring partner.
         The manager's initial assessment is: $(triage)
@@ -40,7 +40,7 @@ team HR[manager   : Codex,
         Write a concise opinion in `opinion2`.
     "
 
-    prompt manager(opinion1, opinion2) -> hired
+    task manager(opinion1, opinion2) -> hired
     "
         Review both reviewer opinions and decide whether to hire the candidate.
         Senior engineer: $(opinion1)

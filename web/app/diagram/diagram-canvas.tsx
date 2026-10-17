@@ -9,13 +9,18 @@ import {
   useRef,
   useState,
 } from "react";
-import { formatDuration, webAgents, type DiagramSnapshot } from "../lib/protocol";
+import {
+  formatCountdown,
+  formatDuration,
+  runClockAt,
+  webAgents,
+  type DiagramSnapshot,
+} from "../lib/protocol";
 
 /**
- * Lingua Franca renders reactors as labelled containers whose ports sit on the
- * container boundary and whose reactions are chevrons laid out inside. We
- * reproduce that visual grammar directly: ELK computes the layered layout and
- * this module draws it as SVG. No KIELER/KLighD involved.
+ * Runtime instances stay grouped with their boundary ports and reactions.
+ * ELK computes the layered layout; SVG task cards apply the workflow design
+ * without changing the topology or its connections.
  */
 
 type Point = { x: number; y: number };
@@ -36,6 +41,8 @@ type ElkSection = {
 
 type ElkEdge = {
   id: string;
+  sources?: string[];
+  targets?: string[];
   sections?: ElkSection[];
 };
 
@@ -54,15 +61,15 @@ type ElkNode = {
 
 type Box = { x: number; y: number; width: number; height: number };
 
-const REACTION_SIZE = { width: 154, height: 50 };
-/** Chevron text starts after the order badge and must clear the right notch. */
-const REACTION_TEXT_X = 46;
+const REACTION_SIZE = { width: 210, height: 88 };
+/** Task text starts after the order badge and leaves room for the deadline. */
+const REACTION_TEXT_X = 48;
 /**
  * The stopwatch a `within` deadline is drawn as, and the room it needs.
  *
  * A face plus a crown, so it reads as a stopwatch rather than the clock a timer
  * already uses — one counts down against a reaction, the other fires on its
- * own. It sits before the chevron's point with its interval beneath, and the
+ * own. It sits before the task card's edge with its interval beneath, and the
  * node widens to hold both rather than crowding the name.
  */
 const WITHIN_RADIUS = 7;
@@ -73,6 +80,13 @@ const ACTION_SIZE = { width: 26, height: 26 };
 const CLOCK_SIZE = { width: 34, height: 34 };
 const PORT_SIZE = { width: 12, height: 12 };
 const TEAM_PADDING = { top: 30, right: 78, bottom: 30, left: 78 };
+/**
+ * Room under a clock for its captions, which hang below the box ELK sees:
+ * name, schedule and, on a live run, the countdown. Reserved whenever the
+ * container holds a timer rather than only while counting, so starting the
+ * run does not move the boxes.
+ */
+const CLOCK_CAPTIONS = 14;
 const CANVAS_MARGIN = 28;
 /** Feedback edges leave and re-enter horizontally before dropping to a lane. */
 /**
@@ -82,7 +96,7 @@ const CANVAS_MARGIN = 28;
  * the border. Every way of doing that desynchronised the layout: moving ports
  * afterwards left edges on a staircase, and `spacing.portsSurrounding` moves
  * the ports without moving the children ELK routes to, which orphans the
- * chevrons. Outside the box there is nothing to avoid.
+ * task cards. Outside the box there is nothing to avoid.
  */
 const TITLE_BAND = 30;
 /** Least vertical gap between two ports on the same side. */
@@ -125,14 +139,31 @@ type TimerView = {
   phase: number;
   /** True on the tag it fired at, which is when the face pulses. */
   firing: boolean;
+  /**
+   * The tag it last fired at, as a string: the hand is keyed on it, so each
+   * firing is a fresh hand and its sweep plays again, even when the timer
+   * fires on consecutive tags and the face never stops reading as firing.
+   */
+  firedKey: string;
+  /**
+   * When it fires next, in the run's own time, or null for a one-shot that
+   * has fired and has nothing left to wait for.
+   */
+  next: number | null;
   center: Point;
 };
 
 type ReactionView = {
   id: string;
   order: number;
+  /** Its number among its own team instance's tasks, which is how the source reads. */
+  localOrder: number;
   name: string;
   meta: string;
+  contract: string;
+  /** One line of what the task asks, from its prompt; the contract for a code reaction. */
+  summary: string;
+  backend: string;
   status: string;
   box: Box;
   /** The agent that runs it, which is whose terminal opens on double click. */
@@ -180,7 +211,7 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-const CHEVRON_NOTCH = 11;
+const CARD_END_PADDING = 11;
 
 /** Shapes are drawn at the origin and placed by a group transform, so that
  * layout changes animate rather than jumping. */
@@ -188,20 +219,6 @@ const CHEVRON_NOTCH = 11;
 const DRAG_SLOP = 4;
 
 const ORIGIN: Point = { x: 0, y: 0 };
-
-/** Six-point Lingua Franca reaction chevron. */
-function chevronPoints(width: number, height: number): string {
-  const mid = height / 2;
-  return [
-    `0,0`,
-    `${width - CHEVRON_NOTCH},0`,
-    `${width},${mid}`,
-    `${width - CHEVRON_NOTCH},${height}`,
-    `0,${height}`,
-    `${CHEVRON_NOTCH},${mid}`,
-  ].join(" ");
-}
-
 
 /**
  * Break a polyline so a label can sit in the gap.
@@ -266,7 +283,7 @@ function distance(a: Point, b: Point): number {
 /**
  * Nudge a polyline's endpoints along their own direction. Positive values pull
  * back (so arrowheads clear port glyphs); negative values push forward (so
- * arrowheads reach a chevron's recessed leading vertex instead of its bounds).
+ * arrowheads reach a task card's recessed leading vertex instead of its bounds).
  */
 /** Below this a segment counts as already on an axis. */
 const AXIS_EPSILON = 0.5;
@@ -409,7 +426,7 @@ function flattenLayout(
 type ReactionLabels = { name: string; meta: string };
 
 /**
- * Labels are needed before layout (to size the chevron) and after it (to draw
+ * Labels are needed before layout (to size the task card) and after it (to draw
  * them), so they are derived once here rather than computed twice.
  */
 function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> {
@@ -422,16 +439,17 @@ function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> 
   return new Map(
     snapshot.reactions.map((reaction) => {
       const owner = agents.get(reaction.agent);
-      const agent = owner?.name ?? reaction.agent;
+      // The agent's own name: the instance it belongs to is the box around it.
+      const agent = localName(owner?.name ?? reaction.agent, reaction.instance);
       // Which model is behind an agent changes how you read what it did, and
-      // the program picked it deliberately, so it belongs on the chevron.
+      // the program picked it deliberately, so it belongs on the task card.
       const detail = [owner?.backend, reaction.status]
         .filter(Boolean)
         .join(" \u00b7 ");
       // The runtime names reactions `reaction.N` because OMAR prompts are
       // anonymous, which makes a poor headline. Lead with the agent and let the
       // contract say what it writes; honour a real name if one ever arrives.
-      const generated = /^reaction\.\d+$/.test(reaction.name);
+      const generated = /(?:^|\.)reaction\.\d+$/.test(reaction.name);
       return [
         reaction.id,
         {
@@ -448,17 +466,120 @@ function textWidth(text: string, perChar: number): number {
   return text.length * perChar;
 }
 
+/**
+ * One line of what a task asks: its prompt's first sentence, with each
+ * `$(port)` read as the port's name. The card's width is set by the name and
+ * the model line, never by this; whatever does not fit ends in an ellipsis.
+ */
+export function summarisePrompt(prompt: string): string {
+  const flat = prompt
+    .replace(/\$\(([^)]*)\)/g, (_, port: string) => port.split(".").pop() ?? port)
+    .replace(/\s+/g, " ")
+    .trim();
+  const sentence = flat.match(/^(.*?[.!?])(?:\s|$)/)?.[1] ?? flat;
+  return sentence.replace(/[.!?:;,]+$/, "");
+}
+
+/** Cut to what a width holds at a per-character advance, ending in an ellipsis. */
+export function fitText(text: string, width: number, perChar: number): string {
+  const room = Math.max(1, Math.floor(width / perChar));
+  return text.length <= room ? text : `${text.slice(0, Math.max(0, room - 1)).trimEnd()}…`;
+}
+
+/**
+ * The model behind a task, as a mark on its card: a monochrome glyph for
+ * the backends OMAR knows, drawn in a 24-unit box, and an initial for one
+ * it does not. Not the vendors' artwork; a shape that reads as theirs.
+ */
+function BackendMark({ backend }: { backend: string }) {
+  const kind = backend.toLowerCase();
+  const stroke = { fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
+  if (kind === "codex") {
+    // Six arcs about the centre: the interlocking ring.
+    return (
+      <g {...stroke} strokeWidth={2}>
+        {[0, 60, 120, 180, 240, 300].map((angle) => (
+          <path key={angle} d="M12 3.2 A8.8 8.8 0 0 1 19.6 7.6 L12 12 Z" transform={`rotate(${angle} 12 12)`} />
+        ))}
+      </g>
+    );
+  }
+  if (kind === "claude" || kind === "claudecode") {
+    // Rays from the centre: the sunburst.
+    return (
+      <g {...stroke} strokeWidth={2.4}>
+        {[0, 45, 90, 135, 180, 225, 270, 315].map((angle, i) => (
+          <path key={angle} d={`M12 12 L12 ${i % 2 === 0 ? 2.6 : 4.2}`} transform={`rotate(${angle} 12 12)`} />
+        ))}
+      </g>
+    );
+  }
+  if (kind === "cursor") {
+    // A cube seen from above.
+    return (
+      <g {...stroke}>
+        <path d="M12 2.5 L20.5 7.25 V16.75 L12 21.5 L3.5 16.75 V7.25 Z" />
+        <path d="M12 12 L20.5 7.25 M12 12 V21.5 M12 12 L3.5 7.25" />
+      </g>
+    );
+  }
+  if (kind === "opencode") {
+    return (
+      <g {...stroke}>
+        <path d="M4 6 L10 12 L4 18" />
+        <path d="M12 19 H20" />
+      </g>
+    );
+  }
+  if (kind === "pi") {
+    return (
+      <g {...stroke}>
+        <path d="M4 7 H20 M8 7 V19 M15.5 7 V17 Q15.5 19.5 18.5 19" />
+      </g>
+    );
+  }
+  if (kind === "antigravity" || kind === "agy") {
+    return (
+      <g {...stroke}>
+        <ellipse cx="12" cy="12" rx="9" ry="4.2" transform="rotate(-30 12 12)" />
+        <path d="M12 17 V5 M8.5 8.5 L12 5 L15.5 8.5" />
+      </g>
+    );
+  }
+  if (kind === "web") {
+    return (
+      <g {...stroke} strokeWidth={1.9}>
+        <circle cx="12" cy="12" r="9" />
+        <ellipse cx="12" cy="12" rx="4" ry="9" />
+        <path d="M3 12 H21" />
+      </g>
+    );
+  }
+  if (kind === "stub") {
+    return (
+      <g {...stroke} strokeWidth={2} strokeDasharray="3 2.6">
+        <circle cx="12" cy="12" r="8.5" />
+      </g>
+    );
+  }
+  return (
+    <text x="12" y="17" textAnchor="middle" fill="currentColor" fontSize="14" fontWeight="700">
+      {backend.slice(0, 1).toUpperCase()}
+    </text>
+  );
+}
+
 function reactionWidth(labels: ReactionLabels, within: number | null): number {
   const widest = Math.max(
-    textWidth(labels.name, 6.9),
-    textWidth(labels.meta, 5.2),
+    textWidth(labels.name, 8.1),
+    textWidth(labels.meta, 6.4) + 22,
   );
   // A deadline is drawn between the text and the point, so the node has to be
   // wider for it rather than the stopwatch sitting on top of the name.
   const deadline = within === null ? 0 : WITHIN_ROOM;
   return clamp(
-    Math.ceil(REACTION_TEXT_X + widest + deadline + CHEVRON_NOTCH + 10),
-    REACTION_SIZE.width,
+    Math.ceil(REACTION_TEXT_X + widest + deadline + CARD_END_PADDING + 10),
+    REACTION_SIZE.width + deadline,
     REACTION_MAX_WIDTH,
   );
 }
@@ -528,6 +649,7 @@ async function runElk(
   snapshot: DiagramSnapshot,
   containers: ContainerView[],
   aspectRatio: number | null,
+  unwrapped: ReadonlySet<string> = new Set(),
 ): Promise<ElkNode> {
   const labels = reactionLabels(snapshot);
   const wrapping: Record<string, string> =
@@ -544,7 +666,7 @@ async function runElk(
   const labelRoom = (names: string[]) =>
     names.length === 0
       ? 0
-      : Math.ceil(Math.max(...names.map((name) => textWidth(name, 6.4))));
+      : Math.ceil(Math.max(...names.map((name) => textWidth(name, 7.5))));
 
   // ELK expresses an edge's route relative to the deepest node containing both
   // of its ends, whatever node the edge was declared on. Declaring each edge
@@ -655,7 +777,7 @@ async function runElk(
           "elk.spacing.portPort": `${PORT_GAP}`,
           "elk.padding": `[top=${TEAM_PADDING.top},left=${
             TEAM_PADDING.left + room("input")
-          },bottom=${TEAM_PADDING.bottom},right=${
+          },bottom=${TEAM_PADDING.bottom + (timers.length > 0 ? CLOCK_CAPTIONS : 0)},right=${
             TEAM_PADDING.right + room("output")
           }]`,
           // In-layer (vertical) spacing only. Kept generous because an action's
@@ -665,7 +787,7 @@ async function runElk(
           "elk.spacing.edgeNode": "22",
           "elk.layered.spacing.edgeNodeBetweenLayers": "22",
           "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
-          ...wrapping,
+          ...(unwrapped.has(container.id) ? {} : wrapping),
         },
         ports: ports.map((port) => ({
           id: port.id,
@@ -778,6 +900,9 @@ function buildLayout(
       // or spent, so the hand sits at the top rather than creeping round.
       phase: timer.period > 0 ? (since % timer.period) / timer.period : 0,
       firing: fired !== null && fired === now,
+      firedKey: timer.last_tag ? `${timer.last_tag.timestamp}:${timer.last_tag.microstep}` : "",
+      next:
+        fired === null ? timer.offset : timer.period > 0 ? fired + timer.period : null,
       center: {
         x: (box?.x ?? 0) + (box?.width ?? CLOCK_SIZE.width) / 2,
         y: (box?.y ?? 0) + (box?.height ?? CLOCK_SIZE.height) / 2,
@@ -787,13 +912,26 @@ function buildLayout(
 
   const labels = reactionLabels(snapshot);
   const web = webAgents(snapshot);
+  // Numbered within each team instance, in declaration order: the card says
+  // "01" for an instance's first task however many other instances precede it.
+  const localOrders = new Map<string, number>();
+  const perInstance = new Map<string, number>();
+  for (const reaction of [...snapshot.reactions].sort((a, b) => a.order - b.order)) {
+    const seen = perInstance.get(reaction.instance) ?? 0;
+    localOrders.set(reaction.id, seen);
+    perInstance.set(reaction.instance, seen + 1);
+  }
   const reactions: ReactionView[] = snapshot.reactions.map((reaction) => {
     const label = labels.get(reaction.id) ?? { name: reaction.name, meta: "" };
     return {
       id: reaction.id,
       order: reaction.order,
+      localOrder: localOrders.get(reaction.id) ?? reaction.order,
       name: label.name,
       meta: label.meta,
+      contract: reaction.contract,
+      summary: reaction.prompt ? summarisePrompt(reaction.prompt) : reaction.contract,
+      backend: snapshot.agents.find((agent) => agent.id === reaction.agent)?.backend ?? "Agent",
       status: reaction.status,
       box: nodeBoxes.get(reaction.id) ?? { x: 0, y: 0, ...REACTION_SIZE },
       agent: componentName(reaction.agent),
@@ -890,7 +1028,6 @@ function buildLayout(
   // edge drawn anywhere before it.
   const wrapped = new Map<string | null, number>();
   const deepestLane = new Map<string, number>();
-  const reactionIds = new Set(snapshot.reactions.map((reaction) => reaction.id));
   const edges: EdgeView[] = snapshot.edges.flatMap((edge) => {
     const points = edgePoints.get(edge.id);
     if (!points || points.length < 2) return [];
@@ -902,7 +1039,20 @@ function buildLayout(
 
     const from = anchorBox(edge.source);
     const to = anchorBox(edge.target);
-    if (from && to && to.x + to.width <= from.x + from.width) {
+    // Two kinds of edge have their target left of their source. One ELK had
+    // to reverse to break a cycle, and draws backwards: out of the source's
+    // left, into the target's right. The other joins one wrapped row to the
+    // next, and ELK already draws it forwards: out of the right, down the gap
+    // between the rows, in from the left. Only the first needs the lane; the
+    // second would be dragged under the whole team by it.
+    const first = routed[0];
+    const last = routed[routed.length - 1];
+    const backwards =
+      from &&
+      to &&
+      (first.x < from.x + from.width - AXIS_EPSILON ||
+        last.x > to.x + AXIS_EPSILON);
+    if (from && to && to.x + to.width <= from.x + from.width && backwards) {
       // Stagger lanes so several feedback edges do not sit on top of each other.
       const span = {
         left: to.x - WRAP_STUB,
@@ -927,7 +1077,7 @@ function buildLayout(
     }
 
     const start = sourcePort ? 8 : 0;
-    const end = targetPort ? 9 : reactionIds.has(edge.target) ? -CHEVRON_NOTCH : 0;
+    const end = targetPort ? 9 : 0;
     const drawn = adjustEnds(squareOff(routed), start, end);
     // A delay is a fact about the connection, so it is written on it. Only for
     // connections: a trigger or an effect is a reaction's own wiring and has
@@ -942,7 +1092,7 @@ function buildLayout(
         : edge.delay === 0
           ? "\u03bcstep"
           : formatDuration(edge.delay);
-    const split = text ? breakForLabel(drawn, textWidth(text, 5.6) + 8) : null;
+    const split = text ? breakForLabel(drawn, textWidth(text, 6.7) + 8) : null;
     return [
       {
         id: edge.id,
@@ -1025,6 +1175,11 @@ function fitScale(layout: Layout, size: Size): number {
  * actually renders larger in the panel we have, biased towards the single row.
  */
 const WRAP_CANDIDATES = [3.0, 2.2, 1.6];
+// Tried only when none of those made a cut worth keeping: a chain of four
+// of the redesign's cards is tall enough that the looser ratios make no cut
+// at all and 1.6 cuts in front of the output port, while this wraps it
+// cleanly. Graphs that already wrap never pay for the extra run.
+const WRAP_FALLBACK = 1.2;
 const WRAP_GAIN = 1.08;
 
 /**
@@ -1055,23 +1210,71 @@ async function computeGeometry(
 
   let best = plain;
   let bestScale = fitScale(buildLayout(snapshot, declared, plain), size) * WRAP_GAIN;
-  for (const aspectRatio of WRAP_CANDIDATES) {
+  const attempt = async (aspectRatio: number) => {
     let candidate: ElkNode;
     let scale: number;
     try {
       candidate = await runElk(factory, snapshot, declared, aspectRatio);
+      const stranded = strandedPorts(candidate);
+      if (stranded.size > 0) {
+        candidate = await runElk(
+          factory,
+          snapshot,
+          declared,
+          aspectRatio,
+          stranded,
+        );
+      }
       scale = fitScale(buildLayout(snapshot, declared, candidate), size);
     } catch {
       // Wrapping is an optimisation, and ELK throws on some graphs — cyclic
       // ones especially. Losing a candidate is fine; losing the diagram is not.
-      continue;
+      return;
     }
     if (scale > bestScale) {
       best = candidate;
       bestScale = scale;
     }
+  };
+  for (const aspectRatio of WRAP_CANDIDATES) {
+    await attempt(aspectRatio);
+  }
+  if (best === plain) {
+    await attempt(WRAP_FALLBACK);
   }
   return { declared, elk: best };
+}
+
+/**
+ * Containers whose wrap left one of their own ports in a row by itself.
+ *
+ * ELK wraps a container by cutting its layering into rows, and its ports are
+ * layered like anything else: inputs first, outputs last. A cut right before
+ * the outputs puts them in a row of their own, and the edge into one leaves
+ * its reaction, drops a row, runs back across the box and comes forward
+ * again to a port that is drawn on the border anyway. That row buys nothing,
+ * so such a container is laid out unwrapped instead. The tell is an edge
+ * between a container and its own port with a leftward run in it: with the
+ * ports on the outer layers nothing else can send one backwards.
+ */
+function strandedPorts(node: ElkNode, into = new Set<string>()): Set<string> {
+  const own = new Set((node.ports ?? []).map((port) => port.id));
+  const backwards = (section: ElkSection) =>
+    [section.startPoint, ...(section.bendPoints ?? []), section.endPoint].some(
+      (point, index, points) =>
+        index > 0 && point.x < points[index - 1].x - AXIS_EPSILON,
+    );
+  for (const edge of node.edges ?? []) {
+    const touchesOwn = [...(edge.sources ?? []), ...(edge.targets ?? [])].some(
+      (end) => own.has(end),
+    );
+    if (touchesOwn && (edge.sections ?? []).some(backwards)) {
+      into.add(node.id);
+      break;
+    }
+  }
+  for (const child of node.children ?? []) strandedPorts(child, into);
+  return into;
 }
 
 /**
@@ -1113,10 +1316,17 @@ export function componentName(id: string): string {
   return separator === -1 ? id : id.slice(separator + 2);
 }
 
+/** `in 1 m 30 s` until the firing, then `due` until the run gets to it. */
+function countdownLabel(remaining: number): string {
+  const left = formatCountdown(remaining);
+  return left === "due" ? left : `in ${left}`;
+}
+
 export function DiagramCanvas({
   snapshot,
   selection = [],
   onToggleComponent,
+  onInspectComponent,
   onOpenTerminal,
   onOpenPanel,
   highlight,
@@ -1124,6 +1334,7 @@ export function DiagramCanvas({
   snapshot: DiagramSnapshot;
   selection?: string[];
   onToggleComponent?: (component: string) => void;
+  onInspectComponent?: (component: string) => void;
   /** Given only while agents are actually running and can be attached to. */
   onOpenTerminal?: (agent: string) => void;
   /** A web agent has no pane, so its double-click opens its panel instead. */
@@ -1139,6 +1350,7 @@ export function DiagramCanvas({
   const [layout, setLayout] = useState<Layout | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [size, setSize] = useState<Size>({ width: 0, height: 0 });
+  const sized = size.width > 0 && size.height > 0;
   const [userView, setUserView] = useState<Viewport | null>(null);
   const dragRef = useRef<{ x: number; y: number; view: Viewport } | null>(null);
   // The glide reads the live view without re-creating itself on every frame.
@@ -1146,12 +1358,46 @@ export function DiagramCanvas({
   const glideRef = useRef(0);
   // A click that panned the canvas is not a click on what sits under it.
   const draggedRef = useRef(false);
+  const inspectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelInspection = () => {
+    if (inspectTimerRef.current !== null) clearTimeout(inspectTimerRef.current);
+  };
+  useEffect(() => () => { if (inspectTimerRef.current !== null) clearTimeout(inspectTimerRef.current); }, [snapshot.team]);
   const selected = useMemo(() => new Set(selection), [selection]);
+
+  // A countdown is the one reading on the canvas that moves between tags,
+  // which is exactly when nothing else does: the hand steps with logical time,
+  // but a timer fires on the physical clock, and that is what an operator
+  // waiting for it wants to see. The run's clock is wall time since the
+  // origin the runtime announced (see `runClockAt`). Only a live run has a
+  // clock to read.
+  const counting =
+    snapshot.status === "running" &&
+    snapshot.timers.some((timer) => timer.last_tag === null || timer.period > 0);
+  const tag = snapshot.current_tag;
+  // When this client first saw the current tag: the fallback origin for a
+  // runtime that has not announced its clock. Keyed on the tag alone, so the
+  // events published within it do not restart the reading.
+  const tagKey = `${tag?.timestamp ?? ""}|${tag?.microstep ?? ""}`;
+  const [seen, setSeen] = useState(() => ({ tagKey, at: Date.now() }));
+  const [wall, setWall] = useState(() => Date.now());
+  useEffect(() => {
+    if (!counting) return;
+    const tick = setInterval(() => setWall(Date.now()), 250);
+    return () => clearInterval(tick);
+  }, [counting]);
+  const firstSeen = seen.tagKey === tagKey ? seen.at : wall;
+  if (seen.tagKey !== tagKey) setSeen({ tagKey, at: wall });
+  /** The run's physical clock as this render sees it, in nanoseconds. */
+  const runClock = runClockAt(snapshot, wall, firstSeen);
 
   // Reads the drag flag when the click happens, never during render.
   function handleNodeClick(component: string) {
     if (draggedRef.current) return;
     onToggleComponent?.(component);
+    cancelInspection();
+    // Let double-click retain its terminal/panel action before opening details.
+    inspectTimerRef.current = setTimeout(() => onInspectComponent?.(component), 250);
   }
 
   /** Props that make a node selectable, or just its class when selection is off. */
@@ -1163,10 +1409,18 @@ export function DiagramCanvas({
     const component = componentName(id);
     return {
       className: `${base}${lit}${selected.has(component) ? " selected" : ""}`,
+      role: "button",
+      tabIndex: 0,
+      "aria-label": `Inspect ${component}`,
+      "aria-pressed": selected.has(component),
       onClick: () => handleNodeClick(component),
+      onKeyDown: (event: { key: string; preventDefault: () => void }) => {
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onToggleComponent?.(component); onInspectComponent?.(component); }
+      },
       // The canvas resets the view on double click; a node has its own meaning.
-      onDoubleClick: (event: { stopPropagation: () => void }) =>
-        event.stopPropagation(),
+      onDoubleClick: (event: { stopPropagation: () => void }) => {
+        event.stopPropagation(); cancelInspection();
+      },
     };
   }
 
@@ -1193,8 +1447,12 @@ export function DiagramCanvas({
 
     // Same shape as what is already drawn: the values moved and nothing else,
     // so redraw from the geometry in hand rather than asking ELK for it again.
+    // A layout worked out before the host had a size could not wrap, since
+    // wrapping fits the panel; it is keyed as such so the first measurement
+    // asks ELK again rather than keeping a single row for good.
+    const key = sized ? shape : `${shape}|unsized`;
     const drawn = geometryRef.current;
-    if (drawn?.key === shape) {
+    if (drawn?.key === key) {
       try {
         setLayout(buildLayout(snapshot, drawn.geometry.declared, drawn.geometry.elk));
         setError(null);
@@ -1207,7 +1465,7 @@ export function DiagramCanvas({
     computeGeometry(snapshot, sizeRef.current)
       .then((geometry) => {
         if (cancelled) return;
-        geometryRef.current = { key: shape, geometry };
+        geometryRef.current = { key, geometry };
         setLayout(buildLayout(snapshot, geometry.declared, geometry.elk));
         const structure = structureKey(snapshot);
         if (structureRef.current !== structure) {
@@ -1223,7 +1481,7 @@ export function DiagramCanvas({
     return () => {
       cancelled = true;
     };
-  }, [snapshot, shape]);
+  }, [snapshot, shape, sized]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -1371,7 +1629,7 @@ export function DiagramCanvas({
     <div className="diagram-wrap" ref={hostRef}>
       <svg
         className="diagram-canvas"
-        role="img"
+        role="group"
         aria-label={`Live topology diagram for ${snapshot.team}`}
         onWheel={handleWheel}
         onPointerDown={handlePointerDown}
@@ -1478,8 +1736,8 @@ export function DiagramCanvas({
             <g className="omar-timers">
               {layout.timers.map((timer) => {
                 const radius = CLOCK_SIZE.width / 2;
-                // The long hand sweeps the period; the short one is a fixed
-                // dial mark, so a face still reads as a clock when stopped.
+                // One hand, at how far through its period the timer is; it
+                // points straight up on the tag it fires at.
                 const angle = timer.phase * Math.PI * 2 - Math.PI / 2;
                 const hand = {
                   x: Math.cos(angle) * (radius - 8),
@@ -1495,22 +1753,22 @@ export function DiagramCanvas({
                     transform={`translate(${timer.center.x},${timer.center.y})`}
                   >
                     <circle className="omar-timer-face" r={radius} />
-                    {/* Grouped so the fire animation turns both hands about
-                        the pin rather than each about its own end. */}
-                    <g className="omar-timer-hands">
+                    {/* Keyed on the firing so the sweep replays each time.
+                        The invisible circle gives the group a bounding box
+                        centred on the pin, which is what the sweep turns
+                        about; a lone hand's box would be centred on itself. */}
+                    <g
+                      key={timer.firedKey}
+                      className="omar-timer-hands"
+                      data-fired={timer.firedKey || undefined}
+                    >
+                      <circle r={radius - 8} fill="none" stroke="none" />
                       <line
                         className="omar-timer-hand"
                         x1={0}
                         y1={0}
                         x2={hand.x}
                         y2={hand.y}
-                      />
-                      <line
-                        className="omar-timer-hand short"
-                        x1={0}
-                        y1={0}
-                        x2={0}
-                        y2={-(radius - 12)}
                       />
                     </g>
                     <circle className="omar-timer-pin" r={1.8} />
@@ -1522,6 +1780,18 @@ export function DiagramCanvas({
                         ? `${formatDuration(timer.offset)}, every ${formatDuration(timer.period)}`
                         : `once at ${formatDuration(timer.offset)}`}
                     </text>
+                    {/* Physical time to its next firing, counting down while
+                        the run is live. A spent one-shot has nothing to wait
+                        for and shows none. */}
+                    {counting && timer.next !== null ? (
+                      <text
+                        className="omar-timer-countdown"
+                        y={radius + 32}
+                        textAnchor="middle"
+                      >
+                        {countdownLabel(timer.next - runClock)}
+                      </text>
+                    ) : null}
                   </g>
                 );
               })}
@@ -1541,19 +1811,20 @@ export function DiagramCanvas({
                     // attach to, so what opens is the panel it is answered
                     // through — the same gesture, the thing that is there.
                     event.stopPropagation();
+                    cancelInspection();
                     if (reaction.web) onOpenPanel?.(reaction.agent);
                     else onOpenTerminal?.(reaction.agent);
                   }}
                   transform={`translate(${reaction.box.x},${reaction.box.y})`}
                 >
-                  <polygon
-                    className="omar-reaction-body"
-                    points={chevronPoints(reaction.box.width, reaction.box.height)}
-                  />
+                  <rect className="omar-reaction-body" width={reaction.box.width} height={reaction.box.height} rx={9} />
+                  <path className="omar-reaction-accent" d={`M9 1.5 H${reaction.box.width - 9}`} />
+                  <circle className="node-connection" cx={0} cy={reaction.box.height / 2} r={4} />
+                  <circle className="node-connection" cx={reaction.box.width} cy={reaction.box.height / 2} r={4} />
                   <rect
                     className="omar-reaction-badge"
                     x={17}
-                    y={reaction.box.height / 2 - 10}
+                    y={22}
                     width={20}
                     height={20}
                     rx={5}
@@ -1562,25 +1833,26 @@ export function DiagramCanvas({
                   <text
                     className="omar-reaction-index"
                     x={27}
-                    y={reaction.box.height / 2 + 4}
+                    y={36}
                     textAnchor="middle"
                   >
-                    {reaction.order + 1}
+                    {String(reaction.localOrder + 1).padStart(2, "0")}
                   </text>
                   <text
                     className="omar-reaction-name"
                     x={REACTION_TEXT_X}
-                    y={reaction.box.height / 2 - 2}
+                    y={29}
                   >
                     {reaction.name}
                   </text>
-                  <text
-                    className="omar-reaction-meta"
-                    x={REACTION_TEXT_X}
-                    y={reaction.box.height / 2 + 12}
-                  >
-                    {reaction.meta}
+                  <text className="omar-reaction-description" x={REACTION_TEXT_X} y={46}>
+                    {fitText(reaction.summary, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING, 6.7)}
                   </text>
+                  <rect className="omar-model-badge" x={REACTION_TEXT_X} y={57} width={16} height={16} rx={5} />
+                  <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 59) scale(0.5)`}>
+                    <BackendMark backend={reaction.backend} />
+                  </g>
+                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={68}>{reaction.meta}</text>
                   {/* A deadline the program set for itself. A stopwatch rather
                       than a clock: a timer fires on its own, this counts down
                       against work already running. */}
@@ -1588,7 +1860,7 @@ export function DiagramCanvas({
                     <g
                       className="omar-within"
                       transform={`translate(${
-                        reaction.box.width - CHEVRON_NOTCH - WITHIN_ROOM / 2
+                        reaction.box.width - CARD_END_PADDING - WITHIN_ROOM / 2
                       },${reaction.box.height / 2})`}
                     >
                       <title>{`must answer within ${formatDuration(reaction.within)}`}</title>
@@ -1672,25 +1944,18 @@ export function DiagramCanvas({
           <svg viewBox="0 0 12 12" aria-hidden="true">
             <circle className="omar-timer-face" cx="6" cy="6" r="5" />
             <line className="omar-timer-hand" x1="6" y1="6" x2="6" y2="2.5" />
-            <line className="omar-timer-hand short" x1="6" y1="6" x2="8.5" y2="6" />
           </svg>
           timer
         </span>
         <span>
           <svg viewBox="0 0 18 12" aria-hidden="true">
-            <polygon
-              className="omar-reaction-body"
-              points="0,1 13,1 18,6 13,11 0,11 4,6"
-            />
+            <rect className="omar-reaction-body" x="1" y="1" width="16" height="10" rx="2" />
           </svg>
           reaction
         </span>
         <span>
           <svg viewBox="0 0 18 12" aria-hidden="true">
-            <polygon
-              className="omar-reaction-body running"
-              points="0,1 13,1 18,6 13,11 0,11 4,6"
-            />
+            <rect className="omar-reaction-body running" x="1" y="1" width="16" height="10" rx="2" />
           </svg>
           running
         </span>

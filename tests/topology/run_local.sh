@@ -89,7 +89,7 @@ if peek_agents:
                 match.group(1)
                 for match in re.finditer(
                     r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*"
-                    r"(?:Codex|Claude|ClaudeCode|OpenCode|Cursor|Agy)\b",
+                    r"(?:Codex|Claude|ClaudeCode|OpenCode|Cursor|Agy|Jev)\b",
                     source,
                     re.IGNORECASE,
                 )
@@ -208,7 +208,7 @@ run_case() {
 
   printf '\n[%s] running with local agents\n' "$name"
   if run_with_timeout "$case_timeout" "$log" "$name" \
-    "$omar" run "$source" --replace \
+    "$omar" run "$source" --fg --replace \
     --timeout-seconds "$invocation_timeout" "$@"; then
     case_passed=$((case_passed + 1))
   else
@@ -222,8 +222,11 @@ run_case() {
     case_failed=$((case_failed + 1))
   fi
 
-  # Teardown persists pane transcripts; keep them with the case results.
-  cp -R "$HOME/.omar/ea/0/topologies/$team/logs" "$results_dir/$name-agents" 2>/dev/null || true
+  # Teardown persists pane transcripts; keep them with the case results. The
+  # run created its own session, named on stderr, and shut it down afterwards.
+  local session_id
+  session_id=$(grep -o 'Started session [^ ;]*' "$log" | awk '{print $3}' | tail -1)
+  [[ -n $session_id ]] && cp -R "$HOME/.omar/sessions/$session_id/ea/0/topologies/$team/logs" "$results_dir/$name-agents" 2>/dev/null || true
 
   if grep -Fq "Topology '$team' completed" "$log"; then
     case_passed=$((case_passed + 1))
@@ -296,6 +299,17 @@ run_case OrderedWrites OrderedWrites writes.result \
 # A watcher one hop and three hops from the same source. It should be invoked
 # once, holding both -- so the run completing at all is the assertion.
 run_case Depths Depths watch.verdict --input src.go=1
+# Two enum types imported from schema files, written by a stub and read by a
+# code body. The stub picks the first value each type admits.
+run_case SchemaEnum SchemaEnum review.decision,review.priority,dispatch.route \
+  --input review.request='route this'
+# The same types inside list and option, crossing connections between two
+# prompt teams.
+run_case SchemaNested SchemaNested triage.decisions,triage.priority,summary.report \
+  --input triage.request='triage this'
+# An enum input from the command line. CI also runs this with a value outside
+# the enum and checks the run is refused; here only the admitted value runs.
+run_case SchemaInput SchemaInput gate.note,gate.route --input gate.decision=stop
 run_case Recurrence Recurrence rec.result --input rec.start=0
 # Three instances wired into a ring. Only the seed is supplied; the other two
 # inputs come off the ring itself.
@@ -322,8 +336,9 @@ run_case SuperdenseTime SuperdenseTime time.fixed_result,time.connected_result \
 # `Heartbeat` and `Bureau` are deliberately absent. `Heartbeat`'s timer has a
 # non-zero period, so the program never finishes and has no completion marker to
 # wait for. `Bureau` is 32 agents across eight sequential stages, and a release
-# gate is not the place to discover whether that fits in a case timeout. Both are
-# compiled and backend-checked like every other source, just never run here.
+# gate is not the place to discover whether that fits in a case timeout.
+# `WorldNews` never finishes either, and fetches from the internet besides. All
+# three are compiled and backend-checked like every other source, never run here.
 
 if ((passed_cases + failed_cases == 0)); then
   printf 'No topology case named %s\n' "$case_filter" >&2

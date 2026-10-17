@@ -29,7 +29,7 @@ team Scout(lens : string)[scout : ClaudeCode]
     input brief : string
     output finding : string
 
-    prompt scout(brief) -> finding
+    task scout(brief) -> finding
     "
         You are a scout working one angle only: $(lens). Answer from your own
         knowledge — do not browse the web, read files, or run commands.
@@ -50,7 +50,7 @@ team Desk[editor : ClaudeCode]
     input practice : string
     output digest : string
 
-    prompt editor(evidence, risk, practice) -> digest
+    task editor(evidence, risk, practice) -> digest
     "
         Three scouts worked this round from different angles. The tag barrier
         delivers all three together.
@@ -79,7 +79,7 @@ team Chair(topic : string)[chair : ClaudeCode]
     output report : string
 
     // Ignition. Nothing upstream; the clock alone starts the program.
-    prompt chair(open1) -> brief
+    task chair(open1) -> brief
     "
         You chair a standing review of this topic: $(topic)
 
@@ -95,7 +95,7 @@ team Chair(topic : string)[chair : ClaudeCode]
     // The digest is not a trigger for the rounds — it only has to land in the
     // chair's memory, which every prompt on this agent shares. The clock, not
     // the digest, decides when the chair acts on what it learned.
-    prompt chair(digest) -> journal
+    task chair(digest) -> journal
     "
         A round has just reported. Read it and remember it; you will be asked
         about it when the clock opens the next round.
@@ -106,7 +106,7 @@ team Chair(topic : string)[chair : ClaudeCode]
         what changed. Do not browse or run commands.
     "
 
-    prompt chair(open2) -> brief
+    task chair(open2) -> brief
     "
         The clock has opened round 2 of 3 at logical time $(open2). Round 1 has
         fully reported and you have already read its digest — recall it from
@@ -117,7 +117,7 @@ team Chair(topic : string)[chair : ClaudeCode]
         round 1 already answered. Do not browse or run commands.
     "
 
-    prompt chair(open3) -> brief
+    task chair(open3) -> brief
     "
         The clock has opened round 3 of 3 at logical time $(open3). You have
         read the digests of rounds 1 and 2 — recall them from your own memory
@@ -130,7 +130,7 @@ team Chair(topic : string)[chair : ClaudeCode]
 
     // The deadline. It fires at tag 30, after every round has settled, so it
     // always publishes a complete review rather than a partial one.
-    prompt chair(close) -> report
+    task chair(close) -> report
     "
         The deadline has arrived at logical time $(close). Three rounds have
         reported on $(topic) and you have read all three digests — recall them
