@@ -3,6 +3,7 @@
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatMessage as ChatMessageModel } from "./lib/protocol";
+import { splitQuote } from "./quote-selection";
 
 /**
  * Assistant messages are markdown — the EA writes bold, inline code, fenced
@@ -12,6 +13,7 @@ import type { ChatMessage as ChatMessageModel } from "./lib/protocol";
  * output relayed from an agent, so it is not trusted enough to inject.
  */
 export function ChatMessage({ message }: { message: ChatMessageModel }) {
+  const { quote, body } = message.role === "operator" ? splitQuote(message.text) : { quote: "", body: message.text };
   return (
     <article
       className={`message ${message.role}${message.progress ? " progress" : ""}`}
@@ -31,7 +33,10 @@ export function ChatMessage({ message }: { message: ChatMessageModel }) {
             <Markdown remarkPlugins={[remarkGfm]}>{message.text}</Markdown>
           </div>
         ) : (
-          <p>{message.text}</p>
+          <>
+            {quote ? <blockquote className="message-quote">{quote}</blockquote> : null}
+            <p>{body}</p>
+          </>
         )}
       </div>
     </article>

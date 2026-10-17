@@ -366,6 +366,66 @@ test("assistant markdown is rendered, not shown as syntax", async ({ page }) => 
   await expect(body).not.toContainText("**three-reaction**");
 });
 
+test("highlighted message text can be quoted into the next message", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByLabel("Describe a workflow").fill("Review the release plan");
+  await page.getByLabel("Draft workflow").click();
+  const reply = page.locator(".message.assistant:not(.progress) .message-body").first();
+  await expect(reply).toContainText("Which agent should own");
+
+  /** Selects `phrase` inside `selector`, as a drag would, then ends the gesture. */
+  const highlight = (selector: string, phrase: string) => page.evaluate(([selector, phrase]) => {
+    const root = document.querySelector(selector)!;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+      const node = walker.currentNode as Text;
+      const at = node.data.indexOf(phrase);
+      if (at < 0) continue;
+      const range = document.createRange();
+      range.setStart(node, at);
+      range.setEnd(node, at + phrase.length);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      return;
+    }
+    throw new Error(`${phrase} not found`);
+  }, [selector, phrase]);
+
+  const button = page.getByRole("button", { name: "Chat about this" });
+  // Text outside a message does not offer it.
+  await highlight(".composer-footnote", "OMAR can make mistakes");
+  await expect(button).toBeHidden();
+
+  await highlight(".message.assistant:not(.progress) .message-body", "Which agent should own");
+  await expect(button).toBeVisible();
+  // Clearing the selection hides it again.
+  await page.evaluate(() => window.getSelection()!.removeAllRanges());
+  await expect(button).toBeHidden();
+
+  await highlight(".message.assistant:not(.progress) .message-body", "Which agent should own");
+  await button.click();
+  await expect(button).toBeHidden();
+  const quote = page.locator(".composer-quote");
+  await expect(quote).toContainText("Which agent should own");
+  await expect(page.getByLabel("Describe a workflow")).toBeFocused();
+
+  // Removable before sending.
+  await page.getByRole("button", { name: "Remove quote" }).click();
+  await expect(quote).toBeHidden();
+  await highlight(".message.assistant:not(.progress) .message-body", "Which agent should own");
+  await button.click();
+
+  const sent = page.waitForRequest((request) => request.method() === "POST" && (request.postData() ?? "").includes("The planner"));
+  await page.getByLabel("Describe a workflow").fill("The planner");
+  await page.getByLabel("Draft workflow").click();
+  expect((await sent).postDataJSON().text).toBe("> Which agent should own\n\nThe planner");
+  await expect(quote).toBeHidden();
+  const operator = page.locator(".message.operator").last();
+  await expect(operator.locator(".message-quote")).toHaveText("Which agent should own");
+  await expect(operator.locator("p")).toHaveText("The planner");
+});
+
 test("discarding a design leaves the gate without running anything", async ({
   page,
 }) => {

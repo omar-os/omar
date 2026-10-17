@@ -2,6 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
+import { QuoteSelection, withQuote } from "./quote-selection";
 import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
 import { Artifacts } from "./artifacts";
 import { DeployConfirmation, type DeployOptions } from "./deploy-confirmation";
@@ -202,6 +203,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   // Bumped whenever the run says a checkpoint landed, so the listing refetches.
   const [checkpointEpoch, setCheckpointEpoch] = useState(0);
   const [prompt, setPrompt] = useState("");
+  /** Message text the operator chose to "Chat about this", sent as a blockquote. */
+  const [quote, setQuote] = useState("");
   /** Diagram components the operator has highlighted for the next message. */
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
@@ -360,6 +363,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     setConfirming(false);
     setPhase("idle");
     setPrompt("");
+    setQuote("");
     setError("");
     setTerminalAgent(null);
     setPanelAgent(null);
@@ -380,7 +384,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     const request = prompt.trim();
     if (!request || (switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning") return;
     const selected = selection;
+    const quoted = withQuote(quote, request);
     setPrompt("");
+    setQuote("");
     const scope = scopeRef.current;
     setError("");
     // The selection belonged to the message just sent. Keeping it would
@@ -389,7 +395,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     setAssistantBusy(true);
     if (!run || isRunFinished(run.status)) setPhase("drafting");
     try {
-      await agent.send(request, selected);
+      await agent.send(quoted, selected);
     } catch (cause) {
       if (scope !== scopeRef.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -1203,6 +1209,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             {assistantBusy ? <Waiting /> : null}
             {phase === "spawning" ? <Waiting label="Starting the run" /> : null}
           </div>
+          <QuoteSelection threadRef={threadRef} onQuote={(text) => { setQuote(text); composerRef.current?.focus(); }} />
 
           {error ? <div className="connection-error">{error}</div> : null}
           {daemon.state === "offline" ? <div className="connection-error" role="status">Cannot reach the runtime at {historyUrl}.</div> : null}
@@ -1223,6 +1230,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           ) : null}
 
           <form className="prompt-box" onSubmit={(event) => void submitPrompt(event)}>
+            {quote ? (
+              <div className="composer-quote">
+                <blockquote>{quote}</blockquote>
+                <button type="button" aria-label="Remove quote" onClick={() => setQuote("")}>×</button>
+              </div>
+            ) : null}
             <textarea
               ref={composerRef}
               disabled={switchingChat || (!isDemo && !conversationId)}

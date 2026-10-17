@@ -1713,6 +1713,71 @@ h2 {
   color: var(--accent-text);
 }
 
+/* "Chat about this": floats over highlighted message text. */
+.quote-selection {
+  position: fixed;
+  z-index: 40;
+  transform: translate(-50%, calc(-100% - 8px));
+  padding: 6px 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  font-size: 0.875rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.quote-selection:hover {
+  border-color: rgba(140, 99, 242, 0.75);
+  color: var(--accent-text);
+}
+
+.prompt-box > .composer-quote {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 10px 10px 0;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: var(--purple-soft);
+}
+
+.composer-quote blockquote,
+.message-quote {
+  margin: 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--line-2);
+  color: var(--text-3);
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.composer-quote blockquote {
+  flex: 1;
+  min-width: 0;
+  max-height: 6em;
+  overflow: auto;
+}
+
+.composer-quote button {
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 1.125rem;
+  line-height: 1;
+}
+
+.composer-quote button:hover {
+  color: var(--accent-text);
+}
+
+.message-quote {
+  margin: 4px 0 2px;
+}
+
 /* The team panel is a backdrop. Left hit-testable it swallows clicks aimed at
    the nodes drawn on it, since a node's box is mostly the gap between its
    glyph and its label. Events fall through to the canvas, which still pans. */
