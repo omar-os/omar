@@ -2,8 +2,10 @@
 
 <img src="img/full-black-banner.jpg" alt="OMAR" width="250">
 
-**Say no to agent “swarms”.**<br>
-**Deploy deterministic, verifiable, programmable agentic workflows.**
+<p align="center">
+<strong>Say no to agent “swarms”.<br>
+Deploy deterministic, verifiable, programmable agentic workflows.</strong>
+</p>
 
 <p align="center">
   <a href="https://omar.rs">omar.rs</a>&nbsp; • &nbsp;
