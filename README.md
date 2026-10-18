@@ -15,10 +15,6 @@
 
 </div>
 
-**OMAR (Open Multi-Agent Runtime) is an open-source runtime for coordinating the coding agents you already use.** Describe a workflow in Mission Control, inspect the generated team diagram, and confirm deployment. Watch the work unfold, open individual agents' terminals, and keep the files the team produces.
-
-The coordination itself is a program. OMAR compiles a `.omar` workflow into explicit inputs, outputs, and handoffs, then uses a deterministic runtime to schedule the work. You can define who receives a result, which steps can run in parallel, and where a human decision enters the workflow. That determinism applies to orchestration; model answers and external tool actions can still vary. See the [language specification](lang/spec.md) for the execution model.
-
 <div align="center">
 
 <p align="center">
@@ -27,6 +23,8 @@ Mission Control
 </p>
 
 </div>
+
+OMAR (Open Multi-Agent Runtime) coordinates coding agents through programmable workflows. Describe a task in Mission Control, review the team diagram, and deploy it with live visibility and terminal access. Compiled `.omar` programs define typed inputs, outputs, and handoffs with deterministic scheduling; model responses and tool actions can still vary. See the [language specification](lang/spec.md).
 
 ## Features
 
