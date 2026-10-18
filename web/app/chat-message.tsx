@@ -5,7 +5,7 @@ import remarkGfm from "remark-gfm";
 import type { ChatMessage as ChatMessageModel } from "./lib/protocol";
 
 /**
- * Assistant messages are markdown — the EA writes bold, inline code, fenced
+ * Chat messages are markdown — participants write bold, inline code, fenced
  * diagrams and lists, and reads as noise unrendered.
  *
  * `react-markdown` does not render raw HTML, which matters here: this is model
@@ -26,14 +26,9 @@ export function ChatMessage({ message }: { message: ChatMessageModel }) {
           // Kept on the message so the thread still shows what "this one" meant.
           <p className="message-selection">[{message.selection.join(", ")}]</p>
         ) : null}
-        {message.role === "assistant" ? (
-          <div className="message-body">
-            <Markdown remarkPlugins={[remarkGfm]}>{message.text}</Markdown>
-          </div>
-        ) : (
-          // Plain text, so its line breaks are the operator's formatting.
-          <p className="message-text">{message.text}</p>
-        )}
+        <div className="message-body">
+          <Markdown remarkPlugins={[remarkGfm]}>{message.text}</Markdown>
+        </div>
       </div>
     </article>
   );

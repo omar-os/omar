@@ -490,14 +490,7 @@ h2 {
   line-height: 1.75;
 }
 
-/* The operator's own message is plain text: keep its line breaks, and break
-   a long unbroken token rather than overflow the column. */
-.message-text {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-/* Assistant messages are rendered markdown. */
+/* Chat messages are rendered markdown. */
 .message-body {
   min-width: 0;
   color: var(--text-2);
@@ -517,12 +510,19 @@ h2 {
   margin: 0 0 10px;
 }
 
+/* Keep the operator's intentional line breaks within Markdown paragraphs. */
+.message.operator .message-body p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .message-body strong {
   color: var(--text);
   font-weight: 650;
 }
 
 .message-body em {
+  font-style: italic;
   color: var(--text);
 }
 

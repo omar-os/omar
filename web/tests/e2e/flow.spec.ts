@@ -352,6 +352,20 @@ test("waiting holds one verb per turn and changes between turns", async ({
   await expect(verb).not.toHaveText(first);
 });
 
+test("operator markdown renders code blocks, inline code, and italics", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByLabel("Describe a workflow").fill(
+    "Review *carefully* with `planner`\n\n```text\nfirst line\nsecond line\n```",
+  );
+  await page.getByLabel("Draft workflow").click();
+  const body = page.locator(".message.operator .message-body").last();
+  await expect(body.locator("em")).toHaveText("carefully");
+  await expect(body.locator("em")).toHaveCSS("font-style", "italic");
+  await expect(body.locator("p code")).toHaveText("planner");
+  await expect(body.locator("pre code")).toHaveText("first line\nsecond line\n");
+  await expect(body.locator("p")).toHaveCSS("white-space", "pre-wrap");
+});
+
 test("assistant markdown is rendered, not shown as syntax", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);
