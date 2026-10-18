@@ -751,7 +751,7 @@ test("the studio opens on a centred prompt, then settles into a thread", async (
   // Once there is a conversation it belongs at the bottom, under the thread.
   await expect(page.locator(".messages")).toContainText("Review the release plan");
   await expect(page.locator(".builder-panel")).not.toHaveClass(/opening/);
-  await expect(page.locator(".message-content > p").first()).toHaveCSS("font-size", "16px");
+  await expect(page.locator(".message.operator .message-body p").first()).toHaveCSS("font-size", "16px");
   await expect(page.locator(".message.assistant:not(.progress) .message-body").first()).toHaveCSS("font-size", "16px");
   const threaded = (await composer.boundingBox())!;
   expect(threaded.y).toBeGreaterThan(opening.y + 100);
