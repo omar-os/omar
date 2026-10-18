@@ -54,6 +54,11 @@ const SESSION_BACKEND_VAR: &str = "OMAR_BACKEND";
 /// Session-environment key describing the backend's side channel, if it has one.
 const SESSION_DELIVERY_VAR: &str = "OMAR_DELIVERY";
 const SESSION_STARTUP_VAR: &str = "@omar_startup_pending";
+/// How long an answered startup dialog may stay on screen before the answer
+/// is sent again. A real dismissal repaints within a few hundred ms.
+const STARTUP_REANSWER_AFTER: Duration = Duration::from_millis(1500);
+/// Answers one dialog gets before startup is reported stuck.
+const STARTUP_MAX_ANSWERS: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
@@ -109,6 +114,13 @@ fn exact_session_target(target: &str) -> String {
     } else {
         format!("={target}")
     }
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
 }
 
 fn exact_pane_target(target: &str) -> String {
@@ -491,16 +503,20 @@ impl TmuxClient {
             screen.hash(&mut hash);
             let observation = format!("{:x}", hash.finish());
             if let Some(gate) = backend.startup_gate(&screen) {
-                if observation == previous
-                    && observation != acted_on
-                    && !gate.keys.is_empty()
-                    && answered_gate.as_deref() != Some(gate.id)
-                {
+                if observation != previous || gate.keys.is_empty() {
+                    // Still painting.
+                } else if observation != acted_on && answered_gate.as_deref() != Some(gate.id) {
                     self.claim_startup_action(session, &gate, &observation, &acted_on)?;
                     acted_on = self
                         .startup_state(session, "@omar_startup_action")
                         .unwrap_or_default();
                     answered_gate = self.startup_state(session, "@omar_startup_answered");
+                } else {
+                    // Answered, yet still up: the keystroke was lost.
+                    self.repeat_startup_action(session, &name, &gate, &observation)?;
+                    acted_on = self
+                        .startup_state(session, "@omar_startup_action")
+                        .unwrap_or_default();
                 }
             } else if !backend.readiness_markers().is_empty()
                 && backend
@@ -556,9 +572,14 @@ impl TmuxClient {
             gate.id,
         );
         let mut commands = format!(
-            "set-option -t {} @omar_startup_action {}",
+            "set-option -t {} @omar_startup_action {} ; \
+             set-option -t {} @omar_startup_acted_at {} ; \
+             set-option -t {} @omar_startup_answers 1",
             quote(target.trim_start_matches('=')),
-            quote(observation)
+            quote(observation),
+            quote(target.trim_start_matches('=')),
+            unix_millis(),
+            quote(target.trim_start_matches('='))
         );
         if gate.confirms {
             commands.push_str(&format!(
@@ -585,6 +606,95 @@ impl TmuxClient {
             &commands,
         ])?;
         Ok(())
+    }
+
+    /// Answer a dialog again when it outlives its answer. The stamp of the
+    /// last answer is the compare-and-set token, so concurrent readers send
+    /// one repeat between them, and a bounded number in all.
+    fn repeat_startup_action(
+        &self,
+        session: &str,
+        backend: &str,
+        gate: &crate::backend::StartupGate,
+        observation: &str,
+    ) -> Result<()> {
+        use crate::manager::shell_single_quote as quote;
+        let acted_at = self
+            .startup_state(session, "@omar_startup_acted_at")
+            .unwrap_or_default();
+        let answers: u32 = self
+            .startup_state(session, "@omar_startup_answers")
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(0);
+        let now = unix_millis();
+        // A session answered before this stamp existed is overdue, not fresh.
+        if now.saturating_sub(acted_at.parse().unwrap_or(0)) < STARTUP_REANSWER_AFTER.as_millis() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            answers < STARTUP_MAX_ANSWERS,
+            "{backend} startup dialog '{}' stayed up after {answers} answers for {session}",
+            gate.id
+        );
+        let keys = if gate.again.is_empty() {
+            gate.keys
+        } else {
+            gate.again
+        };
+        eprintln!(
+            "[omar] {backend} startup dialog '{}' is still up in {session} after {} answer(s); sending {keys:?}",
+            gate.id, answers
+        );
+        let target = exact_session_target(session);
+        let target = quote(target.trim_start_matches('='));
+        let condition = format!(
+            "#{{&&:#{{==:#{{@omar_startup_pending}},1}},#{{==:#{{@omar_startup_acted_at}},{}}}}}",
+            acted_at
+        );
+        let mut commands = format!(
+            "set-option -t {target} @omar_startup_action {} ; \
+             set-option -t {target} @omar_startup_acted_at {now} ; \
+             set-option -t {target} @omar_startup_answers {}",
+            quote(observation),
+            answers + 1
+        );
+        if gate.confirms {
+            commands.push_str(&format!(
+                " ; set-option -t {target} @omar_startup_answered {}",
+                quote(gate.id)
+            ));
+        }
+        commands.push_str(&format!(
+            " ; send-keys -t {} {}",
+            quote(&exact_pane_target(session)),
+            keys.iter()
+                .map(|key| quote(key))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+        self.run(&[
+            "if-shell",
+            "-F",
+            "-t",
+            &exact_pane_target(session),
+            &condition,
+            &commands,
+        ])?;
+        Ok(())
+    }
+
+    /// Clear a fresh launch's startup dialogs in the background, so a pane
+    /// nobody has written to yet does not sit on one. Delivery still runs
+    /// the same handshake; the shared tmux state keeps the two from both
+    /// answering.
+    pub fn settle_startup_in_background(&self, session: &str, timeout: Duration) {
+        let client = self.clone();
+        let session = session.to_string();
+        thread::spawn(move || {
+            if let Err(error) = client.finish_backend_startup(&session, timeout) {
+                eprintln!("[omar] {session}: {error:#}");
+            }
+        });
     }
 
     /// Wait for pane activity to be quiet for `quiet` duration, or until `timeout`.
@@ -1117,6 +1227,7 @@ with Path(sys.argv[1]).open('ab', buffering=0) as log:
                                 &crate::backend::StartupGate {
                                     id: "test",
                                     keys,
+                                    again: &[],
                                     confirms,
                                 },
                                 observation,
@@ -1135,6 +1246,7 @@ with Path(sys.argv[1]).open('ab', buffering=0) as log:
         let gate = crate::backend::StartupGate {
             id: "test",
             keys: &["z"],
+            again: &[],
             confirms: false,
         };
         client
@@ -1159,11 +1271,11 @@ with Path(sys.argv[1]).open('ab', buffering=0) as log:
             eprintln!("Skipping test: tmux not available");
             return;
         }
-        for scenario in ["claude", "codex", "unknown"] {
-            let backend = if scenario == "unknown" {
-                "claude"
-            } else {
-                scenario
+        for scenario in ["claude", "codex", "codex-stubborn", "unknown"] {
+            let backend = match scenario {
+                "unknown" => "claude",
+                "codex-stubborn" => "codex",
+                _ => scenario,
             };
             let dir = tempfile::tempdir().unwrap();
             let script = dir.path().join("startup.py");
@@ -1258,10 +1370,11 @@ with Path(sys.argv[1]).open('ab', buffering=0) as log:
             );
             assert_eq!(client.startup_state(&session, SESSION_STARTUP_VAR), None);
             thread::sleep(Duration::from_millis(150));
-            let expected: &[u8] = if backend == "claude" {
-                b"\x1b[B\r"
-            } else {
-                b"\x1b"
+            let expected: &[u8] = match scenario {
+                "claude" => b"\x1b[B\r",
+                // The first Escape was swallowed; the retry picks Skip outright.
+                "codex-stubborn" => b"\x1b2",
+                _ => b"\x1b",
             };
             assert_eq!(std::fs::read(&log).unwrap(), expected);
         }

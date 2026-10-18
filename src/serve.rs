@@ -852,6 +852,7 @@ impl Serve {
                 }),
             },
         )?;
+        client.settle_startup_in_background(&session, Duration::from_secs(60));
         {
             let mut chat = context.chat.lock().expect("chat poisoned");
             chat.needs_relaunch = false;
@@ -1842,6 +1843,7 @@ fn relaunch_ea(context: &Arc<Context_>, command: &str) -> Result<String> {
             }),
         },
     )?;
+    client.settle_startup_in_background(&session, Duration::from_secs(60));
     Ok(session)
 }
 

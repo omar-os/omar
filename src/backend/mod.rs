@@ -193,6 +193,10 @@ pub struct Launch<'a> {
 pub struct StartupGate {
     pub id: &'static str,
     pub keys: &'static [&'static str],
+    /// What to send when the dialog is still up well after `keys` went in:
+    /// a keystroke can be lost while a TUI is still wiring up its input.
+    /// Empty means repeat `keys`.
+    pub again: &'static [&'static str],
     pub confirms: bool,
 }
 
