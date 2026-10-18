@@ -57,11 +57,11 @@ class JevBackendTests(unittest.TestCase):
                 (temp / "schemas/decision.json").write_text(json.dumps({"type":"string", "enum":["continue","stop","defer"]}))
                 program = PROGRAM
                 if mode in ("timeout", "blocked_input"):
-                    program = program.replace('-> out, evidence "', '-> out, evidence within(250ms) "')
+                    program = program.replace('-> out, evidence "', '-> out, evidence within(750ms) "')
                 (temp / "workflow.omar").write_text(program)
-                response = {"model":"test-jev", "answers":{"decision":{"type":"choice",
+                response = {"model":"jev-fixture-selected", "answers":{"decision":{"type":"choice",
                     "choice":"not_in_schema" if mode == "invalid" else "continue", "confidence":.97,
-                    "probabilities":{"continue":.98,"stop":.01,"defer":.01}}}}
+                    "probabilities":{"continue":.98,"stop":.01,"defer":.01}}, "sufficient_context":{"type":"noul","noul":.99}}}
                 if mode == "bad_probabilities":
                     response["answers"]["decision"]["probabilities"]["continue"] = .2
                 status = {"authentication":401, "rate_limit":429, "service":503, "http":400}.get(mode, 200)
@@ -106,6 +106,7 @@ class JevBackendTests(unittest.TestCase):
                 self.assertNotIn("sensitive-provider-body", combined)
                 if mode == "missing_key": self.assertFalse((temp / "pid").exists())
                 if mode in ("timeout", "blocked_input"):
+                    self.assertTrue((temp / "pid").exists(), combined[-4000:])
                     pid = int((temp / "pid").read_text())
                     with self.assertRaises(ProcessLookupError): os.kill(pid, 0)
                 if policy == "default":
@@ -120,8 +121,9 @@ class JevBackendTests(unittest.TestCase):
                 line = next(line for line in result.stdout.splitlines() if line.startswith("Output review.evidence = "))
                 evidence = json.loads(json.loads(line.split(" = ",1)[1]))
                 self.assertEqual(evidence["context"], {"review.request":message})
+                self.assertEqual(evidence["instructions"], "Choose continue, stop, or defer.")
                 if kind is None:
-                    self.assertEqual(evidence["model"], "test-jev")
+                    self.assertEqual(evidence["model"], "jev-fixture-selected")
                     self.assertEqual(evidence["answers"]["decision"]["probabilities"], response["answers"]["decision"]["probabilities"])
                 else:
                     self.assertEqual(evidence["error"]["kind"], kind)
@@ -168,30 +170,111 @@ main JevConfigurationTest { review = Review() }
                 self.assertIn(expected, result.stderr)
                 self.assertFalse((temp / "called").exists())
 
-    def test_shipped_example_parses_evidence_in_rust(self):
-        with tempfile.TemporaryDirectory() as temp:
-            temp = Path(temp)
-            response = {"model":"test-jev", "answers":{"decision":{"type":"choice","choice":"continue",
-                "confidence":.97, "probabilities":{"continue":.98,"stop":.01,"defer":.01}}}}
-            curl = temp / "curl"
-            curl.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdin.read()\nsys.stdout.write(" + repr(json.dumps(response)+"\n200") + ")\n")
-            curl.chmod(0o700)
-            env = dict(os.environ, TYPESAFE_API_KEY="fixture-not-a-real-key")
-            env.pop("OMAR_JEV_ON_ERROR", None)
-            env["PATH"] = f"{temp}:{REPO}/target/debug:{REPO}/lang/.lake/build/bin:{Path.home()}/.cargo/bin:" + env.get("PATH", "")
-            env["OMARC_BIN"] = str(REPO / "lang/.lake/build/bin/omarc")
-            env["OMAR_HOME"] = tempfile.mkdtemp(prefix="omar-jev-example-test-")
-            result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(REPO / "tests/topology/src/JevReview.omar"),
-                "--input", "review.request=test request", "--timeout-seconds", "30", "--fast", "--fg"],
-                env=env, text=True, capture_output=True, timeout=60)
-            session = re.search(r"Started session ([\w-]+)", result.stderr)
-            if session:
-                subprocess.run([str(REPO / "target/debug/omar"), "down", "-s", session.group(1)],
-                               env=env, capture_output=True, timeout=30)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("Output decider.proceed = true", result.stdout)
-            self.assertNotIn("Output decider.stop", result.stdout)
-            self.assertNotIn("Output decider.needs_review", result.stdout)
+    def test_full_schema_flow_at_and_below_95_percent(self):
+        cases = [(*case, "continue") for case in [
+            ("boundary", "continue", .95, .95, .95, False, "continued"),
+            ("above", "continue", .99, .99, .99, False, "continued"),
+            ("negative", "stop", .99, .99, .99, False, "repair"),
+            ("low_confidence", "stop", .949999, .99, .99, True, "continued"),
+            ("low_probability", "stop", .99, .949999, .99, True, "continued"),
+            ("low_sufficiency", "stop", .99, .99, .949999, True, "continued"),
+            ("uncertain", "defer", .99, .99, .99, True, "continued"),
+            ("service_error", "continue", .99, .99, .99, True, "continued"),
+        ]]
+        cases.extend([
+            ("reasoning_revise", "continue", .949999, .99, .99, True, "repair", "stop"),
+            ("reasoning_unresolved", "continue", .949999, .99, .99, True, "blocked", "defer"),
+            ("reasoning_no_explanation", "continue", .949999, .99, .99, True, "blocked", "continue"),
+            ("deterministic_empty", "continue", .99, .99, .99, False, "repair", "continue"),
+            ("deterministic_oversize", "continue", .99, .99, .99, False, "repair", "continue"),
+        ])
+        for mode, choice, confidence, probability, sufficiency, fallback, branch, reasoned_choice in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                temp = Path(directory)
+                (temp / "schemas").mkdir()
+                # The fixture reasoner selects the first valid schema value.
+                # Order changes only its deterministic answer, never the allowed set.
+                values = [reasoned_choice] + [value for value in ["continue", "stop", "defer"] if value != reasoned_choice]
+                (temp / "schemas/jev-decision.json").write_text(json.dumps({"type":"string", "enum":values}))
+                # Replace only the reasoning backend with a deterministic model
+                # fixture. Its output must only appear on escalated invocations.
+                program = (REPO / "tests/topology/src/JevReview.omar").read_text().replace("reasoner : Codex", "reasoner : Stub")
+                if mode == "reasoning_no_explanation":
+                    # Keep the actual fallback invocation, then blank only its explanation.
+                    program = program.replace("main JevReview {", 'team Blank { input reason : string output out : string reaction(reason) -> out {= out = Some(String::new()); =} }\nmain JevReview { blank = Blank()')
+                    program = program.replace("reasoning.reason -> resolved.reason", "reasoning.reason -> blank.reason\n    blank.out -> resolved.reason")
+                (temp / "workflow.omar").write_text(program)
+                others = [value for value in ["continue", "stop", "defer"] if value != choice]
+                probabilities = {choice: probability, others[0]: (1-probability)/2, others[1]: (1-probability)/2}
+                # Provider fields must not replace the workflow's review criterion.
+                response = {"model":"jev-1.13.0", "instructions":"Provider-supplied replacement criterion", "answers":{
+                    "decision":{"type":"choice", "choice":choice, "confidence":confidence, "probabilities":probabilities},
+                    "sufficient_context":{"type":"noul", "noul":sufficiency}}}
+                body = json.dumps(response) if mode != "service_error" else "private-service-error"
+                status = 200 if mode != "service_error" else 503
+                curl = temp / "curl"
+                curl.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
+                    "config=sys.stdin.read()\n"
+                    "line=next(line for line in config.splitlines() if line.startswith('data = '))\n"
+                    "request=json.loads(json.loads(line[7:]))\n"
+                    "assert request['model']=='jev-1.13.0'\n"
+                    "assert request['questions']['sufficient_context']['type']=='noul'\n"
+                    + "Path(" + repr(str(temp / "request.json")) + ").write_text(json.dumps(request))\n"
+                    + "Path(" + repr(str(temp / "calls")) + ").open('a').write('call\\n')\n"
+                    + "sys.stdout.write(" + repr(body+"\n"+str(status)) + ")\n")
+                curl.chmod(0o700)
+                env = dict(os.environ, TYPESAFE_API_KEY="fixture-not-a-real-key", OMAR_JEV_ON_ERROR="defer")
+                env.pop("OMAR_JEV_MODEL", None)
+                env["PATH"] = f"{temp}:{REPO}/target/debug:{REPO}/lang/.lake/build/bin:" + env.get("PATH", "")
+                env["OMARC_BIN"] = str(REPO / "lang/.lake/build/bin/omarc")
+                env["OMAR_HOME"] = str(temp / "home")
+                message = "Complete request including Unicode ✅ and literal $(not_a_trigger)."
+                if mode == "deterministic_empty": message = " "
+                if mode == "deterministic_oversize": message = "x" * (16 * 1024 + 1)
+                deterministic_failure = mode.startswith("deterministic_")
+                result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(temp / "workflow.omar"),
+                    "--input", "checks.request=" + message, "--timeout-seconds", "30", "--fast", "--fg"],
+                    env=env, text=True, capture_output=True, timeout=90)
+                session = re.search(r"Started session ([\w-]+)", result.stderr)
+                if session:
+                    subprocess.run([str(REPO / "target/debug/omar"), "down", "-s", session.group(1)], env=env, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                calls = (temp / "calls").read_text().splitlines() if (temp / "calls").exists() else []
+                self.assertEqual(calls, [] if deterministic_failure else ["call"])
+                self.assertEqual('Output checks.invalid = ' in result.stdout, deterministic_failure)
+                self.assertEqual('Output review.out = ' in result.stdout, not deterministic_failure)
+                self.assertEqual('Output reasoning.decision = ' in result.stdout, fallback)
+                self.assertEqual('Output decider.needs_review = ' in result.stdout, fallback)
+                self.assertIn(f'Output next.{branch} = ', result.stdout)
+                for other in {"continued", "repair", "blocked"} - {branch}:
+                    self.assertNotIn(f'Output next.{other} = ', result.stdout)
+                line = next(line for line in result.stdout.splitlines() if line.startswith(f'Output next.{branch} = '))
+                evidence = json.loads(json.loads(line.split(' = ', 1)[1]))
+                self.assertEqual(evidence['context'], {'checks.request' if deterministic_failure else 'review.request': message})
+                if not deterministic_failure:
+                    sent = json.loads((temp / "request.json").read_text())
+                    criterion = sent['questions']['decision']['instructions']
+                    self.assertIn('Mira Chen as the founder of Northstar', criterion)
+                    self.assertIn('Spring Summit', criterion)
+                    self.assertNotIn('Mira Chen', message)
+                    self.assertIn(criterion, sent['questions']['sufficient_context']['instructions'])
+                    self.assertEqual(evidence['instructions'], criterion)
+                    if fallback:
+                        # This is the exact port value connected to reasoning.request.
+                        line = next(line for line in result.stdout.splitlines() if line.startswith('Output decider.needs_review = '))
+                        fallback_input = json.loads(json.loads(line.split(' = ', 1)[1]))
+                        self.assertEqual(fallback_input['instructions'], criterion)
+                        self.assertEqual(fallback_input['context'], {'review.request': message})
+                if fallback:
+                    self.assertEqual(evidence['reasoning']['outcome'], reasoned_choice)
+                    self.assertEqual(bool(evidence['reasoning']['reason']), mode != 'reasoning_no_explanation')
+                if branch == "blocked":
+                    self.assertEqual(evidence['error']['kind'], 'unresolved_reasoning')
+                    self.assertTrue(evidence['error']['message'])
+                if deterministic_failure:
+                    self.assertEqual(evidence['error']['kind'], 'deterministic_check')
+                self.assertNotIn('fixture-not-a-real-key', result.stdout + result.stderr)
+                self.assertNotIn('private-service-error', result.stdout + result.stderr)
 
 
 

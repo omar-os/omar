@@ -257,7 +257,11 @@ export function assertChatMessage(value: unknown): ChatMessage {
     if (typeof design.program !== "string") {
       throw new Error("Proposed design is missing its program.");
     }
-    design = { ...design, preview: assertDiagramSnapshot(design.preview) };
+    const files = design.files ?? {};
+    if (!files || typeof files !== "object" || Array.isArray(files) || Object.values(files).some((contents) => typeof contents !== "string")) {
+      throw new Error("Proposed design files must map relative paths to text.");
+    }
+    design = { ...design, files, preview: assertDiagramSnapshot(design.preview) };
   }
   return { ...message, design, progress, selection } as ChatMessage;
 }

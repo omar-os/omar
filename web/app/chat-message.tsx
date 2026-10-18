@@ -3,6 +3,7 @@
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatMessage as ChatMessageModel } from "./lib/protocol";
+import { splitQuote } from "./quote-selection";
 
 /**
  * Chat messages are markdown — participants write bold, inline code, fenced
@@ -12,6 +13,7 @@ import type { ChatMessage as ChatMessageModel } from "./lib/protocol";
  * output relayed from an agent, so it is not trusted enough to inject.
  */
 export function ChatMessage({ message }: { message: ChatMessageModel }) {
+  const { quote, body } = message.role === "operator" ? splitQuote(message.text) : { quote: "", body: message.text };
   return (
     <article
       className={`message ${message.role}${message.progress ? " progress" : ""}`}
@@ -26,8 +28,9 @@ export function ChatMessage({ message }: { message: ChatMessageModel }) {
           // Kept on the message so the thread still shows what "this one" meant.
           <p className="message-selection">[{message.selection.join(", ")}]</p>
         ) : null}
+        {quote ? <blockquote className="message-quote">{quote}</blockquote> : null}
         <div className="message-body">
-          <Markdown remarkPlugins={[remarkGfm]}>{message.text}</Markdown>
+          <Markdown remarkPlugins={[remarkGfm]}>{body}</Markdown>
         </div>
       </div>
     </article>

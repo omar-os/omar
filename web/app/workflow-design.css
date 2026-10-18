@@ -427,6 +427,15 @@ button:focus-visible, select:focus-visible { outline-offset: 3px; }
 :root[data-theme="light"] .artifact-body nav button[aria-current="true"] { color: var(--accent-text); background: var(--purple-soft); border-color: #c9b8f3; }
 :root[data-theme="light"] .artifact-comparison h3 { color: var(--accent-text); }
 
+
+/* A schema/source review can leave the diagram narrower than the viewport. */
+.diagram-panel { container-type: inline-size; }
+@container (max-width: 380px) {
+  .diagram-heading { grid-template-columns: minmax(0, 1fr); }
+  .diagram-heading .workflow-actions { grid-column: 1; grid-row: auto; flex-wrap: wrap; justify-content: flex-start; }
+  .diagram-heading .run-stats { grid-column: 1; flex-wrap: wrap; }
+}
+
 /* Readable text needs room to wrap at small panel and viewport widths. */
 .message p, .message-body { font-size: 1rem; }
 .prompt-box textarea, .builder-panel.opening .prompt-box textarea { font-size: 1rem; }

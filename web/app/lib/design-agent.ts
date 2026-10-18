@@ -61,6 +61,7 @@ export function scriptedDesignAgent(): DesignAgent {
           text: "Drafted a three-reaction review loop: planner drafts a plan, reviewer critiques it, planner integrates the critique into the result.",
           design: {
             program: reviewProgram,
+            files: {},
             inputs: { request: text },
             preview: {
               ...reviewWorkflow,

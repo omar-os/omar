@@ -127,16 +127,21 @@ fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>
             "OMAR_JEV_ON_ERROR=defer requires a defer enum value and an evidence string output"
         );
     }
-    let model = std::env::var("OMAR_JEV_MODEL").unwrap_or_else(|_| "jev-latest".into());
+    let model = std::env::var("OMAR_JEV_MODEL").unwrap_or_else(|_| "jev-1.13.0".into());
     ensure!(!model.trim().is_empty(), "OMAR_JEV_MODEL must not be empty");
     let criteria: BTreeMap<_, _> = options
         .iter()
         .map(|option| (option.clone(), option.clone()))
         .collect();
-    let request = json!({"model": model,
-        "state": triggers, "questions": {"decision": {"type": "choice", "instructions": instructions, "criteria": criteria}}});
+    let context_instructions = format!(
+        "Does the supplied state contain enough evidence to resolve this decision without guessing? Decision instructions: {instructions}"
+    );
+    let request = json!({"model": model, "state": triggers, "questions": {
+        "decision": {"type": "choice", "instructions": instructions, "criteria": criteria},
+        "sufficient_context": {"type": "noul", "instructions": context_instructions}
+    }});
     let result = evaluate(&request, *timeout).and_then(|response| {
-        let choice = validate(&response, &options).map_err(|_| {
+        let choice = validate(&response, &options, &model).map_err(|_| {
             Failure::new(
                 "invalid_response",
                 "Response does not satisfy the Choice contract",
@@ -155,6 +160,9 @@ fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>
         }
         Err(error) => return Err(error.into()),
     };
+    // Preserve the workflow's criterion for fallback, including provider failures.
+    // These fields are owned by the adapter, not taken from the provider response.
+    response["instructions"] = json!(instructions);
     response["context"] = json!(triggers);
     eprintln!("Jev selected {choice}");
     let mut writes = BTreeMap::from([(port.clone(), json!(choice))]);
@@ -310,12 +318,10 @@ fn decode_http(bytes: &[u8]) -> std::result::Result<Value, Failure> {
         .map_err(|_| Failure::new("invalid_response", "Jev response is not valid JSON"))
 }
 
-fn validate(response: &Value, options: &[String]) -> Result<String> {
+fn validate(response: &Value, options: &[String], model: &str) -> Result<String> {
     ensure!(
-        response["model"]
-            .as_str()
-            .is_some_and(|model| !model.trim().is_empty()),
-        "Missing Jev response model"
+        response["model"].as_str() == Some(model),
+        "Jev response model does not match the requested model"
     );
     let answer = &response["answers"]["decision"];
     ensure!(answer["type"] == "choice", "Invalid Jev answer type");
@@ -356,6 +362,15 @@ fn validate(response: &Value, options: &[String]) -> Result<String> {
     ensure!(
         probabilities[choice].as_f64() == Some(max),
         "Choice must have highest probability"
+    );
+    let context = &response["answers"]["sufficient_context"];
+    ensure!(context["type"] == "noul", "Missing Jev context assessment");
+    let sufficiency = context["noul"]
+        .as_f64()
+        .context("Missing context sufficiency")?;
+    ensure!(
+        sufficiency.is_finite() && (0.0..=1.0).contains(&sufficiency),
+        "Invalid context sufficiency"
     );
     Ok(choice.to_string())
 }
@@ -421,11 +436,24 @@ mod tests {
     fn validates_membership_distribution_and_confidence() {
         let options = vec!["proceed".into(), "review".into(), "defer".into()];
         let response = json!({"model":"test-jev","answers":{"decision":{"type":"choice","choice":"proceed","confidence":0.9,
-            "probabilities":{"proceed":0.97,"review":0.02,"defer":0.01}}}});
-        assert_eq!(validate(&response, &options).unwrap(), "proceed");
+            "probabilities":{"proceed":0.97,"review":0.02,"defer":0.01}}, "sufficient_context":{"type":"noul","noul":0.99}}});
+        assert_eq!(
+            validate(&response, &options, "test-jev").unwrap(),
+            "proceed"
+        );
+        assert!(validate(&response, &options, "other-model").is_err());
+        for context in [
+            Value::Null,
+            json!({"type":"choice","noul":0.99}),
+            json!({"type":"noul","noul":1.1}),
+        ] {
+            let mut bad = response.clone();
+            bad["answers"]["sufficient_context"] = context;
+            assert!(validate(&bad, &options, "test-jev").is_err());
+        }
         let mut missing_model = response.clone();
         missing_model["model"] = Value::Null;
-        assert!(validate(&missing_model, &options).is_err());
+        assert!(validate(&missing_model, &options, "test-jev").is_err());
         for (field, value) in [
             ("choice", json!("approve")),
             ("confidence", json!(2)),
@@ -442,7 +470,7 @@ mod tests {
         ] {
             let mut bad = response.clone();
             bad["answers"]["decision"][field] = value;
-            assert!(validate(&bad, &options).is_err());
+            assert!(validate(&bad, &options, "test-jev").is_err());
         }
     }
 }

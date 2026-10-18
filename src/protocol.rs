@@ -201,7 +201,12 @@ pub fn generate() -> String {
         out.push_str(decl);
         out.push_str("\n\n");
     }
-    out
+    out.trim_end()
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 #[cfg(test)]
