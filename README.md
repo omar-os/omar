@@ -2,9 +2,8 @@
 
 <img src="img/full-black-banner.jpg" alt="OMAR" width="250">
 
-**Turn your coding agents into a programmable team.**
-
-Claude Code, Codex, and other agents. Explicit handoffs. Live control. Running on your machine.
+**Say no to agent “swarms”.**<br>
+**Deploy deterministic, verifiable, programmable agentic workflows.**
 
 <p align="center">
   <a href="https://omar.rs">omar.rs</a>&nbsp; • &nbsp;
