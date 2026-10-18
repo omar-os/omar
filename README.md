@@ -30,19 +30,19 @@ OMAR (Open Multi-Agent Runtime) coordinates coding agents through programmable w
 
 ## Features
 
-📜 **Explicit coordination contracts**: Declare typed inputs and outputs, triggers, and permitted output writes. OMAR provides system-level determinism for scheduling and handoffs, with compiler validation and runtime enforcement of output contracts.
+- 📜 **Explicit coordination contracts**: Declare typed inputs and outputs, triggers, and permitted output writes. OMAR provides system-level determinism for scheduling and handoffs, with compiler validation and runtime enforcement of output contracts.
 
-🤝 **Mixed agent teams**: Put Claude Code, Codex, Cursor, OpenCode, Antigravity, and Pi in the same workflow. Choose a backend for each role using the [supported agent backends](#supported-agent-backends).
+- 🤝 **Mixed agent teams**: Put Claude Code, Codex, Cursor, OpenCode, Antigravity, and Pi in the same workflow. Choose a backend for each role using the [supported agent backends](#supported-agent-backends).
 
-🪆 **Teams within teams**: Compose reusable, parameterized teams into deeper hierarchies. Build pipelines, parallel branches, and feedback loops with explicit connections between them.
+- 🪆 **Teams within teams**: Compose reusable, parameterized teams into deeper hierarchies. Build pipelines, parallel branches, and feedback loops with explicit connections between them.
 
-🔎 **Live visibility and direct access**: Follow execution status and values in Mission Control's live diagram. Open an individual agent's terminal to inspect its session and interact directly.
+- 🔎 **Live visibility and direct access**: Follow execution status and values in Mission Control's live diagram. Open an individual agent's terminal to inspect its session and interact directly.
 
-🧠 **Model heterogeneity**: Combine fast System I models such as Jev with System II reasoning models in the same workflow.
+- 🧠 **Model heterogeneity**: Combine fast System I models such as Jev with System II reasoning models in the same workflow.
 
-⏯️ **Checkpointed workflows**: Pause and resume workflows at well-defined checkpoints between logical tags.
+- ⏯️ **Checkpointed workflows**: Pause and resume workflows at well-defined checkpoints between logical tags.
 
-🛠️ **Flexible sessions and familiar tools**: Run long-lived or task-specific agents, with terminal access and the `tmux` controls you already use.
+- 🛠️ **Flexible sessions and familiar tools**: Run long-lived or task-specific agents, with terminal access and the `tmux` controls you already use.
 
 ## Installation
 
