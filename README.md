@@ -81,6 +81,11 @@ cd omar && make install
 
 ## Quick Start
 
+OMAR is organized as **sessions**: each `omar up` starts one independent
+runtime that owns its EAs (executive assistants), agents, workflows, and state.
+EAs live inside a session; one dashboard — TUI or web — shows one session.
+See [docs/sessions.md](docs/sessions.md) for the full model and CLI reference.
+
 #### Step 1: Launch Mission Control
 
 ```bash
@@ -115,8 +120,9 @@ This example requires both Claude Code and Codex to be installed and configured.
 | `omar down -s dev` | Stop the session and keep its state. |
 | `omar rm -s dev` | Remove the session and its state, stopping it first if running. |
 
-Closing the browser or detaching leaves the session running. Use `omar --help`
-for more commands and `omar <command> --help` for options.
+Closing the browser or detaching leaves the session running. See
+[session commands and lifecycle](docs/sessions.md) for the full reference, or
+`omar --help` for more commands and `omar <command> --help` for options.
 
 ### Terminal UI
 
@@ -130,6 +136,8 @@ $ omar up --tui
 
 Or attach to a running session with `omar attach -s <session> --tui`. `z`
 detaches and the runtime keeps every workload running; `Q` stops the session.
+Press `?` inside the TUI for all shortcuts. Full guide:
+[docs/tui.md](docs/tui.md).
 
 Go [here](#supported-agent-backends) to see how to launch with specific agent backends.
 
@@ -142,7 +150,7 @@ Run https://github.com/omar-os/omar/blob/main/prompts/tests/project-factory.md
 
 You should see agents being spawned by the EA.
 
-Tip: Use `↑↓←→` to cycle through agents at the current level. Use `Tab` to drill into a deeper level. Use `Shift+Tab` to back out.
+Tip: Use `[` and `]` to cycle between the session's EAs. Use `↑↓←→` to cycle through agents at the current level. Use `Tab` to drill into a deeper level. Use `Shift+Tab` to back out.
 
 #### Step 3: Shutdown the project.
 
