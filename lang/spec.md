@@ -385,12 +385,21 @@ such a causality loop; use a delayed connection or action to cross a tag boundar
 ### 4.2 Agent protocol
 
 Topology agents do not address other agents. Each active invocation receives
-two scoped MCP tools:
+scoped MCP tools:
 
 ```text
-omar_set_port(invocation_id, port, value)
-omar_complete(invocation_id)
+omar_set_port(task_id, port, value)
+omar_complete(task_id)
 omar_pending()
+```
+
+`task_id` is a positive JSON integer identifying one execution, supplied in the
+task prompt or by `omar_pending`. Calls match it exactly and are checked against
+the calling agent; it is an identifier, not an authentication credential. IDs
+increase without reuse during a runtime process. For example:
+
+```json
+{"task_id": 7, "port": "answer", "value": "hello"}
 ```
 
 The invocation's trigger map contains only the declared triggers present at

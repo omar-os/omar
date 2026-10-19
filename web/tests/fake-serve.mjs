@@ -224,7 +224,7 @@ export async function startFakeServe({
         return readBody(request).then((body) => {
           const answer = JSON.parse(body);
           const owed = (entry.pending ?? []).find(
-            (item) => item.invocation_id === answer.invocation_id,
+            (item) => item.task_id === answer.task_id,
           );
           if (!owed) return json(response, 400, { error: "unknown invocation" });
           // The runtime refuses a port outside the invocation's effects, so
@@ -237,12 +237,12 @@ export async function startFakeServe({
             }
           }
           entry.pending = (entry.pending ?? []).filter(
-            (item) => item.invocation_id !== answer.invocation_id,
+            (item) => item.task_id !== answer.task_id,
           );
           entry.answered = { ...answer };
           return json(response, 202, {
             run_id: id,
-            invocation_id: answer.invocation_id,
+            task_id: answer.task_id,
             sent: Object.keys(answer.values),
           });
         });
@@ -634,6 +634,7 @@ export async function startFakeServe({
   }
 
   /** One pending invocation per reaction whose agent is on the `web` backend. */
+  let nextTaskId = 1;
   function webPending(snapshot) {
     const web = new Set(
       snapshot.agents
@@ -644,7 +645,7 @@ export async function startFakeServe({
     return snapshot.reactions
       .filter((reaction) => web.has(reaction.agent))
       .map((reaction) => ({
-        invocation_id: `inv-${reaction.id}`,
+        task_id: nextTaskId++,
         // The name, not the id: that is what the daemon sends, because the
         // invocation protocol addresses an agent by the name the program
         // gave it.

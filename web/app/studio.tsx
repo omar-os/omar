@@ -429,7 +429,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     setError("");
     try {
       await answerPanel(serveUrl, run.run_id, {
-        invocation_id: invocation.invocation_id,
+        task_id: invocation.task_id,
         agent: invocation.agent,
         values,
       });

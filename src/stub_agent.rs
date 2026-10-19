@@ -66,10 +66,10 @@ pub fn run(context_file: &Path) -> Result<()> {
 }
 
 fn answer(topology: &TopologyMcpContext, fields: &BTreeMap<String, String>) -> Result<()> {
-    let invocation_id = fields
-        .get("invocation_id")
-        .context("invocation had no id")?
-        .clone();
+    let task_id = fields
+        .get("task_id")
+        .context("invocation had no task_id")?
+        .parse::<u64>()?;
     // `effects` is a JSON object of port name to declared type, which is all a
     // stub needs to produce something the runtime will accept.
     for (port, ty) in effect_types(fields)? {
@@ -77,17 +77,14 @@ fn answer(topology: &TopologyMcpContext, fields: &BTreeMap<String, String>) -> R
             topology,
             json!({
                 "op": "set_port",
-                "invocation_id": invocation_id,
+                "task_id": task_id,
                 "port": port,
                 "value": stub_value(&ty),
             }),
         )?;
     }
-    send(
-        topology,
-        json!({"op": "complete", "invocation_id": invocation_id}),
-    )?;
-    println!("stub agent answered {invocation_id}");
+    send(topology, json!({"op": "complete", "task_id": task_id}))?;
+    println!("stub agent answered {task_id}");
     std::io::stdout().flush().ok();
     Ok(())
 }

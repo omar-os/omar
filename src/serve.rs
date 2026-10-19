@@ -2687,7 +2687,7 @@ fn stage_program(
 
 #[derive(Debug, Deserialize)]
 struct PanelAnswer {
-    invocation_id: String,
+    task_id: u64,
     agent: String,
     values: BTreeMap<String, Value>,
 }
@@ -2760,14 +2760,14 @@ fn panel_answer(context: &Arc<Context_>, run_id: &str, body: &[u8]) -> (u16, Val
         &access,
         &team,
         &answer.agent,
-        &answer.invocation_id,
+        &answer.task_id,
         &answer.values,
     ) {
         Ok(()) => (
             202,
             json!({
                 "run_id": run_id,
-                "invocation_id": answer.invocation_id,
+                "task_id": answer.task_id,
                 "sent": answer.values.keys().collect::<Vec<_>>()
             }),
         ),
@@ -5070,7 +5070,7 @@ while True:
             server.address(),
             "POST",
             "/v1/runs/nope/panel",
-            Some(r#"{"invocation_id":"i","agent":"panel","values":{}}"#),
+            Some(r#"{"task_id":1,"agent":"panel","values":{}}"#),
         );
         assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
         assert!(response.contains("unknown run"), "{response}");

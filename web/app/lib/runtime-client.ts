@@ -295,7 +295,7 @@ export async function fetchPanel(
 export async function answerPanel(
   serveUrl: string,
   runId: string,
-  answer: { invocation_id: string; agent: string; values: Record<string, unknown> },
+  answer: { task_id: number; agent: string; values: Record<string, unknown> },
   signal?: AbortSignal,
 ): Promise<void> {
   const base = normalizeRuntimeUrl(serveUrl);
