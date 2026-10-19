@@ -92,6 +92,52 @@ directory either way, so its log explains why. A stale/unreachable record is
 never permission to signal a PID: control verifies the session's incarnation
 before executing operations.
 
+## Migrating from 0.4.2 or earlier
+
+Before sessions, all state lived directly under `~/.omar/`. Current OMAR reads
+only `~/.omar/sessions/<name>/`, so that state needs a one-time move. The old
+layout is byte-identical to a session directory, so the migration is: let OMAR
+build a proper session shell, stop it, move the old files in, and boot it.
+
+Stop any still-running old OMAR and its tmux panes, then:
+
+```bash
+# 1. old installs ran agents on the default tmux server; clear those panes
+tmux ls 2>/dev/null | awk -F: '/^omar-/{print $1}' |
+  while read -r s; do tmux kill-session -t "$s"; done
+
+# 2. create the session shell (this briefly launches EA 0's assistant; down stops it)
+omar up --name migrated
+omar down -s migrated
+
+# 3. move the old state in, keeping the global config.toml as the template
+cd ~/.omar
+rm -rf mcp dashboard_handoff.json          # stale absolute paths; regenerated
+# fresh placeholders the legacy versions must replace (mv would nest them)
+rm -rf sessions/migrated/{ea,logs,prompts,metrics,workspaces,workspace-history}
+for f in eas.json eas.lock ea_next_id active_ea scheduled_events.json \
+         ea prompts logs metrics workspaces workspace-history; do
+  [ -e "$f" ] && mv "$f" sessions/migrated/
+done
+find . -maxdepth 1 -name 'manager_notes_ea*.md' -exec mv {} sessions/migrated/ \;
+[ -e config.toml ] && cp config.toml sessions/migrated/
+
+# 4. repair workspace git pointers that embed the old path
+for id in sessions/migrated/workspace-history/*; do
+  git --git-dir "$id/repository.git" worktree repair \
+    "sessions/migrated/workspaces/$(basename "$id")/worktree" 2>/dev/null
+done
+
+# 5. boot the migrated session
+omar up --name migrated
+```
+
+EA registry, chats, scheduled events, manager notes, and workspace snapshots
+come along. Runs that were live under the old install are not resumable — they
+belonged to the old tmux server — though their records and checkpoint files
+travel with the move. `omar rm -s migrated` deletes the migrated state, so keep
+a copy of `~/.omar` until you are satisfied.
+
 ## Storage and build ownership
 
 Discovery: `$OMAR_HOME/registry`, default `~/.omar/registry`.

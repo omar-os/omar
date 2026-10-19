@@ -64,6 +64,9 @@ curl -fsSL https://omar.rs/install.sh | sh
 
 Installs all binaries to `/usr/local/bin`.
 
+Upgrading from 0.4.2 or earlier? The pre-session state layout needs a one-time
+migration: see [Migrating](docs/sessions.md#migrating-from-042-or-earlier).
+
 ### Homebrew
 
 ```bash
