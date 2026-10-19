@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         assert not Path(env["OMAR_HOME"]).exists(), "help wrote runtime state"
         cli("runs", ok=False)
         bare = subprocess.run([str(BIN)], cwd=root, env=env, text=True, capture_output=True)
-        assert bare.returncode != 0 and "Usage:" in bare.stdout + bare.stderr, "bare omar must print the command list"
+        assert bare.returncode == 0 and "omar up" in bare.stdout, "bare omar must offer a quick start"
         outer = up("outer")
         inherited = dict(env, OMAR_SESSION_ID=outer["name"], OMAR_STATE_DIR=outer["directory"],
                          OMAR_TMUX_SERVER=outer["tmux_server"], OMAR_EA_ID="99", TMUX="parent")
@@ -102,6 +102,8 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         assert "--tui" in cli("attach", "-s", "outer", ok=False) or "--web" in cli("attach", "-s", "outer", ok=False)
         assert outer["tmux_server"] != inner["tmux_server"]
         assert len(json.loads(cli("ls", "--json"))) == 2
+        many = subprocess.run([str(BIN)], cwd=root, env=env, text=True, capture_output=True)
+        assert many.returncode == 0 and "outer" in many.stdout and "inner" in many.stdout, "bare omar lists running sessions"
         cli("up", "--name", "outer", "--no-ea", ok=False)
         cli("--session", "inner", "ea", "list", context=inherited)
         assert json.loads(cli("--session", "outer", "ea", "create", "--name", "Second"))["id"] == 1

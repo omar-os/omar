@@ -79,9 +79,7 @@ const TMUX_SETUP_WARNING: &str = "⚠ tmux not configured for omar — run 'omar
 #[command(
     name = "omar",
     about = "Independent agent runtimes and topology orchestration",
-    version,
-    subcommand_required = true,
-    arg_required_else_help = true
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -429,7 +427,27 @@ fn open_browser(url: &str) {
         .unwrap_or(false);
     if !opened {
         println!("Open {url}");
+        if let Some(hint) = headless_browser_hint(url) {
+            println!("{hint}");
+        }
     }
+}
+
+/// On a headless Linux box there is no desktop to open, so tell the user to
+/// forward the port over SSH instead.
+fn headless_browser_hint(url: &str) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return None;
+    }
+    let host = url.split("://").nth(1)?;
+    let (authority, _) = host.split_once('/').unwrap_or((host, ""));
+    let (_, port) = authority.rsplit_once(':')?;
+    Some(format!(
+        "Headless (no DISPLAY): forward the port to browse it locally:\n  ssh -L {port}:127.0.0.1:{port} <this-host>"
+    ))
 }
 
 fn main() -> Result<()> {
@@ -2085,6 +2103,17 @@ async fn run_dashboard(config: Config, session: sessions::Session) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headless_hint_names_the_session_port() {
+        if cfg!(target_os = "macos") {
+            assert!(headless_browser_hint("http://127.0.0.1:7777").is_none());
+            return;
+        }
+        let hint = headless_browser_hint("http://127.0.0.1:7777").expect("hint");
+        assert!(hint.contains("ssh -L 7777:127.0.0.1:7777"), "{hint}");
+        assert!(headless_browser_hint("not-a-url").is_none());
+    }
 
     /// Regression: `extended-keys always` forces tmux to emit modify-other-keys
     /// sequences to every client, including omar's dashboard, which doesn't
