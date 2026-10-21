@@ -1,11 +1,11 @@
 name: Install
 
 # Runs the README one-liner verbatim: live omar.rs script, latest release.
-# omar.rs serves a shim (omar-os/omar.rs, public/install.sh) that runs main's
-# install.sh. ci.yml only tests the checkout's copy; this tests the path users
-# take, which once broke while CI stayed green. Tests what's deployed, not a
-# commit, so not a PR check. raw.githubusercontent.com caches ~5 min, so a
-# push-triggered run may still see the previous install.sh.
+# omar.rs serves a shim (omar-os/omar.rs, public/install.sh) that runs the
+# latest release's install.sh. ci.yml only tests the checkout's copy; this
+# tests the path users take, which once broke while CI stayed green. Tests
+# what's deployed, not a commit, so not a PR check. An install.sh change on
+# main reaches users, and this, only once released.
 
 on:
   schedule:
@@ -17,7 +17,7 @@ on:
     types: [completed]
   push:
     branches: [main]
-    paths: [install.sh, .github/workflows/install.yml]
+    paths: [.github/workflows/install.yml]
   workflow_dispatch:
 
 permissions:
@@ -40,8 +40,8 @@ jobs:
           sparse-checkout: tests/ci/direct_run.omar
           sparse-checkout-cone-mode: false
 
-      # Default install dir, so the sudo path runs as for a user. Retry: the
-      # script's unauthenticated releases API call is rate limited per runner IP.
+      # Default install dir, so the sudo path runs as for a user. Retry: a
+      # network blip on GitHub's side is not a broken install.
       - name: curl -fsSL https://omar.rs/install.sh | sh
         run: |
           for attempt in 1 2 3; do
