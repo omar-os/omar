@@ -84,5 +84,8 @@ jobs:
       - name: Stop run's agents
         if: always()
         run: |
-          env -u TMUX tmux kill-server 2>/dev/null || true
+          # OMAR runs one named tmux server per session; all of them live here.
+          for socket in "$TMUX_TMPDIR"/tmux-*/*; do
+            [[ -S $socket ]] && env -u TMUX tmux -S "$socket" kill-server 2>/dev/null || true
+          done
           rm -rf "$OMAR_HOME"
