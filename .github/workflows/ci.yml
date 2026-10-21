@@ -121,10 +121,14 @@ jobs:
           lake-package-directory: lang
           test: false
 
+      - name: Test Slack workflow gateway (no Slack credentials)
+        run: node --test integrations/slack/workflow.test.mjs
+
       - name: Verify legacy supervision through MCP and tmux
         run: |
           cargo build -p omar
           python3 tests/ci/independent_sessions.py
+          python3 tests/ci/slack_workflow.py
           python3 tests/ci/team_workspaces.py
           python3 tests/ci/team_checkpoints.py
           python3 tests/ci/session_upgrade.py

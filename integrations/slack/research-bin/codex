@@ -1,0 +1,5 @@
+#!/bin/sh
+# Scope the update-dialog workaround to a dedicated research runtime.
+# Resolve the real executable before putting this directory on PATH.
+: "${SLACK_RESEARCH_CODEX_BIN:?Set SLACK_RESEARCH_CODEX_BIN to the real Codex executable}"
+exec "$SLACK_RESEARCH_CODEX_BIN" -c check_for_update_on_startup=false "$@"
