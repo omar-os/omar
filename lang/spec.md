@@ -186,6 +186,27 @@ not present in an invocation, its interpolation expands to `<absent>`.
   crate and the bytecode are written to `src-gen/<program>/` beside the
   program — next to `src/` when the program is in one — and an unchanged
   program is not rebuilt.
+- `shutdown` is a trigger every team has without declaring it, and no team
+  may declare a name of its own by it. It fires once, at the run's last tag,
+  carrying that tag's timestamp. A body calls `request_stop()` to end the run:
+  the tag finishes, anything queued after it is dropped, and `shutdown` fires
+  one microstep later. A run that runs out of events fires it too. A body that
+  panics fails the run, so `assert!` in a `shutdown` reaction is a verdict:
+
+  ```omar
+  team Smoke {
+      input result : string
+      state seen : bool = false
+      timer deadline(10min, 0)
+      reaction(result) -> {= self.seen = true; request_stop(); =}
+      reaction(deadline) -> {= request_stop(); =}
+      reaction(shutdown) -> {= assert!(self.seen, "no result by the deadline"); =}
+  }
+
+  main { smoke = Smoke() }
+  ```
+
+  An operator's `omar stop` ends a run without `shutdown`.
 - `state round : int = 0` declares a value a reaction reads and writes as
   `self.round`. It starts at the literal and keeps its last value from one
   invocation to the next. Types are `int`, `bool`, `string`, so the value a
@@ -210,7 +231,7 @@ The expression after `->` declares the ports a reaction may set:
 - A bare typed effect requires the agent to set a value.
 - A bare untyped action emits a signal.
 
-Every trigger must be an input or action. Every effect must be an output or
+Every trigger must be an input, action, timer or `shutdown`. Every effect must be an output or
 action. A connection target must be an output or action, and its source and
 target types must match. Values must match their port types.
 
