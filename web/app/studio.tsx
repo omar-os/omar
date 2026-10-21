@@ -606,14 +606,14 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           ? current
           : [...current, message],
       );
-      if (message.role === "assistant" && !message.progress) setAssistantBusy(false);
+      if (message.role === "assistant" && !message.runtime) setAssistantBusy(message.progress);
       if (!message.design) {
         // Only an assistant reply ends the wait — the operator's own message
         // echoes back off the same stream, and commentary while it works is
         // the opposite of finishing. And a reply must not withdraw a pending
         // proposal: assistants routinely comment straight after proposing
         // ("…is in your queue"), which was retracting the gate.
-        if (message.role === "assistant" && !message.progress) {
+        if (message.role === "assistant" && !message.progress && !message.runtime) {
           setPhase((current) => (current === "drafting" ? "idle" : current));
         }
         return;
@@ -1206,7 +1206,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             {messages.map((message) => (
               <ChatMessageView key={message.sequence} message={message} />
             ))}
-            {assistantBusy ? <Waiting /> : null}
+            {assistantBusy ? <Waiting key={run?.status} label={run?.status === "failed" ? "Investigating workflow" : run?.status === "completed" ? "Reviewing results" : undefined} /> : null}
             {phase === "spawning" ? <Waiting label="Starting the run" /> : null}
           </div>
           <QuoteSelection threadRef={threadRef} onQuote={(text) => { setQuote(text); composerRef.current?.focus(); }} />

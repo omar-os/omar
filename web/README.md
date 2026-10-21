@@ -10,11 +10,22 @@ Includes:
 - run admission against `omar serve`, then live observation of that run;
 - an LF-inspired diagram: ELK layout drawn as SVG, no KIELER/KLighD;
 - live tag, reaction, value, and execution status;
+- automatic failure investigation with progress in chat and the assistant terminal;
+- immediate instructions for manual response steps and a result handoff after completion;
 - a fixed-viewport three-panel workspace;
 - CI that lints, builds, contract-tests the protocol, and drives the whole
   flow end to end in a browser without invoking a model.
 
 ## Development
+
+When a run fails, its own assistant receives the saved error and artifact paths.
+The assistant investigates, attempts reversible repairs, validates the result,
+and reports one concrete next action. Follow-ups wait for an existing assistant
+turn to finish and are not redelivered after a successful handoff. Run again
+remains explicit because a failed run may already have caused external effects.
+Web steps immediately explain how to submit a response instead of waiting
+silently until their deadline. A GUI runtime also searches the configured Cargo
+installation and `~/.cargo/bin` if Cargo is absent from its inherited `PATH`.
 
 Requires Node.js 22.13 or newer. Everything below runs from `web/`.
 

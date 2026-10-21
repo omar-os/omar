@@ -263,7 +263,7 @@ export function assertChatMessage(value: unknown): ChatMessage {
     }
     design = { ...design, files, preview: assertDiagramSnapshot(design.preview) };
   }
-  return { ...message, design, progress, selection } as ChatMessage;
+  return { ...message, design, progress, selection, runtime: message.runtime === true } as ChatMessage;
 }
 
 export type RunRequest = {
