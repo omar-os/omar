@@ -107,25 +107,34 @@ if peek_agents:
 
 
 def capture_agent_panes(elapsed):
-    sessions = subprocess.run(
-        ["tmux", "list-sessions", "-F", "#{session_name}"],
-        capture_output=True,
-        text=True,
-    )
-    if sessions.returncode != 0:
-        print(f"[{case_name}] no tmux agent sessions found", flush=True)
-        return
+    # OMAR runs one named tmux server per session, beside the default one.
+    socket_dir = os.path.join(os.environ.get("TMUX_TMPDIR", "/tmp"), f"tmux-{os.getuid()}")
+    try:
+        sockets = sorted(os.listdir(socket_dir))
+    except OSError:
+        sockets = []
+    servers = [[]] + [["-S", os.path.join(socket_dir, name)] for name in sockets]
 
     # Instance-qualified agents reach tmux with '.' flattened to '_', so
     # `n1.agent` is stored as `…-n1_agent`.
-    names = [
-        name for name in sessions.stdout.splitlines()
-        if name.startswith("omar-agent-")
-        and any(
-            name.endswith(f"-{agent}") or name.endswith(f"_{agent}")
-            for agent in agent_names
+    names = []
+    for server in servers:
+        sessions = subprocess.run(
+            ["tmux", *server, "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
         )
-    ]
+        names += [
+            (server, name) for name in sessions.stdout.splitlines()
+            if name.startswith("omar-")
+            and any(
+                name.endswith(f"-{agent}") or name.endswith(f"_{agent}")
+                for agent in agent_names
+            )
+        ]
+    if not names:
+        print(f"[{case_name}] no tmux agent sessions found", flush=True)
+        return
     group = os.environ.get("GITHUB_ACTIONS") == "true"
     if group:
         print(f"::group::{case_name} agent panes at {elapsed}s", flush=True)
@@ -133,9 +142,9 @@ def capture_agent_panes(elapsed):
         print(f"[{case_name}] agent panes at {elapsed}s", flush=True)
 
     ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-    for name in names:
+    for server, name in names:
         pane = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", name, "-S", "-20"],
+            ["tmux", *server, "capture-pane", "-p", "-t", name, "-S", "-20"],
             capture_output=True,
             text=True,
         )
