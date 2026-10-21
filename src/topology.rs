@@ -4113,11 +4113,18 @@ fn invocation_spec(
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_task_id() -> Result<u64> {
-    NEXT_TASK_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-            (id < (1_u64 << 53)).then_some(id + 1)
-        })
-        .map_err(|_| anyhow::anyhow!("task ID space exhausted"))
+    // Explicit CAS loop: `fetch_update` is deprecated on newer toolchains and
+    // its replacement `try_update` postdates the minimum supported Rust.
+    let mut id = NEXT_TASK_ID.load(Ordering::Relaxed);
+    loop {
+        if id >= 1_u64 << 53 {
+            anyhow::bail!("task ID space exhausted");
+        }
+        match NEXT_TASK_ID.compare_exchange_weak(id, id + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(id),
+            Err(current) => id = current,
+        }
+    }
 }
 
 /// The message an agent is handed, with `rendered` as its prompt.
