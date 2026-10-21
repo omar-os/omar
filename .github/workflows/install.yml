@@ -1,10 +1,11 @@
 name: Install
 
 # Runs the README one-liner verbatim: live omar.rs script, latest release.
-# ci.yml tests the checkout's install.sh, but omar.rs serves its own copy
-# (omar-os/omar.rs, public/install.sh). That copy went stale and broke every
-# fresh install while CI stayed green. Tests what's deployed, not a commit,
-# so not a PR check.
+# omar.rs serves a shim (omar-os/omar.rs, public/install.sh) that runs main's
+# install.sh. ci.yml only tests the checkout's copy; this tests the path users
+# take, which once broke while CI stayed green. Tests what's deployed, not a
+# commit, so not a PR check. raw.githubusercontent.com caches ~5 min, so a
+# push-triggered run may still see the previous install.sh.
 
 on:
   schedule:
@@ -23,25 +24,6 @@ permissions:
   contents: read
 
 jobs:
-  # Catches the drift above directly.
-  hosted-script:
-    name: omar.rs serves this install.sh
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          sparse-checkout: install.sh
-          sparse-checkout-cone-mode: false
-      - name: Compare
-        run: |
-          curl -fsSL --retry 3 https://omar.rs/install.sh -o "$RUNNER_TEMP/hosted.sh"
-          if ! diff -u "$RUNNER_TEMP/hosted.sh" install.sh; then
-            echo "::error::https://omar.rs/install.sh differs from install.sh on main; copy it to public/install.sh in omar-os/omar.rs"
-            exit 1
-          fi
-
   one-liner:
     name: One-liner (${{ matrix.os }})
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
