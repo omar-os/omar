@@ -118,6 +118,10 @@ pub struct RunRecord {
 #[derive(Debug, Deserialize)]
 struct StartRunRequest {
     program: String,
+    /// The source's file name, which names a program without a named `main`.
+    /// Must be a plain name ending in `.omar`; default `program.omar`.
+    #[serde(default)]
+    filename: Option<String>,
     /// Files the program imports, by the relative path it imports them under:
     /// `{"schemas/decision.json": "{...}"}` for
     /// `type Decision from "schemas/decision.json"`. The compiler resolves an
@@ -2366,7 +2370,14 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
         .join("serve")
         .join(&run_id);
-    let program_path = run_dir.join("program.omar");
+    let filename = request.filename.as_deref().unwrap_or("program.omar");
+    if !filename.ends_with(".omar") || filename.contains('/') || filename.contains('\\') {
+        return (
+            400,
+            json!({"error": format!("'{filename}' is not a program file name: it must be a plain name ending in .omar")}),
+        );
+    }
+    let program_path = run_dir.join(filename);
     if let Err(error) =
         fs::create_dir_all(&run_dir).and_then(|_| fs::write(&program_path, &request.program))
     {
@@ -2375,7 +2386,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": format!("failed to stage program: {error}")}),
         );
     }
-    if let Err(message) = stage_files(&run_dir, "program.omar", &request.files) {
+    if let Err(message) = stage_files(&run_dir, filename, &request.files) {
         return (400, json!({"error": message}));
     }
 
@@ -3209,16 +3220,15 @@ fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
             None => return (404, json!({"error": "unknown run"})),
         }
     };
-    let program_path = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
         .join("serve")
-        .join(id)
-        .join("program.omar");
-    if !program_path.exists() {
+        .join(id);
+    let Some(program_path) = staged_program(&run_dir) else {
         return (
             409,
-            json!({"error": format!("the run's program is no longer staged at {}", program_path.display())}),
+            json!({"error": format!("the run's program is no longer staged in {}", run_dir.display())}),
         );
-    }
+    };
     {
         let mut runs = context.runs.lock().expect("serve runs poisoned");
         if let Some(active) = find_active_run(&runs, &team).filter(|other| other.run_id != id) {
@@ -3257,6 +3267,15 @@ fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
             (502, json!({"error": message}))
         }
     }
+}
+
+/// A run's source, staged under the name it was started with. Imports are
+/// schemas, never `.omar`, so it is the only one there.
+fn staged_program(run_dir: &Path) -> Option<std::path::PathBuf> {
+    fs::read_dir(run_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "omar"))
 }
 
 /// A run's record on disk, beside its staged program. Written whenever the
@@ -5090,6 +5109,24 @@ while True:
             "{response}"
         );
         assert!(response.contains("invalid request"), "{response}");
+    }
+
+    /// Resume finds the source under the name the run was started with, and
+    /// still finds a run staged before runs kept their names.
+    #[test]
+    fn a_staged_program_is_found_under_its_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(staged_program(dir.path()), None);
+        fs::create_dir(dir.path().join("schemas")).unwrap();
+        fs::write(dir.path().join("schemas/decision.json"), "{}").unwrap();
+        fs::write(dir.path().join("HR.omar"), "").unwrap();
+        assert_eq!(staged_program(dir.path()), Some(dir.path().join("HR.omar")));
+        let legacy = tempfile::tempdir().unwrap();
+        fs::write(legacy.path().join("program.omar"), "").unwrap();
+        assert_eq!(
+            staged_program(legacy.path()),
+            Some(legacy.path().join("program.omar"))
+        );
     }
 
     #[test]
