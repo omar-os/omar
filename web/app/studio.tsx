@@ -6,6 +6,7 @@ import { QuoteSelection, withQuote } from "./quote-selection";
 import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
 import { Artifacts } from "./artifacts";
 import { DeployConfirmation, type DeployOptions } from "./deploy-confirmation";
+import { guideForFiles, responseGuide } from "./lib/response-guide";
 import { defaultRunTimeout, describeRunFailure } from "./lib/run-feedback";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
@@ -423,7 +424,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     invocation: PendingInvocation,
     values: Record<string, unknown>,
   ) {
-    if (!run) return;
+    if (!run) throw new Error("This run is no longer waiting for a response.");
     setAnswering(true);
     const scope = scopeRef.current;
     setError("");
@@ -438,6 +439,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     } catch (cause) {
       if (scope !== scopeRef.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
+      throw cause;
     } finally {
       if (scope === scopeRef.current) setAnswering(false);
     }
@@ -911,6 +913,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const failureDetails = failedRun ? (run.error || error || "The run failed.") : "";
   const failure = failedRun ? describeRunFailure(failureDetails, snapshot?.agents ?? []) : null;
   const manualStep = phase === "observing" ? pending[0] : undefined;
+  const responseGuides = guideForFiles(design?.files);
+  const manualCopy = manualStep ? responseGuide(manualStep, responseGuides[manualStep.agent]) : null;
   // The compiler answers on every pause in typing. Debounced because a check
   // compiles a real program on disk, and aborted on the next keystroke so a
   // stale answer cannot land after a newer one.
@@ -1341,7 +1345,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               <h2>{snapshot?.team}</h2>
             </div>
             <div className="run-stats">
-              <span><small>{phase === "review" && failedRun ? "LAST RUN" : "STATUS"}</small>{run?.status ?? snapshot?.status}</span>
+              <span><small>{phase === "review" && failedRun ? "LAST RUN" : "STATUS"}</small>{manualStep ? "Needs your response" : run?.status ?? snapshot?.status}</span>
               <span><small>TAG</small>{tag}</span>
               <span><small>LAG</small>{lag}</span>
             </div>
@@ -1381,9 +1385,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           ) : null}
           {manualStep ? (
             <div className="run-feedback run-waiting" role="status">
-              <strong>Waiting for your response · {manualStep.agent}</strong>
-              <p>This Web step needs a response from you. Open the response panel to read the task and submit its result.</p>
-              <button type="button" className="primary-button" onClick={() => setPanelAgent(manualStep.agent)}>Open response panel</button>
+              <strong>{manualCopy?.title}</strong>
+              <p>{manualCopy?.summary}</p>
+              <button type="button" className="primary-button" onClick={() => setPanelAgent(manualStep.agent)}>Review required response</button>
             </div>
           ) : null}
           <div className="topology-body">
@@ -1537,7 +1541,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           snapshot={snapshot}
           pending={pending.filter((item) => item.agent === panelAgent)}
           sending={answering}
-          onAnswer={(invocation, values) => void answer(invocation, values)}
+          guides={responseGuides}
+          onAnswer={answer}
           onClose={() => setPanelAgent(null)}
         />
       ) : null}

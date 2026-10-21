@@ -2698,6 +2698,46 @@ h2 {
 .diagram-heading > div:first-child { min-width: 0; overflow-wrap: anywhere; }
 
 .artifact-toolbar { display: flex; align-items: center; gap: 20px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+/* Response dialogs must reflow long instructions and nested JSON at every zoom. */
+dialog.port-panel {
+  padding: 0;
+  color: var(--text);
+  width: min(640px, calc(100dvw - 32px));
+  max-width: calc(100dvw - 32px);
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+}
+dialog.port-panel:not([open]) { display: none; }
+dialog.port-panel::backdrop { background: rgba(6, 6, 9, .72); }
+.port-panel-head > div, .port-panel-body, .port-waiting, .port-field, .port-row { min-width: 0; }
+.port-panel-head h2 { font-family: inherit; overflow-wrap: anywhere; }
+.port-panel-body { overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
+.port-waiting { padding: 0; border: 0; background: transparent; gap: 14px; }
+.port-response-summary { margin: 0; line-height: 1.5; }
+.port-instructions { margin: 0; padding-left: 22px; color: var(--muted); line-height: 1.5; }
+.port-instructions li + li { margin-top: 6px; }
+.port-waiting-prompt, .port-waiting-contract, .port-row-value, .port-row-name, .port-field-name, .port-details { overflow-wrap: anywhere; word-break: normal; }
+.port-row { grid-template-columns: minmax(0, 1fr) auto; }
+.port-row-value { grid-column: 1 / -1; white-space: pre-wrap; margin: 0; color: var(--text); }
+.port-field { grid-template-columns: minmax(0, 1fr); }
+.port-field-help { font-size: .8125rem; color: var(--muted); }
+.port-field textarea { width: 100%; min-width: 0; box-sizing: border-box; resize: vertical; min-height: 90px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+.port-field.invalid textarea { border-color: #e58080; }
+.port-field-problem { color: #f2a3a3; }
+.port-outcomes { margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; display: flex; flex-wrap: wrap; gap: 12px; min-width: 0; }
+.port-outcomes legend { color: var(--muted); font-size: .8125rem; }
+.port-outcomes label { display: flex; align-items: center; gap: 6px; font-size: .875rem; }
+.port-outcomes input { accent-color: var(--purple); }
+.port-details { border-top: 1px solid var(--line); padding-top: 10px; }
+.port-details summary { cursor: pointer; color: var(--muted); font-size: .8125rem; padding: 4px 0; }
+.port-details[open] summary { margin-bottom: 8px; }
+.port-response-footer { position: sticky; bottom: -18px; padding: 12px 0; background: var(--panel); border-top: 1px solid var(--line); z-index: 1; }
+.port-response-footer p { margin: 0 0 10px; font-size: .8125rem; line-height: 1.45; color: var(--muted); }
+.port-response-footer .primary-button { width: 100%; white-space: normal; }
+.run-feedback.run-waiting { padding: 12px 18px; }
+.run-feedback.run-waiting p { margin: 5px 0 10px; }
+@media (max-width: 600px) { .port-panel-head, .port-panel-body { padding: 12px; } .port-response-footer { bottom: -12px; } }
+
 .artifact-tabs { display: flex; gap: 24px; min-width: 0; }
 .artifact-editor-button { margin-left: auto; flex-shrink: 0; margin-bottom: 6px; }
 .artifact-tabs [role="tab"] { appearance: none; border: 0; border-bottom: 3px solid transparent; border-radius: 0; background: transparent; color: var(--text-2, #b1a6bd); padding: 12px 0; font: inherit; font-size: 13px; cursor: pointer; }
