@@ -110,6 +110,7 @@ This example requires both Claude Code and Codex to be installed and configured.
 
 | Command | What it does |
 |---------|--------------|
+| `omar open` | Reopen the remembered workspace, starting its saved runtime if needed. |
 | `omar up --name dev` | Start a background session, or restart the stopped session named `dev`. |
 | `omar attach -s dev --web` | Open Mission Control for that session. Use `--tui` for the terminal UI. |
 | `omar down -s dev` | Stop the session and keep its state. |

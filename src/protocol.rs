@@ -25,7 +25,7 @@
 
 use ts_rs::{Config, TS};
 
-use crate::chat_history::{Conversation, ConversationSummary};
+use crate::chat_history::{Conversation, ConversationSummary, WorkflowDraft, WorkflowState};
 use crate::diagram::{
     wire_name, DiagramAgent, DiagramEdge, DiagramEvent, DiagramEventKind, DiagramInstance,
     DiagramPort, DiagramReaction, DiagramSnapshot, DiagramStatus, DiagramTag, DiagramTimer,
@@ -192,6 +192,8 @@ pub fn generate() -> String {
         DiagramEvent::decl(&config),
         ProposedDesign::decl(&config),
         ChatMessage::decl(&config),
+        WorkflowDraft::decl(&config),
+        WorkflowState::decl(&config),
         Conversation::decl(&config),
         ConversationSummary::decl(&config),
         RunRecord::decl(&config),

@@ -115,6 +115,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Reopen the default workspace, starting its runtime only when needed
+    Open {
+        #[arg(long)]
+        print_url: bool,
+    },
     /// Create a new independent background runtime, or restart a stopped one by name on this build
     Up(sessions::UpOptions),
     /// List independently addressable runtime sessions
@@ -490,7 +495,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     let omar_dir = omar_dir();
     match cli.command {
         Some(
-            Commands::Up(_)
+            Commands::Open { .. }
+            | Commands::Up(_)
             | Commands::Ls
             | Commands::Info
             | Commands::Attach { .. }

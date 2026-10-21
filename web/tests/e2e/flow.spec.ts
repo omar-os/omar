@@ -2748,3 +2748,118 @@ test("workflow tabs support keyboard navigation and saved VS Code edits reach de
   await deploy(page);
   expect((await deployment).postDataJSON().files).toEqual(savedFiles);
 });
+
+test("workflow source and filename restore after reload without changing the transcript", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await expect(page.locator(".messages")).toContainText("It is in your queue for approval.");
+  const before = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+  await page.getByRole("button", {name:"Show the source pane"}).click();
+  const source = page.getByRole("textbox", {name:"OMAR program"});
+  const edited = (await source.inputValue()) + "\n// saved edit\n";
+  await source.fill(edited);
+  await page.getByRole("textbox", {name:"Program file name"}).fill("edited.omar");
+  await expect(page.locator(".workflow-save")).toHaveText("Saved");
+  await page.reload();
+  await expect(page.locator(".diagram-panel")).toBeVisible();
+  await page.getByRole("button", {name:"Show the source pane"}).click();
+  await expect(source).toHaveValue(edited);
+  await expect(page.getByRole("textbox", {name:"Program file name"})).toHaveValue("edited.omar");
+  const after = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+  expect(after.messages).toEqual(before.messages);
+});
+
+
+test("workflows can be archived, undone, and restored after reload with their saved drafts", async ({ page, context }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await expect(page.locator(".messages")).toContainText("It is in your queue for approval.");
+  const original = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+  const second = await context.newPage();
+  try {
+    await useFakeServe(second);
+    await expect(second.locator(".messages")).toContainText("Review the release plan");
+    const history = page.getByRole("complementary", {name:"Chat history"});
+    await history.locator(".workflow-row").filter({hasText:"Review the release plan"}).getByRole("button", {name:"Archive workflow",exact:true}).click();
+    await expect(history.getByRole("list", {name:"Saved chats"})).not.toContainText("Review the release plan");
+    await expect(history.getByRole("status")).toContainText("Workflow archived");
+    await expect(second.locator(".messages")).not.toContainText("Review the release plan");
+    await history.getByRole("button", {name:"Undo",exact:true}).click();
+    await expect(history.getByRole("list", {name:"Saved chats"})).toContainText("Review the release plan");
+    await history.locator(".workflow-row").filter({hasText:"Review the release plan"}).getByRole("button", {name:"Archive workflow",exact:true}).click();
+    await page.reload();
+    await history.getByRole("button", {name:"Archive",exact:true}).click();
+    await expect(history.getByRole("list", {name:"Archive"})).toContainText("Review the release plan");
+    await history.getByRole("button", {name:"Restore workflow",exact:true}).click();
+    await history.getByRole("button", {name:"Back to workflows",exact:true}).click();
+    await history.getByRole("button", {name:/Review the release plan/}).click();
+    await expect(page.locator(".messages")).toContainText("Review the release plan");
+    await expect(page.locator(".diagram-panel")).toBeVisible();
+    const restored = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+    expect(restored.id).toBe(original.id);
+    expect(restored.messages).toEqual(original.messages);
+  } finally { await second.close(); }
+});
+
+test("workflow archive failures keep the row and running workflows cannot be archived", async ({page}) => {
+  await fake.close();
+  fake = (await startFakeServe({stepMs:120,port:FAKE_SERVE_PORT,snapshot:"diagram-web.v1.json"})) as FakeServe;
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const history = page.getByRole("complementary", {name:"Chat history"});
+  await page.route("**/v1/chats/*/archive", route => route.fulfill({status:409,json:{error:"Stop this workflow before archiving it."}}));
+  await history.getByRole("button", {name:"Archive workflow",exact:true}).click();
+  await expect(history.getByRole("alert")).toContainText("Stop this workflow");
+  await expect(history.getByRole("list", {name:"Saved chats"})).toContainText("Review the release plan");
+  await page.unroute("**/v1/chats/*/archive");
+  await page.getByRole("button", {name:"Deploy",exact:true}).click();
+  await page.getByRole("button", {name:"Confirm deploy",exact:true}).click();
+  await expect(history.getByRole("button", {name:"Archive workflow",exact:true})).toBeDisabled();
+});
+
+for (const width of [1280, 390]) {
+  test(`archive separates restoration from confirmed permanent deletion at ${width}px`, async ({page}) => {
+    await page.setViewportSize({width, height: 900});
+    await useFakeServe(page);
+    await draftUntilProposed(page);
+    await expect(page.locator(".messages")).toContainText("It is in your queue for approval.");
+    if (width < 901) await page.getByRole("button", {name:"Open chat history", exact:true}).click();
+    const history = page.locator("#chat-history");
+    const archive = history.getByRole("button", {name:"Archive",exact:true});
+    await expect(archive).toHaveCSS("border-top-width", "0px");
+    await expect(archive).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+    await expect(history.getByRole("button", {name:"Delete workflow permanently"})).toHaveCount(0);
+    await history.getByRole("button", {name:"Archive workflow",exact:true}).click();
+    // Mobile selection may close the drawer after archiving the selected chat.
+    if (width < 901) {
+      await expect(history).not.toBeVisible();
+      await page.getByRole("button", {name:"Open chat history",exact:true}).click();
+    }
+    await archive.click();
+    const row = history.locator(".archived-workflow").filter({hasText:"Review the release plan"});
+    await row.getByRole("button", {name:"Delete workflow permanently"}).click();
+    const confirm = page.getByRole("dialog", {name:"Delete workflow?",exact:true});
+    await expect(confirm).toContainText("Review the release plan");
+    await expect(confirm.getByRole("button", {name:"Cancel",exact:true})).toBeFocused();
+    await confirm.getByRole("button", {name:"Cancel",exact:true}).click();
+    await expect(confirm).toHaveCount(0);
+    await expect(row).toBeVisible();
+    await row.getByRole("button", {name:"Delete workflow permanently"}).click();
+    await page.keyboard.press("Escape");
+    await expect(confirm).toHaveCount(0);
+    await row.getByRole("button", {name:"Delete workflow permanently"}).click();
+    await page.route("**/v1/chats/*/delete", route => route.fulfill({status:500,json:{error:"Could not save history."}}));
+    await confirm.getByRole("button", {name:"Delete permanently",exact:true}).click();
+    await expect(confirm.getByRole("alert")).toHaveText("Could not save history.");
+    await expect(row).toBeVisible();
+    await page.unroute("**/v1/chats/*/delete");
+    await confirm.getByRole("button", {name:"Delete permanently",exact:true}).click();
+    await expect(confirm).toHaveCount(0);
+    await expect(row).toHaveCount(0);
+    await expect(history.getByRole("button", {name:"Undo",exact:true})).toHaveCount(0);
+    await page.reload();
+    if (width < 901) await page.getByRole("button", {name:"Open chat history",exact:true}).click();
+    await archive.click();
+    await expect(history).toContainText("No archived workflows.");
+  });
+}

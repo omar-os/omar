@@ -1478,10 +1478,68 @@ fn strip_target_args(args: impl Iterator<Item = String>) -> Vec<String> {
     }
     stripped
 }
+/// Opening the product reuses its workspace. Creating a separate runtime
+/// remains explicit through `up --name` (or `up` without --web).
+fn open_workspace(cli: &Cli, print_url: bool) -> Result<()> {
+    let sessions = discover()?;
+    let default_file = home_root().join("default-session.json");
+    let remembered = fs::read(&default_file)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<String>(&b).ok());
+    if let Some(name) = &cli.session {
+        anyhow::ensure!(
+            sessions.iter().any(|session| &session.name == name),
+            "unknown session '{name}'"
+        );
+    }
+    let preferred = cli.session.as_deref().or(remembered.as_deref());
+    let chosen = preferred
+        .and_then(|name| sessions.iter().find(|s| s.name == name))
+        .or_else(|| {
+            sessions.iter().max_by_key(|s| {
+                fs::metadata(s.directory.join("ea/0/chats.json"))
+                    .and_then(|m| m.modified())
+                    .ok()
+            })
+        });
+    let session = match chosen {
+        Some(session) if session.state == "ready" => session.clone(),
+        Some(session) => {
+            let source = fs::canonicalize(std::env::current_exe()?)?;
+            let compiler = executable_on_path(crate::topology::resolve_omarc()).ok();
+            relaunch(session, Some(&source), compiler.as_deref(), None, 60)?
+        }
+        None => {
+            launch(
+                cli,
+                UpOptions {
+                    name: Some("default".into()),
+                    ..UpOptions::default()
+                },
+                false,
+            )?
+            .0
+        }
+    };
+    topology_write_default(&default_file, &session.name)?;
+    if print_url || cli.json {
+        print_value(json!({"session": session.name, "url": session.url}))?;
+    } else {
+        println!("Reopened {}: {}", session.name, session.url);
+        crate::open_browser(&session.url);
+    }
+    Ok(())
+}
+fn topology_write_default(path: &Path, name: &str) -> Result<()> {
+    crate::topology::write_json_atomic(path, &name)
+}
+
 pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
     if !matches!(
         cli.command,
-        None | Some(Commands::Up(_) | Commands::Serve { .. } | Commands::Run(_))
+        None | Some(
+            Commands::Open { .. } | Commands::Up(_) | Commands::Serve { .. } | Commands::Run(_)
+        )
     ) && (cli.config.is_some() || cli.agent.is_some() || cli.spawn_metrics)
     {
         return Some(Err(anyhow::anyhow!("configuration options apply when creating a session; target an existing session without changing its configuration")));
@@ -1497,6 +1555,8 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         },
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
         None => Err(anyhow::anyhow!("a command is required; see omar --help")),
+        Some(Commands::Open { print_url }) => open_workspace(cli, *print_url),
+        Some(Commands::Up(options)) if options.web && options.name.is_none() && options.workdir.is_none() && options.address == UpOptions::default().address && !options.no_ea && !options.tui && options.startup_timeout == UpOptions::default().startup_timeout && cli.config.is_none() && cli.agent.is_none() && !cli.spawn_metrics => open_workspace(cli, cli.json),
         Some(Commands::Up(options)) => launch(cli, options.clone(), false).and_then(|(s, previous)| {
             print_started(&s, previous.as_ref(), cli.json)?;
             if options.web { crate::open_browser(&s.url); }
