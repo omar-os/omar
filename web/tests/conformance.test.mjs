@@ -212,6 +212,8 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     assert.equal(f.status, r.status);
     assert.equal(f.body.protocol_version, r.body.protocol_version);
     assert.equal(f.body.status, r.body.status);
+    // A daemon that predates view ports does not say which port this is.
+    if ("access" in r.body) assert.equal(f.body.access, r.body.access);
   });
 
   test("an empty run listing has the same shape", async () => {

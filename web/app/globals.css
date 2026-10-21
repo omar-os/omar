@@ -1667,6 +1667,15 @@ h2 {
   visibility: hidden;
 }
 
+/* A view port has no composer; what stands in for it says why. */
+.prompt-box.view-only {
+  padding: 10px;
+}
+
+.builder-panel.opening .view-only-badge {
+  visibility: visible;
+}
+
 /* Commentary while the assistant works. Present but recessive: it should be
    scannable without competing with what it actually said. */
 .message.progress {

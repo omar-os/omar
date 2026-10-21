@@ -45,6 +45,10 @@ pub struct UpOptions {
     pub workdir: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:0")]
     pub address: SocketAddr,
+    /// Also serve a read-only Mission Control here, e.g. 0.0.0.0:8080. No
+    /// credential: anyone who reaches it can watch, nobody can steer
+    #[arg(long)]
+    pub view_address: Option<SocketAddr>,
     #[arg(long)]
     pub no_ea: bool,
     #[arg(long, default_value_t = 60)]
@@ -62,6 +66,7 @@ impl Default for UpOptions {
             name: None,
             workdir: None,
             address: "127.0.0.1:0".parse().unwrap(),
+            view_address: None,
             no_ea: false,
             startup_timeout: 60,
             web: false,
@@ -126,6 +131,9 @@ pub struct Session {
     pub state: String,
     pub pid: u32,
     pub url: String,
+    /// The read-only Mission Control, when the session serves one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_url: Option<String>,
     pub socket: PathBuf,
     pub directory: PathBuf,
     pub executable: PathBuf,
@@ -138,6 +146,8 @@ pub struct Session {
 struct Launch {
     session: Session,
     address: SocketAddr,
+    #[serde(default)]
+    view_address: Option<SocketAddr>,
     no_ea: bool,
     /// Foreground startup prints the session record in the requested mode.
     #[serde(default)]
@@ -638,6 +648,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
                     Some(&source),
                     compiler.as_deref(),
                     address,
+                    options.view_address,
                     options.startup_timeout,
                 )
                 .map(|started| (started, Some(stopped.clone())));
@@ -704,6 +715,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
         state: "starting".into(),
         pid: 0,
         url: String::new(),
+        view_url: None,
         socket,
         directory: directory.clone(),
         executable,
@@ -717,6 +729,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
         &Launch {
             session: session.clone(),
             address: options.address,
+            view_address: options.view_address,
             no_ea: options.no_ea,
             json: foreground && cli.json,
         },
@@ -828,12 +841,14 @@ fn repin_executable(source: &Path, dest: &Path) -> Result<String> {
 /// Start a stopped session again over its own state directory, on the given
 /// build. The registry record keeps its name, URL and directory; the runtime
 /// is a new incarnation. `address` None keeps the port the session had, so
-/// clients that know its URL find it again.
+/// clients that know its URL find it again; `view_address` None likewise keeps
+/// its view port, if it had one.
 fn relaunch(
     stopped: &Session,
     executable: Option<&Path>,
     compiler: Option<&Path>,
     address: Option<SocketAddr>,
+    view_address: Option<SocketAddr>,
     startup_timeout: u64,
 ) -> Result<Session> {
     let lock = RegistryLock::acquire()?;
@@ -895,6 +910,14 @@ fn relaunch(
             .parse()
             .unwrap_or(launch.address),
     };
+    let bound_view: Option<SocketAddr> = current
+        .view_url
+        .as_deref()
+        .and_then(|url| url.trim_start_matches("http://").parse().ok());
+    launch.view_address = view_address.or_else(|| {
+        let asked = launch.view_address?;
+        Some(bound_view.map_or(asked, |bound| SocketAddr::new(asked.ip(), bound.port())))
+    });
     launch.json = false;
     write_json(&directory.join("launch.json"), &launch)?;
     let config = Config::load(directory.join("config.toml").to_str())?;
@@ -1175,6 +1198,10 @@ async fn daemon(directory: &Path) -> Result<()> {
     let listener = UnixListener::bind(&session.socket)?;
     listener.set_nonblocking(true)?;
     session.url = format!("http://{}", server.address());
+    session.view_url = match launch.view_address {
+        Some(address) => Some(format!("http://{}", server.start_viewer(address)?)),
+        None => None,
+    };
     session.state = "ready".into();
     publish(&session)?;
     print_started(&session, None, launch.json)?;
@@ -1383,9 +1410,13 @@ fn print_started(session: &Session, previous: Option<&Session>, json_output: boo
         if json_output {
             return print_value(json!(session));
         }
+        println!("Started session {}\nURL:    {}", session.name, session.url);
+        if let Some(view_url) = &session.view_url {
+            println!("View:   {view_url} (read-only, no credential)");
+        }
         println!(
-            "Started session {}\nURL:    {}\nTUI:    omar attach -s {} --tui\nWeb:    omar attach -s {} --web\nStop:   omar down -s {}",
-            session.name, session.url, session.name, session.name, session.name
+            "TUI:    omar attach -s {} --tui\nWeb:    omar attach -s {} --web\nStop:   omar down -s {}",
+            session.name, session.name, session.name
         );
         return Ok(());
     };
@@ -1419,6 +1450,9 @@ fn print_started(session: &Session, previous: Option<&Session>, json_output: boo
         "Restarted session {} on {build}\nURL:    {}",
         session.name, session.url
     );
+    if let Some(view_url) = &session.view_url {
+        println!("View:   {view_url} (read-only, no credential)");
+    }
     if paused.is_empty() {
         println!("No paused workflows.");
         return Ok(());
