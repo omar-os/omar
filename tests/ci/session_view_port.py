@@ -55,7 +55,16 @@ def terminal_upgrade(base, agent, origin):
         conn.sendall((f"GET /v1/agents/{agent}/terminal HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
                       f"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n"
                       f"Origin: {origin}\r\n\r\n").encode())
-        return int(conn.recv(4096).decode(errors="replace").split()[1])
+        # A loaded runner can deliver the status line in pieces.
+        reply = b""
+        while b"\r\n" not in reply:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
+        status = reply.split(b"\r\n", 1)[0].split()
+        assert len(status) >= 2, f"no status line from {base}: {reply!r}"
+        return int(status[1])
 
 
 def main():
