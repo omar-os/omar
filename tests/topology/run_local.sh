@@ -226,7 +226,7 @@ run_case() {
   # run created its own session, named on stderr, and shut it down afterwards.
   local session_id
   session_id=$(grep -o 'Started session [^ ;]*' "$log" | awk '{print $3}' | tail -1)
-  [[ -n $session_id ]] && cp -R "$HOME/.omar/sessions/$session_id/ea/0/topologies/$team/logs" "$results_dir/$name-agents" 2>/dev/null || true
+  [[ -n $session_id ]] && cp -R "${OMAR_HOME:-$HOME/.omar}/sessions/$session_id/ea/0/topologies/$team/logs" "$results_dir/$name-agents" 2>/dev/null || true
 
   if grep -Fq "Topology '$team' completed" "$log"; then
     case_passed=$((case_passed + 1))

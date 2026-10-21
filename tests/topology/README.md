@@ -79,10 +79,16 @@ It runs every case even if an earlier case fails. Each case must compile, exit
 successfully after completing all effect contracts, print its completion marker,
 and produce every declared output expected by the test.
 
-The authenticated suite runs on demand: `Topology Release Gate` in the Actions
-tab, which supplies the `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` repository
-secrets. It does not run for pull requests, ordinary `main` pushes, or on a
-schedule.
+`Live Topology` runs the authenticated suite on every same-repo PR, every
+`main` push, and on demand (optionally one `case`). It runs on the
+maintainer's self-hosted runner, label `omar-live`, using that machine's Claude
+Code and Codex logins; no API keys in GitHub. Fork PRs are skipped. Each run
+gets its own tmux server (`TMUX_TMPDIR`) and `OMAR_HOME`, so it never touches
+the machine's interactive sessions. Set up a runner:
+`.github/scripts/setup-live-runner.sh`.
+
+`Topology Release Gate` runs the same suite on demand on a GitHub-hosted
+runner, from the `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` repository secrets.
 
 It used to gate every release. Driving real agents against real models made a
 release wait on a long, paid run that could fail for reasons nothing in the
@@ -103,3 +109,5 @@ The following environment variables adjust local execution:
 - `OMAR_TEST_PEEK_AGENTS`: capture recent tmux output from every live agent once
   per minute; enabled by the CI workflow.
 - `OMAR_TEST_RESULTS_DIR`: directory for logs and metrics.
+- `OMAR_HOME`: OMAR state root, where agent logs are copied from; default
+  `~/.omar`.
