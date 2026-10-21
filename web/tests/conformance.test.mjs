@@ -366,10 +366,25 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     const token = context.serve?.token;
     assert.equal(typeof token, "string", "serve wrote its token into the context");
 
-    const response = await fetch(`${real.url}/v1/agent/proposals`, {
+    const rejected = await fetch(`${real.url}/v1/agent/proposals`, {
       ...post({ token, program: UNRESOLVABLE, summary: "conformance", inputs: {} }),
     });
-    assert.equal(response.status, 202, `proposal rejected: ${response.status}`);
+    assert.equal(rejected.status, 400);
+    assert.match((await rejected.json()).error, /Missing or invalid task metadata: only\.reaction\.0/);
+    const before = await (await fetch(`${real.url}/v1/chat`)).json();
+    assert.ok(!before.messages.some((message) => message.design), "invalid copy was not published");
+
+    const title = "Echo the supplied value";
+    const description = "Copy the supplied go input into the done output.";
+    const program = UNRESOLVABLE.replace(
+      "task worker(go) -> done",
+      `task worker(go) -> done display(${JSON.stringify(title)}, ${JSON.stringify(description)})`,
+    );
+    const response = await fetch(`${real.url}/v1/agent/proposals`, {
+      ...post({ token, program, summary: "conformance", inputs: {} }),
+    });
+    const responseBody = await response.text();
+    assert.equal(response.status, 202, `proposal rejected: ${responseBody}`);
 
     const { messages } = await (await fetch(`${real.url}/v1/chat`)).json();
     const proposal = messages.find((message) => message.design);
@@ -379,6 +394,8 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     const preview = proposal.design.preview;
     assert.equal(preview.protocol_version, 1);
     assert.equal(preview.team, "Conformance");
+    assert.equal(preview.reactions[0].title, title);
+    assert.equal(preview.reactions[0].description, description);
     const ids = new Set([
       ...preview.ports.map((port) => port.id),
       ...preview.reactions.map((reaction) => reaction.id),

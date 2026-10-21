@@ -42,7 +42,9 @@ team Node(idx : int)[agent : Codex]
     input token : int
     output out : int
 
-    task agent(token) -> out "You are node $(idx). Token: $(token)"
+    task agent(token) -> out
+      display("Pass the token onward", "Read the incoming token and return it to the next node.")
+      "You are node $(idx). Token: $(token)"
 }
 
 main Relay {
@@ -54,6 +56,39 @@ main Relay {
 ```
 
 Inputs and outputs are then named `instance.port` — `n1.token`, `n2.out`.
+
+Every step you propose must have a short task title and a detailed description.
+Put `display("Title", "Description")` after its output contract and optional
+`within(...)` deadline, before the execution prompt or code body:
+
+```
+task writer(brief) -> draft
+display("Draft campaign script", "Turn the brief into a script with a hook, scene outline and call to action. Pass the draft to review.")
+"Write the campaign script from $(brief) and set draft to the result."
+```
+
+Use a specific action and object in the title, normally 3–6 words and at most
+80 characters. Describe the actual work and expected result in 1–3 plain-language
+sentences, at most 1200 characters. Explain manual handoffs explicitly: a Web
+panel waits for a person; it does not automatically run ChatGPT. Base the copy
+on the step's real instructions and capabilities. Avoid technical IDs, agent
+names, generic labels such as "Process", and unsupported claims of automation.
+
+Generate this copy automatically while designing the workflow; do not ask the
+operator to name individual steps. Use the actual prompt or code as evidence.
+For reviews, state WHAT is checked and against WHICH evidence (for example,
+"Check claims against release notes"). For routing, explain the branch condition
+and destinations. For code, describe the operation and result, not "Run code".
+Keep backend/agent names in execution settings. Never imply that configured
+connections have been tested. When instructions or connections change, reconsider
+both title and description; do not carry obsolete claims into the revised design.
+
+The canvas shows the title; the details popup shows the full description.
+The execution prompt remains the complete instructions. Task copy does not
+change IDs, agents, triggers, output contracts, deadlines or connections.
+Supply it for every task and code reaction, including nested teams, and keep
+it accurate when revising a step. The proposal endpoint rejects missing copy
+and returns the steps to fix. Older source still compiles without task metadata.
 
 A reaction can also be triggered by a timer, which the runtime fires from its
 own logical clock. Nothing feeds a timer and nothing can write to it:
