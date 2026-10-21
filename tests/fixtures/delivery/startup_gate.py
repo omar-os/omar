@@ -10,6 +10,11 @@ import tty
 backend, log_path = sys.argv[1:]
 log = Path(log_path)
 tty.setraw(sys.stdin.fileno())
+# `claude-deaf` paints its dialog before it reads keys, as Claude Code
+# sometimes does, and loses whatever arrives in that window.
+deaf = backend == 'claude-deaf'
+if deaf:
+    backend = 'claude'
 if backend == 'claude':
     dialog = ("Accessing workspace:\r\n/tmp/team/worktree\r\n"
               "Claude Code'll be able to read, edit, and execute files here.\r\n"
@@ -35,6 +40,11 @@ time.sleep(0.2)
 sys.stdout.write('\x1b[2J\x1b[H' + dialog)
 sys.stdout.flush()
 data = b''
+if deaf:
+    until = time.monotonic() + 0.5
+    while (left := until - time.monotonic()) > 0:
+        if select.select([sys.stdin], [], [], left)[0]:
+            os.read(sys.stdin.fileno(), 1024)
 if backend == 'claude':
     while len(data) < 3:
         data += os.read(sys.stdin.fileno(), 1024)
