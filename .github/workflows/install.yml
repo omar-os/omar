@@ -95,7 +95,8 @@ jobs:
           echo "$output"
           grep -Fq 'Output run.result = "hello"' <<<"$output"
 
-  # Closer to a fresh server than a runner: dash as sh, root, no sudo.
+  # Closer to a fresh server than a runner: dash as sh, root, no sudo. Steps
+  # run under sh here, so no bashisms.
   minimal:
     name: Install ${{ inputs.script || 'hosted' }} (debian:stable-slim)
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
@@ -136,4 +137,4 @@ jobs:
           output=$(omar run "$GITHUB_WORKSPACE/tests/ci/direct_run.omar" \
             --input run.request=hello --replace --fg)
           echo "$output"
-          grep -Fq 'Output run.result = "hello"' <<<"$output"
+          printf '%s\n' "$output" | grep -Fq 'Output run.result = "hello"'
