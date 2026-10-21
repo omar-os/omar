@@ -38,6 +38,7 @@ export function OmarEditor({
   status,
   errors,
   checking,
+  readOnly = false,
   onSourceChange,
   onFilenameChange,
 }: {
@@ -47,6 +48,8 @@ export function OmarEditor({
   status: string;
   errors: string[];
   checking: boolean;
+  /** Shown, highlighted and scrollable, but not editable. */
+  readOnly?: boolean;
   onSourceChange: (source: string) => void;
   onFilenameChange: (filename: string) => void;
 }) {
@@ -70,6 +73,7 @@ export function OmarEditor({
           className="source-name"
           value={name}
           spellCheck={false}
+          readOnly={readOnly}
           aria-label="Program file name"
           onChange={(event) => setEdited(event.target.value)}
           onBlur={commit}
@@ -100,12 +104,13 @@ export function OmarEditor({
           className="source-input"
           value={source}
           spellCheck={false}
+          readOnly={readOnly}
           aria-label="OMAR program"
           onChange={(event) => onSourceChange(event.target.value)}
           onKeyDown={(event) => {
             // A textarea gives Tab to the browser, which moves focus out of
             // the editor mid-word. In a code pane it indents.
-            if (event.key !== "Tab" || event.metaKey || event.ctrlKey) return;
+            if (readOnly || event.key !== "Tab" || event.metaKey || event.ctrlKey) return;
             event.preventDefault();
             const field = event.currentTarget;
             const { selectionStart, selectionEnd, value } = field;

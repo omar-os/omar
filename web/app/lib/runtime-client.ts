@@ -10,7 +10,7 @@ import {
   SERVE_PROTOCOL_VERSION,
   type RunRecord,
   type RunRequest,
-} from "./protocol";
+} from "./protocol.ts";
 
 export function normalizeRuntimeUrl(value: string): string {
   const parsed = new URL(value.trim());
@@ -135,6 +135,9 @@ export function subscribeToChat(
   return () => stream.close();
 }
 
+/** A view port serves the same pages but refuses every write. */
+export type ServeAccess = "full" | "view";
+
 /**
  * Ask `omar serve` whether it is up and speaking a protocol we understand.
  * A version mismatch is reported rather than discovered later on a failed run.
@@ -142,21 +145,22 @@ export function subscribeToChat(
 export async function checkServeHealth(
   serveUrl: string,
   signal?: AbortSignal,
-): Promise<{ ok: true } | { ok: false; reason: string }> {
+): Promise<{ ok: true; access: ServeAccess } | { ok: false; reason: string }> {
   try {
     const base = normalizeRuntimeUrl(serveUrl);
     const response = await fetch(`${base}/health`, { signal });
     if (!response.ok) {
       return { ok: false, reason: `HTTP ${response.status}` };
     }
-    const body = (await response.json()) as { protocol_version?: unknown };
+    const body = (await response.json()) as { protocol_version?: unknown; access?: unknown };
     if (body.protocol_version !== SERVE_PROTOCOL_VERSION) {
       return {
         ok: false,
         reason: `serve speaks protocol ${String(body.protocol_version)}, this client speaks ${SERVE_PROTOCOL_VERSION}`,
       };
     }
-    return { ok: true };
+    // A daemon that predates view ports does not say, and is full access.
+    return { ok: true, access: body.access === "view" ? "view" : "full" };
   } catch (cause) {
     return { ok: false, reason: cause instanceof Error ? cause.message : String(cause) };
   }
@@ -491,10 +495,18 @@ export async function fetchRun(
   return assertRunRecord(await response.json());
 }
 
-/** `omar serve` reports `host:port`; the diagram API is plain HTTP on loopback. */
-export function diagramUrlFor(record: RunRecord): string {
+/**
+ * `omar serve` reports `host:port`; the diagram API is plain HTTP on loopback.
+ *
+ * A remote viewer cannot reach loopback, so a view port relays the same API
+ * under the run: pass its URL as `relay`.
+ */
+export function diagramUrlFor(record: RunRecord, relay?: string): string {
   if (!record.diagram_address) {
     throw new Error(`Run ${record.run_id} has no diagram address yet.`);
+  }
+  if (relay) {
+    return `${normalizeRuntimeUrl(relay)}/v1/runs/${encodeURIComponent(record.run_id)}/diagram`;
   }
   return `http://${record.diagram_address}`;
 }

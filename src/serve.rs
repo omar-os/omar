@@ -33,6 +33,16 @@ pub const SERVE_PROTOCOL_VERSION: u32 = 1;
 /// compilation and process start-up.
 const DIAGRAM_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_BYTES: usize = 512 * 1024;
+/// Relayed diagram routes: `/v1/runs/{id}` + this + the diagram server's path.
+const DIAGRAM_RELAY: &str = "/diagram";
+
+/// Which listener a request arrived on. The view listener may be public and
+/// is unauthenticated, so it answers reads only.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Full,
+    View,
+}
 const TERMINAL_PREFIX: &str = "/v1/agents/";
 const TERMINAL_SUFFIX: &str = "/terminal";
 /// How long the relay waits on each side before checking the other.
@@ -726,7 +736,7 @@ impl Serve {
                     Ok((stream, _)) => {
                         let workspaces = workspaces.clone();
                         thread::spawn(move || {
-                            let _ = handle_client(stream, workspaces);
+                            let _ = handle_client(stream, workspaces, Access::Full);
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -762,6 +772,40 @@ impl Serve {
 
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Serve Mission Control read-only on a second address. It may be public:
+    /// it answers reads only, so nothing on it needs a credential. It stops
+    /// with this server.
+    pub fn start_viewer(&self, address: SocketAddr) -> Result<SocketAddr> {
+        let listener = TcpListener::bind(address)
+            .with_context(|| format!("failed to bind the view port at {address}"))?;
+        let address = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+        let running = self.running.clone();
+        let workspaces = self.workspaces.clone();
+        thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let workspaces = workspaces.clone();
+                        thread::spawn(move || {
+                            let _ = handle_client(stream, workspaces, Access::View);
+                        });
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        thread::sleep(WINDOW_POLL)
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(address)
     }
 
     /// Record this server in the EA's MCP context.
@@ -1094,7 +1138,7 @@ fn workspace_request(
     }
 }
 
-fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<()> {
+fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Access) -> Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -1158,6 +1202,11 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
     } else {
         None
     };
+    if access == Access::View {
+        if let Some(reason) = view_refusal(&method, &path) {
+            return write_json(&mut stream, 403, &json!({"error": reason}), None);
+        }
+    }
     let context = if path == "/v1/agent/reply" || path == "/v1/agent/proposals" {
         let body: Value = match serde_json::from_slice(&raw_body) {
             Ok(body) => body,
@@ -1197,7 +1246,11 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
                 .active_id
                 .clone()
         });
-        match workspaces.get(&id) {
+        let context = match access {
+            Access::Full => workspaces.get(&id),
+            Access::View => workspaces.get_for_view(&id),
+        };
+        match context {
             Ok(context) => context,
             Err(error) => {
                 return write_json(
@@ -1259,6 +1312,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
             websocket_key.as_deref(),
             origin_header.as_deref(),
             terminal_query,
+            access,
         );
     }
     // The assistant is not one of the agents: its session is named
@@ -1285,6 +1339,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
             websocket_key.as_deref(),
             origin_header.as_deref(),
             terminal_query,
+            access,
         );
     }
 
@@ -1301,6 +1356,11 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         }
     }
 
+    // A viewer watches without counting as an operator window, and without
+    // waking the assistant the way an operator's arrival does.
+    if access == Access::View && method == "GET" && path == "/v1/chat/events" {
+        return stream_chat(stream, &context, None);
+    }
     // Streams for as long as the operator keeps Mission Control open.
     if method == "GET" && path == "/v1/chat/events" {
         {
@@ -1330,6 +1390,30 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         return stream_chat(stream, &context, origin);
     }
 
+    if method == "GET" {
+        if let Some((run_id, upstream)) = path
+            .strip_prefix("/v1/runs/")
+            .and_then(|rest| rest.split_once(DIAGRAM_RELAY))
+            .filter(|(_, upstream)| matches!(*upstream, "/v1/diagram" | "/v1/events"))
+        {
+            let address = context
+                .runs
+                .lock()
+                .expect("serve runs poisoned")
+                .get(run_id)
+                .and_then(|record| record.diagram_address.clone());
+            return match address {
+                Some(address) => relay_diagram(stream, &address, upstream),
+                None => write_json(
+                    &mut stream,
+                    404,
+                    &json!({"error": "no live diagram"}),
+                    origin,
+                ),
+            };
+        }
+    }
+
     let read_body = |_length: usize| -> Result<Vec<u8>> { Ok(raw_body.clone()) };
 
     if content_length > MAX_BODY_BYTES
@@ -1346,7 +1430,14 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
     let (status, body) = match (method.as_str(), path.as_str()) {
         ("GET", "/health") => (
             200,
-            json!({"status": "ok", "protocol_version": SERVE_PROTOCOL_VERSION}),
+            json!({
+                "status": "ok",
+                "protocol_version": SERVE_PROTOCOL_VERSION,
+                "access": match access {
+                    Access::Full => "full",
+                    Access::View => "view",
+                },
+            }),
         ),
         ("POST", "/v1/runs") => {
             if content_length > MAX_BODY_BYTES {
@@ -1541,12 +1632,14 @@ fn attach_terminal(
     websocket_key: Option<&str>,
     origin: Option<&str>,
     query: &str,
+    access: Access,
 ) -> Result<()> {
     // Same-origin policy does not cover WebSockets. Without this check any page
     // the operator happens to visit could open a terminal into their agents and
     // type into it, loopback binding notwithstanding. A missing Origin is not a
-    // browser, which cannot suppress it.
-    if let Some(origin) = origin {
+    // browser, which cannot suppress it. A view terminal takes no input and
+    // shows what the view port already shows anyone, so any origin may watch.
+    if let Some(origin) = origin.filter(|_| access == Access::Full) {
         if crate::diagram::allowed_origin(Some(origin)).is_none() {
             return write_json(&mut stream, 403, &json!({"error": "origin refused"}), None);
         }
@@ -1566,9 +1659,13 @@ fn attach_terminal(
             return write_json(&mut stream, 400, &json!({"error": error.to_string()}), None)
         }
     };
-    let attachment = match dimensions {
-        Some(size) => crate::terminal::Attachment::open_session_sized(session, Some(size)),
-        None => crate::terminal::Attachment::open_session(session),
+    // A viewer's geometry is ignored: it must not reshape the operator's window.
+    let attachment = match (access, dimensions) {
+        (Access::View, _) => crate::terminal::Attachment::open_session_read_only(session),
+        (Access::Full, Some(size)) => {
+            crate::terminal::Attachment::open_session_sized(session, Some(size))
+        }
+        (Access::Full, None) => crate::terminal::Attachment::open_session(session),
     };
     let attachment = match attachment {
         Ok(attachment) => attachment,
@@ -1593,7 +1690,40 @@ fn attach_terminal(
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
 
-    relay_terminal(stream, attachment)
+    relay_terminal(stream, attachment, access)
+}
+
+/// Why the view port refuses a request, if it does. Anything that is not a
+/// read, plus reads that hand out more than the view shows: host files and
+/// editors under `/v1/workspaces`, and a run's web-agent panel credentials.
+fn view_refusal(method: &str, path: &str) -> Option<&'static str> {
+    let route = path.split_once('?').map_or(path, |(route, _)| route);
+    let panel = route.starts_with("/v1/runs/") && route.ends_with("/panel");
+    let workspaces = route == "/v1/workspaces" || route.starts_with("/v1/workspaces/");
+    (method != "GET" || panel || workspaces).then_some("read-only view")
+}
+
+/// Forward one read to a run's diagram server, which binds loopback only, and
+/// copy its response back, an event stream included, until either side ends.
+fn relay_diagram(mut client: TcpStream, address: &str, path: &str) -> Result<()> {
+    let mut upstream = match TcpStream::connect(address) {
+        Ok(upstream) => upstream,
+        Err(_) => {
+            return write_json(
+                &mut client,
+                502,
+                &json!({"error": "diagram unavailable"}),
+                None,
+            )
+        }
+    };
+    write!(
+        upstream,
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )?;
+    upstream.flush()?;
+    std::io::copy(&mut upstream, &mut client)?;
+    Ok(())
 }
 
 /// Optional initial geometry, in client cells including tmux's status lines.
@@ -1634,7 +1764,11 @@ struct Resize {
 }
 
 /// Pump bytes between the socket and the pseudo-terminal until either ends.
-fn relay_terminal(stream: TcpStream, mut attachment: crate::terminal::Attachment) -> Result<()> {
+fn relay_terminal(
+    stream: TcpStream,
+    mut attachment: crate::terminal::Attachment,
+    access: Access,
+) -> Result<()> {
     use tungstenite::{Message, WebSocket};
 
     // Reads have to give up regularly so the other direction gets a turn; this
@@ -1653,6 +1787,8 @@ fn relay_terminal(stream: TcpStream, mut attachment: crate::terminal::Attachment
     loop {
         // Keystrokes travelling to the agent.
         match socket.read() {
+            // A viewer's keystrokes and resizes go nowhere.
+            Ok(Message::Binary(_) | Message::Text(_)) if access == Access::View => {}
             Ok(Message::Binary(bytes)) => attachment.write(&bytes)?,
             // Text is the control channel: the viewer says what shape it is and
             // the session reflows to match, the way a terminal does when its
@@ -1964,6 +2100,28 @@ impl Workspaces {
         });
         contexts.insert(id.to_string(), context.clone());
         Ok(context)
+    }
+
+    /// `get` for the view port, which must not change what it shows: a chat
+    /// that has never had an assistant would be given one, so it is refused.
+    fn get_for_view(&self, id: &str) -> Result<Arc<Context_>> {
+        let started = self
+            .history
+            .lock()
+            .expect("history poisoned")
+            .conversations
+            .iter()
+            .any(|chat| chat.id == id && chat.ea_id.is_some());
+        anyhow::ensure!(
+            started
+                || self
+                    .contexts
+                    .lock()
+                    .expect("workspaces poisoned")
+                    .contains_key(id),
+            "unknown chat"
+        );
+        self.get(id)
     }
 
     fn list(&self) -> Value {
@@ -5479,6 +5637,159 @@ while True:
         let survived = crate::terminal::window_size(&session).is_ok();
         tmux(&["kill-session", "-t", &session]);
         assert!(survived, "the agent session outlives its viewer");
+    }
+
+    #[test]
+    fn the_view_port_answers_reads_and_refuses_writes() {
+        let server = test_server();
+        let view = server
+            .start_viewer("127.0.0.1:0".parse().unwrap())
+            .expect("view port binds");
+        assert!(request(server.address(), "GET", "/health", None).contains(r#""access":"full""#));
+        assert!(request(view, "GET", "/health", None).contains(r#""access":"view""#));
+        for path in ["/v1/chats", "/v1/chat", "/v1/runs", "/v1/agent"] {
+            let response = request(view, "GET", path, None);
+            assert!(response.contains(" 200 "), "{path}: {response}");
+        }
+        // Writes, plus reads that hand out more than a view: host files,
+        // editors, and a web agent's panel credentials.
+        for (method, path) in [
+            ("POST", "/v1/chats"),
+            ("POST", "/v1/chat"),
+            ("POST", "/v1/runs"),
+            ("POST", "/v1/runs/r/stop"),
+            ("POST", "/v1/agent/backend"),
+            ("DELETE", "/v1/runs/r"),
+            ("GET", "/v1/workspaces"),
+            ("GET", "/v1/workspaces/w/preview"),
+            ("GET", "/v1/runs/r/panel"),
+        ] {
+            let response = request(view, method, path, Some("{}"));
+            assert!(
+                response.contains(" 403 ") && response.contains("read-only view"),
+                "{method} {path}: {response}"
+            );
+        }
+        // Refused before anything ran: the full port still has one chat.
+        let listing = request(server.address(), "GET", "/v1/chats", None);
+        let body: Value = serde_json::from_str(listing.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["conversations"].as_array().unwrap().len(), 1);
+        // A viewer can't conjure a chat (or the EA one would be given).
+        assert!(request(view, "GET", "/chats/nobody/v1/chat", None).contains(" 404 "));
+        assert!(request(server.address(), "POST", "/v1/chats", Some("{}")).contains(" 200 "));
+    }
+
+    #[test]
+    fn the_view_port_relays_a_runs_loopback_diagram() {
+        let diagram = TcpListener::bind("127.0.0.1:0").unwrap();
+        let diagram_address = diagram.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            let (mut stream, _) = diagram.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"diagram\":1}")
+                .unwrap();
+            line
+        });
+        let server = test_server();
+        let view = server.start_viewer("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut live = record("Live", RunStatus::Running);
+        live.diagram_address = Some(diagram_address.to_string());
+        server
+            .context
+            .runs
+            .lock()
+            .unwrap()
+            .insert(live.run_id.clone(), live.clone());
+
+        let path = format!("/v1/runs/{}/diagram/v1/diagram", live.run_id);
+        let response = request(view, "GET", &path, None);
+        assert!(response.ends_with(r#"{"diagram":1}"#), "{response}");
+        assert!(upstream.join().unwrap().starts_with("GET /v1/diagram "));
+        // Only the diagram server's own reads, and only for a live diagram.
+        let other = format!("/v1/runs/{}/diagram/v1/other", live.run_id);
+        assert!(request(view, "GET", &other, None).contains(" 404 "));
+        assert!(request(view, "GET", "/v1/runs/nobody/diagram/v1/events", None).contains(" 404 "));
+    }
+
+    #[test]
+    fn a_view_terminal_shows_the_screen_but_takes_no_keystrokes_or_resizes() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let prefix = crate::ea::ea_prefix(0, &Config::default().dashboard.session_prefix);
+        let session = format!("{prefix}wsview");
+        let tmux = |args: &[&str]| {
+            crate::tmux::tmux_command()
+                .args(args)
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        tmux(&["kill-session", "-t", &session]);
+        tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            &session,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "sh",
+        ]);
+
+        let server = test_server();
+        let view = server.start_viewer("127.0.0.1:0".parse().unwrap()).unwrap();
+        // Any origin may watch: the view port is public by design.
+        let mut handshake = tungstenite::client::IntoClientRequest::into_client_request(format!(
+            "ws://{view}/v1/agents/wsview/terminal?cols=93&rows=31"
+        ))
+        .unwrap();
+        handshake
+            .headers_mut()
+            .insert("Origin", "https://display.example".parse().unwrap());
+        let (mut socket, _) = tungstenite::connect(handshake).expect("view terminal connects");
+        let size: Value =
+            serde_json::from_str(&socket.read().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(size["cols"], json!(120), "the viewer's geometry is ignored");
+
+        socket
+            .send(tungstenite::Message::Binary(
+                b"echo omar-view-typed\n".to_vec(),
+            ))
+            .unwrap();
+        socket
+            .send(tungstenite::Message::Text(
+                r#"{"cols":50,"rows":10}"#.into(),
+            ))
+            .unwrap();
+        // The operator's own typing still shows up for the viewer.
+        tmux(&["send-keys", "-t", &session, "echo omar-view-shown", "Enter"]);
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !seen.contains("omar-view-shown") && std::time::Instant::now() < deadline {
+            if let Ok(tungstenite::Message::Binary(bytes)) = socket.read() {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        let pane = tmux(&["capture-pane", "-p", "-t", &session]);
+        let window = crate::terminal::window_size(&session);
+        tmux(&["kill-session", "-t", &session]);
+        assert!(
+            seen.contains("omar-view-shown"),
+            "pane: {pane}\ngot: {seen}"
+        );
+        assert!(!pane.contains("omar-view-typed"), "a viewer typed: {pane}");
+        assert_eq!(
+            window.expect("window").cols,
+            120,
+            "a viewer resized the window"
+        );
     }
 
     /// A WebSocket handshake for the terminal, with whatever Origin is given.
