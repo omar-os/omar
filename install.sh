@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="lsk567/omar"
+REPO="omar-os/omar"
 INSTALL_DIR="${OMAR_INSTALL_DIR:-/usr/local/bin}"
 
 # Detect OS
