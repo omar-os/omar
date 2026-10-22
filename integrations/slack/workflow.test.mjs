@@ -7,9 +7,9 @@ import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { loadConfig, OmarRuntime, RuntimeError, WorkflowGateway } from "./workflow.mjs";
-import { handleEnvelope, normalizeMention, SlackApi, socketSession } from "./slack.mjs";
+import { handleEnvelope, normalizeMention, SlackApi, socketSession, formatSlackReply } from "./slack.mjs";
 
-const config = { workspaceId: "T1", allowedUsers: ["U1"], allowedChannels: ["C1"],
+const config = { platform: "slack", accountId: "T1", allowedUsers: ["U1"], allowedConversations: ["C1"],
   command: "demo", outputPort: "run.result", timeoutSeconds: 1,
   request: { program: "fixed source", inputs: { "run.request": "fixed input" } } };
 function payload(overrides = {}, event = {}) {
@@ -23,7 +23,8 @@ function harness({ start, wait, sendMessage, ...options } = {}) {
     async start(request) { starts.push(request); return start ? start(request) : { run_id: "R1", status: "starting" }; },
     async wait(record) { return wait ? wait(record) : { run_id: "R1", status: "completed", outputs: { "run.result": "report" } }; },
   };
-  const messenger = { async sendMessage(destination, text) { replies.push({ destination, text }); if (sendMessage) await sendMessage(destination, text); } };
+  const messenger = { usageHint: (command) => `Use @Omar run ${command}`,
+    async sendMessage(destination, reply) { const text = formatSlackReply(reply); replies.push({ destination, text }); if (sendMessage) await sendMessage(destination, text); } };
   return { starts, replies, logs, gateway: new WorkflowGateway(config,
     { runtime, messenger, log: (value) => logs.push(JSON.parse(value)), ...options }) };
 }
@@ -34,7 +35,7 @@ test("fixed workflow runs once and replies in the originating thread", async () 
   await h.gateway.handle(incoming({}, { thread_ts: "parent" }));
   assert.deepEqual(h.starts, [config.request]);
   assert.equal(h.replies.length, 2);
-  assert.deepEqual(h.replies[1].destination, { accountId: "T1", conversationId: "C1", threadId: "parent" });
+  assert.deepEqual(h.replies[1].destination, { platform: "slack", accountId: "T1", conversationId: "C1", threadId: "parent" });
   assert.match(h.replies[1].text, /completed.*\nreport/);
 });
 
@@ -177,13 +178,13 @@ test("Slack sends to the fixed thread, escapes mentions, and never retries API e
   const api = new SlackApi("bot-secret", "app-secret", { fetchImpl: async (url, options) => {
     calls.push({ url, options }); return { ok: true, json: async () => ({ ok: true }) };
   } });
-  await api.sendMessage({ accountId: "T1", conversationId: "C1", threadId: "1.1" }, "<@U1> & <!channel>");
+  await api.sendMessage({ accountId: "T1", conversationId: "C1", threadId: "1.1" }, { text: "<@U1> & <!channel>" });
   const body = JSON.parse(calls[0].options.body);
   assert.equal(body.channel, "C1"); assert.equal(body.thread_ts, "1.1");
   assert.equal(body.text, "&lt;@U1&gt; &amp; &lt;!channel&gt;");
   assert.equal(body.mrkdwn, false);
   const failed = new SlackApi("secret", "app", { fetchImpl: async () => ({ ok: false, json: async () => ({ error: "private response" }) }) });
-  await assert.rejects(failed.sendMessage({}, "text"), /^Error: Slack API request failed$/);
+  await assert.rejects(failed.sendMessage({}, { text: "text" }), /^Error: Slack API request failed$/);
 });
 
 test("runtime start uses fixed JSON and refuses redirects without automatic retry", async () => {
@@ -205,9 +206,12 @@ test("configuration loads the approved program and rejects unscoped/remote runti
     await writeFile(join(folder, "demo.omar"), "fixed source");
     await writeFile(join(folder, "decision.json"), '{"type":"string","enum":["ok"]}');
     const file = join(folder, "config.json");
-    const base = { ...config, runtimeUrl: "http://127.0.0.1:123/chats/id", programPath: "demo.omar", files: { "schemas/decision.json": "decision.json" } };
+    const base = { ...config, workspaceId: "T1", allowedChannels: ["C1"], runtimeUrl: "http://127.0.0.1:123/chats/id", programPath: "demo.omar", files: { "schemas/decision.json": "decision.json" } };
     await writeFile(file, JSON.stringify(base));
     const loaded = await loadConfig(file);
+    assert.equal(loaded.platform, "slack");
+    assert.equal(loaded.accountId, "T1");
+    assert.deepEqual(loaded.allowedConversations, ["C1"]);
     assert.equal(loaded.request.program, "fixed source");
     assert.equal(loaded.request.replace, false);
     assert.equal(loaded.request.files["schemas/decision.json"], '{"type":"string","enum":["ok"]}');
@@ -226,4 +230,19 @@ test("research launcher scopes the update setting and forwards backend arguments
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), "-c check_for_update_on_startup=false app-server --listen unix:///tmp/test.sock");
+});
+
+test("Slack API applies escaped-text limits locally and preserves the run reference", async () => {
+  let posted;
+  const api = new SlackApi("fixture", "fixture", { fetchImpl: async (_url, options) => {
+    posted = JSON.parse(options.body);
+    return { ok: true, json: async () => ({ ok: true }) };
+  } });
+  await api.sendMessage({ platform: "slack", accountId: "T1", conversationId: "C1", threadId: "parent" },
+    { text: "<@U1>&".repeat(1000), runId: "run-123" });
+  assert.ok(posted.text.length <= 3500);
+  assert.equal(posted.text.includes("<@"), false);
+  assert.match(posted.text, /Truncated; full output in OMAR run run-123/);
+  assert.equal(posted.thread_ts, "parent");
+  assert.equal(api.usageHint("research"), "Use @Omar run research");
 });

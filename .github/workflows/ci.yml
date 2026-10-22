@@ -121,8 +121,8 @@ jobs:
           lake-package-directory: lang
           test: false
 
-      - name: Test Slack workflow gateway (no Slack credentials)
-        run: node --test integrations/slack/workflow.test.mjs
+      - name: Test messaging core and Slack adapter (no credentials)
+        run: node --test integrations/messaging/*.test.mjs integrations/slack/*.test.mjs
 
       - name: Verify legacy supervision through MCP and tmux
         run: |

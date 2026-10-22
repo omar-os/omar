@@ -105,10 +105,17 @@ inputs are fixed by config; arbitrary Slack research topics are not supported.
 - Workflow and runtime configuration are trusted operator inputs. Allowlisting
   does not sandbox a workflow. Use this MVP for controlled read-only demonstrations.
 
+## Shared core
+
+The gateway and runtime client live in `../messaging/workflow.mjs`; see its README
+for the platform-neutral contract. This adapter owns Slack mentions, Socket Mode,
+authentication, thread mapping, escaping and length limits. Existing Slack config
+fields and `node integrations/slack/slack.mjs <config>` remain unchanged.
+
 ## Tests
 
 ```sh
-node --test integrations/slack/workflow.test.mjs
+node --test integrations/messaging/*.test.mjs integrations/slack/*.test.mjs
 python3 tests/ci/slack_workflow.py
 ```
 
@@ -116,7 +123,8 @@ The second command needs freshly built `omar`/`omarc`, tmux and Node on PATH. It
 creates an isolated runtime, feeds duplicate Socket Mode fixtures through the
 adapter, checks exactly one demo run and its captured thread reply, then executes
 the research graph with deterministic fixture agents and its imported enum. It
-removes the test session. Neither test uses Slack credentials or live models.
+removes the test session. The harness also runs the same core against a mock transport with no Slack imports.
+Neither test uses Slack credentials or live models.
 Both run in the existing CI Test job.
 
 References: [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/),

@@ -14,9 +14,16 @@ export function normalizeMention(payload, botId) {
   const prefix = `<@${botId}>`;
   const text = event.text.trim();
   if (!text.startsWith(`${prefix} `)) return null;
-  return { accountId: payload.team_id, senderId: event.user, eventId: payload.event_id,
+  return { platform: "slack", accountId: payload.team_id, senderId: event.user, eventId: payload.event_id,
     command: text.slice(prefix.length).trim(),
-    destination: { accountId: payload.team_id, conversationId: event.channel, threadId: event.thread_ts ?? event.ts } };
+    destination: { platform: "slack", accountId: payload.team_id, conversationId: event.channel, threadId: event.thread_ts ?? event.ts } };
+}
+
+// Slack owns escaping and size limits; the core passes the full selected output.
+export function formatSlackReply({ text, runId }) {
+  const escaped = text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  if (escaped.length <= 3500) return escaped;
+  return `${escaped.slice(0, 3300)}\n[Truncated; full output in OMAR${runId ? ` run ${runId}` : ""}.]`;
 }
 
 export class SlackApi {
@@ -36,10 +43,11 @@ export class SlackApi {
     if (!response.ok || !value.ok) throw new Error("Slack API request failed");
     return value;
   }
-  async sendMessage(destination, text) {
+  usageHint(command) { return `Use @Omar run ${command}`; }
+  async sendMessage(destination, reply) {
     await this.call("chat.postMessage", { channel: destination.conversationId,
       thread_ts: destination.threadId,
-      text: text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"),
+      text: formatSlackReply(reply),
       mrkdwn: false, parse: "none", unfurl_links: false, unfurl_media: false });
   }
 }
@@ -96,7 +104,7 @@ async function main(path) {
   if (!bot?.startsWith("xoxb-") || !app?.startsWith("xapp-")) throw new Error("Set SLACK_BOT_TOKEN and SLACK_APP_TOKEN");
   const api = new SlackApi(bot, app);
   const identity = await api.call("auth.test");
-  if (identity.team_id !== config.workspaceId || typeof identity.user_id !== "string") throw new Error("Slack workspace does not match configuration");
+  if (identity.team_id !== config.accountId || typeof identity.user_id !== "string") throw new Error("Slack workspace does not match configuration");
   const runtime = new OmarRuntime(config.runtimeUrl);
   await runtime.call("/v1/chat"); // Fail early if the configured runtime/chat is unavailable.
   const gateway = new WorkflowGateway(config, { runtime, messenger: api });

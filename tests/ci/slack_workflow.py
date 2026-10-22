@@ -52,7 +52,7 @@ const runtime = new OmarRuntime(config.runtimeUrl, { pollMs: 20, fetchImpl: (url
 }});
 const replies = [], acks = [];
 const gateway = new WorkflowGateway(config, { runtime,
-  messenger: { async sendMessage(destination, text) { replies.push({ destination, text }); } },
+  messenger: { async sendMessage(destination, reply) { replies.push({ destination, text: reply.text }); } },
   log: (line) => { throw new Error(line); },
 });
 const socket = { send(text) { acks.push(JSON.parse(text)); } };
@@ -66,7 +66,7 @@ await handleEnvelope(JSON.stringify(envelope), socket, 'BOT', gateway);
 assert.equal(posts, 1);
 assert.equal(acks.length, 2);
 assert.equal(replies.length, 2);
-assert.deepEqual(replies[1].destination, { accountId: 'T1', conversationId: 'C1', threadId: '90.1' });
+assert.deepEqual(replies[1].destination, { platform: 'slack', accountId: 'T1', conversationId: 'C1', threadId: '90.1' });
 assert.match(replies[1].text, /completed\.\nSlack → OMAR → Slack: demo completed\./);
 const runs = await runtime.call('/v1/runs');
 assert.equal(runs.runs.length, 1);
@@ -101,6 +101,45 @@ console.log('PASS: duplicate Slack envelopes -> one real OMAR run -> correct thr
                                 env=node_env, cwd=REPO, text=True, capture_output=True, timeout=120)
         assert result.returncode == 0, (result.stdout, result.stderr)
         print("PASS: research command -> two-agent graph + imported enum -> captured final report (fixture agents)")
+        neutral = {
+            "platform": "mock-chat", "accountId": "mock-account", "allowedUsers": ["mock-user"],
+            "allowedConversations": ["mock-room"], "command": "demo", "outputPort": "run.result",
+            "timeoutSeconds": 30, "runtimeUrl": config["runtimeUrl"],
+            "programPath": str(REPO / "integrations/slack/demo.omar"),
+            "rawInputs": ["run.request=Mock adapter -> shared core -> OMAR"],
+        }
+        config_path.write_text(json.dumps(neutral))
+        mock_script = r"""
+import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+// No Slack module is imported by this caller.
+const { loadConfig, OmarRuntime, WorkflowGateway } = await import(pathToFileURL(process.env.SLACK_TEST_REPO + '/integrations/messaging/workflow.mjs'));
+const config = await loadConfig(process.env.SLACK_TEST_CONFIG);
+const runtime = new OmarRuntime(config.runtimeUrl, { pollMs: 20 });
+let starts = 0;
+const originalStart = runtime.start.bind(runtime);
+runtime.start = async (request) => { starts++; return originalStart(request); };
+const replies = [];
+const gateway = new WorkflowGateway(config, { runtime,
+  messenger: { async sendMessage(destination, reply) { replies.push({ destination, reply }); } },
+  log: (line) => { throw new Error(line); },
+});
+const message = { platform: 'mock-chat', accountId: 'mock-account', senderId: 'mock-user',
+  eventId: 'same-provider-event', command: 'run demo',
+  destination: { platform: 'mock-chat', accountId: 'mock-account', conversationId: 'mock-room' } };
+await gateway.handle(message);
+await gateway.handle(message);
+assert.equal(starts, 1);
+assert.equal(replies.length, 2);
+assert.deepEqual(replies[1].destination, message.destination);
+assert.match(replies[1].reply.text, /completed\.\nMock adapter -> shared core -> OMAR/);
+assert.ok(replies[1].reply.runId);
+console.log('PASS: mock adapter -> shared core -> real OMAR -> threadless captured reply (no Slack imports)');
+"""
+        result = subprocess.run(["node", "--input-type=module", "-"], input=mock_script,
+                                env=node_env, cwd=REPO, text=True, capture_output=True, timeout=120)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        print(result.stdout.strip())
     finally:
         if session:
             cli("down", "-s", session["name"])
