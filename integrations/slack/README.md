@@ -1,6 +1,6 @@
 # Slack workflow MVP
 
-Node 22.13+; no npm dependencies. Uses Slack Socket Mode and OMAR's existing
+Rust implementation in the OMAR executable. Uses Slack Socket Mode and OMAR's existing
 loopback run API. It does not send requests through the executive assistant.
 
 `@Omar run demo` -> configured `.omar` + fixed inputs -> configured output port
@@ -26,12 +26,37 @@ test, not a market-research workflow.
    `connections:write`. Add bot scopes `app_mentions:read` and `chat:write`,
    subscribe to the `app_mention` bot event, install/reinstall the app, and invite
    it to the allowed channel. This is a mention command, not a slash command.
-5. Set `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` in the adapter's shell. Keep secrets
-   out of config, command arguments, workflow inputs, and Git. Then run:
+5. Save the tokens once using the Rust command (input is hidden):
 
    ```sh
-   node integrations/slack/slack.mjs integrations/slack/config.local.json
+   target/debug/omar messaging slack login
    ```
+
+   Enter the bot token (`xoxb-`) and app token (`xapp-`) when prompted. On WSL/Linux
+   they are saved under `~/.config/omar/credentials/slack.json` (or
+   `$XDG_CONFIG_HOME/omar/credentials/slack.json`), with file mode 0600 inside a
+   0700 directory. This is a private local file, not encrypted keychain storage.
+   It is independent of the runtime session and outside the checkout. Re-run
+   `login` to replace both saved tokens. Format is checked at login; Slack checks
+   validity when the connector starts. Then run normally, even in a new terminal:
+
+   ```sh
+   target/debug/omar messaging slack integrations/slack/config.local.json
+   ```
+
+   `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` can still override saved values
+   individually. An empty/invalid override is an error. Unset old overrides to
+   use the newly saved credentials. Tokens never belong in workflow configs,
+   source, command arguments or Git.
+
+   To remove the saved copy:
+
+   ```sh
+   target/debug/omar messaging slack logout
+   ```
+
+   Logout does not revoke the Slack tokens, unset shell variables, or stop a
+   running connector. Stop the connector separately if required.
 
 6. In the allowed Slack channel, mention your bot: `@Omar run demo`.
    It replies with the run ID, then the selected output in the same thread.
@@ -73,21 +98,51 @@ budget, so it can take several minutes. The existing runtime inherits the PATH
 and backend environment from when it was started.
 
 To switch from the demo, stop the running adapter with Ctrl+C, then in the same
-shell (where your Slack tokens are exported):
+shell (saved tokens load automatically; environment tokens can override them):
 
 ```sh
-node integrations/slack/slack.mjs integrations/slack/config.research.local.json
+target/debug/omar messaging slack integrations/slack/config.research.local.json
 ```
 
-Send `@Omar run research` in the allowed channel. This replaces the one configured
-command for that adapter instance; it does not add a command registry. Do not run
-the demo adapter and research adapter together for the same Slack app. Topic and
-inputs are fixed by config; arbitrary Slack research topics are not supported.
+Send `@Omar run research` in the allowed channel. The legacy configuration still
+selects one workflow. To make several approved workflows available, use the
+registry below. Inputs remain fixed by the operator, not supplied through chat.
+
+## Multiple approved workflows (one running at a time)
+
+Copy `config.workflows.example.json` to `config.workflows.local.json` and set its
+runtime/chat address and allowlists. Each `workflows` entry has a name, optional
+one-line description, `programPath`, `outputPort`, optional `files`, fixed `inputs`
+or `rawInputs`, and `timeoutSeconds`. All entries use the same configured runtime.
+Paths resolve relative to the registry config, not the current shell directory.
+All sources/imports are loaded at startup; an invalid entry rejects the config.
+
+```sh
+target/debug/omar messaging slack integrations/slack/config.workflows.local.json
+```
+
+Stop the previous connector before starting this one. Then use:
+
+```text
+@Omar list
+@Omar run checklist
+@Omar run demo
+@Omar run research
+```
+
+`list` shows only approved names/descriptions; it also works while a run is active.
+Only one workflow can run through this connector at a time, across all names.
+Another run request gets a busy reply, is not queued, and requires a new command
+after the active run finishes. Unknown names or extra arguments do not execute.
+To add a workflow, register its settings and restart the connector; no adapter code
+changes. Legacy single-workflow configs remain supported and also accept `list`.
+Do not combine legacy top-level workflow settings with a `workflows` registry.
+There is no automatic exposure of local files or arbitrary chat-selected inputs.
 
 ## Behavior and limits
 
 - Exact workspace/user/channel allowlists. Only leading explicit bot mentions and
-  the configured `run <command>` are accepted. Bot/subtype events are ignored.
+  `list` or a registered `run <name>` are accepted. Bot/subtype events are ignored.
 - One run at a time. A different command event while busy receives a busy reply;
   no queue. OMAR also rejects active/paused runs of the same team.
 - In-memory event deduplication: up to 2,000 identities for one hour. Reconnects
@@ -107,22 +162,24 @@ inputs are fixed by config; arbitrary Slack research topics are not supported.
 
 ## Shared core
 
-The gateway and runtime client live in `../messaging/workflow.mjs`; see its README
+The gateway and runtime client live in `src/messaging/`; see `../messaging/README.md`
 for the platform-neutral contract. This adapter owns Slack mentions, Socket Mode,
 authentication, thread mapping, escaping and length limits. Existing Slack config
-fields and `node integrations/slack/slack.mjs <config>` remain unchanged.
+fields remain compatible. Launch with `target/debug/omar messaging slack <config>`.
 
 ## Tests
 
 ```sh
-node --test integrations/messaging/*.test.mjs integrations/slack/*.test.mjs
+cargo test --locked --bin omar messaging::
 python3 tests/ci/slack_workflow.py
+python3 tests/ci/slack_credentials.py
 ```
 
-The second command needs freshly built `omar`/`omarc`, tmux and Node on PATH. It
+The second command needs freshly built `omar`/`omarc`, tmux and Cargo on PATH. It
 creates an isolated runtime, feeds duplicate Socket Mode fixtures through the
-adapter, checks exactly one demo run and its captured thread reply, then executes
-the research graph with deterministic fixture agents and its imported enum. It
+Rust adapter, checks exactly one demo run and its captured thread reply, then executes
+the research graph with deterministic fixture agents and its imported enum. A
+registry scenario lists and runs checklist, demo and research sequentially through one gateway. It
 removes the test session. The harness also runs the same core against a mock transport with no Slack imports.
 Neither test uses Slack credentials or live models.
 Both run in the existing CI Test job.
@@ -130,3 +187,6 @@ Both run in the existing CI Test job.
 References: [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/),
 [app_mention](https://docs.slack.dev/reference/events/app_mention/),
 [chat.postMessage](https://docs.slack.dev/reference/methods/chat.postMessage/).
+
+The credential harness tests hidden-input login, private permissions, cancellation
+and logout in an isolated pseudo-terminal, using fake tokens and no Slack calls.

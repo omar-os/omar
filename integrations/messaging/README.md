@@ -1,81 +1,99 @@
-# Shared messaging core
+# Shared messaging core (Rust)
 
-`workflow.mjs` owns one configured workflow's local runtime client, authorization,
-command matching, bounded in-memory deduplication, busy state, monitoring, output
-selection, and failure policy. It does not connect to messaging providers.
+`src/messaging/` owns configuration, the local runtime HTTP client, authorization,
+command matching, bounded in-memory deduplication, busy/uncertain state, monitoring,
+output selection, and failure policy. Slack is the first provider implementation.
+There is no Node dependency for messaging.
 
-Each gateway is bound to one `platform` and `accountId`. A connection/account ID
-must distinguish installations when a provider can have multiple installations in
-the same workspace. Normalize that identity in the adapter; never use a display
-name. The current Slack MVP supports one app in one configured workspace and uses
-that workspace's ID. Deduplication keys include platform, account and provider
-event ID. Separate gateways targeting one OMAR team can still receive a runtime
-busy conflict; there is no global queue or cross-process deduplication.
+## Run
+
+```sh
+cargo build --bin omar
+target/debug/omar messaging slack login
+target/debug/omar messaging slack integrations/slack/config.local.json
+```
+
+The connector runs in the foreground and calls an already running, dedicated OMAR
+runtime. It does not start a second runtime or send work through the executive
+assistant. Ctrl+C/SIGTERM stops the connector, not an admitted workflow.
 
 ## Adapter contract
 
-After authenticating its provider connection, an adapter submits:
+`Incoming` carries platform, account ID, sender ID, event ID, command and a
+`Destination` (platform/account/conversation, optional thread). IDs are opaque and
+scoped to an installation. Slack uses one configured workspace/app; future
+adapters must distinguish installations correctly.
 
-```js
-await gateway.handle({
-  platform: "mock-chat",
-  accountId: "connected-account",
-  senderId: "provider-user",
-  eventId: "stable-provider-event-id",
-  command: "run research",
-  destination: {
-    platform: "mock-chat",
-    accountId: "connected-account",
-    conversationId: "provider-conversation",
-    // threadId: "optional-provider-thread"
-  }
-});
-```
+`Gateway<R, M>` accepts an implementation of `Runtime` and `Messenger`. A messenger
+sends a `Reply` (full text and optional run ID) to the authorized destination and
+can customize usage hints. Formatting, length limits, provider authentication,
+acknowledgements and reconnects belong to the adapter, not the gateway.
 
-The core rejects events outside the configured platform/account/user/conversation
-policy, malformed event IDs, and mismatched destinations before executing or
-replying. Provider authentication does not replace workflow authorization.
-Mention syntax and provider payloads are normalized before entering the core.
+The core checks platform/account/user/conversation and destination identity before
+replying, deduplicating or executing. Dedup keys include platform/account/event.
+No mutex spans network I/O. Admission is marked busy before starting a workflow;
+other requests receive a busy reply rather than entering a queue. Reconnection
+retains the same gateway and its dedup state.
 
-The injected adapter implements:
+Slack config `workspaceId`/`allowedChannels` remain accepted. Neutral callers use
+`platform`/`accountId`/`allowedConversations`. Source/schema paths are relative to
+the config file. Existing `.omar`, schemas, fixed inputs and output selection are
+unchanged. No chat message can select arbitrary files or inputs.
 
-```js
-const messenger = {
-  usageHint(workflowName) { return `Send run ${workflowName}`; }, // optional
-  async sendMessage(destination, { text, runId }) {
-    // Format/escape/limit text and send through this adapter's authenticated API.
-    // runId is optional on messages that did not start a run.
-  }
-};
-```
+HTTP clients disable redirects and request retries. Unknown admission/monitoring
+outcomes block new starts pending operator reconciliation. Failed sends never
+rerun a workflow. Logs omit tokens, secret socket URLs and provider bodies.
 
-The core passes full selected output. The adapter owns message limits, escaping,
-thread mapping, and delivery strategy. Failed sends never rerun the workflow.
-Destinations come from the normalized authorized event, not agent-produced text.
-Credentials, acknowledgements, reconnects and platform errors stay in adapters.
-No plugin registry or universal platform capability model is required.
-
-`loadConfig(path)` accepts neutral `platform`, `accountId`, `allowedUsers`, and
-`allowedConversations`, plus the existing workflow source/files/inputs/output/runtime
-settings. `loadWorkflowConfig(config, path)` loads an already normalized config.
-
-Slack's `../slack/workflow.mjs` is a compatibility entry point: it maps existing
-`workspaceId` and `allowedChannels` config fields into these neutral names. Existing
-Slack local configs and launch commands need no migration.
-
-## Validation
+## Tests
 
 ```sh
-node --test integrations/messaging/*.test.mjs integrations/slack/*.test.mjs
+cargo test --locked --bin omar messaging::
 python3 tests/ci/slack_workflow.py
+python3 tests/ci/slack_credentials.py
 ```
 
-Mock tests cover two transport identities, authorization/destination isolation,
-threaded and threadless messages, duplicate filtering, usage formatting, full-output
-handoff and failures. The runtime integration harness also executes a real no-model
-workflow through a mock adapter without importing any Slack module. This proves
-the shared execution seam, not Discord/WhatsApp connectivity or durable delivery.
+Rust tests use mock platforms and local HTTP/WebSocket servers. The Python CI
+harness invokes Rust tests against an isolated actual OMAR runtime: duplicate
+Slack event -> one demo run; research graph with Stub agents and imported enum;
+neutral mock caller -> threadless reply. No Slack credentials, external network,
+Node, or live models are needed. Both commands run in CI.
 
-Current MVP limits remain: one fixed workflow per connection; in-memory deduplication
-for up to one hour/2,000 events; one invocation per gateway at a time; no durable
-inbox/outbox, crash recovery, conversational memory, or multi-workflow registry.
+## MVP limits
+
+Approved workflow registry per connector (legacy single-workflow configs supported); one invocation at a time; dedup for up to
+one hour/2,000 events, lost on process restart; no durable inbox/outbox or global
+cross-process queue. Early ACK plus a crash can lose an event. The language port
+does not provide exactly-once execution or delivery. Separate gateways targeting
+the same team can still receive a runtime conflict. Discord/WhatsApp, persistent recovery and conversational memory are outside this change.
+
+## Slack credentials
+
+`omar messaging slack login` asks for both tokens with hidden input and saves them
+in the user config directory, outside workflow/session state. On Unix the file is
+0600 and its directory 0700; it is not encrypted. Tokens are replaced atomically.
+The connector loads them automatically across terminals. Environment values win
+per token. `omar messaging slack logout` removes only the saved copy; it does not
+revoke tokens or stop running connectors. No token is accepted as a CLI argument.
+There is currently one saved Slack installation per user configuration directory.
+
+## Workflow registry
+
+`Config.workflows` maps approved command names to source/bundle/input/output/timeout
+settings. The common gateway implements `list` and exact `run <name>` matching;
+Slack only normalizes the mention and sends replies. Registry entries share the
+configured runtime and one busy/uncertain state. A second run is refused, never
+queued. `list` stays available while busy. Authorization and dedup apply to both
+commands, and uncertainty blocks all workflow names. Selected output and timeout
+come from the chosen entry. No arbitrary file paths or chat-provided inputs.
+
+See `integrations/slack/config.workflows.example.json`. Register another workflow
+by editing config and restarting, without changing adapter code. Existing legacy
+configs map to one available workflow and retain their `run <command>` behavior.
+
+## Workflow catalog follow-up
+
+Web UI workflows are not automatically registered for messaging. The current
+operator-owned registry is explicit. Follow-up: one local workflow catalog shared
+by UI, CLI and messaging, with source/schema locations and execution settings.
+Decide between registration on save and an explicit UI action; messaging access
+should have a clear enablement policy. This PR does not implement that UI/catalog.
