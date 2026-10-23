@@ -122,7 +122,7 @@ jobs:
           test: false
 
       - name: Test Rust messaging core and Slack adapter (no credentials)
-        run: cargo test --locked --bin omar messaging::
+        run: 'cargo test --locked --bin omar messaging::'
 
       - name: Verify legacy supervision through MCP and tmux
         run: |
