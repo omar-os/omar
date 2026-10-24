@@ -1154,6 +1154,42 @@ with Path(sys.argv[1]).open('ab', buffering=0) as log:
     }
 
     #[test]
+    fn the_bypass_permissions_warning_is_accepted_before_ready() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("startup.py");
+        let log = dir.path().join("keys");
+        std::fs::write(
+            &script,
+            include_str!("../../tests/fixtures/delivery/startup_gate.py"),
+        )
+        .unwrap();
+        let session = format!("omar-test-startup-bypass-{}", std::process::id());
+        let _guard = SessionGuard(session.clone());
+        let client = TmuxClient::new("");
+        let command = format!(
+            "python3 {} claude-bypass {}",
+            crate::manager::shell_single_quote(&script.display().to_string()),
+            crate::manager::shell_single_quote(&log.display().to_string())
+        );
+        client
+            .new_session_with_backend(&session, &command, None, Some("claude"))
+            .unwrap();
+        // The warning shows both readiness markers; it must not pass for ready.
+        assert!(client.wait_for_markers(
+            &session,
+            &["Claude Code", "❯"],
+            Duration::from_secs(10),
+            Duration::from_millis(50)
+        ));
+        // Trust: Down, Enter. Then the warning: Down, Enter.
+        assert_eq!(std::fs::read(&log).unwrap(), b"\x1b[B\r\x1b[B\r");
+    }
+
+    #[test]
     fn startup_gates_are_answered_once_before_channel_delivery() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
