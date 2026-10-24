@@ -5,7 +5,8 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../.." && pwd)
 source_dir="$script_dir/src"
 results_dir=${OMAR_TEST_RESULTS_DIR:-"$repo_root/target/topology-tests"}
-case_timeout=${OMAR_TEST_CASE_TIMEOUT_SECONDS:-900}
+# A backstop: each program's Smoke team ends it at its own deadline.
+case_timeout=${OMAR_TEST_CASE_TIMEOUT_SECONDS:-3000}
 invocation_timeout=${OMAR_TEST_INVOCATION_TIMEOUT_SECONDS:-300}
 case_filter=${OMAR_TEST_CASE:-}
 fixture="$script_dir/README.md"
@@ -190,11 +191,13 @@ raise SystemExit(status)
 PY
 }
 
+# Each program checks itself: its Smoke team stops the run once the program
+# has produced what it owes, and asserts at shutdown. A failed assert fails the
+# run, so the checks here are the runtime's exit and the completion marker.
 run_case() {
   local name=$1
   local team=$2
-  local output_csv=$3
-  shift 3
+  shift 2
 
   if [[ -n $case_filter && $name != "$case_filter" ]]; then
     return
@@ -206,13 +209,10 @@ run_case() {
   local case_passed=0
   local case_failed=0
   local case_skipped=0
-  local expected_outputs=()
-  local total_checks
+  local total_checks=2
   local status=PASS
   local reason=-
 
-  IFS=',' read -r -a expected_outputs <<<"$output_csv"
-  total_checks=$((2 + ${#expected_outputs[@]}))
   : >"$log"
 
   printf '\n[%s] running with local agents\n' "$name"
@@ -225,6 +225,8 @@ run_case() {
     status=FAIL
     if ((runtime_status == 124)); then
       reason="case timed out"
+    elif grep -Fq 'panicked at' "$log"; then
+      reason="smoke check failed"
     else
       reason="runtime exited $runtime_status"
     fi
@@ -244,17 +246,6 @@ run_case() {
     [[ $reason == - ]] && reason="missing completion marker"
     case_failed=$((case_failed + 1))
   fi
-
-  local output
-  for output in "${expected_outputs[@]}"; do
-    if grep -Fq "Output $output =" "$log"; then
-      case_passed=$((case_passed + 1))
-    else
-      status=FAIL
-      [[ $reason == - ]] && reason="missing output $output"
-      case_failed=$((case_failed + 1))
-    fi
-  done
 
   local elapsed=$((SECONDS - case_started))
   passed_checks=$((passed_checks + case_passed))
@@ -282,7 +273,6 @@ build_prerequisites
 # Every program instantiates its teams in a main block, so ports are named
 # `instance.port` and the program takes its source file's name.
 run_case AllTypes AllTypes \
-  types.bool_out,types.int_out,types.float_out,types.string_out,types.path_out,types.bytes_out,types.list_out,types.option_out,types.nested_out \
   --input types.bool_in=true \
   --input types.int_in=7 \
   --input types.float_in=2.5 \
@@ -293,61 +283,60 @@ run_case AllTypes AllTypes \
   --input 'types.option_in="present"' \
   --input 'types.nested_in=[1,null,3]'
 
-run_case BusinessLoop BusinessLoop biz.delivery \
+run_case BusinessLoop BusinessLoop \
   --input biz.brief='Launch a reliable self-service analytics product for small retailers'
-run_case EffectContracts EffectContracts contracts.accepted \
+run_case EffectContracts EffectContracts \
   --input contracts.candidate='a careful systems engineer'
-run_case FanOutFanIn FanOutFanIn fan.answer \
+run_case FanOutFanIn FanOutFanIn \
   --input fan.request='design a resilient task queue'
-run_case HR HR hr.hired --input "hr.resume=$fixture"
-run_case HRCodex HRCodex hr.hired --input "hr.resume=$fixture"
-run_case OrTriggers OrTriggers triggers.observation \
+run_case HR HR --input "hr.resume=$fixture"
+run_case HRCodex HRCodex --input "hr.resume=$fixture"
+run_case OrTriggers OrTriggers \
   --input triggers.request='compare the fast and slow paths'
-run_case OrderedWrites OrderedWrites writes.result \
+run_case OrderedWrites OrderedWrites \
   --input writes.request='declaration order'
 # A watcher one hop and three hops from the same source. It should be invoked
-# once, holding both -- so the run completing at all is the assertion.
-run_case Depths Depths watch.verdict --input src.go=1
+# once, holding both; its Smoke team counts the firings.
+run_case Depths Depths --input src.go=1
 # Two enum types imported from schema files, written by a stub and read by a
 # code body. The stub picks the first value each type admits.
-run_case SchemaEnum SchemaEnum review.decision,review.priority,dispatch.route \
+run_case SchemaEnum SchemaEnum \
   --input review.request='route this'
 # The same types inside list and option, crossing connections between two
 # prompt teams.
-run_case SchemaNested SchemaNested triage.decisions,triage.priority,summary.report \
+run_case SchemaNested SchemaNested \
   --input triage.request='triage this'
 # An enum input from the command line. CI also runs this with a value outside
 # the enum and checks the run is refused; here only the admitted value runs.
-run_case SchemaInput SchemaInput gate.note,gate.route --input gate.decision=stop
-run_case Recurrence Recurrence rec.result --input rec.start=0
+run_case SchemaInput SchemaInput --input gate.decision=stop
+run_case Recurrence Recurrence --input rec.start=0
 # Three instances wired into a ring. Only the seed is supplied; the other two
 # inputs come off the ring itself.
-run_case Ring Ring n1.done --input n1.token=0
+run_case Ring Ring --input n1.token=0
 # A team instantiating teams: two nested Stage instances inside one Pipeline.
-run_case Nested Nested run.summary --input run.brief='hierarchy'
+run_case Nested Nested --input run.brief='hierarchy'
 # No --input: a timer is the only thing that starts this one.
-run_case Timer Timer beacon.note
+run_case Timer Timer
 # Four one-shot timers opening three rounds and a deadline, on Claude Code.
-run_case Cadence Cadence chair.report
+run_case Cadence Cadence
 # Two deadlines at one tag on Claude Code: one generous and met, one of 1ms
 # that cannot be.
 # The 1ms contract is optional, so its expiry completes the tag rather than
 # failing the run, and `report` shows <absent> where that write would have been.
 # `main` names the program, so the completion marker is WithinTest.
-run_case DeadlineProbe WithinTest probe.report
-run_case SameAgentSerial SameAgentSerial serial.result \
+run_case DeadlineProbe WithinTest
+run_case SameAgentSerial SameAgentSerial \
   --input serial.request='serialize these reactions'
-run_case SuperdenseTime SuperdenseTime time.fixed_result,time.connected_result \
+run_case SuperdenseTime SuperdenseTime \
   --input time.start=7
-# `PortManager` is deliberately absent too: its panel is answered by a web
-# client, and nothing here is one, so the run would wait out its deadline rather
-# than finish. Compiled and backend-checked like every other source.
-# `Heartbeat` and `Bureau` are deliberately absent. `Heartbeat`'s timer has a
-# non-zero period, so the program never finishes and has no completion marker to
-# wait for. `Bureau` is 32 agents across eight sequential stages, and a release
-# gate is not the place to discover whether that fits in a case timeout.
-# `WorldNews` never finishes either, and fetches from the internet besides. All
-# three are compiled and backend-checked like every other source, never run here.
+# Periodic timers never finish on their own; their Smoke teams stop them.
+run_case Heartbeat Heartbeat
+# Fetches from the internet; two ticks of two minutes.
+run_case WorldNews WorldNewsEveryTwoMinutes
+# 32 agents across eight sequential stages, on Claude Code. The slowest case.
+run_case Bureau Bureau
+# `PortManager` is deliberately absent: its panel is answered by a web client,
+# and nothing here is one. Compiled and backend-checked like every other source.
 
 if ((passed_cases + failed_cases == 0)); then
   printf 'No topology case named %s\n' "$case_filter" >&2

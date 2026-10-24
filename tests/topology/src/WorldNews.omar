@@ -3,13 +3,13 @@
 // `tick(0, 2min)` fires at logical time 0 and every two minutes after. Each
 // tick the researcher fetches the news of that moment and the writer replaces
 // `world-news-summary.txt` in its own workspace. Nothing feeds the program and
-// it takes no input; it runs until stopped or the runtime's tag cap.
+// it takes no input; its Smoke team ends it after two saved summaries.
 //
 // What makes it a checkpoint test: every tick produces something different,
 // and the summary file is the writer's state on disk. Pause it, roll back to
 // an earlier tick, resume, and the file is that tick's summary again while
-// the clock continues from there. Compiled and checked in CI, not run: it
-// never finishes, and it reaches the internet.
+// the clock continues from there. Run live by the topology suite; it
+// reaches the internet.
 //
 //   omar run tests/topology/src/WorldNews.omar --checkpoint-period tag
 //   omar pause WorldNewsEveryTwoMinutes --wait
@@ -33,8 +33,30 @@ team NewsSummary[writer : Codex]
     task writer(news) -> saved "Summarize this news briefing in plain text: $(news). Write world-news-summary.txt in your own workspace, replacing the previous summary. Include the retrieval timestamp, a short paragraph or bullet for each major story, and source URLs. If the briefing reports retrieval failure, write that status explicitly. Use filesystem tools to write the file and verify its contents. Set saved to the absolute file path only after successful writing, then complete this invocation."
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+// Two ticks, so a run by hand still has a tick to roll back to.
+team Smoke
+{
+    input saved : string
+    state saveds : int = 0
+    timer deadline(15min, 0)
+
+    reaction(saved) -> {=
+        self.saveds += 1;
+        if self.saveds >= 2 { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.saveds >= 2, "{} of 2 summarize.saved by the deadline", self.saveds);
+    =}
+}
+
 main WorldNewsEveryTwoMinutes {
     fetch = WorldNews()
     summarize = NewsSummary()
     fetch.news -> summarize.news
+
+    smoke = Smoke()
+    summarize.saved -> smoke.saved
 }

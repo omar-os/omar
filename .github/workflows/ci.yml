@@ -467,7 +467,11 @@ jobs:
                   if instruction["op"] == "declare_instance":
                       assert keys == ["op", "name", "parent", "team"], (path, keys)
                   if instruction["op"] == "declare_timer":
-                      assert keys == ["op", "instance", "name", "offset", "period"], (path, keys)
+                      # `shutdown` marks the trigger the run's last tag fires.
+                      assert keys in (
+                          ["op", "instance", "name", "offset", "period"],
+                          ["op", "instance", "name", "offset", "period", "shutdown"],
+                      ), (path, keys)
                   if instruction["op"] == "declare_state":
                       assert keys == ["op", "instance", "name", "type", "initial"], (path, keys)
                   # Every member names the container it belongs to, so a client

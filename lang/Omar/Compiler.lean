@@ -237,6 +237,9 @@ structure Timer where
   offset : Nat
   period : Nat
   instance_ : String := ""
+  /-- The `shutdown` trigger: fired once, at the run's last tag, rather than
+      from the clock. Declared by the compiler for a team that reacts to it. -/
+  shutdown : Bool := false
   deriving Repr
 
 structure Connection where
@@ -722,6 +725,14 @@ private def parseTeam (aliases : Array (String × String)) : Parser TeamDecl := 
   let (_, tokens) ← expectSym "{" tokens
   let (ports, timers, connections, reactions, instances, states, tokens) ←
     parseDeclarations aliases 0 #[] #[] #[] #[] #[] #[] tokens
+  -- `shutdown` is the runtime's, so a team cannot declare something by that
+  -- name, and reacting to it is what declares it.
+  let declared := ports.map (·.name) ++ timers.map (·.name) ++ states.map (·.name)
+  if declared.contains "shutdown" then
+    throw s!"team '{name}' declares 'shutdown', which is the trigger the run's last tag fires"
+  let timers := if reactions.any (·.triggers.contains "shutdown") then
+      timers.push { name := "shutdown", offset := 0, period := 0, shutdown := true }
+    else timers
   pure ({ name, params, agents, ports, timers, connections, reactions, instances, states }, tokens)
 
 private partial def parseMainBody
@@ -795,7 +806,7 @@ private def validate (program : Program) : Except String Program := do
   for timer in program.timers do
     if containsName portNames timer.name then
       throw s!"timer '{timer.name}' is also a port; a trigger has one name"
-    if timer.offset == 0 && timer.period == 0 then
+    if timer.offset == 0 && timer.period == 0 && !timer.shutdown then
       throw s!"timer '{timer.name}' never fires; give it an offset, a period, or both"
   ensureUnique "state" (program.states.map (·.name))
   for var in program.states do
@@ -1086,12 +1097,12 @@ def compile (program : Program) : String :=
       | none => []
     instruction "define_port" fields
   let timers := program.timers.map fun timer =>
-    instruction "declare_timer" [
+    instruction "declare_timer" ([
       ("instance", toJson timer.instance_),
       ("name", toJson timer.name),
       ("offset", toJson timer.offset),
       ("period", toJson timer.period)
-    ]
+    ] ++ (if timer.shutdown then [("shutdown", toJson true)] else []))
   let states := program.states.map fun var =>
     instruction "declare_state" [
       ("instance", toJson var.instance_),
