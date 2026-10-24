@@ -1,0 +1,42 @@
+{
+  "runtimeUrl": "http://127.0.0.1:PORT/chats/CHAT-ID",
+  "workspaceId": "T_WORKSPACE",
+  "allowedUsers": [
+    "U_YOUR_USER"
+  ],
+  "allowedChannels": [
+    "C_DEMO_CHANNEL"
+  ],
+  "workflows": {
+    "demo": {
+      "programPath": "demo.omar",
+      "outputPort": "run.result",
+      "timeoutSeconds": 60,
+      "rawInputs": [
+        "run.request=Slack \u2192 OMAR \u2192 Slack: demo completed."
+      ],
+      "description": "Check Slack to OMAR connectivity (no model calls)"
+    },
+    "research": {
+      "programPath": "research.omar",
+      "outputPort": "edit.report",
+      "timeoutSeconds": 480,
+      "rawInputs": [
+        "research.request=Summarize the latest significant U.S. stock-market news, focusing on NVIDIA (NVDA), Microsoft (MSFT), Apple (AAPL), and major Federal Reserve or economic developments affecting the broad market. Prioritize material news over forcing one item per company. Use dated public sources, normally from the past 72 hours, and explicitly report missing or older coverage."
+      ],
+      "files": {
+        "schemas/research-status.json": "schemas/research-status.json"
+      },
+      "description": "Two-agent public US market-news report"
+    },
+    "checklist": {
+      "description": "Show a workflow-testing checklist (no model calls)",
+      "programPath": "checklist.omar",
+      "outputPort": "checklist.report",
+      "timeoutSeconds": 30,
+      "rawInputs": [
+        "checklist.text=Workflow checklist: choose an approved workflow; start it; wait for completion; check the reply."
+      ]
+    }
+  }
+}
