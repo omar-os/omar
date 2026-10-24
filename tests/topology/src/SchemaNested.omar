@@ -35,10 +35,33 @@ team Summary[writer : Stub]
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+// A body binds scalars only, and `report` is read from both wrapped
+// ports, so it arriving is what says they crossed.
+team Smoke
+{
+    input report : string
+    state got_report : bool = false
+    timer deadline(10min, 0)
+
+    reaction(report) -> {=
+        if report.is_some() { self.got_report = true; }
+        if self.got_report { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_report, "no summary.report by the deadline");
+    =}
+}
+
 main {
     triage = Triage()
     summary = Summary()
 
     triage.decisions -> summary.decisions
     triage.priority -> summary.priority
+
+    smoke = Smoke()
+    summary.report -> smoke.report
 }

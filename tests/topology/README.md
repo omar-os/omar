@@ -39,18 +39,15 @@ Coverage:
 - `Cadence.omar`: one-shot timers opening three rounds and a deadline, with a
   chair whose four prompts share one agent memory. Claude Code.
 - `Bureau.omar`: four levels of containment and 32 agents — the heaviest case
-  here. Claude Code. Compiled and checked, not run: eight sequential stages of
-  live agents is not something the release gate should be finding out about.
-- `Heartbeat.omar`: a periodic timer driving a program that never finishes.
-  Compiled and checked, never run: `run_local.sh` waits for a completion
-  marker this program does not produce.
+  here. Claude Code. The slowest case; its deadline is 40min.
+- `Heartbeat.omar`: a periodic timer driving a program that never finishes on
+  its own; its Smoke team stops it after three verdicts.
 - `WorldNews.omar`: a 2-minute timer; each tick a Codex researcher fetches the
   news of that moment and a writer replaces `world-news-summary.txt` in its
   workspace. For trying checkpoints by hand: every tick differs, the file is
   state on disk, so pause, roll back to an earlier tick and resume, and the
   file is that tick's summary again while the clock continues from there.
-  Compiled and checked, never run: it never finishes and it reaches the
-  internet.
+  Its Smoke team stops it after two ticks. Reaches the internet.
 
 Every program declares its teams and then instantiates them in a `main` block,
 so ports are named `instance.port` and each program takes its source file's
@@ -76,13 +73,26 @@ make test-topology CASE=BusinessLoop
 
 The suite includes both heterogeneous `HR.omar` and Codex-only `HRCodex.omar`.
 It runs every case even if an earlier case fails. Each case must compile, exit
-successfully after completing all effect contracts, print its completion marker,
-and produce every declared output expected by the test.
+successfully after completing all effect contracts, and print its completion
+marker.
 
-The authenticated suite runs on demand: `Topology Release Gate` in the Actions
-tab, which supplies the `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` repository
-secrets. It does not run for pull requests, ordinary `main` pushes, or on a
-schedule.
+Each program checks itself. Its `Smoke` team takes the outputs the program
+owes, calls `request_stop()` once they have all arrived, and `assert!`s at
+`shutdown`. A timer is its deadline: when it fires first, the run stops and the
+asserts fail, which fails the run. So a passing case ends as soon as it has
+passed, and a program with a periodic timer still ends. See `lang/spec.md`
+§2.2.
+
+`Live Topology` runs the authenticated suite on every same-repo PR, every
+`main` push, and on demand (optionally one `case`). It runs on the
+maintainer's self-hosted runner, label `omar-live`, using that machine's Claude
+Code and Codex logins; no API keys in GitHub. Fork PRs are skipped. Each run
+gets its own tmux server (`TMUX_TMPDIR`) and `OMAR_HOME`, so it never touches
+the machine's interactive sessions. Set up a runner:
+`.github/scripts/setup-live-runner.sh`.
+
+`Topology Release Gate` runs the same suite on demand on a GitHub-hosted
+runner, from the `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` repository secrets.
 
 It used to gate every release. Driving real agents against real models made a
 release wait on a long, paid run that could fail for reasons nothing in the
@@ -96,10 +106,13 @@ machine-readable `results.tsv` summary are written under
 
 The following environment variables adjust local execution:
 
-- `OMAR_TEST_CASE_TIMEOUT_SECONDS`: whole-case timeout; default `900`.
+- `OMAR_TEST_CASE_TIMEOUT_SECONDS`: whole-case backstop timeout; default
+  `3000`. Each program's own deadline normally ends it first.
 - `OMAR_TEST_INVOCATION_TIMEOUT_SECONDS`: timeout for one agent prompt;
   default `300`.
 - `OMAR_TEST_CASE`: run only the named case.
 - `OMAR_TEST_PEEK_AGENTS`: capture recent tmux output from every live agent once
   per minute; enabled by the CI workflow.
 - `OMAR_TEST_RESULTS_DIR`: directory for logs and metrics.
+- `OMAR_HOME`: OMAR state root, where agent logs are copied from; default
+  `~/.omar`.
