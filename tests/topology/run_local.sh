@@ -325,7 +325,8 @@ run_case Heartbeat Heartbeat
 # Fetches from the internet; two ticks of two minutes.
 run_case WorldNews WorldNewsEveryTwoMinutes
 # 32 agents across eight sequential stages, on Claude Code. The slowest case.
-run_case Bureau Bureau
+run_case Bureau Bureau \
+  --input bureau.topic='how cities can cut heat-wave deaths'
 # `PortManager` is deliberately absent: its panel is answered by a web client,
 # and nothing here is one. Compiled and backend-checked like every other source.
 
