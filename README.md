@@ -2,9 +2,10 @@
 
 <img src="img/full-black-banner.jpg" alt="OMAR" width="250">
 
-**LLM agents are unpredictable. Their coordination doesn't have to be.**
-
-**`omar` delivers deterministic, formally specified orchestration for multi-agent systems.**
+<p align="center">
+<strong>Say no to agent “swarms”.<br>
+Deploy deterministic, verifiable, programmable agentic workflows.</strong>
+</p>
 
 <p align="center">
   <a href="https://omar.rs">omar.rs</a>&nbsp; • &nbsp;
@@ -14,28 +15,34 @@
   <a href="https://discord.gg/X76PSzmfWr"><img src="https://img.shields.io/discord/1467663881588572182?label=Discord&logo=discord&logoColor=white&color=5865F2&cacheSeconds=60" alt="Discord" valign="middle"/></a>
 </p>
 
-<p align="center">
-<img src="./img/web.gif" alt="Web UI" valign="middle"/>
-Web UI
-</p>
+</div>
+
+<div align="center">
 
 <p align="center">
-<img src="./img/demo.gif" alt="Terminal UI" valign="middle"/>
-Terminal UI
+<img src="./img/web.gif" alt="Web UI" valign="middle"/>
+Mission Control
 </p>
 
 </div>
 
+OMAR (Open Multi-Agent Runtime) coordinates coding agents through programmable workflows. Describe a task in Mission Control, review the team diagram, and deploy it with live visibility and terminal access. Compiled `.omar` programs define typed inputs, outputs, and handoffs with deterministic scheduling; model responses and tool actions can still vary. See the [language specification](lang/spec.md).
+
 ## Features
 
-- **Deep hierarchies**: Agents managing agents, just like a company.
-- **Heterogeneity**: Let `claude`, `codex`, and other agents collaborate as a team.
-- **Full control**: Talk to and control any subagent you want.
-- **Life span**: Long-running or ephemeral agents, your choice.
-- **Customization**: Support all `tmux` commands you love.
-- **Team workspaces**: Each topology team instance gets a versioned `worktree/` and disposable `temp/`. [Inspect and restore file versions](docs/team-workspaces.md).
+- 📜 **Explicit coordination contracts**: Declare typed inputs and outputs, triggers, and permitted output writes. OMAR provides system-level determinism for scheduling and handoffs, with compiler validation and runtime enforcement of output contracts.
 
-Other features include messaging systems integration (e.g., Slack), computer use, and more.
+- 🤝 **Mixed agent teams**: Put Claude Code, Codex, Cursor, OpenCode, Antigravity, and Pi in the same workflow. Choose a backend for each role using the [supported agent backends](#supported-agent-backends).
+
+- 🪆 **Teams within teams**: Compose reusable, parameterized teams into deeper hierarchies. Build pipelines, parallel branches, and feedback loops with explicit connections between them.
+
+- 🔎 **Live visibility and direct access**: Follow execution status and values in Mission Control's live diagram. Open an individual agent's terminal to inspect its session and interact directly.
+
+- 🧠 **Model heterogeneity**: Combine fast System I models such as Jev with System II reasoning models in the same workflow.
+
+- ⏯️ **Checkpointed workflows**: Pause and resume workflows at well-defined checkpoints between logical tags.
+
+- 🛠️ **Flexible sessions and familiar tools**: Run long-lived or task-specific agents, with terminal access and the `tmux` controls you already use.
 
 ## Installation
 
@@ -77,27 +84,52 @@ cd omar && make install
 #### Step 1: Launch Mission Control
 
 ```bash
-$ omar serve --ui
+$ omar up --name dev
+$ omar attach -s dev --web
 ```
 
-Serves the web UI from the daemon's own address and opens it in your browser.
+Starts an independent background runtime, then opens its web UI. Closing the
+browser leaves the runtime and its topologies running. Stop it with `omar down -s dev`.
+`omar --help` lists the session commands.
 
 #### Step 2: Describe a workflow
 
-Type what the team should do. The assistant drafts an OMAR program and shows you
-the topology it compiles to.
-Nothing runs until you press **Confirm deploy**,
-then the diagram goes live.
+Type what the team should do. For example:
 
-### Terminal UI (Legacy)
+> Create a team that drafts and reviews a technical design. Use Claude Code to
+> write a proposal from my brief, then pass it to Codex to review the tradeoffs
+> and missing requirements. Send both the proposal and review to me for a final
+> decision in Mission Control.
 
-Note: The legacy terminal UI does not yet implement the deterministic model in the mission control.
+The assistant drafts an OMAR program and shows you the team diagram it compiles
+to. Inspect the roles and handoffs, then press **Confirm deploy** to start the
+workflow. The diagram goes live as agents work and pass results between steps.
+This example requires both Claude Code and Codex to be installed and configured.
 
-#### Step 1: Launch `omar`
+### Session commands
+
+| Command | What it does |
+|---------|--------------|
+| `omar up --name dev` | Start a background session, or restart the stopped session named `dev`. |
+| `omar attach -s dev --web` | Open Mission Control for that session. Use `--tui` for the terminal UI. |
+| `omar down -s dev` | Stop the session and keep its state. |
+| `omar rm -s dev` | Remove the session and its state, stopping it first if running. |
+
+Closing the browser or detaching leaves the session running. Use `omar --help`
+for more commands and `omar <command> --help` for options.
+
+### Terminal UI
+
+Note: The terminal UI does not yet implement the deterministic model in the mission control.
+
+#### Step 1: Start a session and attach the terminal UI
 
 ```bash
-$ omar
+$ omar up --tui
 ```
+
+Or attach to a running session with `omar attach -s <session> --tui`. `z`
+detaches and the runtime keeps every workload running; `Q` stops the session.
 
 Go [here](#supported-agent-backends) to see how to launch with specific agent backends.
 
@@ -123,30 +155,15 @@ Shutdown the test project and its agents.
 
 | Backend | How to launch |
 |---------|---------------|
-| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar -a claude` (default) |
-| [Codex CLI](https://developers.openai.com/codex/cli) | `omar -a codex` |
-| [Cursor CLI](https://cursor.com/cli) | `omar -a cursor` |
-| [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode` |
-| [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy` |
-| [Pi](https://pi.dev) | `omar -a pi` |
+| [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | `omar -a claude up` (default) |
+| [Codex CLI](https://developers.openai.com/codex/cli) | `omar -a codex up` |
+| [Cursor CLI](https://cursor.com/cli) | `omar -a cursor up` |
+| [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode up` |
+| [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy up` |
+| [Pi](https://pi.dev) | `omar -a pi up` |
 
-Each `omar -a <backend>` launch creates a new EA, named with its new EA number.
-Use `omar -a codex --ea Research` to give the new EA a semantic name. An existing
-name is rejected rather than replacing its manager. Run `omar --ea <id-or-name>`
-without `-a` to open an existing EA.
-
-Codex launch commands no longer disable the alternate screen. OMAR does not
-add `--no-alt-screen`; an explicit flag in a custom command is still respected.
-Remove that flag from an existing `default_command` to try the alternate screen,
-then launch a new session (running sessions keep their original arguments).
-
-The web terminal forwards Escape to the agent. Close with the **Close** button,
-**Ctrl+Shift+Escape**, or a click on the backdrop. New sessions use the launching
-terminal's dimensions, or 120×40 when headless. Web attachments start at the
-panel's measured size. After the last viewer in a daemon closes, OMAR restores
-the original size and sizing policy if no external client remains and the
-policy has not been changed. Concurrent clients still share tmux's window and
-its sizing policy; a manually sized window stays manual.
+Each `omar -a <backend> up` starts a new independent session. Add `--name dev`
+to name it, and `--web` or `--tui` to open a client immediately.
 
 ## License
 

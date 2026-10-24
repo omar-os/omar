@@ -154,11 +154,16 @@ pub(crate) fn opencode_config_env(context: &McpLaunchContext) -> Option<String> 
             "omar": {
                 "type": "local",
                 "enabled": true,
+                // opencode lists MCP tools as `<server>_<tool>`. Bare names
+                // make that `omar_set_port`, the name OMAR's prompts use,
+                // rather than `omar_omar_set_port`, which literal-minded
+                // models never find.
                 "command": [
                     server_exe.display().to_string(),
                     "mcp-server",
                     "--context-file",
-                    context_file.display().to_string()
+                    context_file.display().to_string(),
+                    "--bare-tool-names"
                 ]
             }
         },

@@ -10,7 +10,7 @@ team Beacon(label : string)[agent : Codex]
     timer t(5ns, 0)
     output note : string
 
-    prompt agent(t) -> note
+    task agent(t) -> note
     "
         The $(label) timer fired at logical time $(t).
         Set `note` to exactly: fired at $(t)

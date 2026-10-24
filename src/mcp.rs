@@ -32,7 +32,7 @@ const INITIAL_PROMPT_DELIVERY_STATUS_TIMEOUT: Duration = Duration::from_millis(1
 const SERVER_INSTRUCTIONS: &str = concat!(
     "OMAR provides orchestration tools for executive assistant and worker sessions. ",
     "Use these tools for agent delegation, project tracking, scheduled wake-ups, ",
-    "manager notes, action logs, Slack replies, and shared computer control. ",
+    "manager notes, action logs, and shared computer control. ",
     "Tracked tasks have durable runtime supervision: use finish_task for results, ",
     "get_task to read them, and acknowledge_task with result_revision to consume them. ",
     "Call coordination_state after context loss. Do not schedule child polling timers. ",
@@ -435,7 +435,7 @@ impl Drop for FileLock {
     }
 }
 
-pub fn run_server_from_context_file(path: PathBuf) -> Result<()> {
+pub fn run_server_from_context_file(path: PathBuf, bare_tool_names: bool) -> Result<()> {
     let mut context: McpLaunchContext = serde_json::from_str(
         &fs::read_to_string(&path)
             .with_context(|| format!("Failed to read MCP context file {}", path.display()))?,
@@ -463,7 +463,9 @@ pub fn run_server_from_context_file(path: PathBuf) -> Result<()> {
         }
     }
     apply_context_environment(&context);
-    OmarMcpServer::new(context).run()
+    OmarMcpServer::new(context)
+        .with_bare_tool_names(bare_tool_names)
+        .run()
 }
 
 fn apply_context_environment(context: &McpLaunchContext) {
@@ -475,17 +477,13 @@ fn apply_context_environment(context: &McpLaunchContext) {
 }
 
 /// Run an MCP server without a pre-built context file. Used by peer
-/// processes (e.g. the Slack bridge) that aren't spawned by a specific
+/// processes that aren't spawned by a specific
 /// backend launch and need a default context derived from the current
 /// config + active EA.
-pub fn run_server_with_default_context() -> Result<()> {
+pub fn run_server_with_default_context(bare_tool_names: bool) -> Result<()> {
     let omar_dir = std::env::var_os("OMAR_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".omar")
-        });
+        .unwrap_or_else(crate::sessions::state_root);
     let config_path = omar_dir.join("config.toml").to_string_lossy().into_owned();
     let config = crate::config::Config::load(Some(&config_path))
         .with_context(|| format!("Failed to load omar config for {}", omar_dir.display()))?;
@@ -506,11 +504,13 @@ pub fn run_server_with_default_context() -> Result<()> {
         topology: None,
         serve: None,
     };
-    OmarMcpServer::new(context).run()
+    OmarMcpServer::new(context)
+        .with_bare_tool_names(bare_tool_names)
+        .run()
 }
 
 /// Pick the EA id for a default-context server. Honors `OMAR_EA_ID` so
-/// peer processes (e.g. the Slack bridge) can pin a child to a specific
+/// a peer process can pin a child to a specific
 /// EA without mutating the global active-EA pointer the dashboard reads.
 fn resolve_default_context_ea(omar_dir: &Path, registered: &[ea::EaInfo]) -> Result<ea::EaId> {
     if let Some(raw) = std::env::var_os("OMAR_EA_ID") {
@@ -537,7 +537,16 @@ struct OmarMcpServer {
     session_prefix: String,
     manager_session: String,
     scheduler: scheduler::Scheduler,
+    /// Expose `omar_set_port` as `set_port`, and so on. For clients that
+    /// prefix every tool with the server name: opencode would otherwise show
+    /// `omar_omar_set_port` while every OMAR prompt says `omar_set_port`, and
+    /// a model that takes the prompt literally calls a tool that does not
+    /// exist. With bare names its prefix rebuilds exactly the documented one.
+    bare_tool_names: bool,
 }
+
+/// The prefix bare-name clients drop from tool names and rebuild themselves.
+const TOOL_PREFIX: &str = "omar_";
 
 impl OmarMcpServer {
     fn new(context: McpLaunchContext) -> Self {
@@ -552,7 +561,29 @@ impl OmarMcpServer {
             session_prefix,
             manager_session,
             scheduler,
+            bare_tool_names: false,
         }
+    }
+
+    fn with_bare_tool_names(mut self, bare: bool) -> Self {
+        self.bare_tool_names = bare;
+        self
+    }
+
+    /// The name OMAR dispatches on, for a name the client may have sent bare.
+    fn canonical_tool_name(&self, name: &str) -> String {
+        if self.bare_tool_names && !name.starts_with(TOOL_PREFIX) {
+            let prefixed = format!("{TOOL_PREFIX}{name}");
+            let known = topology_tool_definitions()
+                .into_iter()
+                .chain(ea_tool_definitions())
+                .chain(tool_definitions())
+                .any(|tool| tool["name"].as_str() == Some(prefixed.as_str()));
+            if known {
+                return prefixed;
+            }
+        }
+        name.to_string()
     }
 
     fn run(&self) -> Result<()> {
@@ -629,6 +660,22 @@ impl OmarMcpServer {
                     }
                     tools
                 };
+                let tools = if self.bare_tool_names {
+                    tools
+                        .into_iter()
+                        .map(|mut tool| {
+                            if let Some(bare) = tool["name"]
+                                .as_str()
+                                .and_then(|name| name.strip_prefix(TOOL_PREFIX))
+                            {
+                                tool["name"] = json!(bare);
+                            }
+                            tool
+                        })
+                        .collect()
+                } else {
+                    tools
+                };
                 ok_response(id, json!({ "tools": tools }))
             }
             "tools/call" => match serde_json::from_value::<ToolCallRequest>(request.params) {
@@ -646,6 +693,10 @@ impl OmarMcpServer {
     }
 
     fn call_tool(&self, call: ToolCallRequest) -> Value {
+        let call = ToolCallRequest {
+            name: self.canonical_tool_name(&call.name),
+            arguments: call.arguments,
+        };
         append_debug_log(
             &self.context,
             &format!("tool_call name={} args={}", call.name, call.arguments),
@@ -707,7 +758,6 @@ impl OmarMcpServer {
                 "list_events" => self.list_events(),
                 "cancel_event" => self.cancel_event(call.arguments),
                 "log_justification" => self.log_justification(call.arguments),
-                "slack_reply" => self.slack_reply(call.arguments),
                 "computer_status" => self.computer_status(),
                 "computer_lock_acquire" => self.computer_lock_acquire(call.arguments),
                 "computer_lock_release" => self.computer_lock_release(call.arguments),
@@ -1708,46 +1758,6 @@ impl OmarMcpServer {
         }))
     }
 
-    /// Queue a Slack reply for the `omar-slack-bridge` peer to pick up and
-    /// post to Slack. File-based rendezvous via `{omar_dir}/slack_outbox/`
-    /// keeps the MCP surface free of loopback HTTP and survives a bridge
-    /// that's momentarily down — the bridge drains the outbox on restart.
-    fn slack_reply(&self, args: Value) -> Result<Value> {
-        #[derive(Deserialize)]
-        struct Args {
-            channel: String,
-            #[serde(default)]
-            thread_ts: Option<String>,
-            text: String,
-        }
-        let args: Args = serde_json::from_value(args)?;
-        if args.channel.trim().is_empty() {
-            return Err(anyhow!("slack_reply requires a non-empty channel"));
-        }
-        if args.text.is_empty() {
-            return Err(anyhow!("slack_reply requires a non-empty text"));
-        }
-        let dir = self.context.omar_dir.join("slack_outbox");
-        fs::create_dir_all(&dir).context("Failed to create slack outbox directory")?;
-        let id = Uuid::new_v4();
-        let tmp = dir.join(format!("{}.json.tmp", id));
-        // Prefix filename with timestamp so the bridge delivers messages in
-        // the order they were queued even under heavy fan-out.
-        let final_path = dir.join(format!("{}-{}.json", now_ns(), id));
-        let payload = serde_json::to_vec(&json!({
-            "channel": args.channel,
-            "thread_ts": args.thread_ts,
-            "text": args.text,
-            "queued_at": now_rfc3339(),
-        }))?;
-        fs::write(&tmp, &payload).context("Failed to stage slack reply")?;
-        fs::rename(&tmp, &final_path).context("Failed to commit slack reply")?;
-        Ok(json!({
-            "status": "queued",
-            "path": final_path,
-        }))
-    }
-
     fn log_justification(&self, args: Value) -> Result<Value> {
         #[derive(Deserialize)]
         struct Args {
@@ -2439,20 +2449,6 @@ fn tool_definitions() -> Vec<Value> {
             }),
         ),
         tool(
-            "slack_reply",
-            "Queue a reply for the omar-slack-bridge to post to Slack. Use only in response to a Slack-originated request and pass channel/thread_ts from the inbound [SLACK MESSAGE] event. Side effect: writes an outbox file that the bridge may post. Not retry-safe because duplicate files can post duplicate messages. Fails if channel or text is empty.",
-            json!({
-                "type":"object",
-                "properties":{
-                    "channel":{"type":"string","description":"From the inbound [SLACK MESSAGE] event."},
-                    "thread_ts":{"type":"string","description":"From the inbound [SLACK MESSAGE] event. Omit to start a new thread."},
-                    "text":{"type":"string"}
-                },
-                "required":["channel","text"],
-                "additionalProperties":false
-            }),
-        ),
-        tool(
             "computer_status",
             "Check shared desktop-control availability and dependency status. Use before acquiring the computer lock or diagnosing GUI automation failures. Read-only and safe to retry.",
             json!({"type":"object","properties":{},"additionalProperties":false}),
@@ -2567,7 +2563,8 @@ fn ea_tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "program":{"type":"string","description":"Complete .omar source"},
+                    "program":{"type":"string","description":"Complete .omar source (program.omar)"},
+                    "files":{"type":"object","additionalProperties":{"type":"string"},"description":"Companion files keyed by relative path, e.g. schemas/decision.json. Include every imported schema."},
                     "summary":{"type":"string","description":"One or two sentences on what it does"},
                     "inputs":{"type":"object","description":"Values for the program's declared input ports"}
                 },
@@ -2669,11 +2666,15 @@ fn topology_tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "invocation_id":{"type":"string"},
+                    "task_id":{"type":"integer","minimum":1,"description":"The exact task_id supplied in the task prompt or returned by omar_pending."},
                     "port":{"type":"string"},
-                    "value":{}
+                    // Any JSON type is accepted, so no `type` is declared. An
+                    // empty schema left small models guessing a shape and
+                    // wrapping strings as {"type":"string","value":…}; the
+                    // description alone stopped that.
+                    "value":{"description":"The value as a bare JSON value of the port's declared type: a JSON string for string, path and bytes ports (never an object wrapping it), a number for int and float, true or false for bool, an array for list<...>, and null for a signal or an empty option."}
                 },
-                "required":["invocation_id","port","value"],
+                "required":["task_id","port","value"],
                 "additionalProperties":false
             }),
         ),
@@ -2682,8 +2683,8 @@ fn topology_tool_definitions() -> Vec<Value> {
             "Complete the active OMAR invocation after setting its effects. The runtime validates the final effect snapshot and releases the tag barrier.",
             json!({
                 "type":"object",
-                "properties":{"invocation_id":{"type":"string"}},
-                "required":["invocation_id"],
+                "properties":{"task_id":{"type":"integer","minimum":1,"description":"The exact task_id supplied in the task prompt or returned by omar_pending."}},
+                "required":["task_id"],
                 "additionalProperties":false
             }),
         ),
@@ -3005,12 +3006,117 @@ mod tests {
     }
 
     #[test]
+    fn bare_names_let_a_prefixing_client_rebuild_the_documented_ones() {
+        // opencode lists MCP tools as `<server>_<tool>`; with bare names its
+        // `omar_` prefix yields `omar_set_port`, the name every prompt uses.
+        let topology = McpLaunchContext {
+            topology: Some(crate::manager::TopologyMcpContext {
+                team: "T".to_string(),
+                agent: "a".to_string(),
+                endpoint: "127.0.0.1:1".to_string(),
+                token: "t".to_string(),
+            }),
+            ..test_context()
+        };
+        let bare = OmarMcpServer::new(topology.clone()).with_bare_tool_names(true);
+        assert_eq!(
+            listed_tools_of(&bare),
+            ["set_port", "complete", "pending"],
+            "bare names drop only the omar_ prefix"
+        );
+        assert_eq!(
+            listed_tools_of(&OmarMcpServer::new(topology)),
+            ["omar_set_port", "omar_complete", "omar_pending"],
+            "other clients keep the documented names"
+        );
+        let ea = OmarMcpServer::new(McpLaunchContext {
+            serve: Some(crate::manager::ServeMcpContext {
+                endpoint: "127.0.0.1:1".to_string(),
+                token: "t".to_string(),
+            }),
+            ..test_context()
+        })
+        .with_bare_tool_names(true);
+        let names = listed_tools_of(&ea);
+        assert!(names.contains(&"reply".to_string()), "{names:?}");
+        assert!(names.contains(&"propose_design".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"coordination_state".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with(TOOL_PREFIX)),
+            "{names:?}"
+        );
+        // A bare call reaches the omar_reply handler: it is validated as one.
+        let result = ea.call_tool(ToolCallRequest {
+            name: "reply".to_string(),
+            arguments: json!("not an object"),
+        });
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(
+            rendered.contains("expects an object of arguments"),
+            "{rendered}"
+        );
+        // Names that were never prefixed are passed through untouched.
+        assert_eq!(
+            ea.canonical_tool_name("coordination_state"),
+            "coordination_state"
+        );
+        assert_eq!(ea.canonical_tool_name("omar_reply"), "omar_reply");
+    }
+
+    fn listed_tools_of(server: &OmarMcpServer) -> Vec<String> {
+        let response = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(1)),
+                method: "tools/list".to_string(),
+                params: json!({}),
+            })
+            .expect("tools/list responds");
+        response.result.expect("tools result")["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
     fn topology_scope_exposes_only_port_protocol_tools() {
         let names: Vec<_> = topology_tool_definitions()
             .into_iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(names, ["omar_set_port", "omar_complete", "omar_pending"]);
+    }
+
+    #[test]
+    fn topology_tools_require_integer_task_ids() {
+        let tools = topology_tool_definitions();
+        for tool in &tools[..2] {
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["properties"]["task_id"]["type"], "integer");
+            assert_eq!(schema["properties"]["task_id"]["minimum"], 1);
+            assert!(schema["properties"].get("invocation_id").is_none());
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("task_id")));
+        }
+    }
+
+    #[test]
+    fn set_port_value_is_described_but_untyped() {
+        let tools = topology_tool_definitions();
+        let value = &tools[0]["inputSchema"]["properties"]["value"];
+        // Untyped, because a port may carry any JSON type...
+        assert!(value.get("type").is_none(), "{value}");
+        // ...but described, because an empty schema had small models wrap
+        // strings in an object the string port then rejected.
+        let description = value["description"].as_str().unwrap();
+        assert!(description.contains("never an object"), "{description}");
     }
 
     #[test]
@@ -3188,47 +3294,6 @@ mod tests {
             std::env::var("OMAR_TMUX_SERVER").as_deref(),
             Ok("isolated-test-server")
         );
-    }
-
-    #[test]
-    fn slack_reply_queues_file_in_outbox() {
-        let server = OmarMcpServer::new(test_context());
-        let outbox = server.context.omar_dir.join("slack_outbox");
-
-        let result = server
-            .slack_reply(json!({
-                "channel": "C123",
-                "thread_ts": "1700000000.001",
-                "text": "hello from test",
-            }))
-            .expect("slack_reply should succeed");
-
-        assert_eq!(result["status"], json!("queued"));
-        assert!(outbox.is_dir(), "outbox dir must exist");
-
-        let entries: Vec<_> = std::fs::read_dir(&outbox)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
-            .collect();
-        assert_eq!(entries.len(), 1, "exactly one outbox file");
-
-        let body = std::fs::read_to_string(entries[0].path()).unwrap();
-        let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["channel"], json!("C123"));
-        assert_eq!(parsed["thread_ts"], json!("1700000000.001"));
-        assert_eq!(parsed["text"], json!("hello from test"));
-    }
-
-    #[test]
-    fn slack_reply_rejects_empty_channel_or_text() {
-        let server = OmarMcpServer::new(test_context());
-        assert!(server
-            .slack_reply(json!({"channel": "", "text": "x"}))
-            .is_err());
-        assert!(server
-            .slack_reply(json!({"channel": "C1", "text": ""}))
-            .is_err());
     }
 
     #[test]

@@ -11,18 +11,18 @@ team OrTriggers[splitter : Codex,
     action delay
     action slow : string
 
-    prompt splitter(request) -> fast, delay
+    task splitter(request) -> fast, delay
     "
         Set `fast` to a short immediate response to $(request).
         Also emit the `delay` signal by setting it to null.
     "
 
-    prompt lagger(delay) -> slow
+    task lagger(delay) -> slow
     "
         The delay signal arrived. Set `slow` to `slow path complete`.
     "
 
-    prompt observer(fast, slow) -> observation
+    task observer(fast, slow) -> observation
     "
         This reaction fires when either trigger is present.
         fast=$(fast)

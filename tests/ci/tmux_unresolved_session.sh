@@ -19,13 +19,19 @@ if [ ! -x "$OMAR_BIN" ]; then
   exit 1
 fi
 
-server="omar-unresolved-session-${RANDOM}-$$"
+server=""
+session_id=""
 home_dir="$(mktemp -d)"
 unresolved_session="omar-agent-rest-api"
 legacy_session="omar-agent-ea"
 
 cleanup() {
-  tmux -L "$server" kill-server >/dev/null 2>&1 || true
+  if [ -n "$session_id" ]; then
+    HOME="$home_dir" "$OMAR_BIN" down -s "$session_id" --force --timeout 5 >/dev/null 2>&1 || true
+  fi
+  if [ -n "$server" ]; then
+    tmux -L "$server" kill-server >/dev/null 2>&1 || true
+  fi
   rm -rf "$home_dir"
 }
 trap cleanup EXIT
@@ -58,8 +64,11 @@ wait_for_session() {
   return 1
 }
 
+session_json="$(cd "$REPO_ROOT" && HOME="$home_dir" "$OMAR_BIN" up --name harness --json)"
+session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$session_json")"
+server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
 tmux_cmd new-session -d -s omar-dashboard \
-  "cd '$REPO_ROOT' && HOME='$home_dir' OMAR_TMUX_SERVER='$server' '$OMAR_BIN'"
+  "cd '$REPO_ROOT' && HOME='$home_dir' '$OMAR_BIN' attach -s '$session_id' --tui"
 
 wait_for_session omar-dashboard
 wait_for_session omar-agent-ea-0

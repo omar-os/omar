@@ -10,6 +10,7 @@ const LABELS: Record<string, string> = {
   cursor: "Cursor",
   opencode: "opencode",
   agy: "agy",
+  pi: "pi",
 };
 
 function label(backend: string): string {

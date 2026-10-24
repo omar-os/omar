@@ -72,12 +72,12 @@ const STUB_FLOW = `team StubFlow[writer : Stub,
     output blurb : string
     action draft : string
 
-    prompt writer(topic) -> draft
+    task writer(topic) -> draft
     "
         Draft something about $(topic).
     "
 
-    prompt editor(draft) -> blurb
+    task editor(draft) -> blurb
     "
         Tighten $(draft).
     "
@@ -94,7 +94,7 @@ const UNRESOLVABLE = `team Conformance[worker : NotARealBackend]
     input go : string
     output done : string
 
-    prompt worker(go) -> done
+    task worker(go) -> done
     "
         Echo $(go) into done.
     "
@@ -127,7 +127,7 @@ async function startRealServe() {
     );
     child.stdout.on("data", (chunk) => {
       buffer += chunk;
-      const match = /OMAR serve: (http:\/\/\S+)/.exec(buffer);
+      const match = /URL:\s+(http:\/\/\S+)/.exec(buffer);
       if (match) {
         clearTimeout(timer);
         resolveUrl(match[1]);
@@ -139,9 +139,19 @@ async function startRealServe() {
     });
   });
 
+  // The runtime's private state (its MCP context among it) lives in the
+  // session's own directory, found through the registry.
+  const listed = spawnSync(OMAR_BIN, ["ls", "--json"], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: home },
+  });
+  const stateDir = JSON.parse(listed.stdout || "[]").find((s) => s.state === "ready")?.directory;
+  assert.ok(stateDir, `no ready session listed: ${listed.stdout} ${listed.stderr}`);
+
   return {
     url,
     home,
+    stateDir,
     sessionPrefix,
     async close() {
       child.kill();
@@ -351,7 +361,7 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     // `--no-ea` still writes the context, so the harness can stand in for the
     // assistant without an agent process existing.
     const context = JSON.parse(
-      await readFile(join(real.home, ".omar/mcp/ea-0/context.json"), "utf8"),
+      await readFile(join(real.stateDir, "mcp/ea-0/context.json"), "utf8"),
     );
     const token = context.serve?.token;
     assert.equal(typeof token, "string", "serve wrote its token into the context");
@@ -513,7 +523,7 @@ test("two chats run the same topology independently and retain their live panels
   const program = `team Concurrent[panel : Web] {
     input question : string
     output answer : string
-    prompt panel(question) -> answer within(1min) "Answer $(question)."
+    task panel(question) -> answer within(1min) "Answer $(question)."
   }
   main Concurrent { flow = Concurrent() }`;
   try {
@@ -539,12 +549,12 @@ test("two chats run the same topology independently and retain their live panels
       assert.fail("live panel never became ready");
     };
     const [pa, pb] = await Promise.all([waitPanel(firstBase, a), waitPanel(secondBase, b)]);
-    assert.notEqual(pa.invocation_id, pb.invocation_id);
+    assert.notEqual(pa.task_id, pb.task_id);
     await request(`/v1/chats/${first.id}/activate`, post({}));
     const listing = await request("/v1/chats");
     for (const chat of listing.conversations) assert.equal(chat.run.status, "running");
     assert.equal((await fetch(`${real.url}${secondBase}/v1/runs/${a.run_id}`)).status, 404);
-    const answer = (base, run, panel, value) => request(`${base}/v1/runs/${run.run_id}/panel`, post({ invocation_id: panel.invocation_id, agent: panel.agent, values: { "flow.answer": value } }));
+    const answer = (base, run, panel, value) => request(`${base}/v1/runs/${run.run_id}/panel`, post({ task_id: panel.task_id, agent: panel.agent, values: { "flow.answer": value } }));
     await answer(firstBase, a, pa, "First result");
     for (let attempt = 0; attempt < 100; attempt++) {
       const status = await request(`${firstBase}/v1/runs/${a.run_id}`);

@@ -206,7 +206,17 @@ export async function checkProgram(
   serveUrl: string,
   program: string,
   filename: string,
-  options: { timeline?: boolean; present?: string[] } = {},
+  options: {
+    timeline?: boolean;
+    present?: string[];
+    /**
+     * Files the program imports, by the relative path it imports them under.
+     * The daemon stages the program alone, so what it imports has to come
+     * with it. The editor has no second file to send yet; a caller that has
+     * one passes it here.
+     */
+    files?: Record<string, string>;
+  } = {},
   signal?: AbortSignal,
 ): Promise<ProgramCheck> {
   const base = normalizeRuntimeUrl(serveUrl);
@@ -216,6 +226,7 @@ export async function checkProgram(
     body: JSON.stringify({
       program,
       filename,
+      files: options.files ?? {},
       timeline: options.timeline ?? false,
       present: options.present ?? [],
     }),
@@ -284,7 +295,7 @@ export async function fetchPanel(
 export async function answerPanel(
   serveUrl: string,
   runId: string,
-  answer: { invocation_id: string; agent: string; values: Record<string, unknown> },
+  answer: { task_id: number; agent: string; values: Record<string, unknown> },
   signal?: AbortSignal,
 ): Promise<void> {
   const base = normalizeRuntimeUrl(serveUrl);
@@ -316,6 +327,149 @@ export async function stopRun(
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(
     `${base}/v1/runs/${encodeURIComponent(runId)}/stop`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  return assertRunRecord(await response.json());
+}
+
+/** One runtime checkpoint of a run, as the daemon lists it. */
+export interface CheckpointSummary {
+  id: string;
+  sequence: number;
+  parent: string | null;
+  trigger: "automatic" | "manual" | "pause";
+  completed_tag: [number, number] | null;
+  next_tag: [number, number] | null;
+  created_at: number;
+}
+
+export interface CheckpointListing {
+  checkpoints: CheckpointSummary[];
+  resume_point: string | null;
+}
+
+/** A run's checkpoints, oldest first, and which one a resume continues from. */
+export async function fetchCheckpoints(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<CheckpointListing> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/checkpoints`, { signal });
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { checkpoints?: unknown; resume_point?: unknown };
+  if (!Array.isArray(body.checkpoints)) throw new Error("checkpoint listing is not a list");
+  return {
+    checkpoints: body.checkpoints as CheckpointSummary[],
+    resume_point: typeof body.resume_point === "string" ? body.resume_point : null,
+  };
+}
+
+/** The logical timeline of a run the daemon admitted, projected from its program and inputs. */
+/**
+ * The diagram a paused run left behind. Its own server died with the loop,
+ * so this is what a reload shows until the run is resumed.
+ */
+export async function fetchRunSnapshot(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<DiagramSnapshot> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/snapshot`, { signal });
+  if (!response.ok) {
+    throw new Error(`Runtime returned HTTP ${response.status}.`);
+  }
+  return assertDiagramSnapshot(await response.json());
+}
+
+export async function fetchRunTimeline(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<{ steps: TimelineStep[]; truncated: boolean }> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/timeline`, { signal });
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { steps?: unknown; truncated?: unknown };
+  return {
+    steps: Array.isArray(body.steps) ? (body.steps as TimelineStep[]) : [],
+    truncated: body.truncated === true,
+  };
+}
+
+/** One checkpoint in full: what the run had done, what was queued, and each instance's file version. */
+export interface CheckpointDetail extends CheckpointSummary {
+  is_resume_point: boolean;
+  outputs: Record<string, unknown>;
+  state_vars: Record<string, unknown>;
+  queue_len: number;
+  queued_tags: [number, number][];
+  elapsed_ns: number;
+  workspaces: Record<string, { workspace_id: string; snapshot_id: string; commit: string }>;
+  agents: Record<string, { backend: string; restoration: string }>;
+}
+
+export async function fetchCheckpoint(
+  serveUrl: string,
+  runId: string,
+  checkpoint: string,
+  signal?: AbortSignal,
+): Promise<CheckpointDetail> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/checkpoints/${encodeURIComponent(checkpoint)}`,
+    { signal },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  return (await response.json()) as CheckpointDetail;
+}
+
+/** Move a paused run's resume point to an older checkpoint; nothing is deleted. */
+export async function rollbackRun(
+  serveUrl: string,
+  runId: string,
+  checkpoint: string,
+  signal?: AbortSignal,
+): Promise<CheckpointListing["resume_point"]> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/rollback`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ checkpoint }), signal },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { resume_point?: unknown };
+  return typeof body.resume_point === "string" ? body.resume_point : null;
+}
+
+/** Ask a run to checkpoint at its next tag boundary and park; answers `pausing`. */
+export async function pauseRun(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<RunRecord> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/pause`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  return assertRunRecord(await response.json());
+}
+
+/**
+ * Continue a paused run under the same id. Answers once the resumed run's
+ * diagram is up, so the record comes back `running` with a fresh address.
+ */
+export async function resumeRun(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<RunRecord> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/resume`,
     { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal },
   );
   if (!response.ok) throw new Error(await readError(response));
@@ -375,6 +529,9 @@ export function subscribeToDiagram(
     "reaction_completed",
     "run_completed",
     "run_failed",
+    "run_paused",
+    "run_checkpointed",
+    "clock_started",
   ];
   for (const kind of kinds) {
     stream.addEventListener(kind, (raw) => {

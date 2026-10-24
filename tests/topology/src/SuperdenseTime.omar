@@ -15,18 +15,18 @@ team SuperdenseTime[producer : Codex,
     // fixed delay of 1 are additive, so `connected` arrives at (4, 0).
     immediate -> connected after 3ns
 
-    prompt producer(start) -> immediate, fixed
+    task producer(start) -> immediate, fixed
     "
         Set both `immediate` and `fixed` to the integer $(start).
     "
 
     // `fixed` is scheduled directly by the producer and arrives at (2, 0).
-    prompt fixed_consumer(fixed) -> fixed_result
+    task fixed_consumer(fixed) -> fixed_result
     "
         Copy $(fixed) to `fixed_result`.
     "
 
-    prompt connected_consumer(connected) -> connected_result
+    task connected_consumer(connected) -> connected_result
     "
         Copy $(connected) to `connected_result`.
     "

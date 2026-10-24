@@ -6,10 +6,12 @@
 //! itself. Adding a backend is one variant of [`Kind`], one file, and one
 //! entry in [`ALL`].
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use serde_json::Value;
 
 use crate::manager::McpLaunchContext;
 
@@ -17,6 +19,7 @@ pub(crate) mod antigravity;
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod cursor;
+pub(crate) mod jev;
 pub(crate) mod managed;
 pub(crate) mod opencode;
 pub(crate) mod pi;
@@ -161,6 +164,7 @@ pub enum Kind {
     Cursor,
     Opencode,
     Pi,
+    Jev,
     Stub,
 }
 
@@ -185,7 +189,48 @@ pub struct Launch<'a> {
     pub context: &'a McpLaunchContext,
 }
 
+/// A recognized startup dialog. Empty keys mean its options are still painting.
+pub struct StartupGate {
+    pub id: &'static str,
+    pub keys: &'static [&'static str],
+    pub confirms: bool,
+}
+
+/// A topology prompt evaluated directly by a backend, without a coding-agent pane.
+/// Output types are the canonical types already resolved and checked by the VM.
+pub struct TopologyInvocation<'a> {
+    pub effects: &'a BTreeMap<String, String>,
+    pub triggers: &'a BTreeMap<String, Value>,
+    pub instructions: &'a str,
+    pub timeout: Duration,
+}
+
 pub trait Backend: Send + Sync {
+    /// This backend evaluates topology prompts directly and cannot run a chat assistant.
+    fn topology_only(&self) -> bool {
+        false
+    }
+
+    /// Only called for a topology-only backend. The VM validates returned writes
+    /// against the invocation's effect contract and port types before publishing.
+    fn invoke_topology(
+        &self,
+        _invocation: &TopologyInvocation<'_>,
+    ) -> Result<BTreeMap<String, Value>> {
+        bail!(
+            "{} does not evaluate topology prompts directly",
+            self.kind().name()
+        )
+    }
+
+    /// Only freshly launched native TUIs may have their startup dialogs answered.
+    fn has_startup_gates(&self) -> bool {
+        false
+    }
+    fn startup_gate(&self, _screen: &str) -> Option<StartupGate> {
+        None
+    }
+
     fn kind(&self) -> Kind;
     /// Names an operator may type. The first is canonical.
     fn aliases(&self) -> &'static [&'static str];
@@ -326,20 +371,20 @@ pub(crate) fn remember_conversation(
     Ok(())
 }
 
-pub const ALL: [&dyn Backend; 7] = [
+pub const ALL: [&dyn Backend; 8] = [
     &claude::Claude,
     &codex::Codex,
     &cursor::Cursor,
     &opencode::Opencode,
     &pi::Pi,
     &antigravity::Antigravity,
+    &jev::Jev,
     &stub::Stub,
 ];
 
 /// Backends an operator can run an assistant on.
 ///
-/// The stub is deliberately absent: it answers invocations without a model,
-/// which is useful for exercising a run and useless for talking to.
+/// Stub and Jev are deliberately absent: neither is a conversational assistant.
 pub const ASSISTANT: [Kind; 6] = [
     Kind::Claude,
     Kind::Codex,
@@ -368,14 +413,21 @@ pub fn by_name(name: &str) -> Option<&'static dyn Backend> {
 
 /// Like [`by_name`], with the error an operator reads.
 pub fn resolve(name: &str) -> Result<&'static dyn Backend, String> {
-    // `web` never reaches here: nothing is spawned for it, so there is no
-    // command to resolve. It is named so a typo is told what it meant.
-    by_name(name).ok_or_else(|| {
+    // Web has no launched process; direct topology backends are registered
+    // but cannot supply a command for an executive assistant or coding pane.
+    let backend = by_name(name).ok_or_else(|| {
         format!(
-            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, pi, agy, stub, web",
+            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, pi, agy, stub, web; topology-only: jev",
             name
         )
-    })
+    })?;
+    if backend.topology_only() {
+        return Err(format!(
+            "{} is a topology-only backend; use it in an .omar team, not as a coding assistant",
+            backend.kind().name()
+        ));
+    }
+    Ok(backend)
 }
 
 /// The backend one token of a command line runs, if it is one of ours.
@@ -643,6 +695,7 @@ mod tests {
             Kind::Cursor,
             Kind::Opencode,
             Kind::Pi,
+            Kind::Jev,
             Kind::Stub,
         ] {
             assert_eq!(of(kind).kind(), kind);
@@ -657,6 +710,18 @@ mod tests {
             assistant_names(),
             ["claude", "codex", "cursor", "opencode", "pi", "agy"]
         );
+    }
+
+    #[test]
+    fn jev_is_registered_for_direct_topology_calls_not_assistant_launches() {
+        let backend = by_name("JeV").unwrap();
+        assert!(resolve("jev").err().unwrap().contains("topology-only"));
+        assert_eq!(backend.kind(), Kind::Jev);
+        assert!(backend.topology_only());
+        assert!(backend.executables().is_empty());
+        assert!(!ASSISTANT.contains(&Kind::Jev));
+        assert!(!resolve("Codex").unwrap().topology_only());
+        assert!(!resolve("ClaudeCode").unwrap().topology_only());
     }
 
     #[test]

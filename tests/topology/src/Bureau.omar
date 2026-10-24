@@ -12,7 +12,7 @@ team Analyst(lens : string)[analyst : ClaudeCode]
     input brief : string
     output finding : string
 
-    prompt analyst(brief) -> finding
+    task analyst(brief) -> finding
     "
         You are an analyst working the $(lens) angle. Answer from your own
         knowledge: do not browse the web, read files, or run commands.
@@ -38,7 +38,7 @@ team Cell(charter : string)[lead : ClaudeCode]
     assignment -> counter.brief
     assignment -> ripple.brief
 
-    prompt lead(evidence.finding, counter.finding, ripple.finding) -> report
+    task lead(evidence.finding, counter.finding, ripple.finding) -> report
     "
         You lead the $(charter) cell. Three analysts worked the same assignment
         from different angles.
@@ -63,7 +63,7 @@ team Division(mission : string)[director : ClaudeCode]
     probe = Cell("probe");
     stress = Cell("stress");
 
-    prompt director(mandate) -> probe_task, stress_task
+    task director(mandate) -> probe_task, stress_task
     "
         You direct the $(mission) division. Your mandate: $(mandate)
 
@@ -77,7 +77,7 @@ team Division(mission : string)[director : ClaudeCode]
     probe_task -> probe.assignment
     stress_task -> stress.assignment
 
-    prompt director(probe.report, stress.report) -> brief
+    task director(probe.report, stress.report) -> brief
     "
         Both of your cells have reported on the $(mission) mandate.
 
@@ -102,7 +102,7 @@ team Bureau[chief : ClaudeCode, editor : ClaudeCode]
     d_tech = Division("technology");
     d_risk = Division("risk");
 
-    prompt chief(topic) -> markets_mandate, tech_mandate, risk_mandate
+    task chief(topic) -> markets_mandate, tech_mandate, risk_mandate
     "
         You run a research bureau with three divisions. The topic is: $(topic)
 
@@ -118,7 +118,7 @@ team Bureau[chief : ClaudeCode, editor : ClaudeCode]
     tech_mandate -> d_tech.mandate
     risk_mandate -> d_risk.mandate
 
-    prompt editor(d_markets.brief, d_tech.brief, d_risk.brief) -> dossier
+    task editor(d_markets.brief, d_tech.brief, d_risk.brief) -> dossier
     "
         The three divisions have reported on the bureau's topic.
 
@@ -138,7 +138,7 @@ team Referee(standard : string)[referee : ClaudeCode]
     input dossier : string
     output verdict : string
 
-    prompt referee(dossier) -> verdict
+    task referee(dossier) -> verdict
     "
         Judge this dossier on one standard only: $(standard).
 
@@ -161,7 +161,7 @@ team Audit[judge : ClaudeCode]
     dossier -> rigor.dossier
     dossier -> usefulness.dossier
 
-    prompt judge(rigor.verdict, usefulness.verdict) -> ruling
+    task judge(rigor.verdict, usefulness.verdict) -> ruling
     "
         Two referees graded the bureau's dossier.
 

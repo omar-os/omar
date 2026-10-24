@@ -89,9 +89,67 @@ export function formatDuration(nanos: number): string {
   return `${nanos / scale}${unit}`;
 }
 
+/**
+ * Time left before something fires, read at a glance.
+ *
+ * Coarser than `formatDuration` on purpose. A schedule is a fact of the
+ * program and is shown exactly; a countdown is a moving reading, so it is
+ * shown in the largest units that still say something: `1 m 30 s`, never
+ * milliseconds once there is a whole second to show, never seconds left out
+ * because a minute happens to divide them. Rounded up, so it reads `1 s`
+ * right until the firing and never shows a zero that is not yet true. At or
+ * past the firing it reads `due`.
+ */
+export function formatCountdown(nanos: number): string {
+  if (!Number.isFinite(nanos)) return "—";
+  if (nanos <= 0) return "due";
+  const millis = Math.ceil(nanos / 1_000_000);
+  if (millis < 1000) return `${millis} ms`;
+  const seconds = Math.ceil(nanos / 1_000_000_000);
+  const parts: string[] = [];
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  if (hours > 0) parts.push(`${hours} h`);
+  if (minutes > 0) parts.push(`${minutes} m`);
+  if (rest > 0) parts.push(`${rest} s`);
+  return parts.join(" ");
+}
+
+/**
+ * The run's physical clock as of `now` (wall milliseconds), in the
+ * nanoseconds of run time a tag is stamped in.
+ *
+ * The runtime says where its logical time zero stands on the wall clock
+ * (`clock_origin`, announced when the loop starts its clock, after the agents
+ * are up, and set back on a resume by the time already spent), so the clock
+ * is simply wall time since then. That is right before the first tag, which
+ * is where a timer's offset is counted from, and nothing published within a
+ * tag moves it. A timer due two minutes after a tag that was a minute late
+ * reads one minute away, since the tag's lag is in that elapsed time too.
+ *
+ * A runtime that has not announced its origin is read as the current tag
+ * plus its lag, carried on from when this client first saw that tag: right
+ * unless the client connected mid-tag.
+ */
+export function runClockAt(
+  snapshot: Pick<DiagramSnapshot, "current_tag" | "lag" | "clock_origin">,
+  now: number,
+  firstSeen: number,
+): number {
+  if (typeof snapshot.clock_origin === "number") {
+    return Math.max(0, now - snapshot.clock_origin) * 1_000_000;
+  }
+  return (
+    (snapshot.current_tag?.timestamp ?? 0) +
+    (snapshot.lag ?? 0) +
+    Math.max(0, now - firstSeen) * 1_000_000
+  );
+}
+
 /** One invocation a `Web` agent is waiting on, as the daemon reports it. */
 export type PendingInvocation = {
-  invocation_id: string;
+  task_id: number;
   agent: string;
   reaction: string;
   contract: string;
@@ -129,6 +187,9 @@ export function openInputs(snapshot: DiagramSnapshot): DiagramPort[] {
  * shows as a problem with that field rather than sending and being refused.
  */
 export function parseInputValue(type: string, text: string): unknown | undefined {
+  // An enum string (`string in ["a","b"]`) is typed as bare text, like the CLI;
+  // whether it is an admitted value is the runtime's answer, not the parser's.
+  if (type.startsWith("string in ")) return text;
   const trimmed = text.trim();
   switch (type) {
     case "string":
@@ -196,7 +257,11 @@ export function assertChatMessage(value: unknown): ChatMessage {
     if (typeof design.program !== "string") {
       throw new Error("Proposed design is missing its program.");
     }
-    design = { ...design, preview: assertDiagramSnapshot(design.preview) };
+    const files = design.files ?? {};
+    if (!files || typeof files !== "object" || Array.isArray(files) || Object.values(files).some((contents) => typeof contents !== "string")) {
+      throw new Error("Proposed design files must map relative paths to text.");
+    }
+    design = { ...design, files, preview: assertDiagramSnapshot(design.preview) };
   }
   return { ...message, design, progress, selection } as ChatMessage;
 }
@@ -205,6 +270,16 @@ export type RunRequest = {
   program: string;
   inputs: Record<string, unknown>;
   conversation_id?: string;
+  timeout_seconds?: number;
+  /**
+   * Files the program imports, by the relative path it imports them under.
+   * Staged beside the program; absent, the program imports nothing.
+   */
+  files?: Record<string, string>;
+  /** Keep the instances' workspaces when the run ends; off, they go with it. */
+  keep_workspaces?: boolean;
+  /** `off`, `tag`, `30m` (physical) or `logical:30m`; the daemon's default is an hour. */
+  checkpoint_period?: string;
 };
 
 /**
@@ -214,7 +289,7 @@ export type RunRequest = {
  * failure. It was missing here for as long as the daemon could answer it.
  */
 export function isRunFinished(status: RunStatus): boolean {
-  return status === "completed" || status === "stopped" || status === "failed";
+  return status === "completed" || status === "stopped" || status === "paused" || status === "failed";
 }
 
 export function assertRunRecord(value: unknown): RunRecord {
@@ -322,6 +397,10 @@ export function applyDiagramEvent(
         // Carried on the event as well as the snapshot, so the reading stays
         // right after the run's server has gone and there is nothing to refetch.
         lag: typeof lag === "number" ? lag : snapshot.lag,
+        // A new tag: a task reads idle until it fires again.
+        reactions: snapshot.reactions.map((reaction) =>
+          reaction.status === "idle" ? reaction : { ...reaction, status: "idle", invocation_id: null },
+        ),
         timers: snapshot.timers.map((timer) =>
           timer.name in fired ? { ...timer, last_tag: event.tag } : timer,
         ),
@@ -333,6 +412,28 @@ export function applyDiagramEvent(
       return {
         ...snapshot,
         status: "completed",
+        reactions: snapshot.reactions.map((reaction) =>
+          reaction.status === "running"
+            ? { ...reaction, status: "completed", invocation_id: null }
+            : reaction,
+        ),
+      };
+    case "run_checkpointed":
+      // A checkpoint is a fact about the run's history, not its picture; the
+      // timeline draws it from the listing it refetches on this event.
+      return snapshot;
+    case "clock_started": {
+      // Where the run's logical time zero stands on the wall clock; what a
+      // countdown measures from.
+      const origin = (event.payload as { clock_origin?: unknown }).clock_origin;
+      return typeof origin === "number" ? { ...snapshot, clock_origin: origin } : snapshot;
+    }
+    case "run_paused":
+      // A pause lands at a tag boundary, where nothing is in flight: whatever
+      // was painted as running has finished, and the run waits for a resume.
+      return {
+        ...snapshot,
+        status: "paused",
         reactions: snapshot.reactions.map((reaction) =>
           reaction.status === "running"
             ? { ...reaction, status: "completed", invocation_id: null }

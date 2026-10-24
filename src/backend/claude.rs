@@ -16,6 +16,41 @@ use std::process::Command;
 pub struct Claude;
 
 impl Backend for Claude {
+    fn has_startup_gates(&self) -> bool {
+        true
+    }
+    fn startup_gate(&self, screen: &str) -> Option<super::StartupGate> {
+        // The workspace trust dialog is distinct from tool/command approvals.
+        if !screen.contains("Accessing workspace:") {
+            return None;
+        }
+        let keys = (|| -> Option<&'static [&'static str]> {
+            if !screen.contains("Enter to confirm") {
+                return None;
+            }
+            let lines: Vec<_> = screen.lines().map(str::trim).collect();
+            let yes = lines
+                .iter()
+                .position(|line| line.ends_with("Yes, I trust this folder"))?;
+            let no = lines.iter().position(|line| line.ends_with("No, exit"))?;
+            let selected = |line: &str| line.starts_with(['❯', '›', '>']);
+            if selected(lines[yes]) {
+                Some(&["Enter"])
+            } else if selected(lines[no]) {
+                // Wait for the selection to repaint before confirming it.
+                Some(if yes > no { &["Down"] } else { &["Up"] })
+            } else {
+                None
+            }
+        })()
+        .unwrap_or(&[]);
+        Some(super::StartupGate {
+            id: "workspace-trust",
+            confirms: keys == ["Enter"],
+            keys,
+        })
+    }
+
     fn kind(&self) -> Kind {
         Kind::Claude
     }
@@ -415,6 +450,34 @@ pub(crate) fn child_pids(parent: u32) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_trust_gate_handles_both_option_orders_and_current_selection() {
+        use super::Backend;
+        for (options, expected) in [
+            ("❯ No, exit\n  Yes, I trust this folder", vec!["Down"]),
+            ("  Yes, I trust this folder\n❯ No, exit", vec!["Up"]),
+            (
+                "❯ 1. Yes, I trust this folder\n  2. No, exit",
+                vec!["Enter"],
+            ),
+            ("  No, exit\n  Yes, I trust this folder", vec![]),
+        ] {
+            let screen = format!("Accessing workspace:\n/tmp/team/worktree\n{options}\nEnter to confirm · Esc to cancel");
+            assert_eq!(super::Claude.startup_gate(&screen).unwrap().keys, expected);
+        }
+        let partial = super::Claude
+            .startup_gate("Accessing workspace:\nClaude Code\n❯")
+            .unwrap();
+        assert!(partial.keys.is_empty());
+        assert!(!partial.confirms);
+        assert!(super::Claude
+            .startup_gate("Allow Bash?\n❯ Yes\nNo")
+            .is_none());
+        assert!(super::Claude
+            .startup_gate("Claude Code\n❯ Describe workspace trust")
+            .is_none());
+    }
+
     use super::*;
     use crate::manager::tests::*;
     use crate::manager::TopologyMcpContext;

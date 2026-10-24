@@ -18,6 +18,15 @@ Coverage:
   same source. Plain connections cost nothing, so both are decided at one tag
   and it fires once. Stub.
 - `EffectContracts.omar`: alternatives, optional groups, signals, constants.
+- `SchemaEnum.omar`: two types imported from the JSON Schema files under
+  `src/schemas/`, one with a title and description. A prompt writes both enum
+  ports and a code body reads them. Stub, so the route it reports is fixed by
+  the schema files.
+- `SchemaNested.omar`: the same imported types inside `list` and `option`,
+  written by one prompt and read by another across connections. Stub.
+- `SchemaInput.omar`: an imported enum type on an operator-supplied input,
+  read by a prompt and a code body. CI also runs it with a value outside the
+  enum and checks the run is refused, naming the admitted values. Stub.
 - `OrderedWrites.omar`: shared-effect ordering, optional writes, last writer wins.
 - `Recurrence.omar`: self-triggered action flow across logical microsteps.
 - `Ring.omar`: team parameters, and a `main` block instantiating one team three
@@ -35,6 +44,13 @@ Coverage:
 - `Heartbeat.omar`: a periodic timer driving a program that never finishes.
   Compiled and checked, never run: `run_local.sh` waits for a completion
   marker this program does not produce.
+- `WorldNews.omar`: a 2-minute timer; each tick a Codex researcher fetches the
+  news of that moment and a writer replaces `world-news-summary.txt` in its
+  workspace. For trying checkpoints by hand: every tick differs, the file is
+  state on disk, so pause, roll back to an earlier tick and resume, and the
+  file is that tick's summary again while the clock continues from there.
+  Compiled and checked, never run: it never finishes and it reaches the
+  internet.
 
 Every program declares its teams and then instantiates them in a `main` block,
 so ports are named `instance.port` and each program takes its source file's

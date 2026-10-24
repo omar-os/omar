@@ -208,7 +208,9 @@ fn codex_startup_case(mode: &'static str) -> (bool, usize, usize) {
         "startup event",
         &DeliveryOptions {
             startup_timeout: if mode == "empty" {
-                Duration::from_millis(300)
+                // Each attempt launches several Python tmux doubles; allow
+                // slow hosts enough time to exercise more than one poll.
+                Duration::from_secs(1)
             } else {
                 Duration::from_secs(3)
             },

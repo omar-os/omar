@@ -69,11 +69,17 @@ echo "  root  = $model_a"
 echo "  leaf1 = $model_a"
 echo "  leaf2 = $model_b"
 
-server="omar-opencode-tree-${RANDOM}-$$"
+server=""
+session_id=""
 home_dir="$(mktemp -d)"
 
 cleanup() {
-  tmux -L "$server" kill-server >/dev/null 2>&1 || true
+  if [ -n "$session_id" ]; then
+    HOME="$home_dir" "$OMAR_BIN" down -s "$session_id" --force --timeout 5 >/dev/null 2>&1 || true
+  fi
+  if [ -n "$server" ]; then
+    tmux -L "$server" kill-server >/dev/null 2>&1 || true
+  fi
   rm -rf "$home_dir"
 }
 trap cleanup EXIT
@@ -90,11 +96,11 @@ default_workdir = "."
 EOF
 
 tmux_cmd() {
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" tmux -L "$server" "$@"
+  HOME="$home_dir" tmux -L "$server" "$@"
 }
 
 omar_cmd() {
-  HOME="$home_dir" OMAR_TMUX_SERVER="$server" "$OMAR_BIN" "$@"
+  HOME="$home_dir" "$OMAR_BIN" -s "$session_id" "$@"
 }
 
 wait_for_session() {
@@ -125,8 +131,11 @@ fail() {
   exit 1
 }
 
-# Spawn the EA (root). Uses the configured default_command (opencode + model_a).
-omar_cmd manager start >/dev/null 2>&1 &
+# Start a session; its runtime launches the EA (root) with the configured
+# default_command (opencode + model_a) on the session's own tmux server.
+session_json="$(cd "$REPO_ROOT" && HOME="$home_dir" "$OMAR_BIN" up --name opencode-tree --json)"
+session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$session_json")"
+server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
 ea_session="omar-agent-ea-0"
 wait_for_session "$ea_session" 60 || fail "EA session never came up"
 

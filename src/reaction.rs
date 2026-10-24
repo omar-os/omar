@@ -393,6 +393,11 @@ pub fn reserved_name(qualified: &str) -> Option<&'static str> {
 }
 
 fn rust_type(ty: &str) -> Result<(&'static str, &'static str, &'static str)> {
+    // A refined string arrives as a plain String: what it admits was checked
+    // when it was written. A body may not write one — `verify` says so.
+    if crate::topology::string_enum(ty).is_some() {
+        return Ok(("String", "get_string", "put_string"));
+    }
     // (rust type, getter, putter)
     Ok(match ty {
         "int" => ("i64", "get_int", "put_int"),
@@ -580,12 +585,19 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
                 reactions,
             }));
         }
+        // JSON inspection is opt-in for bodies that name serde_json. Its sources
+        // are already cached by building OMAR, so reaction builds stay offline.
+        let dependencies = if source.contains("serde_json::") {
+            "serde_json = \"1\"\n"
+        } else {
+            ""
+        };
         // An empty [workspace] keeps the crate standalone wherever it lands.
         std::fs::write(
             dir.join("Cargo.toml"),
             format!(
                 "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
-                 [dependencies]\n\n[workspace]\n"
+                 [dependencies]\n{dependencies}\n[workspace]\n"
             ),
         )?;
         // Leaving an unchanged file untouched is what lets cargo skip the work

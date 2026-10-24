@@ -65,10 +65,9 @@ delivery channels all run inside the sandbox. Host-to-worker control uses
 bounded `sbx exec` stdin/stdout frames. No host invocation listener or token is
 passed into the VM; returned effects and state are validated again on the host.
 
-Relative path inputs resolve in the receiving team's worktree. Absolute inputs
-inside the seeded source directory are translated to that
-team's worktree. Paths outside that source and the team's own mounts are rejected;
-cross-team artifact transfer requires a future explicit interface. Ordinary
+Relative path inputs resolve in the receiving team's worktree. Absolute paths
+outside the team's own mounts are rejected; cross-team artifact transfer
+requires a future explicit interface. Ordinary
 strings are not interpreted as paths. Agents cannot use the external `.git`
 pointer: Git versioning belongs to the host runtime.
 
@@ -83,17 +82,20 @@ stop, force kill, and replacement stop the recorded VMs. A failed stop leaves
 cleanup unconfirmed and blocks final/manual snapshots. Cleanup has a single
 60-second budget for the deployment, including one inventory check. Workspaces and stopped
 VMs remain available; use `sbx rm NAME` when their VM-local state is no longer
-needed. OMAR does not automatically delete file history.
+needed. Workspaces follow the run: removed at the end unless
+`--keep-workspaces`.
 
 Sandbox workers keep agent sessions in VM-local tmux. For inspection:
 `sbx exec -it NAME tmux attach`. Host Mission Control terminal attachment and
 code-server execution inside the VM need the editor integration follow-up to
 PR #270. Do not claim a host editor's terminals/extensions are sandboxed.
 
-This PR retains initial/final file snapshots. End-of-tag version publication,
-human-save attribution, consistent whole-topology checkpoints, and pause/resume
-are subsequent work. These snapshots are not resumable execution checkpoints.
-The EA/control runtime remains on the host; this feature isolates topology teams.
+Checkpoints snapshot the mounted worktrees on the host at tag boundaries.
+Pause stops the team's VMs like a stop. Resume reuses the paused run's pinned
+template (not `--sandbox-template`/config) and starts new VMs over the restored
+workspaces; agents start fresh conversations and are told so. Human-save
+attribution remains subsequent work. The EA/control runtime remains on the
+host; this feature isolates topology teams.
 
 ## Validation
 

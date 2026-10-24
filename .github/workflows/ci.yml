@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -116,11 +115,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Build compiler for independent-session integration
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lang
+          test: false
+
       - name: Verify legacy supervision through MCP and tmux
         run: |
           cargo build -p omar
+          python3 tests/ci/independent_sessions.py
           python3 tests/ci/team_workspaces.py
           python3 tests/ci/team_sandboxes.py
+          python3 tests/ci/team_checkpoints.py
+          python3 tests/ci/session_upgrade.py
           python3 tests/ci/legacy_supervision.py
           python3 tests/ci/backend_coordination_contracts.py
           python3 tests/ci/protocol_runner.py
@@ -175,7 +183,7 @@ jobs:
   backend-supervision-contracts:
     name: Backend Supervision Contracts
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -183,6 +191,22 @@ jobs:
           node-version: '22'
       - name: Install pinned backend CLIs
         run: npm install -g @anthropic-ai/claude-code@2.1.274 opencode-ai@1.18.31 @openai/codex@0.154.0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      # The opencode contract registers OMAR's real MCP server to check the
+      # tool names opencode offers the model.
+      - name: Build OMAR
+        run: cargo build --bin omar
       - name: Verify native prompt and wake contracts against local mock providers
         run: |
           python3 tests/ci/claude_prompt_contract.py
@@ -250,6 +274,9 @@ jobs:
           build: true
           test: true
 
+      - name: Test external schema imports
+        run: python3 tests/ci/schema_imports.py
+
       - name: Compile topology corpus to bytecode (offline)
         working-directory: lang
         run: |
@@ -291,9 +318,12 @@ jobs:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
         run: |
           output=$(cargo run --quiet --bin omar -- run \
-            tests/ci/direct_run.omar --input run.request=hello --replace)
+            tests/ci/direct_run.omar --input run.request=hello --replace --fg)
           echo "$output"
           grep -Fq 'Output run.result = "hello"' <<<"$output"
+
+      - name: Verify registered Jev backend (mock HTTP, no API key)
+        run: python3 tests/ci/jev_backend.py -v
 
       - name: Verify agent invocations use side-channel delivery
         env:
@@ -301,7 +331,7 @@ jobs:
         run: |
           output=$(cargo run --quiet --bin omar -- run \
             tests/ci/side_channel_stub.omar --input run.request=go \
-            --timeout-seconds 15 --replace)
+            --timeout-seconds 15 --replace --fg)
           echo "$output"
           grep -Fq 'Output run.result = "stub"' <<<"$output"
 
@@ -312,9 +342,67 @@ jobs:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
         run: |
           output=$(cargo run --quiet --bin omar -- run \
-            tests/topology/src/RingCode.omar --input n1.token=0 --replace)
+            tests/topology/src/RingCode.omar --input n1.token=0 --replace --fg)
           echo "$output"
           grep -Fq 'Output n1.done = 6' <<<"$output"
+
+      # Two types imported from JSON Schema files, written by a stub and read
+      # by a code body. The stub answers with the first value each type
+      # admits, so the route is fixed by the schema files. No model call.
+      - name: Verify imported enum types end to end
+        env:
+          OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
+        run: |
+          output=$(cargo run --quiet --bin omar -- run \
+            tests/topology/src/SchemaEnum.omar --input review.request=hello \
+            --timeout-seconds 15 --replace --fg)
+          echo "$output"
+          grep -Fq 'Output review.decision = "continue"' <<<"$output"
+          grep -Fq 'Output review.priority = "high"' <<<"$output"
+          grep -Fq 'Output dispatch.route = "continue:high"' <<<"$output"
+
+      # Enum types inside list and option, crossing connections between two
+      # prompt teams. The stub writes one admitted value to a list and nothing
+      # to an option. No model call.
+      - name: Verify wrapped enum types end to end
+        env:
+          OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
+        run: |
+          output=$(cargo run --quiet --bin omar -- run \
+            tests/topology/src/SchemaNested.omar --input triage.request=hello \
+            --timeout-seconds 15 --replace --fg)
+          echo "$output"
+          grep -Fq 'Output triage.decisions = ["continue"]' <<<"$output"
+          grep -Fq 'Output triage.priority = null' <<<"$output"
+          grep -Fq 'Output summary.report = "stub"' <<<"$output"
+
+      # An enum input supplied on the command line. A value the type does not
+      # list is refused before anything runs, naming the values it does; one
+      # it lists reaches a prompt and a code body. No model call.
+      - name: Verify an enum input is checked at the door
+        env:
+          OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
+        run: |
+          if output=$(cargo run --quiet --bin omar -- run \
+              tests/topology/src/SchemaInput.omar --input gate.decision=maybe \
+              --timeout-seconds 15 --replace --fg 2>&1); then
+            echo "$output"
+            echo "a value outside the enum was accepted"
+            exit 1
+          fi
+          echo "$output"
+          # The refusal names the admitted values and the one it got; the
+          # quotes around them are escaped in the printed error.
+          refusal=$(grep -F 'expected one of' <<<"$output")
+          grep -Fq 'continue' <<<"$refusal"
+          grep -Fq 'stop' <<<"$refusal"
+          grep -Fq 'maybe' <<<"$refusal"
+          output=$(cargo run --quiet --bin omar -- run \
+            tests/topology/src/SchemaInput.omar --input gate.decision=stop \
+            --timeout-seconds 15 --replace --fg)
+          echo "$output"
+          grep -Fq 'Output gate.route = "routed stop"' <<<"$output"
+          grep -Fq 'Output gate.note = "stub"' <<<"$output"
 
       # No input at all: a timer starts it, and a state variable counts the
       # rounds. The count a run ends with is printed beside its outputs.
@@ -323,7 +411,7 @@ jobs:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
         run: |
           output=$(cargo run --quiet --bin omar -- run \
-            tests/topology/src/RingLeader.omar --replace)
+            tests/topology/src/RingLeader.omar --replace --fg)
           echo "$output"
           grep -Fq 'Output leader.done = true' <<<"$output"
           grep -Fq 'State leader.round = 10' <<<"$output"
@@ -346,7 +434,7 @@ jobs:
 
           # `[name : Backend, other : Backend]` on a team. A port's type is
           # lowercase (`inp : string`), so naming the backends keeps ports out.
-          BACKENDS = "ClaudeCode|Claude|Codex|Cursor|OpenCode|Agy|Stub|Web"
+          BACKENDS = "ClaudeCode|Claude|Codex|Cursor|OpenCode|Agy|Jev|Stub|Web"
           declaration = re.compile(rf"\b(\w+)\s*:\s*({BACKENDS})\b")
 
           def declared_backends(name):
@@ -364,7 +452,7 @@ jobs:
 
           field_rank = {
               "op": 0, "instance": 1, "kind": 2, "name": 3, "type": 4,
-              "delay": 5, "backend": 6, "team": 7
+              "declared": 5, "delay": 6, "backend": 7, "team": 8
           }
           reaction_order = [
               "op", "instance", "id", "agent", "triggers", "effects",
@@ -385,10 +473,17 @@ jobs:
                   ranked = [field_rank[key] for key in keys if key in field_rank]
                   assert ranked == sorted(ranked), (path, keys)
                   if instruction["op"] == "define_port":
+                      # `declared` is how the program spelled an imported
+                      # type, and is absent when it spelled the type itself.
                       assert keys in (
                           ["op", "instance", "kind", "name", "type"],
                           ["op", "instance", "kind", "name", "type", "delay"],
+                          ["op", "instance", "kind", "name", "type", "declared"],
+                          ["op", "instance", "kind", "name", "type", "declared", "delay"],
                       ), (path, keys)
+                  if instruction["op"] == "define_type":
+                      assert keys[:3] == ["op", "name", "type"], (path, keys)
+                      assert set(keys[3:]) <= {"title", "description"}, (path, keys)
                   if instruction["op"] == "declare_instance":
                       assert keys == ["op", "name", "parent", "team"], (path, keys)
                   if instruction["op"] == "declare_timer":
@@ -700,7 +795,7 @@ jobs:
         run: |
           mv lang/.lake "$RUNNER_TEMP/lake-aside"
           output=$(env -u OMARC_BIN "$RUNNER_TEMP/bin/omar" run \
-            tests/ci/direct_run.omar --input run.request=hello --replace)
+            tests/ci/direct_run.omar --input run.request=hello --replace --fg)
           echo "$output"
           grep -Fq 'Output run.result = "hello"' <<<"$output"
           mv "$RUNNER_TEMP/lake-aside" lang/.lake
@@ -746,6 +841,14 @@ jobs:
           test -x "$RUNNER_TEMP/curl-old/omar"
           test ! -e "$RUNNER_TEMP/curl-old/omarc"
 
+  # This commit's install.sh on clean machines, as the omar.rs shim will run it
+  # once released. install-paths covers pinned versions and the compiler guard.
+  install-script:
+    name: Install Script
+    uses: ./.github/workflows/install.yml
+    with:
+      script: head
+
   build:
     name: Build
     runs-on: ${{ matrix.os }}
@@ -779,13 +882,11 @@ jobs:
           name: omar-${{ matrix.os }}
           path: |
             target/release/omar
-            target/release/omar-computer
-            target/release/omar-slack
 
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [msrv, pi-bridge, check, fmt, clippy, test, codex-shared-history, backend-supervision-contracts, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
+    needs: [msrv, pi-bridge, check, fmt, clippy, test, codex-shared-history, backend-supervision-contracts, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, install-script, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: always()
@@ -808,6 +909,7 @@ jobs:
              [[ "${{ needs.dashboard-relaunch-handoff-integration.result }}" != "success" ]] || \
              [[ "${{ needs.opencode-compat.result }}" != "success" ]] || \
              [[ "${{ needs.install-paths.result }}" != "success" ]] || \
+             [[ "${{ needs.install-script.result }}" != "success" ]] || \
              [[ "${{ needs.build.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1

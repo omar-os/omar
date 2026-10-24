@@ -1,0 +1,40 @@
+// WorldNews — a periodic timer driving real work, for exercising checkpoints.
+//
+// `tick(0, 2min)` fires at logical time 0 and every two minutes after. Each
+// tick the researcher fetches the news of that moment and the writer replaces
+// `world-news-summary.txt` in its own workspace. Nothing feeds the program and
+// it takes no input; it runs until stopped or the runtime's tag cap.
+//
+// What makes it a checkpoint test: every tick produces something different,
+// and the summary file is the writer's state on disk. Pause it, roll back to
+// an earlier tick, resume, and the file is that tick's summary again while
+// the clock continues from there. Compiled and checked in CI, not run: it
+// never finishes, and it reaches the internet.
+//
+//   omar run tests/topology/src/WorldNews.omar --checkpoint-period tag
+//   omar pause WorldNewsEveryTwoMinutes --wait
+//   omar checkpoint list WorldNewsEveryTwoMinutes
+//   omar rollback WorldNewsEveryTwoMinutes --checkpoint <id>
+//   omar resume WorldNewsEveryTwoMinutes
+
+team WorldNews[researcher : Codex]
+{
+    timer tick(0, 2min)
+    output news : string
+
+    task researcher(tick) -> news "Fetch current world news from the internet for this scheduled tick $(tick). Use several reputable sources and select 5 to 8 major international stories with geographic variety. Return a concise factual briefing containing the UTC retrieval timestamp, each headline, key verified facts, publication time when available, and source URLs. Distinguish confirmed facts from developing reports. If retrieval fails, return a clearly labeled retrieval failure with the timestamp rather than inventing news. Set the news output and complete this invocation."
+}
+
+team NewsSummary[writer : Codex]
+{
+    input news : string
+    output saved : string
+
+    task writer(news) -> saved "Summarize this news briefing in plain text: $(news). Write world-news-summary.txt in your own workspace, replacing the previous summary. Include the retrieval timestamp, a short paragraph or bullet for each major story, and source URLs. If the briefing reports retrieval failure, write that status explicitly. Use filesystem tools to write the file and verify its contents. Set saved to the absolute file path only after successful writing, then complete this invocation."
+}
+
+main WorldNewsEveryTwoMinutes {
+    fetch = WorldNews()
+    summarize = NewsSummary()
+    fetch.news -> summarize.news
+}

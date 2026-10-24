@@ -16,19 +16,26 @@ def main():
     template = os.environ["OMAR_SANDBOX_TEMPLATE"]
     with tempfile.TemporaryDirectory(prefix="omar-real-sandbox-") as tmp:
         root = Path(tmp).resolve()
-        home, source = root / "home", root / "source"
-        home.mkdir()
-        source.mkdir()
+        home, source, shims = root / "home", root / "source", root / "bin"
+        for path in (home, source, shims):
+            path.mkdir()
         secret = root / "host-only.txt"
         secret.write_text("host-only")
         (source / "seed.txt").write_text("seed")
-        state_root = home / ".omar"
+        env = dict(os.environ, HOME=str(home), PATH=str(shims) + os.pathsep + os.environ["PATH"])
+        for key in ("TMUX", "TMUX_PANE", "OMAR_TMUX_SERVER", "OMAR_SESSION_ID", "OMAR_STATE_DIR", "OMAR_HOME", "OMAR_EA_ID"):
+            env.pop(key, None)
+        compiler = shims / "omarc"
+        compiler.write_text("#!/usr/bin/env python3\nimport shutil,sys\nshutil.copyfile("+repr(str(root / "program.json"))+", sys.argv[-1])\n")
+        compiler.chmod(0o700)
+        # The runtime's state directory, under the dedicated HOME.
+        state_root = home / ".omar" / "sessions" / "real-sandboxes"
         # Source paths embedded in the reaction are deliberately not mounts.
         body = f"""
 assert!(std::fs::read_to_string({json.dumps(str(secret))}).is_err());
 assert!(std::fs::read_dir({json.dumps(str(state_root / "workspace-history"))}).is_err());
 assert!(std::fs::read_to_string({json.dumps(str(source / "seed.txt"))}).is_err());
-assert_eq!(std::fs::read_to_string("seed.txt").unwrap(), "seed");
+assert!(std::fs::read_to_string("seed.txt").is_err());
 assert_eq!(std::fs::read_to_string("boundary-probe").unwrap(), "untouched");
 for foreign in std::fs::read_to_string("foreign-paths").unwrap().lines() {{
     assert!(std::fs::read_to_string(foreign).is_err(), "read another team's file");
@@ -53,17 +60,14 @@ out = Some("isolated".to_string());
         instructions.append({"op": "commit_plan"})
         bytecode = root / "program.json"
         bytecode.write_text(json.dumps(dict(version=1, team="IsolationSmoke", instructions=instructions)))
-        program = root / "program.omar"
+        program = source / "program.omar"
         program.write_text("// runtime isolation fixture\n")
-        compiler = root / "omarc"
-        compiler.write_text("#!/usr/bin/env python3\nimport shutil,sys\nshutil.copyfile("+repr(str(bytecode))+", sys.argv[2])\n")
-        compiler.chmod(0o700)
         # Keep sbx's real HOME for its Docker login and daemon. OMAR uses a
         # dedicated HOME; this adapter restores only sbx's host environment.
         adapter = root / "sbx"
         adapter.write_text("#!/usr/bin/env python3\n" +
             "import json,os,sys\nfrom pathlib import Path\n" +
-            "state_root=Path(" + repr(str(state_root)) + ")\n" +
+            "state_root=Path(os.environ['OMAR_STATE_DIR'])\n" +
             "if len(sys.argv)>1 and sys.argv[1]=='exec':\n" +
             "    record=json.loads(next(state_root.rglob('deployment.json')).read_text())\n" +
             "    own=Path(sys.argv[sys.argv.index('--workdir')+1])\n" +
@@ -77,10 +81,13 @@ out = Some("isolated".to_string());
             "os.environ['HOME']="+repr(str(Path.home()))+
             "\nos.execvp("+repr(SBX)+", ["+repr(SBX)+", *sys.argv[1:]])\n")
         adapter.chmod(0o700)
-        env = dict(os.environ, HOME=str(home), OMAR_SBX_BIN=str(adapter), OMARC_BIN=str(compiler))
+        env["OMAR_SBX_BIN"] = str(adapter)
+        runtime = json.loads(subprocess.run([str(BIN), "up", "--no-ea", "--name", "real-sandboxes", "--json"], cwd=source,
+                                            env=env, text=True, capture_output=True, timeout=90, check=True).stdout)
+        assert Path(runtime["directory"]).resolve() == state_root.resolve(), runtime
         try:
-            result = subprocess.run([str(BIN), "run", str(program), "--sandbox-template", template,
-                "--input", "parent.tick=1", "--input", "parent.child.tick=1", "--fast"],
+            result = subprocess.run([str(BIN), "-s", runtime["name"], "run", str(program), "--sandbox-template", template,
+                "--input", "parent.tick=1", "--input", "parent.child.tick=1", "--fast", "--fg", "--keep-workspaces"],
                 cwd=source, env=env, text=True, capture_output=True, timeout=600)
             assert result.returncode == 0, (result.stdout, result.stderr,
                 [(str(p), p.read_text()) for p in state_root.rglob("sandbox-logs/*.log")])
@@ -94,6 +101,8 @@ out = Some("isolated".to_string());
                 assert len(list((state_root/"workspace-history"/ws/"snapshots").glob("*.json"))) == 2
             print("PASS: real Docker Sandbox execution, parent/child separation, denied host/history access, native backend, snapshots")
         finally:
+            subprocess.run([str(BIN), "down", "-s", runtime["name"], "--force", "--timeout", "5"], env=env, capture_output=True)
+            subprocess.run(["tmux", "-L", runtime["tmux_server"], "kill-server"], capture_output=True)
             for path in state_root.rglob("deployment.json"):
                 for name in json.loads(path.read_text()).get("sandboxes", {}).values():
                     subprocess.run([SBX, "stop", name], capture_output=True, timeout=60)

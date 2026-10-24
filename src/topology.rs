@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::deploy::{self, DeploymentState};
+use crate::checkpoint::{self, ExecutionState, QueuedTag, Trigger};
+use crate::deploy::{self, ControlOp, DeploymentState};
 use crate::diagram::{DiagramServer, NoopTopologyObserver, TopologyObserver};
 use crate::manager::{self, McpLaunchContext, TopologyMcpContext};
 use crate::tmux::flatten_agent_name;
@@ -53,10 +54,27 @@ pub enum Instruction {
         kind: PortKind,
         #[serde(rename = "type")]
         ty: String,
+        /// The type as the program spelled it, when that names an imported
+        /// type: `list<Decision>` where `ty` is the expanded refinement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        declared: Option<String>,
         #[serde(default)]
         delay: Option<u64>,
         #[serde(default)]
         instance: String,
+    },
+    /// `type Decision from "./schemas/decision.json"`: a name for a type the
+    /// program imported. Ports carry the expanded type, so this changes
+    /// nothing the VM checks; it is how an agent is told `Decision` rather
+    /// than the refinement spelled out, and what the schema said about it.
+    DefineType {
+        name: String,
+        #[serde(rename = "type")]
+        ty: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     /// `state round : int = 0`: a value a reaction keeps between
     /// invocations.
@@ -145,10 +163,27 @@ pub struct PortState {
     pub kind: PortKind,
     #[serde(rename = "type")]
     pub ty: String,
+    /// How the program spelled the type, when that differs from `ty`: the
+    /// name of an imported type, possibly inside `list` or `option`. The VM
+    /// checks `ty`; the agent is told this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<u64>,
     #[serde(default)]
     pub instance: String,
+}
+
+/// A named type the program imported, kept so an agent can be told the name
+/// and what the schema said about it. The VM itself only ever sees `ty`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeState {
+    #[serde(rename = "type")]
+    pub ty: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// `timer t(offset, period)`.
@@ -228,6 +263,9 @@ pub struct VmState {
     pub state_vars: BTreeMap<String, StateVarState>,
     #[serde(default)]
     pub params: BTreeMap<String, ParamState>,
+    /// Named types, by the name the program gave them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub types: BTreeMap<String, TypeState>,
 }
 
 pub fn load_bytecode(path: &std::path::Path) -> Result<Bytecode> {
@@ -237,15 +275,20 @@ pub fn load_bytecode(path: &std::path::Path) -> Result<Bytecode> {
         .with_context(|| format!("invalid bytecode JSON in {}", path.display()))
 }
 
-/// Compile and load an OMAR source program.
+/// Compile and load a program a runtime was sent.
 ///
 /// Installed builds find `omarc` beside the `omar` executable or on `PATH`;
 /// development builds also recognize the compiler built under `lang/.lake`.
-pub fn load_program(path: &Path) -> Result<Bytecode> {
-    load_program_with_compiler(path, None)
+///
+/// Every program a runtime compiles arrived as text: a client sent it, with
+/// the files it imports, and the runtime wrote them down together. What the
+/// program imports is confined to the directory it was written in, so a
+/// program sent over the wire cannot read the host's files by naming them.
+pub fn load_staged_program(path: &Path) -> Result<Bytecode> {
+    load_program_with(path, None)
 }
 
-fn load_program_with_compiler(path: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
+fn load_program_with(path: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("omar") {
         bail!(
             "OMAR programs must use the .omar extension: {}",
@@ -254,6 +297,80 @@ fn load_program_with_compiler(path: &Path, compiler: Option<&Path>) -> Result<By
     }
 
     compile_source(path, compiler)
+}
+
+/// The schema types a program imports: each `type Name from "path"`, with
+/// the path as the program spells it.
+///
+/// A client reads these from beside the program to send them with it. The
+/// compiler is the authority on the syntax; a declaration this scan misses
+/// is reported by the runtime as an import it was not sent.
+pub fn imports_of(source: &str) -> Vec<(String, String)> {
+    let mut imports = Vec::new();
+    for line in source.lines() {
+        let line = line.split("//").next().unwrap_or_default().trim();
+        let Some(rest) = line.strip_prefix("type") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (name, rest) = rest.split_at(name_end);
+        let Some(rest) = rest.trim_start().strip_prefix("from") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        imports.push((name.to_string(), rest[..end].to_string()));
+    }
+    imports
+}
+
+/// Whether an import names a file inside the program's own directory: a
+/// relative path with no `..` component, as `omarc --local-imports` accepts.
+pub fn is_local_import(path: &str) -> bool {
+    use std::path::Component;
+    if path.is_empty() || path.contains('\\') {
+        return false;
+    }
+    let mut named = false;
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(_) => named = true,
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    named
+}
+
+/// The files a program imports, read from beside it and keyed by the path it
+/// imports them under, ready to travel with its text to a runtime.
+///
+/// An import that leaves the program's directory is not read: the runtime
+/// refuses it, and says why.
+pub fn imported_files(program: &Path, source: &str) -> Result<BTreeMap<String, String>> {
+    let directory = program.parent().unwrap_or_else(|| Path::new("."));
+    let mut files = BTreeMap::new();
+    for (name, import) in imports_of(source) {
+        if !is_local_import(&import) {
+            continue;
+        }
+        let text = fs::read_to_string(directory.join(&import)).with_context(|| {
+            format!(
+                "schema type '{name}' imports '{import}', which is not beside {}",
+                program.display()
+            )
+        })?;
+        files.insert(import, text);
+    }
+    Ok(files)
 }
 
 /// Where a program's generated artifacts go.
@@ -337,6 +454,7 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
         .unwrap_or_else(resolve_omarc);
 
     let output = Command::new(&compiler)
+        .arg("--local-imports")
         .arg(source)
         .arg(&draft)
         .output()
@@ -391,11 +509,15 @@ fn read_claim(path: &Path) -> String {
 /// Tells one compile's draft from another's in the same process.
 static DRAFTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn resolve_omarc() -> PathBuf {
+pub(crate) fn resolve_omarc() -> PathBuf {
     if let Some(path) = std::env::var_os("OMARC_BIN") {
         return PathBuf::from(path);
     }
 
+    resolve_build_omarc()
+}
+
+pub(crate) fn resolve_build_omarc() -> PathBuf {
     let executable_name = format!("omarc{}", std::env::consts::EXE_SUFFIX);
     if let Ok(current_executable) = std::env::current_exe() {
         if let Some(directory) = current_executable.parent() {
@@ -448,6 +570,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
         reactions: BTreeMap::new(),
         state_vars: BTreeMap::new(),
         params: BTreeMap::new(),
+        types: BTreeMap::new(),
     };
     let mut committed = false;
 
@@ -520,6 +643,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 name,
                 kind,
                 ty,
+                declared,
                 delay,
                 instance,
             } => {
@@ -527,6 +651,20 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 check_instance(&state, "port", name, instance)?;
                 if ty.trim().is_empty() {
                     bail!("port '{name}' has an empty type");
+                }
+                check_type("port", name, ty)?;
+                // The spelling is shown to the agent in place of the type, so
+                // it has to be the type: every name in it a type this plan
+                // defined, expanding to exactly `ty`.
+                if let Some(declared) = declared {
+                    let definitions: BTreeMap<String, String> = state
+                        .types
+                        .iter()
+                        .map(|(name, defined)| (name.clone(), defined.ty.clone()))
+                        .collect();
+                    if rename_type(declared, &definitions) != *ty {
+                        bail!("port '{name}' is declared as '{declared}', which is not {ty}");
+                    }
                 }
                 if delay.is_some() && *kind != PortKind::Action {
                     bail!("only action ports may declare a fixed delay");
@@ -538,6 +676,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                         PortState {
                             kind: *kind,
                             ty: ty.clone(),
+                            declared: declared.clone(),
                             delay: *delay,
                             instance: instance.clone(),
                         },
@@ -545,6 +684,32 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                     .is_some()
                 {
                     bail!("duplicate port '{name}'");
+                }
+            }
+            Instruction::DefineType {
+                name,
+                ty,
+                title,
+                description,
+            } => {
+                require_identifier("type", name)?;
+                if ty.trim().is_empty() {
+                    bail!("type '{name}' has an empty definition");
+                }
+                check_type("type", name, ty)?;
+                if state
+                    .types
+                    .insert(
+                        name.clone(),
+                        TypeState {
+                            ty: ty.clone(),
+                            title: title.clone(),
+                            description: description.clone(),
+                        },
+                    )
+                    .is_some()
+                {
+                    bail!("duplicate type '{name}'");
                 }
             }
             Instruction::DeclareState {
@@ -816,6 +981,21 @@ fn reject_bodies_that_cannot_be_generated(state: &VmState) -> Result<()> {
                     .map(|(name, param)| (name, &param.ty)),
             );
 
+        // A body may read a refined string: what arrives was already checked
+        // against the refinement when it was written. It may not write one,
+        // because the Rust `String` it would write through admits anything.
+        for effect in &reaction.effects {
+            if let Some(ty) = state.ports.get(effect).map(|port| &port.ty) {
+                if is_refined(ty) {
+                    bail!(
+                        "reaction '{id}' has a body and writes '{effect}', which is \
+                         {ty}; a body's String does not enforce the values it admits, \
+                         so an enum port is written by a prompt"
+                    );
+                }
+            }
+        }
+
         for (name, ty) in bound {
             if !crate::reaction::supports_type(ty) {
                 bail!(
@@ -985,7 +1165,7 @@ fn reject_causality_loops(state: &VmState) -> Result<()> {
 
 #[derive(Debug, Clone)]
 struct InvocationRecord {
-    id: String,
+    id: u64,
     team: String,
     agent: String,
     reaction: String,
@@ -1007,7 +1187,7 @@ struct InvocationRecord {
 /// reachable from here, because nothing else was wired to it.
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingInvocation {
-    invocation_id: String,
+    task_id: u64,
     reaction: String,
     contract: String,
     prompt: String,
@@ -1017,14 +1197,14 @@ struct PendingInvocation {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SetPortArgs {
-    invocation_id: String,
+    task_id: u64,
     port: String,
     value: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CompleteArgs {
-    invocation_id: String,
+    task_id: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1059,7 +1239,35 @@ struct InvocationEntry {
 
 #[derive(Clone, Default)]
 struct InvocationRegistry {
-    entries: Arc<Mutex<BTreeMap<String, InvocationEntry>>>,
+    entries: Arc<Mutex<BTreeMap<u64, InvocationEntry>>>,
+}
+
+/// The effect a `set_port` call names, and its type.
+///
+/// Effects are instance-qualified (`faq.objection`), but a prompt names its
+/// ports bare (`$(objection)`), and small models copy that form. A bare name
+/// that matches the last segment of exactly one effect means that effect;
+/// anything else is an error naming the ports that would have worked, so the
+/// agent can correct itself instead of retrying the same name.
+fn resolve_effect_port<'a>(
+    allowed: &'a BTreeMap<String, String>,
+    port: &str,
+) -> Result<(&'a String, &'a String)> {
+    if let Some(entry) = allowed.get_key_value(port) {
+        return Ok(entry);
+    }
+    let mut matches = allowed
+        .iter()
+        .filter(|(name, _)| name.rsplit_once('.').is_some_and(|(_, last)| last == port));
+    if let (Some(entry), None) = (matches.next(), matches.next()) {
+        return Ok(entry);
+    }
+    let names: Vec<&str> = allowed.keys().map(String::as_str).collect();
+    bail!(
+        "port '{}' is not an effect of this invocation; valid ports: {}",
+        port,
+        names.join(", ")
+    )
 }
 
 impl InvocationRegistry {
@@ -1067,7 +1275,7 @@ impl InvocationRegistry {
         &self,
         record: InvocationRecord,
     ) -> Result<mpsc::Receiver<BTreeMap<String, Value>>> {
-        let id = record.id.clone();
+        let id = record.id;
         let (completion, receiver) = mpsc::sync_channel(1);
         let mut entries = self
             .entries
@@ -1086,9 +1294,9 @@ impl InvocationRegistry {
         Ok(receiver)
     }
 
-    fn remove(&self, invocation_id: &str) {
+    fn remove(&self, task_id: &u64) {
         if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(invocation_id);
+            entries.remove(task_id);
         }
     }
 
@@ -1098,10 +1306,10 @@ impl InvocationRegistry {
     /// time answers before the submit, leaving the terminal with no change to
     /// show for it. An entry that has gone counts as answered: there is
     /// nothing left to deliver to either way.
-    fn answered(&self, invocation_id: &str) -> bool {
+    fn answered(&self, task_id: &u64) -> bool {
         match self.entries.lock() {
             Ok(entries) => entries
-                .get(invocation_id)
+                .get(task_id)
                 .is_none_or(|entry| entry.record.completed),
             // A poisoned lock is not evidence of an answer, and claiming one
             // would turn a lost delivery into a silent hang.
@@ -1117,26 +1325,19 @@ impl InvocationRegistry {
         match command {
             InvocationCommand::SetPort(args) => {
                 let invocation = entries
-                    .get_mut(&args.invocation_id)
-                    .with_context(|| format!("unknown invocation '{}'", args.invocation_id))?;
+                    .get_mut(&args.task_id)
+                    .with_context(|| format!("unknown task_id {}", args.task_id))?;
                 validate_invocation_owner(team, agent, &invocation.record)?;
                 if invocation.record.completed {
                     bail!("invocation '{}' is already complete", invocation.record.id);
                 }
-                let ty = invocation
-                    .record
-                    .allowed_effects
-                    .get(&args.port)
-                    .with_context(|| {
-                        format!("port '{}' is not an effect of this invocation", args.port)
-                    })?;
-                validate_value(ty, &args.value)
-                    .with_context(|| format!("invalid value for port '{}'", args.port))?;
-                invocation
-                    .record
-                    .writes
-                    .insert(args.port.clone(), args.value);
-                Ok(json!({"status":"buffered","port":args.port}))
+                let (port, ty) =
+                    resolve_effect_port(&invocation.record.allowed_effects, &args.port)?;
+                let (port, ty) = (port.clone(), ty.clone());
+                validate_value(&ty, &args.value)
+                    .with_context(|| format!("invalid value for port '{}'", port))?;
+                invocation.record.writes.insert(port.clone(), args.value);
+                Ok(json!({"status":"buffered","port":port}))
             }
             InvocationCommand::Pending => {
                 let pending: Vec<PendingInvocation> = entries
@@ -1147,7 +1348,7 @@ impl InvocationRegistry {
                             && entry.record.agent == agent
                     })
                     .map(|entry| PendingInvocation {
-                        invocation_id: entry.record.id.clone(),
+                        task_id: entry.record.id,
                         reaction: entry.record.reaction.clone(),
                         contract: entry.record.contract.clone(),
                         prompt: entry.record.prompt.clone(),
@@ -1159,8 +1360,8 @@ impl InvocationRegistry {
             }
             InvocationCommand::Complete(args) => {
                 let invocation = entries
-                    .get_mut(&args.invocation_id)
-                    .with_context(|| format!("unknown invocation '{}'", args.invocation_id))?;
+                    .get_mut(&args.task_id)
+                    .with_context(|| format!("unknown task_id {}", args.task_id))?;
                 validate_invocation_owner(team, agent, &invocation.record)?;
                 if invocation.record.completed {
                     return Ok(json!({"status":"already_complete"}));
@@ -1377,7 +1578,7 @@ pub fn panel_submit(
     access: &PanelAccess,
     team: &str,
     agent: &str,
-    invocation_id: &str,
+    task_id: &u64,
     values: &BTreeMap<String, Value>,
 ) -> Result<()> {
     let context = panel_context(access, team, agent);
@@ -1385,7 +1586,7 @@ pub fn panel_submit(
         send_invocation_command(
             &context,
             InvocationCommand::SetPort(SetPortArgs {
-                invocation_id: invocation_id.to_string(),
+                task_id: *task_id,
                 port: port.clone(),
                 value: value.clone(),
             }),
@@ -1393,9 +1594,7 @@ pub fn panel_submit(
     }
     send_invocation_command(
         &context,
-        InvocationCommand::Complete(CompleteArgs {
-            invocation_id: invocation_id.to_string(),
-        }),
+        InvocationCommand::Complete(CompleteArgs { task_id: *task_id }),
     )?;
     Ok(())
 }
@@ -1407,7 +1606,64 @@ fn validate_invocation_owner(team: &str, agent: &str, invocation: &InvocationRec
     Ok(())
 }
 
+/// The values a refined string type admits, or `None` if `ty` is not one.
+///
+/// A refinement travels inside the flat type string -- `string in ["a","b"]` --
+/// rather than in a field of its own. Nothing downstream has to learn a new
+/// shape: the bytecode's `type` stays a string, and connection checking stays
+/// equality over the canonical spelling `omarc` emits.
+pub(crate) fn string_enum(ty: &str) -> Option<Vec<String>> {
+    serde_json::from_str(ty.strip_prefix("string in ")?).ok()
+}
+
+/// Whether `ty` is, or wraps, a refined string.
+fn is_refined(ty: &str) -> bool {
+    leaf_type(ty).starts_with("string in ")
+}
+
+/// `ty` with its `list` and `option` wrappers taken off.
+fn leaf_type(ty: &str) -> &str {
+    for outer in ["list", "option"] {
+        if let Some(inner) = generic_inner(ty, outer) {
+            return leaf_type(inner);
+        }
+    }
+    ty
+}
+
+/// `ty` with each leaf that `names` maps replaced, `list` and `option`
+/// wrappers kept: `list<string in ["a"]>` is `list<Decision>` under
+/// `{"string in [\"a\"]": "Decision"}`, and the reverse map turns it back.
+pub(crate) fn rename_type(ty: &str, names: &BTreeMap<String, String>) -> String {
+    for outer in ["list", "option"] {
+        if let Some(inner) = generic_inner(ty, outer) {
+            return format!("{outer}<{}>", rename_type(inner, names));
+        }
+    }
+    names.get(ty).cloned().unwrap_or_else(|| ty.to_string())
+}
+
 fn validate_value(ty: &str, value: &Value) -> Result<()> {
+    if let Some(allowed) = string_enum(ty) {
+        // The agent acts on this message, so it names every legal answer
+        // rather than only reporting that this one was wrong.
+        let text = value
+            .as_str()
+            .with_context(|| format!("expected {ty}, got {value}"))?;
+        // `omarc` rejects an empty refinement, so this is reachable only from
+        // hand-written bytecode. Say what is wrong with the port rather than
+        // offering the agent a choice of nothing.
+        if allowed.is_empty() {
+            bail!("port type {ty} admits no value");
+        }
+        if !allowed.iter().any(|option| option == text) {
+            // Quoted by serde rather than by hand: an admitted value may itself
+            // contain a quote or a newline, and the agent reads this message.
+            let options: Vec<String> = allowed.iter().map(|o| json!(o).to_string()).collect();
+            bail!("expected one of {}, got {value}", options.join(", "));
+        }
+        return Ok(());
+    }
     if let Some(inner) = generic_inner(ty, "list") {
         let values = value
             .as_array()
@@ -1438,6 +1694,50 @@ fn validate_value(ty: &str, value: &Value) -> Result<()> {
         bail!("expected {ty}, got {value}");
     }
     Ok(())
+}
+
+/// Reject a type the VM cannot check a value against, wherever the fault sits.
+///
+/// `validate_value` looks inside `list` and `option`, so this has to as well,
+/// or a nested fault would reach the agent and be reported against the value
+/// it wrote rather than against the port. A refinement that does not parse is
+/// a broken port, not a plain `string`; saying so once, here, keeps
+/// `string_enum` free to answer "not refined" everywhere downstream. And what
+/// the wrappers come off to has to be a type the VM knows: `list<string>>` is
+/// a list of nothing it can check.
+fn check_type(what: &str, name: &str, ty: &str) -> Result<()> {
+    for outer in ["list", "option"] {
+        if ty.starts_with(&format!("{outer}<")) {
+            let Some(inner) = generic_inner(ty, outer) else {
+                bail!("{what} '{name}' has an invalid type '{ty}'");
+            };
+            return check_type(what, name, inner);
+        }
+    }
+    if let Some(list) = ty.strip_prefix("string in ") {
+        return match serde_json::from_str::<Vec<String>>(list) {
+            Ok(values) if values.is_empty() => bail!("{what} '{name}' admits no value"),
+            Ok(values) => {
+                // `omarc` refuses a duplicate; so does the plan, or the bytecode
+                // is the one place the rule does not hold.
+                let mut seen = BTreeSet::new();
+                for value in &values {
+                    if !seen.insert(value) {
+                        bail!(
+                            "{what} '{name}' has a duplicate enum value {}",
+                            json!(value)
+                        );
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => bail!("{what} '{name}' has an invalid string refinement: {error}"),
+        };
+    }
+    match ty {
+        "signal" | "bool" | "int" | "float" | "string" | "path" | "bytes" => Ok(()),
+        _ => bail!("{what} '{name}' has an invalid type '{ty}'"),
+    }
 }
 
 fn generic_inner<'a>(ty: &'a str, outer: &str) -> Option<&'a str> {
@@ -1557,11 +1857,18 @@ fn validate_contract(contract: &str, writes: &BTreeMap<String, Value>) -> Result
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InvocationSpec {
-    id: String,
+    id: u64,
     reaction_id: String,
     agent: String,
     trigger_values: BTreeMap<String, Value>,
     allowed_effects: BTreeMap<String, String>,
+    /// Each effect's type as the program spelled it -- `Decision` where
+    /// `allowed_effects` has the refinement it expands to -- which is what the
+    /// agent is shown.
+    effect_names: BTreeMap<String, String>,
+    /// The named types those spellings use, so the agent is told what the
+    /// schema said about each.
+    types: BTreeMap<String, TypeState>,
     /// Its instance's state variables as they stand, which a code body reads
     /// as `self`.
     state_values: BTreeMap<String, Value>,
@@ -1611,10 +1918,10 @@ struct AgentReactionExecutor {
 
 impl ReactionExecutor for AgentReactionExecutor {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
-        let invocation_id = invocation.id.clone();
+        let task_id = invocation.id;
         let rendered = render_prompt(&invocation.prompt, &invocation.trigger_values)?;
         let record = InvocationRecord {
-            id: invocation_id.clone(),
+            id: task_id,
             team: self.team.clone(),
             agent: invocation.agent.clone(),
             reaction: invocation.reaction_id.clone(),
@@ -1632,23 +1939,16 @@ impl ReactionExecutor for AgentReactionExecutor {
         // follows is the same either way — a client answering is a slow agent,
         // and the registry does not care which kind it is waiting on.
         if !self.web.contains(&invocation.agent) {
-            let message = format!(
-                "OMAR INVOCATION\ninvocation_id: {}\ntriggers: {}\neffects: {}\ncontract: {}\n\n{}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. For a signal effect, set its value to null. Do not address another agent directly.",
-                invocation.id,
-                serde_json::to_string(&invocation.trigger_values)?,
-                serde_json::to_string(&invocation.allowed_effects)?,
-                invocation.contract,
-                rendered
-            );
+            let message = invocation_message(&invocation, &rendered)?;
             let session = self.client.session_for(&invocation.agent);
             if let Err(error) = self
                 .client
                 .deliver_prompt_until(&session, &message, &DeliveryOptions::default(), &|| {
-                    self.registry.answered(&invocation_id)
+                    self.registry.answered(&task_id)
                 })
                 .with_context(|| format!("failed to deliver {}", invocation.reaction_id))
             {
-                self.registry.remove(&invocation_id);
+                self.registry.remove(&task_id);
                 return Err(error);
             }
         }
@@ -1661,7 +1961,7 @@ impl ReactionExecutor for AgentReactionExecutor {
                 "topology invocation service stopped unexpectedly"
             )),
         };
-        self.registry.remove(&invocation_id);
+        self.registry.remove(&task_id);
         result
     }
 }
@@ -1700,6 +2000,31 @@ struct DispatchExecutor<'a, E: ReactionExecutor> {
 
 impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+        if let Some(backend) = self
+            .state
+            .agents
+            .get(&invocation.agent)
+            .and_then(|agent| crate::backend::by_name(&agent.backend))
+            .filter(|backend| backend.topology_only())
+        {
+            let rendered = render_prompt(&invocation.prompt, &invocation.trigger_values)?;
+            let writes = backend.invoke_topology(&crate::backend::TopologyInvocation {
+                effects: &invocation.allowed_effects,
+                triggers: &invocation.trigger_values,
+                instructions: &rendered,
+                timeout: invocation.within.unwrap_or(self.timeout),
+            })?;
+            validate_contract(&invocation.contract, &writes)?;
+            for (port, value) in &writes {
+                let port_type = self
+                    .state
+                    .ports
+                    .get(port)
+                    .context("backend wrote an unknown port")?;
+                validate_value(&port_type.ty, value)?;
+            }
+            return Ok(writes);
+        }
         if let Some(code) = &self.code {
             if code.handles(&invocation.reaction_id) {
                 let deadline = invocation.within.unwrap_or(self.timeout);
@@ -1849,7 +2174,6 @@ pub fn sandbox_worker() -> Result<()> {
         omar_dir: &local_root,
         generated: &generated,
         base_prefix: "omar-team-",
-        default_workdir: worktree.to_str().context("workspace path")?,
         health_idle_warning: 15,
         sandbox_template: None,
         inputs: &[],
@@ -1859,6 +2183,10 @@ pub fn sandbox_worker() -> Result<()> {
         diagram_address: None,
         diagram_ready: None,
         panel_ready: None,
+        // The host checkpoints and owns the workspace's lifetime.
+        checkpoint_policy: None,
+        keep_workspaces: true,
+        program_path: None,
     };
     let server = InvocationServer::start()?;
     let client = TmuxClient::new("omar-team-");
@@ -1875,6 +2203,7 @@ pub fn sandbox_worker() -> Result<()> {
             &config,
             (&workspaces, &init.root),
             &mut sessions,
+            init.resumed_from.as_ref(),
         )?;
         let executor = DispatchExecutor {
             state: &init.state,
@@ -1919,7 +2248,6 @@ pub struct TopologyRunConfig<'a> {
     /// Where this program's generated artifacts go, from `generated_dir`.
     pub generated: &'a Path,
     pub base_prefix: &'a str,
-    pub default_workdir: &'a str,
     pub health_idle_warning: i64,
     pub sandbox_template: Option<&'a str>,
     pub inputs: &'a [String],
@@ -1938,6 +2266,14 @@ pub struct TopologyRunConfig<'a> {
     /// this the daemon cannot answer on a client's behalf, and a web-backed
     /// reaction would always sit until its deadline.
     pub panel_ready: Option<mpsc::Sender<PanelAccess>>,
+    /// How often the run checkpoints on its own; `None` is the default hour.
+    pub checkpoint_policy: Option<checkpoint::Policy>,
+    /// Keep the instances' workspaces when the run ends; otherwise they go
+    /// with it. A resume takes the paused run's choice.
+    pub keep_workspaces: bool,
+    /// The program file, recorded in checkpoints so a resume can place
+    /// generated code beside it. `None` for a program that arrived over HTTP.
+    pub program_path: Option<&'a Path>,
 }
 
 /// Where a run's invocations are answered, and the secret that authorises it.
@@ -1960,6 +2296,18 @@ pub struct PanelAccess {
 pub enum RunEnd {
     Completed,
     Stopped,
+    /// Ended at a checkpoint it can continue from.
+    Paused,
+}
+
+/// How a run ended, with the output ports and state variables it ended with.
+pub struct RunOutcome {
+    pub end: RunEnd,
+    pub outputs: BTreeMap<String, Value>,
+    pub state: BTreeMap<String, Value>,
+    /// The live diagram as the run left it, when one was served: a paused
+    /// run's picture outlives its diagram server.
+    pub diagram: Option<crate::diagram::DiagramSnapshot>,
 }
 
 /// Advance the shared record and persist it, as one step.
@@ -2021,11 +2369,391 @@ fn fail_deployment(
     let _ = deploy::clear_stop(dir);
 }
 
-pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunEnd> {
+/// The run's checkpoint controller: physical-time scheduling, each team
+/// instance's file version, and atomic publication, all keyed to one
+/// deployment. The event loop asks it at tag boundaries; it never interrupts
+/// a tag.
+struct RunCheckpointer<'a> {
+    omar_dir: &'a Path,
+    dir: PathBuf,
+    store: checkpoint::Store,
+    record: Arc<Mutex<deploy::DeploymentRecord>>,
+    workspaces: &'a BTreeMap<String, crate::workspace::Workspace>,
+    program: Value,
+    program_path: Option<String>,
+    team: String,
+    ea_id: u32,
+    pace: Pace,
+    agents: BTreeMap<String, checkpoint::AgentContext>,
+    schedule: Mutex<Schedule>,
+}
+
+struct Schedule {
+    policy: checkpoint::Policy,
+    /// When the next physical-time capture is due; none without a period.
+    next_due: Option<Instant>,
+    /// The tag the last capture of any kind described, so a logical cadence
+    /// counts from it and a boundary revisited mid-wait is not captured twice.
+    last_captured_tag: Option<(u64, u64)>,
+    sequence: u64,
+    parent: Option<String>,
+}
+
+impl Schedule {
+    /// Whether an automatic capture is due at a boundary that completed
+    /// `state.completed_tag`: the physical deadline passed, or the tags
+    /// crossed into a new logical period since the last capture.
+    fn due(&self, now: Instant, state: &ExecutionState) -> bool {
+        if self.next_due.is_some_and(|at| now >= at) {
+            return true;
+        }
+        let Some(completed) = state.completed_tag else {
+            return false;
+        };
+        if self.last_captured_tag == Some(completed) {
+            return false;
+        }
+        if self.policy.every_tag {
+            return true;
+        }
+        let period = self.policy.logical_period_ns;
+        if period == 0 {
+            return false;
+        }
+        let last = self.last_captured_tag.map_or(0, |(t, _)| t / period);
+        completed.0 / period > last
+    }
+}
+
+impl<'a> RunCheckpointer<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        omar_dir: &'a Path,
+        dir: &Path,
+        record: Arc<Mutex<deploy::DeploymentRecord>>,
+        workspaces: &'a BTreeMap<String, crate::workspace::Workspace>,
+        state: &VmState,
+        bytecode: &Bytecode,
+        config: &TopologyRunConfig<'_>,
+        resumed_from: Option<&checkpoint::Manifest>,
+    ) -> Result<Self> {
+        let store = checkpoint::Store::new(dir);
+        // A fresh run starts its own lineage: an earlier run's checkpoints
+        // are set aside, so a rollback can only choose from this run's.
+        if resumed_from.is_none() {
+            if let Some(archived) = store.archive()? {
+                println!(
+                    "Checkpoints of the previous run moved to {}",
+                    archived.display()
+                );
+            }
+        }
+        // An operator's live change outlives the runner that saw it; a launch
+        // override starts a fresh policy; otherwise the default hour.
+        let policy = match (config.checkpoint_policy, deploy::read_policy(dir)?) {
+            (Some(policy), _) => policy,
+            (None, Some(saved)) if resumed_from.is_some() => saved,
+            (None, _) => resumed_from.map(|m| m.policy).unwrap_or_default(),
+        };
+        deploy::write_policy(dir, policy)?;
+        let (existing, problems) = store.list()?;
+        for problem in problems {
+            eprintln!("warning: ignoring unreadable checkpoint {problem}");
+        }
+        let sequence = existing.iter().map(|m| m.sequence).max().unwrap_or(0) + 1;
+        let next_due = policy.physical().map(|period| Instant::now() + period);
+        {
+            let mut guard = record
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
+            guard.next_checkpoint_at = policy
+                .physical()
+                .map(|period| deploy::now_unix() + period.as_secs());
+            guard.save(dir)?;
+        }
+        let program_path = config
+            .program_path
+            .map(|path| path.to_string_lossy().into_owned())
+            .or_else(|| resumed_from.and_then(|m| m.program_path.clone()));
+        Ok(Self {
+            omar_dir,
+            dir: dir.to_path_buf(),
+            store,
+            record,
+            workspaces,
+            program: serde_json::to_value(bytecode)?,
+            program_path,
+            team: state.team.clone(),
+            ea_id: config.ea_id,
+            pace: config.pace,
+            agents: state
+                .agents
+                .iter()
+                .map(|(name, agent)| {
+                    (
+                        name.clone(),
+                        checkpoint::AgentContext {
+                            backend: agent.backend.clone(),
+                            restoration: checkpoint::FRESH_CONVERSATION.to_string(),
+                        },
+                    )
+                })
+                .collect(),
+            schedule: Mutex::new(Schedule {
+                policy,
+                next_due,
+                last_captured_tag: resumed_from.and_then(|m| m.completed_tag),
+                sequence,
+                parent: resumed_from.map(|m| m.id.clone()),
+            }),
+        })
+    }
+
+    /// Pick up a period an operator changed while the run was going. The
+    /// next deadline is one new period from the change.
+    fn refresh_policy(&self, schedule: &mut Schedule) {
+        let Ok(Some(saved)) = deploy::read_policy(&self.dir) else {
+            return;
+        };
+        if saved == schedule.policy {
+            return;
+        }
+        schedule.policy = saved;
+        schedule.next_due = saved.physical().map(|period| Instant::now() + period);
+        if let Ok(mut guard) = self.record.lock() {
+            guard.next_checkpoint_at = saved
+                .physical()
+                .map(|period| deploy::now_unix() + period.as_secs());
+            let _ = guard.save(&self.dir);
+        }
+    }
+}
+
+impl Checkpointer for RunCheckpointer<'_> {
+    fn due(&self, state: &ExecutionState) -> bool {
+        let Ok(mut schedule) = self.schedule.lock() else {
+            return false;
+        };
+        self.refresh_policy(&mut schedule);
+        schedule.due(Instant::now(), state)
+    }
+
+    fn capture(&self, state: &ExecutionState, trigger: Trigger) -> Result<String> {
+        let mut schedule = self
+            .schedule
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint schedule lock poisoned"))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let kind = match trigger {
+            Trigger::Automatic => "automatic",
+            Trigger::Manual => "manual",
+            Trigger::Pause => "pause",
+        };
+        let label = format!("Checkpoint {} ({kind})", schedule.sequence);
+        // Each instance's files, as a version its own history keeps. The
+        // manifest names them; nothing is copied.
+        let mut artifacts = BTreeMap::new();
+        for (instance, workspace) in self.workspaces {
+            let snapshot = workspace
+                .snapshot(self.omar_dir, &label)
+                .with_context(|| format!("snapshot instance '{instance}' files"))?;
+            artifacts.insert(
+                instance.clone(),
+                checkpoint::ArtifactRef {
+                    workspace_id: workspace.id.clone(),
+                    snapshot_id: snapshot.id,
+                    commit: snapshot.commit,
+                },
+            );
+        }
+        let deployment_id = self
+            .record
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
+            .deployment_id
+            .clone();
+        let manifest = checkpoint::Manifest {
+            version: checkpoint::FORMAT,
+            id: id.clone(),
+            sequence: schedule.sequence,
+            parent: schedule.parent.clone(),
+            deployment_id,
+            team: self.team.clone(),
+            ea_id: self.ea_id,
+            created_at: deploy::now_unix(),
+            completed_tag: state.completed_tag,
+            next_tag: state.next_tag(),
+            trigger,
+            policy: schedule.policy,
+            pace: match self.pace {
+                Pace::RealTime => "real_time".to_string(),
+                Pace::Fast => "fast".to_string(),
+            },
+            program_sha256: checkpoint::sha256(&serde_json::to_vec(&self.program)?),
+            program_path: self.program_path.clone(),
+            state_sha256: checkpoint::sha256(&serde_json::to_vec_pretty(state)?),
+            elapsed_ns: state.elapsed_ns,
+            workspaces: artifacts,
+            agents: self.agents.clone(),
+        };
+        self.store.publish(&manifest, state, &self.program)?;
+        schedule.sequence += 1;
+        schedule.parent = Some(id.clone());
+        schedule.next_due = schedule
+            .policy
+            .physical()
+            .map(|period| Instant::now() + period);
+        schedule.last_captured_tag = state.completed_tag;
+        {
+            let mut guard = self
+                .record
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
+            guard.checkpoint = Some(id.clone());
+            guard.checkpoint_error = None;
+            guard.next_checkpoint_at = schedule
+                .policy
+                .physical()
+                .map(|period| deploy::now_unix() + period.as_secs());
+            guard.save(&self.dir)?;
+        }
+        let at = state
+            .completed_tag
+            .map(|(t, m)| format!("({t}, {m})"))
+            .unwrap_or_else(|| "start".to_string());
+        println!("Checkpoint {id} published: {kind}, after tag {at}");
+        Ok(id)
+    }
+
+    fn capture_failed(&self, error: &anyhow::Error, attempt: u32, held: bool) {
+        eprintln!("warning: checkpoint attempt {attempt} failed: {error:#}");
+        // Only a held failure is the operator's to act on; a waiting
+        // `checkpoint create` must not read a retry in progress as final.
+        if !held {
+            return;
+        }
+        if let Ok(mut guard) = self.record.lock() {
+            guard.checkpoint_error = Some(format!("{error:#}"));
+            let _ = guard.save(&self.dir);
+        }
+    }
+}
+
+/// A checkpoint a run continues from, with its files already restored into
+/// fresh workspaces.
+struct ResumePlan {
+    manifest: checkpoint::Manifest,
+    state: ExecutionState,
+    workspaces: BTreeMap<String, crate::workspace::Workspace>,
+}
+
+pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunOutcome> {
     let state = verify(bytecode)?;
     if let Some(template) = config.sandbox_template {
         crate::sandbox::validate_template(template)?;
     }
+    launch(&state, bytecode, config, None)
+}
+
+/// Continue a paused team from its resume point: the head a rollback chose,
+/// else its latest checkpoint. Files come back as new workspaces restored
+/// from the captured versions; agents start fresh conversations and are
+/// told so; the clock continues where the checkpoint left it.
+pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunOutcome> {
+    let runtime_dir = deploy::dir_for(config.omar_dir, config.ea_id, team);
+    let record = deploy::DeploymentRecord::load(&runtime_dir)?
+        .with_context(|| format!("no deployment '{team}'"))?;
+    if record.is_active() && record.pid != std::process::id() && record.runner_alive() {
+        bail!(
+            "deployment '{team}' is {} (pid {}); pause or stop it first",
+            record.state,
+            record.pid
+        );
+    }
+    // Only a paused run: a stopped one executed tags after its last
+    // checkpoint, and continuing from there would replay them.
+    anyhow::ensure!(
+        record.state == DeploymentState::Paused,
+        "deployment '{team}' is {}; only a paused run can resume",
+        record.state
+    );
+    let store = checkpoint::Store::new(&runtime_dir);
+    let point = store
+        .resume_point()?
+        .with_context(|| format!("deployment '{team}' has no complete checkpoint"))?;
+    let (manifest, exec, program) = store.load(&point.id)?;
+    let bytecode: Bytecode = serde_json::from_value(program)?;
+    let state = verify(&bytecode)?;
+    anyhow::ensure!(
+        state.team == team,
+        "checkpoint {} is for team {}, not {team}",
+        manifest.id,
+        state.team
+    );
+    // Every instance the program declares must have a captured version, and
+    // nothing else may be listed: a checkpoint that disagrees with its own
+    // program cannot stand in for the run.
+    let expected: BTreeSet<String> = crate::workspace::instance_owners(&state)
+        .into_keys()
+        .collect();
+    let captured: BTreeSet<String> = manifest.workspaces.keys().cloned().collect();
+    anyhow::ensure!(
+        expected == captured,
+        "checkpoint {} covers instances {:?}, program declares {:?}",
+        manifest.id,
+        captured,
+        expected
+    );
+    let mut workspaces = BTreeMap::new();
+    let result = (|| -> Result<()> {
+        for (instance, artifact) in &manifest.workspaces {
+            let source = crate::workspace::Workspace::load(config.omar_dir, &artifact.workspace_id)
+                .with_context(|| format!("instance '{instance}' workspace"))?;
+            let restored = source
+                .restore(config.omar_dir, &artifact.snapshot_id)
+                .with_context(|| format!("restore instance '{instance}' files"))?;
+            workspaces.insert(instance.clone(), restored);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for workspace in workspaces.values() {
+            if let Some(root) = workspace.worktree(config.omar_dir).parent() {
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+        return Err(error);
+    }
+    // The paused run's choices carry over: a resume is the same run, so it
+    // gets fresh sandboxes from the template the run pinned, or none.
+    let template = record.sandbox_template.clone();
+    if let Some(template) = &template {
+        crate::sandbox::validate_template(template)?;
+    }
+    let config = TopologyRunConfig {
+        keep_workspaces: record.keep_workspaces,
+        sandbox_template: template.as_deref(),
+        ..config
+    };
+    launch(
+        &state,
+        &bytecode,
+        config,
+        Some(ResumePlan {
+            manifest,
+            state: exec,
+            workspaces,
+        }),
+    )
+}
+
+fn launch(
+    state: &VmState,
+    bytecode: &Bytecode,
+    config: TopologyRunConfig<'_>,
+    resume: Option<ResumePlan>,
+) -> Result<RunOutcome> {
+    let state = state.clone();
     let runtime_dir = deploy::dir_for(config.omar_dir, config.ea_id, &state.team);
     fs::create_dir_all(&runtime_dir)?;
     // One live run per team: its sessions are named by team and agent, so a
@@ -2090,7 +2818,9 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
     let planned_sessions: BTreeMap<String, String> = state
         .agents
         .iter()
-        .filter(|(_, agent)| config.sandbox_template.is_none() && !is_web_backend(&agent.backend))
+        .filter(|(_, agent)| {
+            config.sandbox_template.is_none() && needs_agent_process(&agent.backend)
+        })
         .map(|(name, _)| (name.clone(), client.session_for(name)))
         .collect();
     let record = Arc::new(Mutex::new(deploy::DeploymentRecord::create(
@@ -2098,10 +2828,18 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         planned_sessions,
         config.timeout.as_secs(),
     )));
-    record
-        .lock()
-        .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
-        .save(&runtime_dir)?;
+    let (resumed_from, start_state, restored) = match resume {
+        Some(plan) => (Some(plan.manifest), Some(plan.state), Some(plan.workspaces)),
+        None => (None, None, None),
+    };
+    {
+        let mut guard = record
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
+        guard.resumed_from = resumed_from.as_ref().map(|m| m.id.clone());
+        guard.keep_workspaces = config.keep_workspaces;
+        guard.save(&runtime_dir)?;
+    }
     let diagram_server = config
         .diagram_address
         .map(|address| DiagramServer::start(&state, address))
@@ -2148,13 +2886,17 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
             .deployment_id
             .clone();
-        let workspaces = crate::workspace::for_topology(
-            config.omar_dir,
-            config.ea_id,
-            &deployment_id,
-            &state,
-            Path::new(config.default_workdir),
-        )?;
+        // A resumed run's files were restored before launch; a fresh run's
+        // instances get new, empty workspaces.
+        let workspaces = match restored {
+            Some(workspaces) => workspaces,
+            None => crate::workspace::for_topology(
+                config.omar_dir,
+                config.ea_id,
+                &deployment_id,
+                &state,
+            )?,
+        };
         {
             let mut guard = record
                 .lock()
@@ -2199,6 +2941,7 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
                     workspace: workspace.clone(),
                     root: config.omar_dir.to_path_buf(),
                     timeout: config.timeout,
+                    resumed_from: resumed_from.clone(),
                 };
                 worker.request(serde_json::to_value(init)?, Duration::from_secs(180))?;
                 workers.insert(instance.clone(), worker);
@@ -2212,9 +2955,16 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
                 &config,
                 (&workspaces, config.omar_dir),
                 &mut spawned,
+                resumed_from.as_ref(),
             )?;
         }
-        let inputs = parse_inputs(&state, config.inputs)?;
+        // A resumed run's inputs were consumed at its start tag; what it
+        // continues with is in the checkpoint's queue.
+        let inputs = if start_state.is_some() {
+            BTreeMap::new()
+        } else {
+            parse_inputs(&state, config.inputs)?
+        };
         Ok((invocation_server, inputs, reactions, workspaces, workers))
     })();
     let (invocation_server, inputs, reactions, workspaces, workers) = match prepared {
@@ -2271,12 +3021,30 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         timeout: config.timeout,
         host: executor,
     };
+    let checkpointer = match RunCheckpointer::new(
+        config.omar_dir,
+        &runtime_dir,
+        record.clone(),
+        &workspaces,
+        &state,
+        bytecode,
+        &config,
+        resumed_from.as_ref(),
+    ) {
+        Ok(checkpointer) => checkpointer,
+        Err(error) => {
+            observer.run_failed(&error.to_string());
+            fail_deployment(&record, &runtime_dir, &spawned, &error);
+            return Err(error);
+        }
+    };
     if let Err(error) = advance_record(&record, &runtime_dir, DeploymentState::Running, None) {
         fail_deployment(&record, &runtime_dir, &spawned, &error);
         return Err(error);
     }
-    // Flip RUNNING to STOPPING the moment a stop lands, even while the loop
-    // is blocked mid-tag, so an operator polling status sees it acknowledged.
+    // Flip RUNNING to STOPPING or PAUSING the moment a request lands, even
+    // while the loop is blocked mid-tag, so an operator polling status sees
+    // it acknowledged.
     let watcher_shutdown = Arc::new(AtomicBool::new(false));
     let watcher = {
         let record = record.clone();
@@ -2284,13 +3052,24 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         let shutdown = watcher_shutdown.clone();
         thread::spawn(move || {
             while !shutdown.load(Ordering::Acquire) {
-                if deploy::stop_requested(&dir) {
+                let acknowledged = match deploy::pending_request(&dir) {
+                    Some(ControlOp::Stop) => Some((
+                        DeploymentState::Stopping,
+                        "stop requested; waiting for the current tag to close",
+                    )),
+                    Some(ControlOp::Pause) => Some((
+                        DeploymentState::Pausing,
+                        "pause requested; checkpointing at the next tag boundary",
+                    )),
+                    _ => None,
+                };
+                if let Some((next, detail)) = acknowledged {
                     if let Ok(mut guard) = record.lock() {
-                        if guard.state == DeploymentState::Running {
-                            let _ = guard.advance(
-                                DeploymentState::Stopping,
-                                Some("stop requested; waiting for the current tag to close"),
-                            );
+                        if guard.state == DeploymentState::Running
+                            || (guard.state == DeploymentState::Pausing
+                                && next == DeploymentState::Stopping)
+                        {
+                            let _ = guard.advance(next, Some(detail));
                             let _ = guard.save(&dir);
                         }
                     }
@@ -2300,13 +3079,18 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             }
         })
     };
-    let outcome = run_event_loop_observed(
+    let start = match start_state {
+        Some(saved) => LoopStart::Resume(saved),
+        None => LoopStart::Fresh(inputs),
+    };
+    let outcome = run_event_loop_controlled(
         &state,
-        inputs,
+        start,
         &executor,
         observer,
         config.pace,
         Some(&runtime_dir),
+        Some(&checkpointer),
     );
     watcher_shutdown.store(true, Ordering::Release);
     let _ = watcher.join();
@@ -2322,26 +3106,83 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             return Err(error);
         }
     };
+    let sessions = record
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
+        .sessions
+        .clone();
+    if let Err(error) = write_json_atomic(&runtime_dir.join("state.json"), &state) {
+        fail_deployment(&record, &runtime_dir, &sessions, &error);
+        return Err(error);
+    }
+    if let LoopEnd::Paused(paused) = end {
+        // The checkpoint is already published. What remains is to leave
+        // nothing running: agents are torn down, and the record says the
+        // run can continue from where it stands.
+        if let Err(error) = write_json_atomic(&deploy::outputs_path(&runtime_dir), &paused.outputs)
+        {
+            fail_deployment(&record, &runtime_dir, &sessions, &error);
+            return Err(error);
+        }
+        let cleanup_failures = cleanup_recorded_sessions(&record, &sessions, &runtime_dir);
+        for failure in &cleanup_failures {
+            eprintln!("warning: session not cleaned up: {failure}");
+        }
+        let checkpoint_id = {
+            let mut guard = record
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
+            if guard.state == DeploymentState::Running {
+                guard.advance(
+                    DeploymentState::Pausing,
+                    Some("pause honoured at a tag boundary"),
+                )?;
+            }
+            let id = guard.checkpoint.clone().unwrap_or_default();
+            guard.sessions_cleaned = cleanup_failures.is_empty();
+            guard.state_vars = paused.state_vars.clone();
+            guard.next_checkpoint_at = None;
+            guard.advance(
+                DeploymentState::Paused,
+                Some(&format!("paused at checkpoint {id}")),
+            )?;
+            guard.save(&runtime_dir)?;
+            id
+        };
+        deploy::clear_stop(&runtime_dir)?;
+        observer.run_paused(&checkpoint_id);
+        let next = paused
+            .next_tag()
+            .map(|(t, m)| format!("({t}, {m})"))
+            .unwrap_or_else(|| "none".to_string());
+        println!(
+            "Topology '{}' paused at checkpoint {checkpoint_id}; next tag {next}; resume with `omar resume {}`",
+            state.team, state.team
+        );
+        for (port, value) in &paused.outputs {
+            println!("Output {port} = {value}");
+        }
+        return Ok(RunOutcome {
+            end: RunEnd::Paused,
+            outputs: paused.outputs,
+            state: paused.state_vars,
+            diagram: diagram_server.as_ref().map(DiagramServer::snapshot),
+        });
+    }
     let (settled, stopped) = match end {
         LoopEnd::Completed(settled) => (settled, false),
         LoopEnd::Stopped(settled) => (settled, true),
+        LoopEnd::Paused(_) => unreachable!("handled above"),
     };
     let Settled {
         outputs,
         state_vars,
     } = settled;
     observer.run_completed(&outputs);
-    if let Err(error) = write_json_atomic(&runtime_dir.join("state.json"), &state)
-        .and_then(|_| write_json_atomic(&deploy::outputs_path(&runtime_dir), &outputs))
-    {
-        fail_deployment(&record, &runtime_dir, &spawned, &error);
+    if let Err(error) = write_json_atomic(&deploy::outputs_path(&runtime_dir), &outputs) {
+        fail_deployment(&record, &runtime_dir, &sessions, &error);
         return Err(error);
     }
-    let sessions = record
-        .lock()
-        .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
-        .sessions
-        .clone();
     let cleanup_failures = cleanup_recorded_sessions(&record, &sessions, &runtime_dir);
     for failure in &cleanup_failures {
         eprintln!("warning: session not cleaned up: {failure}");
@@ -2365,25 +3206,44 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         // the outputs, so a stopped run can be read back.
         guard.sessions_cleaned = cleanup_failures.is_empty();
         guard.state_vars = state_vars.clone();
+        guard.next_checkpoint_at = None;
         guard.advance(DeploymentState::Terminated, Some(detail))?;
         guard.save(&runtime_dir)?;
     }
     deploy::clear_stop(&runtime_dir)?;
-    // File versions are independent of runtime checkpoints. Agents have
-    // been torn down; keep their final artifacts without reusing the directory.
-    for workspace in workspaces.values() {
-        if !cleanup_failures.is_empty() {
-            eprintln!(
-                "warning: skipped final snapshot of {} because agent cleanup failed",
-                workspace.id
-            );
-            continue;
+    if !cleanup_failures.is_empty() {
+        // Something may still be writing: neither a final version nor a
+        // removal can be trusted.
+        eprintln!("warning: workspaces left as they are because agent cleanup failed");
+    } else if config.keep_workspaces {
+        // File versions are independent of runtime checkpoints. Agents have
+        // been torn down; keep their final artifacts without reusing the directory.
+        for workspace in workspaces.values() {
+            if let Err(error) = workspace.snapshot(config.omar_dir, "Final topology files") {
+                eprintln!(
+                    "warning: could not snapshot workspace {}: {error:#}",
+                    workspace.id
+                );
+            }
         }
-        if let Err(error) = workspace.snapshot(config.omar_dir, "Final topology files") {
-            eprintln!(
-                "warning: could not snapshot workspace {}: {error:#}",
-                workspace.id
-            );
+    } else {
+        // The run is over and nothing can resume it, so its files go with
+        // it: the current workspaces and the ones its checkpoints kept for a
+        // rollback. Copies an operator restored stay theirs.
+        let record = record
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
+            .clone();
+        let (manifests, _) = checkpoint::Store::new(&runtime_dir).list()?;
+        for workspace in
+            crate::workspace::lineage(config.omar_dir, config.ea_id, &record, &manifests, false)?
+        {
+            if let Err(error) = workspace.remove(config.omar_dir) {
+                eprintln!(
+                    "warning: could not remove workspace {}: {error:#}",
+                    workspace.id
+                );
+            }
         }
     }
     if stopped {
@@ -2391,19 +3251,25 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
     } else {
         println!("Topology '{}' completed", state.team);
     }
-    for (port, value) in outputs {
+    for (port, value) in &outputs {
         println!("Output {port} = {value}");
     }
-    for (name, value) in state_vars {
+    for (name, value) in &state_vars {
         println!("State {name} = {value}");
     }
-    Ok(if stopped {
-        RunEnd::Stopped
-    } else {
-        RunEnd::Completed
+    Ok(RunOutcome {
+        end: if stopped {
+            RunEnd::Stopped
+        } else {
+            RunEnd::Completed
+        },
+        outputs,
+        state: state_vars,
+        diagram: diagram_server.as_ref().map(DiagramServer::snapshot),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_topology_agents(
     state: &VmState,
     client: &TmuxClient,
@@ -2412,17 +3278,32 @@ fn spawn_topology_agents(
     config: &TopologyRunConfig<'_>,
     workspace_access: (&BTreeMap<String, crate::workspace::Workspace>, &Path),
     spawned: &mut BTreeMap<String, String>,
+    resumed_from: Option<&checkpoint::Manifest>,
 ) -> Result<()> {
     let (workspaces, workspace_root) = workspace_access;
     // The line each agent was launched with, which is what says how it
     // proves readiness.
     let mut launched: BTreeMap<String, String> = BTreeMap::new();
+    // No backend restores a conversation at a recorded turn, so a resumed
+    // agent is told plainly that it continues a run it has no memory of.
+    let resumed = resumed_from
+        .map(|m| {
+            let at = m
+                .completed_tag
+                .map(|(t, s)| format!("logical tag ({t}, {s})"))
+                .unwrap_or_else(|| "its start".to_string());
+            format!(
+                "\n\nThis run resumed from checkpoint {} taken after {at}. Your earlier conversation was not restored; the files in your workspace are exactly as they were at that checkpoint. Continue from them.",
+                m.id
+            )
+        })
+        .unwrap_or_default();
     let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
     for (name, agent) in &state.agents {
         // A web agent is not spawned. There is no command to resolve, no pane
         // to put it in, and no readiness to wait for — the agent exists as a
         // name in the topology and an inbox in the registry.
-        if is_web_backend(&agent.backend) {
+        if !needs_agent_process(&agent.backend) {
             continue;
         }
         let session = client.session_for(name);
@@ -2445,7 +3326,7 @@ fn spawn_topology_agents(
         let worktree = workspace.worktree(workspace_root);
         let temp = workspace.temp(workspace_root);
         let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
-        fs::write(&prompt_file, format!("{protocol}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.\n", temp.display()))?;
+        fs::write(&prompt_file, format!("{protocol}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.{resumed}\n", temp.display()))?;
         let backend = canonical_backend(&agent.backend);
         let base_command = crate::backend::resolve(backend)
             .map(|backend| backend.default_command().to_string())
@@ -2486,7 +3367,7 @@ fn spawn_topology_agents(
     }
 
     for (name, agent) in &state.agents {
-        if is_web_backend(&agent.backend) {
+        if !needs_agent_process(&agent.backend) {
             continue;
         }
         let Some(backend) = crate::backend::by_name(canonical_backend(&agent.backend)) else {
@@ -2567,6 +3448,12 @@ pub fn parse_inputs(state: &VmState, raw_inputs: &[String]) -> Result<BTreeMap<S
 }
 
 fn parse_input_value(ty: &str, value: &str) -> Result<Value> {
+    // A refined string is still supplied as bare text on the command line;
+    // whether it is one of the values the port admits is `validate_value`'s
+    // answer, not the parser's.
+    if string_enum(ty).is_some() {
+        return Ok(Value::String(value.to_string()));
+    }
     match ty {
         "bool" => Ok(Value::Bool(value.parse()?)),
         "int" => Ok(json!(value.parse::<i64>()?)),
@@ -2960,11 +3847,152 @@ struct Settled {
     state_vars: BTreeMap<String, Value>,
 }
 
-/// How the loop ended: the queue drained, or a stop closed the run at a tag
-/// boundary. Either way what settled so far comes along.
+/// How the loop ended: the queue drained, a stop closed the run at a tag
+/// boundary, or a pause did with a checkpoint behind it. Either way what
+/// settled so far comes along.
 enum LoopEnd {
     Completed(Settled),
     Stopped(Settled),
+    Paused(ExecutionState),
+}
+
+/// Where a loop begins: the start tag seeded with the run's inputs, or the
+/// boundary a checkpoint captured.
+enum LoopStart {
+    Fresh(BTreeMap<String, Value>),
+    Resume(ExecutionState),
+}
+
+/// What the loop asks of the run's checkpoint controller at a boundary.
+/// Operator requests arrive through the deployment's control file; this is
+/// only the part that needs the run's own state.
+pub(crate) trait Checkpointer {
+    /// Whether an automatic capture is due at this boundary, which completed
+    /// `state.completed_tag`.
+    fn due(&self, state: &ExecutionState) -> bool;
+    /// Publish a checkpoint for `state`. Returns its id.
+    fn capture(&self, state: &ExecutionState, trigger: Trigger) -> Result<String>;
+    /// A capture attempt failed. `held` says the internal retries are spent
+    /// and the run now waits at its boundary for an operator.
+    fn capture_failed(&self, error: &anyhow::Error, attempt: u32, held: bool);
+}
+
+/// What a boundary decided.
+enum Boundary {
+    Continue,
+    Stop,
+    Pause(ExecutionState),
+}
+
+/// Bounded internal retries before a failed capture holds the run for an
+/// operator's `checkpoint retry`.
+const CAPTURE_RETRIES: u32 = 3;
+
+/// Honour whatever is owed at a tag boundary: an operator's stop, a capture
+/// that is due or was asked for, or a pause. Nothing is in flight here, so a
+/// capture describes exactly the queue as it stands.
+fn settle_boundary(
+    deployment_dir: Option<&Path>,
+    checkpointer: Option<&dyn Checkpointer>,
+    observer: &dyn TopologyObserver,
+    snapshot: &dyn Fn() -> ExecutionState,
+) -> Result<Boundary> {
+    let request = deployment_dir.and_then(deploy::pending_request);
+    let mut trigger = match request {
+        Some(ControlOp::Stop) => return Ok(Boundary::Stop),
+        Some(ControlOp::Pause) => Some(Trigger::Pause),
+        Some(ControlOp::Checkpoint) | Some(ControlOp::RetryCheckpoint) => Some(Trigger::Manual),
+        None => None,
+    };
+    let Some(checkpointer) = checkpointer else {
+        // A loop with nothing to checkpoint with cannot pause; the request
+        // stays for a runner that can. Tests and projections land here.
+        return Ok(Boundary::Continue);
+    };
+    if trigger.is_none() && checkpointer.due(&snapshot()) {
+        trigger = Some(Trigger::Automatic);
+    }
+    let Some(mut trigger) = trigger else {
+        return Ok(Boundary::Continue);
+    };
+    let mut attempt = 0;
+    // The state that was captured is the state a pause hands back: one
+    // snapshot, so what the checkpoint says and what the runner reports agree
+    // to the nanosecond.
+    let mut captured;
+    loop {
+        captured = snapshot();
+        match checkpointer.capture(&captured, trigger) {
+            Ok(id) => {
+                let kind = match trigger {
+                    Trigger::Automatic => "automatic",
+                    Trigger::Manual => "manual",
+                    Trigger::Pause => "pause",
+                };
+                observer.checkpoint_published(&id, kind, captured.completed_tag);
+                break;
+            }
+            Err(error) => {
+                attempt += 1;
+                checkpointer.capture_failed(&error, attempt, attempt > CAPTURE_RETRIES);
+                if attempt <= CAPTURE_RETRIES {
+                    thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+                    continue;
+                }
+            }
+        }
+        // Held at the boundary: the previous checkpoint stands, the next tag
+        // does not run, and other topologies are unaffected. Only an operator
+        // moves this run again. The request that asked for this capture is
+        // consumed first (its trigger is kept), or the hold would answer it
+        // again at once and no retry could be admitted.
+        if let Some(dir) = deployment_dir {
+            if matches!(
+                deploy::pending_request(dir),
+                Some(ControlOp::Checkpoint | ControlOp::RetryCheckpoint | ControlOp::Pause)
+            ) {
+                deploy::clear_stop(dir)?;
+            }
+        }
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            match deployment_dir.and_then(deploy::pending_request) {
+                Some(ControlOp::Stop) => return Ok(Boundary::Stop),
+                Some(ControlOp::Pause) => {
+                    trigger = Trigger::Pause;
+                    break;
+                }
+                Some(ControlOp::Checkpoint) | Some(ControlOp::RetryCheckpoint) => break,
+                None => {}
+            }
+        }
+        attempt = 0;
+    }
+    if trigger == Trigger::Pause {
+        return Ok(Boundary::Pause(captured));
+    }
+    if let Some(dir) = deployment_dir {
+        // A manual request is answered; a stop or pause that lands later
+        // must not be mistaken for it.
+        if matches!(
+            deploy::pending_request(dir),
+            Some(ControlOp::Checkpoint) | Some(ControlOp::RetryCheckpoint)
+        ) {
+            deploy::clear_stop(dir)?;
+        }
+    }
+    Ok(Boundary::Continue)
+}
+
+fn queued(queue: &BTreeMap<Tag, BTreeMap<String, Value>>) -> Vec<QueuedTag> {
+    queue
+        .iter()
+        .map(|(tag, events)| QueuedTag {
+            timestamp: tag.timestamp,
+            microstep: tag.microstep,
+            events: events.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2982,9 +4010,11 @@ fn run_event_loop<E: ReactionExecutor>(
         None,
     )? {
         LoopEnd::Completed(settled) | LoopEnd::Stopped(settled) => Ok(settled.outputs),
+        LoopEnd::Paused(state) => Ok(state.outputs),
     }
 }
 
+#[cfg(test)]
 fn run_event_loop_observed<E: ReactionExecutor>(
     state: &VmState,
     inputs: BTreeMap<String, Value>,
@@ -2993,29 +4023,87 @@ fn run_event_loop_observed<E: ReactionExecutor>(
     pace: Pace,
     deployment_dir: Option<&Path>,
 ) -> Result<LoopEnd> {
-    // When the run's logical clock was started, which is what every tag's
-    // timestamp is measured from.
+    run_event_loop_controlled(
+        state,
+        LoopStart::Fresh(inputs),
+        executor,
+        observer,
+        pace,
+        deployment_dir,
+        None,
+    )
+}
+
+fn run_event_loop_controlled<E: ReactionExecutor>(
+    state: &VmState,
+    start: LoopStart,
+    executor: &E,
+    observer: &dyn TopologyObserver,
+    pace: Pace,
+    deployment_dir: Option<&Path>,
+    checkpointer: Option<&dyn Checkpointer>,
+) -> Result<LoopEnd> {
+    // When this process joined the run's logical clock. A resumed run has
+    // already spent `base_elapsed` on that clock, so time is measured from
+    // here plus that: the clock continues where the checkpoint left it, and
+    // time spent paused is not on it.
     let origin = Instant::now();
-    let mut queue = BTreeMap::from([(Tag::START, inputs)]);
-    // Arm every timer for its first firing. A timer's value is the timestamp it
-    // fired at, which is what makes `$(t)` in a prompt worth reading.
-    for (name, timer) in &state.timers {
-        queue
-            .entry(Tag {
-                timestamp: timer.offset,
-                microstep: 0,
-            })
-            .or_default()
-            .insert(name.clone(), json!(timer.offset));
-    }
-    let mut outputs = BTreeMap::new();
-    // Every state variable starts where the program said and lives here for
-    // the run: an invocation sees its instance's, and hands back what it set.
-    let mut store: BTreeMap<String, Value> = state
-        .state_vars
-        .iter()
-        .map(|(name, var)| (name.clone(), var.initial.clone()))
-        .collect();
+    let (mut queue, mut outputs, mut store, base_elapsed, mut completed) = match start {
+        LoopStart::Fresh(inputs) => {
+            let mut queue = BTreeMap::from([(Tag::START, inputs)]);
+            // Arm every timer for its first firing. A timer's value is the
+            // timestamp it fired at, which is what makes `$(t)` in a prompt
+            // worth reading.
+            for (name, timer) in &state.timers {
+                queue
+                    .entry(Tag {
+                        timestamp: timer.offset,
+                        microstep: 0,
+                    })
+                    .or_default()
+                    .insert(name.clone(), json!(timer.offset));
+            }
+            // Every state variable starts where the program said and lives
+            // here for the run: an invocation sees its instance's, and hands
+            // back what it set.
+            let store: BTreeMap<String, Value> = state
+                .state_vars
+                .iter()
+                .map(|(name, var)| (name.clone(), var.initial.clone()))
+                .collect();
+            (queue, BTreeMap::new(), store, Duration::ZERO, None)
+        }
+        LoopStart::Resume(saved) => {
+            // Timers are not re-armed from their declarations: their next
+            // firings are in the saved queue, and a one-shot already consumed
+            // has none there.
+            let queue = saved
+                .queue
+                .into_iter()
+                .map(|entry| {
+                    (
+                        Tag {
+                            timestamp: entry.timestamp,
+                            microstep: entry.microstep,
+                        },
+                        entry.events,
+                    )
+                })
+                .collect();
+            (
+                queue,
+                saved.outputs,
+                saved.state_vars,
+                Duration::from_nanos(saved.elapsed_ns),
+                saved.completed_tag,
+            )
+        }
+    };
+    let elapsed = || origin.elapsed() + base_elapsed;
+    // Where logical time zero stands on the wall clock, for anything that
+    // counts down to a tag: agents are up, so from here the clock is real.
+    observer
+        .clock_started(deploy::now_unix_millis().saturating_sub(base_elapsed.as_millis() as u64));
 
     // No bound on how many tags a run may pass through. A loop that costs a
     // microstep somewhere -- through an action, or a connection written
@@ -3029,17 +4117,37 @@ fn run_event_loop_observed<E: ReactionExecutor>(
     // Fixed before the first tag: precedence follows from the wiring, and the
     // wiring does not change while a run is in flight.
     let layers = precedence_layers(state)?;
-    let stop_now = || deployment_dir.is_some_and(deploy::stop_requested);
 
-    while let Some((tag, events)) = queue.pop_first() {
-        // An operator's stop ends the run here, between tags: nothing is in
-        // flight at a boundary, so no invocation's contract is abandoned.
-        if stop_now() {
-            return Ok(LoopEnd::Stopped(Settled {
-                outputs,
-                state_vars: store,
-            }));
+    loop {
+        // A tag boundary: nothing is in flight, so this is where an
+        // operator's stop ends the run without abandoning any invocation's
+        // contract, and where a checkpoint describes the run exactly. The
+        // next tag is still queued, never popped before it runs, so a pause
+        // here loses nothing.
+        let settled = {
+            let snapshot = || ExecutionState {
+                version: checkpoint::FORMAT,
+                completed_tag: completed,
+                queue: queued(&queue),
+                outputs: outputs.clone(),
+                state_vars: store.clone(),
+                elapsed_ns: elapsed().as_nanos() as u64,
+            };
+            settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
+        };
+        match settled {
+            Boundary::Continue => {}
+            Boundary::Stop => {
+                return Ok(LoopEnd::Stopped(Settled {
+                    outputs,
+                    state_vars: store,
+                }))
+            }
+            Boundary::Pause(state) => return Ok(LoopEnd::Paused(state)),
         }
+        let Some((&tag, next_events)) = queue.first_key_value() else {
+            break;
+        };
         // A tag nothing is present at is not a moment the run passed through.
         // No reaction can fire at one -- enabling asks whether any trigger is
         // in `events`, which is false for every reaction when it is empty --
@@ -3047,36 +4155,57 @@ fn run_event_loop_observed<E: ReactionExecutor>(
         // would tell a client the run had advanced when nothing had. The only
         // way to reach one is a program admitted with no inputs, which seeds
         // the start tag with an empty map.
-        if events.is_empty() {
+        if next_events.is_empty() {
+            queue.pop_first();
             continue;
         }
+        let due = Duration::from_nanos(tag.timestamp);
+        if pace == Pace::RealTime {
+            // Microsteps carry no time, so only the timestamp is owed. A tag
+            // whose moment has already passed runs now rather than being
+            // pushed further out: being late is not a reason to be later.
+            // Sliced so a stop during a long wait is honoured within a beat,
+            // and so a checkpoint that falls due mid-wait is taken at this
+            // boundary, with the awaited tag still queued and unexecuted.
+            while let Some(remaining) = due.checked_sub(elapsed()) {
+                let settled = {
+                    let snapshot = || ExecutionState {
+                        version: checkpoint::FORMAT,
+                        completed_tag: completed,
+                        queue: queued(&queue),
+                        outputs: outputs.clone(),
+                        state_vars: store.clone(),
+                        elapsed_ns: elapsed().as_nanos() as u64,
+                    };
+                    settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
+                };
+                match settled {
+                    Boundary::Continue => {}
+                    Boundary::Stop => {
+                        return Ok(LoopEnd::Stopped(Settled {
+                            outputs,
+                            state_vars: store,
+                        }))
+                    }
+                    Boundary::Pause(state) => return Ok(LoopEnd::Paused(state)),
+                }
+                thread::sleep(remaining.min(Duration::from_millis(250)));
+            }
+        }
+        let Some((tag, events)) = queue.pop_first() else {
+            break;
+        };
         // Everything this tag knows. It grows as the tag settles: an
         // instantaneous connection or a reaction's effect joins it rather than
         // landing on a later tag, and the reactions downstream read it before
         // the tag is over.
         let mut events = events;
         let mut carried = BTreeSet::new();
-        let due = Duration::from_nanos(tag.timestamp);
-        if pace == Pace::RealTime {
-            // Microsteps carry no time, so only the timestamp is owed. A tag
-            // whose moment has already passed runs now rather than being
-            // pushed further out: being late is not a reason to be later.
-            // Sliced so a stop during a long wait is honoured within a beat.
-            while let Some(remaining) = due.checked_sub(origin.elapsed()) {
-                if stop_now() {
-                    return Ok(LoopEnd::Stopped(Settled {
-                        outputs,
-                        state_vars: store,
-                    }));
-                }
-                thread::sleep(remaining.min(Duration::from_millis(250)));
-            }
-        }
         // How far past its logical time this tag actually ran. Zero while the
         // run is on or ahead of schedule, and growing only when the work
         // outlasts the gap it was given -- which is the one number that says
         // whether a program is keeping the promise its delays make.
-        let lag = origin.elapsed().saturating_sub(due).as_nanos() as u64;
+        let lag = elapsed().saturating_sub(due).as_nanos() as u64;
         // Settle before observing, so what a tag reports includes the values
         // its connections carried into it rather than only what it was woken
         // with.
@@ -3126,10 +4255,10 @@ fn run_event_loop_observed<E: ReactionExecutor>(
                     tag.timestamp,
                     tag.microstep,
                     &spec.reaction_id,
-                    &spec.id,
+                    &spec.id.to_string(),
                 );
             }
-            let invocation_ids: Vec<_> = specs.iter().map(|spec| spec.id.clone()).collect();
+            let task_ids: Vec<_> = specs.iter().map(|spec| spec.id).collect();
             let results = thread::scope(|scope| {
                 let handles: Vec<_> = specs
                     .into_iter()
@@ -3147,23 +4276,23 @@ fn run_event_loop_observed<E: ReactionExecutor>(
 
             // Declaration order decides who wins a port two reactions in this
             // layer both write, which is the rule the language states.
-            let mut completed: Vec<_> = enabled
+            let mut completed_writes: Vec<_> = enabled
                 .iter()
-                .zip(invocation_ids)
+                .zip(task_ids)
                 .zip(results)
-                .map(|(((id, reaction), invocation_id), writes)| {
+                .map(|(((id, reaction), task_id), writes)| {
                     observer.reaction_completed(
                         tag.timestamp,
                         tag.microstep,
                         id,
-                        &invocation_id,
+                        &task_id.to_string(),
                         &writes,
                     );
                     (reaction.order, writes)
                 })
                 .collect();
-            completed.sort_by_key(|(order, _)| *order);
-            for (_, writes) in completed {
+            completed_writes.sort_by_key(|(order, _)| *order);
+            for (_, writes) in completed_writes {
                 for (port, value) in writes {
                     // A state variable's new value stays with its instance
                     // rather than travelling anywhere.
@@ -3196,6 +4325,7 @@ fn run_event_loop_observed<E: ReactionExecutor>(
                 outputs.insert(name.clone(), value.clone());
             }
         }
+        completed = Some((tag.timestamp, tag.microstep));
     }
     Ok(LoopEnd::Completed(Settled {
         outputs,
@@ -3218,17 +4348,22 @@ fn invocation_spec(
                 .map(|value| (trigger.clone(), value.clone()))
         })
         .collect();
-    let allowed_effects = reaction
-        .effects
-        .iter()
-        .map(|effect| {
-            let port = state
-                .ports
-                .get(effect)
-                .with_context(|| format!("unknown effect port '{effect}'"))?;
-            Ok((effect.clone(), port.ty.clone()))
-        })
-        .collect::<Result<_>>()?;
+    let mut allowed_effects = BTreeMap::new();
+    let mut effect_names = BTreeMap::new();
+    for effect in &reaction.effects {
+        let port = state
+            .ports
+            .get(effect)
+            .with_context(|| format!("unknown effect port '{effect}'"))?;
+        allowed_effects.insert(effect.clone(), port.ty.clone());
+        // As the program spelled it, so the agent reads `Decision` rather
+        // than the refinement it expands to.
+        effect_names.insert(
+            effect.clone(),
+            port.declared.clone().unwrap_or_else(|| port.ty.clone()),
+        );
+    }
+    let types = types_for_effects(state, &effect_names);
     // Only its own instance's: a body reaches state through `self`.
     let state_values = state
         .state_vars
@@ -3237,16 +4372,115 @@ fn invocation_spec(
         .filter_map(|(name, _)| store.get(name).map(|value| (name.clone(), value.clone())))
         .collect();
     Ok(InvocationSpec {
-        id: Uuid::new_v4().to_string(),
+        id: next_task_id()?,
         reaction_id: reaction_id.clone(),
         agent: reaction.agent.clone(),
         trigger_values,
         allowed_effects,
+        effect_names,
+        types,
         state_values,
         contract: reaction.contract.clone(),
         prompt: reaction.prompt.clone(),
         within: reaction.within.map(Duration::from_nanos),
     })
+}
+
+// Process-wide allocation keeps IDs distinct across concurrent runs and never
+// reuses a completed task's ID. Stay within JSON's exact integer range.
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_task_id() -> Result<u64> {
+    // Explicit CAS loop: `fetch_update` is deprecated on newer toolchains and
+    // its replacement `try_update` postdates the minimum supported Rust.
+    let mut id = NEXT_TASK_ID.load(Ordering::Relaxed);
+    loop {
+        if id >= 1_u64 << 53 {
+            anyhow::bail!("task ID space exhausted");
+        }
+        match NEXT_TASK_ID.compare_exchange_weak(id, id + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(id),
+            Err(current) => id = current,
+        }
+    }
+}
+
+/// The message an agent is handed, with `rendered` as its prompt.
+///
+/// The header is one `key: value` per line up to the first blank line, which
+/// is what the stub agent parses. Effects are spelled as the program declared
+/// them, and `types` maps each name used back to the type the runtime checks.
+/// What the schema said about a type follows the header, where the agent
+/// reads it as prose.
+fn invocation_message(invocation: &InvocationSpec, rendered: &str) -> Result<String> {
+    let mut header = format!(
+        "OMAR INVOCATION\ntask_id: {}\ntriggers: {}\neffects: {}\n",
+        invocation.id,
+        serde_json::to_string(&invocation.trigger_values)?,
+        serde_json::to_string(&invocation.effect_names)?,
+    );
+    let mut described = String::new();
+    if !invocation.types.is_empty() {
+        header.push_str(&format!(
+            "types: {}\n",
+            serde_json::to_string(&invocation.types)?
+        ));
+        for (name, declared) in &invocation.types {
+            described.push_str(&describe_type(name, declared));
+            described.push('\n');
+        }
+        described.push('\n');
+    }
+    header.push_str(&format!("contract: {}\n", invocation.contract));
+    Ok(format!(
+        "{header}\n{described}{rendered}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. Pass the integer task_id above to both tools. For a signal effect, set its value to null. Do not address another agent directly."
+    ))
+}
+
+/// One line saying what a named type admits and what its schema said.
+fn describe_type(name: &str, declared: &TypeState) -> String {
+    let mut line = match string_enum(&declared.ty) {
+        Some(allowed) => {
+            // Quoted by serde: an admitted value may contain a quote.
+            let options: Vec<String> = allowed.iter().map(|o| json!(o).to_string()).collect();
+            format!("Type {name} is one of {}.", options.join(", "))
+        }
+        None => format!("Type {name} is {}.", declared.ty),
+    };
+    if let Some(title) = declared
+        .title
+        .as_deref()
+        .filter(|t| !t.is_empty() && *t != name)
+    {
+        line.push_str(&format!(" Title: {title}."));
+    }
+    if let Some(description) = declared.description.as_deref().filter(|d| !d.is_empty()) {
+        line.push_str(&format!(" {}", description.trim()));
+        if !description.trim().ends_with('.') {
+            line.push('.');
+        }
+    }
+    line
+}
+
+/// The named types the effects' spellings use.
+///
+/// By name, not by what the name expands to: two imports may define the same
+/// values, and the agent is told the one the program wrote.
+fn types_for_effects(
+    state: &VmState,
+    effect_names: &BTreeMap<String, String>,
+) -> BTreeMap<String, TypeState> {
+    let named: BTreeSet<&str> = effect_names
+        .values()
+        .map(|spelled| leaf_type(spelled))
+        .collect();
+    state
+        .types
+        .iter()
+        .filter(|(name, _)| named.contains(name.as_str()))
+        .map(|(name, defined)| (name.clone(), defined.clone()))
+        .collect()
 }
 
 fn render_prompt(template: &str, values: &BTreeMap<String, Value>) -> Result<String> {
@@ -3369,12 +4603,13 @@ fn require_identifier(kind: &str, value: &str) -> Result<()> {
     }
 }
 
-/// Whether a backend is answered by a web client rather than a spawned process.
-///
-/// Nothing is spawned for one, so it has no pane, no readiness marker and no
-/// command to resolve — the difference has to be known before any of that is
-/// attempted. It names what answers the reaction, not how the bytes get there:
-/// the transport is the panel's business, not the program's.
+/// Whether this agent needs a launched coding-agent process.
+fn needs_agent_process(backend: &str) -> bool {
+    !is_web_backend(backend)
+        && !crate::backend::by_name(backend).is_some_and(|backend| backend.topology_only())
+}
+
+/// Web agents are answered by a client through the invocation registry.
 fn is_web_backend(backend: &str) -> bool {
     canonical_backend(backend) == "web"
 }
@@ -3483,6 +4718,7 @@ mod tests {
     fn loop_outputs(end: LoopEnd) -> BTreeMap<String, Value> {
         match end {
             LoopEnd::Completed(settled) | LoopEnd::Stopped(settled) => settled.outputs,
+            LoopEnd::Paused(state) => state.outputs,
         }
     }
 
@@ -3537,8 +4773,8 @@ mod tests {
         let bytecode_path = directory.path().join("workflow.json");
         fs::write(&bytecode_path, serde_json::to_vec(&program()).unwrap()).unwrap();
 
-        let error = load_program_with_compiler(&bytecode_path, Some(Path::new("missing-omarc")))
-            .unwrap_err();
+        let error =
+            load_program_with(&bytecode_path, Some(Path::new("missing-omarc"))).unwrap_err();
 
         assert!(error.to_string().contains("must use the .omar extension"));
     }
@@ -3552,14 +4788,208 @@ mod tests {
         let source_path = directory.path().join("workflow.omar");
         fs::write(&source_path, serde_json::to_vec(&program()).unwrap()).unwrap();
         let compiler_path = directory.path().join("omarc");
-        fs::write(&compiler_path, "#!/bin/sh\ncp \"$1\" \"$2\"\n").unwrap();
+        // omarc [options] <input> <output>: the files are the last two arguments.
+        fs::write(
+            &compiler_path,
+            "#!/bin/sh\nshift $(($# - 2))\ncp \"$1\" \"$2\"\n",
+        )
+        .unwrap();
         let mut permissions = fs::metadata(&compiler_path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&compiler_path, permissions).unwrap();
 
-        let loaded = load_program_with_compiler(&source_path, Some(&compiler_path)).unwrap();
+        let loaded = load_program_with(&source_path, Some(&compiler_path)).unwrap();
 
         assert_eq!(loaded.team, "Demo");
+    }
+
+    #[test]
+    fn external_schema_compiles_and_enforces_the_imported_enum() {
+        let compiler = Path::new(env!("CARGO_MANIFEST_DIR")).join("lang/.lake/build/bin/omarc");
+        if !compiler.exists() {
+            eprintln!("skipping: {} has not been built", compiler.display());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let schema = directory.path().join("decision.json");
+        let source = directory.path().join("review.omar");
+        fs::write(
+            &schema,
+            r#"{"type":"string","enum":["approved","needs_revision"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &source,
+            r#"
+            type Decision from "decision.json"
+            team Review[reviewer : Codex] {
+                input request : string
+                output decision : Decision
+                task reviewer(request) -> decision "Review $(request)"
+            }
+            main { review = Review() }
+        "#,
+        )
+        .unwrap();
+        let bytecode = load_program_with(&source, Some(&compiler)).unwrap();
+        let plan = verify(&bytecode).unwrap();
+        let ty = &plan.ports["review.decision"].ty;
+        assert_eq!(ty, r#"string in ["approved","needs_revision"]"#);
+        assert_eq!(
+            plan.ports["review.decision"].declared.as_deref(),
+            Some("Decision")
+        );
+        // The name survives to the plan, so the agent can be told it.
+        assert_eq!(
+            plan.types["Decision"],
+            TypeState {
+                ty: ty.clone(),
+                title: None,
+                description: None,
+            }
+        );
+        validate_value(ty, &json!("approved")).unwrap();
+        let error = validate_value(ty, &json!("approved with revisions"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs_revision"), "{error}");
+        assert!(validate_value(ty, &json!({"decision":"approved"})).is_err());
+        // The bytecode embeds constraints; deployed validation needs no file.
+        fs::remove_file(&schema).unwrap();
+        validate_value(ty, &json!("needs_revision")).unwrap();
+        let error = load_program_with(&source, Some(&compiler))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("decision.json"), "{error}");
+        fs::write(
+            &schema,
+            r#"{"type":"string","enum":["approved"],"minLength":20}"#,
+        )
+        .unwrap();
+        let error = load_program_with(&source, Some(&compiler))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported JSON Schema keyword"), "{error}");
+    }
+
+    #[test]
+    fn a_staged_program_imports_from_its_own_directory_only() {
+        let compiler = Path::new(env!("CARGO_MANIFEST_DIR")).join("lang/.lake/build/bin/omarc");
+        if !compiler.exists() {
+            eprintln!("skipping: {} has not been built", compiler.display());
+            return;
+        }
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("decision.json");
+        fs::write(
+            &elsewhere,
+            r#"{"type":"string","enum":["approved","needs_revision"]}"#,
+        )
+        .unwrap();
+        let directory = outside.path().join("staged");
+        fs::create_dir_all(directory.join("schemas")).unwrap();
+        fs::copy(&elsewhere, directory.join("schemas/decision.json")).unwrap();
+        let program = |import: &str| {
+            format!(
+                r#"
+                type Decision from "{import}"
+                team Review[reviewer : Codex] {{
+                    input request : string
+                    output decision : Decision
+                    task reviewer(request) -> decision "Review $(request)"
+                }}
+                main {{ review = Review() }}
+            "#
+            )
+        };
+        let source = directory.join("review.omar");
+
+        // A staged program reads only what came with it.
+        for import in [
+            elsewhere.display().to_string(),
+            "../decision.json".to_string(),
+            "schemas/../../decision.json".to_string(),
+            "schemas\\decision.json".to_string(),
+        ] {
+            fs::write(&source, program(&import)).unwrap();
+            let error = load_program_with(&source, Some(&compiler))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("inside the program's directory"),
+                "{import} gave {error}"
+            );
+        }
+        for import in ["schemas/decision.json", "./schemas/decision.json"] {
+            fs::write(&source, program(import)).unwrap();
+            load_program_with(&source, Some(&compiler)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_program_s_imports_are_read_from_beside_it_to_travel_with_it() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("schemas")).unwrap();
+        let decision = r#"{"type":"string","enum":["continue","stop"]}"#;
+        let priority = r#"{"type":"string","enum":["high","low"]}"#;
+        fs::write(directory.path().join("schemas/decision.json"), decision).unwrap();
+        fs::write(directory.path().join("priority.json"), priority).unwrap();
+        let program = directory.path().join("review.omar");
+        let source = r#"
+            // type Commented from "schemas/nowhere.json"
+            type Decision from "./schemas/decision.json" // the route
+            type   Priority   from   "priority.json"
+            type Elsewhere from "/etc/hostname"
+            type Above from "../decision.json"
+            team Review[reviewer : Codex] {
+                input request : string
+                output decision : Decision
+                task reviewer(request) -> decision "Review $(request)"
+            }
+            main { review = Review() }
+        "#;
+
+        assert_eq!(
+            imports_of(source),
+            vec![
+                (
+                    "Decision".to_string(),
+                    "./schemas/decision.json".to_string()
+                ),
+                ("Priority".to_string(), "priority.json".to_string()),
+                ("Elsewhere".to_string(), "/etc/hostname".to_string()),
+                ("Above".to_string(), "../decision.json".to_string()),
+            ]
+        );
+        // Imports outside the directory are left for the compiler to refuse.
+        let files = imported_files(&program, source).unwrap();
+        assert_eq!(
+            files,
+            BTreeMap::from([
+                ("./schemas/decision.json".to_string(), decision.to_string()),
+                ("priority.json".to_string(), priority.to_string()),
+            ])
+        );
+
+        let error = imported_files(&program, r#"type Missing from "schemas/missing.json""#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'Missing'"), "{error}");
+        assert!(error.contains("schemas/missing.json"), "{error}");
+        assert!(error.contains("review.omar"), "{error}");
+
+        for local in ["decision.json", "./a/b.json", "a/./b.json"] {
+            assert!(is_local_import(local), "{local}");
+        }
+        for foreign in [
+            "",
+            "/etc/hostname",
+            "../x.json",
+            "a/../../x.json",
+            "a\\b.json",
+        ] {
+            assert!(!is_local_import(foreign), "{foreign}");
+        }
     }
 
     #[test]
@@ -3570,11 +5000,327 @@ mod tests {
         assert_eq!(state.reactions.len(), 1);
     }
 
+    /// A plan with one named enum type and a body reaction that reads or
+    /// writes a port of it.
+    fn body_with_enum(kind: &str, triggers: &str, effects: &str) -> Bytecode {
+        serde_json::from_str(&format!(
+            r#"{{
+              "version": 1,
+              "team": "Desk",
+              "instructions": [
+                {{"op":"begin_plan","team":"Desk"}},
+                {{"op":"define_type","name":"Decision",
+                  "type":"string in [\"continue\",\"stop\"]",
+                  "description":"Whether to go on"}},
+                {{"op":"define_port","kind":"input","name":"token","type":"string"}},
+                {{"op":"define_port","kind":"{kind}","name":"decision",
+                  "type":"string in [\"continue\",\"stop\"]","declared":"Decision"}},
+                {{"op":"define_port","kind":"output","name":"memo","type":"string"}},
+                {{"op":"install_reaction","id":"reaction.0","agent":"",
+                 "triggers":{triggers},"effects":{effects},
+                 "contract":"","prompt":"","body":"memo = Some(String::new());"}},
+                {{"op":"commit_plan"}}
+              ]
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_body_may_read_an_enum_port_but_not_write_one() {
+        let plan = verify(&body_with_enum("input", r#"["decision"]"#, r#"["memo"]"#)).unwrap();
+        assert_eq!(
+            plan.types["Decision"].ty,
+            r#"string in ["continue","stop"]"#
+        );
+        assert_eq!(
+            plan.types["Decision"].description.as_deref(),
+            Some("Whether to go on")
+        );
+        assert!(crate::reaction::supports_type(
+            r#"string in ["continue","stop"]"#
+        ));
+
+        let error = verify(&body_with_enum("output", r#"["token"]"#, r#"["decision"]"#))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("writes 'decision'"), "{error}");
+        assert!(error.contains("does not enforce"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_duplicate_or_malformed_named_type() {
+        for (extra, expected) in [
+            (
+                r#"{"op":"define_type","name":"Decision","type":"string"}"#,
+                "duplicate type",
+            ),
+            (
+                r#"{"op":"define_type","name":"Broken","type":"string in [oops"}"#,
+                "invalid string refinement",
+            ),
+            (
+                r#"{"op":"define_type","name":"Blank","type":" "}"#,
+                "empty definition",
+            ),
+        ] {
+            let mut program = body_with_enum("input", r#"["decision"]"#, r#"["memo"]"#);
+            program
+                .instructions
+                .insert(2, serde_json::from_str(extra).unwrap());
+            let error = verify(&program).unwrap_err().to_string();
+            assert!(error.contains(expected), "{extra} gave {error}");
+        }
+    }
+
+    #[test]
+    fn a_declared_spelling_has_to_be_the_type() {
+        for (declared, expected) in [
+            ("Verdict", "declared as 'Verdict'"),
+            ("list<Decision>", "declared as 'list<Decision>'"),
+            ("string", "declared as 'string'"),
+        ] {
+            let mut program = body_with_enum("input", r#"["decision"]"#, r#"["memo"]"#);
+            let Instruction::DefinePort {
+                declared: spelled, ..
+            } = &mut program.instructions[3]
+            else {
+                panic!("fixture moved");
+            };
+            *spelled = Some(declared.to_string());
+            let error = verify(&program).unwrap_err().to_string();
+            assert!(error.contains(expected), "{declared} gave {error}");
+        }
+    }
+
+    #[test]
+    fn two_imports_of_the_same_values_keep_their_own_names() {
+        // `A` and `B` expand to one refinement. The agent is told the one the
+        // program wrote on the port, not whichever sorts last.
+        let bytecode: Bytecode = serde_json::from_str(
+            r#"{
+              "version": 1,
+              "team": "Desk",
+              "instructions": [
+                {"op":"begin_plan","team":"Desk"},
+                {"op":"define_type","name":"A","type":"string in [\"x\",\"y\"]","description":"the first"},
+                {"op":"define_type","name":"B","type":"string in [\"x\",\"y\"]","description":"the second"},
+                {"op":"spawn_agent","name":"clerk","backend":"Codex"},
+                {"op":"define_port","kind":"input","name":"topic","type":"string"},
+                {"op":"define_port","kind":"output","name":"out",
+                 "type":"string in [\"x\",\"y\"]","declared":"B"},
+                {"op":"install_reaction","id":"reaction.0","agent":"clerk",
+                 "triggers":["topic"],"effects":["out"],"contract":"out","prompt":"p"},
+                {"op":"commit_plan"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let plan = verify(&bytecode).unwrap();
+        let reaction = plan.reactions.get_key_value("reaction.0").unwrap();
+        let spec = invocation_spec(
+            &plan,
+            reaction,
+            &BTreeMap::from([("topic".to_string(), json!("t"))]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(spec.effect_names["out"], "B");
+        assert_eq!(spec.types.keys().collect::<Vec<_>>(), vec!["B"]);
+        let message = invocation_message(&spec, "p").unwrap();
+        assert!(message.contains(r#"effects: {"out":"B"}"#), "{message}");
+        assert!(
+            message.contains("Type B is one of \"x\", \"y\". the second."),
+            "{message}"
+        );
+        assert!(!message.contains("the first"), "{message}");
+    }
+
+    #[test]
+    fn an_agent_is_told_the_type_name_and_what_the_schema_said() {
+        let decision = TypeState {
+            ty: r#"string in ["continue","stop"]"#.into(),
+            title: Some("Review decision".into()),
+            description: Some("Whether the request may go on".into()),
+        };
+        let spec = InvocationSpec {
+            id: 1,
+            reaction_id: "reaction.0".into(),
+            agent: "clerk".into(),
+            trigger_values: BTreeMap::from([("topic".to_string(), json!("hi"))]),
+            allowed_effects: BTreeMap::from([
+                ("out".to_string(), decision.ty.clone()),
+                ("all".to_string(), format!("list<{}>", decision.ty)),
+                ("memo".to_string(), "string".to_string()),
+            ]),
+            effect_names: BTreeMap::from([
+                ("out".to_string(), "Decision".to_string()),
+                ("all".to_string(), "list<Decision>".to_string()),
+                ("memo".to_string(), "string".to_string()),
+            ]),
+            types: BTreeMap::from([("Decision".to_string(), decision.clone())]),
+            state_values: BTreeMap::new(),
+            contract: "out".into(),
+            prompt: "Decide.".into(),
+            within: None,
+        };
+        let message = invocation_message(&spec, "Decide.").unwrap();
+        let header: Vec<&str> = message
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .collect();
+        assert_eq!(header[0], "OMAR INVOCATION");
+        assert!(header.contains(&"task_id: 1"), "{message}");
+        assert!(
+            header
+                .contains(&r#"effects: {"all":"list<Decision>","memo":"string","out":"Decision"}"#),
+            "{message}"
+        );
+        assert!(
+            header.contains(&r#"types: {"Decision":{"type":"string in [\"continue\",\"stop\"]","title":"Review decision","description":"Whether the request may go on"}}"#),
+            "{message}"
+        );
+        assert!(header.contains(&"contract: out"), "{message}");
+        // The prose the agent reads comes after the header, before the prompt.
+        let body = &message[message.find("\n\n").unwrap() + 2..];
+        assert!(
+            body.starts_with(
+                "Type Decision is one of \"continue\", \"stop\". Title: Review decision. Whether the request may go on.\n\nDecide."
+            ),
+            "{body}"
+        );
+
+        // Only the types the effects use are mentioned, and a program with
+        // none reads as it always did.
+        let plain = InvocationSpec {
+            types: BTreeMap::new(),
+            allowed_effects: BTreeMap::from([("memo".to_string(), "string".to_string())]),
+            effect_names: BTreeMap::from([("memo".to_string(), "string".to_string())]),
+            ..spec
+        };
+        let message = invocation_message(&plain, "Decide.").unwrap();
+        assert!(!message.contains("types:"), "{message}");
+        assert!(
+            message.contains(
+                "effects: {\"memo\":\"string\"}\ncontract: out\n\nDecide.\n\nUse omar_set_port"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn only_types_the_effects_use_are_offered() {
+        let plan = verify(&body_with_enum("output", r#"["token"]"#, r#"["memo"]"#)).unwrap();
+        let reaction = plan.reactions.get_key_value("reaction.0").unwrap();
+        let spec = invocation_spec(
+            &plan,
+            reaction,
+            &BTreeMap::from([("token".to_string(), json!("t"))]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(spec.types.is_empty(), "{:?}", spec.types);
+    }
+
+    #[test]
+    fn rejects_a_port_whose_refinement_does_not_parse() {
+        // `omarc` cannot emit either of these. Hand-written bytecode can, and
+        // the port is what is wrong -- not the first value written to it.
+        for (ty, expected) in [
+            (r#"string in [oops"#, "invalid string refinement"),
+            (r#"string in [1,2]"#, "invalid string refinement"),
+            (r#"string in []"#, "admits no value"),
+            // `validate_value` looks inside these, so `verify` must too.
+            (r#"list<string in [oops>"#, "invalid string refinement"),
+            (r#"list<string in [oops"#, "invalid type"),
+            (r#"option<string in ["a"]"#, "invalid type"),
+            (r#"list<>"#, "invalid type"),
+            (r#"option<>"#, "invalid type"),
+            // One `>` too many leaves `string>`, which is not a type.
+            (r#"list<string>>"#, "invalid type"),
+            (r#"option<int>>"#, "invalid type"),
+            (r#"list<option<int>>>"#, "invalid type"),
+            (r#"list<strin>"#, "invalid type"),
+            (r#"text"#, "invalid type"),
+            (r#"string in ["a","a"]"#, "duplicate enum value"),
+            (r#"list<string in ["a","b","a"]>"#, "duplicate enum value"),
+            (r#"list<option<string in [oops>"#, "invalid type"),
+            (r#"option<string in []>"#, "admits no value"),
+            (
+                r#"list<option<string in [1,2]>>"#,
+                "invalid string refinement",
+            ),
+        ] {
+            let mut program = program();
+            program.instructions[2] = serde_json::from_str(&format!(
+                r#"{{"op":"define_port","kind":"input","name":"request","type":{}}}"#,
+                serde_json::to_string(ty).unwrap()
+            ))
+            .unwrap();
+            let error = verify(&program).unwrap_err().to_string();
+            assert!(error.contains(expected), "{ty} gave {error}");
+        }
+    }
+
     #[test]
     fn rejects_incomplete_topology() {
         let mut program = program();
         program.instructions.pop();
         assert!(verify(&program).is_err());
+    }
+
+    #[test]
+    fn a_refined_string_admits_only_what_it_lists() {
+        let ty = "string in [\"continue\",\"stop\"]";
+        validate_value(ty, &json!("continue")).unwrap();
+        validate_value(ty, &json!("stop")).unwrap();
+
+        // The failure the refinement exists for: a value that is a perfectly
+        // good string and not one of the answers the port accepts.
+        let rejected = validate_value(ty, &json!("this is a terminal record, not a forward"))
+            .unwrap_err()
+            .to_string();
+        assert!(rejected.contains("\"continue\""), "{rejected}");
+        assert!(rejected.contains("\"stop\""), "{rejected}");
+
+        assert!(validate_value(ty, &json!(1)).is_err());
+        validate_value("list<string in [\"a\",\"b\"]>", &json!(["a", "b"])).unwrap();
+        assert!(validate_value("list<string in [\"a\",\"b\"]>", &json!(["c"])).is_err());
+    }
+
+    #[test]
+    fn enum_cli_inputs_are_bare_text_and_still_validate_membership() {
+        let ty = r#"string in ["continue","stop"]"#;
+        let value = parse_input_value(ty, "continue").unwrap();
+        assert_eq!(value, json!("continue"));
+        validate_value(ty, &value).unwrap();
+        for raw in ["unknown", r#""continue""#] {
+            let value = parse_input_value(ty, raw).unwrap();
+            assert_eq!(value, json!(raw));
+            assert!(validate_value(ty, &value).is_err());
+        }
+        let nested = "list<string in [\"continue\",\"stop\"]>";
+        let value = parse_input_value(nested, r#"["continue","stop"]"#).unwrap();
+        validate_value(nested, &value).unwrap();
+        assert!(parse_input_value(nested, "continue").is_err());
+    }
+
+    #[test]
+    fn a_refinement_reports_awkward_values_readably() {
+        // An admitted value may contain a quote or a newline, and the agent
+        // reads the rejection, so the options are quoted by serde.
+        let ty = r#"string in ["say \"hi\"","two\nlines"]"#;
+        validate_value(ty, &json!("say \"hi\"")).unwrap();
+        let rejected = validate_value(ty, &json!("no")).unwrap_err().to_string();
+        assert!(rejected.contains(r#""say \"hi\"""#), "{rejected}");
+        assert!(rejected.contains(r#""two\nlines""#), "{rejected}");
+
+        // `omarc` rejects an empty refinement; hand-written bytecode can still
+        // carry one, and it is the port that is wrong, not the value.
+        let empty = validate_value("string in []", &json!("anything"))
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("admits no value"), "{empty}");
     }
 
     #[test]
@@ -3663,6 +5409,7 @@ mod tests {
             team: "HR".into(),
             state_vars: BTreeMap::new(),
             params: BTreeMap::new(),
+            types: BTreeMap::new(),
             instances: BTreeMap::new(),
             timers: BTreeMap::new(),
             agents: BTreeMap::from([
@@ -3705,6 +5452,7 @@ mod tests {
                 PortState {
                     kind,
                     ty: ty.into(),
+                    declared: None,
                     delay: None,
                     instance: String::new(),
                 },
@@ -4052,7 +5800,7 @@ mod tests {
         assert!(error.contains("requires an effect"), "{error}");
         assert!(error.contains("memo"), "{error}");
         assert!(error.contains("reaction.0"), "{error}");
-        assert!(error.contains(&spec.id), "{error}");
+        assert!(error.contains(&spec.id.to_string()), "{error}");
     }
 
     /// Answers nothing, which is what an expired deadline does to a contract
@@ -4231,6 +5979,16 @@ mod tests {
     }
 
     #[test]
+    fn direct_topology_backends_have_no_agent_process() {
+        assert!(!needs_agent_process("Jev"));
+        assert!(!needs_agent_process(" JeV "));
+        assert!(!needs_agent_process("Web"));
+        assert!(needs_agent_process("Codex"));
+        assert!(needs_agent_process("ClaudeCode"));
+        assert!(needs_agent_process("Stub"));
+    }
+
+    #[test]
     fn a_client_is_a_backend_however_it_is_spelled() {
         assert!(is_web_backend("Web"));
         assert!(is_web_backend("web"));
@@ -4280,13 +6038,13 @@ mod tests {
             for _ in 0..200 {
                 let waiting = pending_invocations(&context).unwrap();
                 if let Some(item) = waiting["pending"].as_array().unwrap().first() {
-                    let id = item["invocation_id"].as_str().unwrap().to_string();
+                    let id = item["task_id"].as_u64().unwrap();
                     mcp_set_port(
                         &context,
-                        json!({"invocation_id": id, "port": "verdict", "value": "ship"}),
+                        json!({"task_id": id, "port": "verdict", "value": "ship"}),
                     )
                     .unwrap();
-                    mcp_complete(&context, json!({"invocation_id": id})).unwrap();
+                    mcp_complete(&context, json!({"task_id": id})).unwrap();
                     return item.clone();
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -4312,12 +6070,37 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_port_name_resolves_to_its_one_qualified_effect() {
+        let allowed = BTreeMap::from([
+            ("faq.objection".to_string(), "string".to_string()),
+            ("faq.checked".to_string(), "string".to_string()),
+        ]);
+        let (port, _) = resolve_effect_port(&allowed, "objection").unwrap();
+        assert_eq!(port, "faq.objection");
+        let (port, _) = resolve_effect_port(&allowed, "faq.checked").unwrap();
+        assert_eq!(port, "faq.checked");
+
+        // An unknown name says which names would have worked.
+        let err = resolve_effect_port(&allowed, "verdict")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("faq.checked, faq.objection"), "{err}");
+
+        // A bare name two effects share is not guessed at.
+        let ambiguous = BTreeMap::from([
+            ("a.note".to_string(), "string".to_string()),
+            ("b.note".to_string(), "string".to_string()),
+        ]);
+        assert!(resolve_effect_port(&ambiguous, "note").is_err());
+    }
+
+    #[test]
     fn one_agents_pending_work_is_not_anothers() {
         let server = InvocationServer::start().unwrap();
         server
             .registry
             .register(InvocationRecord {
-                id: "invocation-3".into(),
+                id: 3,
                 team: "Desk".into(),
                 agent: "panel".into(),
                 reaction: "reaction.0".into(),
@@ -4343,7 +6126,7 @@ mod tests {
             .execute("Desk", "clerk", InvocationCommand::Pending)
             .unwrap();
         assert!(theirs["pending"].as_array().unwrap().is_empty());
-        server.registry.remove("invocation-3");
+        server.registry.remove(&3);
     }
 
     /// A connection carrying `delay` nanoseconds, so the run reaches its
@@ -5349,6 +7132,96 @@ mod tests {
     }
 
     #[test]
+    fn integer_task_ids_are_exact_and_owned_by_the_caller() {
+        let registry = InvocationRegistry::default();
+        let record = InvocationRecord {
+            id: 7,
+            team: "Desk".into(),
+            agent: "worker".into(),
+            reaction: "reaction.0".into(),
+            contract: "answer".into(),
+            allowed_effects: BTreeMap::from([("answer".into(), "string".into())]),
+            trigger_values: BTreeMap::new(),
+            prompt: "answer".into(),
+            writes: BTreeMap::new(),
+            completed: false,
+        };
+        let completion = registry.register(record.clone()).unwrap();
+        let set = |id| {
+            InvocationCommand::SetPort(SetPortArgs {
+                task_id: id,
+                port: "answer".into(),
+                value: json!("hello"),
+            })
+        };
+        // Even with only one pending task, an incorrect ID is never guessed.
+        assert!(registry.execute("Desk", "worker", set(8)).is_err());
+        assert!(registry
+            .execute(
+                "Desk",
+                "worker",
+                InvocationCommand::Complete(CompleteArgs { task_id: 8 })
+            )
+            .is_err());
+        // A real ID is not a credential: both commands still check ownership.
+        for (team, agent) in [("Desk", "other"), ("Other", "worker")] {
+            assert!(registry.execute(team, agent, set(7)).is_err());
+            assert!(registry
+                .execute(
+                    team,
+                    agent,
+                    InvocationCommand::Complete(CompleteArgs { task_id: 7 })
+                )
+                .is_err());
+        }
+        let pending = registry
+            .execute("Desk", "worker", InvocationCommand::Pending)
+            .unwrap();
+        assert_eq!(pending["pending"][0]["task_id"], json!(7));
+        assert!(pending["pending"][0].get("invocation_id").is_none());
+        // Multiple pending tasks remain individually addressable.
+        let second = registry
+            .register(InvocationRecord { id: 8, ..record })
+            .unwrap();
+        registry.execute("Desk", "worker", set(7)).unwrap();
+        registry
+            .execute(
+                "Desk",
+                "worker",
+                InvocationCommand::Complete(CompleteArgs { task_id: 7 }),
+            )
+            .unwrap();
+        assert_eq!(completion.try_recv().unwrap()["answer"], json!("hello"));
+        assert!(second.try_recv().is_err());
+        registry.remove(&7);
+        assert!(registry.execute("Desk", "worker", set(7)).is_err());
+    }
+
+    #[test]
+    fn task_ids_are_json_integers_and_not_legacy_strings() {
+        let valid = json!({"task_id": 7, "port": "answer", "value": "hello"});
+        assert_eq!(
+            serde_json::from_value::<SetPortArgs>(valid)
+                .unwrap()
+                .task_id,
+            7
+        );
+        for id in [json!("7"), json!(7.5), json!(-1), Value::Null] {
+            assert!(serde_json::from_value::<SetPortArgs>(
+                json!({"task_id": id, "port": "answer", "value": "hello"})
+            )
+            .is_err());
+            assert!(serde_json::from_value::<CompleteArgs>(json!({"task_id": id})).is_err());
+        }
+        assert!(
+            serde_json::from_value::<CompleteArgs>(json!({"invocation_id": "old-uuid"})).is_err()
+        );
+        let first = next_task_id().unwrap();
+        let second = next_task_id().unwrap();
+        assert!(first > 0 && second > first && second < (1_u64 << 53));
+    }
+
+    #[test]
     fn reactive_scoped_port_writes_are_last_writer_wins() {
         let server = InvocationServer::start().unwrap();
         let context = TopologyMcpContext {
@@ -5358,7 +7231,7 @@ mod tests {
             token: server.token.clone(),
         };
         let record = InvocationRecord {
-            id: "invocation-1".into(),
+            id: 1,
             team: "Demo".into(),
             agent: "worker".into(),
             reaction: "reaction.0".into(),
@@ -5374,15 +7247,95 @@ mod tests {
         for value in ["first", "second"] {
             mcp_set_port(
                 &context,
-                json!({"invocation_id":"invocation-1", "port":"opinion", "value":value}),
+                json!({"task_id":1, "port":"opinion", "value":value}),
             )
             .unwrap();
         }
-        mcp_complete(&context, json!({"invocation_id":"invocation-1"})).unwrap();
+        mcp_complete(&context, json!({"task_id":1})).unwrap();
 
         let writes = completion.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(writes["opinion"], json!("second"));
-        server.registry.remove("invocation-1");
+        server.registry.remove(&1);
+    }
+
+    #[test]
+    fn a_rejected_refinement_can_be_corrected_over_the_invocation_protocol() {
+        let server = InvocationServer::start().unwrap();
+        let context = TopologyMcpContext {
+            team: "Recovery".into(),
+            agent: "worker".into(),
+            endpoint: server.endpoint.clone(),
+            token: server.token.clone(),
+        };
+        let completion = server
+            .registry
+            .register(InvocationRecord {
+                id: 4,
+                team: "Recovery".into(),
+                agent: "worker".into(),
+                reaction: "reaction.0".into(),
+                contract: "decision".into(),
+                allowed_effects: BTreeMap::from([(
+                    "decision".into(),
+                    r#"string in ["continue","stop"]"#.into(),
+                )]),
+                trigger_values: BTreeMap::new(),
+                prompt: "Choose a permitted decision.".into(),
+                writes: BTreeMap::new(),
+                completed: false,
+            })
+            .unwrap();
+
+        // Exercise the real socket path, not just validate_value.
+        let error = mcp_set_port(
+            &context,
+            json!({
+                "task_id": 4, "port": "decision",
+                "value": "this is a terminal record, not a forward"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("decision"), "{error}");
+        assert!(error.contains("expected one of"), "{error}");
+        assert!(error.contains("\"continue\""), "{error}");
+        assert!(error.contains("\"stop\""), "{error}");
+
+        // Rejection must not satisfy the required output or release a result.
+        let error = mcp_complete(&context, json!({"task_id": 4}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("effect contract 'decision' is not satisfied"),
+            "{error}"
+        );
+        assert!(matches!(
+            completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(!server.registry.answered(&4));
+
+        let response = mcp_set_port(
+            &context,
+            json!({
+                "task_id": 4, "port": "decision", "value": "continue"
+            }),
+        )
+        .unwrap();
+        assert_eq!(response["status"], json!("buffered"));
+        assert!(matches!(
+            completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let response = mcp_complete(&context, json!({"task_id": 4})).unwrap();
+        assert_eq!(response["status"], json!("complete"));
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(1)).unwrap(),
+            BTreeMap::from([("decision".into(), json!("continue"))])
+        );
+        assert!(server.registry.answered(&4));
+        server.registry.remove(&4);
     }
 
     #[test]
@@ -5395,7 +7348,7 @@ mod tests {
             token: server.token.clone(),
         };
         let record = InvocationRecord {
-            id: "invocation-2".into(),
+            id: 2,
             team: "Demo".into(),
             agent: "worker".into(),
             reaction: "reaction.0".into(),
@@ -5412,28 +7365,27 @@ mod tests {
         wrong_owner.agent = "intruder".into();
         let owner_error = mcp_set_port(
             &wrong_owner,
-            json!({"invocation_id":"invocation-2", "port":"opinion", "value":"no"}),
+            json!({"task_id":2, "port":"opinion", "value":"no"}),
         )
         .unwrap_err();
         assert!(owner_error.to_string().contains("does not belong"));
 
-        let contract_error =
-            mcp_complete(&context, json!({"invocation_id":"invocation-2"})).unwrap_err();
+        let contract_error = mcp_complete(&context, json!({"task_id":2})).unwrap_err();
         assert!(
             format!("{contract_error:#}").contains("effect contract 'opinion' is not satisfied")
         );
 
         mcp_set_port(
             &context,
-            json!({"invocation_id":"invocation-2", "port":"opinion", "value":"yes"}),
+            json!({"task_id":2, "port":"opinion", "value":"yes"}),
         )
         .unwrap();
-        mcp_complete(&context, json!({"invocation_id":"invocation-2"})).unwrap();
+        mcp_complete(&context, json!({"task_id":2})).unwrap();
         assert_eq!(
             completion.recv_timeout(Duration::from_secs(1)).unwrap(),
             BTreeMap::from([("opinion".into(), json!("yes"))])
         );
-        server.registry.remove("invocation-2");
+        server.registry.remove(&2);
     }
 
     /// Answers its invocation, and files a stop request while doing so.
@@ -5445,7 +7397,9 @@ mod tests {
     impl ReactionExecutor for StopWhileAnsweringExecutor {
         fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
             *self.calls.lock().unwrap() += 1;
-            crate::deploy::request_stop(&self.dir).unwrap();
+            // Filed once; a second invocation finds it pending and is refused,
+            // which is the rule, not a failure of this executor.
+            let _ = crate::deploy::request_stop(&self.dir);
             let port = invocation.allowed_effects.keys().next().unwrap().clone();
             Ok(BTreeMap::from([(port, json!("ping"))]))
         }
@@ -5513,7 +7467,7 @@ mod tests {
             LoopEnd::Completed(settled) => {
                 assert_eq!(settled.outputs.get("out"), Some(&json!("ping")))
             }
-            LoopEnd::Stopped(_) => panic!("nothing requested a stop"),
+            LoopEnd::Stopped(_) | LoopEnd::Paused(_) => panic!("nothing requested a stop"),
         }
         assert_eq!(*executor.calls.lock().unwrap(), 2);
     }
@@ -5541,6 +7495,384 @@ mod tests {
             }}"#
         ))
         .unwrap()
+    }
+
+    /// Counts invocations; pauses the run from inside the first one, the way
+    /// an operator's request lands while a tag is in flight.
+    struct PausingCounter {
+        calls: Mutex<usize>,
+        dir: Option<PathBuf>,
+    }
+    impl ReactionExecutor for PausingCounter {
+        fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+            let calls = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            if calls == 1 {
+                if let Some(dir) = &self.dir {
+                    deploy::request(dir, ControlOp::Pause).unwrap();
+                }
+            }
+            let count = invocation.state_values["c.count"].as_i64().unwrap() + 1;
+            let mut writes = BTreeMap::from([
+                ("c.count".to_string(), json!(count)),
+                ("c.total".to_string(), json!(count * 10)),
+            ]);
+            if count < 3 {
+                writes.insert("c.again".to_string(), json!(count));
+            }
+            Ok(writes)
+        }
+    }
+
+    /// Remembers what it captured; never due on its own unless told.
+    struct Recorder {
+        captures: Mutex<Vec<(Trigger, ExecutionState)>>,
+        due_once: Mutex<bool>,
+        fail_first: Mutex<u32>,
+        failures: Mutex<u32>,
+        expect_hold: Mutex<bool>,
+    }
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                captures: Mutex::new(Vec::new()),
+                due_once: Mutex::new(false),
+                fail_first: Mutex::new(0),
+                failures: Mutex::new(0),
+                expect_hold: Mutex::new(false),
+            }
+        }
+    }
+    impl Checkpointer for Recorder {
+        fn due(&self, _state: &ExecutionState) -> bool {
+            std::mem::take(&mut *self.due_once.lock().unwrap())
+        }
+        fn capture(&self, state: &ExecutionState, trigger: Trigger) -> Result<String> {
+            let mut fail = self.fail_first.lock().unwrap();
+            if *fail > 0 {
+                *fail -= 1;
+                bail!("disk full");
+            }
+            self.captures.lock().unwrap().push((trigger, state.clone()));
+            Ok(format!("cp-{}", self.captures.lock().unwrap().len()))
+        }
+        fn capture_failed(&self, _error: &anyhow::Error, _attempt: u32, held: bool) {
+            assert!(
+                !held || *self.expect_hold.lock().unwrap(),
+                "one failure is retried internally, never held"
+            );
+            *self.failures.lock().unwrap() += 1;
+        }
+    }
+
+    /// A pause at a tag boundary captures the run exactly, and a loop resumed
+    /// from that capture runs only what was left: same final outputs as an
+    /// uninterrupted run, no invocation repeated, none lost.
+    #[test]
+    fn a_resumed_loop_continues_exactly_where_the_pause_left_it() {
+        let state = verify(&counter_bytecode("")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let first = PausingCounter {
+            calls: Mutex::new(0),
+            dir: Some(dir.path().to_path_buf()),
+        };
+        let recorder = Recorder::new();
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::from([("c.tick".to_string(), json!(1))])),
+            &first,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&recorder),
+        )
+        .unwrap();
+        let LoopEnd::Paused(captured) = end else {
+            panic!("the pause request was not honoured");
+        };
+        assert_eq!(
+            *first.calls.lock().unwrap(),
+            1,
+            "paused after the first tag"
+        );
+        assert_eq!(captured.completed_tag, Some((0, 0)));
+        assert_eq!(captured.state_vars["c.count"], json!(1));
+        assert_eq!(captured.outputs["c.total"], json!(10));
+        // The re-trigger through the action is queued, not lost: it is the
+        // whole of the run's remaining work.
+        assert_eq!(captured.queue.len(), 1);
+        assert_eq!(captured.next_tag(), Some((0, 1)));
+        assert!(captured.queue[0].events.contains_key("c.again"));
+        let captures = recorder.captures.lock().unwrap();
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].0, Trigger::Pause);
+        assert_eq!(captures[0].1, captured);
+        drop(captures);
+
+        // The operator's request is consumed by the runner that paused; a
+        // fresh process continues from the capture alone.
+        deploy::clear_stop(dir.path()).unwrap();
+        let second = PausingCounter {
+            calls: Mutex::new(0),
+            dir: None,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Resume(captured),
+            &second,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&Recorder::new()),
+        )
+        .unwrap();
+        let LoopEnd::Completed(settled) = end else {
+            panic!("the resumed run should drain its queue");
+        };
+        assert_eq!(settled.outputs["c.total"], json!(30));
+        assert_eq!(settled.state_vars["c.count"], json!(3));
+        assert_eq!(*second.calls.lock().unwrap(), 2, "two tags were left");
+    }
+
+    /// A timer's next firings travel in the queue, so a resumed run picks up
+    /// the cadence without re-arming from the declaration or firing a backlog.
+    #[test]
+    fn a_resumed_timer_keeps_its_cadence_and_repeats_nothing() {
+        struct Ticks {
+            fired: Mutex<Vec<u64>>,
+            dir: PathBuf,
+            pause_at: usize,
+            stop_at: usize,
+        }
+        impl ReactionExecutor for Ticks {
+            fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+                let at = invocation.trigger_values["t"].as_u64().unwrap();
+                let count = {
+                    let mut fired = self.fired.lock().unwrap();
+                    fired.push(at);
+                    fired.len()
+                };
+                if count == self.pause_at {
+                    deploy::request(&self.dir, ControlOp::Pause).unwrap();
+                }
+                if count == self.stop_at {
+                    deploy::request_stop(&self.dir).unwrap();
+                }
+                Ok(BTreeMap::from([("note".into(), json!("tick"))]))
+            }
+        }
+        let state = verify(&timer_bytecode(5, 10)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ticks = Ticks {
+            fired: Mutex::new(Vec::new()),
+            dir: dir.path().to_path_buf(),
+            pause_at: 2,
+            stop_at: 0,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::new()),
+            &ticks,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&Recorder::new()),
+        )
+        .unwrap();
+        let LoopEnd::Paused(captured) = end else {
+            panic!("expected a pause");
+        };
+        assert_eq!(*ticks.fired.lock().unwrap(), vec![5, 15]);
+        assert_eq!(captured.completed_tag, Some((15, 0)));
+        assert_eq!(
+            captured.next_tag(),
+            Some((25, 0)),
+            "the next firing is queued"
+        );
+        deploy::clear_stop(dir.path()).unwrap();
+        let later = Ticks {
+            fired: Mutex::new(Vec::new()),
+            dir: dir.path().to_path_buf(),
+            pause_at: 0,
+            stop_at: 2,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Resume(captured),
+            &later,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&Recorder::new()),
+        )
+        .unwrap();
+        assert!(matches!(end, LoopEnd::Stopped(_)));
+        assert_eq!(*later.fired.lock().unwrap(), vec![25, 35]);
+        deploy::clear_stop(dir.path()).unwrap();
+    }
+
+    /// An automatic deadline and a manual request both capture at a boundary
+    /// and let the run go on; a capture that fails is retried, and the
+    /// manual request file is cleared once answered.
+    #[test]
+    fn captures_at_boundaries_do_not_interrupt_the_run_and_failures_are_retried() {
+        let state = verify(&counter_bytecode("")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new();
+        *recorder.due_once.lock().unwrap() = true;
+        *recorder.fail_first.lock().unwrap() = 1;
+        deploy::request(dir.path(), ControlOp::Checkpoint).unwrap();
+        let executor = PausingCounter {
+            calls: Mutex::new(0),
+            dir: None,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::from([("c.tick".to_string(), json!(1))])),
+            &executor,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&recorder),
+        )
+        .unwrap();
+        assert!(matches!(end, LoopEnd::Completed(_)));
+        assert_eq!(
+            *executor.calls.lock().unwrap(),
+            3,
+            "the run went on to its end"
+        );
+        let captures = recorder.captures.lock().unwrap();
+        // The manual request was answered at the first boundary, before any
+        // tag; the automatic deadline fell due at the next one.
+        assert_eq!(captures[0].0, Trigger::Manual);
+        assert_eq!(captures[0].1.completed_tag, None);
+        assert_eq!(captures[0].1.next_tag(), Some((0, 0)));
+        assert_eq!(captures[1].0, Trigger::Automatic);
+        assert_eq!(captures[1].1.completed_tag, Some((0, 0)));
+        assert_eq!(captures.len(), 2);
+        assert_eq!(
+            *recorder.failures.lock().unwrap(),
+            1,
+            "one failed attempt, then success"
+        );
+        assert_eq!(
+            deploy::pending_request(dir.path()),
+            None,
+            "answered requests are cleared"
+        );
+    }
+
+    /// A cadence decides at a boundary: physical by the clock, every tag by a
+    /// new completed tag, logical by the tags crossing a period; and never
+    /// twice for one tag, which a wait revisits every slice.
+    #[test]
+    fn cadences_fall_due_on_the_clock_on_every_tag_or_on_logical_periods() {
+        let at = |tag: Option<(u64, u64)>| ExecutionState {
+            version: checkpoint::FORMAT,
+            completed_tag: tag,
+            queue: Vec::new(),
+            outputs: BTreeMap::new(),
+            state_vars: BTreeMap::new(),
+            elapsed_ns: 0,
+        };
+        let now = Instant::now();
+        let mut schedule = Schedule {
+            policy: checkpoint::Policy::OFF,
+            next_due: None,
+            last_captured_tag: None,
+            sequence: 1,
+            parent: None,
+        };
+        assert!(!schedule.due(now, &at(Some((5, 0)))), "off never falls due");
+        schedule.next_due = Some(now + Duration::from_secs(60));
+        assert!(!schedule.due(now, &at(None)));
+        assert!(
+            schedule.due(now + Duration::from_secs(61), &at(None)),
+            "physical: by the clock"
+        );
+        schedule.next_due = None;
+        schedule.policy.every_tag = true;
+        assert!(!schedule.due(now, &at(None)), "no tag completed yet");
+        assert!(schedule.due(now, &at(Some((1, 0)))));
+        schedule.last_captured_tag = Some((1, 0));
+        assert!(
+            !schedule.due(now, &at(Some((1, 0)))),
+            "a boundary revisited mid-wait"
+        );
+        assert!(
+            schedule.due(now, &at(Some((1, 1)))),
+            "a microstep is a tag too"
+        );
+        schedule.policy = checkpoint::Policy {
+            logical_period_ns: 10,
+            ..checkpoint::Policy::OFF
+        };
+        schedule.last_captured_tag = None;
+        assert!(!schedule.due(now, &at(Some((9, 0)))));
+        assert!(
+            schedule.due(now, &at(Some((10, 0)))),
+            "first period crossed"
+        );
+        schedule.last_captured_tag = Some((10, 0));
+        assert!(!schedule.due(now, &at(Some((19, 3)))));
+        assert!(
+            schedule.due(now, &at(Some((25, 0)))),
+            "a later period, however far"
+        );
+        schedule.last_captured_tag = Some((25, 0));
+        assert!(!schedule.due(now, &at(Some((29, 0)))));
+    }
+
+    /// Once its retries are spent a capture holds the run, and only a new
+    /// request moves it: the one that asked for the capture is consumed, so
+    /// the hold neither answers it again nor blocks the retry.
+    #[test]
+    fn a_held_capture_waits_for_a_fresh_retry_request() {
+        let state = verify(&counter_bytecode("")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new();
+        *recorder.fail_first.lock().unwrap() = CAPTURE_RETRIES + 1;
+        *recorder.expect_hold.lock().unwrap() = true;
+        deploy::request(dir.path(), ControlOp::Checkpoint).unwrap();
+        let path = dir.path().to_path_buf();
+        let operator = thread::spawn(move || {
+            // The hold consumed the manual request; a retry is admitted.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while deploy::pending_request(&path).is_some() {
+                assert!(Instant::now() < deadline, "the request was never consumed");
+                thread::sleep(Duration::from_millis(20));
+            }
+            deploy::request(&path, ControlOp::RetryCheckpoint).unwrap();
+        });
+        let executor = PausingCounter {
+            calls: Mutex::new(0),
+            dir: None,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::from([("c.tick".to_string(), json!(1))])),
+            &executor,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&recorder),
+        )
+        .unwrap();
+        operator.join().unwrap();
+        assert!(matches!(end, LoopEnd::Completed(_)));
+        assert_eq!(*recorder.failures.lock().unwrap(), CAPTURE_RETRIES + 1);
+        let captures = recorder.captures.lock().unwrap();
+        assert_eq!(captures.len(), 1, "the retry captured once");
+        assert_eq!(
+            captures[0].0,
+            Trigger::Manual,
+            "the original trigger survives the hold"
+        );
+        assert_eq!(deploy::pending_request(dir.path()), None);
     }
 
     /// State a reaction hands back stays with its instance: it reaches the

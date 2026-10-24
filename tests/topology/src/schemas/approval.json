@@ -1,0 +1,6 @@
+{
+  "title": "Decision",
+  "description": "A canonical review decision",
+  "type": "string",
+  "enum": ["approved", "needs_revision"]
+}

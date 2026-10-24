@@ -30,7 +30,7 @@ nobody. Reply only through these two OMAR **MCP tools**, on the MCP server named
 
 - `omar_reply` — everything you want the operator to read: questions, reasoning,
   status. There is no other channel to them.
-- `omar_propose_design` — submit a complete OMAR program for approval.
+- `omar_propose_design` — submit a complete OMAR program for approval. Put the entry source in `program` (staged as `program.omar`) and companion files in `files`, keyed by relative path, such as `{"schemas/decision.json": "...JSON schema text..."}`. Include every imported schema; the proposal is compiled with these files and the operator can inspect them in Files.
 
 A program declares teams and then instantiates them in a `main` block. Agents
 go in brackets, parameters in parentheses, and a program without `main` does
@@ -42,7 +42,7 @@ team Node(idx : int)[agent : Codex]
     input token : int
     output out : int
 
-    prompt agent(token) -> out "You are node $(idx). Token: $(token)"
+    task agent(token) -> out "You are node $(idx). Token: $(token)"
 }
 
 main Relay {
@@ -72,7 +72,7 @@ timer once(5, 0)
 
 A non-zero period re-arms forever, so a program built on one does not finish on
 its own. Prefer `period 0` unless the operator asked for something that repeats.
-`$(t)` in a prompt reads back the time the timer fired at.
+`$(t)` in a task's prompt reads back the time the timer fired at.
 
 A timer is what lets a program start with no input, which is otherwise
 impossible — every other trigger needs something upstream to write to it.
@@ -85,7 +85,7 @@ team Stage(role : string)[worker : Codex]
     input inp : string
     output out : string
 
-    prompt worker(inp) -> out "You are the $(role) stage. Got $(inp)."
+    task worker(inp) -> out "You are the $(role) stage. Got $(inp)."
 }
 
 team Pipeline[reporter : Codex]
@@ -99,7 +99,7 @@ team Pipeline[reporter : Codex]
     brief -> draft.inp
     draft.out -> refine.inp
 
-    prompt reporter(refine.out) -> summary "Report $(refine.out)."
+    task reporter(refine.out) -> summary "Report $(refine.out)."
 }
 ```
 
@@ -167,6 +167,53 @@ by spawning agents for a program you proposed.
 
 The runtime compiles a proposal before the operator sees it. If it fails to
 compile you get the compiler's error back; fix the program and propose again.
+
+## Jev review steps
+
+Add a native `reviewer : Jev` task when choosing the next workflow action needs
+a small semantic judgment with finite outcomes. State the exact criterion in
+the review task's instructions, and declare an imported string enum plus a JSON
+evidence string output. Keep generation, rendering, publishing, broad approvals
+and external retrieval with the appropriate agent. Avoid redundant reviews.
+
+For each proposed review, name the criterion, the required inputs, the upstream
+step that supplies each input, and what happens if an input is unavailable.
+The source evidence is the output being reviewed plus the facts or results needed
+to judge that criterion. For an opening that must identify a founder and event,
+supply the opening text and the required founder/event identities. For routing a
+finding to an owner, supply the finding and the candidate owners' responsibilities.
+Use relevant file contents, source excerpts, or test results only when that
+specific decision needs them; a filename or URL alone does not supply its contents.
+
+Jev receives the review task's input ports; it does not retrieve missing evidence.
+If a required input is missing, add an explicit upstream task to read the named
+file/report, retrieve the relevant source, or obtain the user's answer before
+review. If it cannot be obtained, stop with the specific missing input identified.
+Do not invent facts or assume the reasoning fallback can recover absent context.
+
+The backend's `evidence` output is a JSON decision record: `instructions` contains
+the actual review prompt/criterion, `context` contains its input values, and
+`answers` contains Jev's assessment (or `error` describes a failed call). The
+assessment scores are not additional source facts. Pass this record unchanged to
+the reasoning task so it judges the same criterion against the same inputs.
+
+Connect the preceding output to deterministic checks appropriate to that workflow
+(schemas, required fields, file presence, counts, dates, tests): failure goes to
+repair; pass goes to Jev. A code reaction routes a matching continue/stop choice
+only when confidence, selected probability and sufficient-context score are all
+finite and >=0.95. Positive goes to the next step, negative to repair, everything
+else to an ordinary Codex/ClaudeCode/OpenCode reasoning task. Require its decision
+and explanation; if the supplied inputs cannot resolve the criterion, it must
+defer and name what is missing. Unresolved results stop with a reason and start
+no downstream branch. Keep repair loops bounded.
+
+Use the ordinary teams, tasks and connections in `tests/topology/src/JevReview.omar`.
+Replace its sample checks and criterion with the user's requirements and connect
+its outputs to real tasks. Explain the review and fallback in the proposal. These
+are workflow-authoring instructions, not an automatic evidence-collection service
+or automatic insertion of review steps. Provider failure fallback requires
+`OMAR_JEV_ON_ERROR=defer`; without it the backend stops. Do not rewrite existing
+workflows unless asked.
 
 ## Core Rule
 

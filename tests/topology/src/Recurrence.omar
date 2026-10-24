@@ -7,7 +7,7 @@ team Recurrence[counter : Codex]
     output result : int
     action next : int
 
-    prompt counter(start, next) -> (next | result)
+    task counter(start, next) -> (next | result)
     "
         Exactly one of these triggers is present:
         start=$(start)

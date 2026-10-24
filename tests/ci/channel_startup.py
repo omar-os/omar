@@ -52,13 +52,15 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
     (root/'.omar/config.toml').write_text(
         '[agent]\ndefault_command = '+json.dumps(str(backend))+
         '\ndefault_workdir = '+json.dumps(folder)+'\n')
-    server = 'omar-startup-'+str(os.getpid())
-    env = dict(os.environ, HOME=folder, OMAR_TMUX_SERVER=server)
-    for key in ['TMUX', 'OMAR_DIR', 'OMAR_EA_ID']:
+    env = dict(os.environ, HOME=folder)
+    for key in ['TMUX', 'TMUX_PANE', 'OMAR_DIR', 'OMAR_EA_ID', 'OMAR_TMUX_SERVER', 'OMAR_SESSION_ID', 'OMAR_STATE_DIR', 'OMAR_HOME']:
         env.pop(key, None)
+    session = json.loads(subprocess.run([OMAR, 'up', '--no-ea', '--json'], cwd=folder, env=env,
+                                        capture_output=True, text=True, timeout=90, check=True).stdout)
+    server, state = session['tmux_server'], session['directory']
     try:
-        launched = subprocess.run([OMAR, 'manager', 'start'], cwd=folder, env=env,
-                                  capture_output=True, text=True, timeout=30)
+        launched = subprocess.run([OMAR, '-s', session['name'], 'ea', 'start', '0'], cwd=folder, env=env,
+                                  capture_output=True, text=True, timeout=120)
         # Non-TTY attach can fail after setup. Inspect the actual channel, not
         # that attach status, and only after the launcher has fully exited.
         stamp = subprocess.run(['tmux', '-L', server, 'show-environment', '-t',
@@ -66,7 +68,7 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
                                capture_output=True, text=True)
         assert stamp.returncode == 0, (launched.stdout, launched.stderr, stamp.stderr)
         assert stamp.stdout.strip().endswith(':startup-session'), stamp.stdout
-        context = dict(omar_dir=str(root/'.omar'), ea_id=0, session_prefix='omar-agent-',
+        context = dict(omar_dir=state, ea_id=0, session_prefix='omar-agent-',
                        default_command=str(backend), default_workdir=folder,
                        health_idle_warning=15, tmux_server=server, topology=None, serve=None)
         (root/'context.json').write_text(json.dumps(context))
@@ -88,4 +90,5 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
             {'type': 'text', 'text': 'AFTER_LAUNCHER_EXIT', 'synthetic': True}]}], deliveries
         print('PASS: slow backend setup survives launcher exit, retries TUI selection, and delivers once')
     finally:
+        subprocess.run([OMAR, 'down', '-s', session['name'], '--force', '--timeout', '5'], env=env, capture_output=True)
         subprocess.run(['tmux', '-L', server, 'kill-server'], capture_output=True)

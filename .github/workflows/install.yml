@@ -1,0 +1,140 @@
+name: Install
+
+# What a new user runs: `curl -fsSL https://omar.rs/install.sh | sh`. omar.rs
+# serves a shim (omar-os/omar.rs, public/install.sh) that runs the latest
+# release's install.sh with OMAR_VERSION set to that release.
+#
+# Two sources, same checks:
+# - head: this commit's install.sh, run the way the shim will run it once
+#   released. ci.yml calls this on every PR, so a release (frozen code) only
+#   ever ships an install.sh that passed here.
+# - hosted: the live one-liner, on a schedule and after each release. Catches
+#   what head can't: the site, the shim, the published assets.
+#
+# head pairs this commit's install.sh with the latest published tarballs, so a
+# PR changing both together is only fully covered by hosted after release.
+
+on:
+  workflow_call:
+    inputs:
+      script:
+        type: string
+        default: hosted
+  workflow_dispatch:
+    inputs:
+      script:
+        type: choice
+        options: [hosted, head]
+        default: hosted
+  schedule:
+    - cron: '17 */6 * * *'
+  # A release built by GITHUB_TOKEN does not fire `release: published`, so
+  # follow the workflow that makes it.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+
+permissions:
+  contents: read
+
+env:
+  SCRIPT: ${{ inputs.script || 'hosted' }}
+
+jobs:
+  install:
+    name: Install ${{ inputs.script || 'hosted' }} (${{ matrix.os }})
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            install.sh
+            tests/ci/direct_run.omar
+          sparse-checkout-cone-mode: false
+
+      # Same redirect the shim reads; no rate-limited API call.
+      - name: Latest release
+        run: |
+          url=$(curl -fsS -o /dev/null -w '%{redirect_url}' "https://github.com/${{ github.repository }}/releases/latest")
+          echo "LATEST=${url##*/v}" >> "$GITHUB_ENV"
+
+      # Default install dir, so the sudo path runs as for a user. Retry: a
+      # network blip on GitHub's side is not a broken install.
+      - name: Install (${{ env.SCRIPT }})
+        shell: sh -e {0}
+        run: |
+          for attempt in 1 2 3; do
+            if [ "$SCRIPT" = head ]; then
+              OMAR_VERSION="$LATEST" sh -c "$(cat install.sh)" && exit 0
+            else
+              curl -fsSL https://omar.rs/install.sh | sh && exit 0
+            fi
+            echo "::warning::attempt $attempt failed"
+            sleep 30
+          done
+          exit 1
+
+      - name: Installed the latest release
+        run: |
+          omar --version
+          [ "$(omar --version)" = "omar $LATEST" ]
+          command -v omarc
+
+      # Outside any source tree, so only the installed omarc can be found.
+      - name: Runs a program
+        run: |
+          cd "$RUNNER_TEMP"
+          output=$(omar run "$GITHUB_WORKSPACE/tests/ci/direct_run.omar" \
+            --input run.request=hello --replace --fg)
+          echo "$output"
+          grep -Fq 'Output run.result = "hello"' <<<"$output"
+
+  # Closer to a fresh server than a runner: dash as sh, root, no sudo. Steps
+  # run under sh here, so no bashisms.
+  minimal:
+    name: Install ${{ inputs.script || 'hosted' }} (debian:stable-slim)
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: debian:stable-slim
+    steps:
+      # git: `omar run` needs it for team workspaces; installer doesn't say so.
+      - name: Prerequisites
+        run: apt-get update -qq && apt-get install -y -qq curl ca-certificates git >/dev/null
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            install.sh
+            tests/ci/direct_run.omar
+          sparse-checkout-cone-mode: false
+      - name: Latest release
+        run: |
+          url=$(curl -fsS -o /dev/null -w '%{redirect_url}' "https://github.com/${{ github.repository }}/releases/latest")
+          echo "LATEST=${url##*/v}" >> "$GITHUB_ENV"
+      - name: Install (${{ env.SCRIPT }})
+        shell: sh -e {0}
+        run: |
+          for attempt in 1 2 3; do
+            if [ "$SCRIPT" = head ]; then
+              OMAR_VERSION="$LATEST" sh -c "$(cat install.sh)" && exit 0
+            else
+              curl -fsSL https://omar.rs/install.sh | sh && exit 0
+            fi
+            echo "::warning::attempt $attempt failed"
+            sleep 30
+          done
+          exit 1
+      - name: Runs a program
+        run: |
+          [ "$(omar --version)" = "omar $LATEST" ]
+          cd /tmp
+          output=$(omar run "$GITHUB_WORKSPACE/tests/ci/direct_run.omar" \
+            --input run.request=hello --replace --fg)
+          echo "$output"
+          printf '%s\n' "$output" | grep -Fq 'Output run.result = "hello"'

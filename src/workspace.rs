@@ -19,7 +19,6 @@ pub struct Workspace {
     pub deployment_id: String,
     pub instance: String,
     pub parent_instance: Option<String>,
-    pub source: PathBuf,
     pub restored_from: Option<(String, String)>,
 }
 
@@ -56,7 +55,7 @@ impl Workspace {
     fn admin(&self, root: &Path) -> PathBuf {
         root.join("workspace-history").join(&self.id)
     }
-    fn git(&self, root: &Path) -> Command {
+    pub(crate) fn git(&self, root: &Path) -> Command {
         let mut cmd = Command::new("git");
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("GIT_") {
@@ -106,7 +105,6 @@ impl Workspace {
         deployment_id: &str,
         instance: &str,
         parent: Option<String>,
-        source: &Path,
     ) -> Result<Self> {
         let workspace = Self {
             version: FORMAT,
@@ -115,7 +113,6 @@ impl Workspace {
             deployment_id: deployment_id.into(),
             instance: instance.into(),
             parent_instance: parent,
-            source: source.to_path_buf(),
             restored_from: None,
         };
         let result = (|| -> Result<()> {
@@ -144,19 +141,13 @@ impl Workspace {
         deployment_id: &str,
         instance: &str,
         parent: Option<String>,
-        source: &Path,
     ) -> Result<Self> {
-        let source = source
-            .canonicalize()
-            .context("resolve workspace source directory")?;
-        anyhow::ensure!(source.is_dir(), "workspace source is not a directory");
-        let workspace = Self::allocate(root, ea_id, deployment_id, instance, parent, &source)?;
+        let workspace = Self::allocate(root, ea_id, deployment_id, instance, parent)?;
         let result = (|| {
+            // A new workspace starts empty; nothing is copied from the operator's
+            // directory. Record the empty tree, then attach a linked worktree to it.
             fs::create_dir(workspace.worktree(root))?;
-            seed(&source, &workspace.worktree(root), root)?;
             let snapshot = workspace.snapshot(root, "Initial workspace")?;
-            // Convert the seeded directory into a linked worktree without checking
-            // files out through attributes/filters. The files already match the tree.
             fs::remove_dir_all(workspace.worktree(root))?;
             workspace.attach(root, &snapshot.commit)?;
             workspace.save(root)?;
@@ -175,9 +166,32 @@ impl Workspace {
             .truncate(false)
             .write(true)
             .open(self.admin(root).join("lock"))?;
-        file.try_lock()
-            .context("workspace versioning operation already in progress")?;
-        Ok(file)
+        // A child forked by another thread holds every open descriptor until
+        // it execs, the lock with them; that window is milliseconds, and not
+        // an operation in progress. Only a lock still held after a moment is.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(error) if std::time::Instant::now() < deadline => {
+                    let _ = error;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => {
+                    return Err(error).context("workspace versioning operation already in progress")
+                }
+            }
+        }
+    }
+    /// Remove the workspace: its files and its whole version history. For a
+    /// run that ends without keeping its workspaces; nothing else calls it.
+    pub fn remove(&self, root: &Path) -> Result<()> {
+        for path in [self.root(root), self.admin(root)] {
+            if path.exists() {
+                fs::remove_dir_all(&path).with_context(|| format!("remove {}", path.display()))?;
+            }
+        }
+        Ok(())
     }
     pub fn snapshot(&self, root: &Path, label: &str) -> Result<Snapshot> {
         let _lock = self.lock(root)?;
@@ -367,7 +381,6 @@ impl Workspace {
             &self.deployment_id,
             &self.instance,
             self.parent_instance.clone(),
-            &self.source,
         )?;
         let result = (|| {
             let mut git = restored.git(root);
@@ -485,13 +498,52 @@ pub fn list(root: &Path, ea_id: u32) -> Result<Vec<Workspace>> {
     Ok(result)
 }
 
-pub fn for_topology(
+/// The workspaces one run owns: those its deployment record names, those its
+/// checkpoints reference (a resumed run restores into new ones, and the old
+/// ones stay for a rollback), and, when asked, copies an operator restored
+/// from any of them. Workspaces already removed are skipped.
+pub fn lineage(
     root: &Path,
     ea_id: u32,
-    deployment_id: &str,
-    state: &crate::topology::VmState,
-    source: &Path,
-) -> Result<BTreeMap<String, Workspace>> {
+    record: &crate::deploy::DeploymentRecord,
+    manifests: &[crate::checkpoint::Manifest],
+    include_restored: bool,
+) -> Result<Vec<Workspace>> {
+    let mut owned: std::collections::BTreeSet<String> =
+        record.workspaces.values().cloned().collect();
+    owned.extend(
+        manifests
+            .iter()
+            .flat_map(|m| m.workspaces.values().map(|a| a.workspace_id.clone())),
+    );
+    let all = list(root, ea_id)?;
+    if include_restored {
+        // A copy of a copy is still this run's; iterate to a fixed point.
+        loop {
+            let before = owned.len();
+            for ws in &all {
+                if let Some((source, _)) = &ws.restored_from {
+                    if owned.contains(source) {
+                        owned.insert(ws.id.clone());
+                    }
+                }
+            }
+            if owned.len() == before {
+                break;
+            }
+        }
+    }
+    let mut result: Vec<Workspace> = all
+        .into_iter()
+        .filter(|ws| owned.contains(&ws.id))
+        .collect();
+    result.sort_by(|a, b| (&a.instance, &a.id).cmp(&(&b.instance, &b.id)));
+    Ok(result)
+}
+
+/// Which instances own a workspace, and their parents. Legacy bytecode with
+/// agents or reactions outside any instance gets one root workspace.
+pub fn instance_owners(state: &crate::topology::VmState) -> BTreeMap<String, Option<String>> {
     let mut owners: BTreeMap<String, Option<String>> = state
         .instances
         .iter()
@@ -508,9 +560,19 @@ pub fn for_topology(
     {
         owners.insert(String::new(), None);
     }
+    owners
+}
+
+pub fn for_topology(
+    root: &Path,
+    ea_id: u32,
+    deployment_id: &str,
+    state: &crate::topology::VmState,
+) -> Result<BTreeMap<String, Workspace>> {
+    let owners = instance_owners(state);
     create_batch(
         owners,
-        |instance, parent| Workspace::create(root, ea_id, deployment_id, instance, parent, source),
+        |instance, parent| Workspace::create(root, ea_id, deployment_id, instance, parent),
         root,
     )
 }
@@ -626,133 +688,19 @@ fn collect(base: &Path, directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()
     }
     Ok(())
 }
-fn seed(source: &Path, destination: &Path, root: &Path) -> Result<()> {
-    let root = root.canonicalize()?;
-    anyhow::ensure!(
-        !source.starts_with(&root),
-        "workspace source must be outside OMAR state directory"
-    );
-    let mut git = Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") {
-            git.env_remove(key);
-        }
-    }
-    git.arg("-C").arg(source).args([
-        "ls-files",
-        "--cached",
-        "--others",
-        "--exclude-standard",
-        "-z",
-        "--",
-        ".",
-    ]);
-    let mut paths = match git.output() {
-        Ok(result) if result.status.success() => {
-            use std::os::unix::ffi::OsStrExt;
-            result
-                .stdout
-                .split(|b| *b == 0)
-                .filter(|p| !p.is_empty())
-                .map(|p| PathBuf::from(std::ffi::OsStr::from_bytes(p)))
-                .collect::<Vec<_>>()
-        }
-        _ => {
-            for parent in source.ancestors() {
-                match fs::symlink_metadata(parent.join(".git")) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error).context("inspect Git source marker"),
-                    Ok(_) => bail!(
-                        "could not list Git source files; refusing to copy ignored files as a fallback"
-                    ),
-                }
-            }
-            let mut paths = Vec::new();
-            collect_seed(source, source, &root, &mut paths)?;
-            paths
-        }
-    };
-    paths.sort();
-    paths.dedup();
-    for path in paths {
-        safe_relative(&path)?;
-        let from = source.join(&path);
-        if from.starts_with(&root) {
-            continue;
-        }
-        let metadata = match fs::symlink_metadata(&from) {
-            Ok(metadata) => metadata,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
-        };
-        anyhow::ensure!(
-            !metadata.is_dir(),
-            "submodules require an explicit source workspace: {}",
-            from.display()
-        );
-        let to = destination.join(path);
-        fs::create_dir_all(to.parent().context("source parent")?)?;
-        if metadata.file_type().is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(from)?, to)?;
-        } else if metadata.is_file() {
-            fs::copy(from, to)?;
-        } else {
-            bail!("cannot seed special file {}", from.display());
-        }
-    }
-    Ok(())
-}
-
-fn collect_seed(
-    base: &Path,
-    directory: &Path,
-    excluded: &Path,
-    paths: &mut Vec<PathBuf>,
-) -> Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry.path().starts_with(excluded) || entry.file_name() == ".git" {
-            anyhow::ensure!(
-                entry.file_name() != ".git" || directory == base,
-                "nested Git repositories require an explicit source directory"
-            );
-            continue;
-        }
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            collect_seed(base, &entry.path(), excluded, paths)?;
-        } else if kind.is_file() || kind.is_symlink() {
-            paths.push(entry.path().strip_prefix(base)?.to_path_buf());
-        } else {
-            bail!("cannot seed special file {}", entry.path().display());
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
-    fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    fn setup() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let root = dir.path().join("omar state");
-        let source = dir.path().join("source files");
         fs::create_dir(&root).unwrap();
-        fs::create_dir(&source).unwrap();
-        (dir, root, source)
+        (dir, root)
     }
-    fn create(root: &Path, source: &Path) -> Workspace {
-        Workspace::create(
-            root,
-            7,
-            "deployment",
-            "team.child",
-            Some("team".into()),
-            source,
-        )
-        .unwrap()
+    fn create(root: &Path) -> Workspace {
+        Workspace::create(root, 7, "deployment", "team.child", Some("team".into())).unwrap()
     }
     fn git_at(path: &Path, args: &[&str]) -> Vec<u8> {
         let mut cmd = Command::new("git");
@@ -761,11 +709,53 @@ mod tests {
     }
 
     #[test]
+    fn a_run_owns_its_workspaces_their_checkpointed_ancestors_and_restored_copies() {
+        let (_dir, root) = setup();
+        let mine = Workspace::create(&root, 7, "d1", "a", None).unwrap();
+        let other = Workspace::create(&root, 7, "d2", "a", None).unwrap();
+        let older = Workspace::create(&root, 7, "d0", "a", None).unwrap();
+        let snapshot = mine.snapshot(&root, "v").unwrap();
+        let copy = mine.restore(&root, &snapshot.id).unwrap();
+        let copy_of_copy = copy
+            .restore(&root, &copy.snapshots(&root).unwrap()[0].id)
+            .unwrap();
+        let mut record = crate::deploy::DeploymentRecord::create("T", BTreeMap::new(), 1);
+        record.workspaces.insert("a".into(), mine.id.clone());
+        let mut manifest: crate::checkpoint::Manifest =
+            serde_json::from_value(serde_json::json!({
+                "version": crate::checkpoint::FORMAT, "id": "x", "sequence": 1, "parent": null,
+                "deployment_id": "d0", "team": "T", "ea_id": 7, "created_at": 0,
+                "completed_tag": null, "next_tag": null, "trigger": "manual",
+                "policy": {"period_secs": 1}, "pace": "fast", "program_sha256": "", "program_path": null,
+                "state_sha256": "", "elapsed_ns": 0, "workspaces": {}, "agents": {}
+            }))
+            .unwrap();
+        manifest.workspaces.insert(
+            "a".into(),
+            crate::checkpoint::ArtifactRef {
+                workspace_id: older.id.clone(),
+                snapshot_id: String::new(),
+                commit: String::new(),
+            },
+        );
+        let ids = |ws: Vec<Workspace>| ws.into_iter().map(|w| w.id).collect::<Vec<_>>();
+        let owned = ids(lineage(&root, 7, &record, &[manifest.clone()], false).unwrap());
+        assert!(owned.contains(&mine.id) && owned.contains(&older.id));
+        assert!(!owned.contains(&other.id) && !owned.contains(&copy.id));
+        let shown = ids(lineage(&root, 7, &record, &[manifest], true).unwrap());
+        assert!(shown.contains(&copy.id) && shown.contains(&copy_of_copy.id));
+        assert!(!shown.contains(&other.id));
+        mine.remove(&root).unwrap();
+        assert!(!mine.worktree(&root).exists() && Workspace::load(&root, &mine.id).is_err());
+        assert_eq!(list(&root, 7).unwrap().len(), 4);
+    }
+
+    #[test]
     fn restores_all_file_bytes_without_changing_the_source_or_live_workspace() {
-        let (_dir, root, source) = setup();
-        fs::write(source.join("original"), "source").unwrap();
-        let ws = create(&root, &source);
+        let (_dir, root) = setup();
+        let ws = create(&root);
         let tree = ws.worktree(&root);
+        fs::write(tree.join("original"), "source").unwrap();
         fs::write(tree.join(".gitignore"), "*.bin\nignored/\n").unwrap();
         fs::write(tree.join(".gitattributes"), "* text eol=lf\n").unwrap();
         fs::write(tree.join("artifact.bin"), b"\0\xff\r\n\x01").unwrap();
@@ -802,10 +792,6 @@ mod tests {
         );
         assert!(!tree.join("original").exists());
         assert_eq!(
-            fs::read_to_string(source.join("original")).unwrap(),
-            "source"
-        );
-        assert_eq!(
             fs::read_link(restored_tree.join("link")).unwrap(),
             Path::new("missing-target")
         );
@@ -827,48 +813,23 @@ mod tests {
     }
 
     #[test]
-    fn invalid_git_marker_never_falls_back_to_copying_ignored_files() {
-        use std::os::unix::fs::symlink;
-        let (_dir, root, source) = setup();
-        fs::write(source.join("secret"), "ignored content").unwrap();
-        symlink(".git", source.join(".git")).unwrap();
-        let destination = root.join("seed-test");
-        fs::create_dir_all(&destination).unwrap();
-        assert!(seed(&source, &destination, &root).is_err());
-        assert!(!destination.join("secret").exists());
-    }
-
-    #[test]
-    fn seeds_git_sources_with_local_changes_and_without_ignored_files() {
-        let (_dir, root, source) = setup();
-        git_at(&source, &["init", "--quiet"]);
-        fs::write(source.join("tracked"), "before").unwrap();
-        fs::write(source.join("deleted"), "before").unwrap();
-        git_at(&source, &["add", "tracked", "deleted"]);
-        fs::write(source.join("tracked"), "local edits").unwrap();
-        fs::remove_file(source.join("deleted")).unwrap();
-        fs::write(source.join(".gitignore"), "cache\n").unwrap();
-        fs::write(source.join("cache"), "not seeded").unwrap();
-        fs::write(source.join("untracked"), "included").unwrap();
-        let before = git_at(&source, &["status", "--porcelain=v1", "-z"]);
-        let ws = create(&root, &source);
-        assert_eq!(
-            fs::read_to_string(ws.worktree(&root).join("tracked")).unwrap(),
-            "local edits"
-        );
-        assert!(ws.worktree(&root).join("untracked").exists());
-        assert!(!ws.worktree(&root).join("deleted").exists());
-        assert!(!ws.worktree(&root).join("cache").exists());
-        assert_eq!(before, git_at(&source, &["status", "--porcelain=v1", "-z"]));
-        let broken = source.parent().unwrap().join("broken-repository");
-        fs::create_dir(&broken).unwrap();
-        fs::write(broken.join(".git"), "invalid gitfile").unwrap();
-        assert!(Workspace::create(&root, 7, "failed", "team", None, &broken).is_err());
+    fn new_workspaces_start_empty() {
+        let (_dir, root) = setup();
+        let ws = create(&root);
+        let names: Vec<String> = fs::read_dir(ws.worktree(&root))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![".git"]);
+        assert_eq!(fs::read_dir(ws.temp(&root)).unwrap().count(), 0);
+        let snapshots = ws.snapshots(&root).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].label, "Initial workspace");
     }
 
     #[test]
     fn nested_instances_and_successive_deployments_have_independent_workspaces() {
-        let (_dir, root, source) = setup();
+        let (_dir, root) = setup();
         let state: crate::topology::VmState = serde_json::from_value(serde_json::json!({
             "version": 1, "team": "Example", "instances": {
                 "one": {"team": "Team", "parent": ""},
@@ -879,8 +840,8 @@ mod tests {
             "ports": {}, "connections": [], "reactions": {}
         }))
         .unwrap();
-        let first = for_topology(&root, 7, "first", &state, &source).unwrap();
-        let second = for_topology(&root, 7, "second", &state, &source).unwrap();
+        let first = for_topology(&root, 7, "first", &state).unwrap();
+        let second = for_topology(&root, 7, "second", &state).unwrap();
         assert_eq!(first.len(), 3);
         assert_ne!(first["one"].id, first["one.child"].id);
         assert_ne!(first["one"].id, second["one"].id);
@@ -892,8 +853,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_ids_versions_special_files_and_concurrent_operations() {
-        let (_dir, root, source) = setup();
-        let ws = create(&root, &source);
+        let (_dir, root) = setup();
+        let ws = create(&root);
         assert!(Workspace::load(&root, "../../escape").is_err());
         assert!(ws.restore(&root, "../../escape").is_err());
         let lock = ws.lock(&root).unwrap();
@@ -917,18 +878,15 @@ mod tests {
 
     #[test]
     fn failed_batch_removes_only_its_new_workspaces() {
-        let (_dir, root, source) = setup();
-        fs::write(source.join("keep"), "source data").unwrap();
-        let existing = create(&root, &source);
+        let (_dir, root) = setup();
+        let existing = create(&root);
+        fs::write(existing.worktree(&root).join("keep"), "existing data").unwrap();
         let owners = [("first".into(), None), ("second".into(), None)].into();
         let result = create_batch(
             owners,
             |instance, parent| {
-                if instance == "second" {
-                    // Fail seeding after allocating the second workspace.
-                    std::os::unix::net::UnixListener::bind(source.join("socket"))?;
-                }
-                Workspace::create(&root, 7, "failed", instance, parent, &source)
+                anyhow::ensure!(instance != "second", "simulated failure");
+                Workspace::create(&root, 7, "failed", instance, parent)
             },
             &root,
         );
@@ -945,19 +903,15 @@ mod tests {
             assert_eq!(fs::read_dir(root.join(directory)).unwrap().count(), 1);
         }
         assert_eq!(
-            fs::read_to_string(source.join("keep")).unwrap(),
-            "source data"
-        );
-        assert_eq!(
             fs::read_to_string(existing.worktree(&root).join("keep")).unwrap(),
-            "source data"
+            "existing data"
         );
     }
 
     #[test]
     fn outstanding_reaction_cleanup_blocks_file_versions() {
-        let (dir, root, _) = setup();
-        let ws = create(&root, dir.path());
+        let (_dir, root) = setup();
+        let ws = create(&root);
         let reactions = ws.worktree(&root).parent().unwrap().join("reactions");
         fs::create_dir(&reactions).unwrap();
         let marker = reactions.join("unconfirmed");
@@ -973,10 +927,9 @@ mod tests {
     }
 
     #[test]
-    fn live_deployments_refuse_manual_snapshots_and_state_directory_is_not_seeded() {
-        let (dir, root, _) = setup();
-        let ws = create(&root, dir.path());
-        assert!(!ws.worktree(&root).join("omar state").exists());
+    fn live_deployments_refuse_manual_snapshots() {
+        let (_dir, root) = setup();
+        let ws = create(&root);
         let mut deployment =
             crate::deploy::DeploymentRecord::create("Example", BTreeMap::new(), 60);
         deployment.deployment_id = ws.deployment_id.clone();

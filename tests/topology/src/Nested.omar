@@ -9,7 +9,7 @@ team Stage(role : string)[worker : Codex]
     input inp : string
     output out : string
 
-    prompt worker(inp) -> out
+    task worker(inp) -> out
     "
         You are the $(role) stage. The text you received is: $(inp)
         Set `out` to that text with the word $(role) appended.
@@ -27,7 +27,7 @@ team Pipeline[reporter : Codex]
     brief -> draft.inp
     draft.out -> refine.inp
 
-    prompt reporter(refine.out) -> summary
+    task reporter(refine.out) -> summary
     "
         The pipeline produced: $(refine.out)
         Set `summary` to exactly that text.

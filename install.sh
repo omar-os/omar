@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="lsk567/omar"
+REPO="omar-os/omar"
 INSTALL_DIR="${OMAR_INSTALL_DIR:-/usr/local/bin}"
 
 # Detect OS
@@ -51,10 +51,10 @@ if [ ! -w "$INSTALL_DIR" ]; then
   echo "Need sudo to install to $INSTALL_DIR"
 fi
 
-$SUDO install -d "$INSTALL_DIR"
+# mkdir, not install -d: that chmods an existing dir, which fails when it is
+# writable (so no sudo) but owned by someone else, e.g. a runner's /usr/local/bin.
+$SUDO mkdir -p "$INSTALL_DIR"
 $SUDO install "$TMP/omar" "$INSTALL_DIR/"
-$SUDO install "$TMP/omar-slack" "$INSTALL_DIR/"
-$SUDO install "$TMP/omar-computer" "$INSTALL_DIR/"
 # The compiler every `.omar` program goes through. Tarballs from v0.4.0 on
 # carry it; an older one pinned through OMAR_VERSION does not, and installing
 # the rest is still better than failing.
@@ -65,8 +65,6 @@ fi
 echo ""
 echo "Done! Installed:"
 echo "  - omar"
-echo "  - omar-slack"
-echo "  - omar-computer"
 if [ -f "$TMP/omarc" ]; then
   echo "  - omarc"
 fi

@@ -21,9 +21,6 @@ pub struct Config {
 
     #[serde(default)]
     pub metrics: MetricsConfig,
-
-    #[serde(default)]
-    pub slack_bridge: SlackBridgeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,15 +77,6 @@ pub struct MetricsConfig {
     /// Enable global spawn metrics sink at ~/.omar/metrics/spawn_metrics.jsonl
     #[serde(default)]
     pub spawn_metrics_enabled: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SlackBridgeConfig {
-    /// EA name the slack bridge targets. The bridge resolves this against
-    /// the EA registry at startup; if unset or unresolvable it falls back
-    /// to the first registered EA. Set via the `/ea <name>` Slack command.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_ea: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -184,10 +172,7 @@ impl Default for AgentConfig {
 impl Config {
     /// Default config path: ~/.omar/config.toml
     pub fn default_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".omar")
-            .join("config.toml")
+        crate::sessions::state_root().join("config.toml")
     }
 
     /// Resolve a config path from CLI input, expanding `~/`.
@@ -234,7 +219,7 @@ impl Config {
 
     /// Number of settings exposed in the dashboard panel.
     pub fn settings_count(&self) -> usize {
-        4
+        3
     }
 
     /// Settings panel entry: a labelled toggle or a labelled text field.
@@ -252,10 +237,6 @@ impl Config {
                 label: "Show inspirational quotes",
                 value: self.dashboard.show_quotes,
             }),
-            3 => Some(SettingItem::Text {
-                label: "Slack bridge target EA (name)",
-                value: self.slack_bridge.active_ea.as_deref().unwrap_or(""),
-            }),
             _ => None,
         }
     }
@@ -271,24 +252,10 @@ impl Config {
         self.save();
     }
 
-    /// Set a text-typed setting by index and save. An empty string clears
-    /// the field (serializes as a missing key thanks to
-    /// `skip_serializing_if = "Option::is_none"`). Returns `true` if the
-    /// index targets a text setting.
-    pub fn set_text_setting(&mut self, index: usize, value: &str) -> bool {
-        let trimmed = value.trim();
-        match index {
-            3 => {
-                self.slack_bridge.active_ea = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
-            }
-            _ => return false,
-        }
-        self.save();
-        true
+    /// Set a text-typed setting by index and save. Returns `true` if the
+    /// index targets a text setting; there are none today.
+    pub fn set_text_setting(&mut self, _index: usize, _value: &str) -> bool {
+        false
     }
 }
 
@@ -346,7 +313,7 @@ mod tests {
         let mut config = Config::default();
         assert!(config.dashboard.show_event_queue);
         assert!(!config.dashboard.show_quotes);
-        assert_eq!(config.settings_count(), 4);
+        assert_eq!(config.settings_count(), 3);
         assert!(matches!(
             config.settings_item(0),
             Some(SettingItem::Toggle {
@@ -357,39 +324,6 @@ mod tests {
         // Toggle without saving to disk (just test the in-memory toggle)
         config.dashboard.show_event_queue = !config.dashboard.show_event_queue;
         assert!(!config.dashboard.show_event_queue);
-    }
-
-    #[test]
-    fn slack_bridge_text_setting_round_trips() {
-        let _env_lock = crate::test_env_lock();
-        let mut config = Config::default();
-        // The default state is no persisted EA — exposed as the empty string.
-        assert!(matches!(
-            config.settings_item(3),
-            Some(SettingItem::Text {
-                label: "Slack bridge target EA (name)",
-                value: "",
-            })
-        ));
-        // Use a tempdir so save() doesn't write to ~/.omar in tests.
-        let dir = tempfile::tempdir().unwrap();
-        let original = std::env::var("HOME").ok();
-        std::env::set_var("HOME", dir.path());
-
-        assert!(config.set_text_setting(3, "Research"));
-        assert_eq!(config.slack_bridge.active_ea.as_deref(), Some("Research"));
-
-        // Whitespace-only input clears the field rather than storing blanks.
-        assert!(config.set_text_setting(3, "   "));
-        assert_eq!(config.slack_bridge.active_ea, None);
-
-        // Toggle indices return false (rejected).
-        assert!(!config.set_text_setting(0, "anything"));
-
-        match original {
-            Some(prev) => std::env::set_var("HOME", prev),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]

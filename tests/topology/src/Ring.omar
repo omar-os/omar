@@ -9,7 +9,7 @@ team Node(idx : int)[agent : Codex]
     output out : int
     output done : int
 
-    prompt agent(token) -> (out | done)
+    task agent(token) -> (out | done)
     "
         You are node $(idx) of a three-node ring.
         The token you received is $(token).

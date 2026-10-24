@@ -4,7 +4,6 @@ FROM rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88
 WORKDIR /build
 COPY Cargo.toml ./
 COPY src ./src
-COPY bridges ./bridges
 COPY prompts ./prompts
 COPY tests ./tests
 RUN cargo build --release --bin omar

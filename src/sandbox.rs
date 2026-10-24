@@ -58,11 +58,10 @@ pub fn map_input_paths(
             *value = Value::String(worktree.join(path).to_string_lossy().into_owned());
             return Ok(());
         }
-        if !path.starts_with(&worktree) && !path.starts_with(workspace.temp(root)) {
-            let relative = path.strip_prefix(&workspace.source)
-                .context("sandbox path input is outside its workspace and seeded source; explicit artifact transfer is required")?;
-            *value = Value::String(worktree.join(relative).to_string_lossy().into_owned());
-        }
+        anyhow::ensure!(
+            path.starts_with(&worktree) || path.starts_with(workspace.temp(root)),
+            "sandbox path input is outside its workspace; explicit artifact transfer is required"
+        );
     }
     Ok(())
 }
@@ -316,6 +315,8 @@ pub struct Init {
     pub workspace: crate::workspace::Workspace,
     pub root: PathBuf,
     pub timeout: Duration,
+    /// Set when the run resumed, so agents are told their conversation is new.
+    pub resumed_from: Option<crate::checkpoint::Manifest>,
 }
 
 #[cfg(test)]
@@ -340,16 +341,13 @@ mod tests {
             deployment_id: "test".into(),
             instance: "parent.child".into(),
             parent_instance: Some("parent".into()),
-            source: "/source".into(),
             restored_from: None,
         };
         let own = workspace.temp(root).join("scratch");
-        let mut paths = serde_json::json!(["/source/file", null, own]);
+        let file = workspace.worktree(root).join("file");
+        let mut paths = serde_json::json!([file, null, own]);
         map_input_paths(&mut paths, "list<option<path>>", &workspace, root).unwrap();
-        assert_eq!(
-            paths[0],
-            workspace.worktree(root).join("file").to_str().unwrap()
-        );
+        assert_eq!(paths[0], file.to_str().unwrap());
         assert!(paths[1].is_null());
         assert_eq!(paths[2], own.to_str().unwrap());
         let mut relative = serde_json::json!("artifact");
@@ -359,8 +357,8 @@ mod tests {
             workspace.worktree(root).join("artifact").to_str().unwrap()
         );
         for path in [
+            "/source/file",
             "/source/../secret",
-            "/source-other/file",
             "/omar/workspace-history/key",
             "/omar/workspaces/another/worktree/file",
         ] {

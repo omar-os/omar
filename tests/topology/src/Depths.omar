@@ -14,7 +14,7 @@ team Source[agent : Stub]
     input go : int
     output value : int
 
-    prompt agent(go) -> value
+    task agent(go) -> value
     "
         Set `value` to $(go) plus 1.
     "
@@ -25,7 +25,7 @@ team Relay[agent : Stub]
     input value : int
     output relayed : int
 
-    prompt agent(value) -> relayed
+    task agent(value) -> relayed
     "
         Set `relayed` to $(value) plus 1.
     "
@@ -37,7 +37,7 @@ team Watcher[agent : Stub]
     input deep : int
     output verdict : int
 
-    prompt agent(shallow, deep) -> verdict
+    task agent(shallow, deep) -> verdict
     "
         You were triggered once, holding both of your inputs: shallow is
         $(shallow) and deep is $(deep). Set `verdict` to their sum.
