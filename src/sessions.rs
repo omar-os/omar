@@ -28,7 +28,8 @@ use uuid::Uuid;
 fn runtime_environment_key(key: &std::ffi::OsStr) -> bool {
     (key.to_string_lossy().starts_with("OMAR_")
         && key != "OMAR_JEV_MODEL"
-        && key != "OMAR_JEV_ON_ERROR")
+        && key != "OMAR_JEV_ON_ERROR"
+        && key != "OMAR_SBX_BIN")
         || key == "TMUX"
         || key == "TMUX_PANE"
         || key == "OMARC_BIN"
@@ -93,6 +94,10 @@ pub struct StartOptions {
     /// go with the run; a paused run keeps them either way.
     #[arg(long)]
     pub keep_workspaces: bool,
+    /// Docker Sandbox template pinned by digest (one sandbox per team
+    /// instance); defaults to `[sandbox].template`.
+    #[arg(long)]
+    pub sandbox_template: Option<String>,
 }
 #[derive(Subcommand, Debug)]
 pub enum EaAction {
@@ -1575,7 +1580,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             let files = crate::topology::imported_files(&options.program, &program)?;
             // The file name names a program whose `main` does not.
             let filename = options.program.file_name().map(|name| name.to_string_lossy().into_owned());
-            let body=json!({"program":program,"filename":filename,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces});
+            let body=json!({"program":program,"filename":filename,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces,"sandbox_template":options.sandbox_template});
             let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
             if owned { run["session"] = json!(s.name); }
             // One structured result: the admission record, or with --fg the terminal record.
@@ -1658,6 +1663,7 @@ mod tests {
             "OMAR_JEV_MODEL",
             "OMAR_JEV_ON_ERROR",
             "TYPESAFE_API_KEY",
+            "OMAR_SBX_BIN",
             "PATH",
         ] {
             assert!(

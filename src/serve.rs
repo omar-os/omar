@@ -154,6 +154,10 @@ struct StartRunRequest {
     /// Keep the instances' workspaces when the run ends; off, they go with it.
     #[serde(default)]
     keep_workspaces: bool,
+    /// Docker Sandbox template for this run; the runtime's configured one
+    /// otherwise.
+    #[serde(default)]
+    sandbox_template: Option<String>,
 }
 
 fn default_replace() -> bool {
@@ -311,6 +315,7 @@ struct Context_ {
     session_prefix: String,
     default_workdir: String,
     health_idle_warning: i64,
+    sandbox_template: Option<String>,
     runs: Runs,
     /// Where each run's web-backed invocations are answered. Absent for a run
     /// whose program has no `Web` agent, which is what makes the panel routes
@@ -688,6 +693,7 @@ impl Serve {
             session_prefix: config.dashboard.session_prefix.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
+            sandbox_template: config.sandbox.template.clone(),
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
@@ -1946,6 +1952,7 @@ impl Workspaces {
             session_prefix: self.root.session_prefix.clone(),
             default_workdir: self.root.default_workdir.clone(),
             health_idle_warning: self.root.health_idle_warning,
+            sandbox_template: self.root.sandbox_template.clone(),
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
@@ -2829,6 +2836,10 @@ fn spawn_run_thread(
         .as_deref()
         .and_then(|period| crate::checkpoint::parse_policy(period).ok());
     let keep_workspaces = request.keep_workspaces;
+    let sandbox_template = request
+        .sandbox_template
+        .clone()
+        .or_else(|| context.sandbox_template.clone());
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let outcome = topology::run_topology(
@@ -2839,6 +2850,7 @@ fn spawn_run_thread(
                 generated: &topology::generated_dir(&program_path),
                 base_prefix: &context.session_prefix,
                 health_idle_warning: context.health_idle_warning,
+                sandbox_template: sandbox_template.as_deref(),
                 inputs: &inputs,
                 replace,
                 timeout,
@@ -3530,6 +3542,8 @@ fn spawn_resume_thread(
                 generated: &generated,
                 base_prefix: &context.session_prefix,
                 health_idle_warning: context.health_idle_warning,
+                // The paused run's recorded template wins.
+                sandbox_template: None,
                 inputs: &[],
                 replace: true,
                 timeout: Duration::from_secs(default_timeout_seconds()),
