@@ -1489,6 +1489,37 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
     if matches!(cli.command, Some(Commands::Attach { tui: true, .. })) {
         return Some(attach_dashboard().await);
     }
+    // Bare `omar`: attach when there is exactly one running session, otherwise
+    // show what exists and how to pick one.
+    if cli.command.is_none() {
+        let listed: Vec<Session> = match discover() {
+            Ok(sessions) => sessions
+                .into_iter()
+                .filter(|s| matches!(s.state.as_str(), "ready" | "starting"))
+                .collect(),
+            Err(error) => return Some(Err(error)),
+        };
+        if let [only] = listed.as_slice() {
+            std::env::set_var("OMAR_SESSION_ID", &only.name);
+            return Some(attach_dashboard().await);
+        }
+        if listed.is_empty() {
+            println!("No running session. Start one with:  omar up --tui");
+        } else {
+            println!("{:<20} {:<12} {:<26} URL", "NAME", "STATUS", "WORKFLOWS");
+            for s in &listed {
+                println!(
+                    "{:<20} {:<12} {:<26} {}",
+                    s.name,
+                    s.state,
+                    runs_summary(s, &session_runs(s)),
+                    s.url
+                );
+            }
+            println!("Attach with:  omar attach -s <name> --tui");
+        }
+        return Some(Ok(()));
+    }
     let result = match &cli.command {
         Some(Commands::Serve { name, address, no_ea, ui }) => {
             // The runtime serves Mission Control whenever the build has it; `--ui` insists on it.
@@ -1496,7 +1527,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             launch(cli, UpOptions { name: name.clone(), address: address.unwrap_or_else(|| UpOptions::default().address), no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
         },
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
-        None => Err(anyhow::anyhow!("a command is required; see omar --help")),
+        None => unreachable!("bare `omar` is handled above"),
         Some(Commands::Up(options)) => launch(cli, options.clone(), false).and_then(|(s, previous)| {
             print_started(&s, previous.as_ref(), cli.json)?;
             if options.web { crate::open_browser(&s.url); }
