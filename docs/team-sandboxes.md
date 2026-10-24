@@ -10,6 +10,9 @@ Sign in with `sbx login`. On a fresh installation, Docker also requires a
 one-time global network policy, such as `sbx policy init balanced`. This affects
 all local Docker Sandboxes: balanced allows typical AI/development traffic;
 choose `deny-all` instead if you intend to allow destinations explicitly.
+On Linux, the user running `sbx` needs `/dev/kvm` (usually the `kvm` group);
+after joining it, `sbx daemon stop` from a new login so the daemon restarts with
+access (`sbx diagnose` checks).
 
 Build the template from the repository root:
 
