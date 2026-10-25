@@ -135,7 +135,13 @@ try:
     if not wait_for_attached("omar-dashboard"):
         fail("Dashboard did not attach through pty harness")
 
-    os.write(fd, b"\r")
+    # A dashboard that has just started can drop the first Enter (seen on
+    # loaded CI runners: a second Enter always opened the popup). Resend only
+    # while the popup is still closed, so no key reaches the EA's shell.
+    for _ in range(3):
+        os.write(fd, b"\r")
+        if wait_for_attached("omar-agent-ea-0", timeout=2.0):
+            break
 
     if not wait_for_attached("omar-agent-ea-0"):
         fail(
