@@ -4,6 +4,7 @@
 One runtime session runs every topology. The fake sbx runs under that
 runtime, so fault injection reads a toggles file rather than per-call env.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import time
 
 BIN = Path(os.environ.get("OMAR_BIN", "target/debug/omar")).resolve()
 TEMPLATE = "docker.io/test/omar@sha256:" + "a" * 64
+DEFAULT = "ghcr.io/omar-os/omar-sandbox@sha256:"
 TICK_NS = 200_000_000
 
 
@@ -27,7 +29,7 @@ def main():
         toggles = root / "toggles.json"
         sbx = root / "sbx"
         sbx.write_text("""#!/usr/bin/env python3
-import json, os, signal, subprocess, sys
+import hashlib, json, os, signal, subprocess, sys
 from pathlib import Path
 try: faults = json.load(open(os.environ["FAKE_TOGGLES"]))
 except FileNotFoundError: faults = {}
@@ -41,6 +43,10 @@ if args[0] == "create":
     box.mkdir()
     (box/"mounts").write_text(json.dumps(args[-2:]))
     if faults.get("FAIL_CREATE") and len(list(root.iterdir())) % 3 == 2: sys.exit(1)
+elif args[0] == "exec" and args[-2:-1] == ["-c"]:
+    # The runtime installs its own binary as the worker.
+    box = root / next(a for a in args if a.startswith("omar-team-"))
+    (box/"worker-sha").write_text(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())
 elif args[0] == "exec":
     name = next(a for a in args if a.startswith("omar-team-"))
     box = root / name
@@ -60,6 +66,12 @@ elif args[0] == "stop":
         except ProcessLookupError: pass
 elif args[0] == "ls":
     print("\\n".join(p.name for p in root.iterdir()))
+elif args[:2] == ["diagnose", "--json"]:
+    status = "fail" if faults.get("SIGNED_OUT") else "pass"
+    print(json.dumps({"checks": [{"name": "Authentication", "status": status,
+                                  "message": "not signed in", "hint": "Run sbx login"}]}))
+elif args[:2] == ["secret", "ls"]:
+    print(json.dumps({"secrets": []}))
 else: sys.exit(2)
 """)
         sbx.chmod(0o700)
@@ -191,6 +203,9 @@ total = Some(self.count);
                 assert not (mounts[0]/"seed.txt").exists()
                 assert not any("workspace-history" in a for a in create)
             assert not (source/"artifact").exists()
+            binary = hashlib.sha256(BIN.read_bytes()).hexdigest()
+            for create in creates:
+                assert (boxes/create[create.index("--name")+1]/"worker-sha").read_text() == binary
             first = record()
             assert first["sessions"] == {} and first["sessions_cleaned"]
             assert first["sandbox_template"] == TEMPLATE
@@ -284,7 +299,32 @@ total = Some(self.count);
             wait_until(lambda: record("SandboxTicker")["state"] == "TERMINATED", "the stop")
             assert record("SandboxTicker")["sessions_cleaned"]
             assert ["stop", vm.name] in entries(before), entries(before)
-            print("PASS: per-team workers, shared file order, native backend delivery, exact mounts, protected history, cleanup, pause/resume")
+
+            # Sandboxes are the default: the published kit, no flag needed.
+            plain = [a for a in args if a not in ("--sandbox-template", TEMPLATE)] + ["--replace"]
+            before = len(entries())
+            result = omar(*plain)
+            assert result.returncode == 0 and "warning" not in result.stderr, result
+            creates = creates_since(before)
+            assert len(creates) == 3 and all(c[-3].startswith(DEFAULT) for c in creates), creates
+            # Not ready: the default falls back to the host and says why.
+            fault(SIGNED_OUT=1)
+            before = len(entries())
+            result = omar(*plain)
+            assert result.returncode == 0, result
+            assert "warning: Docker Sandboxes Authentication: not signed in" in result.stderr, result
+            assert "teams run on the host" in result.stderr and not creates_since(before), result
+            assert record().get("sandbox_template") is None
+            # A named template is required, never silently replaced by the host.
+            refused = omar(*plain, "--sandbox-template", TEMPLATE)
+            assert refused.returncode != 0 and "not signed in" in refused.stdout + refused.stderr, refused
+            assert not creates_since(before)
+            fault()
+            # Opting out is silent.
+            result = omar(*plain, "--no-sandbox")
+            assert result.returncode == 0 and "warning" not in result.stderr, result
+            assert not creates_since(before)
+            print("PASS: per-team workers, shared file order, native backend delivery, exact mounts, protected history, cleanup, pause/resume, default kit, host fallback warning, required template, opt-out")
         except BaseException:
             log = state_root / "logs" / "runtime.log"
             if log.exists():

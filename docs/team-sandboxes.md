@@ -1,125 +1,107 @@
 # Team Docker Sandboxes
 
-Opt-in local execution using Docker Sandboxes (the `sbx` microVM runtime).
-Requires `sbx` 0.46 or later, Docker sign-in, and a template built with this
-OMAR worker protocol. Docker Engine containers are not a fallback.
+Each topology team instance runs in its own Docker Sandboxes (`sbx`) microVM.
+**On by default** when the host is ready; otherwise teams run on the host and
+`omar run` prints why:
 
-## Configure
+```
+warning: Docker Sandboxes Authentication: not signed in Run sbx login; teams run on the host, unsandboxed ([sandbox] enabled = false silences this)
+```
 
-Sign in with `sbx login`. On a fresh installation, Docker also requires a
-one-time global network policy, such as `sbx policy init balanced`. This affects
-all local Docker Sandboxes: balanced allows typical AI/development traffic;
-choose `deny-all` instead if you intend to allow destinations explicitly.
-On Linux, the user running `sbx` needs `/dev/kvm` (usually the `kvm` group);
-after joining it, `sbx daemon stop` from a new login so the daemon restarts with
-access (`sbx diagnose` checks).
+Docker Engine containers are not a fallback. The EA/control runtime stays on
+the host.
 
-Build the template from the repository root:
+## Choosing
+
+| Setting | Effect |
+|---|---|
+| nothing | OMAR's published kit if ready, else host + warning |
+| `omar run --sandbox-template REF` | required: run fails if not ready |
+| `omar run --no-sandbox` | host, no warning |
+| `[sandbox] template = "REF"` in `~/.omar/config.toml` | required, as the flag |
+| `[sandbox] enabled = true` | default kit, required |
+| `[sandbox] enabled = false` | host, no warning |
+
+`REF` is a kit image pinned by digest (`IMAGE@sha256:...`) or a local kit
+directory (built by sbx on first use). Config is copied into a session when it is created.
+Resume reuses the paused run's choice.
+
+## Ready means
+
+- `sbx` installed and signed in (`sbx login`), global network policy set
+  (`sbx policy init deny-all` recommended), `/dev/kvm` usable on Linux (`kvm`
+  group, then `sbx daemon stop` from a new login). `sbx diagnose` checks.
+- A Linux `omar` for the worker: this binary on Linux; on macOS the release's
+  `omar-linux` (installed beside `omar`), or `OMAR_SANDBOX_WORKER_BIN`.
+- A model key for every agent backend in the program, stored in sbx and
+  approved for third-party kits:
+
+| Backend | sbx service |
+|---|---|
+| claude | `anthropic` (API key; Claude subscriptions cannot be shared into sandboxes) |
+| codex | `openai` (`sbx secret set openai --oauth` for ChatGPT sign-in, or a key) |
+| cursor | `cursor` |
+| agy | `google` (Gemini API key) |
+| opencode, pi | any of anthropic, openai, google, openrouter, xai, mistral, groq |
+| stub, Rust reactions | none |
+| jev | not supported in sandboxes yet |
 
 ```sh
-docker build -f sandbox/Dockerfile -t docker.io/YOUR_NAMESPACE/omar-sandbox:v1 .
+sbx secret set anthropic          # key stays on the host; the VM sees a placeholder
 ```
 
-The supplied shell template includes OMAR, tmux, and Rust. It runs Rust reactions
-and the model-free `stub` backend. Install the chosen agent CLIs in a derived
-template and configure their Docker Sandbox authentication/network access before
-using model-backed agents. OMAR does not copy host backend homes or credentials.
-Mixed backends use the existing OMAR adapters inside the same team sandbox.
+Approve it for kits once, in `~/.config/sbx/credentials.yaml` (or let an
+interactive `sbx create` prompt):
 
-Publish the image yourself, then select its immutable registry digest:
-
-```toml
-[sandbox]
-template = "docker.io/YOUR_NAMESPACE/omar-sandbox@sha256:YOUR_DIGEST"
+```yaml
+bindings:
+  anthropic:
+    apiKey:
+      domains: [api.anthropic.com]
 ```
 
-Or set `omar run program.omar --sandbox-template IMAGE@sha256:DIGEST`.
-Without a template, existing host execution remains unchanged. A configured
-sandbox failure never falls back to host execution. Docker Engine's image store
-is separate from sbx; building an image locally alone does not make it available
-to the sandbox runtime.
-`OMAR_SBX_BIN` selects a CLI executable for installations outside PATH.
+## The kit
 
-For local development without publishing, import a canonical digest reference:
+`sandbox/omar-sandbox/` (published as `ghcr.io/omar-os/omar-sandbox`, pinned
+in `sandbox::DEFAULT_TEMPLATE`): every backend CLI, Rust, tmux. Network: only
+model API hosts, plus whatever the global policy allows; under deny-all
+nothing else. Keys are injected by the sbx proxy, never enter the VM. 2 CPUs,
+2 GiB per VM, shared by the instance's agents.
 
-```sh
-docker build -f sandbox/Dockerfile -t omar-sandbox:dev .
-docker save -o /tmp/omar-image.tar omar-sandbox:dev
-python3 sandbox/pin-image.py /tmp/omar-image.tar /tmp/omar-pinned.tar
-sbx template load /tmp/omar-pinned.tar
-```
-
-Use the `IMAGE@sha256:...` printed by the helper in the config or CLI. Choose
-unused archive filenames; the helper refuses to overwrite an existing archive.
-A plain tag-only `docker save` import is insufficient for digest lookup in sbx
-0.46: the helper preserves image content and adds its canonical digest name.
+OMAR is not in the image: each new VM gets the host runtime's own binary as
+`/usr/local/bin/omar` (root-owned), so worker and runtime always match.
+Changing the kit: edit, push, take the digest `Sandbox Kit` prints, update
+`DEFAULT_TEMPLATE`.
 
 ## Files and execution
 
-Each exact team instance gets a distinct sandbox, including nested teams.
-Only its `worktree/` and `temp/` are mounted read/write, at the same absolute
-paths as on the host. Never mount the workspace parent, source checkout,
-`workspace-history/`, other teams, or the host Docker socket.
+Only the instance's `worktree/` and `temp/` are mounted, read/write, at the
+same absolute paths as on the host. Never the workspace parent, source
+checkout, `workspace-history/`, other teams, or the Docker socket.
 
-Directly contained agents share the workspace. The host scheduler runs their
-reactions in definition order; separate instances can run concurrently.
-Rust compilation, Rust bodies, agent CLIs, MCP sidecars, tmux, and backend
-delivery channels all run inside the sandbox. Host-to-worker control uses
-bounded `sbx exec` stdin/stdout frames. No host invocation listener or token is
-passed into the VM; returned effects and state are validated again on the host.
+Rust compilation, Rust bodies, agent CLIs, MCP sidecars and tmux run inside
+the VM. Control: newline JSON frames over `sbx exec` stdin/stdout, bounded; no
+host listener or token enters the VM; returned writes are re-validated on the
+host. Relative path inputs resolve in the team's worktree; absolute paths
+outside its mounts are rejected. Agents cannot use the external `.git`
+pointer.
 
-Relative path inputs resolve in the receiving team's worktree. Absolute paths
-outside the team's own mounts are rejected; cross-team artifact transfer
-requires a future explicit interface. Ordinary
-strings are not interpreted as paths. Agents cannot use the external `.git`
-pointer: Git versioning belongs to the host runtime.
+Inspect: `sbx exec -it NAME tmux attach`. Host Mission Control terminals and
+code-server are not sandboxed.
 
-Each VM currently requests 2 CPUs and 2 GiB RAM. All agents in that instance
-share these limits. The template digest pins the environment; installing extra
-tools interactively is not a portable checkpoint.
+## Lifecycle
 
-## Lifecycle and scope
+VM names and the kit are recorded before creation. Completion, stop, kill and
+replacement stop the VMs; a failed stop blocks final/manual snapshots. Cleanup
+has one 60 s budget. Stopped VMs remain: `sbx rm NAME`. Pause stops VMs;
+resume starts new ones from the same kit over the restored workspaces; agents
+start fresh conversations and are told so.
 
-Deployment records persist sandbox names and the template digest before creation. Completion, graceful
-stop, force kill, and replacement stop the recorded VMs. A failed stop leaves
-cleanup unconfirmed and blocks final/manual snapshots. Cleanup has a single
-60-second budget for the deployment, including one inventory check. Workspaces and stopped
-VMs remain available; use `sbx rm NAME` when their VM-local state is no longer
-needed. Workspaces follow the run: removed at the end unless
-`--keep-workspaces`.
+## Tests
 
-Sandbox workers keep agent sessions in VM-local tmux. For inspection:
-`sbx exec -it NAME tmux attach`. Host Mission Control terminal attachment and
-code-server execution inside the VM need the editor integration follow-up to
-PR #270. Do not claim a host editor's terminals/extensions are sandboxed.
-
-Checkpoints snapshot the mounted worktrees on the host at tag boundaries.
-Pause stops the team's VMs like a stop. Resume reuses the paused run's pinned
-template (not `--sandbox-template`/config) and starts new VMs over the restored
-workspaces; agents start fresh conversations and are told so. Human-save
-attribution remains subsequent work. The EA/control runtime remains on the
-host; this feature isolates topology teams.
-
-## Validation
-
-`python3 tests/ci/team_sandboxes.py` exercises real OMAR workers/native stub
-delivery against a CLI fixture: topology ownership, exact mounts, Rust compilation
-inside workers, shared-file ordering, and cleanup failure guards. It runs in CI
-but does not demonstrate microVM security. CI also builds the Linux template
-and runs that same worker fixture inside it.
-
-For the real filesystem boundary, after signing into Docker Sandboxes:
-
-```sh
-OMAR_SANDBOX_TEMPLATE=IMAGE@sha256:DIGEST python3 tests/ci/team_sandboxes_real.py
-```
-
-This launches parent/child sandboxes, tests denied host-file/history and other-team file access,
-runs native stub invocations and Rust reactions, checks final snapshots, and
-removes only the test's recorded VMs.
-
-References:
-- [Docker workspace storage](https://docs.docker.com/ai/sandboxes/architecture/)
-- [Create shell sandboxes](https://docs.docker.com/reference/cli/sbx/create/shell/)
-- [Sandbox exec](https://docs.docker.com/reference/cli/sbx/exec/)
-- [Template loading](https://docs.docker.com/ai/sandboxes/usage/#load-a-template)
+- `tests/ci/team_sandboxes.py`: fake sbx; default kit, host fallback warning,
+  required template, opt-out, worker install, lifecycle. Also run inside the
+  kit image. Not VM isolation.
+- `tests/ci/team_sandboxes_real.py`: real VMs from this checkout's kit; file
+  isolation, worker, egress (`OMAR_EXPECT_DENY_ALL=1`). CI: `Sandbox Live` on
+  the self-hosted `omar-sandbox` runner (`.github/scripts/setup-sandbox-runner.sh`).

@@ -94,9 +94,35 @@ jobs:
           name: omar-${{ matrix.suffix }}
           path: omar-${{ matrix.suffix }}.tar.gz
 
+  # A macOS host's team sandboxes are Linux VMs: their worker is the Linux
+  # build of the same release, shipped beside omar as omar-linux.
+  bundle-sandbox-worker:
+    name: Bundle sandbox worker (darwin)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        arch: [arm64, amd64]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: omar-*-${{ matrix.arch }}
+      - name: Add omar-linux to the darwin tarball
+        run: |
+          tar xzf omar-linux-${{ matrix.arch }}/omar-linux-${{ matrix.arch }}.tar.gz
+          tar xzf omar-darwin-${{ matrix.arch }}/omar-darwin-${{ matrix.arch }}.tar.gz
+          cp omar-linux-${{ matrix.arch }}/omar omar-darwin-${{ matrix.arch }}/omar-linux
+          tar czf omar-darwin-${{ matrix.arch }}.tar.gz omar-darwin-${{ matrix.arch }}/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omar-darwin-${{ matrix.arch }}
+          path: omar-darwin-${{ matrix.arch }}.tar.gz
+          overwrite: true
+
   release:
     name: Publish Release
-    needs: build
+    needs: bundle-sandbox-worker
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -167,6 +193,11 @@ jobs:
                   r'(omar-' + re.escape(platform) + r'\.tar\.gz\"\n\s+sha256 \").*?(\")',
                   r'\g<1>' + sha + r'\2',
                   content
+              )
+          if 'omar-linux' not in content:
+              content = content.replace(
+                  '    bin.install \"omar\"',
+                  '    bin.install \"omar\"\\n    bin.install \"omar-linux\" if OS.mac?'
               )
           if 'bin.install \"omarc\"' not in content:
               content = content.replace(

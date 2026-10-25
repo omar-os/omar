@@ -27,6 +27,9 @@ def main():
         home, source, shims = root / "home", root / "source", root / "bin"
         for path in (home, source, shims):
             path.mkdir()
+        # Host execution under test; sandboxes have their own suite.
+        (home / ".omar").mkdir()
+        (home / ".omar" / "config.toml").write_text("[sandbox]\nenabled = false\n")
         env = dict(os.environ, HOME=str(home),
                    PATH=str(shims) + os.pathsep + os.environ["PATH"],
                    CARGO_HOME=os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")),

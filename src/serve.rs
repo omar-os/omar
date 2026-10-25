@@ -158,6 +158,9 @@ struct StartRunRequest {
     /// otherwise.
     #[serde(default)]
     sandbox_template: Option<String>,
+    /// Run the teams on the host even where sandboxes are the default.
+    #[serde(default)]
+    no_sandbox: bool,
 }
 
 fn default_replace() -> bool {
@@ -315,7 +318,7 @@ struct Context_ {
     session_prefix: String,
     default_workdir: String,
     health_idle_warning: i64,
-    sandbox_template: Option<String>,
+    sandbox: crate::sandbox::Config,
     runs: Runs,
     /// Where each run's web-backed invocations are answered. Absent for a run
     /// whose program has no `Web` agent, which is what makes the panel routes
@@ -693,7 +696,7 @@ impl Serve {
             session_prefix: config.dashboard.session_prefix.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
-            sandbox_template: config.sandbox.template.clone(),
+            sandbox: config.sandbox.clone(),
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
@@ -1952,7 +1955,7 @@ impl Workspaces {
             session_prefix: self.root.session_prefix.clone(),
             default_workdir: self.root.default_workdir.clone(),
             health_idle_warning: self.root.health_idle_warning,
-            sandbox_template: self.root.sandbox_template.clone(),
+            sandbox: self.root.sandbox.clone(),
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
@@ -2358,7 +2361,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         .chat_operation
         .lock()
         .expect("chat operation poisoned");
-    let request: StartRunRequest = match serde_json::from_slice(body) {
+    let mut request: StartRunRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
@@ -2432,6 +2435,18 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             return (409, team_held_error(active));
         }
     }
+    let backends: Vec<&str> = state.agents.values().map(|a| a.backend.as_str()).collect();
+    let mut sandbox = match crate::sandbox::select(
+        request.sandbox_template.as_deref(),
+        request.no_sandbox,
+        &context.sandbox,
+        &backends,
+    ) {
+        Ok(sandbox) => sandbox,
+        Err(error) => return (400, json!({"error": format!("{error:#}")})),
+    };
+    // From here the request names where its teams run.
+    request.sandbox_template = sandbox.template.take();
 
     // The verified bytecode beside the source: a later timeline projection
     // or resume reads it back without a compiler.
@@ -2482,7 +2497,11 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
                 if record.status == RunStatus::Starting {
                     record.status = RunStatus::Running;
                 }
-                return (201, json!(record));
+                let mut value = json!(record);
+                if let Some(warning) = sandbox.warning {
+                    value["warning"] = json!(warning);
+                }
+                return (201, value);
             }
             (500, json!({"error": "run vanished"}))
         }
@@ -2836,10 +2855,7 @@ fn spawn_run_thread(
         .as_deref()
         .and_then(|period| crate::checkpoint::parse_policy(period).ok());
     let keep_workspaces = request.keep_workspaces;
-    let sandbox_template = request
-        .sandbox_template
-        .clone()
-        .or_else(|| context.sandbox_template.clone());
+    let sandbox_template = request.sandbox_template.clone();
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let outcome = topology::run_topology(

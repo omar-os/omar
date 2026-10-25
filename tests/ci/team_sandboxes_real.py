@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Real microVM smoke test. Requires signed-in sbx and a pinned OMAR template.
-OMAR_SANDBOX_TEMPLATE=<image@sha256:...> python3 tests/ci/team_sandboxes_real.py
+"""Real microVM smoke test. Requires signed-in sbx. Uses this checkout's kit
+(sandbox/omar-sandbox) unless OMAR_SANDBOX_TEMPLATE names another.
+OMAR_EXPECT_DENY_ALL=1 also checks egress under a deny-all global policy.
 """
 import json
 import os
@@ -9,11 +10,22 @@ import subprocess
 import tempfile
 
 BIN = Path(os.environ.get("OMAR_BIN", "target/debug/omar")).resolve()
+KIT = Path(__file__).resolve().parents[2] / "sandbox" / "omar-sandbox"
 SBX = os.environ.get("OMAR_SBX_BIN", "sbx")
 
 
 def main():
-    template = os.environ["OMAR_SANDBOX_TEMPLATE"]
+    template = os.environ.get("OMAR_SANDBOX_TEMPLATE") or str(KIT)
+    # Model hosts the kit allows answer; anything else is refused at the proxy.
+    egress = """
+let status = |url: &str| String::from_utf8(std::process::Command::new("curl")
+    .args(["-s", "-m", "20", "-o", "/dev/null", "-w", "%{http_code}", url]).output().unwrap().stdout).unwrap();
+assert_eq!(status("https://api.anthropic.com/v1/models"), "401", "model host unreachable");
+""" + ("""
+for url in ["https://api.github.com/gists", "https://pypi.org/simple/", "https://example.com/"] {
+    assert_eq!(status(url), "403", "{url} reachable");
+}
+""" if os.environ.get("OMAR_EXPECT_DENY_ALL") else "")
     with tempfile.TemporaryDirectory(prefix="omar-real-sandbox-") as tmp:
         root = Path(tmp).resolve()
         home, source, shims = root / "home", root / "source", root / "bin"
@@ -43,6 +55,7 @@ for foreign in std::fs::read_to_string("foreign-paths").unwrap().lines() {{
 }}
 assert!(std::fs::write({json.dumps(str(secret))}, "changed").is_err());
 std::fs::write("artifact", "inside sandbox").unwrap();
+{egress}
 out = Some("isolated".to_string());
 """
         instructions = [{"op": "begin_plan", "team": "IsolationSmoke"}]
@@ -68,7 +81,7 @@ out = Some("isolated".to_string());
         adapter.write_text("#!/usr/bin/env python3\n" +
             "import json,os,sys\nfrom pathlib import Path\n" +
             "state_root=Path(os.environ['OMAR_STATE_DIR'])\n" +
-            "if len(sys.argv)>1 and sys.argv[1]=='exec':\n" +
+            "if len(sys.argv)>1 and sys.argv[1]=='exec' and '--workdir' in sys.argv:\n" +
             "    record=json.loads(next(state_root.rglob('deployment.json')).read_text())\n" +
             "    own=Path(sys.argv[sys.argv.index('--workdir')+1])\n" +
             "    others=[]\n" +
@@ -99,7 +112,7 @@ out = Some("isolated".to_string());
                 assert (tree/"boundary-probe").read_text() == "untouched"
                 assert (tree/"artifact").read_text() == "inside sandbox"
                 assert len(list((state_root/"workspace-history"/ws/"snapshots").glob("*.json"))) == 2
-            print("PASS: real Docker Sandbox execution, parent/child separation, denied host/history access, native backend, snapshots")
+            print("PASS: real Docker Sandbox execution, parent/child separation, denied host/history access, native backend, snapshots, egress")
         finally:
             subprocess.run([str(BIN), "down", "-s", runtime["name"], "--force", "--timeout", "5"], env=env, capture_output=True)
             subprocess.run(["tmux", "-L", runtime["tmux_server"], "kill-server"], capture_output=True)

@@ -1,0 +1,51 @@
+name: Sandbox Live
+
+# Team sandboxes in real Docker Sandboxes microVMs, on the maintainer's
+# self-hosted runner (label `omar-sandbox`): KVM, sbx signed in, global
+# policy deny-all. Setup: .github/scripts/setup-sandbox-runner.sh.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sandbox-live-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox-live:
+    name: Sandbox Live (self-hosted)
+    # Fork PRs never reach the runner; outside contributors' workflows also
+    # need maintainer approval, since a fork could edit this condition away.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, omar-sandbox]
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          clean: false
+      - name: Isolate run state
+        run: |
+          git clean -ffdx -e target
+          echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+      - name: Check Docker Sandboxes
+        run: |
+          sbx diagnose --json | jq -e '[.checks[] | select(.status == "fail")] | length == 0'
+          sbx policy ls | grep -q '^default-deny-all '
+      - name: Build
+        run: cargo build -p omar
+      # This checkout's kit, built by sbx; real VMs, mounts, worker install,
+      # and egress through the kit's allow list only.
+      - name: Real microVM sandboxes
+        env:
+          OMAR_EXPECT_DENY_ALL: "1"
+        run: python3 tests/ci/team_sandboxes_real.py

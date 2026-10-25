@@ -48,6 +48,9 @@ def main():
                            f"if 'new-session' in sys.argv and (not faults.get('KILL_FAIL') or faults.get('REPLACE_SIDECAR')): sys.argv[-1] = {('python3 ' + shlex.quote(str(sidecar)) + ' & ')!r} + sys.argv[-1]\n"
                            f"os.execv({tmux!r}, [{tmux!r}, *sys.argv[1:]])\n")
         wrapper.chmod(0o700)
+        # Host execution under test; sandboxes have their own suite.
+        (home / ".omar").mkdir()
+        (home / ".omar" / "config.toml").write_text("[sandbox]\nenabled = false\n")
         env = dict(os.environ, HOME=str(home),
                    PATH=str(shims) + os.pathsep + os.environ["PATH"],
                    CARGO_HOME=os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")),

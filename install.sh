@@ -61,6 +61,10 @@ $SUDO install "$TMP/omar" "$INSTALL_DIR/"
 if [ -f "$TMP/omarc" ]; then
   $SUDO install "$TMP/omarc" "$INSTALL_DIR/"
 fi
+# macOS: the Linux build team sandboxes run as their worker.
+if [ -f "$TMP/omar-linux" ]; then
+  $SUDO install "$TMP/omar-linux" "$INSTALL_DIR/"
+fi
 
 echo ""
 echo "Done! Installed:"

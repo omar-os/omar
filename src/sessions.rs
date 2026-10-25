@@ -94,10 +94,14 @@ pub struct StartOptions {
     /// go with the run; a paused run keeps them either way.
     #[arg(long)]
     pub keep_workspaces: bool,
-    /// Docker Sandbox template pinned by digest (one sandbox per team
-    /// instance); defaults to `[sandbox].template`.
+    /// Docker Sandbox kit pinned by digest, or a local kit directory (one
+    /// sandbox per team instance); defaults to `[sandbox].template`, else
+    /// OMAR's published kit. Naming one makes sandboxes required.
     #[arg(long)]
     pub sandbox_template: Option<String>,
+    /// Run the teams on the host, unsandboxed.
+    #[arg(long, conflicts_with = "sandbox_template")]
+    pub no_sandbox: bool,
 }
 #[derive(Subcommand, Debug)]
 pub enum EaAction {
@@ -1580,8 +1584,14 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             let files = crate::topology::imported_files(&options.program, &program)?;
             // The file name names a program whose `main` does not.
             let filename = options.program.file_name().map(|name| name.to_string_lossy().into_owned());
-            let body=json!({"program":program,"filename":filename,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces,"sandbox_template":options.sandbox_template});
+            // A local kit directory is named for the runtime, whose cwd differs.
+            let template = options.sandbox_template.as_ref().map(|t| match Path::new(t).is_dir() {
+                true => fs::canonicalize(t).map(|p| p.to_string_lossy().into_owned()),
+                false => Ok(t.clone()),
+            }).transpose()?;
+            let body=json!({"program":program,"filename":filename,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces,"sandbox_template":template,"no_sandbox":options.no_sandbox});
             let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
+            if let Some(warning) = run["warning"].as_str() { eprintln!("warning: {warning}"); }
             if owned { run["session"] = json!(s.name); }
             // One structured result: the admission record, or with --fg the terminal record.
             if !options.fg { return print_value(run); }

@@ -12,22 +12,216 @@ use std::time::{Duration, Instant};
 pub const FRAME_LIMIT: usize = 8 * 1024 * 1024;
 pub const PROTOCOL: u32 = 1;
 
+/// The published OMAR kit (`sandbox/omar-sandbox`), used unless a run or
+/// `[sandbox].template` names another.
+pub const DEFAULT_TEMPLATE: &str = "ghcr.io/omar-os/omar-sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// A registry image pinned by SHA-256 digest.
+    /// A kit image pinned by SHA-256 digest, or an absolute kit directory.
     pub template: Option<String>,
+    /// `false`: teams run on the host. `true`: sandboxes are required.
+    /// Unset: sandboxed when Docker Sandboxes is ready, else on the host
+    /// with a warning.
+    pub enabled: Option<bool>,
 }
 
 pub fn validate_template(template: &str) -> Result<()> {
+    if Path::new(template).is_absolute() {
+        anyhow::ensure!(
+            Path::new(template).is_dir(),
+            "sandbox kit directory {template} does not exist"
+        );
+        return Ok(());
+    }
     let hash = template
         .rsplit_once("@sha256:")
         .filter(|(name, _)| !name.is_empty())
         .map(|(_, hash)| hash);
     anyhow::ensure!(
         hash.is_some_and(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_hexdigit())),
-        "sandbox template must be pinned by IMAGE@sha256:<digest>"
+        "sandbox template must be pinned by IMAGE@sha256:<digest> or be an absolute kit directory"
     );
     Ok(())
+}
+
+/// Where a run's teams execute: in sandboxes from `template`, or on the host,
+/// with the reason when the default could not be used.
+#[derive(Debug, PartialEq)]
+pub struct Selection {
+    pub template: Option<String>,
+    pub warning: Option<String>,
+}
+
+/// An explicit template (the run's or the config's) or `enabled = true`
+/// requires sandboxes; otherwise an unready host falls back with a warning.
+pub fn select(
+    requested: Option<&str>,
+    disabled: bool,
+    config: &Config,
+    backends: &[&str],
+) -> Result<Selection> {
+    if disabled || config.enabled == Some(false) {
+        return Ok(Selection {
+            template: None,
+            warning: None,
+        });
+    }
+    let required = requested.is_some() || config.template.is_some() || config.enabled == Some(true);
+    let template = requested
+        .or(config.template.as_deref())
+        .unwrap_or(DEFAULT_TEMPLATE);
+    validate_template(template)?;
+    match ready(backends) {
+        Ok(()) => Ok(Selection {
+            template: Some(template.to_owned()),
+            warning: None,
+        }),
+        Err(error) if required => Err(error),
+        Err(error) => Ok(Selection {
+            template: None,
+            warning: Some(format!(
+                "{error:#}; teams run on the host, unsandboxed ([sandbox] enabled = false silences this)"
+            )),
+        }),
+    }
+}
+
+/// Services whose key, in sbx's store and approved for kits, lets a backend
+/// reach its models from a sandbox. Any one suffices.
+fn services(backend: &str) -> Result<&'static [&'static str]> {
+    use crate::backend::Kind;
+    const MODELS: &[&str] = &[
+        "anthropic",
+        "openai",
+        "google",
+        "openrouter",
+        "xai",
+        "mistral",
+        "groq",
+    ];
+    if backend.eq_ignore_ascii_case("web") {
+        return Ok(&[]);
+    }
+    let kind = crate::backend::by_name(backend)
+        .with_context(|| format!("unknown backend '{backend}'"))?
+        .kind();
+    Ok(match kind {
+        Kind::Claude => &["anthropic"],
+        Kind::Codex => &["openai"],
+        Kind::Cursor => &["cursor"],
+        Kind::Antigravity => &["google"],
+        Kind::Opencode | Kind::Pi => MODELS,
+        Kind::Stub => &[],
+        Kind::Jev => bail!("Jev agents cannot run in sandboxes yet"),
+    })
+}
+
+/// Docker Sandboxes can run these backends here: sbx installed, signed in,
+/// virtualization usable, a worker binary to install, and model keys.
+fn ready(backends: &[&str]) -> Result<()> {
+    let needs = backends
+        .iter()
+        .map(|backend| Ok((*backend, services(backend)?)))
+        .collect::<Result<Vec<_>>>()?;
+    worker_binary()?;
+    let mut cmd = command();
+    cmd.args(["diagnose", "--json"]);
+    let report: Value = serde_json::from_slice(
+        &checked(cmd, Duration::from_secs(30))
+            .context("Docker Sandboxes (sbx) is not installed or not working")?,
+    )?;
+    for check in report["checks"].as_array().into_iter().flatten() {
+        let name = check["name"].as_str().unwrap_or_default();
+        if check["status"] == "fail"
+            && matches!(
+                name,
+                "Virtualization" | "Authentication" | "Global network policy"
+            )
+        {
+            bail!(
+                "Docker Sandboxes {name}: {} {}",
+                check["message"].as_str().unwrap_or_default(),
+                check["hint"].as_str().unwrap_or_default()
+            );
+        }
+    }
+    if needs.iter().all(|(_, services)| services.is_empty()) {
+        return Ok(());
+    }
+    let mut cmd = command();
+    cmd.args(["secret", "ls", "--global", "--json"]);
+    let stored: Value = serde_json::from_slice(&checked(cmd, Duration::from_secs(30))?)?;
+    let bound = bindings();
+    for (backend, services) in needs {
+        let usable = |service: &&str| {
+            bound.iter().any(|b| b == service)
+                && stored["secrets"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|secret| secret["name"] == *service)
+        };
+        if !services.is_empty() && !services.iter().any(usable) {
+            bail!(
+                "{backend} agents need a model key in Docker Sandboxes: `sbx secret set {}` and a binding for it (docs/team-sandboxes.md)",
+                services[0]
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Services approved for third-party kits in sbx's `credentials.yaml`: the
+/// keys directly under `bindings:`.
+fn bindings() -> Vec<String> {
+    let path = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+        .map(|dir| dir.join("sbx/credentials.yaml"));
+    let text = path
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    parse_bindings(&text)
+}
+
+fn parse_bindings(text: &str) -> Vec<String> {
+    let mut services = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let content = line.trim();
+        if content.is_empty() || content.starts_with('#') {
+            continue;
+        }
+        if indent == 0 {
+            inside = content == "bindings:";
+        } else if inside && indent == 2 {
+            if let Some(name) = content
+                .strip_suffix(':')
+                .or_else(|| content.split_once(": ").map(|(name, _)| name))
+            {
+                services.push(name.trim_matches(['"', '\'']).to_owned());
+            }
+        }
+    }
+    services
+}
+
+/// The Linux `omar` a sandbox runs as its worker: this binary on Linux, the
+/// release's `omar-linux` beside it elsewhere.
+fn worker_binary() -> Result<PathBuf> {
+    let path = match std::env::var_os("OMAR_SANDBOX_WORKER_BIN") {
+        Some(path) => PathBuf::from(path),
+        None if cfg!(target_os = "linux") => std::env::current_exe()?,
+        None => std::env::current_exe()?.with_file_name("omar-linux"),
+    };
+    anyhow::ensure!(
+        path.is_file(),
+        "no Linux omar binary for the sandbox worker at {}",
+        path.display()
+    );
+    Ok(path)
 }
 
 /// Source path inputs refer to the seeded copy, never to another host mount.
@@ -155,24 +349,20 @@ pub fn create(name: &str, template: &str, worktree: &Path, temp: &Path) -> Resul
     );
     let mut cmd = command();
     cmd.args([
-        "create",
-        "--name",
-        name,
-        "--template",
-        template,
-        "--skills",
-        "off",
-        "--pull",
-        "missing",
-        "--cpus",
-        "2",
-        "--memory",
-        "2g",
-        "shell",
+        "create", "--name", name, "--skills", "off", "--pull", "missing", "--cpus", "2",
+        "--memory", "2g", template,
     ])
     .arg(worktree)
     .arg(temp);
-    checked(cmd, Duration::from_secs(180)).map(|_| ())
+    // A kit directory builds on first use.
+    checked(cmd, Duration::from_secs(900))?;
+    // The worker is this runtime's own build, so its protocol always matches.
+    // Root-owned: agents in the VM cannot replace it.
+    let mut cmd = command();
+    cmd.args(["exec", "-i", "-u", "root", name, "sh", "-c"])
+        .arg("cat > /usr/local/bin/omar.part && chmod 0755 /usr/local/bin/omar.part && mv /usr/local/bin/omar.part /usr/local/bin/omar")
+        .stdin(std::fs::File::open(worker_binary()?)?);
+    checked(cmd, Duration::from_secs(120)).map(|_| ())
 }
 
 pub fn stop_all(names: &std::collections::BTreeMap<String, String>) -> Vec<String> {
@@ -369,6 +559,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reads_bound_services_and_their_backend_needs() {
+        let text = "# approvals\nbindings:\n  anthropic:\n    apiKey:\n      domains: [api.anthropic.com]\n  \"openai\": {oauth: {domains: [chatgpt.com]}}\nother:\n  google:\n";
+        assert_eq!(parse_bindings(text), ["anthropic", "openai"]);
+        assert_eq!(services("claude").unwrap(), ["anthropic"]);
+        assert!(services("opencode").unwrap().contains(&"openrouter"));
+        assert!(services("stub").unwrap().is_empty());
+        assert!(services("jev").is_err());
+    }
+    #[test]
+    fn disabled_sandboxes_skip_selection() {
+        let host = Selection {
+            template: None,
+            warning: None,
+        };
+        let off = Config {
+            enabled: Some(false),
+            ..Config::default()
+        };
+        assert_eq!(select(None, false, &off, &["claude"]).unwrap(), host);
+        assert_eq!(
+            select(None, true, &Config::default(), &["claude"]).unwrap(),
+            host
+        );
+        assert!(validate_template("/nonexistent/kit").is_err());
+        assert!(validate_template(DEFAULT_TEMPLATE).is_ok());
+    }
     #[test]
     fn worker_timeout_disables_further_requests() {
         let child = Command::new("sleep").arg("30").spawn().unwrap();
