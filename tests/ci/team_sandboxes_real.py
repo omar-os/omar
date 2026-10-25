@@ -119,7 +119,9 @@ out = Some("isolated".to_string());
             for path in state_root.rglob("deployment.json"):
                 for name in json.loads(path.read_text()).get("sandboxes", {}).values():
                     subprocess.run([SBX, "stop", name], capture_output=True, timeout=60)
-                    subprocess.run([SBX, "rm", "--force", name], capture_output=True, timeout=60, check=True)
+                    removed = subprocess.run([SBX, "rm", "--force", name], capture_output=True, text=True, timeout=60)
+                    # A create that failed leaves a recorded name and no VM.
+                    assert removed.returncode == 0 or "not found" in removed.stderr, removed
 
 
 if __name__ == "__main__":

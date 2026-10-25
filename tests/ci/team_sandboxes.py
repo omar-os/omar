@@ -14,7 +14,7 @@ import time
 
 BIN = Path(os.environ.get("OMAR_BIN", "target/debug/omar")).resolve()
 TEMPLATE = "docker.io/test/omar@sha256:" + "a" * 64
-DEFAULT = "ghcr.io/omar-os/omar-sandbox@sha256:"
+DEFAULT = "docker.io/omar-os/omar-sandbox@sha256:"
 TICK_NS = 200_000_000
 
 
