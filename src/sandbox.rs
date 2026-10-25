@@ -14,7 +14,7 @@ pub const PROTOCOL: u32 = 1;
 
 /// The published OMAR kit (`sandbox/omar-sandbox`), used unless a run or
 /// `[sandbox].template` names another.
-pub const DEFAULT_TEMPLATE: &str = "ghcr.io/omar-os/omar-sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+pub const DEFAULT_TEMPLATE: &str = "ghcr.io/omar-os/omar-sandbox@sha256:9eeaa3c5f0f4a854336371f9740773141a0b9f329a2f7497a282c4195a06d615";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
