@@ -65,6 +65,9 @@ pub enum Trigger {
     Automatic,
     Manual,
     Pause,
+    /// Not captured from a running loop: written while the run was paused,
+    /// from the checkpoint before it with the program changed.
+    Mutation,
 }
 
 /// How often a run checkpoints on its own. Physical time is the default: a
@@ -268,6 +271,10 @@ pub struct Manifest {
     pub elapsed_ns: u64,
     pub workspaces: BTreeMap<String, ArtifactRef>,
     pub agents: BTreeMap<String, AgentContext>,
+    /// For a `mutation` checkpoint, the plan that turned its parent's program
+    /// into this one's, between `begin_mutation` and `commit_plan`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutation: Vec<crate::topology::Instruction>,
 }
 
 /// Where a run's checkpoints live, beneath its deployment directory and so
@@ -697,6 +704,7 @@ mod tests {
             elapsed_ns: state.elapsed_ns,
             workspaces: BTreeMap::new(),
             agents: BTreeMap::new(),
+            mutation: Vec::new(),
         }
     }
 

@@ -1,4 +1,5 @@
 import Omar.Compiler
+import Omar.Mutation
 
 open Lean
 open Omar
@@ -588,6 +589,84 @@ def testSchemaTypeResolution : IO Unit := do
     | .ok _ => throw (IO.userError "accepted unknown, incompatible, or inline schema type")
   IO.println "schema type resolution tests passed"
 
+/-- The plan `omarc --mutate-from` writes, as one string per instruction. -/
+def mutationPlan (running target : String) : IO (Array String) := do
+  let bytecode ← match compileSource "Relay" running with
+    | .ok bytecode => pure bytecode
+    | .error error => throw (IO.userError s!"running program: {error}")
+  let running ← match Json.parse bytecode with
+    | .ok json => pure json
+    | .error error => throw (IO.userError error)
+  planOf running target
+
+where
+  planOf (running : Json) (target : String) : IO (Array String) := do
+    match compileMutationSourceWithSchemas running "Relay" target #[] with
+    | .ok plan =>
+      match Json.parse plan >>= (·.getObjValAs? (Array Json) "instructions") with
+      | .ok instructions => pure (instructions.map (·.compress))
+      | .error error => throw (IO.userError error)
+    | .error error => throw (IO.userError s!"plan: {error}")
+
+def relaySource (second : String) (prompt : String) (extra : String := "") : String :=
+  "team Node(idx : int)[agent : Stub] { input token : int output out : int state seen : int = 0 " ++
+  extra ++ " task agent(token) -> out \"" ++ prompt ++ " $(idx)\" } " ++
+  "main Relay { n1 = Node(1) n2 = Node(" ++ second ++ ") n1.out -> n2.token }"
+
+def testMutation : IO Unit := do
+  let v1 := relaySource "2" "go"
+  -- Unchanged: the frame and nothing else.
+  let same ← mutationPlan v1 v1
+  assertEqual "unchanged plan" same.size 2
+  -- A runtime writes nulls the compiler leaves out; they change nothing.
+  let running ← match compileSource "Relay" v1 >>= Json.parse with
+    | .ok json => pure json
+    | .error error => throw (IO.userError error)
+  let withNulls := match running.getObjValAs? (Array Json) "instructions" with
+    | .ok instructions => running.setObjVal! "instructions" (Json.arr (instructions.map fun i =>
+        if (i.getObjValAs? String "op").toOption == some "define_port" then i.setObjVal! "delay" Json.null
+        else i))
+    | .error _ => running
+  assertEqual "nulls are absent fields" (← mutationPlan.planOf withNulls v1).size 2
+  -- A prompt edited: both reactions updated in place, nothing else.
+  let edited ← mutationPlan v1 (relaySource "2" "go faster")
+  assertEqual "edited prompt" (edited.filter (mentions · "update_reaction")).size 2
+  assertEqual "edited prompt only" edited.size 4
+  -- An argument changed: that instance replaced whole, the other untouched.
+  let replaced ← mutationPlan v1 (relaySource "5" "go")
+  for expected in ["kill_agent", "remove_instance", "remove_state", "declare_instance",
+      "\"name\":\"n2.seen\""] do
+    unless replaced.any (mentions · expected) do
+      throw (IO.userError s!"replaced instance: {expected} missing from {replaced}")
+  if replaced.any (mentions · "n1.") then
+    throw (IO.userError s!"replacing n2 touched n1: {replaced}")
+  -- Removals come before declarations.
+  let firstDeclare := (replaced.findIdx? (mentions · "declare_instance")).getD 0
+  let lastRemoval := (replaced.toList.reverse.findIdx? (mentions · "remove_")).map
+    (replaced.size - 1 - ·) |>.getD replaced.size
+  unless lastRemoval < firstDeclare do
+    throw (IO.userError s!"a removal follows a declaration: {replaced}")
+  -- A connection taken out and a port added.
+  let rewired ← mutationPlan v1
+    ("team Node(idx : int)[agent : Stub] { input token : int output out : int state seen : int = 0 " ++
+     "output echo : int task agent(token) -> out \"go $(idx)\" } " ++
+     "main Relay { n1 = Node(1) n2 = Node(2) }")
+  for expected in ["disconnect_ports", "\"name\":\"n1.echo\"", "\"name\":\"n2.echo\""] do
+    unless rewired.any (mentions · expected) do
+      throw (IO.userError s!"rewired: {expected} missing from {rewired}")
+  -- A renamed main is another program.
+  match running |> fun running => compileMutationSourceWithSchemas running "Other"
+      (v1.replace "main Relay" "main Other") #[] with
+  | .error error => unless mentions error "keeps the program's main" do
+      throw (IO.userError s!"renamed main: {error}")
+  | .ok _ => throw (IO.userError "a renamed main was planned as a mutation")
+  -- The theorems hold of what is shipped: these are what `plan_sound`,
+  -- `plan_minimal` and `compiled_plan_sound` are about.
+  let _ := @Omar.Mutation.plan_sound
+  let _ := @Omar.Mutation.plan_minimal
+  let _ := @Omar.Mutation.compiled_plan_sound
+  IO.println "mutation tests passed"
+
 def main : IO UInt32 := do
   try
     for test in topologyCases do
@@ -603,6 +682,7 @@ def main : IO UInt32 := do
     testCodeTerminator
     testExternalSchemas
     testSchemaTypeResolution
+    testMutation
     IO.println "compiler rejection tests passed"
     pure 0
   catch error =>

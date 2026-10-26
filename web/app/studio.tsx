@@ -52,6 +52,7 @@ import {
   fetchCheckpoint,
   fetchCheckpoints,
   fetchRunTimeline,
+  mutateRun,
   pauseRun,
   resumeRun,
   rollbackRun,
@@ -156,6 +157,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [checking, setChecking] = useState(false);
   const [applyingConfiguration, setApplyingConfiguration] = useState(false);
+  // What applying the edited source to the run would change, while the
+  // operator decides; and whether an applied change is still landing.
+  const [mutationPlan, setMutationPlan] = useState<string[] | null>(null);
+  const [mutating, setMutating] = useState(false);
   /** Every tag the program passes through, projected or observed. */
   const [steps, setSteps] = useState<TimelineStep[]>([]);
   const [truncated, setTruncated] = useState(false);
@@ -831,6 +836,86 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     }
   }
 
+  /** Show what changing the run to the edited source would do. */
+  async function previewMutation() {
+    if (!run || mutating) return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const { changes } = await mutateRun(serveUrl, run.run_id, {
+        program: source,
+        filename,
+        files: design?.files,
+        dry_run: true,
+      });
+      if (scope !== scopeRef.current) return;
+      if (changes.length === 0) {
+        setError("The source matches what the run is executing; there is nothing to apply.");
+        return;
+      }
+      setMutationPlan(changes);
+      // The plan is shown above the source it came from.
+      setTab("source");
+      setInspectorWidth((width) => width || DEFAULT_INSPECTOR);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  /**
+   * Change the run to the edited source. A running run pauses at its next tag
+   * boundary, takes the change and resumes on its own, under a new diagram
+   * address; this follows it until it is back, then watches it again.
+   */
+  async function applyMutation() {
+    if (!run || mutating) return;
+    const scope = scopeRef.current;
+    setMutating(true);
+    setError("");
+    try {
+      let { record } = await mutateRun(serveUrl, run.run_id, {
+        program: source,
+        filename,
+        files: design?.files,
+      });
+      if (scope !== scopeRef.current) return;
+      setMutationPlan(null);
+      if (!record) return;
+      runRef.current = record;
+      setRun(record);
+      const wasPaused = record.status === "paused";
+      // As long as a pause may take: the tag in progress closes first.
+      const deadline = Date.now() + 420_000;
+      while (
+        Date.now() < deadline &&
+        (record.mutation?.status === "pending" ||
+          record.status === "pausing" ||
+          record.status === "starting" ||
+          (!wasPaused && record.status === "paused"))
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        record = await fetchRun(serveUrl, record.run_id);
+        if (scope !== scopeRef.current) return;
+      }
+      runRef.current = record;
+      setRun(record);
+      setCheckpointEpoch((n) => n + 1);
+      if (record.mutation?.status === "failed") {
+        setError(`The change was not applied: ${record.mutation.error ?? "unknown error"}`);
+      }
+      if (record.status === "running" && record.diagram_address) {
+        setPhase("observing");
+        observe(record);
+      }
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (scope === scopeRef.current) setMutating(false);
+    }
+  }
+
   /** Move the resume point of a paused run back to the checkpoint picked on the timeline. */
   async function requestRollback(checkpoint: string) {
     if (!run || run.status !== "paused" || checkpoint === resumePoint) return;
@@ -1058,6 +1143,17 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             }
           >
             {isPausing ? "Pausing…" : "Pause"}
+          </button>
+        ) : null}
+        {((phase === "observing" && run?.status === "running") || isPaused) && run ? (
+          <button
+            className="secondary-button"
+            onClick={() => void previewMutation()}
+            type="button"
+            disabled={mutating || sourceErrors.length > 0 || run.mutation?.status === "pending"}
+            title="Shows what changing the run to the edited source would do, then applies it"
+          >
+            {mutating || run.mutation?.status === "pending" ? "Applying…" : "Apply edits"}
           </button>
         ) : null}
         {(phase === "observing" || isPaused) && run ? (
@@ -1488,13 +1584,40 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           {tab === "source" ? (
             <>
             {Object.keys(design?.files ?? {}).length > 0 ? <button className="secondary-button" onClick={() => setFilesOpen(true)}>View companion files ({Object.keys(design?.files ?? {}).length})</button> : null}
+            {mutationPlan ? (
+              <section className="mutation-plan" aria-label="Mutation plan">
+                <strong>Apply these changes to the run?</strong>
+                <span>
+                  {run?.status === "paused"
+                    ? "The paused run takes them and stays paused."
+                    : "It pauses at the next tag boundary, changes, and resumes."}
+                </span>
+                <ul>
+                  {mutationPlan.map((change, at) => (
+                    <li key={at}>{change}</li>
+                  ))}
+                </ul>
+                <div className="mutation-plan-actions">
+                  <button className="primary-button" type="button" disabled={mutating} onClick={() => void applyMutation()}>
+                    {mutating ? "Applying…" : "Apply"}
+                  </button>
+                  <button className="secondary-button" type="button" disabled={mutating} onClick={() => setMutationPlan(null)}>
+                    Cancel
+                  </button>
+                </div>
+              </section>
+            ) : null}
             <OmarEditor
               source={source}
               filename={filename}
               status={run ? run.status : "draft"}
               errors={sourceErrors}
               checking={checking}
-              onSourceChange={setSource}
+              onSourceChange={(next) => {
+                setSource(next);
+                // A plan describes the text it was made from.
+                setMutationPlan(null);
+              }}
               onFilenameChange={setFilename}
             />
             </>

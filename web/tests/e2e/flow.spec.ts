@@ -864,6 +864,49 @@ test("a run can be paused and resumed from the panel that shows it", async ({ pa
   await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
 });
 
+test("an edited source is applied to the run, and the change marks the timeline", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+  const actions = page.getByRole("group", { name: "Run controls" });
+  const apply = actions.getByRole("button", { name: "Apply edits" });
+  await expect(apply).toBeEnabled();
+
+  // Nothing edited: nothing to apply, and the run is left alone.
+  await apply.click();
+  await expect(page.getByText("there is nothing to apply")).toBeVisible();
+
+  // An edit is previewed as the plan the daemon would run, before anything
+  // happens to the run.
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+  await page.getByRole("tab", { name: "Source" }).click();
+  const editor = page.getByLabel("OMAR program");
+  await editor.press("ControlOrMeta+End");
+  await editor.pressSequentially("\n// tightened");
+  await apply.click();
+  const plan = page.getByLabel("Mutation plan");
+  await expect(plan).toContainText("update_reaction review.reaction.0");
+  await expect(plan).toContainText("pauses at the next tag boundary");
+  await plan.getByRole("button", { name: "Apply" }).click();
+
+  // The run pauses, takes the change, and comes back on its own.
+  await expect(plan).toHaveCount(0);
+  await expect(actions.getByRole("button", { name: "Pause" })).toBeEnabled({ timeout: 10000 });
+  await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
+
+  // On the timeline the change is a mark of its own, in its own colour,
+  // whose preview lists what changed.
+  await page.getByRole("button", { name: /Run timeline/ }).click();
+  const timeline = page.getByLabel("Logical timeline");
+  const mark = timeline.getByRole("button", { name: "Checkpoint #3" });
+  await expect(mark).toHaveClass(/mutation/);
+  await expect(timeline.getByRole("button", { name: "Checkpoint #2" })).not.toHaveClass(/mutation/);
+  await mark.click();
+  const preview = timeline.getByLabel("Checkpoint preview");
+  await expect(preview).toContainText("Checkpoint #3 · mutation");
+  await expect(preview.getByLabel("Mutation")).toContainText("update_reaction review.reaction.0");
+});
+
 test("the confirmation chooses what the run keeps and how it checkpoints", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);

@@ -256,6 +256,11 @@ jobs:
 
       - name: Test external schema imports
         run: python3 tests/ci/schema_imports.py
+      - name: Verify a running topology is mutated to a new program
+        run: |
+          sudo apt-get update && sudo apt-get install -y tmux
+          cargo build --bin omar
+          python3 tests/ci/team_mutation.py
 
       - name: Compile topology corpus to bytecode (offline)
         working-directory: lang

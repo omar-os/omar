@@ -29,7 +29,7 @@ pub struct Bytecode {
     pub instructions: Vec<Instruction>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Instruction {
     BeginPlan {
@@ -132,6 +132,55 @@ pub enum Instruction {
         within: Option<u64>,
     },
     CommitPlan,
+    /// Opens a mutation plan: what turns the running program into a new one.
+    /// Everything below up to `commit_plan` is the diff, removals first; the
+    /// rest of the program is left as it was.
+    BeginMutation {
+        team: String,
+    },
+    RemoveType {
+        name: String,
+    },
+    RemoveInstance {
+        name: String,
+    },
+    KillAgent {
+        name: String,
+    },
+    RemovePort {
+        name: String,
+    },
+    RemoveTimer {
+        name: String,
+    },
+    RemoveState {
+        name: String,
+    },
+    RemoveParam {
+        name: String,
+    },
+    DisconnectPorts {
+        source: String,
+        target: String,
+    },
+    RemoveReaction {
+        id: String,
+    },
+    /// A reaction kept under its id with anything else about it changed.
+    UpdateReaction {
+        id: String,
+        agent: String,
+        triggers: Vec<String>,
+        effects: Vec<String>,
+        contract: String,
+        prompt: String,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        instance: String,
+        #[serde(default)]
+        within: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -490,6 +539,41 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
 
     load_bytecode(&output_path)
         .with_context(|| format!("omarc failed to compile {}", source.display()))
+}
+
+/// The plan that turns `running` into the program staged at `source`. The
+/// compiler computes it (`omarc --mutate-from`), with the plan function its
+/// proofs are about; the runtime checks it before applying anything.
+pub fn compile_mutation(source: &Path, running: &Bytecode) -> Result<Bytecode> {
+    let dir = source.parent().unwrap_or_else(|| Path::new("."));
+    let running_path = dir.join(".running.json");
+    let plan_path = dir.join(".plan.json");
+    fs::write(&running_path, serde_json::to_vec(running)?)
+        .with_context(|| format!("failed to write {}", running_path.display()))?;
+    let compiler = resolve_omarc();
+    let output = Command::new(&compiler)
+        .arg("--local-imports")
+        .arg("--mutate-from")
+        .arg(&running_path)
+        .arg(source)
+        .arg(&plan_path)
+        .output();
+    let _ = fs::remove_file(&running_path);
+    let output = output.with_context(|| {
+        format!(
+            "failed to invoke OMAR compiler '{}'; install omarc beside omar, \
+             add it to PATH, or set OMARC_BIN",
+            compiler.display()
+        )
+    })?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&plan_path);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("omarc failed: {stderr}");
+    }
+    let plan = load_bytecode(&plan_path);
+    let _ = fs::remove_file(&plan_path);
+    plan
 }
 
 /// The identity in a claim, waiting for it to be written.
@@ -915,6 +999,10 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 }
             }
             Instruction::CommitPlan => committed = true,
+            other => bail!(
+                "instruction {index} ({}) belongs to a mutation plan, not a program",
+                crate::mutation::op_name(other)
+            ),
         }
     }
     reject_causality_loops(&state)?;
@@ -2370,6 +2458,7 @@ impl Checkpointer for RunCheckpointer<'_> {
             Trigger::Automatic => "automatic",
             Trigger::Manual => "manual",
             Trigger::Pause => "pause",
+            Trigger::Mutation => "mutation",
         };
         let label = format!("Checkpoint {} ({kind})", schedule.sequence);
         // Each instance's files, as a version its own history keeps. The
@@ -2417,6 +2506,7 @@ impl Checkpointer for RunCheckpointer<'_> {
             elapsed_ns: state.elapsed_ns,
             workspaces: artifacts,
             agents: self.agents.clone(),
+            mutation: Vec::new(),
         };
         self.store.publish(&manifest, state, &self.program)?;
         schedule.sequence += 1;
@@ -3661,6 +3751,7 @@ fn settle_boundary(
                     Trigger::Automatic => "automatic",
                     Trigger::Manual => "manual",
                     Trigger::Pause => "pause",
+                    Trigger::Mutation => "mutation",
                 };
                 observer.checkpoint_published(&id, kind, captured.completed_tag);
                 break;

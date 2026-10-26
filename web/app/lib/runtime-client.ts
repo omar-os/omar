@@ -338,10 +338,12 @@ export interface CheckpointSummary {
   id: string;
   sequence: number;
   parent: string | null;
-  trigger: "automatic" | "manual" | "pause";
+  trigger: "automatic" | "manual" | "pause" | "mutation";
   completed_tag: [number, number] | null;
   next_tag: [number, number] | null;
   created_at: number;
+  /** A mutation checkpoint's plan, one line per instruction. */
+  mutation?: string[];
 }
 
 export interface CheckpointListing {
@@ -441,6 +443,31 @@ export async function rollbackRun(
   if (!response.ok) throw new Error(await readError(response));
   const body = (await response.json()) as { resume_point?: unknown };
   return typeof body.resume_point === "string" ? body.resume_point : null;
+}
+
+/**
+ * Change a running or paused run's program to `program`. A dry run, or a
+ * program that changes nothing, answers with the plan alone; otherwise the
+ * run's record, whose `mutation` is `pending` while a running run pauses.
+ */
+export async function mutateRun(
+  serveUrl: string,
+  runId: string,
+  request: { program: string; filename?: string; files?: Record<string, string>; dry_run?: boolean },
+  signal?: AbortSignal,
+): Promise<{ changes: string[]; record: RunRecord | null }> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/mutate`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request), signal },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { changes?: unknown; run_id?: unknown };
+  if (typeof body.run_id === "string") {
+    const record = assertRunRecord(body);
+    return { changes: record.mutation?.changes ?? [], record };
+  }
+  return { changes: Array.isArray(body.changes) ? (body.changes as string[]) : [], record: null };
 }
 
 /** Ask a run to checkpoint at its next tag boundary and park; answers `pausing`. */

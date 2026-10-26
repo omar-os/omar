@@ -1,8 +1,10 @@
 import Omar.Compiler
 
+open Lean
 open Omar
 
-def usage : String := "usage: omarc [--local-imports] <input.omar> <output.json>"
+def usage : String :=
+  "usage: omarc [--local-imports] [--mutate-from <running.json>] <input.omar> <output.json>"
 
 /-- Whether an import path stays inside the program's own directory: relative,
     and never climbing out. What a program staged from a request may import;
@@ -16,6 +18,11 @@ def main (args : List String) : IO UInt32 := do
   let (localImports, args) := match args with
     | "--local-imports" :: rest => (true, rest)
     | args => (false, args)
+  -- A running program's bytecode: the output is then the plan that turns it
+  -- into the input, rather than the input's own bytecode.
+  let (running, args) := match args with
+    | "--mutate-from" :: path :: rest => (some path, rest)
+    | args => (none, args)
   match args with
   | [input, output] =>
       try
@@ -36,7 +43,14 @@ def main (args : List String) : IO UInt32 := do
             pure (path, ← IO.FS.readFile schemaPath)
           catch error =>
             throw (IO.userError s!"schema type '{name}' from '{schemaPath}': {error}")
-        match compileSourceWithSchemas programName source schemas with
+        let compiled ← match running with
+          | none => pure (compileSourceWithSchemas programName source schemas)
+          | some path => do
+            let running ← match Json.parse (← IO.FS.readFile path) with
+              | .ok running => pure running
+              | .error message => throw (IO.userError s!"{path}: {message}")
+            pure (compileMutationSourceWithSchemas running programName source schemas)
+        match compiled with
         | .ok bytecode =>
             IO.FS.writeFile output bytecode
             IO.println s!"compiled {input} -> {output}"
