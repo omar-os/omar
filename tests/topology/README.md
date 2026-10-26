@@ -102,7 +102,8 @@ worth naming: nothing between a tag and its artifacts exercises a live agent.
 The runner prints per-case duration and assertion counts, followed by an
 aggregate PASS/FAIL verdict. It exits nonzero if any case fails. Logs and a
 machine-readable `results.tsv` summary are written under
-`target/topology-tests/`.
+`target/topology-tests/`. Each case lists `agent=backend` for the CLI each
+agent's pane actually ran; in CI the same table is on the run's summary page.
 
 The following environment variables adjust local execution:
 
@@ -111,6 +112,10 @@ The following environment variables adjust local execution:
 - `OMAR_TEST_INVOCATION_TIMEOUT_SECONDS`: timeout for one agent prompt;
   default `300`.
 - `OMAR_TEST_CASE`: run only the named case.
+- `OMAR_TEST_BACKEND`: run only the core cases (AllTypes, EffectContracts,
+  FanOutFanIn, OrTriggers, SameAgentSerial, Timer), every agent on this
+  backend, e.g. `cursor`, `opencode`, `pi`, `agy`. A case also fails if any
+  agent's pane ran another CLI.
 - `OMAR_TEST_PEEK_AGENTS`: capture recent tmux output from every live agent once
   per minute; enabled by the CI workflow.
 - `OMAR_TEST_RESULTS_DIR`: directory for logs and metrics.
