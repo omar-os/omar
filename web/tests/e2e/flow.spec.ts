@@ -868,7 +868,12 @@ test("an edited source is applied to the run, and the change marks the timeline"
   await useFakeServe(page);
   await draftUntilProposed(page);
   await deploy(page);
+  // Paused, so the fake's short walk cannot end under the test. Pausing,
+  // applying and resuming a running run is the daemon's, and covered against
+  // the real one by tests/ci/team_mutation.py.
   const actions = page.getByRole("group", { name: "Run controls" });
+  await actions.getByRole("button", { name: "Pause" }).click();
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
   const apply = actions.getByRole("button", { name: "Apply edits" });
   await expect(apply).toBeEnabled();
 
@@ -886,16 +891,15 @@ test("an edited source is applied to the run, and the change marks the timeline"
   await apply.click();
   const plan = page.getByLabel("Mutation plan");
   await expect(plan).toContainText("update_reaction review.reaction.0");
-  await expect(plan).toContainText("pauses at the next tag boundary");
+  await expect(plan).toContainText("stays paused");
   await plan.getByRole("button", { name: "Apply" }).click();
-
-  // The run pauses, takes the change, and comes back on its own.
   await expect(plan).toHaveCount(0);
-  await expect(actions.getByRole("button", { name: "Pause" })).toBeEnabled({ timeout: 10000 });
-  await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
+  await expect(page.getByText("The change was not applied")).toHaveCount(0);
+  // Applied to a paused run, it stays paused until resumed.
+  await expect(actions.getByRole("button", { name: "Resume" })).toBeVisible();
 
   // On the timeline the change is a mark of its own, in its own colour,
-  // whose preview lists what changed.
+  // whose preview lists what changed; it is where a resume continues.
   await page.getByRole("button", { name: /Run timeline/ }).click();
   const timeline = page.getByLabel("Logical timeline");
   const mark = timeline.getByRole("button", { name: "Checkpoint #3" });
@@ -905,6 +909,10 @@ test("an edited source is applied to the run, and the change marks the timeline"
   const preview = timeline.getByLabel("Checkpoint preview");
   await expect(preview).toContainText("Checkpoint #3 · mutation");
   await expect(preview.getByLabel("Mutation")).toContainText("update_reaction review.reaction.0");
+  await expect(preview).toContainText("A resume continues from here.");
+
+  await actions.getByRole("button", { name: "Resume" }).click();
+  await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
 });
 
 test("the confirmation chooses what the run keeps and how it checkpoints", async ({ page }) => {
