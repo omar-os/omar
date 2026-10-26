@@ -24,7 +24,7 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, omar-sandbox]
+    runs-on: [omar-sandbox]
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
