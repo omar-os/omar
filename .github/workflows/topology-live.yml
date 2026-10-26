@@ -81,6 +81,17 @@ jobs:
             echo "OMAR_TEST_RESULTS_DIR=$RUNNER_TEMP/topology-tests"
           } >>"$GITHUB_ENV"
 
+      # Test against the backend's latest release.
+      - name: Update backend CLI
+        if: env.OMAR_TEST_BACKEND != ''
+        run: |
+          case "$OMAR_TEST_BACKEND" in
+            cursor) cursor-agent update ;;
+            opencode) opencode upgrade ;;
+            pi) pi update ;;
+            agy) agy update ;;
+          esac
+
       - name: Verify live agent CLIs
         run: |
           case "$OMAR_TEST_BACKEND" in
