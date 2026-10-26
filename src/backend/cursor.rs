@@ -1,5 +1,6 @@
 //! Cursor: driven over its protocol by OMAR's runner.
 
+use super::{connection, Connection};
 use super::{managed, spool, PaneSetup};
 use super::{Backend, Kind, Launch};
 use crate::manager::{managed_agent_command, materialize_prompt_file, shell_single_quote};
@@ -19,6 +20,19 @@ impl Backend for Cursor {
     }
     fn default_command(&self) -> &'static str {
         "cursor agent --yolo"
+    }
+    /// The status command ignores `CURSOR_API_KEY`, so that is checked first.
+    fn connection(&self, program: &str) -> Connection {
+        if let Some(name) = connection::env_credential(&["CURSOR_API_KEY"]) {
+            return Connection::connected(name);
+        }
+        match connection::run(program, &["agent", "status", "--format", "json"]) {
+            Some(output) => agent_status(&output.stdout),
+            None => Connection::unknown("`cursor agent status` did not answer"),
+        }
+    }
+    fn login_command(&self) -> Option<&'static str> {
+        Some("cursor agent login")
     }
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["Cursor Agent"]
@@ -172,8 +186,39 @@ pub(crate) fn install_cursor_hook() -> bool {
     spool::write_json_atomically(&path, &config)
 }
 
+/// `cursor agent status --format json` exits 0 signed in or not.
+fn agent_status(stdout: &str) -> Connection {
+    let Ok(status) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return Connection::unknown("`cursor agent status` gave no JSON");
+    };
+    match status["isAuthenticated"].as_bool() {
+        Some(true) => Connection::Connected { via: None },
+        Some(false) => Connection::SignedOut,
+        None => Connection::unknown("`cursor agent status` gave no answer OMAR knows"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_status_reads_is_authenticated() {
+        use super::{agent_status, Connection};
+        assert_eq!(
+            agent_status(
+                r#"{"status":"unauthenticated","isAuthenticated":false,"message":"Not logged in"}"#
+            ),
+            Connection::SignedOut
+        );
+        assert_eq!(
+            agent_status(r#"{"isAuthenticated":true}"#),
+            Connection::Connected { via: None }
+        );
+        assert!(matches!(
+            agent_status("Not logged in"),
+            Connection::Unknown { .. }
+        ));
+    }
+
     use super::*;
 
     #[test]

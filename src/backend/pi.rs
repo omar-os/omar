@@ -3,6 +3,7 @@ use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
+use super::{connection, Connection};
 use super::{Backend, Kind, Launch, NotReady, PaneSetup, Readiness, Target, WRITE_TIMEOUT};
 use crate::manager::{
     materialize_mcp_context_file, mcp_ea_dir, omar_server_exe, shell_single_quote,
@@ -24,6 +25,27 @@ impl Backend for Pi {
     }
     fn default_command(&self) -> &'static str {
         "pi"
+    }
+    /// Pi answers for one provider at a time, so its own store is read
+    /// instead, then the keys most people sign in with.
+    fn connection(&self, _program: &str) -> Connection {
+        let dir = std::env::var_os("PI_CODING_AGENT_DIR")
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".pi").join("agent")));
+        let stored = dir
+            .and_then(|dir| std::fs::read_to_string(dir.join("auth.json")).ok())
+            .map(|text| stored_providers(&text))
+            .unwrap_or_default();
+        if !stored.is_empty() {
+            return Connection::connected(stored.join(", "));
+        }
+        match connection::env_credential(PI_KEYS) {
+            Some(name) => Connection::connected(name),
+            None => Connection::SignedOut,
+        }
+    }
+    fn login_command(&self) -> Option<&'static str> {
+        Some("pi, then /login")
     }
     fn readiness(&self, _command: &str) -> Readiness {
         Readiness::Channel
@@ -124,8 +146,40 @@ fn launch_command(launch: &Launch<'_>) -> Result<String> {
     ))
 }
 
+const PI_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+    "GROQ_API_KEY",
+    "MISTRAL_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "COPILOT_GITHUB_TOKEN",
+];
+
+/// `auth.json` maps each provider signed in through `/login` to its credential.
+fn stored_providers(text: &str) -> Vec<String> {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(providers)) => providers.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stored_providers_are_the_keys_of_auth_json() {
+        use super::stored_providers;
+        assert_eq!(
+            stored_providers(r#"{"anthropic":{"type":"oauth"},"openai":{"type":"api_key"}}"#),
+            ["anthropic", "openai"]
+        );
+        assert!(stored_providers("{}").is_empty());
+        assert!(stored_providers("not json").is_empty());
+    }
+
     use super::*;
     #[test]
     fn pi_launch_materializes_scoped_bridge_and_resumes_only_saved_chat() {

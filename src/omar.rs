@@ -230,6 +230,13 @@ enum Commands {
     /// Configure tmux for optimal omar experience
     SetupTmux,
 
+    /// Show which agent backends are installed and signed in
+    Backends {
+        /// Print JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Restore authoritative coordination state to a backend lifecycle hook.
     AgentHook {
         #[arg(long)]
@@ -590,6 +597,10 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             status_deployment(&omar_dir, target.id, &deployment)
         }
         Some(Commands::SetupTmux) => setup_tmux(),
+        Some(Commands::Backends { json }) => {
+            print!("{}", backends_report(json));
+            Ok(())
+        }
         Some(Commands::Ea {
             action: sessions::EaAction::Event { action },
         }) => {
@@ -1401,6 +1412,38 @@ fn sync_tmux_setup_warning(app: &mut app::App) {
 }
 
 /// Interactive tmux configuration setup.
+/// Every assistant backend's sign-in, as a table or as JSON.
+fn backends_report(json: bool) -> String {
+    use crate::backend::{connection, Connection};
+    let statuses = connection::assistants();
+    if json {
+        let rows: Vec<_> = statuses
+            .iter()
+            .map(|(backend, status)| connection::describe(*backend, status))
+            .collect();
+        return format!("{}\n", serde_json::Value::Array(rows));
+    }
+    let mut out = format!("{:<10}{:<28}{}\n", "BACKEND", "STATUS", "SIGN IN");
+    for (backend, status) in statuses {
+        let (state, hint) = match &status {
+            Connection::Connected { via: Some(via) } => (format!("✓ {via}"), None),
+            Connection::Connected { via: None } => ("✓ signed in".to_string(), None),
+            Connection::SignedOut => ("not signed in".to_string(), backend.login_command()),
+            Connection::NotInstalled => ("not installed".to_string(), None),
+            Connection::Unknown { reason } => (format!("? {reason}"), None),
+        };
+        let row = format!(
+            "{:<10}{:<28}{}",
+            backend.kind().name(),
+            state,
+            hint.unwrap_or("")
+        );
+        out += row.trim_end();
+        out.push('\n');
+    }
+    out
+}
+
 fn setup_tmux() -> Result<()> {
     use std::io::Write;
 

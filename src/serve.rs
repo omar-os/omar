@@ -1390,6 +1390,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
             select_chat(&workspaces, Some(id))
         }
         ("GET", "/v1/agent") => (200, describe_agent(&context)),
+        ("GET", "/v1/agent/backends") => (200, backend_connections()),
         ("POST", "/v1/agent/backend") => switch_backend(&context, &read_body(content_length)?),
         // EA-only, authenticated with the token handed to its MCP sidecar.
         ("POST", "/v1/agent/reply") => agent_reply(&context, &read_body(content_length)?),
@@ -1712,6 +1713,17 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
             .map(crate::backend::Kind::name),
         "available": crate::backend::assistant_names(),
     })
+}
+
+/// Whether each backend is installed and signed in. Asked on demand: the
+/// answer comes from each CLI and takes up to a few seconds.
+fn backend_connections() -> Value {
+    use crate::backend::connection;
+    let backends: Vec<Value> = connection::assistants()
+        .into_iter()
+        .map(|(backend, status)| connection::describe(backend, &status))
+        .collect();
+    json!({ "backends": backends })
 }
 
 /// Relaunch the assistant on a different backend.

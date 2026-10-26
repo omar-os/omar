@@ -165,6 +165,17 @@ Shutdown the test project and its agents.
 Each `omar -a <backend> up` starts a new independent session. Add `--name dev`
 to name it, and `--web` or `--tui` to open a client immediately.
 
+`omar backends` shows which are installed and signed in, and the command that
+signs in the rest (`--json` for scripts). Mission Control's backend menu shows
+the same.
+
+```
+BACKEND   STATUS                      SIGN IN
+claude    ✓ Claude Max
+codex     not signed in               codex login
+cursor    not installed
+```
+
 ## License
 
 BSD 3-Clause

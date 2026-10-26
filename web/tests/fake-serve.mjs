@@ -299,6 +299,18 @@ export async function startFakeServe({
         available: ["claude", "codex", "cursor", "opencode", "agy"],
       });
     }
+    if (request.method === "GET" && url.pathname === "/v1/agent/backends") {
+      return json(response, 200, {
+        backends: [
+          ["claude", { status: "connected", via: "Claude Max" }, "claude auth login"],
+          ["codex", { status: "connected", via: "ChatGPT" }, "codex login"],
+          ["cursor", { status: "signed_out" }, "cursor agent login"],
+          ["opencode", { status: "unknown", reason: "no answer" }, "opencode auth login"],
+          ["pi", { status: "not_installed" }, "pi, then /login"],
+          ["agy", { status: "not_installed" }, "agy (it signs in on first launch)"],
+        ].map(([name, status, login]) => ({ name, ...status, login })),
+      });
+    }
     if (request.method === "POST" && url.pathname === "/v1/agent/backend") {
       return readBody(request).then((body) => {
         let chosen;

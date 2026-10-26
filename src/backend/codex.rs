@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
+use super::{connection, Connection};
 use super::{detect, detect_token, Backend, Kind, Launch};
 use super::{managed, NotReady, PaneSetup, WRITE_TIMEOUT};
 use crate::manager::{
@@ -50,6 +51,15 @@ impl Backend for Codex {
     }
     fn default_command(&self) -> &'static str {
         "codex --dangerously-bypass-approvals-and-sandbox"
+    }
+    fn connection(&self, program: &str) -> Connection {
+        match connection::run(program, &["login", "status"]) {
+            Some(output) => login_status(&output.text),
+            None => Connection::unknown("`codex login status` did not answer"),
+        }
+    }
+    fn login_command(&self) -> Option<&'static str> {
+        Some("codex login")
     }
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         let socket = from_stamp(target.stamp?)?;
@@ -591,8 +601,41 @@ pub(crate) fn only_thread(listed: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// `codex login status` answers in a sentence, on stderr.
+fn login_status(text: &str) -> Connection {
+    if text.contains("Not logged in") {
+        return Connection::SignedOut;
+    }
+    match text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Logged in using "))
+    {
+        Some(via) if via.starts_with("an API key") => Connection::connected("API key"),
+        Some(via) => Connection::connected(via.trim()),
+        None => Connection::unknown("`codex login status` gave no answer OMAR knows"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn login_status_reads_the_sentence_codex_prints() {
+        use super::{login_status, Connection};
+        assert_eq!(
+            login_status("\nLogged in using ChatGPT\n"),
+            Connection::connected("ChatGPT")
+        );
+        assert_eq!(
+            login_status("Logged in using an API key - sk-proj-***ABCD"),
+            Connection::connected("API key")
+        );
+        assert_eq!(
+            login_status("WARNING: proceeding\nNot logged in\n"),
+            Connection::SignedOut
+        );
+        assert!(matches!(login_status(""), Connection::Unknown { .. }));
+    }
+
     #[test]
     fn startup_update_gate_skips_once_without_persistent_dismissal() {
         use super::Backend;

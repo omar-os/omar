@@ -2,6 +2,7 @@
 //! through one `--settings`, and OMAR's tools over MCP.
 use std::path::{Path, PathBuf};
 
+use super::{connection, Connection};
 use super::{delivery_failed, NotReady, PaneSetup, Target, WRITE_TIMEOUT};
 use super::{detect, detect_token, Backend, Kind, Launch};
 use crate::manager::{
@@ -70,6 +71,15 @@ impl Backend for Claude {
     }
     fn default_command(&self) -> &'static str {
         "claude --dangerously-skip-permissions"
+    }
+    fn connection(&self, program: &str) -> Connection {
+        match connection::run(program, &["auth", "status"]) {
+            Some(output) => auth_status(&output.stdout),
+            None => Connection::unknown("`claude auth status` did not answer"),
+        }
+    }
+    fn login_command(&self) -> Option<&'static str> {
+        Some("claude auth login")
     }
     fn conversation_id(&self, target: &Target<'_>) -> Option<String> {
         let directory = claude_sessions_dir()?;
@@ -454,8 +464,60 @@ pub(crate) fn child_pids(parent: u32) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// `claude auth status` prints JSON, and exits 1 when signed out.
+fn auth_status(stdout: &str) -> Connection {
+    let Ok(status) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return Connection::unknown("`claude auth status` needs a newer Claude Code");
+    };
+    if status["loggedIn"] != true {
+        return Connection::SignedOut;
+    }
+    let via = match (
+        status["authMethod"].as_str(),
+        status["subscriptionType"].as_str(),
+    ) {
+        (Some("claude.ai"), Some(plan)) => {
+            let mut plan = plan.chars();
+            let first = plan.next().map(|c| c.to_uppercase().collect::<String>());
+            format!("Claude {}{}", first.unwrap_or_default(), plan.as_str())
+        }
+        (Some("api_key"), _) => match status["apiKeySource"].as_str() {
+            Some(source) => format!("API key ({source})"),
+            None => "API key".to_string(),
+        },
+        (Some(method), _) => method.to_string(),
+        (None, _) => return Connection::Connected { via: None },
+    };
+    Connection::connected(via)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auth_status_names_the_plan_or_the_key_it_signed_in_with() {
+        use super::{auth_status, Connection};
+        assert_eq!(
+            auth_status(
+                r#"{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}"#
+            ),
+            Connection::connected("Claude Max")
+        );
+        assert_eq!(
+            auth_status(
+                r#"{"loggedIn": true, "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"}"#
+            ),
+            Connection::connected("API key (ANTHROPIC_API_KEY)")
+        );
+        assert_eq!(
+            auth_status(r#"{"loggedIn": false, "authMethod": "none"}"#),
+            Connection::SignedOut
+        );
+        assert!(matches!(
+            auth_status("error: unknown command 'auth'"),
+            Connection::Unknown { .. }
+        ));
+    }
+
     #[test]
     fn startup_trust_gate_handles_both_option_orders_and_current_selection() {
         use super::Backend;

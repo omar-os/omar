@@ -14,10 +14,12 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use crate::manager::McpLaunchContext;
+pub use connection::Connection;
 
 pub(crate) mod antigravity;
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod connection;
 pub(crate) mod cursor;
 pub(crate) mod jev;
 pub(crate) mod managed;
@@ -228,6 +230,15 @@ pub trait Backend: Send + Sync {
         false
     }
     fn startup_gate(&self, _screen: &str) -> Option<StartupGate> {
+        None
+    }
+
+    /// Whether this backend's installed CLI, run as `program`, is signed in.
+    fn connection(&self, _program: &str) -> Connection {
+        Connection::unknown("no sign-in check for this backend")
+    }
+    /// The command an operator runs to sign this backend in.
+    fn login_command(&self) -> Option<&'static str> {
         None
     }
 
