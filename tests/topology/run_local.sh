@@ -332,6 +332,11 @@ run_case() {
   local session_id
   session_id=$(grep -o 'Started session [^ ;]*' "$log" | awk '{print $3}' | tail -1)
   [[ -n $session_id ]] && cp -R "${OMAR_HOME:-$HOME/.omar}/sessions/$session_id/ea/0/topologies/$team/logs" "$results_dir/$name-agents" 2>/dev/null || true
+  # The runtime's own log; a session that failed to start is named only here.
+  local runtime_log
+  runtime_log=$(grep -o 'see [^ ]*/logs/runtime\.log' "$log" | awk '{print $2}' | tail -1)
+  [[ -z $runtime_log && -n $session_id ]] && runtime_log="${OMAR_HOME:-$HOME/.omar}/sessions/$session_id/logs/runtime.log"
+  [[ -n $runtime_log ]] && cp "$runtime_log" "$results_dir/$name-runtime.log" 2>/dev/null || true
 
   if grep -Fq "Topology '$team' completed" "$log"; then
     case_passed=$((case_passed + 1))
