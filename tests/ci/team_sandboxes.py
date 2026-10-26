@@ -154,9 +154,10 @@ total = Some(self.count);
         runtime = json.loads(subprocess.run([str(BIN), "up", "--no-ea", "--name", "sandboxes", "--json"], cwd=source,
                                             env=env, text=True, capture_output=True, timeout=90, check=True).stdout)
         state_root = Path(runtime["directory"])
+        runtimes = [runtime]
 
-        def omar(*args, timeout=240):
-            return subprocess.run([str(BIN), "-s", runtime["name"], *args], cwd=source, env=env,
+        def omar(*args, timeout=240, session=None):
+            return subprocess.run([str(BIN), "-s", session or runtime["name"], *args], cwd=source, env=env,
                                   capture_output=True, text=True, timeout=timeout)
 
         def ok(*args, **kwargs):
@@ -300,39 +301,44 @@ total = Some(self.count);
             assert record("SandboxTicker")["sessions_cleaned"]
             assert ["stop", vm.name] in entries(before), entries(before)
 
-            # Sandboxes are the default: the published kit, no flag needed.
+            # Sandboxes are opt-in: without a template or config, the host.
             plain = [a for a in args if a not in ("--sandbox-template", TEMPLATE)] + ["--replace"]
             before = len(entries())
             result = omar(*plain)
             assert result.returncode == 0 and "warning" not in result.stderr, result
-            creates = creates_since(before)
-            assert len(creates) == 3 and all(c[-3].startswith(DEFAULT) for c in creates), creates
-            # Not ready: the default falls back to the host and says why.
-            fault(SIGNED_OUT=1)
-            before = len(entries())
-            result = omar(*plain)
-            assert result.returncode == 0, result
-            assert "warning: Docker Sandboxes Authentication: not signed in" in result.stderr, result
-            assert "teams run on the host" in result.stderr and not creates_since(before), result
-            assert record().get("sandbox_template") is None
+            assert not creates_since(before) and record().get("sandbox_template") is None
             # A named template is required, never silently replaced by the host.
+            fault(SIGNED_OUT=1)
             refused = omar(*plain, "--sandbox-template", TEMPLATE)
             assert refused.returncode != 0 and "not signed in" in refused.stdout + refused.stderr, refused
             assert not creates_since(before)
             fault()
-            # Opting out is silent.
-            result = omar(*plain, "--no-sandbox")
-            assert result.returncode == 0 and "warning" not in result.stderr, result
+            # `[sandbox] enabled = true`: the published kit, no flag needed.
+            (home / ".omar").mkdir(exist_ok=True)
+            (home / ".omar" / "config.toml").write_text("[sandbox]\nenabled = true\n")
+            enabled = json.loads(subprocess.run([str(BIN), "up", "--no-ea", "--name", "sandboxes-on", "--json"], cwd=source,
+                                                env=env, text=True, capture_output=True, timeout=90, check=True).stdout)
+            runtimes.append(enabled)
+            before = len(entries())
+            result = omar(*plain, session=enabled["name"])
+            assert result.returncode == 0, result
+            creates = creates_since(before)
+            assert len(creates) == 3 and all(c[-3].startswith(DEFAULT) for c in creates), creates
+            # Opting out overrides the config.
+            before = len(entries())
+            result = omar(*plain, "--no-sandbox", session=enabled["name"])
+            assert result.returncode == 0, result
             assert not creates_since(before)
-            print("PASS: per-team workers, shared file order, native backend delivery, exact mounts, protected history, cleanup, pause/resume, default kit, host fallback warning, required template, opt-out")
+            print("PASS: per-team workers, shared file order, native backend delivery, exact mounts, protected history, cleanup, pause/resume, opt-in, required template, enabled default kit, opt-out")
         except BaseException:
             log = state_root / "logs" / "runtime.log"
             if log.exists():
                 print("runtime.log:", log.read_text()[-4000:])
             raise
         finally:
-            subprocess.run([str(BIN), "down", "-s", runtime["name"], "--force", "--timeout", "5"], env=env, capture_output=True)
-            subprocess.run(["tmux", "-L", runtime["tmux_server"], "kill-server"], capture_output=True)
+            for started in runtimes:
+                subprocess.run([str(BIN), "down", "-s", started["name"], "--force", "--timeout", "5"], env=env, capture_output=True)
+                subprocess.run(["tmux", "-L", started["tmux_server"], "kill-server"], capture_output=True)
             for box in list(boxes.iterdir()) + list((root / "empty-boxes").glob("*")):
                 subprocess.run([str(sbx), "stop", box.name], env=env, capture_output=True)
 

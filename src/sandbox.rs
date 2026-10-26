@@ -12,17 +12,16 @@ use std::time::{Duration, Instant};
 pub const FRAME_LIMIT: usize = 8 * 1024 * 1024;
 pub const PROTOCOL: u32 = 1;
 
-/// The published OMAR kit (`sandbox/omar-sandbox`), used unless a run or
-/// `[sandbox].template` names another.
+/// The published OMAR kit (`sandbox/omar-sandbox`), used by `enabled = true`
+/// unless a run or `[sandbox].template` names another.
 pub const DEFAULT_TEMPLATE: &str = "docker.io/omar-os/omar-sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// A kit image pinned by SHA-256 digest, or an absolute kit directory.
     pub template: Option<String>,
-    /// `false`: teams run on the host. `true`: sandboxes are required.
-    /// Unset: sandboxed when Docker Sandboxes is ready, else on the host
-    /// with a warning.
+    /// `true`: teams run in sandboxes, from `template` or OMAR's published
+    /// kit. Unset or `false`: on the host, unless a template is named.
     pub enabled: Option<bool>,
 }
 
@@ -45,46 +44,25 @@ pub fn validate_template(template: &str) -> Result<()> {
     Ok(())
 }
 
-/// Where a run's teams execute: in sandboxes from `template`, or on the host,
-/// with the reason when the default could not be used.
-#[derive(Debug, PartialEq)]
-pub struct Selection {
-    pub template: Option<String>,
-    pub warning: Option<String>,
-}
-
-/// An explicit template (the run's or the config's) or `enabled = true`
-/// requires sandboxes; otherwise an unready host falls back with a warning.
+/// The template a run's teams execute in, or `None` for the host. Sandboxes
+/// are opt-in: an explicit template (the run's or the config's) or
+/// `enabled = true` requires them, and an unready host is an error.
 pub fn select(
     requested: Option<&str>,
     disabled: bool,
     config: &Config,
     backends: &[&str],
-) -> Result<Selection> {
-    if disabled || config.enabled == Some(false) {
-        return Ok(Selection {
-            template: None,
-            warning: None,
-        });
+) -> Result<Option<String>> {
+    let wanted = requested.is_some() || config.template.is_some() || config.enabled == Some(true);
+    if disabled || config.enabled == Some(false) || !wanted {
+        return Ok(None);
     }
-    let required = requested.is_some() || config.template.is_some() || config.enabled == Some(true);
     let template = requested
         .or(config.template.as_deref())
         .unwrap_or(DEFAULT_TEMPLATE);
     validate_template(template)?;
-    match ready(backends) {
-        Ok(()) => Ok(Selection {
-            template: Some(template.to_owned()),
-            warning: None,
-        }),
-        Err(error) if required => Err(error),
-        Err(error) => Ok(Selection {
-            template: None,
-            warning: Some(format!(
-                "{error:#}; teams run on the host, unsandboxed ([sandbox] enabled = false silences this)"
-            )),
-        }),
-    }
+    ready(backends)?;
+    Ok(Some(template.to_owned()))
 }
 
 /// Services whose key, in sbx's store and approved for kits, lets a backend
@@ -569,20 +547,21 @@ mod tests {
         assert!(services("jev").is_err());
     }
     #[test]
-    fn disabled_sandboxes_skip_selection() {
-        let host = Selection {
-            template: None,
-            warning: None,
-        };
+    fn sandboxes_are_opt_in() {
         let off = Config {
             enabled: Some(false),
             ..Config::default()
         };
-        assert_eq!(select(None, false, &off, &["claude"]).unwrap(), host);
         assert_eq!(
-            select(None, true, &Config::default(), &["claude"]).unwrap(),
-            host
+            select(None, false, &Config::default(), &["claude"]).unwrap(),
+            None
         );
+        assert_eq!(select(None, false, &off, &["claude"]).unwrap(), None);
+        let on = Config {
+            enabled: Some(true),
+            ..Config::default()
+        };
+        assert_eq!(select(None, true, &on, &["claude"]).unwrap(), None);
         assert!(validate_template("/nonexistent/kit").is_err());
         assert!(validate_template(DEFAULT_TEMPLATE).is_ok());
     }

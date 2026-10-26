@@ -1,12 +1,8 @@
 # Team Docker Sandboxes
 
-Each topology team instance runs in its own Docker Sandboxes (`sbx`) microVM.
-**On by default** when the host is ready; otherwise teams run on the host and
-`omar run` prints why:
-
-```
-warning: Docker Sandboxes Authentication: not signed in Run sbx login; teams run on the host, unsandboxed ([sandbox] enabled = false silences this)
-```
+Opt-in: each topology team instance runs in its own Docker Sandboxes (`sbx`)
+microVM. Off by default; teams run on the host. Once opted in, sandboxes are
+required: a run whose host is not ready fails instead of running on the host.
 
 Docker Engine containers are not a fallback. The EA/control runtime stays on
 the host.
@@ -15,12 +11,12 @@ the host.
 
 | Setting | Effect |
 |---|---|
-| nothing | OMAR's published kit if ready, else host + warning |
-| `omar run --sandbox-template REF` | required: run fails if not ready |
-| `omar run --no-sandbox` | host, no warning |
-| `[sandbox] template = "REF"` in `~/.omar/config.toml` | required, as the flag |
-| `[sandbox] enabled = true` | default kit, required |
-| `[sandbox] enabled = false` | host, no warning |
+| nothing | host |
+| `omar run --sandbox-template REF` | sandboxes from `REF` |
+| `omar run --no-sandbox` | host, overriding the config |
+| `[sandbox] template = "REF"` in `~/.omar/config.toml` | as the flag |
+| `[sandbox] enabled = true` | OMAR's published kit |
+| `[sandbox] enabled = false` | host |
 
 `REF` is a kit image pinned by digest (`IMAGE@sha256:...`) or a local kit
 directory (built by sbx on first use). Config is copied into a session when it is created.
@@ -99,7 +95,7 @@ start fresh conversations and are told so.
 
 ## Tests
 
-- `tests/ci/team_sandboxes.py`: fake sbx; default kit, host fallback warning,
+- `tests/ci/team_sandboxes.py`: fake sbx; opt-in, default kit under `enabled = true`,
   required template, opt-out, worker install, lifecycle. Also run inside the
   kit image. Not VM isolation.
 - `tests/ci/team_sandboxes_real.py`: real VMs from this checkout's kit; file

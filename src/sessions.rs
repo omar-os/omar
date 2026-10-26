@@ -95,11 +95,11 @@ pub struct StartOptions {
     #[arg(long)]
     pub keep_workspaces: bool,
     /// Docker Sandbox kit pinned by digest, or a local kit directory (one
-    /// sandbox per team instance); defaults to `[sandbox].template`, else
-    /// OMAR's published kit. Naming one makes sandboxes required.
+    /// sandbox per team instance); defaults to `[sandbox].template`, or OMAR's
+    /// published kit under `[sandbox] enabled = true`.
     #[arg(long)]
     pub sandbox_template: Option<String>,
-    /// Run the teams on the host, unsandboxed.
+    /// Run the teams on the host even where the config enables sandboxes.
     #[arg(long, conflicts_with = "sandbox_template")]
     pub no_sandbox: bool,
 }
@@ -1591,7 +1591,6 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             }).transpose()?;
             let body=json!({"program":program,"filename":filename,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces,"sandbox_template":template,"no_sandbox":options.no_sandbox});
             let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
-            if let Some(warning) = run["warning"].as_str() { eprintln!("warning: {warning}"); }
             if owned { run["session"] = json!(s.name); }
             // One structured result: the admission record, or with --fg the terminal record.
             if !options.fg { return print_value(run); }

@@ -90,9 +90,6 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         for args in [("--help",), ("ea", "--help"), ("workspace", "--help"), ("ea", "event", "schedule", "--help")]:
             cli(*args)
         assert not Path(env["OMAR_HOME"]).exists(), "help wrote runtime state"
-        # Host execution under test; sandboxes have their own suite.
-        Path(env["OMAR_HOME"]).mkdir()
-        (Path(env["OMAR_HOME"]) / "config.toml").write_text("[sandbox]\nenabled = false\n")
         cli("runs", ok=False)
         bare = subprocess.run([str(BIN)], cwd=root, env=env, text=True, capture_output=True)
         assert bare.returncode != 0 and "Usage:" in bare.stdout + bare.stderr, "bare omar must print the command list"

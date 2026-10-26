@@ -158,7 +158,7 @@ struct StartRunRequest {
     /// otherwise.
     #[serde(default)]
     sandbox_template: Option<String>,
-    /// Run the teams on the host even where sandboxes are the default.
+    /// Run the teams on the host even where the config enables sandboxes.
     #[serde(default)]
     no_sandbox: bool,
 }
@@ -2436,17 +2436,15 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         }
     }
     let backends: Vec<&str> = state.agents.values().map(|a| a.backend.as_str()).collect();
-    let mut sandbox = match crate::sandbox::select(
+    request.sandbox_template = match crate::sandbox::select(
         request.sandbox_template.as_deref(),
         request.no_sandbox,
         &context.sandbox,
         &backends,
     ) {
-        Ok(sandbox) => sandbox,
+        Ok(template) => template,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
-    // From here the request names where its teams run.
-    request.sandbox_template = sandbox.template.take();
 
     // The verified bytecode beside the source: a later timeline projection
     // or resume reads it back without a compiler.
@@ -2497,11 +2495,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
                 if record.status == RunStatus::Starting {
                     record.status = RunStatus::Running;
                 }
-                let mut value = json!(record);
-                if let Some(warning) = sandbox.warning {
-                    value["warning"] = json!(warning);
-                }
-                return (201, value);
+                return (201, json!(record));
             }
             (500, json!({"error": "run vanished"}))
         }
