@@ -23,7 +23,7 @@ on:
         default: ""
 
 concurrency:
-  group: live-topology-${{ github.event_name == 'schedule' && 'nightly' || github.event.pull_request.number || github.ref }}
+  group: live-topology-${{ github.event_name == 'schedule' && 'nightly' || github.event.pull_request.number || github.ref }}-${{ inputs.backend }}
   cancel-in-progress: true
 
 permissions:
