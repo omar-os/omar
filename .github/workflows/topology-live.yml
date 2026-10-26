@@ -1,8 +1,9 @@
 name: Live Topology
 
 # Every registered topology program, run end to end with live agents on the
-# maintainer's self-hosted runner (label `omar-live`). Nightly instead, a core
-# subset with every agent on each other backend. That machine is logged in to
+# maintainer's self-hosted runner (label `omar-live`). Nightly, and on PRs that
+# change that backend's code, a core subset with every agent on each other
+# backend. That machine is logged in to
 # every agent CLI and holds TYPESAFE_API_KEY in the runner's .env, so no keys
 # pass through GitHub. Setup: .github/scripts/setup-live-runner.sh.
 on:
@@ -28,13 +29,46 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
+  plan:
+    name: Plan backends
+    runs-on: ubuntu-latest
+    outputs:
+      backends: ${{ steps.plan.outputs.backends }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          BACKEND: ${{ inputs.backend }}
+        run: |
+          # Blank: each program on the backends it names. agy is off until
+          # the runner has a paid Antigravity plan.
+          case "$EVENT" in
+            schedule) backends='["cursor","opencode","pi"]' ;;
+            workflow_dispatch) backends=$(jq -cn --arg b "$BACKEND" '[$b]') ;;
+            pull_request)
+              files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" -q '.[].filename')
+              # A backend's own code, or the harness itself.
+              harness='^(tests/topology/run_local\.sh|\.github/workflows/topology-live\.yml)$'
+              extra=()
+              grep -qE "^src/(backend/cursor\.rs|backend_runner\.rs)$|$harness" <<<"$files" && extra+=(cursor)
+              grep -qE "^src/backend/opencode(\.rs|/)|$harness" <<<"$files" && extra+=(opencode)
+              grep -qE "^src/backend/pi(\.rs|/)|$harness" <<<"$files" && extra+=(pi)
+              backends=$(jq -cn '$ARGS.positional' --args "" "${extra[@]}") ;;
+            *) backends='[""]' ;;
+          esac
+          echo "backends=$backends" | tee -a "$GITHUB_OUTPUT"
+
   live-topology:
     name: Live Topology (${{ matrix.backend || 'self-hosted' }})
     # The runner holds personal agent logins: fork PRs never reach it. The
     # repo also requires approval before any outside contributor's workflow
     # runs, since a fork could edit this condition away.
+    needs: plan
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -43,9 +77,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Blank: each program on the backends it names. agy is off until
-        # the runner has a paid Antigravity plan.
-        backend: ${{ fromJSON(github.event_name == 'schedule' && '["cursor","opencode","pi"]' || format('["{0}"]', inputs.backend)) }}
+        backend: ${{ fromJSON(needs.plan.outputs.backends) }}
     env:
       CARGO_TERM_COLOR: always
       DISABLE_AUTOUPDATER: "1"
