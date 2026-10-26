@@ -40,6 +40,8 @@ export async function startFakeServe({
   port = 0,
   /** Which captured topology to replay; see tests/fixtures. */
   snapshot: snapshotFile = "diagram-snapshot.v1.json",
+  /** Display metadata for exercising new snapshots beside the legacy fixture. */
+  taskMetadata = /** @type {Array<{title: string, description: string}>} */ ([]),
   /** The geometry a terminal announces, as the daemon reports the agent's. */
   terminal: terminalSize = { cols: 96, rows: 28 },
   terminalReflow = false,
@@ -49,6 +51,7 @@ export async function startFakeServe({
   const golden = JSON.parse(
     await readFile(new URL(`./fixtures/${snapshotFile}`, import.meta.url), "utf8"),
   );
+  golden.reactions.forEach((reaction, index) => Object.assign(reaction, taskMetadata[index] ?? {}));
 
   /** @type {Map<string, {record: object, snapshot: object, subscribers: Set<import("node:http").ServerResponse>, sequence: number}>} */
   const runs = new Map();

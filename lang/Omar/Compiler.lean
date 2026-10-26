@@ -258,6 +258,9 @@ structure Reaction where
   effects : Array String
   contract : String
   prompt : String
+  /-- Display metadata, separate from the execution identity and prompt. -/
+  title : Option String := none
+  description : Option String := none
   /-- A Rust body, when the reaction is code rather than a prompt. The two are
       exclusive: whichever the source gave, the other is empty. -/
   body : Option String := none
@@ -524,7 +527,24 @@ private partial def takeContract (acc : List Token) : List Token -> Except Strin
   | tokens@(Token.text _ :: _) => pure (acc.reverse, tokens)
   | tokens@(Token.code _ :: _) => pure (acc.reverse, tokens)
   | tokens@(Token.word "within" :: _) => pure (acc.reverse, tokens)
+  | tokens@(Token.word "display" :: Token.sym "(" :: _) => pure (acc.reverse, tokens)
   | token :: rest => takeContract (token :: acc) rest
+
+/-- Optional task copy. Older source remains valid; new assistant proposals
+    require it on every reaction before they can be published. -/
+private def taskMetadata : Parser (Option String × Option String)
+  | Token.word "display" :: Token.sym "(" :: Token.text title :: Token.sym "," ::
+      Token.text description :: Token.sym ")" :: rest => do
+      let title := title.trimAscii.toString
+      let description := description.trimAscii.toString
+      if title.isEmpty || title.length > 80 then
+        throw "task title must contain 1–80 characters"
+      if description.isEmpty || description.length > 1200 then
+        throw "task description must contain 1–1200 characters"
+      pure ((some title, some description), rest)
+  | Token.word "display" :: Token.sym "(" :: _ =>
+      throw "expected display(\"Short action title\", \"What this step does and produces.\")"
+  | tokens => pure ((none, none), tokens)
 
 /-- `port`, or `instance.port` written as one dotted name. -/
 private def qualifiedTail (head : String) : Parser String
@@ -651,6 +671,7 @@ private partial def parseDeclarations
             let (_, tail) ← expectSym ")" tail
             pure (some value, tail)
         | _ => pure (none, rest)
+      let ((title, description), rest) ← taskMetadata rest
       let (prompt, rest) ← match rest with
         | Token.text prompt :: tail => pure (prompt, tail)
         | _ => throw "expected the task's prompt string after the production contract"
@@ -658,7 +679,7 @@ private partial def parseDeclarations
       let contract := String.intercalate " " (contractTokens.map tokenSource)
       let reaction := {
         id := s!"reaction.{reactionIndex}"
-        agent, triggers, effects, contract, prompt, within
+        agent, triggers, effects, contract, prompt, within, title, description
       }
       parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
   -- `task` asks an agent, `reaction` just runs, so a reaction names none.
@@ -676,6 +697,7 @@ private partial def parseDeclarations
             let (_, tail) ← expectSym ")" tail
             pure (some value, tail)
         | _ => pure (none, rest)
+      let ((title, description), rest) ← taskMetadata rest
       let (body, rest) ← match rest with
         | Token.code body :: tail => pure (body, tail)
         | _ => throw "expected code block after production contract"
@@ -683,7 +705,8 @@ private partial def parseDeclarations
       let contract := String.intercalate " " (contractTokens.map tokenSource)
       let reaction := {
         id := s!"reaction.{reactionIndex}"
-        agent := "", triggers, effects, contract, prompt := "", body := some body, within
+        agent := "", triggers, effects, contract, prompt := "", body := some body, within,
+        title, description
       }
       parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
   | Token.word first :: rest => do
@@ -1134,7 +1157,9 @@ def compile (program : Program) : String :=
       ("effects", jsonStringArray reaction.effects),
       ("contract", toJson reaction.contract),
       ("prompt", toJson reaction.prompt)
-    ] ++ (match reaction.body with
+    ] ++ (match reaction.title, reaction.description with
+      | some title, some description => [("title", toJson title), ("description", toJson description)]
+      | _, _ => []) ++ (match reaction.body with
       | some body => [("body", toJson body)]
       | none => []) ++ match reaction.within with
       | some within => [("within", toJson within)]

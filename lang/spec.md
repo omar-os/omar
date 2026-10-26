@@ -45,9 +45,10 @@ endpoint    = identifier | qualified ;
 qualified   = identifier, ".", identifier ;
 
 task        = "task", identifier, "(", [ triggers ], ")",
-              "->", effects, [ deadline ], string ;
+              "->", effects, [ deadline ], [ display ], string ;
 reaction    = "reaction", "(", [ triggers ], ")", "->", effects,
-              [ deadline ], code-body ;
+              [ deadline ], [ display ], code-body ;
+display     = "display", "(", string, ",", string, ")" ;
 code-body   = "{=", rust, "=}" ;
 deadline    = "within", "(", duration, ")" ;
 delay       = duration | "0" ;
@@ -169,6 +170,15 @@ not accepted in `main`.
 - `task agent(a, b)` declares a task for `agent`, triggered when port `a`
   or port `b` is present. If both are present at the same tag, the task is
   invoked once with both values.
+
+Optional `display("Title", "Description")` provides display copy, not execution
+instructions. It follows the optional deadline and precedes the prompt or code
+body. Both strings must be nonempty after trimming; titles allow up to 80
+characters and descriptions up to 1200. Task strings are literal text. They
+do not affect reaction IDs, ordering, agents, ports, contracts or execution.
+Bytecode and diagram snapshots carry them as `title` and `description`.
+Older source can omit them; Mission Control assistant proposals require them
+on every reaction so newly generated workflows explain their tasks.
 
 The task's prompt is delivered to the agent. `$(name)` interpolates a trigger
 value and may only reference that task's triggers. If a declared trigger is

@@ -2173,7 +2173,12 @@ fn mission_control_envelope(text: &str, selection: &[String]) -> String {
          To offer a workflow, call the MCP tool `omar_propose_design` with a complete \
          OMAR program. Include companion files in `files`, keyed by their relative paths \
          (for example schemas/decision.json), so imported types compile. The entry \
-         source is program.omar. The operator approves and runs it; you do not.\n\n\
+         source is program.omar. The operator approves and runs it; you do not.\n\
+         Every step must include display(\"Short action title\", \"What it does and produces.\") \
+         after its output contract and optional within(...) deadline, before its prompt \
+         string or code body. Use a specific 3–6 word action title and 1–3 plain-language \
+         sentences explaining the work, result, and any manual handoff. Keep technical \
+         IDs and backend names out of titles; preserve the actual execution behavior.\n\
          {selected}{text}"
     )
 }
@@ -2232,6 +2237,9 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
+    if let Err(error) = validate_task_metadata(&state) {
+        return (400, json!({"error": error}));
+    }
     if let Err(error) = context.publish(
         ChatRole::Assistant,
         proposal.summary,
@@ -2246,6 +2254,82 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         return (500, json!({"error": format!("{error:#}")}));
     }
     (202, json!({"status": "proposed"}))
+}
+
+/// Only assistant proposals require task copy. Older source and saved runs
+/// remain loadable, and display metadata never changes execution identity.
+fn validate_task_metadata(state: &VmState) -> std::result::Result<(), String> {
+    let invalid: Vec<_> = state
+        .reactions
+        .iter()
+        .filter_map(|(id, reaction)| {
+            let valid = |value: &Option<String>, max: usize| {
+                value.as_deref().is_some_and(|s| {
+                    let s = s.trim();
+                    !s.is_empty() && s.chars().count() <= max
+                })
+            };
+            (!valid(&reaction.title, 80)
+                || !valid(&reaction.description, 1200)
+                || reaction.title.as_deref().is_some_and(|title| {
+                    let title = title.trim().to_lowercase();
+                    let role_words = [
+                        "agent",
+                        "reviewer",
+                        "review",
+                        "reasoner",
+                        "reasoning",
+                        "worker",
+                        "step",
+                        "task",
+                        "node",
+                        "runner",
+                        "assistant",
+                        "run",
+                        "code",
+                        "the",
+                        "a",
+                        "an",
+                        "jev",
+                        "codex",
+                        "claude",
+                        "claudecode",
+                    ];
+                    title.split_whitespace().count() < 2
+                        || title
+                            .split(|c: char| !c.is_alphanumeric())
+                            .filter(|word| !word.is_empty())
+                            .all(|word| {
+                                role_words.contains(&word) || word.chars().all(|c| c.is_numeric())
+                            })
+                        || title.contains("::")
+                        || title.contains("reaction.")
+                        || title == reaction.agent.to_lowercase()
+                        || [
+                            "review step",
+                            "run agent",
+                            "run task",
+                            "process data",
+                            "short action title",
+                            "task title",
+                        ]
+                        .contains(&title.as_str())
+                })
+                || reaction.description.as_deref().is_some_and(|description| {
+                    description.split_whitespace().count() < 5
+                        || Some(description.trim()) == reaction.title.as_deref().map(str::trim)
+                }))
+            .then_some(id.as_str())
+        })
+        .collect();
+    if invalid.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Every proposed step needs a specific action-and-object title (2 or more words, at most 80 characters) and an explanation of its work and result (5 or more words, at most 1200 characters). Generic role names and placeholders are not task titles. Add display(\"Short action title\", \"What this step does and produces, including any manual handoff.\") after the output contract and optional within(...) deadline, before the prompt string or code body. Missing or invalid task metadata: {}. Preserve existing IDs, prompts, agents and connections.",
+            invalid.join(", ")
+        ))
+    }
 }
 
 fn compile_preview(program: &str, files: &BTreeMap<String, String>) -> Result<VmState> {
@@ -3698,7 +3782,9 @@ mod tests {
             team Review[reviewer : Stub] {
                 input request : string
                 output decision : Decision
-                task reviewer(request) -> decision "Review $(request)"
+                task reviewer(request) -> decision
+                  display("Review the supplied request", "Assess the supplied request and return a review decision.")
+                  "Review $(request)"
             }
             main { review = Review() }
         "#;
@@ -3929,13 +4015,47 @@ mod tests {
     #[ignore = "requires omarc"]
     fn builder_proposals_compile_and_preserve_imported_schema_files() {
         let server = test_server();
-        let program = "type Decision from \"./schemas/decision.json\"\nteam Review[reviewer : Jev] { input request : string output out : Decision task reviewer(request) -> out \"Choose.\" }\nmain SchemaProposal { review = Review() }";
+        let program = "type Decision from \"./schemas/decision.json\"\nteam Review[reviewer : Jev] { input request : string output out : Decision task reviewer(request) -> out display(\"Assess the supplied request\", \"Choose an outcome using the supplied request.\") \"Choose.\" }\nmain SchemaProposal { review = Review() }";
         let files = BTreeMap::from([(
             "schemas/decision.json".to_string(),
             "{\"type\":\"string\",\"enum\":[\"continue\",\"stop\",\"defer\"]}".to_string(),
         )]);
         let token = server.context.agent_token.lock().unwrap().clone();
         let proposal = json!({"token": token, "program": program, "files": files, "inputs":{"review.request":"Complete input"}, "summary":"Schema flow"});
+        let before = server
+            .context
+            .history
+            .lock()
+            .unwrap()
+            .conversation(&server.context.conversation_id)
+            .messages
+            .len();
+        for annotation in [
+            "",
+            "display(\"reviewer\", \"Choose an outcome using the supplied request.\")",
+        ] {
+            let mut invalid = proposal.clone();
+            invalid["program"] = json!(program.replace(
+                "display(\"Assess the supplied request\", \"Choose an outcome using the supplied request.\")", annotation));
+            let (status, error) =
+                agent_proposal(&server.context, &serde_json::to_vec(&invalid).unwrap());
+            assert_eq!(status, 400, "{error}");
+            assert!(error["error"]
+                .as_str()
+                .unwrap()
+                .contains("review.reaction.0"));
+            assert_eq!(
+                server
+                    .context
+                    .history
+                    .lock()
+                    .unwrap()
+                    .conversation(&server.context.conversation_id)
+                    .messages
+                    .len(),
+                before
+            );
+        }
         let (status, response) =
             agent_proposal(&server.context, &serde_json::to_vec(&proposal).unwrap());
         assert_eq!(status, 202, "{response}");
@@ -5174,6 +5294,65 @@ while True:
         }
         // Nothing reached the conversation.
         assert!(request(server.address(), "GET", "/v1/chat", None).contains("\"messages\":[]"));
+    }
+
+    #[test]
+    fn proposed_tasks_require_titles_and_descriptions_for_every_step() {
+        let mut state = sample_state();
+        let reaction: topology::ReactionState = serde_json::from_value(json!({
+            "order": 0, "agent": "worker", "triggers": ["request"],
+            "effects": ["answer"], "contract": "answer", "prompt": "Answer the request"
+        }))
+        .unwrap();
+        state
+            .reactions
+            .insert("reaction.0".into(), reaction.clone());
+        state.reactions.insert("nested.reaction.0".into(), reaction);
+        let error = validate_task_metadata(&state).unwrap_err();
+        assert!(error.contains("reaction.0") && error.contains("nested.reaction.0"));
+        for reaction in state.reactions.values_mut() {
+            reaction.title = Some("Answer the request".into());
+            reaction.description = Some("Read the request and return an answer.".into());
+        }
+        assert!(validate_task_metadata(&state).is_ok());
+        for title in [
+            "reviewer",
+            "agent",
+            "reasoner",
+            "review step",
+            "run task",
+            "short action title",
+            "Reviewer agent",
+            "Agent 1",
+            "Jev reviewer",
+            "Run code",
+        ] {
+            state.reactions.get_mut("nested.reaction.0").unwrap().title = Some(title.into());
+            assert!(
+                validate_task_metadata(&state).is_err(),
+                "accepted generic title {title}"
+            );
+        }
+        state.reactions.get_mut("nested.reaction.0").unwrap().title =
+            Some("Answer the request".into());
+        let reaction = state.reactions.get_mut("nested.reaction.0").unwrap();
+        reaction.description = Some("  \n ".into());
+        assert!(validate_task_metadata(&state)
+            .unwrap_err()
+            .ends_with("Preserve existing IDs, prompts, agents and connections."));
+        state
+            .reactions
+            .get_mut("nested.reaction.0")
+            .unwrap()
+            .description = Some("x".repeat(1201));
+        assert!(validate_task_metadata(&state).is_err());
+        state
+            .reactions
+            .get_mut("nested.reaction.0")
+            .unwrap()
+            .description = Some("Read the request and return an answer.".into());
+        state.reactions.get_mut("nested.reaction.0").unwrap().title = Some("x".repeat(81));
+        assert!(validate_task_metadata(&state).is_err());
     }
 
     #[test]

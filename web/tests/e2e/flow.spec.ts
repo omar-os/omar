@@ -137,16 +137,12 @@ test("the diagram reflects live reaction state from the run", async ({ page }) =
   await expect(reactions).toHaveCount(3);
   await expect(page.locator(".omar-reaction.completed")).toHaveCount(1);
   await expect(page.locator(".omar-reaction.idle")).toHaveCount(2);
-  // Numbered within the team instance, named by the agent alone, summarised
-  // by the prompt in one line that never widens the card.
+  // Legacy snapshots derive readable titles from their actual prompts.
   const first = reactions.first();
   await expect(first.locator(".omar-reaction-index")).toHaveText("01");
-  await expect(first.locator(".omar-reaction-name")).toHaveText("planner");
-  await expect(first.locator(".omar-reaction-description")).toHaveText(/^Draft a release plan.*…$/);
-  await expect(reactions.nth(1).locator(".omar-reaction-description")).toHaveText("Critique the plan: plan");
-  // Reactions are anonymous in OMAR, so the agent is the headline.
-  await expect(page.locator(".omar-reactions")).toContainText("planner");
-  await expect(page.locator(".omar-reactions")).toContainText("reviewer");
+  await expect(first.locator(".omar-reaction-name")).toContainText("Draft a release plan");
+  await expect(first.locator(".omar-reaction-description")).toHaveText(/^Draft a release plan/);
+  await expect(reactions.nth(1).locator(".omar-reaction-name")).toContainText("Critique the plan");
 
   // Effects written during the run mark their action ports as carrying a value.
   await expect(page.locator(".omar-action.filled")).toHaveCount(2);
@@ -236,7 +232,7 @@ test("a web component's panel opens from the diagram, and answers it", async ({
   const web = page.locator(".omar-reaction.web");
   await expect(web).toHaveCount(1, { timeout: 30_000 });
   await expect(page.locator(".omar-reaction")).toHaveCount(3);
-  await expect(web).toContainText("reviewer");
+  await expect(web.locator(".omar-reaction-name")).toContainText("Request human response");
 
   // Double-clicking a reaction opens the agent that runs it; this one has no
   // pane, so what opens is its panel.
@@ -1599,7 +1595,7 @@ test("an edge into a reaction actually reaches it", async ({ page }) => {
   const strays = async () => {
     const found: string[] = [];
     for (const reaction of reactions) {
-      const id = (await reaction.getAttribute("aria-label"))?.replace(/^Inspect /, "");
+      const id = await reaction.getAttribute("data-component");
       const box = (await reaction.boundingBox())!;
       const edges = page.locator(`[data-id$="${id}"]`);
       if ((await edges.count()) === 0) found.push(`${id}: no edge`);
