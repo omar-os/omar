@@ -9,6 +9,9 @@ results_dir=${OMAR_TEST_RESULTS_DIR:-"$repo_root/target/topology-tests"}
 case_timeout=${OMAR_TEST_CASE_TIMEOUT_SECONDS:-3000}
 invocation_timeout=${OMAR_TEST_INVOCATION_TIMEOUT_SECONDS:-300}
 case_filter=${OMAR_TEST_CASE:-}
+# Run the core cases with every agent on this backend instead, e.g. `cursor`.
+backend=${OMAR_TEST_BACKEND:-}
+core_cases=" AllTypes EffectContracts FanOutFanIn OrTriggers SameAgentSerial Timer "
 fixture="$script_dir/README.md"
 omar="$repo_root/target/debug/omar"
 summary="$results_dir/results.tsv"
@@ -90,7 +93,7 @@ if peek_agents:
                 match.group(1)
                 for match in re.finditer(
                     r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*"
-                    r"(?:Codex|Claude|ClaudeCode|OpenCode|Cursor|Agy|Jev)\b",
+                    r"(?:Codex|Claude|ClaudeCode|OpenCode|Cursor|Agy|Pi|Jev)\b",
                     source,
                     re.IGNORECASE,
                 )
@@ -202,8 +205,21 @@ run_case() {
   if [[ -n $case_filter && $name != "$case_filter" ]]; then
     return
   fi
+  if [[ -n $backend && $core_cases != *" $name "* ]]; then
+    return
+  fi
 
   local source="$source_dir/$name.omar"
+  if [[ -n $backend ]]; then
+    # A copy beside the schemas it imports, keeping the program's file name.
+    local dir="$results_dir/src"
+    mkdir -p "$dir"
+    ln -sfn "$source_dir/schemas" "$dir/schemas"
+    ln -sfn "$source_dir/scripts" "$dir/scripts"
+    sed -E "s/:[[:space:]]*(Codex|ClaudeCode|Claude)\b/: $backend/g" \
+      "$source" >"$dir/$name.omar"
+    source="$dir/$name.omar"
+  fi
   local log="$results_dir/$name.log"
   local case_started=$SECONDS
   local case_passed=0
@@ -215,7 +231,7 @@ run_case() {
 
   : >"$log"
 
-  printf '\n[%s] running with local agents\n' "$name"
+  printf '\n[%s] running with %s agents\n' "$name" "${backend:-local}"
   if run_with_timeout "$case_timeout" "$log" "$name" \
     "$omar" run "$source" --fg --replace \
     --timeout-seconds "$invocation_timeout" "$@"; then
@@ -336,6 +352,10 @@ run_case WorldNews WorldNewsEveryTwoMinutes
 # 32 agents across eight sequential stages, on Claude Code. The slowest case.
 run_case Bureau Bureau \
   --input bureau.topic='how cities can cut heat-wave deaths'
+# A Jev review, its uncertain verdicts resolved by a Codex agent. Needs
+# TYPESAFE_API_KEY.
+run_case JevReview JevReview \
+  --input checks.request='Mira Chen, founder of Northstar, welcomed guests to the Spring Summit.'
 # `PortManager` is deliberately absent: its panel is answered by a web client,
 # and nothing here is one. Compiled and backend-checked like every other source.
 

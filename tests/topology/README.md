@@ -111,6 +111,9 @@ The following environment variables adjust local execution:
 - `OMAR_TEST_INVOCATION_TIMEOUT_SECONDS`: timeout for one agent prompt;
   default `300`.
 - `OMAR_TEST_CASE`: run only the named case.
+- `OMAR_TEST_BACKEND`: run only the core cases (AllTypes, EffectContracts,
+  FanOutFanIn, OrTriggers, SameAgentSerial, Timer), every agent on this
+  backend, e.g. `cursor`, `opencode`, `pi`, `agy`.
 - `OMAR_TEST_PEEK_AGENTS`: capture recent tmux output from every live agent once
   per minute; enabled by the CI workflow.
 - `OMAR_TEST_RESULTS_DIR`: directory for logs and metrics.

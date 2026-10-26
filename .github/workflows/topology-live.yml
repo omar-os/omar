@@ -1,9 +1,10 @@
 name: Live Topology
 
 # Every registered topology program, run end to end with live agents on the
-# maintainer's self-hosted runner (label `omar-live`). That machine is logged
-# in to Claude Code and Codex, so no API keys pass through GitHub. Setup:
-# .github/scripts/setup-live-runner.sh.
+# maintainer's self-hosted runner (label `omar-live`), then a core subset with
+# every agent on each other backend. That machine is logged in to every agent
+# CLI and holds TYPESAFE_API_KEY in the runner's .env, so no keys pass through
+# GitHub. Setup: .github/scripts/setup-live-runner.sh.
 on:
   pull_request:
   push:
@@ -24,7 +25,7 @@ permissions:
 
 jobs:
   live-topology:
-    name: Live Topology (self-hosted)
+    name: Live Topology (${{ matrix.backend || 'self-hosted' }})
     # The runner holds personal agent logins: fork PRs never reach it. The
     # repo also requires approval before any outside contributor's workflow
     # runs, since a fork could edit this condition away.
@@ -33,11 +34,18 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, omar-live]
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        # Blank: each program on the backends it names. agy is left out
+        # until the runner's Antigravity quota resets (429 since 2026-10-26).
+        backend: ["", cursor, opencode, pi]
     env:
       CARGO_TERM_COLOR: always
       DISABLE_AUTOUPDATER: "1"
       OMAR_TEST_PEEK_AGENTS: "1"
       OMAR_TEST_CASE: ${{ inputs.case }}
+      OMAR_TEST_BACKEND: ${{ matrix.backend }}
 
     steps:
       - name: Check out source
@@ -52,7 +60,12 @@ jobs:
         run: |
           git clean -ffdx -e target -e lang/.lake
           # Agent CLIs, Rust and Lean are installed per user on this machine.
-          printf '%s\n' "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.elan/bin" >>"$GITHUB_PATH"
+          printf '%s\n' "$HOME/.local/bin" "$HOME/.opencode/bin" "$HOME/.cargo/bin" "$HOME/.elan/bin" >>"$GITHUB_PATH"
+          # OMAR launches `cursor agent`; the standalone CLI is `cursor-agent`.
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\n[ "$1" = agent ] && shift\nexec cursor-agent "$@"\n' >"$RUNNER_TEMP/bin/cursor"
+          chmod +x "$RUNNER_TEMP/bin/cursor"
+          command -v cursor >/dev/null || echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
           # Own tmux server and OMAR home, so runs never touch the
           # maintainer's interactive sessions.
           mkdir -m 700 -p "$RUNNER_TEMP/tmux"
@@ -64,10 +77,18 @@ jobs:
 
       - name: Verify live agent CLIs
         run: |
-          claude --version
-          codex --version
-          codex login status
-          claude auth status >/dev/null
+          case "$OMAR_TEST_BACKEND" in
+            "")
+              claude --version
+              codex --version
+              codex login status
+              claude auth status >/dev/null
+              test -n "${TYPESAFE_API_KEY:-}" || { echo "TYPESAFE_API_KEY not set" >&2; exit 1; } ;;
+            cursor) cursor-agent --version; cursor-agent status ;;
+            opencode) opencode --version; opencode auth list ;;
+            pi) pi --version ;;
+            agy) agy --version ;;
+          esac
 
       - name: Run live topology suite
         run: env -u TMUX -u TMUX_PANE ./tests/topology/run_local.sh
@@ -76,7 +97,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: live-topology-${{ github.run_id }}
+          name: live-topology-${{ matrix.backend || 'default' }}-${{ github.run_id }}
           path: ${{ env.OMAR_TEST_RESULTS_DIR }}
           if-no-files-found: warn
           retention-days: 14
