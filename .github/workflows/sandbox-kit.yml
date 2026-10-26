@@ -1,6 +1,6 @@
 name: Sandbox Kit
 
-# Publishes sandbox/omar-sandbox to docker.io/omar-os/omar-sandbox (sbx only
+# Publishes sandbox/omar-sandbox to docker.io/lsk567/omar-sandbox (sbx only
 # trusts docker.io/ kits by default). Runs pin it by digest: copy the digest
 # this prints into sandbox::DEFAULT_TEMPLATE. Pushes come only from this
 # repository's branches; secrets DOCKERHUB_USERNAME/DOCKERHUB_TOKEN.
@@ -27,7 +27,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Build and push (amd64, arm64)
         run: |
-          image=docker.io/omar-os/omar-sandbox
+          image=docker.io/lsk567/omar-sandbox
           tags="-t $image:sha-${GITHUB_SHA::12}"
           [ "$GITHUB_REF" = refs/heads/main ] && tags="$tags -t $image:latest"
           docker buildx build --platform linux/amd64,linux/arm64 --push $tags \

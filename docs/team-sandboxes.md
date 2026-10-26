@@ -58,7 +58,7 @@ bindings:
 
 ## The kit
 
-`sandbox/omar-sandbox/` (published as `docker.io/omar-os/omar-sandbox`, pinned
+`sandbox/omar-sandbox/` (published as `docker.io/lsk567/omar-sandbox`, pinned
 in `sandbox::DEFAULT_TEMPLATE`): every backend CLI, Rust, tmux. Network: only
 model API hosts, plus whatever the global policy allows; under deny-all
 nothing else. Keys are injected by the sbx proxy, never enter the VM. 2 CPUs,

@@ -14,7 +14,7 @@ pub const PROTOCOL: u32 = 1;
 
 /// The published OMAR kit (`sandbox/omar-sandbox`), used by `enabled = true`
 /// unless a run or `[sandbox].template` names another.
-pub const DEFAULT_TEMPLATE: &str = "docker.io/omar-os/omar-sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+pub const DEFAULT_TEMPLATE: &str = "docker.io/lsk567/omar-sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
