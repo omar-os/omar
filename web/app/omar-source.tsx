@@ -71,7 +71,7 @@ export function OmarEditor({
           value={name}
           spellCheck={false}
           aria-label="Program file name"
-          onChange={(event) => setEdited(event.target.value)}
+          onChange={(event) => { setEdited(event.target.value); onFilenameChange(event.target.value); }}
           onBlur={commit}
           onKeyDown={(event) => {
             if (event.key === "Enter") {

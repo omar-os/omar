@@ -2705,3 +2705,6 @@ h2 {
 .artifact-tabs [role="tab"]:hover { color: var(--text, #eee); }
 .artifact-tabs [role="tab"]:focus-visible { outline: 2px solid var(--accent, #8b5cf6); outline-offset: 3px; }
 .workflow-editor-controls { align-items: center; }
+
+.workflow-save { font-size: .75rem; color: var(--muted); padding: 6px 12px; overflow-wrap: anywhere; }
+.workflow-save button { margin-left: 8px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 4px 8px; }

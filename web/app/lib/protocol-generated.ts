@@ -132,11 +132,23 @@ progress: boolean, design: ProposedDesign | null,
  */
 selection: Array<string>, };
 
-export type Conversation = { id: string, title: string, ea_id: number | null, created_at: number, updated_at: number, messages: Array<ChatMessage>, };
+export type WorkflowDraft = { design: ProposedDesign, filename: string,
+/**
+ * A later assistant proposal supersedes an older edited draft.
+ */
+proposal_sequence: number, };
 
-export type ConversationSummary = { id: string, title: string, created_at: number, updated_at: number, message_count: number, ea_id: number | null, busy: boolean, run: RunRecord | null, };
+export type WorkflowState = { revision: number, name: string | null, draft: WorkflowDraft | null, };
 
-export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number, finished_at: number | null, error: string | null,
+export type Conversation = { id: string, title: string, ea_id: number | null, created_at: number, updated_at: number, messages: Array<ChatMessage>, workspace: WorkflowState, };
+
+export type ConversationSummary = { id: string, title: string, created_at: number, updated_at: number, message_count: number, ea_id: number | null, workflow_name: string | null, busy: boolean, run: RunRecord | null, };
+
+export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number,
+/**
+ * Last meaningful run activity, in milliseconds like chat timestamps.
+ */
+activity_at: number, finished_at: number | null, error: string | null,
 /**
  * Input ports the run was admitted with, so its timeline can be
  * projected again later from the same starting point.
