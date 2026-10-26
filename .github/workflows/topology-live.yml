@@ -1,23 +1,29 @@
 name: Live Topology
 
 # Every registered topology program, run end to end with live agents on the
-# maintainer's self-hosted runner (label `omar-live`), then a core subset with
-# every agent on each other backend. That machine is logged in to every agent
-# CLI and holds TYPESAFE_API_KEY in the runner's .env, so no keys pass through
-# GitHub. Setup: .github/scripts/setup-live-runner.sh.
+# maintainer's self-hosted runner (label `omar-live`). Nightly instead, a core
+# subset with every agent on each other backend. That machine is logged in to
+# every agent CLI and holds TYPESAFE_API_KEY in the runner's .env, so no keys
+# pass through GitHub. Setup: .github/scripts/setup-live-runner.sh.
 on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: "0 9 * * *"
   workflow_dispatch:
     inputs:
       case:
         description: Run one case by name (blank runs them all)
         required: false
         default: ""
+      backend:
+        description: Run the core subset on this backend (blank runs the suite as written)
+        required: false
+        default: ""
 
 concurrency:
-  group: live-topology-${{ github.event.pull_request.number || github.ref }}
+  group: live-topology-${{ github.event_name == 'schedule' && 'nightly' || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -37,9 +43,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Blank: each program on the backends it names. agy is left out
-        # until the runner's Antigravity quota resets (429 since 2026-10-26).
-        backend: ["", cursor, opencode, pi]
+        # Blank: each program on the backends it names. agy is off until
+        # the runner has a paid Antigravity plan.
+        backend: ${{ fromJSON(github.event_name == 'schedule' && '["cursor","opencode","pi"]' || format('["{0}"]', inputs.backend)) }}
     env:
       CARGO_TERM_COLOR: always
       DISABLE_AUTOUPDATER: "1"
