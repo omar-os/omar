@@ -43,11 +43,16 @@ pub struct UpOptions {
     pub name: Option<String>,
     #[arg(long)]
     pub workdir: Option<PathBuf>,
-    #[arg(long, default_value = "127.0.0.1:0")]
-    pub address: SocketAddr,
-    /// Also serve a read-only Mission Control here, e.g. 0.0.0.0:8080. No
-    /// credential: anyone who reaches it can watch, nobody can steer
+    /// Port for Mission Control, on 127.0.0.1 only: reach it from elsewhere
+    /// through an SSH tunnel. Default: a free port. Kept across restarts
     #[arg(long)]
+    pub port: Option<u16>,
+    /// Also serve a read-only Mission Control, with no credential. The IP
+    /// picks who can watch:
+    ///   127.0.0.1:8080  this machine only (SSH tunnel)
+    ///   10.0.1.5:8080   one of this machine's IPs: whoever can reach it
+    ///   0.0.0.0:8080    every interface: whoever the firewall lets in
+    #[arg(long, verbatim_doc_comment)]
     pub view_address: Option<SocketAddr>,
     #[arg(long)]
     pub no_ea: bool,
@@ -65,7 +70,7 @@ impl Default for UpOptions {
         Self {
             name: None,
             workdir: None,
-            address: "127.0.0.1:0".parse().unwrap(),
+            port: None,
             view_address: None,
             no_ea: false,
             startup_timeout: 60,
@@ -606,16 +611,16 @@ fn pin_executable(source: &Path, dest: &Path) -> Result<String> {
     std::io::copy(&mut File::open(dest)?, &mut hash)?;
     Ok(format!("{:x}", hash.finalize()))
 }
+/// Session APIs bind only to loopback.
+fn loopback(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
 /// Start a session. Returns the stopped record it replaced when `--name`
 /// restarted an existing session, so the caller can say what changed.
 fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, Option<Session>)> {
     anyhow::ensure!(
         cli.session.is_none(),
         "up creates a new session; --session selects an existing one"
-    );
-    anyhow::ensure!(
-        options.address.ip().is_loopback(),
-        "session APIs bind only to loopback"
     );
     anyhow::ensure!(
         cli.ea.is_none(),
@@ -641,13 +646,11 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
                 drop(_lock);
                 let source = fs::canonicalize(std::env::current_exe()?)?;
                 let compiler = executable_on_path(crate::topology::resolve_omarc()).ok();
-                let address =
-                    (options.address != UpOptions::default().address).then_some(options.address);
                 return relaunch(
                     stopped,
                     Some(&source),
                     compiler.as_deref(),
-                    address,
+                    options.port.map(loopback),
                     options.view_address,
                     options.startup_timeout,
                 )
@@ -728,7 +731,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
         &directory.join("launch.json"),
         &Launch {
             session: session.clone(),
-            address: options.address,
+            address: loopback(options.port.unwrap_or(0)),
             view_address: options.view_address,
             no_ea: options.no_ea,
             json: foreground && cli.json,
@@ -1524,10 +1527,10 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         return Some(attach_dashboard().await);
     }
     let result = match &cli.command {
-        Some(Commands::Serve { name, address, no_ea, ui }) => {
+        Some(Commands::Serve { name, port, no_ea, ui }) => {
             // The runtime serves Mission Control whenever the build has it; `--ui` insists on it.
             if *ui && !crate::web_assets::is_bundled() { return Some(Err(anyhow::anyhow!("{}", crate::web_assets::MISSING))); }
-            launch(cli, UpOptions { name: name.clone(), address: address.unwrap_or_else(|| UpOptions::default().address), no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
+            launch(cli, UpOptions { name: name.clone(), port: *port, no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
         },
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
         None => Err(anyhow::anyhow!("a command is required; see omar --help")),

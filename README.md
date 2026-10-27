@@ -111,8 +111,8 @@ This example requires both Claude Code and Codex to be installed and configured.
 | Command | What it does |
 |---------|--------------|
 | `omar up --name dev` | Start a background session, or restart the stopped session named `dev`. |
-| `omar up --address 127.0.0.1:34223` | Pick the session's port (loopback only; reach it remotely through an SSH tunnel). Kept across restarts. |
-| `omar up --view-address 0.0.0.0:8080` | Also serve a read-only Mission Control: conversations, live diagram, terminals; no writes. No credential, so expose it only where anyone may watch. |
+| `omar up --port 34223` | Pick the session's port. Always on 127.0.0.1; reach it remotely through an SSH tunnel. Kept across restarts. |
+| `omar up --view-address 0.0.0.0:8080` | Also serve a read-only Mission Control: conversations, live diagram, terminals; no writes, no credential. IP picks who can watch: `127.0.0.1` this machine, one of its IPs (e.g. `10.0.1.5`) whoever reaches that IP, `0.0.0.0` every interface. |
 | `omar attach -s dev --web` | Open Mission Control for that session. Use `--tui` for the terminal UI. |
 | `omar down -s dev` | Stop the session and keep its state. |
 | `omar rm -s dev` | Remove the session and its state, stopping it first if running. |

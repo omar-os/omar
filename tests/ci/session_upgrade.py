@@ -308,8 +308,8 @@ def main():
             #    start that works brings them back.
             text = omar("gamma", "down")
             assert "2 paused workflow(s) kept" in text, text
-            taken = ls()["alpha"]["url"].removeprefix("http://")
-            failed = up("gamma", "--address", taken, check=False)
+            taken = ls()["alpha"]["url"].rsplit(":", 1)[1]
+            failed = up("gamma", "--port", taken, check=False)
             assert failed.returncode != 0 and "startup failed" in failed.stderr, failed
             assert ls()["gamma"]["state"] == "failed" and listed_runs("gamma") == {"Ticker": "paused", "Sleeper": "paused"}
             again = up("gamma")

@@ -38,7 +38,7 @@ logical tag, waits at the global tag barrier, and prints the final outputs.
 programs arrive. `omar serve` outlives individual runs and admits them:
 
 ```sh
-omar serve --address 127.0.0.1:7340
+omar serve --port 7340
 ```
 
 ```

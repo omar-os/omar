@@ -114,7 +114,7 @@ async function startRealServe() {
     join(home, ".omar/config.toml"),
     `[dashboard]\nsession_prefix = "${sessionPrefix}"\n`,
   );
-  const child = spawn(OMAR_BIN, ["serve", "--address", "127.0.0.1:0", "--no-ea"], {
+  const child = spawn(OMAR_BIN, ["serve", "--port", "0", "--no-ea"], {
     env: { ...process.env, HOME: home, OMARC_BIN },
     stdio: ["ignore", "pipe", "pipe"],
   });

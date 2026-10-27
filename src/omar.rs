@@ -309,9 +309,9 @@ enum Commands {
         /// Name for a new independent foreground session
         #[arg(long)]
         name: Option<String>,
-        /// Loopback address to bind the admission API
+        /// Port for the admission API, on 127.0.0.1
         #[arg(long)]
-        address: Option<std::net::SocketAddr>,
+        port: Option<u16>,
 
         /// Serve the API without starting an executive assistant. The agent
         /// context is still written, so a test harness can stand in for one.

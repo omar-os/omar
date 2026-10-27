@@ -94,10 +94,15 @@ def main():
             return result
 
         try:
-            session = json.loads(omar("up", "--no-ea", "--name", "shown", "--json",
+            # The session's own port is picked with --port, and always on loopback.
+            assert omar("up", "--no-ea", "--name", "shown", "--address", "0.0.0.0:8080", check=False).returncode != 0
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            session = json.loads(omar("up", "--no-ea", "--name", "shown", "--json", "--port", str(port),
                                       "--view-address", "127.0.0.1:0").stdout)
             full, view = session["url"], session["view_url"]
-            assert full != view, session
+            assert full == f"http://127.0.0.1:{port}" and full != view, session
             assert http("GET", f"{full}/health")[1]["access"] == "full"
             assert http("GET", f"{view}/health")[1]["access"] == "view"
 

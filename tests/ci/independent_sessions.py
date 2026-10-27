@@ -143,8 +143,8 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         # Occupied endpoint fails readiness instead of advertising a dead URL.
         with socket.socket() as occupied:
             occupied.bind(("127.0.0.1", 0)); occupied.listen()
-            error = cli("up", "--name", "conflict", "--no-ea", "--address",
-                        f"127.0.0.1:{occupied.getsockname()[1]}", ok=False)
+            error = cli("up", "--name", "conflict", "--no-ea", "--port",
+                        str(occupied.getsockname()[1]), ok=False)
             assert "startup failed" in error and "runtime.log" in error
         assert info("conflict")["session"]["state"] == "failed"
         # A separately built runtime selects its own sibling compiler, even
