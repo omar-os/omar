@@ -2,6 +2,12 @@
 
 Rules for every contributor, human or agent. Agents also follow [AGENT.md](AGENT.md).
 
+## Design principles
+
+OMAR's philosophy, collected so PRs need less back-and-forth. When a design question comes up, check here first; when a review settles one, add it here.
+
+- **`.omar` source is canonical; bytecode is a cache.** The source is the program of record; bytecode can always be rebuilt from it. So checkpoints keep the source and rollback restores it; editor diffs compare against the source the run executes, never bytecode; operators review `.omar` changes, not instructions.
+
 ## Repository
 
 1. No documentation in the repo: no `docs/` folder, no new Markdown files. Docs drift out of date; user documentation lives on [omar.rs](https://omar.rs), built separately. Exceptions: top-level `README.md`, `lang/spec.md`, `prompts/`, and these contributor files. Explain code in comments, `--help` text and test names, which change with the code. Explain changes in PR descriptions.
