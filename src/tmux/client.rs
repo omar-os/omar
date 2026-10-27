@@ -892,6 +892,8 @@ impl TmuxClient {
             && (error.contains("can't find session")
                 || error.contains("no server running")
                 || error.contains("no sessions")
+                // The last session was just killed and the server is exiting.
+                || error.contains("server exited unexpectedly")
                 || (error.contains("error connecting to")
                     && (error.contains("No such file or directory")
                         || error.contains("Connection refused"))))
@@ -996,6 +998,7 @@ mod tests {
         for (message, ordinary_missing, cleanup_missing) in [
             ("can't find session: example", true, false),
             ("no server running on /tmp/test", true, false),
+            ("server exited unexpectedly", true, false),
             (
                 "error connecting to /tmp/test (No such file or directory)",
                 true,
