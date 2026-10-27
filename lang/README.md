@@ -26,6 +26,8 @@ inspection:
 ```sh
 cd lang
 lake exe omarc ../tests/topology/src/HR.omar /tmp/HR.bytecode.json
+# mutation plan: the diff that turns old into new, as bytecode
+lake exe omarc --diff old.omar new.omar /tmp/diff.json
 ```
 
 The runtime starts topology-scoped agents, delivers enabled prompts at each

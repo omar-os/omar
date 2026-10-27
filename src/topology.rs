@@ -541,31 +541,29 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
         .with_context(|| format!("omarc failed to compile {}", source.display()))
 }
 
-/// The plan that turns `running` into the program staged at `source`. The
-/// compiler computes it (`omarc --mutate-from`), with the plan function its
-/// proofs are about; the runtime checks it before applying anything.
-pub fn compile_mutation(source: &Path, running: &Bytecode) -> Result<Bytecode> {
-    let dir = source.parent().unwrap_or_else(|| Path::new("."));
-    let running_path = dir.join(".running.json");
-    let plan_path = dir.join(".plan.json");
-    fs::write(&running_path, serde_json::to_vec(running)?)
-        .with_context(|| format!("failed to write {}", running_path.display()))?;
+/// The plan that turns the program at `old` into the one at `new`. The
+/// compiler computes it (`omarc --diff`), with the plan function its proofs
+/// are about; the runtime checks it before applying anything.
+pub fn compile_mutation(old: &Path, new: &Path) -> Result<Bytecode> {
+    let plan_path = new
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".plan.json");
     let compiler = resolve_omarc();
     let output = Command::new(&compiler)
         .arg("--local-imports")
-        .arg("--mutate-from")
-        .arg(&running_path)
-        .arg(source)
+        .arg("--diff")
+        .arg(old)
+        .arg(new)
         .arg(&plan_path)
-        .output();
-    let _ = fs::remove_file(&running_path);
-    let output = output.with_context(|| {
-        format!(
-            "failed to invoke OMAR compiler '{}'; install omarc beside omar, \
-             add it to PATH, or set OMARC_BIN",
-            compiler.display()
-        )
-    })?;
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to invoke OMAR compiler '{}'; install omarc beside omar, \
+                 add it to PATH, or set OMARC_BIN",
+                compiler.display()
+            )
+        })?;
     if !output.status.success() {
         let _ = fs::remove_file(&plan_path);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2291,6 +2289,9 @@ struct RunCheckpointer<'a> {
     workspaces: &'a BTreeMap<String, crate::workspace::Workspace>,
     program: Value,
     program_path: Option<String>,
+    /// The program's source, read once at the start so an edit to the file
+    /// after it was compiled does not reach the checkpoints.
+    source: Option<checkpoint::Source>,
     team: String,
     ea_id: u32,
     pace: Pace,
@@ -2385,6 +2386,18 @@ impl<'a> RunCheckpointer<'a> {
             .program_path
             .map(|path| path.to_string_lossy().into_owned())
             .or_else(|| resumed_from.and_then(|m| m.program_path.clone()));
+        let source = match config.program_path {
+            Some(path) if path.extension().is_some_and(|e| e == "omar") => {
+                Some(checkpoint::Source::read(path)?)
+            }
+            _ => match resumed_from {
+                Some(manifest) => store
+                    .source(&manifest.id)?
+                    .map(|path| checkpoint::Source::read(&path))
+                    .transpose()?,
+                None => None,
+            },
+        };
         Ok(Self {
             omar_dir,
             dir: dir.to_path_buf(),
@@ -2393,6 +2406,7 @@ impl<'a> RunCheckpointer<'a> {
             workspaces,
             program: serde_json::to_value(bytecode)?,
             program_path,
+            source,
             team: state.team.clone(),
             ea_id: config.ea_id,
             pace: config.pace,
@@ -2508,7 +2522,8 @@ impl Checkpointer for RunCheckpointer<'_> {
             agents: self.agents.clone(),
             mutation: Vec::new(),
         };
-        self.store.publish(&manifest, state, &self.program)?;
+        self.store
+            .publish(&manifest, state, &self.program, self.source.as_ref())?;
         schedule.sequence += 1;
         schedule.parent = Some(id.clone());
         schedule.next_due = schedule

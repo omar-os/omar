@@ -589,24 +589,16 @@ def testSchemaTypeResolution : IO Unit := do
     | .ok _ => throw (IO.userError "accepted unknown, incompatible, or inline schema type")
   IO.println "schema type resolution tests passed"
 
-/-- The plan `omarc --mutate-from` writes, as one string per instruction. -/
-def mutationPlan (running target : String) : IO (Array String) := do
-  let bytecode ← match compileSource "Relay" running with
-    | .ok bytecode => pure bytecode
-    | .error error => throw (IO.userError s!"running program: {error}")
-  let running ← match Json.parse bytecode with
-    | .ok json => pure json
-    | .error error => throw (IO.userError error)
-  planOf running target
+/-- The plan `omarc --diff` writes, as one string per instruction. -/
+def mutationPlan (old new : String) (newName : String := "Relay") : Except String (Array String) := do
+  let plan ← compileDiffSourcesWithSchemas "Relay" old #[] newName new #[]
+  let instructions ← Json.parse plan >>= (·.getObjValAs? (Array Json) "instructions")
+  pure (instructions.map (·.compress))
 
-where
-  planOf (running : Json) (target : String) : IO (Array String) := do
-    match compileMutationSourceWithSchemas running "Relay" target #[] with
-    | .ok plan =>
-      match Json.parse plan >>= (·.getObjValAs? (Array Json) "instructions") with
-      | .ok instructions => pure (instructions.map (·.compress))
-      | .error error => throw (IO.userError error)
-    | .error error => throw (IO.userError s!"plan: {error}")
+def planOf (old new : String) : IO (Array String) :=
+  match mutationPlan old new with
+  | .ok plan => pure plan
+  | .error error => throw (IO.userError s!"plan: {error}")
 
 def relaySource (second : String) (prompt : String) (extra : String := "") : String :=
   "team Node(idx : int)[agent : Stub] { input token : int output out : int state seen : int = 0 " ++
@@ -616,24 +608,14 @@ def relaySource (second : String) (prompt : String) (extra : String := "") : Str
 def testMutation : IO Unit := do
   let v1 := relaySource "2" "go"
   -- Unchanged: the frame and nothing else.
-  let same ← mutationPlan v1 v1
+  let same ← planOf v1 v1
   assertEqual "unchanged plan" same.size 2
-  -- A runtime writes nulls the compiler leaves out; they change nothing.
-  let running ← match compileSource "Relay" v1 >>= Json.parse with
-    | .ok json => pure json
-    | .error error => throw (IO.userError error)
-  let withNulls := match running.getObjValAs? (Array Json) "instructions" with
-    | .ok instructions => running.setObjVal! "instructions" (Json.arr (instructions.map fun i =>
-        if (i.getObjValAs? String "op").toOption == some "define_port" then i.setObjVal! "delay" Json.null
-        else i))
-    | .error _ => running
-  assertEqual "nulls are absent fields" (← mutationPlan.planOf withNulls v1).size 2
   -- A prompt edited: both reactions updated in place, nothing else.
-  let edited ← mutationPlan v1 (relaySource "2" "go faster")
+  let edited ← planOf v1 (relaySource "2" "go faster")
   assertEqual "edited prompt" (edited.filter (mentions · "update_reaction")).size 2
   assertEqual "edited prompt only" edited.size 4
   -- An argument changed: that instance replaced whole, the other untouched.
-  let replaced ← mutationPlan v1 (relaySource "5" "go")
+  let replaced ← planOf v1 (relaySource "5" "go")
   for expected in ["kill_agent", "remove_instance", "remove_state", "declare_instance",
       "\"name\":\"n2.seen\""] do
     unless replaced.any (mentions · expected) do
@@ -647,7 +629,7 @@ def testMutation : IO Unit := do
   unless lastRemoval < firstDeclare do
     throw (IO.userError s!"a removal follows a declaration: {replaced}")
   -- A connection taken out and a port added.
-  let rewired ← mutationPlan v1
+  let rewired ← planOf v1
     ("team Node(idx : int)[agent : Stub] { input token : int output out : int state seen : int = 0 " ++
      "output echo : int task agent(token) -> out \"go $(idx)\" } " ++
      "main Relay { n1 = Node(1) n2 = Node(2) }")
@@ -655,8 +637,7 @@ def testMutation : IO Unit := do
     unless rewired.any (mentions · expected) do
       throw (IO.userError s!"rewired: {expected} missing from {rewired}")
   -- A renamed main is another program.
-  match running |> fun running => compileMutationSourceWithSchemas running "Other"
-      (v1.replace "main Relay" "main Other") #[] with
+  match mutationPlan v1 (v1.replace "main Relay" "main Other") "Other" with
   | .error error => unless mentions error "keeps the program's main" do
       throw (IO.userError s!"renamed main: {error}")
   | .ok _ => throw (IO.userError "a renamed main was planned as a mutation")

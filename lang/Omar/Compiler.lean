@@ -1236,8 +1236,8 @@ def compileSource (programName : String) (source : String) : Except String Strin
 /-! ## Mutation
 
 A running program changed into another is bytecode too: the diff between the
-two, as instructions. The running program arrives as the bytecode the runtime
-executes, the new one as source, and the plan is what turns one into the other.
+two, as instructions. Both programs arrive as source and are compiled here;
+the plan is what turns the first's bytecode into the second's.
 -/
 
 /-- A declaration's key: what pairs it with its counterpart in the other
@@ -1265,44 +1265,39 @@ private def declarationOwner (instruction : Json) : Option String :=
   | "install_reaction" => some (field "instance")
   | _ => none
 
-/-- A declaration in canonical form: keys sorted, and an absent field the same
-    as a null one, since the runtime writes nulls the compiler leaves out. -/
-private def canonical : Json -> String
-  | .obj fields => (Json.mkObj (fields.toList.filter (fun (_, value) => value != Json.null))).compress
-  | other => other.compress
-
-/-- The plan that turns `running`, a program's bytecode, into `program`.
+/-- The plan that turns program `old` into program `new`.
 
     The plan itself is `Mutation.plan` and its bytecode `Mutation.emit`, both
-    proved correct in `Mutation.lean`; this reads the running program and
-    prints what they produce. Which declarations are replaced outright is the
-    one choice made here: an instance whose team, parent or arguments changed
-    is a different instance under the same name, so it and everything in it
-    is replaced. -/
-def compileMutation (running : Json) (program : Program) : Except String String := do
-  let team ← running.getObjValAs? String "team"
-  if team != program.team then
-    throw s!"a mutation keeps the program's main: the run is '{team}', \
-      the new program is '{program.team}'"
-  let old ← running.getObjValAs? (Array Json) "instructions"
-  let new ← (instructionTexts program).mapM fun text => do
+    proved correct in `Mutation.lean`; this keys both programs' declarations
+    and prints what they produce. Which declarations are replaced outright is
+    the one choice made here: an instance whose team, parent or arguments
+    changed is a different instance under the same name, so it and everything
+    in it is replaced. -/
+def compileDiff (old new : Program) : Except String String := do
+  let team := old.team
+  if team != new.team then
+    throw s!"a mutation keeps the program's main: the old program is '{team}', \
+      the new program is '{new.team}'"
+  let parse (program : Program) := (instructionTexts program).mapM fun text => do
     pure (text, ← Json.parse text)
+  let old := (← parse old).map (·.2)
+  let new ← parse new
   let keyed (instructions : Array Json) : List (Mutation.Key × Json) :=
     instructions.toList.filterMap fun instruction =>
       (declarationKey instruction).map (·, instruction)
   let olds := keyed old
   let news := keyed (new.map (·.2))
   let decls (table : List (Mutation.Key × Json)) : Mutation.Program :=
-    table.map fun (key, instruction) => { key, body := canonical instruction }
+    table.map fun (key, instruction) => { key, body := instruction.compress }
   let oldDecls := decls olds
   let newDecls := decls news
   -- What the proof assumes, and what verified bytecode guarantees.
-  unless (Mutation.keys oldDecls).Nodup do throw "the running program declares something twice"
+  unless (Mutation.keys oldDecls).Nodup do throw "the old program declares something twice"
   unless (Mutation.keys newDecls).Nodup do throw "the new program declares something twice"
   let lookup (table : List (Mutation.Key × Json)) (key : Mutation.Key) :=
     (table.find? (·.1 == key)).map (·.2)
   let differs (key : Mutation.Key) :=
-    (lookup olds key).map canonical != (lookup news key).map canonical
+    (lookup olds key).map (·.compress) != (lookup news key).map (·.compress)
   let replaced : List String := (olds ++ news).filterMap fun (key, instruction) =>
     let inst := (declarationOwner instruction).getD ""
     let both := (lookup olds (.inst, inst)).isSome && (lookup news (.inst, inst)).isSome
@@ -1334,8 +1329,11 @@ def compileMutation (running : Json) (program : Program) : Except String String 
     ((#[instruction "begin_mutation" [("team", toJson team)]] ++ body.toArray).push
       (instruction "commit_plan")))
 
-def compileMutationSourceWithSchemas (running : Json) (programName source : String)
-    (schemas : Array (String × String)) : Except String String := do
-  compileMutation running (← elaborateSourceWithSchemas programName source schemas)
+def compileDiffSourcesWithSchemas
+    (oldName oldSource : String) (oldSchemas : Array (String × String))
+    (newName newSource : String) (newSchemas : Array (String × String)) :
+    Except String String := do
+  let old ← (elaborateSourceWithSchemas oldName oldSource oldSchemas).mapError (s!"old program: {·}")
+  compileDiff old (← elaborateSourceWithSchemas newName newSource newSchemas)
 
 end Omar

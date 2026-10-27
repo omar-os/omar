@@ -497,9 +497,9 @@ different program and is refused.
 
 1. pause: checkpoint at the next tag boundary, agents stopped (a paused run
    skips this);
-2. the compiler diffs the resume point's program (bytecode) against the new
-   source into a mutation plan (§6): `omarc --mutate-from RUNNING.json
-   NEW.omar PLAN.json`;
+2. the compiler diffs the old program's source, kept in the resume point
+   checkpoint, against the new one into a mutation plan (§6):
+   `omarc --diff OLD.omar NEW.omar PLAN.json`;
 3. the runtime checks the plan: applied to the old program it must yield
    exactly the new one, or nothing happens;
 4. execute it on the checkpoint and publish the result as a `mutation`
@@ -581,8 +581,8 @@ Proved in `lang/Omar/Mutation.lean`, for any choice of what is replaced whole:
 - `emit_sound` / `compiled_plan_sound`: the emitted instructions, run by the
   bytecode semantics (`vm`), do what the plan does.
 
-Trusted, not proved: reading the running bytecode and printing the plan as
-JSON, and the Rust VM implementing `vm` (it re-checks each plan).
+Trusted, not proved: parsing each program's own instruction JSON back and
+printing the plan, and the Rust VM implementing `vm` (it re-checks each plan).
 
 JSON instruction fields are emitted in deterministic order with `op` first.
 Port and connection fields are ordered:
@@ -615,7 +615,7 @@ The compiler core is pure:
 parse          : String -> Except ParseError Syntax
 elaborate      : Syntax -> Except TypeError Topology
 compile        : Topology -> Except CompileError Bytecode
-compileMutation: Bytecode -> Topology -> Except CompileError Bytecode
+compileDiff    : Topology -> Topology -> Except CompileError Bytecode
 verifyBytecode : Bytecode -> Except VerifyError VerifiedBytecode
 ```
 

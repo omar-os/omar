@@ -3259,15 +3259,23 @@ fn rollback_run(context: &Arc<Context_>, id: &str, body: &[u8]) -> (u16, Value) 
         Ok(head) => head,
         Err(error) => return (500, json!({"error": format!("{error:#}")})),
     };
-    // A rollback across a mutation goes back to the program it had then.
-    let program = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+    // A rollback across a mutation goes back to the program it had then:
+    // its bytecode, and its source where the checkpoint kept it.
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
         .join("serve")
-        .join(id)
-        .join("program.json");
-    if let Err(error) = store
-        .load(&manifest.id)
-        .and_then(|(_, _, bytecode)| Ok(fs::write(&program, serde_json::to_vec(&bytecode)?)?))
-    {
+        .join(id);
+    let restored = store.load(&manifest.id).and_then(|(_, _, bytecode)| {
+        fs::write(run_dir.join("program.json"), serde_json::to_vec(&bytecode)?)?;
+        if let Some(program) = store.source(&manifest.id)? {
+            let source = crate::checkpoint::Source::read(&program)?;
+            if let Some(old) = staged_program(&run_dir) {
+                fs::remove_file(old)?;
+            }
+            source.write(&run_dir)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = restored {
         return (500, json!({"error": format!("{error:#}")}));
     }
     (
@@ -3361,20 +3369,18 @@ fn mutate_run(context: &Arc<Context_>, id: &str, body: &[u8]) -> (u16, Value) {
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
     // The program the run would continue with: a paused run's resume point
-    // holds it, a running one is executing what was last staged. The
-    // compiler plans the change from it.
+    // holds its source, a running one is executing what was last staged.
+    // The compiler plans the change from it.
     let plan = if status == RunStatus::Paused {
-        crate::mutation::paused_program(&crate::deploy::dir_for(
+        crate::mutation::paused_source(&crate::deploy::dir_for(
             &context.omar_dir,
             context.ea_id,
             &team,
         ))
     } else {
-        fs::read(run_dir.join("program.json"))
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| Ok(serde_json::from_slice::<topology::Bytecode>(&bytes)?))
+        staged_program(&run_dir).context("the run's program is no longer staged")
     }
-    .and_then(|from| topology::compile_mutation(&staged.join(filename), &from));
+    .and_then(|from| topology::compile_mutation(&from, &staged.join(filename)));
     let plan = match plan {
         Ok(plan) => plan,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
@@ -5105,7 +5111,9 @@ while True:
                 agents: BTreeMap::new(),
                 mutation: Vec::new(),
             };
-            store.publish(&manifest, &state, &program).expect("publish");
+            store
+                .publish(&manifest, &state, &program, None)
+                .expect("publish");
             ids.push(manifest.id);
         }
         let response = request(address, "GET", "/v1/runs/run-1/checkpoints", None);

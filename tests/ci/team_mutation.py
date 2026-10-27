@@ -6,9 +6,9 @@ the counter into a keeper it adds. `omar mutate` pauses the run, applies the
 diff to the pause checkpoint, and resumes: the counter carries on from its
 count, the keeper starts receiving, and a `mutation` checkpoint sits on the
 timeline between the pause and the resumed run. Rolling back to the pause
-checkpoint goes back to the old program. A program that renames `main` is
-refused without touching the run, and a paused run takes a mutation and stays
-paused.
+checkpoint goes back to the old program and its source. A program that renames
+`main` is refused without touching the run, and a paused run takes a mutation
+and stays paused.
 
 The real compiler, Rust bodies and the stub backend; no model.
 """
@@ -115,6 +115,12 @@ def main():
             found = next(deployment("checkpoints").glob(f"*-{checkpoint}")) / "program.json"
             return {i["name"] for i in json.loads(found.read_text())["instructions"] if i["op"] == "declare_instance"}
 
+        def kept_source(checkpoint):
+            return next((next(deployment("checkpoints").glob(f"*-{checkpoint}")) / "source").glob("*.omar")).read_text()
+
+        def staged():
+            return next(next(state_root.glob(f"ea/*/serve/{run_id}")).glob("*.omar")).read_text()
+
         def lines(instance, name):
             path = state_root / "workspaces" / record()["workspaces"][instance] / "worktree" / name
             return [int(l) for l in path.read_text().split()] if path.exists() else []
@@ -159,6 +165,8 @@ def main():
             assert manifest(pause_id)["trigger"] == "pause", manifest(pause_id)
             assert {"op": "disconnect_ports", "source": "c.total", "target": "e.inp"} in change["mutation"], change
             assert program(pause_id) == {"c", "e"} and program(mutation_id) == {"c", "e", "k"}
+            # Each checkpoint keeps the source it runs: the next diff's old program.
+            assert kept_source(pause_id) == V1 and kept_source(mutation_id) == V2 and staged() == V2
             # Kept instances keep their files; the new one starts empty.
             assert change["workspaces"]["c"] == manifest(pause_id)["workspaces"]["c"], change
             assert change["workspaces"]["k"] != manifest(pause_id)["workspaces"].get("k"), change
@@ -191,6 +199,7 @@ def main():
             wait_until(lambda: record()["state"] == "RUNNING" and record().get("resumed_from") == pause_id,
                        "the run rolled back before the mutation")
             assert set(record()["workspaces"]) == {"c", "e"}, record()["workspaces"]
+            assert staged() == V1, "the rollback did not restore the old source"
             # A mutation is diffed against what the run executes now, v1 again.
             again = json.loads(omar("mutate", "Morph", str(v2), "--dry-run").stdout)["changes"]
             assert again == plan, (again, plan)

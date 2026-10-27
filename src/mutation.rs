@@ -3,7 +3,7 @@
 //! A mutation is applied to a paused run. The plan is the diff between the
 //! program the run's resume point holds and the new one, as instructions: the
 //! removals, then the declarations that are new or changed. The compiler
-//! computes it (`omarc --mutate-from`, proved correct in
+//! computes it from the two sources (`omarc --diff`, proved correct in
 //! `lang/Omar/Mutation.lean`); the runtime checks that it turns the one program
 //! into the other before executing anything. Executing it means
 //! carrying the checkpoint over to the new program — events for ports that are
@@ -14,7 +14,7 @@
 //! undoes the mutation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -304,18 +304,23 @@ pub struct Applied {
     pub dropped: Vec<String>,
 }
 
-/// The program a paused team's resume would run.
-pub fn paused_program(runtime_dir: &Path) -> Result<Bytecode> {
+/// The source of the program a paused team's resume would run.
+pub fn paused_source(runtime_dir: &Path) -> Result<PathBuf> {
     let store = checkpoint::Store::new(runtime_dir);
     let point = store
         .resume_point()?
         .context("the run has no checkpoint to mutate")?;
-    let (_, _, program) = store.load(&point.id)?;
-    Ok(serde_json::from_value(program)?)
+    store.source(&point.id)?.with_context(|| {
+        format!(
+            "checkpoint {} has no saved source to diff against; \
+             resume the run and let it checkpoint again",
+            point.id
+        )
+    })
 }
 
 /// Apply `to`, compiled from `source`, to a paused team: have the compiler
-/// plan it against the resume point's program, check the plan, carry the
+/// plan it against the resume point's source, check the plan, carry the
 /// checkpoint over and publish it as the new resume point. Nothing is
 /// published unless every step succeeds. `None` when the programs do not
 /// differ.
@@ -336,7 +341,8 @@ pub fn apply(omar_dir: &Path, ea_id: u32, to: &Bytecode, source: &Path) -> Resul
         .context("the run has no checkpoint to mutate")?;
     let (manifest, mut state, program) = store.load(&point.id)?;
     let from: Bytecode = serde_json::from_value(program)?;
-    let plan = topology::compile_mutation(source, &from)?;
+    let plan = topology::compile_mutation(&paused_source(&runtime_dir)?, source)?;
+    let new_source = checkpoint::Source::read(source)?;
     if changes(&plan).is_empty() {
         return Ok(None);
     }
@@ -385,7 +391,7 @@ pub fn apply(omar_dir: &Path, ea_id: u32, to: &Bytecode, source: &Path) -> Resul
                 .collect(),
             mutation: changes(&plan).to_vec(),
         };
-        store.publish(&new, &state, &serde_json::to_value(to)?)?;
+        store.publish(&new, &state, &serde_json::to_value(to)?, Some(&new_source))?;
         Ok(new.id)
     })();
     match result {
