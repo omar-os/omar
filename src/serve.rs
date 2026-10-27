@@ -2211,7 +2211,7 @@ fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
 /// message is indistinguishable from any other, and the EA answers in the
 /// terminal where nobody is looking. Topology agents get an `OMAR INVOCATION`
 /// envelope for the same reason.
-fn mission_control_envelope(text: &str, selection: &[String]) -> String {
+fn mission_control_envelope(text: &str, selection: &[String], live: Option<&LiveRun>) -> String {
     // Named on their own line so the EA can tell the operator's words from the
     // components they had highlighted while writing them.
     let selected = if selection.is_empty() {
@@ -2236,8 +2236,62 @@ fn mission_control_envelope(text: &str, selection: &[String]) -> String {
          OMAR program. Include companion files in `files`, keyed by their relative paths \
          (for example schemas/decision.json), so imported types compile. The entry \
          source is program.omar. The operator approves and runs it; you do not.\n\n\
-         {selected}{text}"
+         {live}{selected}{text}",
+        live = live.map(ToString::to_string).unwrap_or_default(),
     )
+}
+
+/// The run an operator's message may be about, while it still has a program
+/// to change.
+struct LiveRun {
+    team: String,
+    status: String,
+    program: PathBuf,
+}
+
+impl std::fmt::Display for LiveRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "The workflow `{team}` is {status}; the program it runs is {program}. \
+             To change it, edit that program and propose the complete result with \
+             `omar_propose_design`, keeping `main {team}`. The operator applies it to \
+             the live run, which keeps its state and files.\n\n",
+            team = self.team,
+            status = self.status,
+            program = self.program.display(),
+        )
+    }
+}
+
+/// This chat's run, if it is running or paused.
+fn live_run(context: &Context_) -> Option<LiveRun> {
+    let id = context
+        .chat
+        .lock()
+        .expect("serve chat poisoned")
+        .latest_run
+        .clone()?;
+    let record = context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .get(&id)?
+        .clone();
+    if !matches!(
+        record.status,
+        RunStatus::Starting | RunStatus::Running | RunStatus::Pausing | RunStatus::Paused
+    ) {
+        return None;
+    }
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(&id);
+    Some(LiveRun {
+        team: record.team,
+        status: crate::diagram::wire_name(&record.status).unwrap_or_default(),
+        program: staged_program(&run_dir)?,
+    })
 }
 
 fn deliver_to_ea(context: &Arc<Context_>, text: &str, selection: &[String]) -> Result<()> {
@@ -2249,7 +2303,7 @@ fn deliver_to_ea(context: &Arc<Context_>, text: &str, selection: &[String]) -> R
     );
     client.deliver_prompt(
         &session,
-        &mission_control_envelope(text, selection),
+        &mission_control_envelope(text, selection, live_run(context).as_ref()),
         &DeliveryOptions::default(),
     )?;
     Ok(())
@@ -5626,7 +5680,7 @@ while True:
     #[test]
     fn operator_messages_are_labelled_with_how_to_answer() {
         // Without this the EA answers in its pane, where nobody is looking.
-        let envelope = mission_control_envelope("review the release plan", &[]);
+        let envelope = mission_control_envelope("review the release plan", &[], None);
         assert!(envelope.starts_with("OMAR MISSION CONTROL"));
         assert!(envelope.contains("omar_reply"));
         assert!(envelope.contains("omar_propose_design"));
@@ -5645,6 +5699,7 @@ while True:
         let envelope = mission_control_envelope(
             "give this one a retry",
             &["n1.agent".to_string(), "n1.out".to_string()],
+            None,
         );
 
         assert!(envelope.contains("n1.agent, n1.out"), "{envelope}");
@@ -5658,13 +5713,32 @@ while True:
     }
 
     #[test]
+    fn a_live_run_tells_the_ea_how_to_change_it() {
+        // "Add a keeper" mid-run means this run's program, changed in place.
+        let live = LiveRun {
+            team: "Morph".into(),
+            status: "running".into(),
+            program: PathBuf::from("/state/serve/run-1/Morph.omar"),
+        };
+        let envelope = mission_control_envelope("add a keeper", &[], Some(&live));
+        assert!(envelope.contains("`Morph` is running"), "{envelope}");
+        assert!(
+            envelope.contains("/state/serve/run-1/Morph.omar"),
+            "{envelope}"
+        );
+        assert!(envelope.contains("keeping `main Morph`"), "{envelope}");
+        assert!(envelope.ends_with("add a keeper"), "{envelope}");
+        assert!(!mission_control_envelope("add a keeper", &[], None).contains("Morph"));
+    }
+
+    #[test]
     fn an_empty_selection_adds_nothing_to_the_envelope() {
         // Most messages have no selection; they should read exactly as before.
         assert_eq!(
-            mission_control_envelope("plain question", &[]),
-            mission_control_envelope("plain question", &[]),
+            mission_control_envelope("plain question", &[], None),
+            mission_control_envelope("plain question", &[], None),
         );
-        assert!(!mission_control_envelope("plain question", &[]).contains("selected"));
+        assert!(!mission_control_envelope("plain question", &[], None).contains("selected"));
     }
 
     #[test]

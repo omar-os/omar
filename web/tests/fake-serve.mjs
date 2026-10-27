@@ -540,6 +540,19 @@ export async function startFakeServe({
       Math.max(10, stepMs / 3),
     );
     setTimeout(() => {
+      // Asked while the chat's run is live, it changes that run's program,
+      // as the envelope tells the real EA to: same main, edited in place.
+      const live = latest(chat);
+      if (live && ["running", "paused"].includes(live.record.status)) {
+        const preview = structuredClone(golden);
+        preview.status = "ready";
+        publish("assistant", "Tightened the reviewer's prompt in the running workflow.", {
+          program: `${live.program ?? PROPOSED_PROGRAM}\n// tightened by OMAR\n`,
+          inputs: {},
+          preview,
+        });
+        return;
+      }
       if (!asked) {
         publish(
           "assistant",

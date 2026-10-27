@@ -915,6 +915,43 @@ test("an edited source is applied to the run, and the change marks the timeline"
   await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
 });
 
+test("asked mid-run, the assistant's change is offered as a plan for the live run", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+  const actions = page.getByRole("group", { name: "Run controls" });
+  // Paused, so the fake's short walk cannot end under the test.
+  await actions.getByRole("button", { name: "Pause" }).click();
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+
+  // The proposal is a change to this run, not a new design to deploy.
+  const ask = async () => {
+    await page.getByLabel("Describe a workflow").fill("Tighten the reviewer");
+    await page.getByLabel("Draft workflow").click();
+  };
+  await ask();
+  const plan = page.getByLabel("Mutation plan");
+  await expect(plan).toContainText("OMAR proposes these changes to the run");
+  await expect(plan).toContainText("update_reaction review.reaction.0");
+  await expect(page.getByLabel("OMAR program")).toHaveValue(/tightened by OMAR/);
+  await expect(page.getByRole("group", { name: "Deploy design" })).toHaveCount(0);
+
+  // Declined, the source is the running program again.
+  await plan.getByRole("button", { name: "Decline" }).click();
+  await expect(plan).toHaveCount(0);
+  await expect(page.getByLabel("OMAR program")).not.toHaveValue(/tightened by OMAR/);
+
+  // Accepted, it is applied to the run and marks the timeline.
+  await ask();
+  await plan.getByRole("button", { name: "Apply" }).click();
+  await expect(plan).toHaveCount(0);
+  await expect(page.getByText("The change was not applied")).toHaveCount(0);
+  await expect(actions.getByRole("button", { name: "Resume" })).toBeVisible();
+  await page.getByRole("button", { name: /Run timeline/ }).click();
+  await expect(page.getByLabel("Logical timeline").getByRole("button", { name: "Checkpoint #3" })).toHaveClass(/mutation/);
+  await expect(page.getByLabel("OMAR program")).toHaveValue(/tightened by OMAR/);
+});
+
 test("the confirmation chooses what the run keeps and how it checkpoints", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);
