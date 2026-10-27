@@ -24,6 +24,7 @@ mod editor;
 #[cfg(test)]
 mod protocol;
 mod reaction;
+mod sandbox;
 mod scheduler;
 mod serve;
 mod sessions;
@@ -115,6 +116,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(hide = true)]
+    SandboxWorker,
     /// Create a new independent background runtime, or restart a stopped one by name on this build
     Up(sessions::UpOptions),
     /// List independently addressable runtime sessions
@@ -455,6 +458,9 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(mut cli: Cli) -> Result<()> {
+    if matches!(cli.command, Some(Commands::SandboxWorker)) {
+        return topology::sandbox_worker();
+    }
     let internal = if let Some(Commands::SessionExec { args }) = &cli.command {
         let args = args.clone();
         cli = Cli::try_parse_from(std::iter::once("omar".to_string()).chain(args))?;
@@ -639,6 +645,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             Some(path) => mcp::run_server_from_context_file(PathBuf::from(path), bare_tool_names),
             None => mcp::run_server_with_default_context(bare_tool_names),
         },
+        Some(Commands::SandboxWorker) => unreachable!(),
         Some(Commands::Checkpoint { action }) => {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
             checkpoint_command(&omar_dir, target.id, action)
@@ -1203,7 +1210,11 @@ fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> R
     let dir = deployment_dir(omar_dir, ea_id, team)?;
     let mut record = deploy::DeploymentRecord::load(&dir)?
         .ok_or_else(|| anyhow::anyhow!("no deployment '{}'", team))?;
-    let client = record.session_client()?;
+    let client = if record.sandboxes.is_empty() {
+        Some(record.session_client()?)
+    } else {
+        None
+    };
     // A finished deployment's runner is done with it; the pid it recorded may
     // be a runtime that is still serving other work.
     if record.is_active() && record.pid != std::process::id() && record.runner_alive() {
@@ -1215,8 +1226,10 @@ fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> R
     }
     let failures = if record.sessions_cleaned {
         Vec::new()
-    } else {
+    } else if let Some(client) = client {
         deploy::teardown_sessions(&client, &record.sessions, &deploy::logs_dir(&dir))
+    } else {
+        sandbox::stop_all(&record.sandboxes)
     };
     for failure in &failures {
         eprintln!("warning: session not cleaned up: {failure}");

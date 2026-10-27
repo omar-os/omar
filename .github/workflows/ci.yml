@@ -126,6 +126,7 @@ jobs:
           cargo build -p omar
           python3 tests/ci/independent_sessions.py
           python3 tests/ci/team_workspaces.py
+          python3 tests/ci/team_sandboxes.py
           python3 tests/ci/team_checkpoints.py
           python3 tests/ci/session_upgrade.py
           python3 tests/ci/legacy_supervision.py
@@ -135,6 +136,26 @@ jobs:
 
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1
+
+  sandbox-template:
+    name: Sandbox Kit
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The host installs its own binary as each sandbox's worker.
+      - name: Build worker
+        run: cargo build -p omar
+      - name: Build kit image
+        run: docker buildx build --load -f sandbox/omar-sandbox/omar-sandbox.yaml -t omar-sandbox:test sandbox/omar-sandbox
+      - name: Exercise worker in kit image (not microVM isolation)
+        run: |
+          docker run --rm --entrypoint python3 \
+            -e OMAR_BIN=/usr/local/bin/omar \
+            -v "$PWD/target/debug/omar:/usr/local/bin/omar:ro" \
+            -v "$PWD/tests/ci/team_sandboxes.py:/tmp/team_sandboxes.py:ro" \
+            omar-sandbox:test /tmp/team_sandboxes.py
 
   codex-shared-history:
     name: Codex Shared History
