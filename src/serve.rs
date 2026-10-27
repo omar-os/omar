@@ -1477,6 +1477,12 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
                 .trim_end_matches("/snapshot");
             run_snapshot(&context, id)
         }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/program") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/program");
+            run_program(&context, id)
+        }
         ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/workspaces") => {
             let id = rest
                 .trim_start_matches("/v1/runs/")
@@ -3866,6 +3872,38 @@ fn run_snapshot(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     }
 }
 
+/// The source a run executes now: what it was started with, or what a
+/// mutation or a rollback last made it. What an edit is compared against.
+fn run_program(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    if !context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .contains_key(id)
+    {
+        return (404, json!({"error": "unknown run"}));
+    }
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id);
+    let Some(path) = staged_program(&run_dir) else {
+        return (
+            404,
+            json!({"error": "the run's program is no longer staged"}),
+        );
+    };
+    match fs::read_to_string(&path) {
+        Ok(program) => (
+            200,
+            json!({
+                "filename": path.file_name().map(|name| name.to_string_lossy()),
+                "program": program,
+            }),
+        ),
+        Err(error) => (500, json!({"error": format!("{error:#}")})),
+    }
+}
+
 /// What the daemon records once a run's loop returns, however it returned.
 fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::RunOutcome>) {
     // The run is over, so its invocation service is gone with it. Leaving
@@ -5427,6 +5465,44 @@ while True:
             "{response}"
         );
         assert!(request(address, "GET", "/v1/runs/run-1", None).contains("\"status\":\"paused\""));
+    }
+
+    /// An edit is compared against the source the run executes now, which
+    /// the run's program route serves from where the run keeps it.
+    #[test]
+    fn a_run_serves_the_source_it_executes() {
+        let server = test_server();
+        let address = server.address();
+        server.context.runs.lock().expect("runs").insert(
+            "run-1".to_string(),
+            RunRecord {
+                run_id: "run-1".to_string(),
+                team: "Morph".to_string(),
+                status: RunStatus::Running,
+                diagram_address: None,
+                started_at: 0,
+                finished_at: None,
+                error: None,
+                present: Vec::new(),
+                outputs: BTreeMap::new(),
+                state: BTreeMap::new(),
+                mutation: None,
+            },
+        );
+        assert!(request(address, "GET", "/v1/runs/run-1/program", None).contains(" 404 "));
+        assert!(request(address, "GET", "/v1/runs/nobody/program", None).contains(" 404 "));
+        let run_dir = crate::ea::ea_state_dir(server.context.ea_id, &server.context.omar_dir)
+            .join("serve")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(run_dir.join("Morph.omar"), "main Morph {}\n").unwrap();
+        let response = request(address, "GET", "/v1/runs/run-1/program", None);
+        assert!(
+            response.contains(" 200 ")
+                && response.contains("\"filename\":\"Morph.omar\"")
+                && response.contains("\"program\":\"main Morph {}\\n\""),
+            "{response}"
+        );
     }
 
     /// A paused run has no runner to ask, so a stop gives it up in place,

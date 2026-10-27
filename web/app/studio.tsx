@@ -53,6 +53,7 @@ import {
   fetchCheckpoints,
   fetchRunTimeline,
   mutateRun,
+  fetchRunProgram,
   pauseRun,
   resumeRun,
   rollbackRun,
@@ -159,7 +160,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [applyingConfiguration, setApplyingConfiguration] = useState(false);
   // What applying the edited source to the run would change, while the
   // operator decides; and whether an applied change is still landing.
-  const [mutationPlan, setMutationPlan] = useState<{ changes: string[]; fromAssistant: boolean } | null>(null);
+  const [mutationPlan, setMutationPlan] = useState<{ fromAssistant: boolean } | null>(null);
+  /** The source the live run executes, which an edit is shown against. */
+  const [runningProgram, setRunningProgram] = useState<{ run: string; program: string } | null>(null);
   const [mutating, setMutating] = useState(false);
   /** What the source pane held before the assistant's change replaced it, so
       declining the change puts the running program back. */
@@ -872,7 +875,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           : "The source matches what the run is executing; there is nothing to apply.");
         return;
       }
-      setMutationPlan({ changes, fromAssistant });
+      setMutationPlan({ fromAssistant });
       // The plan is shown above the source it came from.
       setTab("source");
       setInspectorWidth((width) => width || DEFAULT_INSPECTOR);
@@ -1132,6 +1135,19 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       })
       .catch(() => {});
   }, [runId, serveUrl, checkpointEpoch]);
+
+  // What the run executes, refetched when a mutation or a rollback changes it.
+  const runLive = run ? ["running", "pausing", "paused"].includes(run.status) : false;
+  useEffect(() => {
+    if (!runId || !runLive) return;
+    const scope = scopeRef.current;
+    void fetchRunProgram(serveUrl, runId)
+      .then(({ program }) => {
+        if (scope === scopeRef.current) setRunningProgram({ run: runId, program });
+      })
+      .catch(() => {});
+  }, [runId, runLive, serveUrl, checkpointEpoch]);
+  const diffBase = runLive && runningProgram && runningProgram.run === runId ? runningProgram.program : null;
 
   // A run observed without a draft behind it (admitted over the API, or the
   // page reloaded) still gets its timeline: the daemon projects it from the
@@ -1635,17 +1651,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             {Object.keys(design?.files ?? {}).length > 0 ? <button className="secondary-button" onClick={() => setFilesOpen(true)}>View companion files ({Object.keys(design?.files ?? {}).length})</button> : null}
             {mutationPlan ? (
               <section className="mutation-plan" aria-label="Mutation plan">
-                <strong>{mutationPlan.fromAssistant ? "OMAR proposes these changes to the run" : "Apply these changes to the run?"}</strong>
+                <strong>{mutationPlan.fromAssistant ? "OMAR proposes changes to the run" : "Apply your changes to the run?"}</strong>
                 <span>
+                  Review them in the source below: green lines are added, red lines removed.{" "}
                   {run?.status === "paused"
                     ? "The paused run takes them and stays paused."
                     : "It pauses at the next tag boundary, changes, and resumes."}
                 </span>
-                <ul>
-                  {mutationPlan.changes.map((change, at) => (
-                    <li key={at}>{change}</li>
-                  ))}
-                </ul>
                 <div className="mutation-plan-actions">
                   <button className="primary-button" type="button" disabled={mutating} onClick={() => void applyMutation()}>
                     {mutating ? "Applying…" : "Apply"}
@@ -1658,6 +1670,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             ) : null}
             <OmarEditor
               source={source}
+              base={diffBase}
               filename={filename}
               status={run ? run.status : "draft"}
               errors={sourceErrors}

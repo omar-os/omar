@@ -518,6 +518,20 @@ export async function fetchRun(
   return assertRunRecord(await response.json());
 }
 
+/** The source a run executes now: what an edit to it is compared against. */
+export async function fetchRunProgram(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<{ filename: string; program: string }> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/program`, { signal });
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
+  return (await response.json()) as { filename: string; program: string };
+}
+
 /** `omar serve` reports `host:port`; the diagram API is plain HTTP on loopback. */
 export function diagramUrlFor(record: RunRecord): string {
   if (!record.diagram_address) {

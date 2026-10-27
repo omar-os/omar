@@ -1,6 +1,11 @@
 import { expect, test } from "@playwright/test";
 import { FAKE_SERVE_PORT, FAKE_SERVE_URL } from "../../playwright.config";
 import { startFakeServe } from "../fake-serve.mjs";
+import { readFileSync } from "node:fs";
+
+/** What the fake assistant proposes. The editor renders only the lines in
+    view, so a test reads the whole program from here rather than the page. */
+const PROPOSED_PROGRAM = readFileSync(new URL("../fixtures/review-flow.omar", import.meta.url), "utf8");
 
 type FakeServe = { url: string; agentToken: string; close(): Promise<void> };
 
@@ -101,7 +106,7 @@ test("prompt to finished run, gated on an explicit confirmation", async ({ page 
   await expect(page.getByRole("button", { name: /Codex/ })).toBeVisible();
   await expect(phase).toContainText("review");
   await page.getByRole("button", { name: "Show the source pane" }).click();
-  await expect(page.locator(".source-code")).toContainText("team ReviewFlow[");
+  await expect(page.locator(".source-editor")).toContainText("team ReviewFlow[");
   // Nothing is deployed yet, so there is no event stream to offer.
   await expect(page.locator(".tabs button")).toHaveText(["Source"]);
 
@@ -590,7 +595,7 @@ test("the source view highlights OMAR, and its pane can be hidden", async ({
   await draftUntilProposed(page);
 
   await page.getByRole("button", { name: "Show the source pane" }).click();
-  const code = page.locator(".source-code");
+  const code = page.locator(".source-editor");
   await expect(code).toBeVisible();
   await expect(code.locator(".omar-tok-keyword").first()).toHaveText("team");
   // Backends and types are distinguished, and prompt interpolation stands out.
@@ -886,17 +891,29 @@ test("an edited source is applied to the run, and the change marks the timeline"
   await page.getByRole("button", { name: "Show the source pane" }).click();
   await page.getByRole("tab", { name: "Source" }).click();
   const editor = page.getByLabel("OMAR program");
-  await editor.press("ControlOrMeta+End");
-  await editor.pressSequentially("\n// tightened");
+  // The edit is shown against what the run executes as it is typed: a
+  // changed line is its old text in red above its new text in green.
+  await expect(page.locator(".source-editor .cm-changedLine")).toHaveCount(0);
+  await editor.locator(".cm-line", { hasText: "Find risks and omissions" }).click();
+  await editor.press("End");
+  await editor.pressSequentially(" Note any gaps.");
+  const added = page.locator(".source-editor .cm-changedLine");
+  await expect(added).toHaveCount(1);
+  await expect(added).toContainText("Find risks and omissions in this plan: Note any gaps.");
+  await expect(page.locator(".source-editor .cm-deletedChunk")).toHaveText(/^\s*Find risks and omissions in this plan:\s*$/);
   await apply.click();
   const plan = page.getByLabel("Mutation plan");
-  await expect(plan).toContainText("update_reaction review.reaction.0");
+  // The operator reviews code, not the instructions that carry it out.
+  await expect(plan).toContainText("green lines are added, red lines removed");
+  await expect(plan).not.toContainText("update_reaction");
   await expect(plan).toContainText("stays paused");
   await plan.getByRole("button", { name: "Apply" }).click();
   await expect(plan).toHaveCount(0);
   await expect(page.getByText("The change was not applied")).toHaveCount(0);
   // Applied to a paused run, it stays paused until resumed.
   await expect(actions.getByRole("button", { name: "Resume" })).toBeVisible();
+  // What the run executes now is the edit, so nothing is marked changed.
+  await expect(page.locator(".source-editor .cm-changedLine")).toHaveCount(0);
 
   // On the timeline the change is a mark of its own, in its own colour,
   // whose preview lists what changed; it is where a resume continues.
@@ -931,15 +948,16 @@ test("asked mid-run, the assistant's change is offered as a plan for the live ru
   };
   await ask();
   const plan = page.getByLabel("Mutation plan");
-  await expect(plan).toContainText("OMAR proposes these changes to the run");
-  await expect(plan).toContainText("update_reaction review.reaction.0");
-  await expect(page.getByLabel("OMAR program")).toHaveValue(/tightened by OMAR/);
+  await expect(plan).toContainText("OMAR proposes changes to the run");
+  // The change is scrolled into view and marked as added.
+  await expect(page.locator(".source-editor .cm-changedLine", { hasText: "tightened by OMAR" })).toBeVisible();
   await expect(page.getByRole("group", { name: "Deploy design" })).toHaveCount(0);
 
   // Declined, the source is the running program again.
   await plan.getByRole("button", { name: "Decline" }).click();
   await expect(plan).toHaveCount(0);
-  await expect(page.getByLabel("OMAR program")).not.toHaveValue(/tightened by OMAR/);
+  await expect(page.getByLabel("OMAR program")).not.toContainText("tightened by OMAR");
+  await expect(page.locator(".source-editor .cm-changedLine")).toHaveCount(0);
 
   // Accepted, it is applied to the run and marks the timeline.
   await ask();
@@ -949,7 +967,14 @@ test("asked mid-run, the assistant's change is offered as a plan for the live ru
   await expect(actions.getByRole("button", { name: "Resume" })).toBeVisible();
   await page.getByRole("button", { name: /Run timeline/ }).click();
   await expect(page.getByLabel("Logical timeline").getByRole("button", { name: "Checkpoint #3" })).toHaveClass(/mutation/);
-  await expect(page.getByLabel("OMAR program")).toHaveValue(/tightened by OMAR/);
+  await expect(page.getByLabel("OMAR program")).toContainText("tightened by OMAR");
+  // After it, an edit by hand is read against the program the run now has.
+  await expect(page.locator(".source-editor .cm-changedLine")).toHaveCount(0);
+  const editor = page.getByLabel("OMAR program");
+  await editor.locator(".cm-line", { hasText: "tightened by OMAR" }).click();
+  await editor.press("End");
+  await editor.pressSequentially(" and by hand");
+  await expect(page.locator(".source-editor .cm-changedLine")).toContainText("tightened by OMAR and by hand");
 });
 
 test("the confirmation chooses what the run keeps and how it checkpoints", async ({ page }) => {
@@ -1749,7 +1774,7 @@ test("the diagram follows the text", async ({ page }) => {
   await page.getByRole("button", { name: "Show the source pane" }).click();
   const editor = page.getByLabel("OMAR program");
   await expect(editor).toBeVisible();
-  const source = await editor.inputValue();
+  const source = PROPOSED_PROGRAM;
   await editor.fill(source.replace(/\bmain\b/, "main Renamed"));
 
   // No deploy, no reload: the drawing is recompiled from the text on the pause
@@ -2207,7 +2232,7 @@ test("chat history restores messages and proposals after switching and reloading
   await expect(page.locator(".messages")).not.toContainText("Prepare a product launch");
   await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
   await page.getByRole("button", { name: "Show the source pane" }).click();
-  await expect(page.locator(".source-code")).toContainText("team ReviewFlow[");
+  await expect(page.locator(".source-editor")).toContainText("team ReviewFlow[");
   await expect(page.locator(".connection")).toHaveText("review");
   await page.screenshot({ path: "/tmp/omar-history-sidebar-desktop.png" });
   expect(errors).toEqual([]);
@@ -2695,8 +2720,8 @@ test("step configuration validates real source edits and never starts a run", as
   await expect(inspector.getByLabel("Step prompt")).toHaveValue('Read $(request), then produce a "reviewed" plan.');
   await inspector.getByRole("button", { name: "Edit prompt & backend in source" }).click();
   const program = page.getByRole("textbox", { name: "OMAR program", exact: true });
-  await expect(program).toHaveValue(/planner\s+: ClaudeCode/);
-  await expect(program).toHaveValue(/\\"reviewed\\"/);
+  await expect(program).toContainText(/planner\s+: ClaudeCode/);
+  await expect(program).toContainText(/\\"reviewed\\"/);
   await page.getByRole("separator", { name: "Resize the source pane" }).hover();
   await page.getByRole("button", { name: "Hide the source pane" }).click();
   await page.route("**/v1/programs/check", (route) => {

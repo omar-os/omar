@@ -124,6 +124,16 @@ export async function startFakeServe({
     if (
       request.method === "GET" &&
       url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/program")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/program".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return json(response, 200, { filename: entry.filename ?? "program.omar", program: entry.program });
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
       url.pathname.endsWith("/checkpoints")
     ) {
       const id = url.pathname.slice("/v1/runs/".length, -"/checkpoints".length);
@@ -739,6 +749,7 @@ export async function startFakeServe({
       },
       // What the run executes, so a mutation can tell an edit from none.
       program: request.program,
+      filename: request.filename,
       // What the operator chose at the confirmation, so a test can read it back.
       options: {
         keep_workspaces: request.keep_workspaces === true,
