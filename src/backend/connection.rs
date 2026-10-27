@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use super::Backend;
+use super::{sbx, Backend};
 use crate::backend_probe;
 
 /// A status command may reach its vendor's servers; past this it is unknown.
@@ -27,6 +27,8 @@ pub enum Connection {
     Unknown {
         reason: String,
     },
+    /// Sandboxes only: this backend cannot run in one yet.
+    Unsupported,
 }
 
 impl Connection {
@@ -105,31 +107,44 @@ pub fn connection(backend: &dyn Backend) -> Connection {
     backend.connection(program)
 }
 
+/// One backend's sign-in on the host and, when sbx is installed, in a sandbox.
+pub struct Status {
+    pub backend: &'static dyn Backend,
+    pub host: Connection,
+    pub sandbox: Option<Connection>,
+}
+
 /// Every assistant backend, asked at once so the slowest bounds the wait.
-pub fn assistants() -> Vec<(&'static dyn Backend, Connection)> {
+pub fn assistants() -> Vec<Status> {
     std::thread::scope(|scope| {
+        let keys = scope.spawn(sbx::keys);
         let asks: Vec<_> = super::ASSISTANT
             .iter()
             .map(|kind| super::of(*kind))
             .map(|backend| (backend, scope.spawn(move || connection(backend))))
             .collect();
+        let keys = keys.join().ok().flatten();
         asks.into_iter()
-            .map(|(backend, ask)| {
-                let connection = ask
+            .map(|(backend, ask)| Status {
+                backend,
+                host: ask
                     .join()
-                    .unwrap_or_else(|_| Connection::unknown("status check panicked"));
-                (backend, connection)
+                    .unwrap_or_else(|_| Connection::unknown("status check panicked")),
+                sandbox: keys.as_ref().map(|keys| sbx::status(backend, Some(keys))),
             })
             .collect()
     })
 }
 
 /// One backend as the CLI, MCP and Mission Control report it.
-pub fn describe(backend: &dyn Backend, connection: &Connection) -> serde_json::Value {
-    let mut value = serde_json::to_value(connection).expect("a connection serializes");
-    value["name"] = backend.kind().name().into();
-    if let Some(login) = backend.login_command() {
-        value["login"] = login.into();
+pub fn describe(status: &Status) -> serde_json::Value {
+    let mut value = serde_json::to_value(&status.host).expect("a connection serializes");
+    let name = status.backend.kind().name();
+    value["name"] = name.into();
+    value["login"] = format!("omar connect {name}").into();
+    if let Some(sandbox) = &status.sandbox {
+        value["sandbox"] = serde_json::to_value(sandbox).expect("a connection serializes");
+        value["sandbox"]["login"] = format!("omar connect {name} --sandbox").into();
     }
     value
 }

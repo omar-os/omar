@@ -2,7 +2,7 @@
 //! and given its prompt as the first message over HTTP.
 
 use super::managed;
-use super::{connection, Connection};
+use super::{connection, Connection, Login};
 use super::{Backend, Kind, Launch};
 use crate::manager::{
     actor_file, materialize_mcp_context_file, mcp_ea_dir, omar_server_exe, shell_single_quote,
@@ -44,8 +44,17 @@ impl Backend for Opencode {
             None => Connection::unknown("`opencode auth list` did not answer"),
         }
     }
-    fn login_command(&self) -> Option<&'static str> {
-        Some("opencode auth login")
+    fn install_command(&self) -> Option<&'static str> {
+        Some("curl -fsSL https://opencode.ai/install | bash")
+    }
+    fn login(&self, _headless: bool) -> Option<Login> {
+        Some(Login {
+            args: &["auth", "login"],
+            note: None,
+        })
+    }
+    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
+        Some(super::sbx::MODEL_SERVICES)
     }
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         from_stamp(target.stamp?).map(|(_, session)| session)

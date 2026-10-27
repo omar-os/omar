@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
-use super::{connection, Connection};
+use super::{connection, Connection, Login};
 use super::{detect, detect_token, Backend, Kind, Launch};
 use super::{managed, NotReady, PaneSetup, WRITE_TIMEOUT};
 use crate::manager::{
@@ -58,8 +58,24 @@ impl Backend for Codex {
             None => Connection::unknown("`codex login status` did not answer"),
         }
     }
-    fn login_command(&self) -> Option<&'static str> {
-        Some("codex login")
+    fn install_command(&self) -> Option<&'static str> {
+        Some("curl -fsSL https://chatgpt.com/codex/install.sh | sh")
+    }
+    fn login(&self, headless: bool) -> Option<Login> {
+        Some(if headless {
+            Login {
+                args: &["login", "--device-auth"],
+                note: Some("Device code sign-in must be allowed in ChatGPT: Settings → Security."),
+            }
+        } else {
+            Login {
+                args: &["login"],
+                note: None,
+            }
+        })
+    }
+    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
+        Some(&["openai"])
     }
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         let socket = from_stamp(target.stamp?)?;

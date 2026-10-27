@@ -165,16 +165,24 @@ Shutdown the test project and its agents.
 Each `omar -a <backend> up` starts a new independent session. Add `--name dev`
 to name it, and `--web` or `--tui` to open a client immediately.
 
-`omar backends` shows which are installed and signed in, and the command that
-signs in the rest (`--json` for scripts). Mission Control's backend menu shows
-the same.
+No need to install them yourself: `omar connect <backend>` runs the vendor's
+official installer if needed, then the CLI's own sign-in (device code for
+Codex over SSH). `omar backends` shows where each stands (`--json` for
+scripts); so does Mission Control's backend menu.
 
 ```
-BACKEND   STATUS                      SIGN IN
-claude    ✓ Claude Max
-codex     not signed in               codex login
-cursor    not installed
+BACKEND   STATUS                      SANDBOX           NEXT
+claude    ✓ Claude Max                no key            omar connect claude --sandbox
+codex     not signed in               no key            omar connect codex
+cursor    not installed               no key            omar connect cursor
 ```
+
+Sandboxed teams can't use host sign-ins. `omar connect <backend> --sandbox`
+stores a key in Docker Sandboxes (`sbx`) and approves it for OMAR's kit:
+Claude needs an API key (subscriptions don't work in sandboxes), Codex signs
+in to ChatGPT separately (`--api-key` for a key), Opencode/Pi take
+`--service anthropic|openai|google|openrouter|xai|mistral|groq`. The SANDBOX
+column appears once `sbx` is installed.
 
 ## License
 

@@ -62,8 +62,14 @@ export type BackendStatus = {
   via?: string;
   /** Why the status is unknown. */
   reason?: string;
-  /** What to run to sign it in. */
+  /** What to run to install and sign it in. */
   login?: string;
+  /** Its key for Docker Sandboxes, when sbx is installed. */
+  sandbox?: {
+    status: "connected" | "signed_out" | "unsupported";
+    via?: string;
+    login?: string;
+  };
 };
 
 export async function fetchBackendStatus(

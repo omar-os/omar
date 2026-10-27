@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use super::{connection, Connection};
+use super::{connection, Connection, Login};
 use super::{managed, spool, PaneSetup};
 use super::{Backend, Kind, Launch};
 use crate::ea::EaId;
@@ -36,8 +36,18 @@ impl Backend for Antigravity {
             None => Connection::unknown("`agy models` did not answer"),
         }
     }
-    fn login_command(&self) -> Option<&'static str> {
-        Some("agy (it signs in on first launch)")
+    fn install_command(&self) -> Option<&'static str> {
+        Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
+    }
+    /// agy has no login command; it signs in on first launch.
+    fn login(&self, _headless: bool) -> Option<Login> {
+        Some(Login {
+            args: &[],
+            note: Some("agy signs in on first launch; quit it once you are in."),
+        })
+    }
+    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
+        Some(&["google"])
     }
     // No readiness banner is pinned: `agy` is not available in CI or local
     // discovery, so a marker would be an unverified guess.

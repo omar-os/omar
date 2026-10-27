@@ -1295,9 +1295,9 @@ test("the composer says which assistant is answering, and can change it", async 
   await expect(menu.getByRole("menuitem")).toHaveText([
     "Claude CodeClaude Max",
     "CodexChatGPT✓",
-    "Cursornot signed in · run cursor agent login",
+    "Cursornot signed in · run omar connect cursor",
     "opencode",
-    "agynot installed",
+    "agynot installed · run omar connect agy",
   ]);
   // One that cannot sign in would only hang, so it cannot be chosen.
   await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();

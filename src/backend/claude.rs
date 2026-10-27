@@ -2,7 +2,7 @@
 //! through one `--settings`, and OMAR's tools over MCP.
 use std::path::{Path, PathBuf};
 
-use super::{connection, Connection};
+use super::{connection, Connection, Login};
 use super::{delivery_failed, NotReady, PaneSetup, Target, WRITE_TIMEOUT};
 use super::{detect, detect_token, Backend, Kind, Launch};
 use crate::manager::{
@@ -78,8 +78,19 @@ impl Backend for Claude {
             None => Connection::unknown("`claude auth status` did not answer"),
         }
     }
-    fn login_command(&self) -> Option<&'static str> {
-        Some("claude auth login")
+    fn install_command(&self) -> Option<&'static str> {
+        Some("curl -fsSL https://claude.ai/install.sh | bash")
+    }
+    /// Without a browser it prints a link and takes the code back pasted.
+    fn login(&self, _headless: bool) -> Option<Login> {
+        Some(Login {
+            args: &["auth", "login"],
+            note: None,
+        })
+    }
+    /// A Claude subscription cannot be shared into a sandbox; an API key can.
+    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
+        Some(&["anthropic"])
     }
     fn conversation_id(&self, target: &Target<'_>) -> Option<String> {
         let directory = claude_sessions_dir()?;
@@ -465,6 +476,11 @@ pub(crate) fn child_pids(parent: u32) -> Vec<u32> {
 }
 
 /// `claude auth status` prints JSON, and exits 1 when signed out.
+/// `via`, as [`auth_status`] names it, is a Claude subscription plan.
+pub(crate) fn is_subscription(via: &str) -> bool {
+    via.starts_with("Claude ")
+}
+
 fn auth_status(stdout: &str) -> Connection {
     let Ok(status) = serde_json::from_str::<serde_json::Value>(stdout) else {
         return Connection::unknown("`claude auth status` needs a newer Claude Code");

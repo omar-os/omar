@@ -3,7 +3,7 @@ use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use super::{connection, Connection};
+use super::{connection, Connection, Login};
 use super::{Backend, Kind, Launch, NotReady, PaneSetup, Readiness, Target, WRITE_TIMEOUT};
 use crate::manager::{
     materialize_mcp_context_file, mcp_ea_dir, omar_server_exe, shell_single_quote,
@@ -44,8 +44,18 @@ impl Backend for Pi {
             None => Connection::SignedOut,
         }
     }
-    fn login_command(&self) -> Option<&'static str> {
-        Some("pi, then /login")
+    fn install_command(&self) -> Option<&'static str> {
+        Some("npm install -g @earendil-works/pi-coding-agent")
+    }
+    /// Pi signs in only from inside its TUI.
+    fn login(&self, _headless: bool) -> Option<Login> {
+        Some(Login {
+            args: &[],
+            note: Some("In pi, type /login and pick a provider, then /quit."),
+        })
+    }
+    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
+        Some(super::sbx::MODEL_SERVICES)
     }
     fn readiness(&self, _command: &str) -> Readiness {
         Readiness::Channel

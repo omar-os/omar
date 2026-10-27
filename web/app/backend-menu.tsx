@@ -28,15 +28,17 @@ function note(status: BackendStatus | undefined): ReactNode {
     case "connected":
       return status.via ?? "signed in";
     case "signed_out":
+    case "not_installed": {
+      const state =
+        status.status === "signed_out" ? "not signed in" : "not installed";
       return status.login ? (
         <>
-          not signed in · run <code>{status.login}</code>
+          {state} · run <code>{status.login}</code>
         </>
       ) : (
-        "not signed in"
+        state
       );
-    case "not_installed":
-      return "not installed";
+    }
     default:
       return null;
   }
