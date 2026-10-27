@@ -99,11 +99,6 @@ jobs:
           git clean -ffdx -e target -e lang/.lake
           # Agent CLIs, Rust and Lean are installed per user on this machine.
           printf '%s\n' "$HOME/.local/bin" "$HOME/.opencode/bin" "$HOME/.cargo/bin" "$HOME/.elan/bin" >>"$GITHUB_PATH"
-          # OMAR launches `cursor agent`; the standalone CLI is `cursor-agent`.
-          mkdir -p "$RUNNER_TEMP/bin"
-          printf '#!/bin/sh\n[ "$1" = agent ] && shift\nexec cursor-agent "$@"\n' >"$RUNNER_TEMP/bin/cursor"
-          chmod +x "$RUNNER_TEMP/bin/cursor"
-          command -v cursor >/dev/null || echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
           # Own tmux server and OMAR home, so runs never touch the
           # maintainer's interactive sessions.
           mkdir -m 700 -p "$RUNNER_TEMP/tmux"
