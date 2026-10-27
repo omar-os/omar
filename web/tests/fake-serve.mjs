@@ -436,13 +436,14 @@ export async function startFakeServe({
   }
   const agentToken = randomUUID();
 
-  function publishChat(role, text, design, progress = false, selection = [], chat = activeChat) {
+  function publishChat(role, text, design, progress = false, selection = [], chat = activeChat, runtime = false) {
     chat.sequence += 1;
     const message = {
       sequence: chat.sequence,
       role,
       text,
       progress,
+      ...(runtime ? { runtime: true } : {}),
       design: design ?? null,
       selection,
     };
@@ -450,7 +451,7 @@ export async function startFakeServe({
     chat.messages.push(message);
     chat.updated_at = Date.now();
     if (role === "operator") chat.busy = true;
-    else if (!progress) chat.busy = false;
+    else if (!progress && !runtime) chat.busy = false;
     const kind = design ? "design_proposed" : "message";
     const frame = `id: ${message.sequence}\nevent: ${kind}\ndata: ${JSON.stringify(message)}\n\n`;
     for (const subscriber of chat.subscribers) subscriber.write(frame);
@@ -868,6 +869,9 @@ export async function startFakeServe({
   return {
     url: `http://${host}:${server.address().port}`,
     agentToken,
+    publishRuntime(text) {
+      return publishChat("assistant", text, null, false, [], activeChat, true);
+    },
     async close() {
       for (const client of terminals.clients) client.terminate();
       terminals.close();

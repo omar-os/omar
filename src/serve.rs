@@ -5,7 +5,7 @@
 //! accepts source, compiles it, supervises the run on a worker thread, and
 //! reports the per-run diagram address back to the caller.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -26,6 +26,10 @@ use crate::config::Config;
 use crate::ea::EaId;
 use crate::tmux::{DeliveryOptions, TmuxClient};
 use crate::topology::{self, PortKind, TopologyRunConfig, VmState};
+
+#[path = "serve_recovery.rs"]
+mod recovery;
+use recovery::WorkflowFollowup;
 
 pub const SERVE_PROTOCOL_VERSION: u32 = 1;
 
@@ -173,6 +177,7 @@ type Panels = Arc<Mutex<BTreeMap<String, topology::PanelAccess>>>;
 #[serde(rename_all = "snake_case")]
 pub enum ChatRole {
     Operator,
+    #[serde(alias = "runtime")]
     Assistant,
 }
 
@@ -232,6 +237,11 @@ pub struct ChatMessage {
     pub text: String,
     /// Commentary while working, rather than something awaiting an answer.
     pub progress: bool,
+    /// Runtime guidance does not finish or interrupt an assistant turn.
+    /// An optional field keeps saved chats readable by older runtimes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional, type = "boolean")]
+    pub runtime: bool,
     pub design: Option<ProposedDesign>,
     /// Diagram components the operator had selected when they sent this.
     /// "this one" is unresolvable in text; a selection says which.
@@ -289,6 +299,8 @@ struct Chat {
     needs_context: bool,
     needs_relaunch: bool,
     owned: bool,
+    pending_followup: Option<WorkflowFollowup>,
+    announced: BTreeSet<String>,
 }
 
 /// A chat owns one EA; only the durable archive is shared between workspaces.
@@ -347,19 +359,37 @@ impl Context_ {
         design: Option<ProposedDesign>,
         selection: Vec<String>,
     ) -> Result<ChatMessage> {
+        self.publish_message(ChatMessage {
+            sequence: 0,
+            role,
+            text,
+            progress,
+            runtime: false,
+            design,
+            selection,
+        })
+    }
+
+    fn publish_runtime(&self, text: String) -> Result<ChatMessage> {
+        self.publish_message(ChatMessage {
+            sequence: 0,
+            role: ChatRole::Assistant,
+            text,
+            progress: false,
+            runtime: true,
+            design: None,
+            selection: Vec::new(),
+        })
+    }
+
+    fn publish_message(&self, draft: ChatMessage) -> Result<ChatMessage> {
         let mut chat = self.chat.lock().expect("serve chat poisoned");
-        let message = self.history.lock().expect("history poisoned").append_to(
-            &self.conversation_id,
-            ChatMessage {
-                sequence: 0,
-                role,
-                text,
-                progress,
-                design,
-                selection,
-            },
-        )?;
-        if role == ChatRole::Assistant && !progress {
+        let message = self
+            .history
+            .lock()
+            .expect("history poisoned")
+            .append_to(&self.conversation_id, draft)?;
+        if message.role == ChatRole::Assistant && !message.progress && !message.runtime {
             chat.busy = false;
         }
         chat.subscribers
@@ -697,6 +727,8 @@ impl Serve {
                 needs_context: has_history,
                 needs_relaunch: has_history,
                 owned: false,
+                pending_followup: None,
+                announced: BTreeSet::new(),
             })),
             agent_token: Mutex::new(agent_token.clone()),
             chat_operation: Mutex::new(()),
@@ -861,7 +893,10 @@ impl Serve {
             chat.needs_relaunch = false;
         }
         match self.verify_ea_context(omar_dir, ea_id) {
-            Ok(()) => Ok(AttachEa::Attached(session)),
+            Ok(()) => {
+                recovery::revisit(context);
+                Ok(AttachEa::Attached(session))
+            }
             Err(reason) => Ok(AttachEa::LaunchedWithoutServe {
                 session,
                 reason: reason.to_string(),
@@ -1325,7 +1360,10 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
                 if context.chat.lock().expect("chat poisoned").needs_relaunch {
                     let command = context.command.lock().expect("command poisoned").clone();
                     match relaunch_ea(&context, &command) {
-                        Ok(_) => context.chat.lock().expect("chat poisoned").needs_relaunch = false,
+                        Ok(_) => {
+                            context.chat.lock().expect("chat poisoned").needs_relaunch = false;
+                            recovery::revisit(&context);
+                        }
                         Err(error) => eprintln!("Could not resume assistant: {error:#}"),
                     }
                 }
@@ -1955,6 +1993,8 @@ impl Workspaces {
                 needs_context: has_history,
                 needs_relaunch: true,
                 owned: false,
+                pending_followup: None,
+                announced: BTreeSet::new(),
             })),
             agent_token: Mutex::new(Uuid::new_v4().to_string()),
             chat_operation: Mutex::new(()),
@@ -2167,9 +2207,16 @@ fn mission_control_envelope(text: &str, selection: &[String]) -> String {
          Your backend may list it as `omar__omar_reply` or `mcp__omar__omar_reply`. \
          It is an MCP tool call, NOT a shell command: there is no `omar_reply` \
          executable, and the `omar` CLI cannot send it. Do not search your PATH for it.\n\
-         The operator is in Mission Control and cannot see this terminal, so text you \
-         print here reaches nobody. Every question, status update, and answer must go \
-         through `omar_reply`.\n\
+         The operator is in Mission Control and can inspect this terminal. Every \
+         question, status update, and answer must also go through `omar_reply`. \
+         Be proactive: explain the next action, expected output and manual handoffs. \
+         For a runtime failure, announce that you are trying to solve it, inspect \
+         the evidence, attempt safe repairs, and report verified results and next steps. \
+         For setup guidance, distinguish what is verified fixed from the current blocker. \
+         Give one primary action, its exact location, and the check that proves it worked. \
+         Use only available controls; do not invent setup buttons or ask for secrets in chat. \
+         If terminal setup is necessary, identify the actual shell and runtime session, \
+         give concrete instructions, and explain persistence and restart effects.\n\
          To offer a workflow, call the MCP tool `omar_propose_design` with a complete \
          OMAR program. Include companion files in `files`, keyed by their relative paths \
          (for example schemas/decision.json), so imported types compile. The entry \
@@ -2206,7 +2253,12 @@ fn agent_reply(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         return (403, json!({"error": "forbidden"}));
     }
     match context.publish(ChatRole::Assistant, reply.text, reply.progress, None) {
-        Ok(_) => (202, json!({"status": "delivered"})),
+        Ok(_) => {
+            if !reply.progress {
+                recovery::kick(context);
+            }
+            (202, json!({"status": "delivered"}))
+        }
         Err(error) => (500, json!({"error": format!("{error:#}")})),
     }
 }
@@ -2245,6 +2297,7 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     ) {
         return (500, json!({"error": format!("{error:#}")}));
     }
+    recovery::kick(context);
     (202, json!({"status": "proposed"}))
 }
 
@@ -2737,10 +2790,13 @@ fn panel_status(context: &Arc<Context_>, run_id: &str) -> (u16, Value) {
         Err(response) => return response,
     };
     match topology::panel_pending(&access, &team) {
-        Ok(pending) => (
-            200,
-            json!({"run_id": run_id, "team": team, "pending": pending}),
-        ),
+        Ok(pending) => {
+            recovery::manual_steps(context, run_id, &pending);
+            (
+                200,
+                json!({"run_id": run_id, "team": team, "pending": pending}),
+            )
+        }
         Err(error) => (502, json!({"error": format!("{error:#}")})),
     }
 }
@@ -2801,16 +2857,18 @@ fn spawn_run_thread(
     // The panel's credentials arrive on their own channel, and only for a run
     // that has a web agent. Stored as they come rather than waited for: a run
     // with none would otherwise hold up admission for nothing.
-    let (panel_sender, panel_receiver) = mpsc::channel();
+    let (panel_sender, panel_receiver) = mpsc::channel::<topology::PanelAccess>();
     {
         let panels = context.panels.clone();
+        let context = context.clone();
         let id = run_id.to_string();
         thread::spawn(move || {
             if let Ok(access) = panel_receiver.recv() {
                 panels
                     .lock()
                     .expect("serve panels poisoned")
-                    .insert(id, access);
+                    .insert(id.clone(), access.clone());
+                recovery::watch_panel(context, id, access);
             }
         });
     }
@@ -3493,6 +3551,11 @@ fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::R
         }
         persist_run(context, record);
     }
+    let finished = runs.get(run_id).cloned();
+    drop(runs);
+    if let Some(record) = finished {
+        recovery::finished(context, &record);
+    }
 }
 
 fn spawn_resume_thread(
@@ -3504,16 +3567,18 @@ fn spawn_resume_thread(
 ) {
     // A resumed run answers web agents through the panel too: its credentials
     // arrive on their own channel, stored as they come, as on a fresh start.
-    let (panel_sender, panel_receiver) = mpsc::channel();
+    let (panel_sender, panel_receiver) = mpsc::channel::<topology::PanelAccess>();
     {
         let panels = context.panels.clone();
+        let context = context.clone();
         let id = run_id.to_string();
         thread::spawn(move || {
             if let Ok(access) = panel_receiver.recv() {
                 panels
                     .lock()
                     .expect("serve panels poisoned")
-                    .insert(id, access);
+                    .insert(id.clone(), access.clone());
+                recovery::watch_panel(context, id, access);
             }
         });
     }
