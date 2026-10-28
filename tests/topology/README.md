@@ -83,10 +83,11 @@ asserts fail, which fails the run. So a passing case ends as soon as it has
 passed, and a program with a periodic timer still ends. See `lang/spec.md`
 §2.2.
 
-`Live Topology` runs the authenticated suite on every same-repo PR, every
-`main` push, and on demand (optionally one `case`). It runs on the
-maintainer's self-hosted runner, label `omar-live`, using that machine's Claude
-Code and Codex logins; no API keys in GitHub. Fork PRs are skipped. Each run
+`Live Topology` runs the authenticated suite nightly and on demand
+(optionally one `case` or `backend`), not on PRs: a full run takes about 25
+minutes on one runner. It runs on the maintainer's self-hosted runner, label
+`omar-live`, using that machine's Claude Code and Codex logins; no API keys in
+GitHub. Each run
 gets its own tmux server (`TMUX_TMPDIR`) and `OMAR_HOME`, so it never touches
 the machine's interactive sessions. Set up a runner:
 `.github/scripts/setup-live-runner.sh`.
