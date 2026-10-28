@@ -17,7 +17,8 @@ $ omar attach -s dev --tui    # the dashboard
 ```
 
 - `[` / `]` cycle the session's EAs — same keys as before.
-- `N` spawns another EA (prompts for a name); `D` deletes the current one.
+- `N` spawns another EA (prompts for a name). `D` is currently disabled on
+  session-attached dashboards until daemon-owned EA deletion ships.
 - Each EA can run a different backend:
   `omar -s dev ea create --name review --agent codex` then
   `omar -s dev ea start review`, and `]` to reach it.
@@ -43,7 +44,8 @@ Press `?` inside the TUI for the full shortcut list:
 | `Enter` | Attach terminal to selected agent |
 | `Tab` / `Shift+Tab` or `Esc` | Drill into / out of a team level |
 | `[` / `]` | Previous / next EA |
-| `N` / `D` | New EA / delete current EA |
+| `N` | New EA |
+| `D` | Disabled on attached dashboards until daemon-owned deletion ships |
 | `n` / `d` | Spawn / kill a single agent |
 | `e` | Scheduled events |
 | `z` | Detach (everything keeps running) |

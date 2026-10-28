@@ -99,44 +99,151 @@ only `~/.omar/sessions/<name>/`, so that state needs a one-time move. The old
 layout is byte-identical to a session directory, so the migration is: let OMAR
 build a proper session shell, stop it, move the old files in, and boot it.
 
-Stop any still-running old OMAR and its tmux panes, then:
+Stop the old OMAR and its agent tmux panes first. Run this one-time recipe
+with Bash and Python 3 (Linux or macOS). It respects `OMAR_HOME`; the default
+is `~/.omar`. Set `OMAR_MIGRATION_NAME` to choose another destination name.
+An existing session without this recipe's marker is refused. Newly generated
+placeholders are parked internally, and interrupted moves can be retried by
+running the same recipe. A conflict stops without overwriting either copy.
 
 ```bash
-# 1. old installs ran agents on the default tmux server; clear those panes
-tmux ls 2>/dev/null | awk -F: '/^omar-/{print $1}' |
-  while read -r s; do tmux kill-session -t "$s"; done
+#!/usr/bin/env bash
+set -euo pipefail
+python3 - <<'PY'
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
 
-# 2. create the session shell (this briefly launches EA 0's assistant; down stops it)
-omar up --name migrated
-omar down -s migrated
+home = Path(os.environ.get("OMAR_HOME", str(Path.home() / ".omar"))).resolve()
+name = os.environ.get("OMAR_MIGRATION_NAME", "migrated")
+if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+    sys.exit("Choose a session name using 1–64 letters, digits, '-' or '_'.")
+dest = home / "sessions" / name
+marker = dest / ".legacy-import.json"
+park = dest / ".legacy-import-placeholders"
+items = "eas.json eas.lock ea_next_id active_ea scheduled_events.json ea prompts logs metrics workspaces workspace-history".split()
+items += sorted(p.name for p in home.glob("manager_notes_ea*.md") if p.is_file() or p.is_symlink())
 
-# 3. move the old state in, keeping the global config.toml as the template
-cd ~/.omar
-rm -rf mcp dashboard_handoff.json          # stale absolute paths; regenerated
-# fresh placeholders the legacy versions must replace (mv would nest them)
-rm -rf sessions/migrated/{ea,logs,prompts,metrics,workspaces,workspace-history}
-for f in eas.json eas.lock ea_next_id active_ea scheduled_events.json \
-         ea prompts logs metrics workspaces workspace-history; do
-  [ -e "$f" ] && mv "$f" sessions/migrated/
-done
-find . -maxdepth 1 -name 'manager_notes_ea*.md' -exec mv {} sessions/migrated/ \;
-[ -e config.toml ] && cp config.toml sessions/migrated/
+def exists(path):
+    return os.path.lexists(path)
 
-# 4. repair workspace git pointers that embed the old path
-for id in sessions/migrated/workspace-history/*; do
-  git --git-dir "$id/repository.git" worktree repair \
-    "sessions/migrated/workspaces/$(basename "$id")/worktree" 2>/dev/null
-done
+def fingerprint(path):
+    if path.is_symlink():
+        return ["link", os.readlink(path)]
+    if path.is_dir():
+        return ["dir", {p.name: fingerprint(p) for p in sorted(path.iterdir())}]
+    return ["file", hashlib.sha256(path.read_bytes()).hexdigest()]
 
-# 5. boot the migrated session
-omar up --name migrated
+def cli(*args):
+    return subprocess.check_output(["omar", *args], text=True)
+
+def state():
+    return json.loads(cli("--json", "info", "-s", name))["session"]["state"]
+
+def save():
+    tmp = marker.with_suffix(".tmp")
+    with tmp.open("w") as stream:
+        json.dump(record, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, marker)
+
+def migrate():
+    global record
+    if exists(dest) and not marker.is_file():
+        sys.exit(f"Refusing existing session {dest}; choose another OMAR_MIGRATION_NAME.")
+    if not exists(dest):
+        if not any(exists(home / item) for item in items):
+            print("No legacy state to migrate.")
+            return
+        cli("up", "--name", name, "--no-ea")
+        # If interrupted before this marker, refuse the ambiguous shell on retry.
+        record = {"version": 1, "home": str(home), "name": name, "phase": "preparing"}
+        save()
+    record = json.loads(marker.read_text())
+    if (record.get("version"), record.get("home"), record.get("name")) != (1, str(home), name):
+        sys.exit(f"Migration marker does not match {dest}")
+    if record["phase"] == "complete":
+        if state() == "stopped":
+            cli("up", "--name", name)
+        print(f"Migration already complete: {dest}")
+        return
+    if record["phase"] == "preparing":
+        cli("down", "-s", name)
+        if state() != "stopped":
+            sys.exit("Session must be stopped before importing.")
+        record.update(phase="moving", items=items,
+                      placeholders={item: fingerprint(dest / item) for item in items + ["config.toml"] if exists(dest / item)},
+                      config=fingerprint(home / "config.toml") if exists(home / "config.toml") else None)
+        save()
+    if state() != "stopped":
+        sys.exit(f"Stop session {name} before resuming this migration.")
+    park.mkdir(exist_ok=True)
+    for item in record["items"]:
+        src, dst, parked = home / item, dest / item, park / item
+        if not exists(src):
+            continue
+        if exists(dst):
+            if exists(parked) or fingerprint(dst) != record["placeholders"].get(item):
+                sys.exit(f"Conflict: {src} and {dst}; not overwriting.")
+            os.rename(dst, parked)
+        # Explicit destination prevents directory nesting. Same-filesystem rename
+        # leaves either the source or the destination intact after interruption.
+        os.rename(src, dst)
+    if record["config"] is not None:
+        src, dst, parked = home / "config.toml", dest / "config.toml", park / "config.toml"
+        if fingerprint(src) != record["config"]:
+            sys.exit("Legacy config changed during migration; inspect before continuing.")
+        if exists(dst) and fingerprint(dst) != record["config"]:
+            if exists(parked) or fingerprint(dst) != record["placeholders"].get("config.toml"):
+                sys.exit(f"Conflict: {dst}; not overwriting.")
+            os.rename(dst, parked)
+        if not exists(dst):
+            tmp = dest / ".legacy-config.tmp"
+            with tmp.open("wb") as stream:
+                stream.write(src.read_bytes())
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, dst)
+    history = dest / "workspace-history"
+    if history.is_dir():
+        for item in sorted(history.iterdir()):
+            repository = item / "repository.git"
+            if not repository.is_dir():
+                continue
+            worktree = dest / "workspaces" / item.name / "worktree"
+            if not worktree.is_dir():
+                sys.exit(f"Missing workspace worktree: {worktree}")
+            subprocess.run(["git", "--git-dir", str(repository), "worktree", "repair", str(worktree)], check=True)
+    record["phase"] = "complete"
+    save()
+    cli("up", "--name", name)
+    print(f"Migrated legacy state to {dest}")
+
+home.mkdir(parents=True, exist_ok=True)
+# Advisory lock is automatically released after a crash (Linux and macOS).
+with (home / ".legacy-import.lock").open("a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    migrate()
+PY
 ```
 
+The same recipe is checked in as `scripts/migrate_legacy_session.sh`; a binary
+installation can use the complete command above. Keep the internal marker and
+`.legacy-import-placeholders` for retry/recovery; no separate backup step is
+required. A shell created just before interruption but without a marker is
+ambiguous: choose a new migration name; the legacy source remains intact.
+
 EA registry, chats, scheduled events, manager notes, and workspace snapshots
-come along. Runs that were live under the old install are not resumable — they
-belonged to the old tmux server — though their records and checkpoint files
-travel with the move. `omar rm -s migrated` deletes the migrated state, so keep
-a copy of `~/.omar` until you are satisfied.
+come along. Old live runs cannot resume: their tmux server belonged to the old
+runtime. Obsolete top-level `mcp` and `dashboard_handoff.json` are left alone;
+the session runtime ignores them. After success, rerunning leaves imported data
+alone. `omar rm -s migrated` deletes that session and its imported state.
 
 ## Storage and build ownership
 
