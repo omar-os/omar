@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="img/full-black-banner.jpg" alt="OMAR" width="250">
+<img src="https://omar.rs/img/full-black-banner.jpg" alt="OMAR" width="250">
 
 <p align="center">
 <strong>Say no to agent “swarms”.<br>
@@ -20,7 +20,7 @@ Deploy deterministic, verifiable, programmable agentic workflows.</strong>
 <div align="center">
 
 <p align="center">
-<img src="./img/web.gif" alt="Web UI" valign="middle"/>
+<img src="https://omar.rs/img/web.gif" alt="Web UI" valign="middle"/>
 Mission Control
 </p>
 

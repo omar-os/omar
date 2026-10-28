@@ -97,6 +97,41 @@ export async function startFakeServe({
       return json(response, 202, entry.record);
     }
     if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/mutate")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/mutate".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      if (!["running", "paused"].includes(entry.record.status)) {
+        return json(response, 409, { error: `run is ${entry.record.status}; only a running or paused run can mutate` });
+      }
+      const body = JSON.parse((await readBody(request)) || "{}");
+      // The plan the daemon would diff out of the edit: one line per change.
+      const changes = body.program === entry.program ? [] : ["update_reaction review.reaction.0 on review.reviewer"];
+      if (changes.length === 0 || body.dry_run) return json(response, 200, { changes });
+      entry.program = body.program;
+      entry.record.mutation = { status: "pending", changes };
+      if (entry.record.status === "paused") {
+        applyMutation(entry);
+        return json(response, 200, entry.record);
+      }
+      // A running run pauses first; the walk applies it at the boundary.
+      entry.record.status = "pausing";
+      return json(response, 202, entry.record);
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/program")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/program".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return json(response, 200, { filename: entry.filename ?? "program.omar", program: entry.program });
+    }
+    if (
       request.method === "GET" &&
       url.pathname.startsWith("/v1/runs/") &&
       url.pathname.endsWith("/checkpoints")
@@ -527,6 +562,19 @@ export async function startFakeServe({
       Math.max(10, stepMs / 3),
     );
     setTimeout(() => {
+      // Asked while the chat's run is live, it changes that run's program,
+      // as the envelope tells the real EA to: same main, edited in place.
+      const live = latest(chat);
+      if (live && ["running", "paused"].includes(live.record.status)) {
+        const preview = structuredClone(golden);
+        preview.status = "ready";
+        publish("assistant", "Tightened the reviewer's prompt in the running workflow.", {
+          program: `${live.program ?? PROPOSED_PROGRAM}\n// tightened by OMAR\n`,
+          inputs: {},
+          preview,
+        });
+        return;
+      }
       if (!asked) {
         publish(
           "assistant",
@@ -711,6 +759,9 @@ export async function startFakeServe({
         finished_at: null,
         error: null,
       },
+      // What the run executes, so a mutation can tell an edit from none.
+      program: request.program,
+      filename: request.filename,
       // What the operator chose at the confirmation, so a test can read it back.
       options: {
         keep_workspaces: request.keep_workspaces === true,
@@ -776,6 +827,26 @@ export async function startFakeServe({
     return entry.checkpoints;
   }
 
+  /** A mutation lands as a checkpoint of its own, the new resume point. */
+  function applyMutation(entry) {
+    const checkpoints = checkpointsOf(entry);
+    const parent = entry.resumePoint;
+    const sequence = checkpoints.length + 1;
+    const id = `cp-${sequence}`;
+    checkpoints.push({
+      id,
+      sequence,
+      parent,
+      trigger: "mutation",
+      completed_tag: [0, 1],
+      next_tag: [0, 2],
+      created_at: sequence,
+      mutation: entry.record.mutation.changes,
+    });
+    entry.resumePoint = id;
+    entry.record.mutation = { ...entry.record.mutation, status: "applied", checkpoint: id };
+  }
+
   function publish(entry, kind, payload, tag = null) {
     entry.sequence += 1;
     entry.snapshot.sequence = entry.sequence;
@@ -816,6 +887,12 @@ export async function startFakeServe({
       entry.snapshot.status = "paused";
       publish(entry, "run_checkpointed", { checkpoint: "cp-2", trigger: "pause" }, { timestamp: 0, microstep: 1 });
       publish(entry, "run_paused", { checkpoint: "cp-2" });
+      // A pause a mutation asked for: apply it, then resume on our own.
+      if (entry.record.mutation?.status === "pending") {
+        applyMutation(entry);
+        entry.record.status = "running";
+        entry.record.finished_at = null;
+      }
       while (entry.record.status === "paused") await wait();
       entry.snapshot.status = "running";
       publish(entry, "run_started", {});

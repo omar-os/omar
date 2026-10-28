@@ -1243,43 +1243,83 @@ h2 {
   white-space: pre-wrap;
 }
 
-/* The editable source: a transparent textarea over the highlighted text.
-
-   Every metric that decides where a glyph lands has to match between the two,
-   or the caret drifts from the colours behind it. They share one font
-   shorthand, one padding, and one wrapping rule; the pair below is the place to
-   change any of them. */
+/* The editable source: a CodeMirror editor coloured by the OMAR tokenizer. */
 .source-editor {
-  position: relative;
   flex: 1;
   min-height: 0;
-  display: grid;
+  display: flex;
 }
 
-.source-editor > .source-code,
-.source-input {
-  grid-area: 1 / 1;
-  margin: 0;
-  padding: 16px;
-  border: 0;
+.source-editor .cm-editor {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-2);
   font: 0.75rem/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
-  tab-size: 2;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  overflow: auto;
 }
 
-.source-input {
-  resize: none;
-  background: transparent;
-  /* Transparent text over the highlighting, with a visible caret. */
-  color: transparent;
-  caret-color: #d8caff;
+.source-editor .cm-editor.cm-focused {
   outline: none;
 }
 
-.source-input::selection {
-  background: var(--purple-soft);
+.source-editor .cm-scroller {
+  font: inherit;
+  line-height: inherit;
+}
+
+.source-editor .cm-content {
+  padding: 16px 0;
+  caret-color: #d8caff;
+}
+
+.source-editor .cm-line,
+.source-editor .cm-deletedLine {
+  position: relative;
+  padding: 0 16px 0 22px;
+}
+
+.source-editor .cm-cursor {
+  border-left-color: #d8caff;
+}
+
+.source-editor .cm-selectionBackground,
+.source-editor .cm-focused .cm-selectionBackground {
+  background: var(--purple-soft) !important;
+}
+
+/* A change against what the run executes, as a code review shows one:
+   removed lines red and marked −, added lines green and marked +. */
+.source-editor .cm-deletedChunk {
+  padding-left: 0;
+  background: rgba(248, 81, 73, 0.16);
+}
+
+.source-editor .cm-deletedChunk .cm-deletedText {
+  background: rgba(248, 81, 73, 0.3);
+}
+
+.source-editor .cm-changedLine {
+  background: rgba(46, 160, 67, 0.18) !important;
+}
+
+.source-editor .cm-changedText {
+  background: rgba(46, 160, 67, 0.36) !important;
+}
+
+.source-editor .cm-changedLine::before,
+.source-editor .cm-deletedLine::before {
+  position: absolute;
+  left: 8px;
+  font-weight: 700;
+}
+
+.source-editor .cm-changedLine::before {
+  content: "+";
+  color: #3fb950;
+}
+
+.source-editor .cm-deletedLine::before {
+  content: "−";
+  color: #f85149;
 }
 
 .source-name {
@@ -1947,6 +1987,51 @@ h2 {
   margin-left: -2px;
   background: #7ef0a6;
   z-index: 1;
+}
+
+/* A mutation is not a capture of the run but a change to its program, so it
+   stands apart from the green captures. */
+.timeline-controls .timeline-tick.mutation {
+  background: var(--purple);
+}
+
+.timeline-controls .timeline-tick.mutation:hover,
+.timeline-controls .timeline-tick.mutation:focus-visible,
+.timeline-controls .timeline-tick.mutation.selected {
+  background: var(--link);
+}
+
+.timeline-controls .timeline-tick.mutation.resume {
+  box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 3.5px var(--purple);
+}
+
+.timeline-preview-mutation {
+  margin: 6px 0;
+  padding-left: 18px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.mutation-plan {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--purple);
+  border-radius: 8px;
+  background: var(--purple-soft);
+}
+
+.mutation-plan ul {
+  margin: 0;
+  padding-left: 18px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.mutation-plan-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .timeline-checkpoints {

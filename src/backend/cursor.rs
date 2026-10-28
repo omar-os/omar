@@ -15,11 +15,13 @@ impl Backend for Cursor {
     fn aliases(&self) -> &'static [&'static str] {
         &["cursor"]
     }
+    /// The editor ships `cursor`, which runs the agent as `cursor agent`; the
+    /// standalone CLI installs `cursor-agent` and `agent`.
     fn executables(&self) -> &'static [&'static str] {
-        &["cursor"]
+        &["cursor", "cursor-agent", "agent"]
     }
     fn default_command(&self) -> &'static str {
-        "cursor agent --yolo"
+        command_for(on_path)
     }
     /// The status command ignores `CURSOR_API_KEY`, so that is checked first.
     fn connection(&self, program: &str) -> Connection {
@@ -111,6 +113,22 @@ impl Backend for Cursor {
             None | Some("sessionStart" | "postToolUse" | "postToolUseFailure")
         )
     }
+}
+
+/// The standalone CLI when installed, else the editor's `cursor agent`.
+fn command_for(installed: impl Fn(&str) -> bool) -> &'static str {
+    [
+        ("cursor-agent", "cursor-agent --yolo"),
+        ("agent", "agent --yolo"),
+    ]
+    .into_iter()
+    .find(|(executable, _)| installed(executable))
+    .map_or("cursor agent --yolo", |(_, command)| command)
+}
+
+fn on_path(executable: &str) -> bool {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .any(|dir| dir.join(executable).is_file())
 }
 
 /// The tail of the command OMAR installs, and the only thing it will replace
@@ -250,6 +268,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_standalone_cli_is_preferred_over_the_editor() {
+        assert_eq!(command_for(|_| true), "cursor-agent --yolo");
+        assert_eq!(command_for(|name| name == "agent"), "agent --yolo");
+        assert_eq!(command_for(|_| false), "cursor agent --yolo");
+        for command in ["cursor-agent --yolo", "agent --yolo", "cursor agent --yolo"] {
+            assert_eq!(crate::backend::command_name(command), Some("cursor"));
+        }
+    }
 
     #[test]
     fn installing_the_cursor_hook_keeps_the_operators_own_hooks() {

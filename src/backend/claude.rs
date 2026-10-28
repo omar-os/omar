@@ -797,6 +797,16 @@ mod tests {
             .args(["-c", "sleep 30; :", "sh", "--dangerously-skip-permissions"])
             .spawn()
             .unwrap();
+        // spawn returns once exec swaps the child's memory, which can be
+        // before the kernel records its new argv; /proc then reads it empty.
+        for pid in [accepting.id(), holding.id()] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while process_argv(pid).is_none_or(|argv| argv.is_empty())
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
 
         assert!(launched_to_accept(accepting.id()));
         assert!(!launched_to_accept(holding.id()));
