@@ -9,7 +9,7 @@ fail=0
 
 while IFS= read -r path; do
   case $path in
-    README.md | AGENT.md | CLAUDE.md | CONTRIBUTING.md | lang/spec.md | prompts/*) ;;
+    README.md | AGENT.md | CLAUDE.md | CONTRIBUTING.md | lang/spec.md | prompts/* | docs/sessions.md | docs/tui.md) ;;
     docs/* | */docs/* | *.md | *.mdx | *.rst | *.adoc)
       echo "::error file=$path::documentation belongs on omar.rs, not in the repo (CONTRIBUTING.md rule 1)"
       fail=1

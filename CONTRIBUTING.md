@@ -10,7 +10,7 @@ OMAR's philosophy, collected so PRs need less back-and-forth. When a design ques
 
 ## Repository
 
-1. No documentation in the repo: no `docs/` folder, no new Markdown files. Docs drift out of date; user documentation lives on [omar.rs](https://omar.rs), built separately. Exceptions: top-level `README.md`, `lang/spec.md`, `prompts/`, and these contributor files. Explain code in comments, `--help` text and test names, which change with the code. Explain changes in PR descriptions.
+1. No documentation in the repo: no `docs/` folder, no new Markdown files. Docs drift out of date; user documentation lives on [omar.rs](https://omar.rs), built separately. Exceptions: top-level `README.md`, `lang/spec.md`, `prompts/`, the session guides (`docs/sessions.md` and `docs/tui.md`), and these contributor files. Explain code in comments, `--help` text and test names, which change with the code. Explain changes in PR descriptions.
 2. No binary files (images, GIFs, videos, archives, builds). Site assets go in the [omar.rs repo](https://github.com/omar-os/omar.rs); PR screenshots and videos go on a `pr-assets/<branch>` branch (rule 9).
 3. Never commit secrets. Keys go in GitHub repository secrets or `sbx secret`, never in files.
 4. Justify each new dependency in the PR description. Keep the minimum supported Rust version (1.89, checked in CI).

@@ -44,6 +44,8 @@ def main():
             "CONTRIBUTING.md": "rules\n",
             "AGENT.md": "agents\n",
             "CLAUDE.md": "@AGENT.md\n",
+            "docs/sessions.md": "session guide\n",
+            "docs/tui.md": "terminal guide\n",
         }
         result = check(allowed)
         assert result.returncode == 0, result
@@ -51,6 +53,8 @@ def main():
         refused = {
             "docs/guide.md": "doc",
             "docs/diagram.txt": "doc",
+            "docs/tui.mdx": "doc",
+            "docs/sessions/extra.md": "doc",
             "web/NOTES.md": "doc",
             "src/docs/api.rst": "doc",
             "img/shot.png": b"\x89PNG\r\n\x1a\n\0\0\0",
