@@ -880,6 +880,12 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: Verify macOS migration portability and recovery
+        if: runner.os == 'macOS'
+        run: |
+          bash -n scripts/migrate_legacy_session.sh
+          python3 tests/ci/legacy_migration.py Migration
+
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
