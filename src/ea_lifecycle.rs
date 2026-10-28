@@ -94,16 +94,11 @@ pub(crate) fn delete(
             registry.len() > 1,
             "Cannot delete the only EA; at least one EA must remain"
         );
-        let mut paths = vec![
+        let paths = vec![
             PathBuf::from(format!("ea/{id}")),
             PathBuf::from(format!("mcp/ea-{id}")),
             PathBuf::from(format!("manager_notes_ea{id}.md")),
         ];
-        for workspace in crate::workspace::list(root, id)? {
-            paths.push(PathBuf::from("workspaces").join(&workspace.id));
-            paths.push(PathBuf::from("workspace-history").join(&workspace.id));
-            paths.push(PathBuf::from("editors").join(&workspace.id));
-        }
         let saved = Deletion {
             result: DeleteResult {
                 deleted_ea: id,
@@ -198,6 +193,18 @@ pub(crate) fn delete(
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+    // Admitted requests and run teardown may have allocated a workspace after
+    // the fence was written. Inventory only once both have fully quiesced.
+    // Keep existing journal entries and indices when resuming staged cleanup.
+    for workspace in crate::workspace::list(root, id)? {
+        for directory in ["workspaces", "workspace-history", "editors"] {
+            let relative = PathBuf::from(directory).join(&workspace.id);
+            if !deletion.paths.contains(&relative) {
+                deletion.paths.push(relative);
+            }
+        }
+    }
+    crate::topology::write_json_atomic(&path, &deletion)?;
     deletion.result.events_cancelled += scheduler.cancel_by_ea_checked(id)?;
     crate::topology::write_json_atomic(&path, &deletion)?;
     // Never remove another session's global backend registration.
@@ -340,6 +347,38 @@ mod tests {
         assert!(worker.join().unwrap().is_err());
         assert!(fenced(&root, 1));
         assert_eq!(ea::load_registry(&root).len(), 2);
+    }
+
+    #[test]
+    fn cleanup_includes_workspaces_created_while_admitted_work_drains() {
+        let (dir, scheduler, prefix) = fixture();
+        let root = dir.path();
+        let mut created = None;
+        delete(
+            root,
+            1,
+            &prefix,
+            &scheduler,
+            || {
+                let workspace =
+                    crate::workspace::Workspace::create(root, 1, "draining", "worker", None)?;
+                fs::write(workspace.worktree(root).join("sentinel"), "late state")?;
+                let editor = root.join("editors").join(&workspace.id);
+                fs::create_dir_all(&editor)?;
+                fs::write(editor.join("sentinel"), "late editor state")?;
+                created = Some(workspace.id);
+                Ok(())
+            },
+            |survivor| History::load_session(root)?.remove_ea(1, survivor),
+        )
+        .unwrap();
+        let id = created.unwrap();
+        for directory in ["workspaces", "workspace-history", "editors"] {
+            assert!(
+                !root.join(directory).join(&id).exists(),
+                "left {directory}/{id} after deletion"
+            );
+        }
     }
 
     #[test]
