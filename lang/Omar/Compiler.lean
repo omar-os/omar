@@ -1,4 +1,5 @@
 import Lean
+import Omar.Mutation
 
 open Lean
 
@@ -1060,7 +1061,8 @@ private def renderField (field : String × Json) : String :=
 private def instruction (op : String) (fields : List (String × Json) := []) : String :=
   "{" ++ String.intercalate ", " ((("op", toJson op) :: fields).map renderField) ++ "}"
 
-def compile (program : Program) : String :=
+/-- A program's instructions, `begin_plan` to `commit_plan`, each rendered. -/
+def instructionTexts (program : Program) : Array String :=
   let begin := instruction "begin_plan" [("team", toJson program.team)]
   let types := program.types.map fun declared =>
     let fields := [
@@ -1141,12 +1143,16 @@ def compile (program : Program) : String :=
       | none => []
     instruction "install_reaction" fields
   let commit := instruction "commit_plan"
-  let instructions :=
-    #[begin] ++ types ++ instances ++ agents ++ ports ++ timers ++ states ++ params ++ connections ++
-      reactions ++ #[commit]
+  #[begin] ++ types ++ instances ++ agents ++ ports ++ timers ++ states ++ params ++ connections ++
+    reactions ++ #[commit]
+
+private def renderBytecode (team : String) (instructions : Array String) : String :=
   let rendered := String.intercalate ",\n    " instructions.toList
-  "{\n  \"version\": 1,\n  \"team\": " ++ (toJson program.team).compress ++
+  "{\n  \"version\": 1,\n  \"team\": " ++ (toJson team).compress ++
     ",\n  \"instructions\": [\n    " ++ rendered ++ "\n  ]\n}\n"
+
+def compile (program : Program) : String :=
+  renderBytecode program.team (instructionTexts program)
 
 /-- What a string enum schema says: the values, and the `title` and
     `description` it may carry, which are shown to the agent. -/
@@ -1204,8 +1210,8 @@ private partial def parseSchemaImports (acc : Array (String × String)) :
 def schemaImports (source : String) : Except String (Array (String × String)) := do
   pure (← parseSchemaImports #[] (← lex source)).1
 
-def compileSourceWithSchemas (programName source : String)
-    (schemas : Array (String × String)) : Except String String := do
+def elaborateSourceWithSchemas (programName source : String)
+    (schemas : Array (String × String)) : Except String Program := do
   let (imports, tokens) ← parseSchemaImports #[] (← lex source)
   let types ← imports.mapM fun (name, path) => do
     let contents ← match schemas.find? (fun entry => entry.1 == path) with
@@ -1218,9 +1224,116 @@ def compileSourceWithSchemas (programName source : String)
            title := schema.title, description := schema.description : SchemaType }
   let aliases := types.map fun declared => (declared.name, declared.type)
   let program ← parse programName tokens aliases
-  pure (compile { program with types })
+  pure { program with types }
+
+def compileSourceWithSchemas (programName source : String)
+    (schemas : Array (String × String)) : Except String String :=
+  compile <$> elaborateSourceWithSchemas programName source schemas
 
 def compileSource (programName : String) (source : String) : Except String String :=
   compileSourceWithSchemas programName source #[]
+
+/-! ## Mutation
+
+A running program changed into another is bytecode too: the diff between the
+two, as instructions. Both programs arrive as source and are compiled here;
+the plan is what turns the first's bytecode into the second's.
+-/
+
+/-- A declaration's key: what pairs it with its counterpart in the other
+    program. -/
+private def declarationKey (instruction : Json) : Option Mutation.Key :=
+  let field (name : String) := (instruction.getObjValAs? String name).toOption.getD ""
+  match field "op" with
+  | "define_type" => some (.type, field "name")
+  | "declare_instance" => some (.inst, field "name")
+  | "spawn_agent" => some (.agent, field "name")
+  | "define_port" => some (.port, field "name")
+  | "declare_timer" => some (.timer, field "name")
+  | "declare_state" => some (.state, field "name")
+  | "declare_param" => some (.param, field "name")
+  | "connect_ports" => some (.connection, s!"{field "source"} -> {field "target"}")
+  | "install_reaction" => some (.reaction, field "id")
+  | _ => none
+
+/-- The instance a declaration belongs to; an instance belongs to itself. -/
+private def declarationOwner (instruction : Json) : Option String :=
+  let field (name : String) := (instruction.getObjValAs? String name).toOption.getD ""
+  match field "op" with
+  | "declare_instance" => some (field "name")
+  | "spawn_agent" | "define_port" | "declare_timer" | "declare_state" | "declare_param"
+  | "install_reaction" => some (field "instance")
+  | _ => none
+
+/-- The plan that turns program `old` into program `new`.
+
+    The plan itself is `Mutation.plan` and its bytecode `Mutation.emit`, both
+    proved correct in `Mutation.lean`; this keys both programs' declarations
+    and prints what they produce. Which declarations are replaced outright is
+    the one choice made here: an instance whose team, parent or arguments
+    changed is a different instance under the same name, so it and everything
+    in it is replaced. -/
+def compileDiff (old new : Program) : Except String String := do
+  let team := old.team
+  if team != new.team then
+    throw s!"a mutation keeps the program's main: the old program is '{team}', \
+      the new program is '{new.team}'"
+  let parse (program : Program) := (instructionTexts program).mapM fun text => do
+    pure (text, ← Json.parse text)
+  let old := (← parse old).map (·.2)
+  let new ← parse new
+  let keyed (instructions : Array Json) : List (Mutation.Key × Json) :=
+    instructions.toList.filterMap fun instruction =>
+      (declarationKey instruction).map (·, instruction)
+  let olds := keyed old
+  let news := keyed (new.map (·.2))
+  let decls (table : List (Mutation.Key × Json)) : Mutation.Program :=
+    table.map fun (key, instruction) => { key, body := instruction.compress }
+  let oldDecls := decls olds
+  let newDecls := decls news
+  -- What the proof assumes, and what verified bytecode guarantees.
+  unless (Mutation.keys oldDecls).Nodup do throw "the old program declares something twice"
+  unless (Mutation.keys newDecls).Nodup do throw "the new program declares something twice"
+  let lookup (table : List (Mutation.Key × Json)) (key : Mutation.Key) :=
+    (table.find? (·.1 == key)).map (·.2)
+  let differs (key : Mutation.Key) :=
+    (lookup olds key).map (·.compress) != (lookup news key).map (·.compress)
+  let replaced : List String := (olds ++ news).filterMap fun (key, instruction) =>
+    let inst := (declarationOwner instruction).getD ""
+    let both := (lookup olds (.inst, inst)).isSome && (lookup news (.inst, inst)).isSome
+    if both && (key.1 == .inst || key.1 == .param) && differs key then some inst else none
+  let forced (key : Mutation.Key) : Bool :=
+    match (lookup olds key).orElse fun _ => lookup news key with
+    | some instruction => (declarationOwner instruction).any fun inst =>
+        replaced.any fun r => inst == r || inst.startsWith (r ++ ".")
+    | none => false
+  let render : Mutation.Instr -> Except String String
+    | .removal op name => do
+      let some kind := Mutation.removalKind op | throw s!"no removal '{op}'"
+      let some removed := lookup olds (kind, name) | throw s!"nothing to remove at '{name}'"
+      let field (name : String) := toJson ((removed.getObjValAs? String name).toOption.getD "")
+      pure <| instruction op <| match kind with
+        | .connection => [("source", field "source"), ("target", field "target")]
+        | .reaction => [("id", field "id")]
+        | _ => [("name", field "name")]
+    | .declare d => match new.find? (fun (_, j) => declarationKey j == some d.key) with
+      | some (text, _) => pure text
+      | none => throw s!"nothing to declare at '{d.key.2}'"
+    | .update d => match new.find? (fun (_, j) => declarationKey j == some d.key) with
+      | some (text, _) =>
+        pure ("{\"op\": \"update_reaction\"" ++
+          (text.drop "{\"op\": \"install_reaction\"".length).toString)
+      | none => throw s!"nothing to update at '{d.key.2}'"
+  let body ← ((Mutation.plan forced oldDecls newDecls).map Mutation.emit).mapM render
+  pure (renderBytecode team
+    ((#[instruction "begin_mutation" [("team", toJson team)]] ++ body.toArray).push
+      (instruction "commit_plan")))
+
+def compileDiffSourcesWithSchemas
+    (oldName oldSource : String) (oldSchemas : Array (String × String))
+    (newName newSource : String) (newSchemas : Array (String × String)) :
+    Except String String := do
+  let old ← (elaborateSourceWithSchemas oldName oldSource oldSchemas).mapError (s!"old program: {·}")
+  compileDiff old (← elaborateSourceWithSchemas newName newSource newSchemas)
 
 end Omar
