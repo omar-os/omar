@@ -10,6 +10,20 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  repo-rules:
+    name: Repository Rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test the rules check
+        run: python3 tests/ci/repo_rules.py
+      # CONTRIBUTING.md rules 1 and 2: no added docs, no binary files.
+      - name: Check this change
+        run: .github/scripts/check-repo-rules.sh "${{ github.event.pull_request.base.sha || github.event.before }}"
+
   msrv:
     name: Minimum Rust 1.89
     runs-on: ubuntu-latest
@@ -257,6 +271,11 @@ jobs:
 
       - name: Test external schema imports
         run: python3 tests/ci/schema_imports.py
+      - name: Verify a running topology is mutated to a new program
+        run: |
+          sudo apt-get update && sudo apt-get install -y tmux
+          cargo build --bin omar
+          python3 tests/ci/team_mutation.py
 
       - name: Compile topology corpus to bytecode (offline)
         working-directory: lang
@@ -468,7 +487,11 @@ jobs:
                   if instruction["op"] == "declare_instance":
                       assert keys == ["op", "name", "parent", "team"], (path, keys)
                   if instruction["op"] == "declare_timer":
-                      assert keys == ["op", "instance", "name", "offset", "period"], (path, keys)
+                      # `shutdown` marks the trigger the run's last tag fires.
+                      assert keys in (
+                          ["op", "instance", "name", "offset", "period"],
+                          ["op", "instance", "name", "offset", "period", "shutdown"],
+                      ), (path, keys)
                   if instruction["op"] == "declare_state":
                       assert keys == ["op", "instance", "name", "type", "initial"], (path, keys)
                   # Every member names the container it belongs to, so a client
@@ -822,6 +845,14 @@ jobs:
           test -x "$RUNNER_TEMP/curl-old/omar"
           test ! -e "$RUNNER_TEMP/curl-old/omarc"
 
+  # This commit's install.sh on clean machines, as the omar.rs shim will run it
+  # once released. install-paths covers pinned versions and the compiler guard.
+  install-script:
+    name: Install Script
+    uses: ./.github/workflows/install.yml
+    with:
+      script: head
+
   build:
     name: Build
     runs-on: ${{ matrix.os }}
@@ -859,7 +890,7 @@ jobs:
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [msrv, pi-bridge, check, fmt, clippy, test, codex-shared-history, backend-supervision-contracts, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, build]
+    needs: [repo-rules, msrv, pi-bridge, check, fmt, clippy, test, codex-shared-history, backend-supervision-contracts, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, install-script, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: always()
@@ -882,6 +913,7 @@ jobs:
              [[ "${{ needs.dashboard-relaunch-handoff-integration.result }}" != "success" ]] || \
              [[ "${{ needs.opencode-compat.result }}" != "success" ]] || \
              [[ "${{ needs.install-paths.result }}" != "success" ]] || \
+             [[ "${{ needs.install-script.result }}" != "success" ]] || \
              [[ "${{ needs.build.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1

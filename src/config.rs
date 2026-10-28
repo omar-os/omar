@@ -112,7 +112,13 @@ fn detect_agent_command() -> String {
     let candidates: Vec<(&str, &str)> = crate::backend::ASSISTANT
         .iter()
         .map(|kind| crate::backend::of(*kind))
-        .map(|backend| (backend.executables()[0], backend.default_command()))
+        .map(|backend| backend.default_command())
+        .map(|command| {
+            (
+                command.split_whitespace().next().unwrap_or(command),
+                command,
+            )
+        })
         .collect();
     detect_agent_command_from(&candidates).unwrap_or_else(|| {
         crate::backend::of(crate::backend::Kind::Claude)

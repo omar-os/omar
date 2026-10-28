@@ -186,6 +186,27 @@ not present in an invocation, its interpolation expands to `<absent>`.
   crate and the bytecode are written to `src-gen/<program>/` beside the
   program — next to `src/` when the program is in one — and an unchanged
   program is not rebuilt.
+- `shutdown` is a trigger every team has without declaring it, and no team
+  may declare a name of its own by it. It fires once, at the run's last tag,
+  carrying that tag's timestamp. A body calls `request_stop()` to end the run:
+  the tag finishes, anything queued after it is dropped, and `shutdown` fires
+  one microstep later. A run that runs out of events fires it too. A body that
+  panics fails the run, so `assert!` in a `shutdown` reaction is a verdict:
+
+  ```omar
+  team Smoke {
+      input result : string
+      state seen : bool = false
+      timer deadline(10min, 0)
+      reaction(result) -> {= self.seen = true; request_stop(); =}
+      reaction(deadline) -> {= request_stop(); =}
+      reaction(shutdown) -> {= assert!(self.seen, "no result by the deadline"); =}
+  }
+
+  main { smoke = Smoke() }
+  ```
+
+  An operator's `omar stop` ends a run without `shutdown`.
 - `state round : int = 0` declares a value a reaction reads and writes as
   `self.round`. It starts at the literal and keeps its last value from one
   invocation to the next. Types are `int`, `bool`, `string`, so the value a
@@ -210,7 +231,7 @@ The expression after `->` declares the ports a reaction may set:
 - A bare typed effect requires the agent to set a value.
 - A bare untyped action emits a signal.
 
-Every trigger must be an input or action. Every effect must be an output or
+Every trigger must be an input, action, timer or `shutdown`. Every effect must be an output or
 action. A connection target must be an output or action, and its source and
 target types must match. Values must match their port types.
 
@@ -385,12 +406,21 @@ such a causality loop; use a delayed connection or action to cross a tag boundar
 ### 4.2 Agent protocol
 
 Topology agents do not address other agents. Each active invocation receives
-two scoped MCP tools:
+scoped MCP tools:
 
 ```text
-omar_set_port(invocation_id, port, value)
-omar_complete(invocation_id)
+omar_set_port(task_id, port, value)
+omar_complete(task_id)
 omar_pending()
+```
+
+`task_id` is a positive JSON integer identifying one execution, supplied in the
+task prompt or by `omar_pending`. Calls match it exactly and are checked against
+the calling agent; it is an identifier, not an authentication credential. IDs
+increase without reuse during a runtime process. For example:
+
+```json
+{"task_id": 7, "port": "answer", "value": "hello"}
 ```
 
 The invocation's trigger map contains only the declared triggers present at
@@ -455,19 +485,42 @@ with a person in it can be replayed by supplying the recorded writes.
 
 ## 5. Topology lifecycle
 
-Components have stable IDs derived from their qualified names. A compatible
-agent retains its process, context, memory, and active work across topology
-updates.
+Components have stable IDs: their qualified names (`n1.agent`, `n1.out`,
+`n1.out -> n2.token`). Reactions are named by position in their instance, so
+inserting one updates those after it.
 
-Mutation uses create-before-destroy:
+### 5.1 Mutation
 
-1. verify the installed revision;
-2. spawn new agents and install the new topology;
-3. atomically activate the new revision;
-4. drain obsolete reactions; and
-5. kill obsolete agents.
+`omar mutate RUN NEW.omar` (`POST /v1/runs/{id}/mutate`) changes a running or
+paused run's program. `NEW.omar` keeps `main`'s name; a renamed `main` is a
+different program and is refused.
 
-An active invocation finishes against the topology revision on which it began.
+1. pause: checkpoint at the next tag boundary, agents stopped (a paused run
+   skips this);
+2. the compiler diffs the old program's source, kept in the resume point
+   checkpoint, against the new one into a mutation plan (§6):
+   `omarc --diff OLD.omar NEW.omar PLAN.json`;
+3. the runtime checks the plan: applied to the old program it must yield
+   exactly the new one, or nothing happens;
+4. execute it on the checkpoint and publish the result as a `mutation`
+   checkpoint, the new resume point;
+5. resume (a run that was already paused stays paused).
+
+Executing a plan on a checkpoint:
+
+- matched by name, unchanged components keep their state, files and queued
+  events;
+- an instance whose team, parent or arguments changed is replaced whole, with
+  everything it contains: state from its initial values, a new empty
+  workspace;
+- a removed port or timer drops its queued events (reported); a removed
+  instance's workspace stays reachable from earlier checkpoints;
+- a new timer is armed from the last completed tag: `timer t(1s, …)` first
+  fires 1s after it;
+- every agent restarts with a fresh conversation, as on any resume.
+
+The checkpoint before a mutation holds the old program, so rolling back to it
+undoes the mutation. `--dry-run` prints the plan and changes nothing.
 
 ## 6. Bytecode
 
@@ -482,28 +535,54 @@ not accepted by the CLI.
 ```text
 BEGIN_PLAN team
 
+DEFINE_TYPE name type [title] [description]
+DECLARE_INSTANCE name team parent
 SPAWN_AGENT name backend
-KILL_AGENT name
-
 DEFINE_PORT kind name type [delay]
-REMOVE_PORT name
-
+DECLARE_TIMER name offset period
 DECLARE_STATE name type initial
-
+DECLARE_PARAM name type value
 CONNECT_PORTS source target [delay]
-
 INSTALL_REACTION id agent triggers effects contract prompt [body] [within]
-UPDATE_REACTION id triggers effects contract prompt within
-REMOVE_REACTION id
 
-ACTIVATE_TOPOLOGY revision
 COMMIT_PLAN
-ABORT_PLAN reason
 ```
 
-The initial construction subset consists of `BEGIN_PLAN`, `SPAWN_AGENT`,
-`DEFINE_PORT`, `CONNECT_PORTS`, `INSTALL_REACTION`, and `COMMIT_PLAN`. Mutation
-instructions are reserved for the next implementation stage.
+A program is `BEGIN_PLAN`, declarations, `COMMIT_PLAN`. A mutation plan is
+`BEGIN_MUTATION`, removals, then the declarations that are new or changed, then
+`COMMIT_PLAN`:
+
+```text
+BEGIN_MUTATION team
+
+REMOVE_REACTION id
+DISCONNECT_PORTS source target
+REMOVE_PARAM name
+REMOVE_STATE name
+REMOVE_TIMER name
+REMOVE_PORT name
+KILL_AGENT name
+REMOVE_INSTANCE name
+REMOVE_TYPE name
+
+UPDATE_REACTION id agent triggers effects contract prompt [body] [within]
+```
+
+Removals run in the reverse of declaration order. A changed declaration other
+than a reaction is removed and declared again; a changed reaction is updated.
+A mutation instruction in a program, or a plan whose result is not the new
+program, is rejected.
+
+Proved in `lang/Omar/Mutation.lean`, for any choice of what is replaced whole:
+
+- `plan_sound`: executing the plan on the old program's declarations yields
+  exactly the new program's;
+- `plan_minimal`: a declaration unchanged and not replaced is never touched;
+- `emit_sound` / `compiled_plan_sound`: the emitted instructions, run by the
+  bytecode semantics (`vm`), do what the plan does.
+
+Trusted, not proved: parsing each program's own instruction JSON back and
+printing the plan, and the Rust VM implementing `vm` (it re-checks each plan).
 
 JSON instruction fields are emitted in deterministic order with `op` first.
 Port and connection fields are ordered:
@@ -536,6 +615,7 @@ The compiler core is pure:
 parse          : String -> Except ParseError Syntax
 elaborate      : Syntax -> Except TypeError Topology
 compile        : Topology -> Except CompileError Bytecode
+compileDiff    : Topology -> Topology -> Except CompileError Bytecode
 verifyBytecode : Bytecode -> Except VerifyError VerifiedBytecode
 ```
 

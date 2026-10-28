@@ -1056,6 +1056,11 @@ fn handle_operation(server: &Serve, session: &mut Session, operation: Value) -> 
             target.id,
             operation["run"].as_str().context("run id required")?,
         ),
+        "mutate" => server.session_mutate(
+            target.id,
+            operation["run"].as_str().context("run id required")?,
+            &operation["request"],
+        ),
         "rollback" => server.session_rollback(
             target.id,
             operation["run"].as_str().context("run id required")?,
@@ -1573,7 +1578,9 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             // The runtime compiles what it is sent, so a program's imports go with it.
             let program = fs::read_to_string(&options.program)?;
             let files = crate::topology::imported_files(&options.program, &program)?;
-            let body=json!({"program":program,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces});
+            // The file name names a program whose `main` does not.
+            let filename = options.program.file_name().map(|name| name.to_string_lossy().into_owned());
+            let body=json!({"program":program,"filename":filename,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces});
             let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
             if owned { run["session"] = json!(s.name); }
             // One structured result: the admission record, or with --fg the terminal record.
@@ -1625,6 +1632,24 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             print_value(state)
         }),
         Some(Commands::Resume { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"resume","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(120))).and_then(print_value),
+        Some(Commands::Mutate { deployment, program, dry_run, wait }) => target(cli).and_then(|s| {
+            let ea = ea_selector(cli);
+            let source = fs::read_to_string(program)?;
+            let files = crate::topology::imported_files(program, &source)?;
+            let filename = program.file_name().map(|name| name.to_string_lossy().into_owned());
+            let request = json!({"program":source,"filename":filename,"files":files,"dry_run":dry_run});
+            let mut state = rpc(&s,json!({"op":"mutate","ea":ea,"run":deployment,"request":request}),Duration::from_secs(120))?;
+            // As long as a pause may take: the tag in progress closes first.
+            let deadline = Instant::now() + Duration::from_secs(420);
+            while *wait && state["mutation"]["status"] == "pending" && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(200));
+                state = rpc(&s,json!({"op":"status","ea":ea,"run":state["run_id"]}),Duration::from_secs(5))?;
+            }
+            if *wait && state.get("mutation").is_some() {
+                anyhow::ensure!(state["mutation"]["status"] == "applied", "mutation {}: {}", state["mutation"]["status"], state["mutation"]["error"]);
+            }
+            print_value(state)
+        }),
         Some(Commands::Rollback { deployment, checkpoint }) => target(cli).and_then(|s|rpc(&s,json!({"op":"rollback","ea":ea_selector(cli),"run":deployment,"checkpoint":checkpoint}),Duration::from_secs(10))).and_then(print_value),
         Some(Commands::Spawn{..}|Commands::List{..}|Commands::Kill{..}|Commands::Workspace{..}|Commands::Checkpoint{..}|Commands::Ea{action:EaAction::Event{..}}) => target(cli).and_then(|s| {
             let args=strip_target_args(std::env::args().skip(1));

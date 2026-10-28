@@ -36,6 +36,27 @@ team OrderedWrites[first : Codex,
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input result : string
+    state got_result : bool = false
+    timer deadline(10min, 0)
+
+    reaction(result) -> {=
+        if result.is_some() { self.got_result = true; }
+        if self.got_result { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_result, "no writes.result by the deadline");
+    =}
+}
+
 main {
     writes = OrderedWrites()
+
+    smoke = Smoke()
+    writes.result -> smoke.result
 }

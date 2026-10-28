@@ -52,6 +52,8 @@ import {
   fetchCheckpoint,
   fetchCheckpoints,
   fetchRunTimeline,
+  mutateRun,
+  fetchRunProgram,
   pauseRun,
   resumeRun,
   rollbackRun,
@@ -156,6 +158,18 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [checking, setChecking] = useState(false);
   const [applyingConfiguration, setApplyingConfiguration] = useState(false);
+  // What applying the edited source to the run would change, while the
+  // operator decides; and whether an applied change is still landing.
+  const [mutationPlan, setMutationPlan] = useState<{ fromAssistant: boolean } | null>(null);
+  /** The source the live run executes, which an edit is shown against. */
+  const [runningProgram, setRunningProgram] = useState<{ run: string; program: string } | null>(null);
+  const [mutating, setMutating] = useState(false);
+  /** What the source pane held before the assistant's change replaced it, so
+      declining the change puts the running program back. */
+  const declinedRef = useRef<{ source: string; design: ProposedDesign | null } | null>(null);
+  /** Takes a proposal that arrives while the run is live; set after render
+      so the chat subscription always reaches the current one. */
+  const proposeChangeRef = useRef<(design: ProposedDesign) => void>(() => {});
   /** Every tag the program passes through, projected or observed. */
   const [steps, setSteps] = useState<TimelineStep[]>([]);
   const [truncated, setTruncated] = useState(false);
@@ -429,7 +443,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     setError("");
     try {
       await answerPanel(serveUrl, run.run_id, {
-        invocation_id: invocation.invocation_id,
+        task_id: invocation.task_id,
         agent: invocation.agent,
         values,
       });
@@ -621,6 +635,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       if (replaying) replayedProposal = true;
       // A fresh proposal remains in the transcript while this chat's
       // deployed topology continues to own the live diagram and controls.
+      // A change to the live run, paused or not: shown as the plan that
+      // applies it rather than as a design to deploy.
+      if (!replaying && runRef.current && ["running", "paused"].includes(runRef.current.status)) {
+        proposeChangeRef.current(message.design);
+        return;
+      }
       if (!replaying && runRef.current && !isRunFinished(runRef.current.status)) return;
       if (!runRef.current || isRunFinished(runRef.current.status)) {
         // The proposal now owns the view. Disconnecting also invalidates any
@@ -831,6 +851,123 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     }
   }
 
+  /**
+   * Show what changing the run to `program` would do: the operator's edited
+   * source, or a program the assistant proposed for the live run.
+   */
+  async function previewMutation(program = source, files = design?.files, fromAssistant = false) {
+    const current = runRef.current;
+    if (!current || mutating) return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const { changes } = await mutateRun(serveUrl, current.run_id, {
+        program,
+        filename,
+        files,
+        dry_run: true,
+      });
+      if (scope !== scopeRef.current) return;
+      if (changes.length === 0) {
+        if (fromAssistant) restoreDeclined();
+        setError(fromAssistant
+          ? "OMAR's proposal matches what the run is executing; there is nothing to apply."
+          : "The source matches what the run is executing; there is nothing to apply.");
+        return;
+      }
+      setMutationPlan({ fromAssistant });
+      // The plan is shown above the source it came from.
+      setTab("source");
+      setInspectorWidth((width) => width || DEFAULT_INSPECTOR);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      if (fromAssistant) restoreDeclined();
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(fromAssistant ? `OMAR's proposal cannot be applied to this run: ${message}` : message);
+    }
+  }
+
+  /** Put back what the source pane held before the assistant's change. */
+  function restoreDeclined() {
+    const declined = declinedRef.current;
+    declinedRef.current = null;
+    if (!declined) return;
+    setSource(declined.source);
+    setDesign(declined.design);
+  }
+
+  function cancelMutation() {
+    if (mutationPlan?.fromAssistant) restoreDeclined();
+    declinedRef.current = null;
+    setMutationPlan(null);
+  }
+
+  useEffect(() => {
+    proposeChangeRef.current = (proposed) => {
+      if (mutating) return;
+      // The first change still pending keeps what the run really executes.
+      if (!declinedRef.current) declinedRef.current = { source, design };
+      setDesign(proposed);
+      setSource(proposed.program);
+      setSourceErrors([]);
+      void previewMutation(proposed.program, proposed.files, true);
+    };
+  });
+
+  /**
+   * Change the run to the edited source. A running run pauses at its next tag
+   * boundary, takes the change and resumes on its own, under a new diagram
+   * address; this follows it until it is back, then watches it again.
+   */
+  async function applyMutation() {
+    if (!run || mutating) return;
+    const scope = scopeRef.current;
+    setMutating(true);
+    setError("");
+    try {
+      let { record } = await mutateRun(serveUrl, run.run_id, {
+        program: source,
+        filename,
+        files: design?.files,
+      });
+      if (scope !== scopeRef.current) return;
+      setMutationPlan(null);
+      declinedRef.current = null;
+      if (!record) return;
+      runRef.current = record;
+      setRun(record);
+      const wasPaused = record.status === "paused";
+      // As long as a pause may take: the tag in progress closes first.
+      const deadline = Date.now() + 420_000;
+      while (
+        Date.now() < deadline &&
+        (record.mutation?.status === "pending" ||
+          record.status === "pausing" ||
+          record.status === "starting" ||
+          (!wasPaused && record.status === "paused"))
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        record = await fetchRun(serveUrl, record.run_id);
+        if (scope !== scopeRef.current) return;
+      }
+      runRef.current = record;
+      setRun(record);
+      setCheckpointEpoch((n) => n + 1);
+      if (record.mutation?.status === "failed") {
+        setError(`The change was not applied: ${record.mutation.error ?? "unknown error"}`);
+      }
+      if (record.status === "running" && record.diagram_address) {
+        setPhase("observing");
+        observe(record);
+      }
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (scope === scopeRef.current) setMutating(false);
+    }
+  }
+
   /** Move the resume point of a paused run back to the checkpoint picked on the timeline. */
   async function requestRollback(checkpoint: string) {
     if (!run || run.status !== "paused" || checkpoint === resumePoint) return;
@@ -999,6 +1136,19 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       .catch(() => {});
   }, [runId, serveUrl, checkpointEpoch]);
 
+  // What the run executes, refetched when a mutation or a rollback changes it.
+  const runLive = run ? ["running", "pausing", "paused"].includes(run.status) : false;
+  useEffect(() => {
+    if (!runId || !runLive) return;
+    const scope = scopeRef.current;
+    void fetchRunProgram(serveUrl, runId)
+      .then(({ program }) => {
+        if (scope === scopeRef.current) setRunningProgram({ run: runId, program });
+      })
+      .catch(() => {});
+  }, [runId, runLive, serveUrl, checkpointEpoch]);
+  const diffBase = runLive && runningProgram && runningProgram.run === runId ? runningProgram.program : null;
+
   // A run observed without a draft behind it (admitted over the API, or the
   // page reloaded) still gets its timeline: the daemon projects it from the
   // program it staged, so checkpoints have tags to sit on.
@@ -1058,6 +1208,17 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             }
           >
             {isPausing ? "Pausing…" : "Pause"}
+          </button>
+        ) : null}
+        {((phase === "observing" && run?.status === "running") || isPaused) && run ? (
+          <button
+            className="secondary-button"
+            onClick={() => void previewMutation()}
+            type="button"
+            disabled={mutating || sourceErrors.length > 0 || run.mutation?.status === "pending"}
+            title="Shows what changing the run to the edited source would do, then applies it"
+          >
+            {mutating || run.mutation?.status === "pending" ? "Applying…" : "Apply edits"}
           </button>
         ) : null}
         {(phase === "observing" || isPaused) && run ? (
@@ -1488,13 +1649,39 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           {tab === "source" ? (
             <>
             {Object.keys(design?.files ?? {}).length > 0 ? <button className="secondary-button" onClick={() => setFilesOpen(true)}>View companion files ({Object.keys(design?.files ?? {}).length})</button> : null}
+            {mutationPlan ? (
+              <section className="mutation-plan" aria-label="Mutation plan">
+                <strong>{mutationPlan.fromAssistant ? "OMAR proposes changes to the run" : "Apply your changes to the run?"}</strong>
+                <span>
+                  Review them in the source below: green lines are added, red lines removed.{" "}
+                  {run?.status === "paused"
+                    ? "The paused run takes them and stays paused."
+                    : "It pauses at the next tag boundary, changes, and resumes."}
+                </span>
+                <div className="mutation-plan-actions">
+                  <button className="primary-button" type="button" disabled={mutating} onClick={() => void applyMutation()}>
+                    {mutating ? "Applying…" : "Apply"}
+                  </button>
+                  <button className="secondary-button" type="button" disabled={mutating} onClick={cancelMutation}>
+                    {mutationPlan.fromAssistant ? "Decline" : "Cancel"}
+                  </button>
+                </div>
+              </section>
+            ) : null}
             <OmarEditor
               source={source}
+              base={diffBase}
               filename={filename}
               status={run ? run.status : "draft"}
               errors={sourceErrors}
               checking={checking}
-              onSourceChange={setSource}
+              onSourceChange={(next) => {
+                setSource(next);
+                // A plan describes the text it was made from; edited, the
+                // text is the operator's own.
+                setMutationPlan(null);
+                declinedRef.current = null;
+              }}
               onFilenameChange={setFilename}
             />
             </>

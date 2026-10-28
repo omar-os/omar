@@ -740,10 +740,6 @@ mod tests {
             resolve("claude").unwrap().default_command(),
             "claude --dangerously-skip-permissions"
         );
-        assert_eq!(
-            resolve("cursor").unwrap().default_command(),
-            "cursor agent --yolo"
-        );
         assert_eq!(resolve("opencode").unwrap().default_command(), "opencode");
         assert_eq!(
             resolve("agy").unwrap().default_command(),

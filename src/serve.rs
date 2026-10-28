@@ -113,11 +113,47 @@ pub struct RunRecord {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[ts(optional, type = "Record<string, unknown>")]
     pub state: BTreeMap<String, Value>,
+    /// The last mutation asked of the run, and how it went.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mutation: Option<MutationRecord>,
+}
+
+/// A mutation as a run's record reports it. A running run is paused first,
+/// so a mutation waits `pending` until the run reaches a tag boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct MutationRecord {
+    pub status: MutationStatus,
+    /// One line per instruction of the plan.
+    pub changes: Vec<String>,
+    /// Queued events the new program had no port or timer for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional, type = "Array<string>")]
+    pub dropped: Vec<String>,
+    /// The `mutation` checkpoint the run continues from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationStatus {
+    Pending,
+    Applied,
+    Failed,
 }
 
 #[derive(Debug, Deserialize)]
 struct StartRunRequest {
     program: String,
+    /// The source's file name, which names a program without a named `main`.
+    /// Must be a plain name ending in `.omar`; default `program.omar`.
+    #[serde(default)]
+    filename: Option<String>,
     /// Files the program imports, by the relative path it imports them under:
     /// `{"schemas/decision.json": "{...}"}` for
     /// `type Decision from "schemas/decision.json"`. The compiler resolves an
@@ -312,6 +348,9 @@ struct Context_ {
     /// whose program has no `Web` agent, which is what makes the panel routes
     /// 404 rather than offer an empty panel.
     panels: Panels,
+    /// Mutations waiting for their run to pause: the new program, compiled,
+    /// and the directory its source is staged in.
+    mutations: Mutex<BTreeMap<String, (topology::Bytecode, PathBuf)>>,
     chat: Arc<Mutex<Chat>>,
     /// Authenticates the EA's MCP sidecar on the agent-only endpoints.
     agent_token: Mutex<String>,
@@ -520,6 +559,20 @@ impl Serve {
         Ok(value)
     }
 
+    pub(crate) fn session_mutate(
+        &self,
+        ea: EaId,
+        selector: &str,
+        request: &Value,
+    ) -> Result<Value> {
+        let (context, id) = self.session_find(ea, selector, |run| {
+            matches!(run.status, RunStatus::Running | RunStatus::Paused)
+        })?;
+        let (status, value) = mutate_run(&context, &id, &serde_json::to_vec(request)?);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
     pub(crate) fn session_rollback(
         &self,
         ea: EaId,
@@ -686,6 +739,7 @@ impl Serve {
             health_idle_warning: config.health.idle_warning,
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
+            mutations: Mutex::default(),
             chat: Arc::new(Mutex::new(Chat {
                 latest_run: latest_parked,
                 subscribers: Vec::new(),
@@ -1423,6 +1477,12 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
                 .trim_end_matches("/snapshot");
             run_snapshot(&context, id)
         }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/program") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/program");
+            run_program(&context, id)
+        }
         ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/workspaces") => {
             let id = rest
                 .trim_start_matches("/v1/runs/")
@@ -1457,6 +1517,17 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
                 (413, json!({"error": "body too large"}))
             } else {
                 rollback_run(&context, &id, &read_body(content_length)?)
+            }
+        }
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/mutate") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/mutate")
+                .to_string();
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "body too large"}))
+            } else {
+                mutate_run(&context, &id, &read_body(content_length)?)
             }
         }
         ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/pause") => {
@@ -1944,6 +2015,7 @@ impl Workspaces {
             health_idle_warning: self.root.health_idle_warning,
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
+            mutations: Mutex::default(),
             chat: Arc::new(Mutex::new(Chat {
                 latest_run: latest_parked,
                 subscribers: Vec::new(),
@@ -2145,7 +2217,7 @@ fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
 /// message is indistinguishable from any other, and the EA answers in the
 /// terminal where nobody is looking. Topology agents get an `OMAR INVOCATION`
 /// envelope for the same reason.
-fn mission_control_envelope(text: &str, selection: &[String]) -> String {
+fn mission_control_envelope(text: &str, selection: &[String], live: Option<&LiveRun>) -> String {
     // Named on their own line so the EA can tell the operator's words from the
     // components they had highlighted while writing them.
     let selected = if selection.is_empty() {
@@ -2170,8 +2242,62 @@ fn mission_control_envelope(text: &str, selection: &[String]) -> String {
          OMAR program. Include companion files in `files`, keyed by their relative paths \
          (for example schemas/decision.json), so imported types compile. The entry \
          source is program.omar. The operator approves and runs it; you do not.\n\n\
-         {selected}{text}"
+         {live}{selected}{text}",
+        live = live.map(ToString::to_string).unwrap_or_default(),
     )
+}
+
+/// The run an operator's message may be about, while it still has a program
+/// to change.
+struct LiveRun {
+    team: String,
+    status: String,
+    program: PathBuf,
+}
+
+impl std::fmt::Display for LiveRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "The workflow `{team}` is {status}; the program it runs is {program}. \
+             To change it, edit that program and propose the complete result with \
+             `omar_propose_design`, keeping `main {team}`. The operator applies it to \
+             the live run, which keeps its state and files.\n\n",
+            team = self.team,
+            status = self.status,
+            program = self.program.display(),
+        )
+    }
+}
+
+/// This chat's run, if it is running or paused.
+fn live_run(context: &Context_) -> Option<LiveRun> {
+    let id = context
+        .chat
+        .lock()
+        .expect("serve chat poisoned")
+        .latest_run
+        .clone()?;
+    let record = context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .get(&id)?
+        .clone();
+    if !matches!(
+        record.status,
+        RunStatus::Starting | RunStatus::Running | RunStatus::Pausing | RunStatus::Paused
+    ) {
+        return None;
+    }
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(&id);
+    Some(LiveRun {
+        team: record.team,
+        status: crate::diagram::wire_name(&record.status).unwrap_or_default(),
+        program: staged_program(&run_dir)?,
+    })
 }
 
 fn deliver_to_ea(context: &Arc<Context_>, text: &str, selection: &[String]) -> Result<()> {
@@ -2183,7 +2309,7 @@ fn deliver_to_ea(context: &Arc<Context_>, text: &str, selection: &[String]) -> R
     );
     client.deliver_prompt(
         &session,
-        &mission_control_envelope(text, selection),
+        &mission_control_envelope(text, selection, live_run(context).as_ref()),
         &DeliveryOptions::default(),
     )?;
     Ok(())
@@ -2366,7 +2492,14 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
         .join("serve")
         .join(&run_id);
-    let program_path = run_dir.join("program.omar");
+    let filename = request.filename.as_deref().unwrap_or("program.omar");
+    if !filename.ends_with(".omar") || filename.contains('/') || filename.contains('\\') {
+        return (
+            400,
+            json!({"error": format!("'{filename}' is not a program file name: it must be a plain name ending in .omar")}),
+        );
+    }
+    let program_path = run_dir.join(filename);
     if let Err(error) =
         fs::create_dir_all(&run_dir).and_then(|_| fs::write(&program_path, &request.program))
     {
@@ -2375,7 +2508,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": format!("failed to stage program: {error}")}),
         );
     }
-    if let Err(message) = stage_files(&run_dir, "program.omar", &request.files) {
+    if let Err(message) = stage_files(&run_dir, filename, &request.files) {
         return (400, json!({"error": message}));
     }
 
@@ -2436,6 +2569,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             .collect(),
         outputs: BTreeMap::new(),
         state: BTreeMap::new(),
+        mutation: None,
     };
     persist_run(context, &record);
     context
@@ -2687,7 +2821,7 @@ fn stage_program(
 
 #[derive(Debug, Deserialize)]
 struct PanelAnswer {
-    invocation_id: String,
+    task_id: u64,
     agent: String,
     values: BTreeMap<String, Value>,
 }
@@ -2760,14 +2894,14 @@ fn panel_answer(context: &Arc<Context_>, run_id: &str, body: &[u8]) -> (u16, Val
         &access,
         &team,
         &answer.agent,
-        &answer.invocation_id,
+        &answer.task_id,
         &answer.values,
     ) {
         Ok(()) => (
             202,
             json!({
                 "run_id": run_id,
-                "invocation_id": answer.invocation_id,
+                "task_id": answer.task_id,
                 "sent": answer.values.keys().collect::<Vec<_>>()
             }),
         ),
@@ -2974,7 +3108,7 @@ fn pause_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
 
 /// One checkpoint as Mission Control lists it.
 fn checkpoint_summary(manifest: &crate::checkpoint::Manifest) -> Value {
-    json!({
+    let mut summary = json!({
         "id": manifest.id,
         "sequence": manifest.sequence,
         "parent": manifest.parent,
@@ -2982,7 +3116,15 @@ fn checkpoint_summary(manifest: &crate::checkpoint::Manifest) -> Value {
         "completed_tag": manifest.completed_tag,
         "next_tag": manifest.next_tag,
         "created_at": manifest.created_at,
-    })
+    });
+    if !manifest.mutation.is_empty() {
+        summary["mutation"] = json!(manifest
+            .mutation
+            .iter()
+            .map(crate::mutation::describe)
+            .collect::<Vec<_>>());
+    }
+    summary
 }
 
 /// The team whose live checkpoint directory is this run's, or why it is not:
@@ -3173,16 +3315,298 @@ fn rollback_run(context: &Arc<Context_>, id: &str, body: &[u8]) -> (u16, Value) 
         Ok(manifest) => manifest,
         Err(error) => return (409, json!({"error": format!("{error:#}")})),
     };
-    match store.set_head(&manifest.id) {
-        Ok(head) => (
-            200,
-            json!({
-                "resume_point": head.checkpoint_id,
-                "abandoned": head.abandoned,
-                "checkpoint": checkpoint_summary(&manifest),
-            }),
-        ),
-        Err(error) => (500, json!({"error": format!("{error:#}")})),
+    let head = match store.set_head(&manifest.id) {
+        Ok(head) => head,
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    // A rollback across a mutation goes back to the program it had then:
+    // its bytecode, and its source where the checkpoint kept it.
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id);
+    let restored = store.load(&manifest.id).and_then(|(_, _, bytecode)| {
+        fs::write(run_dir.join("program.json"), serde_json::to_vec(&bytecode)?)?;
+        if let Some(program) = store.source(&manifest.id)? {
+            let source = crate::checkpoint::Source::read(&program)?;
+            if let Some(old) = staged_program(&run_dir) {
+                fs::remove_file(old)?;
+            }
+            source.write(&run_dir)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = restored {
+        return (500, json!({"error": format!("{error:#}")}));
+    }
+    (
+        200,
+        json!({
+            "resume_point": head.checkpoint_id,
+            "abandoned": head.abandoned,
+            "checkpoint": checkpoint_summary(&manifest),
+        }),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct MutateRequest {
+    program: String,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    files: BTreeMap<String, String>,
+    /// Answer with the plan and change nothing.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Change a run's program to the one sent. A paused run is changed where it
+/// stands and stays paused. A running run is asked to pause; when it parks the
+/// mutation is applied and the run resumed (see `finish_run`), so a mutation
+/// sits on the timeline between the pause checkpoint and the resumed run. A
+/// program that does not compile, renames `main`, or changes nothing is
+/// answered at once and the run is not touched.
+fn mutate_run(context: &Arc<Context_>, id: &str, body: &[u8]) -> (u16, Value) {
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
+    let request: MutateRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    let (team, status) = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) => (record.team.clone(), record.status),
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    if !matches!(status, RunStatus::Running | RunStatus::Paused) {
+        return (
+            409,
+            json!({"error": format!("run is {}; only a running or paused run can mutate", crate::diagram::wire_name(&status).unwrap_or_default())}),
+        );
+    }
+    if context
+        .mutations
+        .lock()
+        .expect("serve mutations poisoned")
+        .contains_key(id)
+    {
+        return (
+            409,
+            json!({"error": "a mutation is already waiting for this run to pause"}),
+        );
+    }
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id);
+    let filename = request.filename.as_deref().unwrap_or("program.omar");
+    if !filename.ends_with(".omar") || filename.contains('/') || filename.contains('\\') {
+        return (
+            400,
+            json!({"error": format!("'{filename}' is not a program file name: it must be a plain name ending in .omar")}),
+        );
+    }
+    let staged = run_dir.join("mutation");
+    let _ = fs::remove_dir_all(&staged);
+    if let Err(error) =
+        fs::create_dir_all(&staged).and_then(|_| fs::write(staged.join(filename), &request.program))
+    {
+        return (
+            500,
+            json!({"error": format!("failed to stage program: {error}")}),
+        );
+    }
+    if let Err(message) = stage_files(&staged, filename, &request.files) {
+        return (400, json!({"error": message}));
+    }
+    let bytecode = match topology::load_staged_program(&staged.join(filename))
+        .and_then(|bytecode| topology::verify(&bytecode).map(|_| bytecode))
+    {
+        Ok(bytecode) => bytecode,
+        Err(error) => return (400, json!({"error": format!("{error:#}")})),
+    };
+    // The program the run would continue with: a paused run's resume point
+    // holds its source, a running one is executing what was last staged.
+    // The compiler plans the change from it.
+    let plan = if status == RunStatus::Paused {
+        crate::mutation::paused_source(&crate::deploy::dir_for(
+            &context.omar_dir,
+            context.ea_id,
+            &team,
+        ))
+    } else {
+        staged_program(&run_dir).context("the run's program is no longer staged")
+    }
+    .and_then(|from| topology::compile_mutation(&from, &staged.join(filename)));
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => return (400, json!({"error": format!("{error:#}")})),
+    };
+    let changes: Vec<String> = crate::mutation::changes(&plan)
+        .iter()
+        .map(crate::mutation::describe)
+        .collect();
+    if changes.is_empty() || request.dry_run {
+        let _ = fs::remove_dir_all(&staged);
+        return (200, json!({"changes": changes}));
+    }
+    if status == RunStatus::Paused {
+        let mutation = apply_staged(context, id, &bytecode, &staged);
+        let code = if mutation.status == MutationStatus::Applied {
+            200
+        } else {
+            409
+        };
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        return (code, json!(runs.get(id)));
+    }
+    context
+        .mutations
+        .lock()
+        .expect("serve mutations poisoned")
+        .insert(id.to_string(), (bytecode, staged));
+    let (code, value) = pause_run(context, id);
+    if code >= 400 {
+        context
+            .mutations
+            .lock()
+            .expect("serve mutations poisoned")
+            .remove(id);
+        return (code, value);
+    }
+    let mut runs = context.runs.lock().expect("serve runs poisoned");
+    match runs.get_mut(id) {
+        Some(record) => {
+            record.mutation = Some(MutationRecord {
+                status: MutationStatus::Pending,
+                changes,
+                dropped: Vec::new(),
+                checkpoint: None,
+                error: None,
+            });
+            persist_run(context, record);
+            (202, json!(record))
+        }
+        None => (404, json!({"error": "unknown run"})),
+    }
+}
+
+/// Apply a staged mutation to a paused run and record how it went. On success
+/// the staged source replaces the run's, so a resume, a restart and the
+/// timeline all read the new program.
+fn apply_staged(
+    context: &Arc<Context_>,
+    id: &str,
+    bytecode: &topology::Bytecode,
+    staged: &Path,
+) -> MutationRecord {
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id);
+    let outcome = staged_program(staged)
+        .context("the mutation's program is no longer staged")
+        .and_then(|source| {
+            crate::mutation::apply(&context.omar_dir, context.ea_id, bytecode, &source)
+        })
+        .and_then(|applied| {
+            if let Some(old) = staged_program(&run_dir) {
+                fs::remove_file(old)?;
+            }
+            promote(staged, &run_dir)?;
+            fs::write(run_dir.join("program.json"), serde_json::to_vec(bytecode)?)?;
+            Ok(applied)
+        });
+    let _ = fs::remove_dir_all(staged);
+    let mutation = match outcome {
+        Ok(Some(applied)) => MutationRecord {
+            status: MutationStatus::Applied,
+            changes: applied.changes,
+            dropped: applied.dropped,
+            checkpoint: Some(applied.checkpoint),
+            error: None,
+        },
+        Ok(None) => MutationRecord {
+            status: MutationStatus::Applied,
+            changes: Vec::new(),
+            dropped: Vec::new(),
+            checkpoint: None,
+            error: None,
+        },
+        Err(error) => MutationRecord {
+            status: MutationStatus::Failed,
+            changes: Vec::new(),
+            dropped: Vec::new(),
+            checkpoint: None,
+            error: Some(format!("{error:#}")),
+        },
+    };
+    let mut runs = context.runs.lock().expect("serve runs poisoned");
+    if let Some(record) = runs.get_mut(id) {
+        record.mutation = Some(mutation.clone());
+        persist_run(context, record);
+    }
+    mutation
+}
+
+/// Move everything staged in `from` into `to`, replacing what is there.
+fn promote(from: &Path, to: &Path) -> Result<()> {
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            fs::create_dir_all(&target)?;
+            promote(&entry.path(), &target)?;
+        } else {
+            fs::rename(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// A run that parked with a mutation waiting: apply it, then resume. Resumed
+/// even when the mutation failed, as the program it had, since the pause was
+/// the mutation's and not the operator's; not resumed while the runtime is
+/// shutting down, which wanted the run paused anyway.
+fn complete_mutation(context: &Arc<Context_>, run_id: &str) {
+    let Some((bytecode, staged)) = context
+        .mutations
+        .lock()
+        .expect("serve mutations poisoned")
+        .remove(run_id)
+    else {
+        return;
+    };
+    let paused = context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .get(run_id)
+        .is_some_and(|record| record.status == RunStatus::Paused);
+    if !paused {
+        let _ = fs::remove_dir_all(&staged);
+        let mut runs = context.runs.lock().expect("serve runs poisoned");
+        if let Some(record) = runs.get_mut(run_id) {
+            if let Some(mutation) = record.mutation.as_mut() {
+                mutation.status = MutationStatus::Failed;
+                mutation.error = Some("the run ended before it paused".to_string());
+            }
+            persist_run(context, record);
+        }
+        return;
+    }
+    let _ = apply_staged(context, run_id, &bytecode, &staged);
+    if context.shutdown.load(Ordering::SeqCst) {
+        return;
+    }
+    let (code, value) = resume_run(context, run_id);
+    if code >= 400 {
+        eprintln!(
+            "run {run_id} did not resume after its mutation: {}",
+            value["error"]
+        );
     }
 }
 
@@ -3209,16 +3633,15 @@ fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
             None => return (404, json!({"error": "unknown run"})),
         }
     };
-    let program_path = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
         .join("serve")
-        .join(id)
-        .join("program.omar");
-    if !program_path.exists() {
+        .join(id);
+    let Some(program_path) = staged_program(&run_dir) else {
         return (
             409,
-            json!({"error": format!("the run's program is no longer staged at {}", program_path.display())}),
+            json!({"error": format!("the run's program is no longer staged in {}", run_dir.display())}),
         );
-    }
+    };
     {
         let mut runs = context.runs.lock().expect("serve runs poisoned");
         if let Some(active) = find_active_run(&runs, &team).filter(|other| other.run_id != id) {
@@ -3257,6 +3680,15 @@ fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
             (502, json!({"error": message}))
         }
     }
+}
+
+/// A run's source, staged under the name it was started with. Imports are
+/// schemas, never `.omar`, so it is the only one there.
+fn staged_program(run_dir: &Path) -> Option<std::path::PathBuf> {
+    fs::read_dir(run_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "omar"))
 }
 
 /// A run's record on disk, beside its staged program. Written whenever the
@@ -3440,6 +3872,38 @@ fn run_snapshot(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     }
 }
 
+/// The source a run executes now: what it was started with, or what a
+/// mutation or a rollback last made it. What an edit is compared against.
+fn run_program(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    if !context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .contains_key(id)
+    {
+        return (404, json!({"error": "unknown run"}));
+    }
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id);
+    let Some(path) = staged_program(&run_dir) else {
+        return (
+            404,
+            json!({"error": "the run's program is no longer staged"}),
+        );
+    };
+    match fs::read_to_string(&path) {
+        Ok(program) => (
+            200,
+            json!({
+                "filename": path.file_name().map(|name| name.to_string_lossy()),
+                "program": program,
+            }),
+        ),
+        Err(error) => (500, json!({"error": format!("{error:#}")})),
+    }
+}
+
 /// What the daemon records once a run's loop returns, however it returned.
 fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::RunOutcome>) {
     // The run is over, so its invocation service is gone with it. Leaving
@@ -3474,6 +3938,8 @@ fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::R
         }
         persist_run(context, record);
     }
+    drop(runs);
+    complete_mutation(context, run_id);
 }
 
 fn spawn_resume_thread(
@@ -3891,6 +4357,7 @@ mod tests {
             present: Vec::new(),
             outputs: BTreeMap::new(),
             state: BTreeMap::new(),
+            mutation: None,
         }
     }
 
@@ -4313,6 +4780,7 @@ mod tests {
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    mutation: None,
                 },
             );
             finish_run(
@@ -4612,6 +5080,7 @@ while True:
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    mutation: None,
                 },
             );
         }
@@ -4681,6 +5150,7 @@ while True:
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    mutation: None,
                 },
             );
         }
@@ -4731,8 +5201,11 @@ while True:
                 elapsed_ns: state.elapsed_ns,
                 workspaces: BTreeMap::new(),
                 agents: BTreeMap::new(),
+                mutation: Vec::new(),
             };
-            store.publish(&manifest, &state, &program).expect("publish");
+            store
+                .publish(&manifest, &state, &program, None)
+                .expect("publish");
             ids.push(manifest.id);
         }
         let response = request(address, "GET", "/v1/runs/run-1/checkpoints", None);
@@ -4832,6 +5305,7 @@ while True:
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    mutation: None,
                 },
             );
         }
@@ -4968,6 +5442,7 @@ while True:
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    mutation: None,
                 },
             );
         }
@@ -4992,6 +5467,44 @@ while True:
         assert!(request(address, "GET", "/v1/runs/run-1", None).contains("\"status\":\"paused\""));
     }
 
+    /// An edit is compared against the source the run executes now, which
+    /// the run's program route serves from where the run keeps it.
+    #[test]
+    fn a_run_serves_the_source_it_executes() {
+        let server = test_server();
+        let address = server.address();
+        server.context.runs.lock().expect("runs").insert(
+            "run-1".to_string(),
+            RunRecord {
+                run_id: "run-1".to_string(),
+                team: "Morph".to_string(),
+                status: RunStatus::Running,
+                diagram_address: None,
+                started_at: 0,
+                finished_at: None,
+                error: None,
+                present: Vec::new(),
+                outputs: BTreeMap::new(),
+                state: BTreeMap::new(),
+                mutation: None,
+            },
+        );
+        assert!(request(address, "GET", "/v1/runs/run-1/program", None).contains(" 404 "));
+        assert!(request(address, "GET", "/v1/runs/nobody/program", None).contains(" 404 "));
+        let run_dir = crate::ea::ea_state_dir(server.context.ea_id, &server.context.omar_dir)
+            .join("serve")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(run_dir.join("Morph.omar"), "main Morph {}\n").unwrap();
+        let response = request(address, "GET", "/v1/runs/run-1/program", None);
+        assert!(
+            response.contains(" 200 ")
+                && response.contains("\"filename\":\"Morph.omar\"")
+                && response.contains("\"program\":\"main Morph {}\\n\""),
+            "{response}"
+        );
+    }
+
     /// A paused run has no runner to ask, so a stop gives it up in place,
     /// which frees its team; it cannot be resumed afterwards.
     #[test]
@@ -5013,6 +5526,7 @@ while True:
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    mutation: None,
                 },
             );
         }
@@ -5070,7 +5584,7 @@ while True:
             server.address(),
             "POST",
             "/v1/runs/nope/panel",
-            Some(r#"{"invocation_id":"i","agent":"panel","values":{}}"#),
+            Some(r#"{"task_id":1,"agent":"panel","values":{}}"#),
         );
         assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
         assert!(response.contains("unknown run"), "{response}");
@@ -5090,6 +5604,24 @@ while True:
             "{response}"
         );
         assert!(response.contains("invalid request"), "{response}");
+    }
+
+    /// Resume finds the source under the name the run was started with, and
+    /// still finds a run staged before runs kept their names.
+    #[test]
+    fn a_staged_program_is_found_under_its_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(staged_program(dir.path()), None);
+        fs::create_dir(dir.path().join("schemas")).unwrap();
+        fs::write(dir.path().join("schemas/decision.json"), "{}").unwrap();
+        fs::write(dir.path().join("HR.omar"), "").unwrap();
+        assert_eq!(staged_program(dir.path()), Some(dir.path().join("HR.omar")));
+        let legacy = tempfile::tempdir().unwrap();
+        fs::write(legacy.path().join("program.omar"), "").unwrap();
+        assert_eq!(
+            staged_program(legacy.path()),
+            Some(legacy.path().join("program.omar"))
+        );
     }
 
     #[test]
@@ -5224,7 +5756,7 @@ while True:
     #[test]
     fn operator_messages_are_labelled_with_how_to_answer() {
         // Without this the EA answers in its pane, where nobody is looking.
-        let envelope = mission_control_envelope("review the release plan", &[]);
+        let envelope = mission_control_envelope("review the release plan", &[], None);
         assert!(envelope.starts_with("OMAR MISSION CONTROL"));
         assert!(envelope.contains("omar_reply"));
         assert!(envelope.contains("omar_propose_design"));
@@ -5243,6 +5775,7 @@ while True:
         let envelope = mission_control_envelope(
             "give this one a retry",
             &["n1.agent".to_string(), "n1.out".to_string()],
+            None,
         );
 
         assert!(envelope.contains("n1.agent, n1.out"), "{envelope}");
@@ -5256,13 +5789,32 @@ while True:
     }
 
     #[test]
+    fn a_live_run_tells_the_ea_how_to_change_it() {
+        // "Add a keeper" mid-run means this run's program, changed in place.
+        let live = LiveRun {
+            team: "Morph".into(),
+            status: "running".into(),
+            program: PathBuf::from("/state/serve/run-1/Morph.omar"),
+        };
+        let envelope = mission_control_envelope("add a keeper", &[], Some(&live));
+        assert!(envelope.contains("`Morph` is running"), "{envelope}");
+        assert!(
+            envelope.contains("/state/serve/run-1/Morph.omar"),
+            "{envelope}"
+        );
+        assert!(envelope.contains("keeping `main Morph`"), "{envelope}");
+        assert!(envelope.ends_with("add a keeper"), "{envelope}");
+        assert!(!mission_control_envelope("add a keeper", &[], None).contains("Morph"));
+    }
+
+    #[test]
     fn an_empty_selection_adds_nothing_to_the_envelope() {
         // Most messages have no selection; they should read exactly as before.
         assert_eq!(
-            mission_control_envelope("plain question", &[]),
-            mission_control_envelope("plain question", &[]),
+            mission_control_envelope("plain question", &[], None),
+            mission_control_envelope("plain question", &[], None),
         );
-        assert!(!mission_control_envelope("plain question", &[]).contains("selected"));
+        assert!(!mission_control_envelope("plain question", &[], None).contains("selected"));
     }
 
     #[test]
