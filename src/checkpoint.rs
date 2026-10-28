@@ -65,6 +65,9 @@ pub enum Trigger {
     Automatic,
     Manual,
     Pause,
+    /// Not captured from a running loop: written while the run was paused,
+    /// from the checkpoint before it with the program changed.
+    Mutation,
 }
 
 /// How often a run checkpoints on its own. Physical time is the default: a
@@ -268,6 +271,10 @@ pub struct Manifest {
     pub elapsed_ns: u64,
     pub workspaces: BTreeMap<String, ArtifactRef>,
     pub agents: BTreeMap<String, AgentContext>,
+    /// For a `mutation` checkpoint, the plan that turned its parent's program
+    /// into this one's, between `begin_mutation` and `commit_plan`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutation: Vec<crate::topology::Instruction>,
 }
 
 /// Where a run's checkpoints live, beneath its deployment directory and so
@@ -279,6 +286,8 @@ pub struct Store {
 const LATEST: &str = "latest";
 const HEAD: &str = "head.json";
 const STAGING_PREFIX: &str = ".staging-";
+/// The program source a checkpoint keeps beside its bytecode.
+const SOURCE: &str = "source";
 
 /// Which checkpoint a resume continues from. Normally the latest; a rollback
 /// moves it to an older one and records what it left behind.
@@ -324,6 +333,46 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// A program's source as it was compiled: its `.omar` file and the files it
+/// imports, by path relative to the program's directory. A checkpoint keeps
+/// the source of the program it runs, so a mutation can diff it against a new
+/// one and a rollback can put it back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Source(pub BTreeMap<PathBuf, Vec<u8>>);
+
+impl Source {
+    /// Read the program at `program` and what it imports from beside it.
+    pub fn read(program: &Path) -> Result<Self> {
+        let text =
+            fs::read_to_string(program).with_context(|| format!("read {}", program.display()))?;
+        let dir = program.parent().unwrap_or_else(|| Path::new("."));
+        let mut files = BTreeMap::from([(
+            PathBuf::from(program.file_name().context("program has no file name")?),
+            text.clone().into_bytes(),
+        )]);
+        for (_, path) in crate::topology::imports_of(&text) {
+            if crate::topology::is_local_import(&path) {
+                let bytes =
+                    fs::read(dir.join(&path)).with_context(|| format!("read import {path}"))?;
+                files.insert(PathBuf::from(path), bytes);
+            }
+        }
+        Ok(Self(files))
+    }
+
+    /// Write the files under `dir`, replacing any already there.
+    pub fn write(&self, dir: &Path) -> Result<()> {
+        for (path, bytes) in &self.0 {
+            let target = dir.join(path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            write_synced(&target, bytes)?;
+        }
+        Ok(())
+    }
+}
+
 /// Replace a pointer file durably: synced temporary, rename, synced
 /// directory. A crash leaves the old pointer or the new one, never a torn
 /// file that a loader cannot read.
@@ -363,6 +412,7 @@ impl Store {
         manifest: &Manifest,
         state: &ExecutionState,
         program: &Value,
+        source: Option<&Source>,
     ) -> Result<PathBuf> {
         valid_id(&manifest.id)?;
         anyhow::ensure!(manifest.version == FORMAT, "unsupported checkpoint format");
@@ -383,6 +433,11 @@ impl Store {
         let result = (|| -> Result<PathBuf> {
             write_synced(&staging.join("state.json"), &state_bytes)?;
             write_synced(&staging.join("program.json"), &program_bytes)?;
+            if let Some(source) = source {
+                let dir = staging.join(SOURCE);
+                fs::create_dir(&dir)?;
+                source.write(&dir)?;
+            }
             write_synced(
                 &staging.join("manifest.json"),
                 &serde_json::to_vec_pretty(manifest)?,
@@ -510,6 +565,22 @@ impl Store {
             }
         }
         bail!("no checkpoint '{id}'")
+    }
+
+    /// The `.omar` program checkpoint `id` runs, among its saved source;
+    /// `None` for a checkpoint published without its source.
+    pub fn source(&self, id: &str) -> Result<Option<PathBuf>> {
+        let dir = self.find(id)?.join(SOURCE);
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_file() && path.extension().is_some_and(|e| e == "omar") {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
     }
 
     pub fn load(&self, id: &str) -> Result<(Manifest, ExecutionState, Value)> {
@@ -697,6 +768,7 @@ mod tests {
             elapsed_ns: state.elapsed_ns,
             workspaces: BTreeMap::new(),
             agents: BTreeMap::new(),
+            mutation: Vec::new(),
         }
     }
 
@@ -758,9 +830,9 @@ mod tests {
         let program = json!({"version": 1});
         assert!(store.latest().unwrap().is_none());
         let first = manifest(1, &state(10), &program);
-        store.publish(&first, &state(10), &program).unwrap();
+        store.publish(&first, &state(10), &program, None).unwrap();
         let second = manifest(2, &state(20), &program);
-        store.publish(&second, &state(20), &program).unwrap();
+        store.publish(&second, &state(20), &program, None).unwrap();
         assert_eq!(store.latest().unwrap().unwrap().id, second.id);
         let (loaded, loaded_state, _) = store.load(&first.id).unwrap();
         assert_eq!(loaded, first);
@@ -772,7 +844,7 @@ mod tests {
         fs::write(staging.join("manifest.json"), b"{").unwrap();
         // A complete checkpoint whose `latest` pointer never landed still wins.
         let third = manifest(3, &state(30), &program);
-        store.publish(&third, &state(30), &program).unwrap();
+        store.publish(&third, &state(30), &program, None).unwrap();
         fs::write(store.dir().join(LATEST), second.id.as_bytes()).unwrap();
         assert_eq!(store.latest().unwrap().unwrap().id, third.id);
         let (listed, problems) = store.list().unwrap();
@@ -782,7 +854,7 @@ mod tests {
         // A hash mismatch or wrong format is refused, and the rest survive.
         let mut forged = manifest(4, &state(40), &program);
         forged.state_sha256 = sha256(b"other");
-        assert!(store.publish(&forged, &state(40), &program).is_err());
+        assert!(store.publish(&forged, &state(40), &program, None).is_err());
         let tampered = store.find(&third.id).unwrap().join("state.json");
         fs::write(&tampered, serde_json::to_vec_pretty(&state(31)).unwrap()).unwrap();
         let (listed, problems) = store.list().unwrap();
@@ -797,14 +869,45 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpoint_keeps_the_source_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let program_dir = dir.path().join("program");
+        fs::create_dir_all(program_dir.join("schemas")).unwrap();
+        fs::write(
+            program_dir.join("flow.omar"),
+            "type Report from \"schemas/report.json\"\nmain Flow {}\n",
+        )
+        .unwrap();
+        fs::write(program_dir.join("schemas/report.json"), b"{}").unwrap();
+        fs::write(program_dir.join("unrelated.txt"), b"not imported").unwrap();
+        let source = Source::read(&program_dir.join("flow.omar")).unwrap();
+        assert_eq!(
+            source.0.keys().collect::<Vec<_>>(),
+            [Path::new("flow.omar"), Path::new("schemas/report.json")]
+        );
+        let store = Store::new(&dir.path().join("checkpoints"));
+        let program = json!({"version": 1});
+        let first = manifest(1, &state(1), &program);
+        store
+            .publish(&first, &state(1), &program, Some(&source))
+            .unwrap();
+        let second = manifest(2, &state(2), &program);
+        store.publish(&second, &state(2), &program, None).unwrap();
+        let kept = store.source(&first.id).unwrap().unwrap();
+        assert!(kept.ends_with("source/flow.omar"), "{}", kept.display());
+        assert_eq!(Source::read(&kept).unwrap(), source);
+        assert!(store.source(&second.id).unwrap().is_none());
+    }
+
+    #[test]
     fn rollback_moves_the_head_and_keeps_the_abandoned_branch() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
         let program = json!({"version": 1});
         let first = manifest(1, &state(1), &program);
         let second = manifest(2, &state(2), &program);
-        store.publish(&first, &state(1), &program).unwrap();
-        store.publish(&second, &state(2), &program).unwrap();
+        store.publish(&first, &state(1), &program, None).unwrap();
+        store.publish(&second, &state(2), &program, None).unwrap();
         assert_eq!(store.resume_point().unwrap().unwrap().id, second.id);
         let head = store.set_head(&first.id).unwrap();
         assert_eq!(head.abandoned.as_deref(), Some(second.id.as_str()));
@@ -825,8 +928,8 @@ mod tests {
         let first = manifest(1, &state(1), &program);
         let mut second = manifest(2, &state(2), &program);
         second.parent = Some(first.id.clone());
-        store.publish(&first, &state(1), &program).unwrap();
-        store.publish(&second, &state(2), &program).unwrap();
+        store.publish(&first, &state(1), &program, None).unwrap();
+        store.publish(&second, &state(2), &program, None).unwrap();
         // The crash: the second checkpoint is complete, the head still names the first.
         let stale = Head {
             checkpoint_id: first.id.clone(),
@@ -852,7 +955,7 @@ mod tests {
         assert!(store.archive().unwrap().is_none(), "nothing to archive");
         let program = json!({"version": 1});
         store
-            .publish(&manifest(1, &state(1), &program), &state(1), &program)
+            .publish(&manifest(1, &state(1), &program), &state(1), &program, None)
             .unwrap();
         let archived = store.archive().unwrap().unwrap();
         assert!(

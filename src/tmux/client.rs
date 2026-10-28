@@ -892,7 +892,7 @@ impl TmuxClient {
             && (error.contains("can't find session")
                 || error.contains("no server running")
                 || error.contains("no sessions")
-                // The last session was just killed and the server is exiting.
+                // Asked while it shut down after its last session: none left.
                 || error.contains("server exited unexpectedly")
                 || (error.contains("error connecting to")
                     && (error.contains("No such file or directory")
