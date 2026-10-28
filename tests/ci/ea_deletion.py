@@ -110,6 +110,16 @@ with tempfile.TemporaryDirectory(prefix="omar-delete-") as folder:
         record = cli("info", "-s", session["name"])["session"]
         assert (record["pid"], record["incarnation"], record["state"]) == (session["pid"], session["incarnation"], "ready"), record
 
+    def wait_run(session, run, expected):
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            status = cli("-s", session["name"], "status", run)["status"]
+            if status == expected:
+                return
+            assert status != "failed", status
+            time.sleep(.1)
+        raise AssertionError((run, expected, status))
+
     def mcp(session, actor, name, arguments):
         context = Path(session["directory"]) / f"mcp/ea-{actor}/context.json"
         # Deliberately inherit another session; the context's owner must win.
@@ -231,6 +241,7 @@ with tempfile.TemporaryDirectory(prefix="omar-delete-") as folder:
         survivor = cli("-s", "outer", "ea", "create", "--name", "survivor")["id"]
         assert survivor > active
         cli("-s", "outer", "ea", "start", str(survivor))
+        survivor_run = cli("-s", "outer", "--ea", str(survivor), "start", str(program))["run_id"]
         chats = http(outer, "/v1/chats")[1]["conversations"]
         chat = next(chat["id"] for chat in chats if chat["ea_id"] == survivor)
         context = json.loads((state / f"mcp/ea-{survivor}/context.json").read_text())
@@ -240,6 +251,8 @@ with tempfile.TemporaryDirectory(prefix="omar-delete-") as folder:
         assert not result.get("isError"), result
         assert [ea["id"] for ea in cli("-s", "outer", "ea", "list")] == [survivor]
         assert not (state / "ea/0").exists()
+        wait_run(outer, survivor_run, "running")
+        assert tmux(outer, "has-session", "-t", f"=omar-agent-ea-{survivor}").returncode == 0
         assert http(outer, f"/chats/{chat}/v1/chat")[1]["messages"][0]["text"] == "survivor history"
         assert any(event["ea_id"] == survivor for event in json.loads((state / "scheduled_events.json").read_text()))
         ready(outer)
@@ -248,6 +261,9 @@ with tempfile.TemporaryDirectory(prefix="omar-delete-") as folder:
         cli("down", "-s", "outer")
         restarted = cli("up", "--name", "outer", "--no-ea", "--json")
         outer.update(restarted)
+        wait_run(outer, survivor_run, "paused")
+        cli("-s", "outer", "resume", survivor_run)
+        wait_run(outer, survivor_run, "running")
         assert http(outer, f"/chats/{chat}/v1/chat")[1]["messages"][0]["text"] == "survivor history"
         assert not (state / "ea/0").exists()
         attach(outer)
