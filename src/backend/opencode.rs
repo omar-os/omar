@@ -30,8 +30,10 @@ impl Backend for Opencode {
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         from_stamp(target.stamp?).map(|(_, session)| session)
     }
+    /// Single words: a long workspace path wraps the footer and splits
+    /// "tab agents" and "ctrl+p commands" across lines.
     fn readiness_markers(&self) -> &'static [&'static str] {
-        &["tab agents", "ctrl+p commands"]
+        &["tab", "agents", "ctrl+p", "commands"]
     }
     /// opencode has no `--append-system-prompt`, and `--prompt` is treated
     /// as the first user message, which makes the model read the agent
@@ -331,6 +333,17 @@ pub(crate) fn split_response(response: &str) -> Option<(u16, String)> {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn a_footer_wrapped_by_a_long_path_still_reads_as_ready() {
+        let screen = "  ┃  Build · GPT-5.6 Terra Fast OpenAI\n\
+            \x20  /tmp/omar/sessions/cosmic- tab      ctrl+p\n\
+            \x20  badger/workspaces/0c4c37e5agents   commands\n";
+        assert!(Opencode
+            .readiness_markers()
+            .iter()
+            .all(|marker| screen.contains(marker)));
+    }
 
     #[test]
     fn native_resume_waits_for_startup_and_only_creates_when_history_is_missing() {

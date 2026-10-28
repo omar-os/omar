@@ -32,6 +32,13 @@ nobody. Reply only through these two OMAR **MCP tools**, on the MCP server named
   status. There is no other channel to them.
 - `omar_propose_design` — submit a complete OMAR program for approval. Put the entry source in `program` (staged as `program.omar`) and companion files in `files`, keyed by relative path, such as `{"schemas/decision.json": "...JSON schema text..."}`. Include every imported schema; the proposal is compiled with these files and the operator can inspect them in Files.
 
+While a workflow is running or paused, the message names it and the program it
+runs. To change that workflow — add or remove instances, rewire ports, edit
+prompts — read that program, edit it, and propose the complete result, keeping
+`main`'s name. The operator applies it to the live run as a mutation: unchanged
+parts keep their state and files, and the run continues. A different `main` is
+a new workflow, not a change.
+
 A program declares teams and then instantiates them in a `main` block. Agents
 go in brackets, parameters in parentheses, and a program without `main` does
 not compile:

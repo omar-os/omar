@@ -149,7 +149,7 @@ export function runClockAt(
 
 /** One invocation a `Web` agent is waiting on, as the daemon reports it. */
 export type PendingInvocation = {
-  invocation_id: string;
+  task_id: number;
   agent: string;
   reaction: string;
   contract: string;

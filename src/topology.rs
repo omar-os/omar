@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,7 +29,7 @@ pub struct Bytecode {
     pub instructions: Vec<Instruction>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Instruction {
     BeginPlan {
@@ -102,6 +102,9 @@ pub enum Instruction {
         period: u64,
         #[serde(default)]
         instance: String,
+        /// `shutdown`: fired once at the run's last tag, not by the clock.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        shutdown: bool,
     },
     ConnectPorts {
         source: String,
@@ -129,6 +132,55 @@ pub enum Instruction {
         within: Option<u64>,
     },
     CommitPlan,
+    /// Opens a mutation plan: what turns the running program into a new one.
+    /// Everything below up to `commit_plan` is the diff, removals first; the
+    /// rest of the program is left as it was.
+    BeginMutation {
+        team: String,
+    },
+    RemoveType {
+        name: String,
+    },
+    RemoveInstance {
+        name: String,
+    },
+    KillAgent {
+        name: String,
+    },
+    RemovePort {
+        name: String,
+    },
+    RemoveTimer {
+        name: String,
+    },
+    RemoveState {
+        name: String,
+    },
+    RemoveParam {
+        name: String,
+    },
+    DisconnectPorts {
+        source: String,
+        target: String,
+    },
+    RemoveReaction {
+        id: String,
+    },
+    /// A reaction kept under its id with anything else about it changed.
+    UpdateReaction {
+        id: String,
+        agent: String,
+        triggers: Vec<String>,
+        effects: Vec<String>,
+        contract: String,
+        prompt: String,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        instance: String,
+        #[serde(default)]
+        within: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -197,6 +249,9 @@ pub struct TimerState {
     pub period: u64,
     #[serde(default)]
     pub instance: String,
+    /// `shutdown`: fired once, at the run's last tag, and never by the clock.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shutdown: bool,
 }
 
 /// A state variable: typed as OMAR's types so its value can be recorded and
@@ -484,6 +539,39 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
 
     load_bytecode(&output_path)
         .with_context(|| format!("omarc failed to compile {}", source.display()))
+}
+
+/// The plan that turns the program at `old` into the one at `new`. The
+/// compiler computes it (`omarc --diff`), with the plan function its proofs
+/// are about; the runtime checks it before applying anything.
+pub fn compile_mutation(old: &Path, new: &Path) -> Result<Bytecode> {
+    let plan_path = new
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".plan.json");
+    let compiler = resolve_omarc();
+    let output = Command::new(&compiler)
+        .arg("--local-imports")
+        .arg("--diff")
+        .arg(old)
+        .arg(new)
+        .arg(&plan_path)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to invoke OMAR compiler '{}'; install omarc beside omar, \
+                 add it to PATH, or set OMARC_BIN",
+                compiler.display()
+            )
+        })?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&plan_path);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("omarc failed: {stderr}");
+    }
+    let plan = load_bytecode(&plan_path);
+    let _ = fs::remove_file(&plan_path);
+    plan
 }
 
 /// The identity in a claim, waiting for it to be written.
@@ -781,6 +869,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 offset,
                 period,
                 instance,
+                shutdown,
             } => {
                 require_identifier("timer", name)?;
                 check_instance(&state, "timer", name, instance)?;
@@ -789,7 +878,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 if state.ports.contains_key(name) {
                     bail!("timer '{name}' is also a port; a trigger has one name");
                 }
-                if *offset == 0 && *period == 0 {
+                if *offset == 0 && *period == 0 && !shutdown {
                     bail!("timer '{name}' never fires; give it an offset, a period, or both");
                 }
                 if state
@@ -800,6 +889,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                             offset: *offset,
                             period: *period,
                             instance: instance.clone(),
+                            shutdown: *shutdown,
                         },
                     )
                     .is_some()
@@ -907,6 +997,10 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 }
             }
             Instruction::CommitPlan => committed = true,
+            other => bail!(
+                "instruction {index} ({}) belongs to a mutation plan, not a program",
+                crate::mutation::op_name(other)
+            ),
         }
     }
     reject_causality_loops(&state)?;
@@ -1165,7 +1259,7 @@ fn reject_causality_loops(state: &VmState) -> Result<()> {
 
 #[derive(Debug, Clone)]
 struct InvocationRecord {
-    id: String,
+    id: u64,
     team: String,
     agent: String,
     reaction: String,
@@ -1187,7 +1281,7 @@ struct InvocationRecord {
 /// reachable from here, because nothing else was wired to it.
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingInvocation {
-    invocation_id: String,
+    task_id: u64,
     reaction: String,
     contract: String,
     prompt: String,
@@ -1197,14 +1291,14 @@ struct PendingInvocation {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SetPortArgs {
-    invocation_id: String,
+    task_id: u64,
     port: String,
     value: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CompleteArgs {
-    invocation_id: String,
+    task_id: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1239,7 +1333,7 @@ struct InvocationEntry {
 
 #[derive(Clone, Default)]
 struct InvocationRegistry {
-    entries: Arc<Mutex<BTreeMap<String, InvocationEntry>>>,
+    entries: Arc<Mutex<BTreeMap<u64, InvocationEntry>>>,
 }
 
 /// The effect a `set_port` call names, and its type.
@@ -1275,7 +1369,7 @@ impl InvocationRegistry {
         &self,
         record: InvocationRecord,
     ) -> Result<mpsc::Receiver<BTreeMap<String, Value>>> {
-        let id = record.id.clone();
+        let id = record.id;
         let (completion, receiver) = mpsc::sync_channel(1);
         let mut entries = self
             .entries
@@ -1294,9 +1388,9 @@ impl InvocationRegistry {
         Ok(receiver)
     }
 
-    fn remove(&self, invocation_id: &str) {
+    fn remove(&self, task_id: &u64) {
         if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(invocation_id);
+            entries.remove(task_id);
         }
     }
 
@@ -1306,10 +1400,10 @@ impl InvocationRegistry {
     /// time answers before the submit, leaving the terminal with no change to
     /// show for it. An entry that has gone counts as answered: there is
     /// nothing left to deliver to either way.
-    fn answered(&self, invocation_id: &str) -> bool {
+    fn answered(&self, task_id: &u64) -> bool {
         match self.entries.lock() {
             Ok(entries) => entries
-                .get(invocation_id)
+                .get(task_id)
                 .is_none_or(|entry| entry.record.completed),
             // A poisoned lock is not evidence of an answer, and claiming one
             // would turn a lost delivery into a silent hang.
@@ -1325,8 +1419,8 @@ impl InvocationRegistry {
         match command {
             InvocationCommand::SetPort(args) => {
                 let invocation = entries
-                    .get_mut(&args.invocation_id)
-                    .with_context(|| format!("unknown invocation '{}'", args.invocation_id))?;
+                    .get_mut(&args.task_id)
+                    .with_context(|| format!("unknown task_id {}", args.task_id))?;
                 validate_invocation_owner(team, agent, &invocation.record)?;
                 if invocation.record.completed {
                     bail!("invocation '{}' is already complete", invocation.record.id);
@@ -1348,7 +1442,7 @@ impl InvocationRegistry {
                             && entry.record.agent == agent
                     })
                     .map(|entry| PendingInvocation {
-                        invocation_id: entry.record.id.clone(),
+                        task_id: entry.record.id,
                         reaction: entry.record.reaction.clone(),
                         contract: entry.record.contract.clone(),
                         prompt: entry.record.prompt.clone(),
@@ -1360,8 +1454,8 @@ impl InvocationRegistry {
             }
             InvocationCommand::Complete(args) => {
                 let invocation = entries
-                    .get_mut(&args.invocation_id)
-                    .with_context(|| format!("unknown invocation '{}'", args.invocation_id))?;
+                    .get_mut(&args.task_id)
+                    .with_context(|| format!("unknown task_id {}", args.task_id))?;
                 validate_invocation_owner(team, agent, &invocation.record)?;
                 if invocation.record.completed {
                     return Ok(json!({"status":"already_complete"}));
@@ -1578,7 +1672,7 @@ pub fn panel_submit(
     access: &PanelAccess,
     team: &str,
     agent: &str,
-    invocation_id: &str,
+    task_id: &u64,
     values: &BTreeMap<String, Value>,
 ) -> Result<()> {
     let context = panel_context(access, team, agent);
@@ -1586,7 +1680,7 @@ pub fn panel_submit(
         send_invocation_command(
             &context,
             InvocationCommand::SetPort(SetPortArgs {
-                invocation_id: invocation_id.to_string(),
+                task_id: *task_id,
                 port: port.clone(),
                 value: value.clone(),
             }),
@@ -1594,9 +1688,7 @@ pub fn panel_submit(
     }
     send_invocation_command(
         &context,
-        InvocationCommand::Complete(CompleteArgs {
-            invocation_id: invocation_id.to_string(),
-        }),
+        InvocationCommand::Complete(CompleteArgs { task_id: *task_id }),
     )?;
     Ok(())
 }
@@ -1859,7 +1951,7 @@ fn validate_contract(contract: &str, writes: &BTreeMap<String, Value>) -> Result
 
 #[derive(Debug, Clone)]
 struct InvocationSpec {
-    id: String,
+    id: u64,
     reaction_id: String,
     agent: String,
     trigger_values: BTreeMap<String, Value>,
@@ -1920,10 +2012,10 @@ struct AgentReactionExecutor {
 
 impl ReactionExecutor for AgentReactionExecutor {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
-        let invocation_id = invocation.id.clone();
+        let task_id = invocation.id;
         let rendered = render_prompt(&invocation.prompt, &invocation.trigger_values)?;
         let record = InvocationRecord {
-            id: invocation_id.clone(),
+            id: task_id,
             team: self.team.clone(),
             agent: invocation.agent.clone(),
             reaction: invocation.reaction_id.clone(),
@@ -1946,11 +2038,11 @@ impl ReactionExecutor for AgentReactionExecutor {
             if let Err(error) = self
                 .client
                 .deliver_prompt_until(&session, &message, &DeliveryOptions::default(), &|| {
-                    self.registry.answered(&invocation_id)
+                    self.registry.answered(&task_id)
                 })
                 .with_context(|| format!("failed to deliver {}", invocation.reaction_id))
             {
-                self.registry.remove(&invocation_id);
+                self.registry.remove(&task_id);
                 return Err(error);
             }
         }
@@ -1963,7 +2055,7 @@ impl ReactionExecutor for AgentReactionExecutor {
                 "topology invocation service stopped unexpectedly"
             )),
         };
-        self.registry.remove(&invocation_id);
+        self.registry.remove(&task_id);
         result
     }
 }
@@ -2048,7 +2140,10 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
                 // State comes back beside the effects and is not one of them.
                 let effects: BTreeMap<_, _> = writes
                     .iter()
-                    .filter(|(name, _)| !self.state.state_vars.contains_key(*name))
+                    .filter(|(name, _)| {
+                        !self.state.state_vars.contains_key(*name)
+                            && name.as_str() != crate::reaction::STOP
+                    })
                     .map(|(name, value)| (name.clone(), value.clone()))
                     .collect();
                 validate_contract(&invocation.contract, &effects)?;
@@ -2194,6 +2289,9 @@ struct RunCheckpointer<'a> {
     workspaces: &'a BTreeMap<String, crate::workspace::Workspace>,
     program: Value,
     program_path: Option<String>,
+    /// The program's source, read once at the start so an edit to the file
+    /// after it was compiled does not reach the checkpoints.
+    source: Option<checkpoint::Source>,
     team: String,
     ea_id: u32,
     pace: Pace,
@@ -2288,6 +2386,18 @@ impl<'a> RunCheckpointer<'a> {
             .program_path
             .map(|path| path.to_string_lossy().into_owned())
             .or_else(|| resumed_from.and_then(|m| m.program_path.clone()));
+        let source = match config.program_path {
+            Some(path) if path.extension().is_some_and(|e| e == "omar") => {
+                Some(checkpoint::Source::read(path)?)
+            }
+            _ => match resumed_from {
+                Some(manifest) => store
+                    .source(&manifest.id)?
+                    .map(|path| checkpoint::Source::read(&path))
+                    .transpose()?,
+                None => None,
+            },
+        };
         Ok(Self {
             omar_dir,
             dir: dir.to_path_buf(),
@@ -2296,6 +2406,7 @@ impl<'a> RunCheckpointer<'a> {
             workspaces,
             program: serde_json::to_value(bytecode)?,
             program_path,
+            source,
             team: state.team.clone(),
             ea_id: config.ea_id,
             pace: config.pace,
@@ -2361,6 +2472,7 @@ impl Checkpointer for RunCheckpointer<'_> {
             Trigger::Automatic => "automatic",
             Trigger::Manual => "manual",
             Trigger::Pause => "pause",
+            Trigger::Mutation => "mutation",
         };
         let label = format!("Checkpoint {} ({kind})", schedule.sequence);
         // Each instance's files, as a version its own history keeps. The
@@ -2408,8 +2520,10 @@ impl Checkpointer for RunCheckpointer<'_> {
             elapsed_ns: state.elapsed_ns,
             workspaces: artifacts,
             agents: self.agents.clone(),
+            mutation: Vec::new(),
         };
-        self.store.publish(&manifest, state, &self.program)?;
+        self.store
+            .publish(&manifest, state, &self.program, self.source.as_ref())?;
         schedule.sequence += 1;
         schedule.parent = Some(id.clone());
         schedule.next_due = schedule
@@ -3463,7 +3577,7 @@ pub fn timeline(
         .map(|name| (name.clone(), Value::Null))
         .collect();
     let mut queue = BTreeMap::from([(Tag::START, seed)]);
-    for (name, timer) in &state.timers {
+    for (name, timer) in state.timers.iter().filter(|(_, timer)| !timer.shutdown) {
         queue
             .entry(Tag {
                 timestamp: timer.offset,
@@ -3652,6 +3766,7 @@ fn settle_boundary(
                     Trigger::Automatic => "automatic",
                     Trigger::Manual => "manual",
                     Trigger::Pause => "pause",
+                    Trigger::Mutation => "mutation",
                 };
                 observer.checkpoint_published(&id, kind, captured.completed_tag);
                 break;
@@ -3777,8 +3892,8 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
             let mut queue = BTreeMap::from([(Tag::START, inputs)]);
             // Arm every timer for its first firing. A timer's value is the
             // timestamp it fired at, which is what makes `$(t)` in a prompt
-            // worth reading.
-            for (name, timer) in &state.timers {
+            // worth reading. `shutdown` waits for the run's last tag.
+            for (name, timer) in state.timers.iter().filter(|(_, timer)| !timer.shutdown) {
                 queue
                     .entry(Tag {
                         timestamp: timer.offset,
@@ -3841,6 +3956,10 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
     // Fixed before the first tag: precedence follows from the wiring, and the
     // wiring does not change while a run is in flight.
     let layers = precedence_layers(state)?;
+    // A body called `request_stop()` at this tag.
+    let mut stop_requested = false;
+    // The queue holds only the `shutdown` tag: the run ends once it is over.
+    let mut shutting_down = false;
 
     loop {
         // A tag boundary: nothing is in flight, so this is where an
@@ -3857,7 +3976,13 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
                 state_vars: store.clone(),
                 elapsed_ns: elapsed().as_nanos() as u64,
             };
-            settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
+            // The last tag is not a boundary a pause can hold: resumed, it
+            // would end the run without remembering it had begun to.
+            if shutting_down {
+                Boundary::Continue
+            } else {
+                settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
+            }
         };
         match settled {
             Boundary::Continue => {}
@@ -3870,7 +3995,12 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
             Boundary::Pause(state) => return Ok(LoopEnd::Paused(state)),
         }
         let Some((&tag, next_events)) = queue.first_key_value() else {
-            break;
+            // Nothing left to happen is an end too, and `shutdown` hears of it.
+            if shutting_down || !arm_shutdown(state, &mut queue, completed)? {
+                break;
+            }
+            shutting_down = true;
+            continue;
         };
         // A tag nothing is present at is not a moment the run passed through.
         // No reaction can fire at one -- enabling asks whether any trigger is
@@ -3979,10 +4109,10 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
                     tag.timestamp,
                     tag.microstep,
                     &spec.reaction_id,
-                    &spec.id,
+                    &spec.id.to_string(),
                 );
             }
-            let invocation_ids: Vec<_> = specs.iter().map(|spec| spec.id.clone()).collect();
+            let task_ids: Vec<_> = specs.iter().map(|spec| spec.id).collect();
             let results = thread::scope(|scope| {
                 let handles: Vec<_> = specs
                     .into_iter()
@@ -4002,14 +4132,15 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
             // layer both write, which is the rule the language states.
             let mut completed_writes: Vec<_> = enabled
                 .iter()
-                .zip(invocation_ids)
+                .zip(task_ids)
                 .zip(results)
-                .map(|(((id, reaction), invocation_id), writes)| {
+                .map(|(((id, reaction), task_id), mut writes)| {
+                    stop_requested |= writes.remove(crate::reaction::STOP).is_some();
                     observer.reaction_completed(
                         tag.timestamp,
                         tag.microstep,
                         id,
-                        &invocation_id,
+                        &task_id.to_string(),
                         &writes,
                     );
                     (reaction.order, writes)
@@ -4050,11 +4181,51 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
             }
         }
         completed = Some((tag.timestamp, tag.microstep));
+        if shutting_down {
+            break;
+        }
+        // Whatever else was queued never happens: the run ends here, after
+        // one more microstep for `shutdown`.
+        if stop_requested {
+            queue.clear();
+            if !arm_shutdown(state, &mut queue, completed)? {
+                break;
+            }
+            shutting_down = true;
+        }
     }
     Ok(LoopEnd::Completed(Settled {
         outputs,
         state_vars: store,
     }))
+}
+
+/// Queue every `shutdown` trigger one microstep after the last tag, or at the
+/// start of a run that passed through none. False when nothing reacts to it.
+fn arm_shutdown(
+    state: &VmState,
+    queue: &mut BTreeMap<Tag, BTreeMap<String, Value>>,
+    last: Option<(u64, u64)>,
+) -> Result<bool> {
+    let tag = match last {
+        Some((timestamp, microstep)) => Tag {
+            timestamp,
+            microstep,
+        }
+        .advance(Delay::MICROSTEP)?,
+        None => Tag::START,
+    };
+    let events: BTreeMap<_, _> = state
+        .timers
+        .iter()
+        .filter(|(_, timer)| timer.shutdown)
+        .map(|(name, _)| (name.clone(), json!(tag.timestamp)))
+        .collect();
+    if events.is_empty() {
+        return Ok(false);
+    }
+    queue.insert(tag, events);
+    Ok(true)
 }
 
 fn invocation_spec(
@@ -4096,7 +4267,7 @@ fn invocation_spec(
         .filter_map(|(name, _)| store.get(name).map(|value| (name.clone(), value.clone())))
         .collect();
     Ok(InvocationSpec {
-        id: Uuid::new_v4().to_string(),
+        id: next_task_id()?,
         reaction_id: reaction_id.clone(),
         agent: reaction.agent.clone(),
         trigger_values,
@@ -4110,6 +4281,25 @@ fn invocation_spec(
     })
 }
 
+// Process-wide allocation keeps IDs distinct across concurrent runs and never
+// reuses a completed task's ID. Stay within JSON's exact integer range.
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_task_id() -> Result<u64> {
+    // Explicit CAS loop: `fetch_update` is deprecated on newer toolchains and
+    // its replacement `try_update` postdates the minimum supported Rust.
+    let mut id = NEXT_TASK_ID.load(Ordering::Relaxed);
+    loop {
+        if id >= 1_u64 << 53 {
+            anyhow::bail!("task ID space exhausted");
+        }
+        match NEXT_TASK_ID.compare_exchange_weak(id, id + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(id),
+            Err(current) => id = current,
+        }
+    }
+}
+
 /// The message an agent is handed, with `rendered` as its prompt.
 ///
 /// The header is one `key: value` per line up to the first blank line, which
@@ -4119,7 +4309,7 @@ fn invocation_spec(
 /// reads it as prose.
 fn invocation_message(invocation: &InvocationSpec, rendered: &str) -> Result<String> {
     let mut header = format!(
-        "OMAR INVOCATION\ninvocation_id: {}\ntriggers: {}\neffects: {}\n",
+        "OMAR INVOCATION\ntask_id: {}\ntriggers: {}\neffects: {}\n",
         invocation.id,
         serde_json::to_string(&invocation.trigger_values)?,
         serde_json::to_string(&invocation.effect_names)?,
@@ -4138,7 +4328,7 @@ fn invocation_message(invocation: &InvocationSpec, rendered: &str) -> Result<Str
     }
     header.push_str(&format!("contract: {}\n", invocation.contract));
     Ok(format!(
-        "{header}\n{described}{rendered}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. For a signal effect, set its value to null. Do not address another agent directly."
+        "{header}\n{described}{rendered}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. Pass the integer task_id above to both tools. For a signal effect, set its value to null. Do not address another agent directly."
     ))
 }
 
@@ -4775,7 +4965,7 @@ mod tests {
             description: Some("Whether the request may go on".into()),
         };
         let spec = InvocationSpec {
-            id: "inv-1".into(),
+            id: 1,
             reaction_id: "reaction.0".into(),
             agent: "clerk".into(),
             trigger_values: BTreeMap::from([("topic".to_string(), json!("hi"))]),
@@ -4801,7 +4991,7 @@ mod tests {
             .take_while(|line| !line.is_empty())
             .collect();
         assert_eq!(header[0], "OMAR INVOCATION");
-        assert!(header.contains(&"invocation_id: inv-1"), "{message}");
+        assert!(header.contains(&"task_id: 1"), "{message}");
         assert!(
             header
                 .contains(&r#"effects: {"all":"list<Decision>","memo":"string","out":"Decision"}"#),
@@ -5431,7 +5621,7 @@ mod tests {
         assert!(error.contains("requires an effect"), "{error}");
         assert!(error.contains("memo"), "{error}");
         assert!(error.contains("reaction.0"), "{error}");
-        assert!(error.contains(&spec.id), "{error}");
+        assert!(error.contains(&spec.id.to_string()), "{error}");
     }
 
     /// Answers nothing, which is what an expired deadline does to a contract
@@ -5669,13 +5859,13 @@ mod tests {
             for _ in 0..200 {
                 let waiting = pending_invocations(&context).unwrap();
                 if let Some(item) = waiting["pending"].as_array().unwrap().first() {
-                    let id = item["invocation_id"].as_str().unwrap().to_string();
+                    let id = item["task_id"].as_u64().unwrap();
                     mcp_set_port(
                         &context,
-                        json!({"invocation_id": id, "port": "verdict", "value": "ship"}),
+                        json!({"task_id": id, "port": "verdict", "value": "ship"}),
                     )
                     .unwrap();
-                    mcp_complete(&context, json!({"invocation_id": id})).unwrap();
+                    mcp_complete(&context, json!({"task_id": id})).unwrap();
                     return item.clone();
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -5731,7 +5921,7 @@ mod tests {
         server
             .registry
             .register(InvocationRecord {
-                id: "invocation-3".into(),
+                id: 3,
                 team: "Desk".into(),
                 agent: "panel".into(),
                 reaction: "reaction.0".into(),
@@ -5757,7 +5947,7 @@ mod tests {
             .execute("Desk", "clerk", InvocationCommand::Pending)
             .unwrap();
         assert!(theirs["pending"].as_array().unwrap().is_empty());
-        server.registry.remove("invocation-3");
+        server.registry.remove(&3);
     }
 
     /// A connection carrying `delay` nanoseconds, so the run reaches its
@@ -6417,6 +6607,93 @@ mod tests {
         assert_eq!(*fired.last().unwrap(), 10 * 1499);
     }
 
+    /// A clock that ticks every 10ns, and a reaction to `shutdown`.
+    fn shutdown_bytecode(period: u64) -> Bytecode {
+        serde_json::from_str(&format!(
+            r#"{{
+              "version": 1,
+              "team": "Smoke",
+              "instructions": [
+                {{"op":"begin_plan","team":"Smoke"}},
+                {{"op":"spawn_agent","name":"agent","backend":"Codex"}},
+                {{"op":"define_port","kind":"output","name":"note","type":"string"}},
+                {{"op":"declare_timer","name":"t","offset":5,"period":{period}}},
+                {{"op":"declare_timer","name":"shutdown","offset":0,"period":0,"shutdown":true}},
+                {{"op":"install_reaction","id":"reaction.0","agent":"agent","triggers":["t"],"effects":["note"],"contract":"note","prompt":"tick"}},
+                {{"op":"install_reaction","id":"reaction.1","agent":"agent","triggers":["shutdown"],"effects":["note"],"contract":"note","prompt":"bye"}},
+                {{"op":"commit_plan"}}
+              ]
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    /// Records which trigger fired when, and asks to stop at a given firing.
+    struct StopExecutor {
+        fired: Mutex<Vec<(String, u64)>>,
+        stop_at: usize,
+    }
+
+    impl ReactionExecutor for StopExecutor {
+        fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+            let (trigger, at) = invocation.trigger_values.iter().next().unwrap();
+            let count = {
+                let mut fired = self.fired.lock().unwrap();
+                fired.push((trigger.clone(), at.as_u64().unwrap()));
+                fired.len()
+            };
+            let mut writes = BTreeMap::from([("note".into(), json!(trigger))]);
+            if count == self.stop_at {
+                writes.insert(crate::reaction::STOP.into(), json!(true));
+            }
+            Ok(writes)
+        }
+    }
+
+    #[test]
+    fn a_requested_stop_ends_the_run_after_one_shutdown_microstep() {
+        let state = verify(&shutdown_bytecode(10)).unwrap();
+        let executor = StopExecutor {
+            fired: Mutex::new(Vec::new()),
+            stop_at: 3,
+        };
+        // A periodic timer never ends on its own; the request is what ends it.
+        let outputs = run_event_loop(&state, BTreeMap::new(), &executor).unwrap();
+        let fired = executor.fired.lock().unwrap().clone();
+        let at = |name: &str, time| (name.to_string(), time);
+        assert_eq!(
+            fired,
+            vec![at("t", 5), at("t", 15), at("t", 25), at("shutdown", 25)]
+        );
+        assert_eq!(outputs["note"], json!("shutdown"));
+    }
+
+    #[test]
+    fn a_run_that_runs_out_of_events_still_shuts_down() {
+        let state = verify(&shutdown_bytecode(0)).unwrap();
+        let executor = StopExecutor {
+            fired: Mutex::new(Vec::new()),
+            stop_at: 0,
+        };
+        run_event_loop(&state, BTreeMap::new(), &executor).unwrap();
+        let fired = executor.fired.lock().unwrap().clone();
+        assert_eq!(
+            fired,
+            vec![("t".to_string(), 5), ("shutdown".to_string(), 5)]
+        );
+    }
+
+    #[test]
+    fn a_stop_with_nothing_reacting_to_shutdown_ends_at_its_tag() {
+        let state = verify(&timer_bytecode(0, 10)).unwrap();
+        let executor = StopExecutor {
+            fired: Mutex::new(Vec::new()),
+            stop_at: 2,
+        };
+        run_event_loop(&state, BTreeMap::new(), &executor).unwrap();
+        assert_eq!(executor.fired.lock().unwrap().len(), 2);
+    }
+
     #[test]
     fn a_timer_cannot_share_a_name_with_a_port_or_be_written_to() {
         let shadowing: Bytecode = serde_json::from_str(
@@ -6763,6 +7040,96 @@ mod tests {
     }
 
     #[test]
+    fn integer_task_ids_are_exact_and_owned_by_the_caller() {
+        let registry = InvocationRegistry::default();
+        let record = InvocationRecord {
+            id: 7,
+            team: "Desk".into(),
+            agent: "worker".into(),
+            reaction: "reaction.0".into(),
+            contract: "answer".into(),
+            allowed_effects: BTreeMap::from([("answer".into(), "string".into())]),
+            trigger_values: BTreeMap::new(),
+            prompt: "answer".into(),
+            writes: BTreeMap::new(),
+            completed: false,
+        };
+        let completion = registry.register(record.clone()).unwrap();
+        let set = |id| {
+            InvocationCommand::SetPort(SetPortArgs {
+                task_id: id,
+                port: "answer".into(),
+                value: json!("hello"),
+            })
+        };
+        // Even with only one pending task, an incorrect ID is never guessed.
+        assert!(registry.execute("Desk", "worker", set(8)).is_err());
+        assert!(registry
+            .execute(
+                "Desk",
+                "worker",
+                InvocationCommand::Complete(CompleteArgs { task_id: 8 })
+            )
+            .is_err());
+        // A real ID is not a credential: both commands still check ownership.
+        for (team, agent) in [("Desk", "other"), ("Other", "worker")] {
+            assert!(registry.execute(team, agent, set(7)).is_err());
+            assert!(registry
+                .execute(
+                    team,
+                    agent,
+                    InvocationCommand::Complete(CompleteArgs { task_id: 7 })
+                )
+                .is_err());
+        }
+        let pending = registry
+            .execute("Desk", "worker", InvocationCommand::Pending)
+            .unwrap();
+        assert_eq!(pending["pending"][0]["task_id"], json!(7));
+        assert!(pending["pending"][0].get("invocation_id").is_none());
+        // Multiple pending tasks remain individually addressable.
+        let second = registry
+            .register(InvocationRecord { id: 8, ..record })
+            .unwrap();
+        registry.execute("Desk", "worker", set(7)).unwrap();
+        registry
+            .execute(
+                "Desk",
+                "worker",
+                InvocationCommand::Complete(CompleteArgs { task_id: 7 }),
+            )
+            .unwrap();
+        assert_eq!(completion.try_recv().unwrap()["answer"], json!("hello"));
+        assert!(second.try_recv().is_err());
+        registry.remove(&7);
+        assert!(registry.execute("Desk", "worker", set(7)).is_err());
+    }
+
+    #[test]
+    fn task_ids_are_json_integers_and_not_legacy_strings() {
+        let valid = json!({"task_id": 7, "port": "answer", "value": "hello"});
+        assert_eq!(
+            serde_json::from_value::<SetPortArgs>(valid)
+                .unwrap()
+                .task_id,
+            7
+        );
+        for id in [json!("7"), json!(7.5), json!(-1), Value::Null] {
+            assert!(serde_json::from_value::<SetPortArgs>(
+                json!({"task_id": id, "port": "answer", "value": "hello"})
+            )
+            .is_err());
+            assert!(serde_json::from_value::<CompleteArgs>(json!({"task_id": id})).is_err());
+        }
+        assert!(
+            serde_json::from_value::<CompleteArgs>(json!({"invocation_id": "old-uuid"})).is_err()
+        );
+        let first = next_task_id().unwrap();
+        let second = next_task_id().unwrap();
+        assert!(first > 0 && second > first && second < (1_u64 << 53));
+    }
+
+    #[test]
     fn reactive_scoped_port_writes_are_last_writer_wins() {
         let server = InvocationServer::start().unwrap();
         let context = TopologyMcpContext {
@@ -6772,7 +7139,7 @@ mod tests {
             token: server.token.clone(),
         };
         let record = InvocationRecord {
-            id: "invocation-1".into(),
+            id: 1,
             team: "Demo".into(),
             agent: "worker".into(),
             reaction: "reaction.0".into(),
@@ -6788,15 +7155,15 @@ mod tests {
         for value in ["first", "second"] {
             mcp_set_port(
                 &context,
-                json!({"invocation_id":"invocation-1", "port":"opinion", "value":value}),
+                json!({"task_id":1, "port":"opinion", "value":value}),
             )
             .unwrap();
         }
-        mcp_complete(&context, json!({"invocation_id":"invocation-1"})).unwrap();
+        mcp_complete(&context, json!({"task_id":1})).unwrap();
 
         let writes = completion.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(writes["opinion"], json!("second"));
-        server.registry.remove("invocation-1");
+        server.registry.remove(&1);
     }
 
     #[test]
@@ -6811,7 +7178,7 @@ mod tests {
         let completion = server
             .registry
             .register(InvocationRecord {
-                id: "retry-1".into(),
+                id: 4,
                 team: "Recovery".into(),
                 agent: "worker".into(),
                 reaction: "reaction.0".into(),
@@ -6831,7 +7198,7 @@ mod tests {
         let error = mcp_set_port(
             &context,
             json!({
-                "invocation_id": "retry-1", "port": "decision",
+                "task_id": 4, "port": "decision",
                 "value": "this is a terminal record, not a forward"
             }),
         )
@@ -6843,7 +7210,7 @@ mod tests {
         assert!(error.contains("\"stop\""), "{error}");
 
         // Rejection must not satisfy the required output or release a result.
-        let error = mcp_complete(&context, json!({"invocation_id": "retry-1"}))
+        let error = mcp_complete(&context, json!({"task_id": 4}))
             .unwrap_err()
             .to_string();
         assert!(
@@ -6854,12 +7221,12 @@ mod tests {
             completion.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
-        assert!(!server.registry.answered("retry-1"));
+        assert!(!server.registry.answered(&4));
 
         let response = mcp_set_port(
             &context,
             json!({
-                "invocation_id": "retry-1", "port": "decision", "value": "continue"
+                "task_id": 4, "port": "decision", "value": "continue"
             }),
         )
         .unwrap();
@@ -6869,14 +7236,14 @@ mod tests {
             Err(mpsc::TryRecvError::Empty)
         ));
 
-        let response = mcp_complete(&context, json!({"invocation_id": "retry-1"})).unwrap();
+        let response = mcp_complete(&context, json!({"task_id": 4})).unwrap();
         assert_eq!(response["status"], json!("complete"));
         assert_eq!(
             completion.recv_timeout(Duration::from_secs(1)).unwrap(),
             BTreeMap::from([("decision".into(), json!("continue"))])
         );
-        assert!(server.registry.answered("retry-1"));
-        server.registry.remove("retry-1");
+        assert!(server.registry.answered(&4));
+        server.registry.remove(&4);
     }
 
     #[test]
@@ -6889,7 +7256,7 @@ mod tests {
             token: server.token.clone(),
         };
         let record = InvocationRecord {
-            id: "invocation-2".into(),
+            id: 2,
             team: "Demo".into(),
             agent: "worker".into(),
             reaction: "reaction.0".into(),
@@ -6906,28 +7273,27 @@ mod tests {
         wrong_owner.agent = "intruder".into();
         let owner_error = mcp_set_port(
             &wrong_owner,
-            json!({"invocation_id":"invocation-2", "port":"opinion", "value":"no"}),
+            json!({"task_id":2, "port":"opinion", "value":"no"}),
         )
         .unwrap_err();
         assert!(owner_error.to_string().contains("does not belong"));
 
-        let contract_error =
-            mcp_complete(&context, json!({"invocation_id":"invocation-2"})).unwrap_err();
+        let contract_error = mcp_complete(&context, json!({"task_id":2})).unwrap_err();
         assert!(
             format!("{contract_error:#}").contains("effect contract 'opinion' is not satisfied")
         );
 
         mcp_set_port(
             &context,
-            json!({"invocation_id":"invocation-2", "port":"opinion", "value":"yes"}),
+            json!({"task_id":2, "port":"opinion", "value":"yes"}),
         )
         .unwrap();
-        mcp_complete(&context, json!({"invocation_id":"invocation-2"})).unwrap();
+        mcp_complete(&context, json!({"task_id":2})).unwrap();
         assert_eq!(
             completion.recv_timeout(Duration::from_secs(1)).unwrap(),
             BTreeMap::from([("opinion".into(), json!("yes"))])
         );
-        server.registry.remove("invocation-2");
+        server.registry.remove(&2);
     }
 
     /// Answers its invocation, and files a stop request while doing so.
@@ -7763,6 +8129,58 @@ mod tests {
             }}"#
         ))
         .unwrap()
+    }
+
+    /// The smoke-test shape: a body records what it saw and asks to stop, and
+    /// a `shutdown` body checks the record. A failed check fails the run.
+    #[test]
+    #[ignore = "shells out to cargo; run with --ignored"]
+    fn a_shutdown_body_decides_whether_the_run_passed() {
+        struct Unused;
+        impl ReactionExecutor for Unused {
+            fn invoke(&self, _: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+                panic!("every reaction has a body, so no agent is asked");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let run = |expected: i64| {
+            let bytecode: Bytecode = serde_json::from_str(&format!(
+                r#"{{
+                  "version": 1,
+                  "team": "Smoke",
+                  "instructions": [
+                    {{"op":"begin_plan","team":"Smoke"}},
+                    {{"op":"declare_instance","name":"s","parent":"","team":"Smoke"}},
+                    {{"op":"declare_timer","instance":"s","name":"s.tick","offset":1,"period":1}},
+                    {{"op":"declare_timer","instance":"s","name":"s.shutdown","offset":0,"period":0,"shutdown":true}},
+                    {{"op":"declare_state","instance":"s","name":"s.ticks","type":"int","initial":0}},
+                    {{"op":"install_reaction","instance":"s","id":"s.reaction.0","agent":"",
+                      "triggers":["s.tick"],"effects":[],"contract":"","prompt":"",
+                      "body":"self.ticks += 1; if self.ticks == 3 {{ request_stop(); }}"}},
+                    {{"op":"install_reaction","instance":"s","id":"s.reaction.1","agent":"",
+                      "triggers":["s.shutdown"],"effects":[],"contract":"","prompt":"",
+                      "body":"assert_eq!(self.ticks, {expected}, \"ticks before shutdown\");"}},
+                    {{"op":"commit_plan"}}
+                  ]
+                }}"#
+            ))
+            .unwrap();
+            let state = verify(&bytecode).unwrap();
+            let code = crate::reaction::build(&state, dir.path()).unwrap().unwrap();
+            let executor = DispatchExecutor {
+                workspace_dirs: BTreeMap::new(),
+                state: &state,
+                code: Some(code),
+                timeout: Duration::from_secs(30),
+                agents: Unused,
+            };
+            run_event_loop(&state, BTreeMap::new(), &executor)
+        };
+
+        // The periodic timer would tick forever; the request ends it at three.
+        run(3).unwrap();
+        let error = format!("{:#}", run(4).unwrap_err());
+        assert!(error.contains("ticks before shutdown"), "{error}");
     }
 
     /// The generated directory belongs to the program, so two runs of it share

@@ -179,6 +179,11 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         # Without a selected runtime, run creates a session, prints the summary, and shuts it down.
         summary = subprocess.run([str(BIN), "run", str(once), "--fg"], cwd=root, env=env, text=True, capture_output=True, timeout=120)
         assert summary.returncode == 0 and "Topology 'OnceRun' completed" in summary.stdout and "Output once.done = 1" in summary.stdout, summary
+        # A program whose main is unnamed takes its source file's name.
+        unnamed = root / "Unnamed.omar"
+        unnamed.write_text('team Once { timer tick(1ns, 0) output done : int reaction(tick) -> done {= done = Some(1); =} }\nmain { once = Once() }\n')
+        named = subprocess.run([str(BIN), "--session", "outer", "run", str(unnamed), "--fg"], cwd=root, env=env, text=True, capture_output=True, timeout=120)
+        assert named.returncode == 0 and "Topology 'Unnamed' completed" in named.stdout, named
         created = re.search(r"Started session (\S+);", summary.stderr)
         assert created, summary.stderr
         assert created.group(1) not in {s["name"] for s in json.loads(cli("ls", "--json"))}, "run --fg left its own session behind"

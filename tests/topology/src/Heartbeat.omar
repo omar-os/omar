@@ -4,9 +4,8 @@
 // feeds it and nothing can write to it: the clock alone drives this program,
 // and it takes no input at all.
 //
-// A periodic timer does not stop. This run ends only at the runtime's 1024-tag
-// cap, or when you stop it — whichever comes first. Whatever it produced up to
-// then stands.
+// A periodic timer does not stop. Its Smoke team ends the run after three
+// verdicts, with `request_stop()`.
 //
 // Both prompts on `monitor` share one agent memory, so each tick sees every
 // tick before it. That is what makes a heartbeat rather than a repeated
@@ -44,9 +43,31 @@ team Watch[watcher : ClaudeCode]
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+// The pulse never stops on its own; three verdicts are enough.
+team Smoke
+{
+    input verdict : string
+    state verdicts : int = 0
+    timer deadline(10min, 0)
+
+    reaction(verdict) -> {=
+        self.verdicts += 1;
+        if self.verdicts >= 3 { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.verdicts >= 3, "{} of 3 watch.verdict by the deadline", self.verdicts);
+    =}
+}
+
 main Heartbeat {
     pulse = Pulse()
     watch = Watch()
 
     pulse.reading -> watch.reading
+
+    smoke = Smoke()
+    watch.verdict -> smoke.verdict
 }

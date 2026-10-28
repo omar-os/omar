@@ -258,6 +258,11 @@ jobs:
 
       - name: Test external schema imports
         run: python3 tests/ci/schema_imports.py
+      - name: Verify a running topology is mutated to a new program
+        run: |
+          sudo apt-get update && sudo apt-get install -y tmux
+          cargo build --bin omar
+          python3 tests/ci/team_mutation.py
 
       - name: Compile topology corpus to bytecode (offline)
         working-directory: lang
@@ -469,7 +474,11 @@ jobs:
                   if instruction["op"] == "declare_instance":
                       assert keys == ["op", "name", "parent", "team"], (path, keys)
                   if instruction["op"] == "declare_timer":
-                      assert keys == ["op", "instance", "name", "offset", "period"], (path, keys)
+                      # `shutdown` marks the trigger the run's last tag fires.
+                      assert keys in (
+                          ["op", "instance", "name", "offset", "period"],
+                          ["op", "instance", "name", "offset", "period", "shutdown"],
+                      ), (path, keys)
                   if instruction["op"] == "declare_state":
                       assert keys == ["op", "instance", "name", "type", "initial"], (path, keys)
                   # Every member names the container it belongs to, so a client

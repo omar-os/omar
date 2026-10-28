@@ -2559,7 +2559,7 @@ fn ea_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "omar_propose_design",
-            "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares.",
+            "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares. While a workflow is running or paused, a program that keeps its `main` name is a change to that run, which the operator applies live.",
             json!({
                 "type":"object",
                 "properties":{
@@ -2666,7 +2666,7 @@ fn topology_tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "invocation_id":{"type":"string"},
+                    "task_id":{"type":"integer","minimum":1,"description":"The exact task_id supplied in the task prompt or returned by omar_pending."},
                     "port":{"type":"string"},
                     // Any JSON type is accepted, so no `type` is declared. An
                     // empty schema left small models guessing a shape and
@@ -2674,7 +2674,7 @@ fn topology_tool_definitions() -> Vec<Value> {
                     // description alone stopped that.
                     "value":{"description":"The value as a bare JSON value of the port's declared type: a JSON string for string, path and bytes ports (never an object wrapping it), a number for int and float, true or false for bool, an array for list<...>, and null for a signal or an empty option."}
                 },
-                "required":["invocation_id","port","value"],
+                "required":["task_id","port","value"],
                 "additionalProperties":false
             }),
         ),
@@ -2683,8 +2683,8 @@ fn topology_tool_definitions() -> Vec<Value> {
             "Complete the active OMAR invocation after setting its effects. The runtime validates the final effect snapshot and releases the tag barrier.",
             json!({
                 "type":"object",
-                "properties":{"invocation_id":{"type":"string"}},
-                "required":["invocation_id"],
+                "properties":{"task_id":{"type":"integer","minimum":1,"description":"The exact task_id supplied in the task prompt or returned by omar_pending."}},
+                "required":["task_id"],
                 "additionalProperties":false
             }),
         ),
@@ -3090,6 +3090,21 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(names, ["omar_set_port", "omar_complete", "omar_pending"]);
+    }
+
+    #[test]
+    fn topology_tools_require_integer_task_ids() {
+        let tools = topology_tool_definitions();
+        for tool in &tools[..2] {
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["properties"]["task_id"]["type"], "integer");
+            assert_eq!(schema["properties"]["task_id"]["minimum"], 1);
+            assert!(schema["properties"].get("invocation_id").is_none());
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("task_id")));
+        }
     }
 
     #[test]

@@ -64,7 +64,9 @@ test("a view port watches conversations and runs without offering a write", asyn
   await expect(page.getByRole("group", { name: "Run controls" })).toHaveCount(0);
   await expect(page.getByRole("group", { name: "Deploy design" })).toHaveCount(0);
   await page.getByRole("tab", { name: "Source" }).click();
-  await expect(page.getByLabel("OMAR program")).toHaveAttribute("readonly", "");
+  await expect(page.getByLabel("OMAR program")).toHaveAttribute("aria-readonly", "true");
+  await expect(page.getByLabel("OMAR program")).toHaveAttribute("contenteditable", "false");
+  await expect(page.getByRole("button", { name: "Apply edits" })).toHaveCount(0);
 
   // A terminal can be watched, not typed into or resized.
   await page.getByRole("button", { name: "Inspect terminal" }).click();

@@ -551,12 +551,12 @@ test("two chats run the same topology independently and retain their live panels
       assert.fail("live panel never became ready");
     };
     const [pa, pb] = await Promise.all([waitPanel(firstBase, a), waitPanel(secondBase, b)]);
-    assert.notEqual(pa.invocation_id, pb.invocation_id);
+    assert.notEqual(pa.task_id, pb.task_id);
     await request(`/v1/chats/${first.id}/activate`, post({}));
     const listing = await request("/v1/chats");
     for (const chat of listing.conversations) assert.equal(chat.run.status, "running");
     assert.equal((await fetch(`${real.url}${secondBase}/v1/runs/${a.run_id}`)).status, 404);
-    const answer = (base, run, panel, value) => request(`${base}/v1/runs/${run.run_id}/panel`, post({ invocation_id: panel.invocation_id, agent: panel.agent, values: { "flow.answer": value } }));
+    const answer = (base, run, panel, value) => request(`${base}/v1/runs/${run.run_id}/panel`, post({ task_id: panel.task_id, agent: panel.agent, values: { "flow.answer": value } }));
     await answer(firstBase, a, pa, "First result");
     for (let attempt = 0; attempt < 100; attempt++) {
       const status = await request(`${firstBase}/v1/runs/${a.run_id}`);
