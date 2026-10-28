@@ -26,6 +26,8 @@ inspection:
 ```sh
 cd lang
 lake exe omarc ../tests/topology/src/HR.omar /tmp/HR.bytecode.json
+# mutation plan: the diff that turns old into new, as bytecode
+lake exe omarc --diff old.omar new.omar /tmp/diff.json
 ```
 
 The runtime starts topology-scoped agents, delivers enabled prompts at each
@@ -46,6 +48,8 @@ POST   /v1/runs      { program, inputs, replace?, timeout_seconds? }
                      -> 201 { run_id, team, status, diagram_address, ... }
 GET    /v1/runs      -> { runs: [ ... ] }
 GET    /v1/runs/{id} -> one record, or 404
+POST   /v1/runs/{id}/mutate { program, files?, dry_run? }
+                     -> change the run's program (spec §5.1)
 GET    /health       -> { status, protocol_version }
 ```
 

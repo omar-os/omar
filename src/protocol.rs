@@ -31,7 +31,9 @@ use crate::diagram::{
     DiagramPort, DiagramReaction, DiagramSnapshot, DiagramStatus, DiagramTag, DiagramTimer,
     EdgeKind, ReactionStatus,
 };
-use crate::serve::{ChatMessage, ChatRole, ProposedDesign, RunRecord, RunStatus};
+use crate::serve::{
+    ChatMessage, ChatRole, MutationRecord, MutationStatus, ProposedDesign, RunRecord, RunStatus,
+};
 use crate::topology::PortKind;
 
 /// Where the generated file lives, relative to the repository root.
@@ -90,6 +92,16 @@ fn vocabularies() -> Vec<Vocabulary> {
                 RunStatus::Pausing,
                 RunStatus::Paused,
                 RunStatus::Failed,
+            ],
+        ),
+        vocabulary(
+            "MUTATION_STATUSES",
+            "MutationStatus",
+            "How a mutation asked of a run went. `pending` waits for the run to pause.",
+            &[
+                MutationStatus::Pending,
+                MutationStatus::Applied,
+                MutationStatus::Failed,
             ],
         ),
         vocabulary(
@@ -194,6 +206,7 @@ pub fn generate() -> String {
         ChatMessage::decl(&config),
         Conversation::decl(&config),
         ConversationSummary::decl(&config),
+        MutationRecord::decl(&config),
         RunRecord::decl(&config),
     ];
     for decl in &mut decls {
