@@ -136,7 +136,7 @@ pub(crate) fn delete(
         .collect::<Vec<_>>();
     anyhow::ensure!(
         !sessions.iter().any(|s| s.attached),
-        "EA {id} deletion is pending: detach its agent terminals, then retry deletion"
+        "Cannot delete attached session: EA {id} deletion is pending; detach its agent terminals, then retry deletion"
     );
     for session in &sessions {
         if !deletion.agents.contains(&session.name) {
@@ -157,7 +157,7 @@ pub(crate) fn delete(
         .collect::<Vec<_>>();
     anyhow::ensure!(
         !sessions.iter().any(|s| s.attached),
-        "detach this EA's agent terminals before retrying deletion"
+        "Cannot delete attached session: detach this EA's agent terminals before retrying deletion"
     );
     for session in sessions {
         let tree = client.session_process_tree(&session.name)?;
