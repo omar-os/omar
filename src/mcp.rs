@@ -697,6 +697,28 @@ impl OmarMcpServer {
             name: self.canonical_tool_name(&call.name),
             arguments: call.arguments,
         };
+        // Managed deletion uses the daemon and must not hold its own shared
+        // admission while waiting for the daemon's exclusive deletion lock.
+        let managed = self
+            .context
+            .omar_dir
+            .join("launch.json")
+            .symlink_metadata()
+            .is_ok();
+        if call.name == "delete_ea" && managed {
+            return match self.delete_ea(call.arguments) {
+                Ok(value) => tool_success(value),
+                Err(error) => tool_error(error),
+            };
+        }
+        let _admission = if managed {
+            match crate::ea_lifecycle::Admission::acquire(&self.context.omar_dir, self.ea_id()) {
+                Ok(admission) => Some(admission),
+                Err(error) => return tool_error(error),
+            }
+        } else {
+            None
+        };
         append_debug_log(
             &self.context,
             &format!("tool_call name={} args={}", call.name, call.arguments),
@@ -1016,6 +1038,13 @@ impl OmarMcpServer {
             ea_id: u32,
         }
         let args: Args = serde_json::from_value(args)?;
+        if let Some(session) = crate::sessions::owner(&self.context.omar_dir)? {
+            return crate::sessions::rpc(
+                &session,
+                json!({"op":"delete_ea", "ea":args.ea_id.to_string()}),
+                std::time::Duration::from_secs(90),
+            );
+        }
         let registry = ea::ensure_default_ea(&self.context.omar_dir)?;
         if registry.len() <= 1 {
             return Err(anyhow!(

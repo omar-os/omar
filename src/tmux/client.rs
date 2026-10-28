@@ -867,6 +867,30 @@ impl TmuxClient {
         teardown
     }
 
+    /// Capture every pane in every window, including descendant processes.
+    pub(crate) fn session_process_tree(&self, name: &str) -> Result<Vec<(u32, String)>> {
+        let target = exact_session_target(name);
+        let panes = self.run(&[
+            "list-panes",
+            "-s",
+            "-t",
+            &target,
+            "-F",
+            "#{pane_pid}|#{pane_dead}",
+        ])?;
+        let mut tree = Vec::new();
+        for pane in panes.lines() {
+            let (pid, dead) = pane.split_once('|').context("invalid tmux pane identity")?;
+            if dead == "1" {
+                continue;
+            }
+            tree.extend(crate::process::process_tree(pid.parse()?));
+        }
+        tree.sort();
+        tree.dedup();
+        Ok(tree)
+    }
+
     /// Check if a session exists
     pub fn has_session(&self, name: &str) -> Result<bool> {
         self.check_session(name, false)

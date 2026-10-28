@@ -258,6 +258,14 @@ impl Scheduler {
     }
 
     pub fn insert(&self, event: ScheduledEvent) {
+        let _admission = if let Some(root) = self.store_path.as_deref().and_then(Path::parent) {
+            match crate::ea_lifecycle::Admission::acquire(root, event.ea_id) {
+                Ok(admission) => Some(admission),
+                Err(_) => return,
+            }
+        } else {
+            None
+        };
         self.transaction(true, |queue| {
             queue.push(event);
         });
@@ -309,6 +317,28 @@ impl Scheduler {
         self.transaction(false, |queue| {
             queue.iter().filter(|e| e.ea_id == ea_id).cloned().collect()
         })
+    }
+
+    /// Deletion must never acknowledge an in-memory-only cancellation.
+    pub(crate) fn cancel_by_ea_checked(&self, id: u32) -> anyhow::Result<usize> {
+        let Some(path) = &self.store_path else {
+            return Ok(self.cancel_by_ea(id));
+        };
+        let _lock = StoreLock::acquire(store_lock_path(path))?;
+        let events: Vec<ScheduledEvent> = match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let count = events.iter().filter(|event| event.ea_id == id).count();
+        let remaining: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.ea_id != id)
+            .collect();
+        crate::topology::write_json_atomic(path, &remaining)?;
+        *self.queue.lock().unwrap() = remaining.into_iter().collect();
+        self.notify.notify_one();
+        Ok(count)
     }
 
     /// Cancel all events for a specific EA. Returns the number cancelled.
@@ -669,11 +699,22 @@ pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer, bas
 
                     // Socket and HTTP delivery run off the async event loop.
                     // No terminal input is read or modified.
+                    let admission = if let Some(root) =
+                        scheduler.store_path.as_deref().and_then(Path::parent)
+                    {
+                        match crate::ea_lifecycle::Admission::acquire(root, ea_id) {
+                            Ok(admission) => Some(admission),
+                            Err(_) => continue,
+                        }
+                    } else {
+                        None
+                    };
                     let message = format_delivery(&batch, timestamp);
                     let receiver_name = receiver.clone();
                     let base_prefix_clone = base_prefix.clone();
                     let ticker_clone = ticker.clone();
                     let delivery_result = tokio::task::spawn_blocking(move || {
+                        let _admission = admission;
                         deliver_to_tmux(
                             ea_id,
                             &receiver_name,
