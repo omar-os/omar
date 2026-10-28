@@ -91,6 +91,11 @@ const EMBEDDED_PROMPTS: &[(&str, &str)] = &[
     ("agent.md", PROMPT_AGENT),
 ];
 
+/// The helper a Claude Code Workflow script routes every `agent()` through. It
+/// fills `{{OMAR_WORKFLOW_HELPER}}` in the EA prompt and is quoted by the
+/// workflow guard when it denies a script.
+pub(crate) const OMAR_WORKFLOW_HELPER: &str = "const omar = (name, prompt, {backend, model, ...opts} = {}) => agent(`omar: name=${name} backend=${backend ?? ''} model=${model ?? ''}\\n` + prompt, {...opts, agentType: 'omar', label: backend ? `${name} · ${backend}` : name})";
+
 /// Return the `{omar_dir}/prompts/` directory, writing embedded prompts into it.
 ///
 /// Prompts are shared templates containing `{{EA_ID}}` placeholders.
@@ -515,7 +520,8 @@ pub fn build_ea_command(
     std::fs::write(&combined_path, &combined).ok();
     let resolved = combined
         .replace("{{EA_ID}}", &ea_id.to_string())
-        .replace("{{EA_NAME}}", ea_name);
+        .replace("{{EA_NAME}}", ea_name)
+        .replace("{{OMAR_WORKFLOW_HELPER}}", OMAR_WORKFLOW_HELPER);
     let backend = crate::backend::detect(base_command);
     let normalized = match backend {
         Some(backend) => backend.normalize_command(base_command),
@@ -532,7 +538,11 @@ pub fn build_ea_command(
     let cmd = build_agent_command(
         base_command,
         &combined_path,
-        &[("{{EA_ID}}", &ea_id.to_string()), ("{{EA_NAME}}", ea_name)],
+        &[
+            ("{{EA_ID}}", &ea_id.to_string()),
+            ("{{EA_NAME}}", ea_name),
+            ("{{OMAR_WORKFLOW_HELPER}}", OMAR_WORKFLOW_HELPER),
+        ],
         mcp_context,
     );
     (cmd, None)
@@ -1333,6 +1343,10 @@ pub(crate) mod tests {
         assert!(
             !body.contains("{{EA_NAME}}"),
             "combined prompt should have EA_NAME resolved"
+        );
+        assert!(
+            body.contains(OMAR_WORKFLOW_HELPER),
+            "combined prompt should carry the workflow helper"
         );
     }
 

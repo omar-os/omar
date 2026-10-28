@@ -241,6 +241,12 @@ enum Commands {
         event: Option<String>,
     },
 
+    /// Claude Code hooks, wired into every Claude EA's launch settings by Omar.
+    ClaudeHook {
+        #[command(subcommand)]
+        hook: ClaudeHookKind,
+    },
+
     /// Run a protocol-backed agent with a durable side-channel inbox.
     BackendRunner {
         #[arg(long)]
@@ -262,6 +268,14 @@ enum Commands {
         /// rebuilds the names OMAR's prompts use, instead of `omar_omar_...`.
         #[arg(long)]
         bare_tool_names: bool,
+        /// Let spawn_agent and get_task take `wait_s` and hold their reply
+        /// until the task finishes. For an orchestrator's stand-in only:
+        /// OMAR-launched agents never pass it, so they cannot block. Only
+        /// add_project, spawn_agent and get_task are exposed. If the client
+        /// exits mid-hold, the workers keep running and a retried spawn_agent
+        /// with the same name reattaches; a cancelled call cancels the task.
+        #[arg(long)]
+        hold: bool,
     },
 
     /// Pause a running topology: checkpoint at the next tag boundary, then
@@ -338,6 +352,14 @@ enum Commands {
         #[arg(long)]
         ui: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ClaudeHookKind {
+    /// PreToolUse: deny Workflow scripts whose agents bypass the omar stand-in.
+    /// The reason it prints is the helper to route every agent() through;
+    /// `// omar:allow-native` opts a script out.
+    WorkflowGuard,
 }
 
 #[derive(Subcommand)]
@@ -649,12 +671,31 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             format,
             event,
         }) => supervision::run_hook(&context_file, &format, event.as_deref()),
+        Some(Commands::ClaudeHook {
+            hook: ClaudeHookKind::WorkflowGuard,
+        }) => {
+            use std::io::Read;
+            let mut raw = String::new();
+            io::stdin().take(1_048_576).read_to_string(&mut raw)?;
+            let input = serde_json::from_str(&raw).unwrap_or_default();
+            if let Some(reason) = workflow_guard_denial(&input) {
+                println!(
+                    "{}",
+                    serde_json::json!({"hookSpecificOutput":{
+                    "hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":reason}})
+                );
+            }
+            Ok(())
+        }
         Some(Commands::McpServer {
             context_file,
             bare_tool_names,
+            hold,
         }) => match context_file {
-            Some(path) => mcp::run_server_from_context_file(PathBuf::from(path), bare_tool_names),
-            None => mcp::run_server_with_default_context(bare_tool_names),
+            Some(path) => {
+                mcp::run_server_from_context_file(PathBuf::from(path), bare_tool_names, hold)
+            }
+            None => mcp::run_server_with_default_context(bare_tool_names, hold),
         },
         Some(Commands::Checkpoint { action }) => {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
@@ -742,7 +783,13 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
     ("Setup", &["setup-tmux", "help"]),
     (
         "For agents (launched by OMAR, not typed)",
-        &["agent-hook", "hook-drain", "backend-runner", "mcp-server"],
+        &[
+            "agent-hook",
+            "hook-drain",
+            "claude-hook",
+            "backend-runner",
+            "mcp-server",
+        ],
     ),
 ];
 
@@ -932,7 +979,7 @@ fn kill_agent(
     }
     let _ = client.ensure_session_not_attached(&full_name)?;
 
-    client.kill_session(&full_name)?;
+    backend::kill_worker(client, &full_name, false)?;
     let _ = scheduler.cancel_by_receiver_and_ea(name, ea_id);
     println!("Killed agent: {}", name);
     Ok(())
@@ -2100,9 +2147,66 @@ async fn run_dashboard(config: Config, session: sessions::Session) -> Result<()>
     Ok(())
 }
 
+/// Why a Claude Code `Workflow` call must not run: one of its `agent()` calls
+/// would start a native subagent that Omar cannot see. Every call must carry
+/// `agentType: 'omar'` in its own argument list, unless the script opts out
+/// with `omar:allow-native`.
+fn workflow_guard_denial(input: &serde_json::Value) -> Option<String> {
+    static ROUTED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let script = input["tool_input"]["script"].as_str()?;
+    if input["tool_name"] != "Workflow" || script.contains("omar:allow-native") {
+        return None;
+    }
+    let routed =
+        ROUTED.get_or_init(|| regex::Regex::new(r#"agentType\s*:\s*['"`]omar['"`]"#).unwrap());
+    script
+        .match_indices("agent(")
+        .any(|(at, call)| {
+            let args = &script[at + call.len()..];
+            let mut depth = 1;
+            let end = args
+                .char_indices()
+                .find(|&(_, c)| {
+                    depth += (c == '(') as i32 - (c == ')') as i32;
+                    depth == 0
+                })
+                .map_or(args.len(), |(end, _)| end);
+            !routed.is_match(&args[..end])
+        })
+        .then(|| {
+            format!(
+                "Route every agent() through this helper: {} - or add // omar:allow-native.",
+                manager::OMAR_WORKFLOW_HELPER
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_guard_denies_only_unrouted_agent_calls() {
+        let call = |tool: &str, script: &str| {
+            workflow_guard_denial(
+                &serde_json::json!({"tool_name":tool,"tool_input":{"script":script}}),
+            )
+        };
+        assert!(call("Workflow", "await agent('hi')").is_some());
+        assert!(call("Workflow", "agent(p, {agentType: 'omar'})").is_none());
+        assert!(call("Workflow", "agent(p, {agentType: \"omar\"})").is_none());
+        assert!(call("Workflow", "// omar:allow-native\nagent(p)").is_none());
+        assert!(call("Workflow", "agent(p, {agentType:'omar'})").is_none());
+        assert!(call("Workflow", "agent(p, { agentType :`omar` })").is_none());
+        assert!(call("Workflow", "await sleep(1)").is_none());
+        // Every call is checked on its own: a helper does not vouch for a raw call.
+        let helper = manager::OMAR_WORKFLOW_HELPER;
+        assert!(call("Workflow", &format!("{helper}\nawait omar('a', 'b')")).is_none());
+        let reason = call("Workflow", &format!("{helper}\nawait agent('raw')")).unwrap();
+        assert!(reason.contains(helper));
+        assert!(call("Workflow", "agent(a, {agentType: 'omar'}); agent(b)").is_some());
+        assert!(call("Bash", "agent(p)").is_none());
+    }
 
     /// Regression: `extended-keys always` forces tmux to emit modify-other-keys
     /// sequences to every client, including omar's dashboard, which doesn't

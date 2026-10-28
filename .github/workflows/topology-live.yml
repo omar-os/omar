@@ -135,3 +135,51 @@ jobs:
             [[ -S $socket ]] && env -u TMUX tmux -S "$socket" kill-server 2>/dev/null || true
           done
           rm -rf "$OMAR_HOME"
+
+  # Omar-backed ultracode: a Claude EA's Workflow agents run as real Omar
+  # workers, one on codex. Asserts from disk (see the script's docstring).
+  ultracode-live:
+    name: Live Ultracode
+    runs-on: [self-hosted, omar-live]
+    timeout-minutes: 20
+    concurrency:
+      group: live-ultracode
+      cancel-in-progress: false
+    env:
+      CARGO_TERM_COLOR: always
+      DISABLE_AUTOUPDATER: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          clean: false
+
+      - name: Isolate run state
+        run: |
+          git clean -ffdx -e target -e lang/.lake
+          printf '%s\n' "$HOME/.local/bin" "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+          mkdir -m 700 -p "$RUNNER_TEMP/tmux"
+          {
+            echo "TMUX_TMPDIR=$RUNNER_TEMP/tmux"
+            echo "OMAR_HOME=$RUNNER_TEMP/omar-home"
+          } >>"$GITHUB_ENV"
+
+      - name: Verify live agent CLIs
+        run: |
+          claude --version
+          codex --version
+          codex login status
+          claude auth status >/dev/null
+
+      - name: Run live ultracode smoke
+        run: env -u TMUX -u TMUX_PANE python3 tests/topology/ultracode_live.py
+
+      - name: Stop run's agents
+        if: always()
+        run: |
+          for socket in "$TMUX_TMPDIR"/tmux-*/*; do
+            [[ -S $socket ]] && env -u TMUX tmux -S "$socket" kill-server 2>/dev/null || true
+          done
+          rm -rf "$OMAR_HOME"

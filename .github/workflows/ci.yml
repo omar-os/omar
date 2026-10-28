@@ -204,6 +204,7 @@ jobs:
       - name: Verify native prompt and wake contracts against local mock providers
         run: |
           python3 tests/ci/claude_prompt_contract.py
+          python3 tests/ci/claude_workflow_contract.py
           python3 tests/ci/opencode_wake_contract.py
           python3 tests/ci/codex_event_wake.py
 

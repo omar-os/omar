@@ -30,6 +30,11 @@ impl Backend for Opencode {
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         from_stamp(target.stamp?).map(|(_, session)| session)
     }
+    fn forget(&self, target: &super::Target<'_>) {
+        if let Some((port, session)) = target.stamp.and_then(from_stamp) {
+            let _ = http_json(port, "DELETE", &format!("/session/{session}"), None);
+        }
+    }
     /// Single words: a long workspace path wraps the footer and splits
     /// "tab agents" and "ctrl+p commands" across lines.
     fn readiness_markers(&self) -> &'static [&'static str] {
@@ -439,6 +444,33 @@ mod tests {
         });
         deliver_over_http(port, "session_test", "agent event").unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn forgetting_a_worker_deletes_its_session_over_http() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stamp = format!("opencode:{}:ses_abc", listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntrue")
+                .unwrap();
+            line
+        });
+        Opencode.forget(&super::super::Target {
+            name: "pane",
+            pane_pid: 0,
+            stamp: Some(&stamp),
+        });
+        assert_eq!(
+            server.join().unwrap(),
+            "DELETE /session/ses_abc HTTP/1.1\r\n"
+        );
     }
 
     #[test]

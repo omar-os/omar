@@ -96,8 +96,13 @@ fn launch_command(launch: &Launch<'_>) -> Result<String> {
     let binary = omar_server_exe().context("OMAR executable")?;
     let (_, end) = super::executable(launch.base_command).context("Pi executable")?;
     let mut command = format!(
-        "{} --approve{}",
+        "{} --approve{}{}",
         &launch.base_command[..end],
+        if super::ephemeral_worker(context) {
+            " --no-session"
+        } else {
+            ""
+        },
         &launch.base_command[end..]
     );
     if !shlex::split(launch.base_command)
@@ -164,6 +169,8 @@ mod tests {
         context.agent_name = Some("worker".into());
         let worker = crate::manager::build_agent_command("pi", &prompt, &[], &context);
         assert!(!worker.contains("--session"));
+        assert!(worker.contains("pi --approve --no-session"), "{worker}");
+        assert!(!command.contains("--no-session"));
         assert_ne!(launch_socket(&command), launch_socket(&worker));
         context.agent_name = None;
         std::fs::remove_file(session).unwrap();
