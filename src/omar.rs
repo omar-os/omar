@@ -80,6 +80,14 @@ const TMUX_SETUP_WARNING: &str = "⚠ tmux not configured for omar — run 'omar
 #[command(
     name = "omar",
     about = "Independent agent runtimes and topology orchestration",
+    before_help = "Quick start:
+  A session is a background OMAR server; detach with z or close the browser to
+  leave agents running, or use omar down to pause workflows and stop it.
+
+  omar up --name dev --tui  Start a session and open it
+  omar attach -s dev --tui  Reopen it later (--web for the browser)
+  omar down -s dev          Pause it; `omar up --name dev` resumes it
+  omar rm -s dev            Delete it and all its state (cannot be undone)",
     version,
     subcommand_required = true,
     arg_required_else_help = true
@@ -790,7 +798,7 @@ fn help_template() -> String {
     if !rest.is_empty() {
         section("Other", &rest, &about, width, &mut listed, &mut sections);
     }
-    format!("{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{sections}Options:\n{{options}}{{after-help}}")
+    format!("{{before-help}}{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{sections}Options:\n{{options}}{{after-help}}")
 }
 
 fn omar_dir() -> PathBuf {

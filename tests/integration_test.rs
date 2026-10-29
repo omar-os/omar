@@ -775,21 +775,46 @@ fn test_spawn_custom_command() {
     let _ = tmux(&["kill-session", "-t", &session_name]);
 }
 
-/// Test that the omar binary can be built and shows help
+/// Bare invocation and both help flags show the quick start and grouped help.
 #[test]
 fn test_omar_help() {
-    let output = Command::new("cargo")
-        .args(["run", "--", "--help"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("Failed to run omar");
+    for args in [vec![], vec!["--help"], vec!["-h"]] {
+        let output = Command::new(omar_bin())
+            .args(&args)
+            .output()
+            .expect("Failed to run omar");
+        assert_eq!(
+            output.status.code(),
+            Some(if args.is_empty() { 2 } else { 0 })
+        );
+        let help = if args.is_empty() {
+            String::from_utf8_lossy(&output.stderr)
+        } else {
+            String::from_utf8_lossy(&output.stdout)
+        };
+        assert!(
+            help.starts_with(
+                "Quick start:
+  A session is a background OMAR server; detach with z or close the browser to
+  leave agents running, or use omar down to pause workflows and stop it.
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Independent agent runtimes and topology orchestration"),
-        "Help should contain description: {}",
-        stdout
-    );
+  omar up --name dev --tui  Start a session and open it
+  omar attach -s dev --tui  Reopen it later (--web for the browser)
+  omar down -s dev          Pause it; `omar up --name dev` resumes it
+  omar rm -s dev            Delete it and all its state (cannot be undone)
+"
+            ),
+            "Help should start with session commands: {help}"
+        );
+        assert!(
+            help.contains("Independent agent runtimes and topology orchestration"),
+            "Help should contain description: {help}"
+        );
+        assert!(
+            help.contains("Sessions:\n"),
+            "Help should retain command groups: {help}"
+        );
+    }
 }
 
 #[test]
