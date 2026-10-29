@@ -135,10 +135,15 @@ jobs:
           lake-package-directory: lang
           test: false
 
+      - name: Test Rust messaging core and Slack adapter (no credentials)
+        run: 'cargo test --locked --bin omar messaging::'
+
       - name: Verify legacy supervision through MCP and tmux
         run: |
           cargo build -p omar
           python3 tests/ci/independent_sessions.py
+          python3 tests/ci/slack_workflow.py
+          python3 tests/ci/slack_credentials.py
           python3 tests/ci/team_workspaces.py
           python3 tests/ci/team_checkpoints.py
           python3 tests/ci/session_upgrade.py
@@ -147,8 +152,12 @@ jobs:
           python3 tests/ci/protocol_runner.py
           python3 tests/ci/mission_control_lifecycle.py
 
+      # These two environment-bound fixtures already run in slack_workflow.py above.
       - name: Run tests that shell out to cargo
-        run: cargo test --bin omar -- --ignored --test-threads=1
+        run: |
+          cargo test --bin omar -- --ignored --test-threads=1 \
+            --skip messaging::tests::real_runtime \
+            --skip messaging::tests::real_registry
 
   codex-shared-history:
     name: Codex Shared History

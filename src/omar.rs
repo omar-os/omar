@@ -13,6 +13,7 @@ mod event;
 mod manager;
 mod mcp;
 mod memory;
+mod messaging;
 mod metrics;
 mod mutation;
 mod panic_hook;
@@ -116,6 +117,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Connect an external messaging platform to an approved workflow
+    Messaging {
+        #[command(subcommand)]
+        command: messaging::Command,
+    },
     /// Create a new independent background runtime, or restart a stopped one by name on this build
     Up(sessions::UpOptions),
     /// List independently addressable runtime sessions
@@ -471,6 +477,9 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(mut cli: Cli) -> Result<()> {
+    if let Some(Commands::Messaging { command }) = &cli.command {
+        return messaging::run(command).await;
+    }
     let internal = if let Some(Commands::SessionExec { args }) = &cli.command {
         let args = args.clone();
         cli = Cli::try_parse_from(std::iter::once("omar".to_string()).chain(args))?;
@@ -506,7 +515,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     let omar_dir = omar_dir();
     match cli.command {
         Some(
-            Commands::Up(_)
+            Commands::Messaging { .. }
+            | Commands::Up(_)
             | Commands::Ls
             | Commands::Info
             | Commands::Attach { .. }

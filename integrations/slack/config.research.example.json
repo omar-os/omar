@@ -1,0 +1,20 @@
+{
+  "runtimeUrl": "http://127.0.0.1:PORT/chats/CHAT-ID",
+  "workspaceId": "T_WORKSPACE",
+  "allowedUsers": [
+    "U_YOUR_USER"
+  ],
+  "allowedChannels": [
+    "C_DEMO_CHANNEL"
+  ],
+  "command": "research",
+  "programPath": "research.omar",
+  "outputPort": "edit.report",
+  "timeoutSeconds": 480,
+  "rawInputs": [
+    "research.request=Summarize the latest significant U.S. stock-market news, focusing on NVIDIA (NVDA), Microsoft (MSFT), Apple (AAPL), and major Federal Reserve or economic developments affecting the broad market. Prioritize material news over forcing one item per company. Use dated public sources, normally from the past 72 hours, and explicitly report missing or older coverage."
+  ],
+  "files": {
+    "schemas/research-status.json": "schemas/research-status.json"
+  }
+}

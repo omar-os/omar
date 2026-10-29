@@ -36,11 +36,17 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 tracing = "0.1.44"
 # Terminal attach. `tungstenite` is the sync API, which matches the blocking
-# thread-per-connection model `omar serve` already uses; TLS is off because the
-# server binds loopback only.
+# thread-per-connection model `omar serve` already uses. Terminal connections
+# remain loopback/plaintext; the Slack client below enables TLS for external WSS.
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 portable-pty = "0.8"
 ts-rs = { version = "12.0.1", features = ["serde-compat"] }
+
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+
+rpassword = "7"
 
 [dev-dependencies]
 pretty_assertions = "1"
