@@ -49,6 +49,39 @@ thread_local! {
     static SESSION: RefCell<Option<TestSession>> = const { RefCell::new(None) };
 }
 
+/// A temporary HOME that shuts its session down before the directory goes.
+/// The thread-local session alone drops only when the test thread ends, after
+/// the directory is gone, so `omar down` could not find it and the daemon
+/// outlived the test.
+struct TestHome(tempfile::TempDir);
+
+impl TestHome {
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for TestHome {
+    fn drop(&mut self) {
+        let session = SESSION.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            if cell
+                .as_ref()
+                .is_some_and(|session| session.home == self.path())
+            {
+                cell.take()
+            } else {
+                None
+            }
+        });
+        drop(session);
+    }
+}
+
+fn test_home() -> TestHome {
+    TestHome(tempfile::tempdir().expect("temp home"))
+}
+
 /// Every runtime log under the test home, so a failed `up` explains itself.
 fn runtime_logs(home: &Path) -> String {
     let Ok(sessions) = std::fs::read_dir(home.join(".omar").join("sessions")) else {
@@ -768,7 +801,7 @@ fn test_omar_list_empty() {
 
     // Isolate HOME so we don't read the developer's live `~/.omar/` nor
     // race against other tests that bootstrap their own omar dir.
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
 
     let output = omar_command(home.path())
         .arg("list")
@@ -793,7 +826,7 @@ fn test_omar_spawn_and_kill() {
     // Per-test unique agent name: tmux sessions are process-global so even
     // with isolated HOME, a parallel test running the same CLI would race
     // on the tmux daemon. The uuid suffix pins this test's session.
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
     let agent_name = format!("test-spawn-{}", &Uuid::new_v4().to_string()[..8]);
 
     // Spawn a new agent.
@@ -871,7 +904,7 @@ fn test_mcp_delete_ea_refuses_attached_session() {
         return;
     }
 
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
     let mut server = McpCliServer::start(home.path(), "bash");
 
     let created = server.tool_call("create_ea", json!({ "name": "attached-ea" }));
@@ -953,7 +986,7 @@ fn test_omar_kill_refuses_attached_session() {
         return;
     }
 
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
     let agent_name = format!("kill-attached-{}", &Uuid::new_v4().to_string()[..8]);
     let session_name = format!("{}{}", "omar-agent-0-", agent_name);
     let spawn_output = omar_command(home.path())
@@ -1038,7 +1071,7 @@ fn test_omar_kill_refuses_attached_session() {
 
 #[test]
 fn test_omar_event_cli_roundtrip() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
 
     let output = omar_command(home.path())
         .args([
@@ -1156,7 +1189,7 @@ fn register_project(home: &Path, project_name: &str) -> usize {
 
 #[test]
 fn test_omar_mcp_server_tools_list_via_cli() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
     let mut server = McpCliServer::start(home.path(), "bash");
 
     let response = server.request("tools/list", json!({}));
@@ -1254,7 +1287,7 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
         return;
     }
 
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
     let mut server = McpCliServer::start(home.path(), "bash");
     let suffix = &Uuid::new_v4().to_string()[..8];
     let name = format!("mcp-agent-{}", suffix);
@@ -1339,7 +1372,7 @@ fn test_spawn_agent_task_is_durable_and_visible_via_cli() {
         return;
     }
 
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
     let mut server = McpCliServer::start(home.path(), "bash");
     let suffix = &Uuid::new_v4().to_string()[..8];
     let agent_name = format!("task-agent-{}", suffix);
@@ -1418,7 +1451,7 @@ fn test_spawn_agent_requires_explicit_parent_when_project_has_pm() {
         return;
     }
 
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
     let mut server = McpCliServer::start(home.path(), "bash");
     let suffix = &Uuid::new_v4().to_string()[..8];
     let project_name = format!("ownership-project-{}", suffix);
@@ -1498,7 +1531,7 @@ fn test_spawn_agent_rejects_parent_from_different_project() {
         return;
     }
 
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
     let mut server = McpCliServer::start(home.path(), "bash");
     let suffix = &Uuid::new_v4().to_string()[..8];
     let pm_name = format!("cross-pm-{}", suffix);
@@ -1564,7 +1597,7 @@ fn test_complete_project_blocks_on_running_agent() {
         return;
     }
 
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
     let mut server = McpCliServer::start(home.path(), "bash");
     let suffix = &Uuid::new_v4().to_string()[..8];
     let agent_name = format!("project-agent-{}", suffix);
@@ -1633,7 +1666,7 @@ fn test_integer_fields_accept_strings() {
         eprintln!("Skipping test: tmux not available");
         return;
     }
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
     let mut server = McpCliServer::start(home.path(), "bash");
     let suffix = &Uuid::new_v4().to_string()[..8];
     let agent_name = format!("flex-agent-{}", suffix);
@@ -1938,7 +1971,7 @@ fn test_manager_notes_shell_write_persists_across_ea_restart() {
         return;
     }
 
-    let home = tempfile::tempdir().expect("temp home");
+    let home = test_home();
     let session_prefix = format!("omar-notes-{}-", Uuid::new_v4());
 
     // Override default_command so `omar ea start` runs a tame shell

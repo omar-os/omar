@@ -15,6 +15,7 @@ mod mcp;
 mod memory;
 mod messaging;
 mod metrics;
+mod mutation;
 mod panic_hook;
 mod paths;
 mod process;
@@ -286,6 +287,21 @@ enum Commands {
         deployment: String,
     },
 
+    /// Change a running or paused topology's program. A running one pauses at
+    /// its next tag boundary, takes the change, and resumes.
+    Mutate {
+        /// Team name or run id
+        deployment: String,
+        /// The new version of the program; its `main` must keep its name
+        program: PathBuf,
+        /// Print the changes and apply nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Wait until the change is applied
+        #[arg(long)]
+        wait: bool,
+    },
+
     /// Move a paused topology's resume point back to an earlier checkpoint.
     /// Nothing is deleted; `omar resume` then continues from there.
     Rollback {
@@ -511,6 +527,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Runs { .. }
             | Commands::Pause { .. }
             | Commands::Resume { .. }
+            | Commands::Mutate { .. }
             | Commands::Rollback { .. }
             | Commands::SessionDaemon { .. }
             | Commands::SessionExec { .. }
@@ -722,6 +739,7 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
             "stop",
             "pause",
             "resume",
+            "mutate",
             "rollback",
             "checkpoint",
             "workspace",

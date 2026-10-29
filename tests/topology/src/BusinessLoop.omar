@@ -223,6 +223,27 @@ team BusinessLoop[a_builder : Codex,
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input delivery : string
+    state got_delivery : bool = false
+    timer deadline(20min, 0)
+
+    reaction(delivery) -> {=
+        if delivery.is_some() { self.got_delivery = true; }
+        if self.got_delivery { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_delivery, "no biz.delivery by the deadline");
+    =}
+}
+
 main {
     biz = BusinessLoop()
+
+    smoke = Smoke()
+    biz.delivery -> smoke.delivery
 }

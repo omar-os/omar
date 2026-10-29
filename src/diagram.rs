@@ -1036,6 +1036,7 @@ mod tests {
                 offset: 0,
                 period: 10,
                 instance: String::new(),
+                shutdown: false,
             },
         );
         state

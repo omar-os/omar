@@ -8,6 +8,10 @@
 export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "pausing", "paused", "failed"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
+/** How a mutation asked of a run went. `pending` waits for the run to pause. */
+export const MUTATION_STATUSES = ["pending", "applied", "failed"] as const;
+export type MutationStatus = (typeof MUTATION_STATUSES)[number];
+
 /** Where a drawing stands. `ready` is compiled but never run, which is what a proposal's preview is. */
 export const DIAGRAM_STATUSES = ["ready", "running", "completed", "failed", "paused"] as const;
 export type DiagramStatus = (typeof DIAGRAM_STATUSES)[number];
@@ -136,6 +140,20 @@ export type Conversation = { id: string, title: string, ea_id: number | null, cr
 
 export type ConversationSummary = { id: string, title: string, created_at: number, updated_at: number, message_count: number, ea_id: number | null, busy: boolean, run: RunRecord | null, };
 
+export type MutationRecord = { status: MutationStatus,
+/**
+ * One line per instruction of the plan.
+ */
+changes: Array<string>,
+/**
+ * Queued events the new program had no port or timer for.
+ */
+dropped?: Array<string>,
+/**
+ * The `mutation` checkpoint the run continues from.
+ */
+checkpoint?: string, error?: string, };
+
 export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number, finished_at: number | null, error: string | null,
 /**
  * Input ports the run was admitted with, so its timeline can be
@@ -149,4 +167,8 @@ outputs?: Record<string, unknown>,
 /**
  * State variables a finished run ended with.
  */
-state?: Record<string, unknown>, };
+state?: Record<string, unknown>,
+/**
+ * The last mutation asked of the run, and how it went.
+ */
+mutation?: MutationRecord, };

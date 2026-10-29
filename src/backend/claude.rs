@@ -21,17 +21,23 @@ impl Backend for Claude {
     }
     fn startup_gate(&self, screen: &str) -> Option<super::StartupGate> {
         // The workspace trust dialog is distinct from tool/command approvals.
-        if !screen.contains("Accessing workspace:") {
+        // The bypass-permissions warning follows it on a machine that has never
+        // accepted it; OMAR launched with `--dangerously-skip-permissions`, so
+        // it is OMAR's choice to accept. Until accepted, Claude Code registers
+        // no peer socket.
+        let (id, yes) = if screen.contains("Accessing workspace:") {
+            ("workspace-trust", "Yes, I trust this folder")
+        } else if screen.contains("Bypass Permissions mode") {
+            ("bypass-permissions", "Yes, I accept")
+        } else {
             return None;
-        }
+        };
         let keys = (|| -> Option<&'static [&'static str]> {
             if !screen.contains("Enter to confirm") {
                 return None;
             }
             let lines: Vec<_> = screen.lines().map(str::trim).collect();
-            let yes = lines
-                .iter()
-                .position(|line| line.ends_with("Yes, I trust this folder"))?;
+            let yes = lines.iter().position(|line| line.ends_with(yes))?;
             let no = lines.iter().position(|line| line.ends_with("No, exit"))?;
             let selected = |line: &str| line.starts_with(['❯', '›', '>']);
             if selected(lines[yes]) {
@@ -45,7 +51,7 @@ impl Backend for Claude {
         })()
         .unwrap_or(&[]);
         Some(super::StartupGate {
-            id: "workspace-trust",
+            id,
             confirms: keys == ["Enter"],
             keys,
         })
@@ -478,6 +484,30 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn startup_bypass_permissions_warning_is_accepted() {
+        use super::Backend;
+        for (options, expected) in [
+            ("❯ No, exit\n  Yes, I accept", vec!["Down"]),
+            ("❯ 1. No, exit\n  2. Yes, I accept", vec!["Down"]),
+            ("  No, exit\n❯ Yes, I accept", vec!["Enter"]),
+            ("  No, exit\n  Yes, I accept", vec![]),
+        ] {
+            let screen = format!(
+                "WARNING: Claude Code running in Bypass Permissions mode\n{options}\nEnter to confirm · Esc to cancel"
+            );
+            let gate = super::Claude.startup_gate(&screen).unwrap();
+            assert_eq!(gate.id, "bypass-permissions");
+            assert_eq!(gate.keys, expected);
+            assert_eq!(gate.confirms, expected == ["Enter"]);
+        }
+        // Its own words on screen are not a dialog without the confirm hint.
+        let partial = super::Claude
+            .startup_gate("Claude Code running in Bypass Permissions mode\n❯")
+            .unwrap();
+        assert!(partial.keys.is_empty());
+    }
+
     use super::*;
     use crate::manager::tests::*;
     use crate::manager::TopologyMcpContext;
@@ -689,6 +719,16 @@ mod tests {
             .args(["-c", "sleep 30; :", "sh", "--dangerously-skip-permissions"])
             .spawn()
             .unwrap();
+        // spawn returns once exec swaps the child's memory, which can be
+        // before the kernel records its new argv; /proc then reads it empty.
+        for pid in [accepting.id(), holding.id()] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while process_argv(pid).is_none_or(|argv| argv.is_empty())
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
 
         assert!(launched_to_accept(accepting.id()));
         assert!(!launched_to_accept(holding.id()));

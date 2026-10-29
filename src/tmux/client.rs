@@ -54,6 +54,8 @@ const SESSION_BACKEND_VAR: &str = "OMAR_BACKEND";
 /// Session-environment key describing the backend's side channel, if it has one.
 const SESSION_DELIVERY_VAR: &str = "OMAR_DELIVERY";
 const SESSION_STARTUP_VAR: &str = "@omar_startup_pending";
+/// How long a startup navigation key may go unanswered before it is resent.
+const STARTUP_KEY_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
@@ -483,6 +485,11 @@ impl TmuxClient {
             .startup_state(session, "@omar_startup_action")
             .unwrap_or_default();
         let mut answered_gate = self.startup_state(session, "@omar_startup_answered");
+        // A TUI can paint its dialog before it reads keys, and a key sent then
+        // is lost with the screen unchanged. Navigation is recomputed from the
+        // screen, so resending it to a screen that still shows the same
+        // selection is safe; a confirmation is never resent.
+        let mut acted_at = Instant::now();
         loop {
             // Current viewport only: scrollback may contain old dialogs.
             let screen = self.run(&["capture-pane", "-p", "-t", &target])?;
@@ -491,8 +498,9 @@ impl TmuxClient {
             screen.hash(&mut hash);
             let observation = format!("{:x}", hash.finish());
             if let Some(gate) = backend.startup_gate(&screen) {
+                let unheard = !gate.confirms && acted_at.elapsed() >= STARTUP_KEY_RETRY;
                 if observation == previous
-                    && observation != acted_on
+                    && (observation != acted_on || unheard)
                     && !gate.keys.is_empty()
                     && answered_gate.as_deref() != Some(gate.id)
                 {
@@ -500,6 +508,7 @@ impl TmuxClient {
                     acted_on = self
                         .startup_state(session, "@omar_startup_action")
                         .unwrap_or_default();
+                    acted_at = Instant::now();
                     answered_gate = self.startup_state(session, "@omar_startup_answered");
                 }
             } else if !backend.readiness_markers().is_empty()
@@ -883,6 +892,8 @@ impl TmuxClient {
             && (error.contains("can't find session")
                 || error.contains("no server running")
                 || error.contains("no sessions")
+                // Asked while it shut down after its last session: none left.
+                || error.contains("server exited unexpectedly")
                 || (error.contains("error connecting to")
                     && (error.contains("No such file or directory")
                         || error.contains("Connection refused"))))
@@ -987,6 +998,7 @@ mod tests {
         for (message, ordinary_missing, cleanup_missing) in [
             ("can't find session: example", true, false),
             ("no server running on /tmp/test", true, false),
+            ("server exited unexpectedly", true, false),
             (
                 "error connecting to /tmp/test (No such file or directory)",
                 true,
@@ -1151,6 +1163,79 @@ with Path(sys.argv[1]).open('ab', buffering=0) as log:
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(std::fs::read(&log).unwrap(), b"xy");
+    }
+
+    /// A key sent before the TUI reads keys is lost and leaves the dialog as
+    /// it was. Readiness must not wait out its timeout on that dialog.
+    #[test]
+    fn a_startup_key_the_tui_did_not_hear_is_sent_again() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("startup.py");
+        let log = dir.path().join("keys");
+        std::fs::write(
+            &script,
+            include_str!("../../tests/fixtures/delivery/startup_gate.py"),
+        )
+        .unwrap();
+        let session = format!("omar-test-startup-deaf-{}", std::process::id());
+        let _guard = SessionGuard(session.clone());
+        let client = TmuxClient::new("");
+        let command = format!(
+            "python3 {} claude-deaf {}",
+            crate::manager::shell_single_quote(&script.display().to_string()),
+            crate::manager::shell_single_quote(&log.display().to_string())
+        );
+        client
+            .new_session_with_backend(&session, &command, None, Some("claude"))
+            .unwrap();
+        assert!(client.wait_for_markers(
+            &session,
+            &["Claude Code", "❯"],
+            Duration::from_secs(10),
+            Duration::from_millis(50)
+        ));
+        // One Down heard after the deaf window, then one Enter.
+        assert_eq!(std::fs::read(&log).unwrap(), b"\x1b[B\r");
+    }
+
+    #[test]
+    fn the_bypass_permissions_warning_is_accepted_before_ready() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("startup.py");
+        let log = dir.path().join("keys");
+        std::fs::write(
+            &script,
+            include_str!("../../tests/fixtures/delivery/startup_gate.py"),
+        )
+        .unwrap();
+        let session = format!("omar-test-startup-bypass-{}", std::process::id());
+        let _guard = SessionGuard(session.clone());
+        let client = TmuxClient::new("");
+        let command = format!(
+            "python3 {} claude-bypass {}",
+            crate::manager::shell_single_quote(&script.display().to_string()),
+            crate::manager::shell_single_quote(&log.display().to_string())
+        );
+        client
+            .new_session_with_backend(&session, &command, None, Some("claude"))
+            .unwrap();
+        // The warning shows both readiness markers; it must not pass for ready.
+        assert!(client.wait_for_markers(
+            &session,
+            &["Claude Code", "❯"],
+            Duration::from_secs(10),
+            Duration::from_millis(50)
+        ));
+        // Trust: Down, Enter. Then the warning: Down, Enter.
+        assert_eq!(std::fs::read(&log).unwrap(), b"\x1b[B\r\x1b[B\r");
     }
 
     #[test]
