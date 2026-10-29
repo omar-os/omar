@@ -44,20 +44,21 @@ impl HealthChecker {
     /// Check the health of a session by comparing against the previous frame.
     /// Initial observations use tmux activity instead of assuming Running.
     pub fn check(&mut self, session_name: &str) -> HealthState {
-        let current = self
-            .client
-            .capture_pane(session_name, 50)
-            .unwrap_or_default();
+        if self.idle_for(session_name).unwrap_or_default() >= self.idle_threshold {
+            HealthState::Idle
+        } else {
+            HealthState::Running
+        }
+    }
+
+    pub fn idle_for(&mut self, session_name: &str) -> anyhow::Result<Duration> {
+        let current = self.client.capture_pane(session_name, 50)?;
 
         let now = Instant::now();
         let initial_change = if self.last_frames.contains_key(session_name) {
             now
         } else {
-            let activity = self
-                .client
-                .get_pane_activity(session_name)
-                .unwrap_or(0)
-                .max(0) as u64;
+            let activity = self.client.get_pane_activity(session_name)?.max(0) as u64;
             let seconds = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -65,7 +66,7 @@ impl HealthChecker {
             now.checked_sub(Duration::from_secs(seconds.saturating_sub(activity)))
                 .unwrap_or(now)
         };
-        self.observe(session_name, current, now, initial_change)
+        Ok(self.observe_idle_for(session_name, current, now, initial_change))
     }
 
     fn observe(
@@ -75,6 +76,20 @@ impl HealthChecker {
         now: Instant,
         initial_change: Instant,
     ) -> HealthState {
+        if self.observe_idle_for(session, current, now, initial_change) >= self.idle_threshold {
+            HealthState::Idle
+        } else {
+            HealthState::Running
+        }
+    }
+
+    fn observe_idle_for(
+        &mut self,
+        session: &str,
+        current: String,
+        now: Instant,
+        initial_change: Instant,
+    ) -> Duration {
         let entry = self
             .last_frames
             .entry(session.to_owned())
@@ -82,11 +97,7 @@ impl HealthChecker {
         if entry.0 != current {
             *entry = (current, now);
         }
-        if now.saturating_duration_since(entry.1) >= self.idle_threshold {
-            HealthState::Idle
-        } else {
-            HealthState::Running
-        }
+        now.saturating_duration_since(entry.1)
     }
 
     /// Remove stale entries for sessions that no longer exist
@@ -105,6 +116,37 @@ mod tests {
         assert_eq!(HealthState::Running.as_str(), "running");
         assert_eq!(HealthState::Idle.as_str(), "idle");
     }
+    #[test]
+    fn changing_timer_is_activity_even_when_the_rest_of_the_pane_is_quiet() {
+        let mut checker = HealthChecker::new(TmuxClient::new(""), 300);
+        let now = Instant::now();
+        for seconds in (0..=900).step_by(5) {
+            let at = now + Duration::from_secs(seconds);
+            assert_eq!(
+                checker.observe("busy", format!("Running command ({seconds}s)"), at, now),
+                HealthState::Running
+            );
+        }
+        assert_eq!(
+            checker.observe(
+                "busy",
+                "Running command (900s)".into(),
+                now + Duration::from_secs(1199),
+                now
+            ),
+            HealthState::Running
+        );
+        assert_eq!(
+            checker.observe(
+                "busy",
+                "Running command (900s)".into(),
+                now + Duration::from_secs(1200),
+                now
+            ),
+            HealthState::Idle
+        );
+    }
+
     #[test]
     fn idle_threshold_and_initial_activity_survive_frequent_checks() {
         let mut checker = HealthChecker::new(TmuxClient::new(""), 15);
