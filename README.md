@@ -11,7 +11,7 @@ Deploy deterministic, verifiable, programmable agentic workflows.</strong>
   <a href="https://omar.rs">omar.rs</a>&nbsp; • &nbsp;
   <a href="https://omar.rs/zh/">中文</a>&nbsp; • &nbsp;
   <a href="https://opensource.org/licenses/BSD-3-Clause"><img src="https://img.shields.io/badge/License-BSD_3--Clause-blue.svg" alt="License" valign="middle"/></a>&nbsp; • &nbsp;
-  <a href="https://github.com/lsk567/omar/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/lsk567/omar/ci.yml?label=CI&logo=github" alt="CI Status" valign="middle"/></a>&nbsp; • &nbsp;
+  <a href="https://github.com/omar-os/omar/actions/workflows/ci.yml"><img src="https://github.com/omar-os/omar/actions/workflows/ci.yml/badge.svg" alt="CI Status" valign="middle"/></a>&nbsp; • &nbsp;
   <a href="https://discord.gg/X76PSzmfWr"><img src="https://img.shields.io/discord/1467663881588572182?label=Discord&logo=discord&logoColor=white&color=5865F2&cacheSeconds=60" alt="Discord" valign="middle"/></a>
 </p>
 
@@ -81,6 +81,12 @@ cd omar && make install
 
 ## Quick Start
 
+A session is a background OMAR server; detaching the terminal UI with `z` or
+closing the browser leaves agents running, while `omar down` pauses workflows
+safely and stops the session.
+
+### Mission Control (web)
+
 #### Step 1: Launch Mission Control
 
 ```bash
@@ -89,7 +95,7 @@ $ omar attach -s dev --web
 ```
 
 Starts an independent background runtime, then opens its web UI. Closing the
-browser leaves the runtime and its topologies running. Stop it with `omar down -s dev`.
+browser leaves the runtime and its topologies running.
 `omar --help` lists the session commands.
 
 #### Step 2: Describe a workflow
@@ -106,17 +112,7 @@ to. Inspect the roles and handoffs, then press **Confirm deploy** to start the
 workflow. The diagram goes live as agents work and pass results between steps.
 This example requires both Claude Code and Codex to be installed and configured.
 
-### Session commands
-
-| Command | What it does |
-|---------|--------------|
-| `omar up --name dev` | Start a background session, or restart the stopped session named `dev`. |
-| `omar attach -s dev --web` | Open Mission Control for that session. Use `--tui` for the terminal UI. |
-| `omar down -s dev` | Stop the session and keep its state. |
-| `omar rm -s dev` | Remove the session and its state, stopping it first if running. |
-
-Closing the browser or detaching leaves the session running. Use `omar --help`
-for more commands and `omar <command> --help` for options.
+Stop the session with `omar down -s dev`.
 
 ### Terminal UI
 
@@ -150,6 +146,20 @@ Go back to the EA and type in:
 ```
 Shutdown the test project and its agents.
 ```
+
+Press `Q` and confirm to stop the session.
+
+## Session commands
+
+| Command | What it does |
+|---------|--------------|
+| `omar up --name dev` | Start a background session, or restart the stopped session named `dev`. |
+| `omar attach -s dev --web` | Open Mission Control for that session. Use `--tui` for the terminal UI. |
+| `omar down -s dev` | Pause it; `omar up --name dev` resumes it. |
+| `omar rm -s dev` | Delete it and all its state (cannot be undone). |
+
+Closing the browser or detaching leaves the session running. Use `omar --help`
+for more commands and `omar <command> --help` for options.
 
 ## Supported Agent Backends
 
