@@ -554,6 +554,23 @@ struct DueDelivery {
 
 pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer, base_prefix: String) {
     let external_poll_interval = std::time::Duration::from_millis(500);
+    // Load once per runtime, using the same health settings as the dashboard.
+    let health_config = scheduler
+        .store_path
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(|root| {
+            crate::config::Config::load(Some(&root.join("config.toml").to_string_lossy()))
+                .map_err(|error| ticker.push(format!("supervision config: {error}")))
+                .ok()
+        })
+        .map(|config| config.health)
+        .unwrap_or_default();
+    let idle_threshold_ms = (health_config.idle_critical.max(0) as u64).saturating_mul(1000);
+    let mut health = crate::tmux::HealthChecker::new(
+        crate::tmux::TmuxClient::new(""),
+        health_config.idle_critical,
+    );
     let mut last_supervision = std::time::Instant::now() - std::time::Duration::from_secs(5);
     loop {
         if last_supervision.elapsed() >= std::time::Duration::from_secs(5) {
@@ -564,11 +581,30 @@ pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer, bas
                     match crate::tmux::TmuxClient::new("").list_sessions() {
                         Ok(sessions) => {
                             let client = crate::tmux::TmuxClient::new("");
-                            let live = sessions
+                            let live: std::collections::BTreeSet<_> = sessions
                                 .into_iter()
                                 .filter(|s| client.session_has_live_pane(&s.name).unwrap_or(true))
                                 .map(|s| s.name)
                                 .collect();
+                            health.retain_sessions(&live.iter().cloned().collect::<Vec<_>>());
+                            let idle = crate::supervision::running_sessions(root)
+                                .unwrap_or_default()
+                                .intersection(&live)
+                                .filter_map(|session| {
+                                    health.idle_for(session).ok().map(|elapsed| {
+                                        (session.clone(), elapsed.as_millis() as u64)
+                                    })
+                                })
+                                .collect();
+                            if let Err(error) = crate::supervision::check_idle(
+                                root,
+                                crate::supervision::now_ms(),
+                                &live,
+                                &idle,
+                                idle_threshold_ms,
+                            ) {
+                                ticker.push(format!("supervision idle: {error}"));
+                            }
                             let result = crate::supervision::reconcile(root, &live, |wakes| {
                                 for (ea_id, receiver, payload) in wakes.iter().cloned() {
                                     let id = format!("supervisor-{ea_id}-{receiver}");

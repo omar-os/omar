@@ -6,10 +6,8 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -57,6 +55,25 @@ struct Ledger {
     tasks: BTreeMap<String, Task>,
     #[serde(default)]
     pending_wakes: BTreeMap<String, (u32, String)>,
+    #[serde(default)]
+    idle: BTreeMap<String, IdleWatch>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IdleWatch {
+    reminded_at_ms: u64,
+    escalated: bool,
+}
+
+pub fn running_sessions(root: &Path) -> Result<BTreeSet<String>> {
+    read(root, |ledger| {
+        Ok(ledger
+            .tasks
+            .values()
+            .filter(|task| task.status == Status::Running)
+            .map(|task| task.session.clone())
+            .collect())
+    })
 }
 
 fn transaction<T>(root: &Path, f: impl FnOnce(&mut Ledger) -> Result<T>) -> Result<T> {
@@ -180,6 +197,7 @@ pub fn finish(
         task.result_revision += 1;
         task.acknowledged = false;
         let task = task.clone();
+        ledger.idle.remove(id);
         // Commit the result and one parent-delivery obligation together.
         ledger
             .pending_wakes
@@ -216,6 +234,7 @@ pub fn cancel_agent(root: &Path, ea: u32, agent: &str) -> Result<()> {
                     .insert(uuid::Uuid::new_v4().to_string(), (ea, task.parent.clone()));
             }
             task.retired = true;
+            ledger.idle.remove(&task.id);
             if !task.status.terminal() {
                 task.status = Status::Cancelled;
                 task.result = Some(json!({"reason":"agent session was explicitly killed"}));
@@ -237,6 +256,7 @@ pub fn remove_ea(root: &Path, ea: u32) -> Result<()> {
     transaction(root, |ledger| {
         ledger.tasks.retain(|_, task| task.ea_id != ea);
         ledger.pending_wakes.retain(|_, (ea_id, _)| *ea_id != ea);
+        ledger.idle.retain(|id, _| ledger.tasks.contains_key(id));
         Ok(())
     })
 }
@@ -249,7 +269,9 @@ fn projection_page(ledger: &Ledger, ea: u32, actor: &str, offset: usize) -> Valu
     let mut tasks: Vec<_> = ledger.tasks.values().filter(|t| t.ea_id == ea &&
         ((t.agent == actor && !t.status.terminal()) || (t.parent == actor && (!t.status.terminal() || !t.acknowledged || !t.retired))))
         .map(|t| json!({"task_id":t.id,"agent":t.agent,"parent":t.parent,"project_id":t.project_id,
-            "task":preview(&t.assignment, 400),"status":t.status,"has_result":t.result.is_some(),"result_revision":t.result_revision,"result_preview":t.result.as_ref().map(|r|preview(&r.to_string(),400)),"acknowledged":t.acknowledged,"retired":t.retired})).collect();
+            "task":preview(&t.assignment, 400),"status":t.status,"has_result":t.result.is_some(),"result_revision":t.result_revision,"result_preview":t.result.as_ref().map(|r|preview(&r.to_string(),400)),"acknowledged":t.acknowledged,"retired":t.retired,
+            "idle_without_result":ledger.idle.contains_key(&t.id),
+            "idle_escalated":ledger.idle.get(&t.id).is_some_and(|idle| idle.escalated)})).collect();
     tasks.sort_by_key(|t| {
         (
             t["agent"] != actor,
@@ -299,6 +321,7 @@ pub fn resume(root: &Path, ea: u32, actor: &str, id: &str) -> Result<()> {
         task.status = Status::Running;
         task.result = None;
         task.acknowledged = false;
+        ledger.idle.remove(id);
         ledger
             .pending_wakes
             .insert(uuid::Uuid::new_v4().to_string(), (ea, task.agent.clone()));
@@ -317,7 +340,20 @@ pub fn context_page(root: &Path, ea: u32, actor: &str, offset: usize) -> Result<
 }
 
 pub fn context_message(state: &Value) -> String {
-    format!("OMAR COORDINATION STATE (authoritative runtime state, not conversation memory)\n{}\nUse finish_task(task_id, status, result) to return your work; the runtime notifies your parent. Read child results and call acknowledge_task(task_id, result_revision) after incorporating each result. If truncated, use coordination_state(offset=next_offset) to inspect remaining tasks. Running children are owned by the runtime; do not create polling timers. If blocked, finish_task with status=blocked and the concrete reason. Retire acknowledged terminal children with kill_agent. Never infer completion from a quiet terminal.", state)
+    let mut reminders = String::new();
+    if let Some(tasks) = state["tasks"].as_array() {
+        for task in tasks {
+            if task["idle_without_result"] == true {
+                let agent = task["agent"].as_str().unwrap_or("");
+                if task["agent"] == state["agent"] {
+                    reminders.push_str(&format!("\nIdle without a result: {agent}. Report with finish_task, or status=blocked with a concrete reason."));
+                } else if task["idle_escalated"] == true {
+                    reminders.push_str(&format!("\nStalled child: {agent} is still idle without a result after its reminder."));
+                }
+            }
+        }
+    }
+    format!("OMAR COORDINATION STATE (authoritative runtime state, not conversation memory)\n{}\nUse finish_task(task_id, status, result) to return your work; the runtime notifies your parent. Read child results and call acknowledge_task(task_id, result_revision) after incorporating each result. If truncated, use coordination_state(offset=next_offset) to inspect remaining tasks. Running children are owned by the runtime; do not create polling timers. If blocked, finish_task with status=blocked and the concrete reason. Retire acknowledged terminal children with kill_agent. Never infer completion from a quiet terminal.{}", state, reminders)
 }
 
 pub fn stop_reason(root: &Path, ea: u32, actor: &str) -> Result<Option<String>> {
@@ -476,6 +512,65 @@ pub fn run_hook(path: &Path, backend: &str, event: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Screen idleness is only a prompt to report progress, never task failure.
+pub fn check_idle(
+    root: &Path,
+    now: u64,
+    live: &BTreeSet<String>,
+    idle_ms: &BTreeMap<String, u64>,
+    idle_threshold_ms: u64,
+) -> Result<()> {
+    transaction(root, |ledger| {
+        let mut recipients = BTreeSet::new();
+        ledger.idle.retain(|id, _| {
+            ledger
+                .tasks
+                .get(id)
+                .is_some_and(|task| task.status == Status::Running && live.contains(&task.session))
+        });
+        for task in ledger
+            .tasks
+            .values()
+            .filter(|t| t.status == Status::Running)
+        {
+            // An unavailable activity observation is not evidence of a stall or recovery.
+            let Some(elapsed) = idle_ms.get(&task.session) else {
+                continue;
+            };
+            if *elapsed == 0 || *elapsed < idle_threshold_ms {
+                ledger.idle.remove(&task.id);
+                continue;
+            }
+            match ledger.idle.get_mut(&task.id) {
+                None => {
+                    ledger.idle.insert(
+                        task.id.clone(),
+                        IdleWatch {
+                            reminded_at_ms: now,
+                            escalated: false,
+                        },
+                    );
+                    recipients.insert((task.ea_id, task.agent.clone()));
+                }
+                Some(idle)
+                    if !idle.escalated
+                        && now.saturating_sub(idle.reminded_at_ms) >= idle_threshold_ms =>
+                {
+                    idle.escalated = true;
+                    recipients.insert((task.ea_id, task.parent.clone()));
+                }
+                _ => {}
+            }
+        }
+        for (ea, actor) in recipients {
+            ledger
+                .pending_wakes
+                .insert(uuid::Uuid::new_v4().to_string(), (ea, actor));
+        }
+        Ok(())
+    })
+}
+
 /// Queue state changes once; unconsumed results remain in the ledger for hooks
 /// and coordination_state. Persist the queue before clearing delivery obligations.
 pub fn reconcile(
@@ -582,10 +677,21 @@ mod tests {
     use super::*;
     fn reconcile(
         root: &Path,
-        _now: u64,
+        now: u64,
         live: &BTreeSet<String>,
     ) -> Result<Vec<(u32, String, String)>> {
+        reconcile_idle(root, now, live, &BTreeMap::new(), 300_000)
+    }
+
+    fn reconcile_idle(
+        root: &Path,
+        now: u64,
+        live: &BTreeSet<String>,
+        idle: &BTreeMap<String, u64>,
+        threshold: u64,
+    ) -> Result<Vec<(u32, String, String)>> {
         let mut wakes = Vec::new();
+        super::check_idle(root, now, live, idle, threshold)?;
         super::reconcile(root, live, |pending| {
             wakes = pending.to_vec();
             Ok(())
@@ -694,6 +800,90 @@ mod tests {
             .unwrap()
             .is_empty());
     }
+    #[test]
+    fn idle_reminds_once_escalates_once_and_activity_rearms() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let id = register(root, task("worker", "ea")).unwrap();
+        let live = BTreeSet::from(["s-worker".into()]);
+        let active = BTreeMap::from([("s-worker".into(), 0)]);
+        let idle = BTreeMap::from([("s-worker".into(), 10_000)]);
+        assert!(reconcile_idle(root, 0, &live, &active, 10_000)
+            .unwrap()
+            .is_empty());
+        for start in [10_000, 100_000] {
+            let reminder = reconcile_idle(root, start, &live, &idle, 10_000).unwrap();
+            assert_eq!(reminder.len(), 1);
+            assert_eq!(reminder[0].1, "worker");
+            assert!(reminder[0].2.contains("Idle without a result: worker"));
+            assert!(reminder[0].2.contains("status=blocked"));
+            assert!(reconcile_idle(root, start + 9_999, &live, &idle, 10_000)
+                .unwrap()
+                .is_empty());
+            let escalation = reconcile_idle(root, start + 10_000, &live, &idle, 10_000).unwrap();
+            assert_eq!(escalation.len(), 1);
+            assert_eq!(escalation[0].1, "ea");
+            assert!(escalation[0].2.contains("Stalled child: worker"));
+            assert!(reconcile_idle(root, start + 80_000, &live, &idle, 10_000)
+                .unwrap()
+                .is_empty());
+            // A new read of the ledger preserves the latch; only activity re-arms it.
+            assert!(read_state(root).unwrap().idle[&id].escalated);
+            assert!(reconcile_idle(root, start + 80_001, &live, &active, 10_000)
+                .unwrap()
+                .is_empty());
+            assert!(read_state(root).unwrap().idle.is_empty());
+        }
+        finish(
+            root,
+            0,
+            "worker",
+            &id,
+            Status::Blocked,
+            json!("needs input"),
+        )
+        .unwrap();
+        assert!(read_state(root).unwrap().idle.is_empty());
+        assert_eq!(
+            reconcile_idle(root, 200_000, &live, &idle, 10_000).unwrap()[0].1,
+            "ea"
+        );
+        assert!(reconcile_idle(root, 300_000, &live, &idle, 10_000)
+            .unwrap()
+            .is_empty());
+        resume(root, 0, "ea", &id).unwrap();
+        let resumed = reconcile(root, 300_001, &live).unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].1, "worker");
+    }
+
+    #[test]
+    fn silent_running_work_gets_bounded_notices_without_failure_or_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let id = register(root, task("worker", "ea")).unwrap();
+        let live = BTreeSet::from(["s-worker".into()]);
+        let idle = BTreeMap::from([("s-worker".into(), 300_000)]);
+        let reminder = reconcile_idle(root, 300_000, &live, &idle, 300_000).unwrap();
+        assert_eq!(reminder.len(), 1);
+        assert_eq!(reminder[0].1, "worker");
+        // A missing capture is neither activity nor further evidence of a stall.
+        assert!(reconcile(root, 600_000, &live).unwrap().is_empty());
+        let escalation = reconcile_idle(root, 600_001, &live, &idle, 300_000).unwrap();
+        assert_eq!(escalation.len(), 1);
+        assert_eq!(escalation[0].1, "ea");
+        assert!(escalation[0].2.contains("Stalled child: worker"));
+        for now in [900_000, 1_200_000, 3_600_000] {
+            assert!(reconcile_idle(root, now, &live, &idle, 300_000)
+                .unwrap()
+                .is_empty());
+        }
+        let ledger = read_state(root).unwrap();
+        assert_eq!(ledger.tasks[&id].status, Status::Running);
+        assert!(ledger.tasks[&id].result.is_none());
+        assert!(!ledger.tasks[&id].retired);
+    }
+
     #[test]
     fn cancelled_and_changed_results_each_notify_once() {
         let dir = tempfile::tempdir().unwrap();

@@ -16,7 +16,7 @@ Before any orchestration action, inspect the runtime's available MCP tool catalo
 
 OMAR persists task ownership and results outside your conversation. Call `coordination_state` after a restart or lost context. Use `get_task` to read complete assignments and result pages.
 
-The runtime notifies parents once on task state changes. Do not create polling timers for child management. Use `schedule_omar_event` only for explicit future reminders or messages unrelated to task completion. Do not substitute backend-native schedulers.
+The runtime notifies parents once on task state changes. A running task idle past the health threshold gets one reminder to report with `finish_task` or `status=blocked` and a reason; after a further threshold, its parent gets one stalled-child notice. Activity re-arms idle detection. Do not create polling timers for child management. Use `schedule_omar_event` only for explicit future reminders or messages unrelated to task completion. Do not substitute backend-native schedulers.
 
 Read each child result, incorporate it, then call `acknowledge_task` before retiring its terminal with `kill_agent`. A quiet terminal is not evidence of completion. For a blocked child, resolve the concrete blocker and call `resume_task`, or explicitly cancel it with `kill_agent` and acknowledge the cancellation.
 
@@ -238,7 +238,7 @@ Default workflow per user request:
    c. Persist updated notes and report the result to the user.
 7. Persist concise recovery notes and report the result to the user.
 
-The runtime owns state-change notifications for tracked tasks.
+The runtime owns idle detection and state-change notifications for tracked tasks.
 
 ## Projects
 
