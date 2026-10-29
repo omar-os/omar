@@ -1364,7 +1364,7 @@ impl OmarMcpServer {
             let client2 = client.clone();
             let session2 = session_name.clone();
             let header = format!(
-                "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}\nOMAR TASK ID: {}\nReturn your result using finish_task; the runtime handles parent notification.",
+                "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}\nOMAR TASK ID: {}\nReturn your result using finish_task; the runtime handles parent notification and idle detection.",
                 short_name, prompt_parent, task, task_id.as_deref().unwrap_or("untracked")
             );
             // A backend with no way to take the prompt at launch gets the
@@ -2400,7 +2400,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "schedule_omar_event",
-            "Enqueue an event in OMAR's persistent event queue to wake an agent or the EA at a chosen time. Tracked task state changes are reported automatically by the runtime; do not duplicate them. Use this instead of sleep loops or any backend-native timer/reminder tool. Side effect: appends a scheduled event visible in the dashboard via list_events and durable across restarts. Not retry-safe unless duplicate delivery is acceptable; use list_events/cancel_event after uncertain results. Use finish_task for completion, and acknowledge_task with the observed result_revision after incorporating a child result.",
+            "Enqueue an event in OMAR's persistent event queue to wake an agent or the EA at a chosen time. Tracked task state changes and idle stalls are reported automatically by the runtime; do not duplicate them. Use this instead of sleep loops or any backend-native timer/reminder tool. Side effect: appends a scheduled event visible in the dashboard via list_events and durable across restarts. Not retry-safe unless duplicate delivery is acceptable; use list_events/cancel_event after uncertain results. Use finish_task for completion, and acknowledge_task with the observed result_revision after incorporating a child result.",
             json!({
                 "type":"object",
                 "properties":{
