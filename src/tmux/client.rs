@@ -886,8 +886,6 @@ impl TmuxClient {
             }
             tree.extend(crate::process::process_tree(pid.parse()?));
         }
-        tree.sort();
-        tree.dedup();
         Ok(tree)
     }
 

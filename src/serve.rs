@@ -374,6 +374,11 @@ struct Context_ {
 }
 
 impl Context_ {
+    /// Hold this while serving the EA so its deletion waits for the work.
+    fn admit(&self) -> Result<crate::ea_lifecycle::Admission> {
+        crate::ea_lifecycle::Admission::acquire(&self.omar_dir, self.ea_id)
+    }
+
     fn publish(
         &self,
         role: ChatRole,
@@ -392,7 +397,7 @@ impl Context_ {
         design: Option<ProposedDesign>,
         selection: Vec<String>,
     ) -> Result<ChatMessage> {
-        let _admission = crate::ea_lifecycle::Admission::acquire(&self.omar_dir, self.ea_id)?;
+        let _admission = self.admit()?;
         let mut chat = self.chat.lock().expect("serve chat poisoned");
         let message = self.history.lock().expect("history poisoned").append_to(
             &self.conversation_id,
@@ -464,10 +469,10 @@ impl Serve {
                     .filter(|context| context.ea_id == id)
                     .cloned()
                     .collect::<Vec<_>>();
+                for workspace in crate::workspace::list(root, id)? {
+                    self.workspaces.editors.lock().unwrap().stop(&workspace.id);
+                }
                 for context in &contexts {
-                    for workspace in crate::workspace::list(root, id)? {
-                        self.workspaces.editors.lock().unwrap().stop(&workspace.id);
-                    }
                     // Mutation continuations must not launch a replacement after a stop.
                     context.mutations.lock().unwrap().clear();
                     let ids = context
@@ -482,19 +487,20 @@ impl Serve {
                         anyhow::ensure!(status < 400, "cannot stop run: {}", value["error"]);
                     }
                 }
-                let deadline = Instant::now() + Duration::from_secs(40);
-                while contexts.iter().any(|context| {
-                    context
-                        .runs
-                        .lock()
-                        .unwrap()
-                        .values()
-                        .any(|run| run.status.is_active())
-                }) {
-                    anyhow::ensure!(Instant::now() < deadline,
-                    "EA deletion is fenced; waiting for topology termination timed out; retry deletion");
-                    thread::sleep(Duration::from_millis(25));
-                }
+                crate::ea_lifecycle::wait_until(
+                    40,
+                    "EA deletion is fenced; waiting for topology termination timed out; retry deletion",
+                    || {
+                        !contexts.iter().any(|context| {
+                            context
+                                .runs
+                                .lock()
+                                .unwrap()
+                                .values()
+                                .any(|run| run.status.is_active())
+                        })
+                    },
+                )?;
                 for context in &contexts {
                     context.agent_token.lock().unwrap().clear();
                     context.chat.lock().unwrap().subscribers.clear();
@@ -1369,8 +1375,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
         }
     };
 
-    let admission = match crate::ea_lifecycle::Admission::acquire(&context.omar_dir, context.ea_id)
-    {
+    let admission = match context.admit() {
         Ok(admission) => admission,
         Err(error) => {
             return write_json(
@@ -1492,9 +1497,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
                     .chat_operation
                     .lock()
                     .expect("chat operation poisoned");
-                let Ok(_admission) =
-                    crate::ea_lifecycle::Admission::acquire(&context.omar_dir, context.ea_id)
-                else {
+                let Ok(_admission) = context.admit() else {
                     return;
                 };
                 if context.chat.lock().expect("chat poisoned").needs_relaunch {
@@ -1506,8 +1509,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
                 }
             });
         }
-        drop(admission);
-        return stream_chat(stream, &context, origin);
+        return stream_chat(stream, &context, origin, admission);
     }
 
     let read_body = |_length: usize| -> Result<Vec<u8>> { Ok(raw_body.clone()) };
@@ -2099,8 +2101,7 @@ impl Workspaces {
     fn get(&self, id: &str) -> Result<Arc<Context_>> {
         let mut contexts = self.contexts.lock().expect("workspaces poisoned");
         if let Some(context) = contexts.get(id) {
-            let _admission =
-                crate::ea_lifecycle::Admission::acquire(&context.omar_dir, context.ea_id)?;
+            let _admission = context.admit()?;
             return Ok(context.clone());
         }
         let mut history = self.history.lock().expect("history poisoned");
@@ -2205,19 +2206,16 @@ fn select_chat(workspaces: &Arc<Workspaces>, id: Option<&str>) -> (u16, Value) {
     let _selection = workspaces.selection.lock().expect("selection poisoned");
     let selected = {
         let mut history = workspaces.history.lock().expect("history poisoned");
-        if id.is_some_and(|id| !history.conversations.iter().any(|chat| chat.id == id)) {
-            return (404, json!({"error": "unknown chat"}));
-        }
         if let Some(id) = id {
-            if let Some(ea) = history
-                .conversations
-                .iter()
-                .find(|c| c.id == id)
-                .and_then(|c| c.ea_id)
+            let Some(chat) = history.conversations.iter().find(|chat| chat.id == id) else {
+                return (404, json!({"error": "unknown chat"}));
+            };
+            let omar_dir = &workspaces.settings.omar_dir;
+            if chat
+                .ea_id
+                .is_some_and(|ea| crate::ea_lifecycle::fenced(omar_dir, ea))
             {
-                if crate::ea_lifecycle::fenced(&workspaces.settings.omar_dir, ea) {
-                    return (410, json!({"error":"EA is deleting or deleted"}));
-                }
+                return (410, json!({"error":"EA is deleting or deleted"}));
             }
         }
         if let Err(error) = history.select(id) {
@@ -2519,13 +2517,17 @@ fn compile_preview(program: &str, files: &BTreeMap<String, String>) -> Result<Vm
     staged.finish(outcome).map_err(anyhow::Error::msg)
 }
 
-fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&str>) -> Result<()> {
+fn stream_chat(
+    mut stream: TcpStream,
+    context: &Arc<Context_>,
+    origin: Option<&str>,
+    admission: crate::ea_lifecycle::Admission,
+) -> Result<()> {
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n{}Vary: Origin\r\n\r\n",
         crate::diagram::cors_origin_header(origin)
     )?;
-    let admission = crate::ea_lifecycle::Admission::acquire(&context.omar_dir, context.ea_id)?;
     let (sender, receiver) = mpsc::sync_channel(CHAT_QUEUE);
     let (mut conversation, backlog) = {
         let mut chat = context.chat.lock().expect("serve chat poisoned");
@@ -2612,8 +2614,7 @@ fn write_chat_event(stream: &mut TcpStream, message: &ChatMessage) -> Result<()>
 }
 
 fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
-    let _admission = match crate::ea_lifecycle::Admission::acquire(&context.omar_dir, context.ea_id)
-    {
+    let _admission = match context.admit() {
         Ok(admission) => admission,
         Err(error) => return (410, json!({"error":error.to_string()})),
     };
@@ -3719,8 +3720,7 @@ fn promote(from: &Path, to: &Path) -> Result<()> {
 /// the mutation's and not the operator's; not resumed while the runtime is
 /// shutting down, which wanted the run paused anyway.
 fn complete_mutation(context: &Arc<Context_>, run_id: &str) {
-    let Ok(_admission) = crate::ea_lifecycle::Admission::acquire(&context.omar_dir, context.ea_id)
-    else {
+    let Ok(_admission) = context.admit() else {
         return;
     };
     let Some((bytecode, staged)) = context
@@ -3766,8 +3766,7 @@ fn complete_mutation(context: &Arc<Context_>, run_id: &str) {
 /// same run id. The program it was admitted with is still staged beside the
 /// run, so generated code lands where the original run put it.
 fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
-    let _admission = match crate::ea_lifecycle::Admission::acquire(&context.omar_dir, context.ea_id)
-    {
+    let _admission = match context.admit() {
         Ok(admission) => admission,
         Err(error) => return (410, json!({"error":error.to_string()})),
     };
@@ -4537,6 +4536,10 @@ mod tests {
         let mut config = Config::default();
         config.dashboard.session_prefix = format!("retire-{}-", Uuid::new_v4());
         let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let first_message = |server: &Serve, chat: &str| {
+            let history = server.workspaces.history.lock().unwrap();
+            history.conversation(chat).messages[0].text.clone()
+        };
         let survivor = server.session_create_ea("survivor", None).unwrap();
         let chat = server
             .workspaces
@@ -4585,17 +4588,7 @@ mod tests {
             .all(|context| context.ea_id == survivor));
         assert!(server.session_runs(Some(0)).is_empty());
         assert_eq!(server.session_runs(Some(survivor)).len(), 1);
-        assert_eq!(
-            server
-                .workspaces
-                .history
-                .lock()
-                .unwrap()
-                .conversation(&chat)
-                .messages[0]
-                .text,
-            "Keep this"
-        );
+        assert_eq!(first_message(&server, &chat), "Keep this");
         assert!(!crate::ea::ea_state_dir(0, dir.path()).exists());
         drop(server);
         let restarted = Serve::start(
@@ -4605,17 +4598,7 @@ mod tests {
             survivor,
         )
         .unwrap();
-        assert_eq!(
-            restarted
-                .workspaces
-                .history
-                .lock()
-                .unwrap()
-                .conversation(&chat)
-                .messages[0]
-                .text,
-            "Keep this"
-        );
+        assert_eq!(first_message(&restarted, &chat), "Keep this");
         assert!(!crate::ea::ea_state_dir(0, dir.path()).exists());
     }
 

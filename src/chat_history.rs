@@ -95,18 +95,16 @@ impl History {
         let path = root.join("chats.json");
         let legacy = root.join("ea/0/chats.json");
         if legacy.exists() {
-            let old = Self::load(legacy.clone())?;
+            Self::load(legacy.clone())?;
             if path.exists() {
-                let current = Self::load(path.clone())?;
-                anyhow::ensure!(serde_json::to_value(&old)? == serde_json::to_value(&current)?,
+                anyhow::ensure!(fs::read(&legacy)? == fs::read(&path)?,
                     "conflicting session and legacy chat histories; preserve both and resolve before restarting");
+                fs::remove_file(legacy)?;
             } else {
-                // Validate before moving. Same-filesystem rename is atomic;
-                // after interruption exactly one canonical history exists.
-                fs::rename(&legacy, &path)?;
-                return Self::load(path);
+                // Same-filesystem rename is atomic; after interruption exactly
+                // one canonical history exists.
+                fs::rename(legacy, &path)?;
             }
-            fs::remove_file(legacy)?;
         }
         Self::load(path)
     }
@@ -116,22 +114,9 @@ impl History {
         id: crate::ea::EaId,
         survivor: crate::ea::EaId,
     ) -> Result<()> {
+        let survivor_chat = self.chat_for_ea(survivor)?;
         let mut next = self.clone();
         next.conversations.retain(|chat| chat.ea_id != Some(id));
-        let survivor_chat = match next
-            .conversations
-            .iter()
-            .find(|chat| chat.ea_id == Some(survivor))
-        {
-            Some(chat) => chat.id.clone(),
-            None => {
-                let mut chat = Conversation::new();
-                chat.ea_id = Some(survivor);
-                let id = chat.id.clone();
-                next.conversations.push(chat);
-                id
-            }
-        };
         if !next
             .conversations
             .iter()

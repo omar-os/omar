@@ -1,5 +1,5 @@
 //! Cross-process EA admission and restartable daemon-owned deletion.
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -20,7 +20,11 @@ pub(crate) fn fenced(root: &Path, id: EaId) -> bool {
     marker(root, id).exists()
 }
 
-pub(crate) struct Admission(File);
+/// Shared lock held while a request runs; deletion takes it exclusively.
+/// Dropping the file releases it.
+pub(crate) struct Admission {
+    _lock: File,
+}
 impl Admission {
     pub(crate) fn acquire(root: &Path, id: EaId) -> Result<Self> {
         anyhow::ensure!(
@@ -29,28 +33,33 @@ impl Admission {
         );
         let lock = lock(root, id)?;
         anyhow::ensure!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0,
+            try_flock(&lock, libc::LOCK_SH),
             "EA {id} lifecycle operation in progress; retry after it completes"
         );
         anyhow::ensure!(!fenced(root, id), "EA {id} is deleting or deleted");
-        Ok(Self(lock))
+        Ok(Self { _lock: lock })
     }
 }
-impl Drop for Admission {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
+fn try_flock(file: &File, operation: i32) -> bool {
+    unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) == 0 }
 }
 fn lock(root: &Path, id: EaId) -> Result<File> {
     fs::create_dir_all(directory(root))?;
-    Ok(OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(directory(root).join(format!("{id}.lock")))?)
+    Ok(File::create(directory(root).join(format!("{id}.lock")))?)
+}
+
+/// Poll `ready` until it holds or `seconds` pass.
+pub(crate) fn wait_until(
+    seconds: u64,
+    timeout: &str,
+    mut ready: impl FnMut() -> bool,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while !ready() {
+        anyhow::ensure!(Instant::now() < deadline, "{timeout}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -59,14 +68,12 @@ pub(crate) struct DeleteResult {
     pub(crate) agents_killed: usize,
     pub(crate) events_cancelled: usize,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct Deletion {
     result: DeleteResult,
     paths: Vec<PathBuf>,
     complete: bool,
-    #[serde(default)]
     processes: Vec<(u32, String)>,
-    #[serde(default)]
     agents: Vec<String>,
 }
 
@@ -94,104 +101,77 @@ pub(crate) fn delete(
             registry.len() > 1,
             "Cannot delete the only EA; at least one EA must remain"
         );
-        let paths = vec![
-            PathBuf::from(format!("ea/{id}")),
-            PathBuf::from(format!("mcp/ea-{id}")),
-            PathBuf::from(format!("manager_notes_ea{id}.md")),
-        ];
         let saved = Deletion {
             result: DeleteResult {
                 deleted_ea: id,
                 ..Default::default()
             },
-            paths,
-            complete: false,
-            processes: Vec::new(),
-            agents: Vec::new(),
+            paths: vec![
+                format!("ea/{id}").into(),
+                format!("mcp/ea-{id}").into(),
+                format!("manager_notes_ea{id}.md").into(),
+            ],
+            ..Default::default()
         };
         crate::topology::write_json_atomic(&path, &saved)?;
         saved
     };
     let file = lock(root, id)?;
-    let deadline = Instant::now() + Duration::from_secs(40);
-    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "EA {id} deletion is fenced but requests did not drain; retry deletion"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    wait_until(
+        40,
+        &format!("EA {id} deletion is fenced but requests did not drain; retry deletion"),
+        || try_flock(&file, libc::LOCK_EX),
+    )?;
     let client = crate::tmux::TmuxClient::new("");
     let manager = crate::ea::ea_manager_session(id, prefix);
     let workers = crate::ea::ea_prefix(id, prefix);
-    let sessions = client
-        .list_all_sessions()?
-        .into_iter()
-        .filter(|s| s.name == manager || s.name.starts_with(&workers))
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        !sessions.iter().any(|s| s.attached),
-        "Cannot delete attached session: EA {id} deletion is pending; detach its agent terminals, then retry deletion"
-    );
-    for session in &sessions {
-        if !deletion.agents.contains(&session.name) {
-            deletion.agents.push(session.name.clone());
+    // Journal the EA's live sessions and their process trees.
+    let capture = |deletion: &mut Deletion| -> Result<Vec<String>> {
+        let sessions = client
+            .list_all_sessions()?
+            .into_iter()
+            .filter(|s| s.name == manager || s.name.starts_with(&workers))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            !sessions.iter().any(|s| s.attached),
+            "Cannot delete attached session: EA {id} deletion is pending; detach its agent terminals, then retry deletion"
+        );
+        for session in &sessions {
+            if !deletion.agents.contains(&session.name) {
+                deletion.agents.push(session.name.clone());
+            }
+            deletion
+                .processes
+                .extend(client.session_process_tree(&session.name)?);
         }
-        deletion
-            .processes
-            .extend(client.session_process_tree(&session.name)?);
-    }
-    deletion.result.agents_killed = deletion.agents.len();
-    crate::topology::write_json_atomic(&path, &deletion)?;
-    quiesce()?;
-    // Run teardown may already have closed some of the captured panes.
-    let sessions = client
-        .list_all_sessions()?
-        .into_iter()
-        .filter(|s| s.name == manager || s.name.starts_with(&workers))
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        !sessions.iter().any(|s| s.attached),
-        "Cannot delete attached session: detach this EA's agent terminals before retrying deletion"
-    );
-    for session in sessions {
-        let tree = client.session_process_tree(&session.name)?;
-        deletion.processes.extend(tree.clone());
         deletion.processes.sort();
         deletion.processes.dedup();
-        crate::topology::write_json_atomic(&path, &deletion)?;
-        let teardown = client.kill_session(&session.name);
-        crate::process::signal_tree(&tree, "-TERM");
-        std::thread::sleep(Duration::from_millis(100));
-        crate::process::signal_tree(&tree, "-KILL");
-        teardown?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::process::tree_alive(&tree) {
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "EA {id} child processes survived termination; retry deletion"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        deletion.result.agents_killed = deletion.agents.len();
+        crate::topology::write_json_atomic(&path, &*deletion)?;
+        Ok(sessions.into_iter().map(|s| s.name).collect())
+    };
+    capture(&mut deletion)?;
+    quiesce()?;
+    // Run teardown may already have closed some of the captured panes.
+    let sessions = capture(&mut deletion)?;
+    let closed = sessions
+        .iter()
+        .map(|name| client.kill_session(name))
+        .collect::<Result<Vec<_>>>();
+    crate::process::signal_tree(&deletion.processes, "-TERM");
+    std::thread::sleep(Duration::from_millis(100));
+    crate::process::signal_tree(&deletion.processes, "-KILL");
+    closed?;
+    wait_until(
+        5,
+        &format!("EA {id} child processes survived termination; retry deletion"),
+        || !crate::process::tree_alive(&deletion.processes),
+    )?;
+    for name in &sessions {
         anyhow::ensure!(
-            !client.has_session(&session.name)?,
+            !client.has_session(name)?,
             "EA process session survived teardown"
         );
-        if !deletion.agents.contains(&session.name) {
-            deletion.agents.push(session.name.clone());
-        }
-        deletion.result.agents_killed = deletion.agents.len();
-        crate::topology::write_json_atomic(&path, &deletion)?;
-    }
-    // A prior attempt may have closed tmux before its descendants exited.
-    crate::process::signal_tree(&deletion.processes, "-KILL");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while crate::process::tree_alive(&deletion.processes) {
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "EA {id} descendants still alive; retry deletion"
-        );
-        std::thread::sleep(Duration::from_millis(25));
     }
     // Admitted requests and run teardown may have allocated a workspace after
     // the fence was written. Inventory only once both have fully quiesced.
@@ -204,7 +184,6 @@ pub(crate) fn delete(
             }
         }
     }
-    crate::topology::write_json_atomic(&path, &deletion)?;
     deletion.result.events_cancelled += scheduler.cancel_by_ea_checked(id)?;
     crate::topology::write_json_atomic(&path, &deletion)?;
     // Never remove another session's global backend registration.
@@ -226,11 +205,11 @@ pub(crate) fn delete(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         }
-        match dst.symlink_metadata() {
-            Ok(_) => anyhow::bail!("deletion staging conflict at {}", src.display()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        anyhow::ensure!(
+            dst.symlink_metadata().is_err(),
+            "deletion staging conflict at {}",
+            src.display()
+        );
         fs::rename(&src, dst)?;
     }
     if crate::ea::load_registry(root).iter().any(|ea| ea.id == id) {
@@ -289,6 +268,10 @@ mod tests {
         let prefix = format!("delete-test-{}-", uuid::Uuid::new_v4());
         (dir, scheduler, prefix)
     }
+    fn write_state(root: &Path, id: EaId, text: &str) {
+        fs::create_dir_all(ea::ea_state_dir(id, root)).unwrap();
+        fs::write(ea::ea_state_dir(id, root).join("sentinel"), text).unwrap();
+    }
     fn remove(root: &Path, id: EaId, prefix: &str, scheduler: &Scheduler) -> Result<DeleteResult> {
         delete(
             root,
@@ -334,11 +317,7 @@ mod tests {
                 |_| Ok(()),
             )
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !fenced(&root, 1) {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_until(5, "fence not written", || fenced(&root, 1)).unwrap();
         assert!(Admission::acquire(&root, 1).is_err());
         assert!(Admission::acquire(&root, 0).is_ok());
         assert!(recv.try_recv().is_err());
@@ -385,8 +364,7 @@ mod tests {
     fn cancellation_failure_keeps_state_and_retries_on_restart() {
         let (dir, scheduler, prefix) = fixture();
         let root = dir.path();
-        fs::create_dir_all(ea::ea_state_dir(1, root)).unwrap();
-        fs::write(ea::ea_state_dir(1, root).join("sentinel"), "keep").unwrap();
+        write_state(root, 1, "keep");
         fs::write(crate::scheduler::events_store_path(root), "invalid events").unwrap();
         assert!(remove(root, 1, &prefix, &scheduler).is_err());
         assert_eq!(ea::load_registry(root).len(), 2);
@@ -404,8 +382,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (dir, scheduler, prefix) = fixture();
         let root = dir.path();
-        fs::create_dir_all(ea::ea_state_dir(1, root)).unwrap();
-        fs::write(ea::ea_state_dir(1, root).join("sentinel"), "keep").unwrap();
+        write_state(root, 1, "keep");
         fs::set_permissions(root.join("ea"), fs::Permissions::from_mode(0o000)).unwrap();
         let result = remove(root, 1, &prefix, &scheduler);
         fs::set_permissions(root.join("ea"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -423,8 +400,7 @@ mod tests {
     fn staging_collision_is_explicit_and_keeps_both_copies() {
         let (dir, scheduler, prefix) = fixture();
         let root = dir.path();
-        fs::create_dir_all(ea::ea_state_dir(1, root)).unwrap();
-        fs::write(ea::ea_state_dir(1, root).join("sentinel"), "source").unwrap();
+        write_state(root, 1, "source");
         let staged = directory(root).join("deleted-1/0");
         fs::create_dir_all(&staged).unwrap();
         fs::write(staged.join("sentinel"), "conflicting state").unwrap();
@@ -445,9 +421,8 @@ mod tests {
     fn registry_failure_after_staging_recovers_without_touching_survivor() {
         let (dir, scheduler, prefix) = fixture();
         let root = dir.path();
-        fs::create_dir_all(ea::ea_state_dir(1, root)).unwrap();
-        fs::write(ea::ea_state_dir(1, root).join("sentinel"), "target").unwrap();
-        fs::write(ea::ea_state_dir(0, root).join("sentinel"), "survivor").unwrap();
+        write_state(root, 1, "target");
+        write_state(root, 0, "survivor");
         fs::remove_file(root.join("eas.lock")).unwrap();
         fs::create_dir(root.join("eas.lock")).unwrap();
         assert!(remove(root, 1, &prefix, &scheduler).is_err());

@@ -697,21 +697,11 @@ impl OmarMcpServer {
             name: self.canonical_tool_name(&call.name),
             arguments: call.arguments,
         };
-        // Managed deletion uses the daemon and must not hold its own shared
-        // admission while waiting for the daemon's exclusive deletion lock.
-        let managed = self
-            .context
-            .omar_dir
-            .join("launch.json")
-            .symlink_metadata()
-            .is_ok();
-        if call.name == "delete_ea" && managed {
-            return match self.delete_ea(call.arguments) {
-                Ok(value) => tool_success(value),
-                Err(error) => tool_error(error),
-            };
-        }
-        let _admission = if managed {
+        // Managed deletion goes through the daemon, whose exclusive lock must
+        // not wait on this process's shared admission.
+        let _admission = if call.name != "delete_ea"
+            && self.context.omar_dir.join("launch.json").exists()
+        {
             match crate::ea_lifecycle::Admission::acquire(&self.context.omar_dir, self.ea_id()) {
                 Ok(admission) => Some(admission),
                 Err(error) => return tool_error(error),

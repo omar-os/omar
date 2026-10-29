@@ -257,14 +257,16 @@ impl Scheduler {
         }
     }
 
+    /// Persistent schedulers refuse work for an EA being deleted.
+    fn admit(&self, ea_id: u32) -> anyhow::Result<Option<crate::ea_lifecycle::Admission>> {
+        let root = self.store_path.as_deref().and_then(Path::parent);
+        root.map(|root| crate::ea_lifecycle::Admission::acquire(root, ea_id))
+            .transpose()
+    }
+
     pub fn insert(&self, event: ScheduledEvent) {
-        let _admission = if let Some(root) = self.store_path.as_deref().and_then(Path::parent) {
-            match crate::ea_lifecycle::Admission::acquire(root, event.ea_id) {
-                Ok(admission) => Some(admission),
-                Err(_) => return,
-            }
-        } else {
-            None
+        let Ok(_admission) = self.admit(event.ea_id) else {
+            return;
         };
         self.transaction(true, |queue| {
             queue.push(event);
@@ -699,15 +701,8 @@ pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer, bas
 
                     // Socket and HTTP delivery run off the async event loop.
                     // No terminal input is read or modified.
-                    let admission = if let Some(root) =
-                        scheduler.store_path.as_deref().and_then(Path::parent)
-                    {
-                        match crate::ea_lifecycle::Admission::acquire(root, ea_id) {
-                            Ok(admission) => Some(admission),
-                            Err(_) => continue,
-                        }
-                    } else {
-                        None
+                    let Ok(admission) = scheduler.admit(ea_id) else {
+                        continue;
                     };
                     let message = format_delivery(&batch, timestamp);
                     let receiver_name = receiver.clone();
