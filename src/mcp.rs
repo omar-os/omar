@@ -895,7 +895,6 @@ impl OmarMcpServer {
             }
         };
         if self.context.topology.is_none() {
-            let _ = crate::supervision::touch(&self.context.omar_dir, self.ea_id(), self.actor());
             if let Ok(state) =
                 crate::supervision::context(&self.context.omar_dir, self.ea_id(), self.actor())
             {
@@ -1466,7 +1465,6 @@ impl OmarMcpServer {
                         result_revision: 0,
                         acknowledged: false,
                         retired: false,
-                        next_check_ms: 0,
                         held_until_ms: 0,
                     },
                 ) {
@@ -1496,7 +1494,7 @@ impl OmarMcpServer {
             let client2 = client.clone();
             let session2 = session_name.clone();
             let header = format!(
-                "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}\nOMAR TASK ID: {}\nReturn your result using finish_task; the runtime handles parent notification and check-ins.",
+                "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}\nOMAR TASK ID: {}\nReturn your result using finish_task; the runtime handles parent notification.",
                 short_name, prompt_parent, task, task_id.as_deref().unwrap_or("untracked")
             );
             // A backend with no way to take the prompt at launch gets the
@@ -2464,7 +2462,7 @@ fn tool_definitions() -> Vec<Value> {
         .get_or_init(|| vec![
         tool("coordination_state", "Read authoritative task ownership and unconsumed child results after context loss. Use get_task for full results.", json!({"type":"object","properties":{"offset":{"type":"integer","minimum":0}}})),
         tool("get_task", "Read a scoped durable task and a bounded page of its result; offset counts characters.", json!({"type":"object","properties":{"task_id":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["task_id"]})),
-        tool("finish_task", "Persist your completed, failed, or blocked result. Automatically notifies your parent until acknowledged. Finish or cancel children and consume their results first.", json!({"type":"object","properties":{"task_id":{"type":"string"},"status":{"type":"string","enum":["completed","failed","blocked"]},"result":{}},"required":["task_id","status","result"]})),
+        tool("finish_task", "Persist your completed, failed, or blocked result. Automatically notifies your parent once; the result remains available until acknowledged. Finish or cancel children and consume their results first.", json!({"type":"object","properties":{"task_id":{"type":"string"},"status":{"type":"string","enum":["completed","failed","blocked"]},"result":{}},"required":["task_id","status","result"]})),
         tool("acknowledge_task", "Acknowledge incorporating a child's durable result. Transport delivery alone never acknowledges it.", json!({"type":"object","properties":{"task_id":{"type":"string"},"result_revision":{"type":"integer"}},"required":["task_id","result_revision"]})),
         tool("resume_task", "Resume a blocked child after resolving its blocker. The runtime wakes the child with its task state.", json!({"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"]})),
         tool(
@@ -2629,7 +2627,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "schedule_omar_event",
-            "Enqueue an event in OMAR's persistent event queue to wake an agent or the EA at a chosen time. Tracked task check-ins and completion notifications are scheduled automatically by the runtime; do not duplicate them. Use this instead of sleep loops or any backend-native timer/reminder tool. Side effect: appends a scheduled event visible in the dashboard via list_events and durable across restarts. Not retry-safe unless duplicate delivery is acceptable; use list_events/cancel_event after uncertain results. Use finish_task for completion, and acknowledge_task with the observed result_revision after incorporating a child result.",
+            "Enqueue an event in OMAR's persistent event queue to wake an agent or the EA at a chosen time. Tracked task state changes are reported automatically by the runtime; do not duplicate them. Use this instead of sleep loops or any backend-native timer/reminder tool. Side effect: appends a scheduled event visible in the dashboard via list_events and durable across restarts. Not retry-safe unless duplicate delivery is acceptable; use list_events/cancel_event after uncertain results. Use finish_task for completion, and acknowledge_task with the observed result_revision after incorporating a child result.",
             json!({
                 "type":"object",
                 "properties":{
@@ -3115,7 +3113,7 @@ mod tests {
                 result_revision: 0,
                 acknowledged: false,
                 retired: false,
-                next_check_ms: 0,
+
                 held_until_ms: 0,
             },
         )
