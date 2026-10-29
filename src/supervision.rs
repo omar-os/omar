@@ -6,10 +6,10 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CHECK_INTERVAL_MS: u64 = 60_000;
-
+#[cfg(test)]
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -50,12 +50,13 @@ pub struct Task {
     pub acknowledged: bool,
     #[serde(default)]
     pub retired: bool,
-    pub next_check_ms: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct Ledger {
     tasks: BTreeMap<String, Task>,
+    #[serde(default)]
+    pending_wakes: BTreeMap<String, (u32, String)>,
 }
 
 fn transaction<T>(root: &Path, f: impl FnOnce(&mut Ledger) -> Result<T>) -> Result<T> {
@@ -129,7 +130,6 @@ pub fn register(root: &Path, mut task: Task) -> Result<String> {
             })
             .map(|t| t.id.clone());
         task.id = uuid::Uuid::new_v4().to_string();
-        task.next_check_ms = now_ms() + CHECK_INTERVAL_MS;
         let id = task.id.clone();
         ledger.tasks.insert(id.clone(), task);
         Ok(id)
@@ -179,9 +179,12 @@ pub fn finish(
         task.result = Some(result);
         task.result_revision += 1;
         task.acknowledged = false;
-        // Result and parent-delivery obligation commit in the same record.
-        task.next_check_ms = 0;
-        Ok(task.clone())
+        let task = task.clone();
+        // Commit the result and one parent-delivery obligation together.
+        ledger
+            .pending_wakes
+            .insert(uuid::Uuid::new_v4().to_string(), (ea, task.parent.clone()));
+        Ok(task)
     })
 }
 
@@ -207,13 +210,20 @@ pub fn cancel_agent(root: &Path, ea: u32, agent: &str) -> Result<()> {
             .values_mut()
             .filter(|t| t.ea_id == ea && t.agent == agent)
         {
+            if !task.retired && !task.acknowledged {
+                ledger
+                    .pending_wakes
+                    .insert(uuid::Uuid::new_v4().to_string(), (ea, task.parent.clone()));
+            }
             task.retired = true;
             if !task.status.terminal() {
                 task.status = Status::Cancelled;
                 task.result = Some(json!({"reason":"agent session was explicitly killed"}));
                 task.result_revision += 1;
                 task.acknowledged = false;
-                task.next_check_ms = 0;
+                ledger
+                    .pending_wakes
+                    .insert(uuid::Uuid::new_v4().to_string(), (ea, task.parent.clone()));
             }
         }
         Ok(())
@@ -226,22 +236,7 @@ pub fn remove_ea(root: &Path, ea: u32) -> Result<()> {
     }
     transaction(root, |ledger| {
         ledger.tasks.retain(|_, task| task.ea_id != ea);
-        Ok(())
-    })
-}
-
-pub fn touch(root: &Path, ea: u32, actor: &str) -> Result<()> {
-    if !root.join("task-lifecycle.json").exists() {
-        return Ok(());
-    }
-    transaction(root, |ledger| {
-        for task in ledger
-            .tasks
-            .values_mut()
-            .filter(|t| t.ea_id == ea && t.agent == actor && t.status == Status::Running)
-        {
-            task.next_check_ms = now_ms() + CHECK_INTERVAL_MS;
-        }
+        ledger.pending_wakes.retain(|_, (ea_id, _)| *ea_id != ea);
         Ok(())
     })
 }
@@ -304,7 +299,9 @@ pub fn resume(root: &Path, ea: u32, actor: &str, id: &str) -> Result<()> {
         task.status = Status::Running;
         task.result = None;
         task.acknowledged = false;
-        task.next_check_ms = 0;
+        ledger
+            .pending_wakes
+            .insert(uuid::Uuid::new_v4().to_string(), (ea, task.agent.clone()));
         Ok(())
     })
 }
@@ -356,8 +353,7 @@ pub fn hook_response(context: &crate::manager::McpLaunchContext, input: &Value) 
         .as_str()
         .context("hook_event_name is required")?;
     if event == "Stop" {
-        // One immediate correction per turn; the persistent watchdog handles
-        // repeated refusal without an unbounded native Stop-hook loop.
+        // One immediate correction per turn, without an unbounded Stop-hook loop.
         if input["stop_hook_active"] == true {
             return Ok(json!({}));
         }
@@ -409,19 +405,7 @@ pub fn backend_hook_response(
         "agy" | "antigravity" => Ok(
             json!({"injectSteps":[{"ephemeralMessage":context_message(&self::context(&context.omar_dir,context.ea_id,actor)?)}]}),
         ),
-        "opencode" if event == "Stop" => {
-            if stop_reason(&context.omar_dir, context.ea_id, actor)?.is_some() {
-                transaction(&context.omar_dir, |ledger| {
-                    for task in ledger.tasks.values_mut().filter(|t| {
-                        t.ea_id == context.ea_id && (t.agent == actor || t.parent == actor)
-                    }) {
-                        task.next_check_ms = 0;
-                    }
-                    Ok(())
-                })?;
-            }
-            Ok(json!({}))
-        }
+        "opencode" if event == "Stop" => Ok(json!({})),
         "opencode" => Ok(
             json!({"context":context_message(&self::context(&context.omar_dir,context.ea_id,actor)?)}),
         ),
@@ -492,30 +476,36 @@ pub fn run_hook(path: &Path, backend: &str, event: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Parent notifications remain obligations until acknowledged, even after a
-/// successful transport write or daemon restart. Running tasks always have a
-/// check-in, without requiring the model to schedule one.
+/// Queue state changes once; unconsumed results remain in the ledger for hooks
+/// and coordination_state. Persist the queue before clearing delivery obligations.
 pub fn reconcile(
     root: &Path,
-    now: u64,
     live: &BTreeSet<String>,
-) -> Result<Vec<(u32, String, String)>> {
+    enqueue: impl FnOnce(&[(u32, String, String)]) -> Result<()>,
+) -> Result<()> {
     if !root.join("task-lifecycle.json").exists() {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    transaction(root, |ledger| {
+    let (pending, wakes) = transaction(root, |ledger| {
         let mut recipients = BTreeSet::new();
         for task in ledger.tasks.values_mut() {
-            if !live.contains(&task.session) {
+            if !live.contains(&task.session) && !task.retired {
                 task.retired = true;
+                if !task.acknowledged {
+                    recipients.insert((task.ea_id, task.parent.clone()));
+                }
             }
-            if task.status == Status::Running && !live.contains(&task.session) {
+            if !task.status.terminal() && !live.contains(&task.session) {
                 task.status = Status::Failed;
-                task.result =
-                    Some(json!({"reason":"agent session exited without returning a task result"}));
+                let mut result =
+                    json!({"reason":"agent session exited without returning a task result"});
+                if let Some(previous) = task.result.take() {
+                    result["previous_result"] = previous;
+                }
+                task.result = Some(result);
                 task.result_revision += 1;
                 task.acknowledged = false;
-                task.next_check_ms = 0;
+                recipients.insert((task.ea_id, task.parent.clone()));
             }
         }
         // If a supervisor dies, its outstanding children become the nearest
@@ -539,44 +529,70 @@ pub fn reconcile(
                 }
                 task.parent = parent.clone();
                 task.parent_task_id = parent_id.clone();
-                task.next_check_ms = 0;
+                recipients.insert((task.ea_id, task.parent.clone()));
             }
         }
-        let waiting: BTreeSet<_> = ledger
+        let departed_agents: BTreeSet<_> = ledger
             .tasks
             .values()
-            .filter(|t| t.status == Status::Running)
-            .map(|t| (t.ea_id, t.parent.clone()))
+            .filter(|t| {
+                t.retired
+                    && t.status.terminal()
+                    && !ledger.tasks.values().any(|current| {
+                        current.ea_id == t.ea_id && current.agent == t.agent && !current.retired
+                    })
+            })
+            .map(|t| (t.ea_id, t.agent.clone()))
             .collect();
-        for task in ledger.tasks.values_mut() {
-            if task.next_check_ms > now {
-                continue;
-            }
-            if task.result.is_some()
-                && (!task.acknowledged || (task.status.terminal() && !task.retired))
-            {
-                recipients.insert((task.ea_id, task.parent.clone()));
-            } else if task.status == Status::Running
-                && !waiting.contains(&(task.ea_id, task.agent.clone()))
-            {
-                recipients.insert((task.ea_id, task.agent.clone()));
-                recipients.insert((task.ea_id, task.parent.clone()));
-            }
-            task.next_check_ms = now.saturating_add(CHECK_INTERVAL_MS);
+        recipients.retain(|recipient| !departed_agents.contains(recipient));
+        for (ea, actor) in recipients {
+            ledger
+                .pending_wakes
+                .insert(uuid::Uuid::new_v4().to_string(), (ea, actor));
         }
-        Ok(recipients
+        ledger
+            .pending_wakes
+            .retain(|_, recipient| !departed_agents.contains(recipient));
+        let recipients: BTreeSet<_> = ledger.pending_wakes.values().cloned().collect();
+        let wakes: Vec<_> = recipients
             .into_iter()
             .map(|(ea, actor)| {
                 let message = context_message(&projection(ledger, ea, &actor));
                 (ea, actor, message)
             })
-            .collect())
+            .collect();
+        Ok((ledger.pending_wakes.clone(), wakes))
+    })?;
+    // No ledger lock is held during the scheduler transaction. New changes have
+    // distinct IDs, so clearing this snapshot cannot consume a concurrent wake.
+    enqueue(&wakes)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    transaction(root, |ledger| {
+        ledger
+            .pending_wakes
+            .retain(|id, _| !pending.contains_key(id));
+        Ok(())
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reconcile(
+        root: &Path,
+        _now: u64,
+        live: &BTreeSet<String>,
+    ) -> Result<Vec<(u32, String, String)>> {
+        let mut wakes = Vec::new();
+        super::reconcile(root, live, |pending| {
+            wakes = pending.to_vec();
+            Ok(())
+        })?;
+        Ok(wakes)
+    }
+
     fn task(agent: &str, parent: &str) -> Task {
         Task {
             id: String::new(),
@@ -592,11 +608,10 @@ mod tests {
             result_revision: 0,
             acknowledged: false,
             retired: false,
-            next_check_ms: 0,
         }
     }
     #[test]
-    fn completion_is_durable_idempotent_and_retried_until_consumed() {
+    fn completion_is_durable_idempotent_and_delivered_once() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let id = register(root, task("child", "pm")).unwrap();
@@ -610,14 +625,11 @@ mod tests {
         )
         .unwrap();
         let live = BTreeSet::from(["s-child".into()]);
-        assert_eq!(reconcile(root, 10, &live).unwrap()[0].1, "pm");
+        let wakes = reconcile(root, 10, &live).unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].1, "pm");
         assert!(reconcile(root, 11, &live).unwrap().is_empty());
-        assert_eq!(
-            reconcile(root, CHECK_INTERVAL_MS + 11, &live)
-                .unwrap()
-                .len(),
-            1
-        );
+        assert!(reconcile(root, 60_000 + 11, &live).unwrap().is_empty());
         finish(
             root,
             0,
@@ -629,15 +641,9 @@ mod tests {
         .unwrap();
         assert!(acknowledge(root, 0, "stranger", &id, 1).is_err());
         acknowledge(root, 0, "pm", &id, 1).unwrap();
-        assert_eq!(
-            reconcile(root, CHECK_INTERVAL_MS * 3, &live).unwrap()[0].1,
-            "pm",
-            "retirement remains an obligation after result consumption"
-        );
+        assert!(reconcile(root, 60_000 * 3, &live).unwrap().is_empty());
         cancel_agent(root, 0, "child").unwrap();
-        assert!(reconcile(root, CHECK_INTERVAL_MS * 4, &live)
-            .unwrap()
-            .is_empty());
+        assert!(reconcile(root, 60_000 * 4, &live).unwrap().is_empty());
         assert!(finish(root, 0, "child", &id, Status::Completed, json!("changed")).is_err());
     }
     #[test]
@@ -672,20 +678,152 @@ mod tests {
         assert!(context_message(&context(root, 0, "ea").unwrap()).contains("combined result"));
     }
     #[test]
-    fn forgotten_timer_and_crashed_worker_have_runtime_continuations() {
+    fn running_is_quiet_and_dead_session_sends_once() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         register(root, task("worker", "ea")).unwrap();
         let live = BTreeSet::from(["s-worker".into()]);
-        let due = reconcile(root, now_ms() + CHECK_INTERVAL_MS + 1, &live).unwrap();
-        assert_eq!(
-            due.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
-            vec!["ea", "worker"]
-        );
-        let failed = reconcile(root, now_ms() + CHECK_INTERVAL_MS + 2, &BTreeSet::new()).unwrap();
+        assert!(reconcile(root, now_ms() + 60_000, &live)
+            .unwrap()
+            .is_empty());
+        let failed = reconcile(root, now_ms() + 60_001, &BTreeSet::new()).unwrap();
+        assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].1, "ea");
         assert!(failed[0].2.contains("exited without"));
+        assert!(reconcile(root, now_ms() + 600_000, &BTreeSet::new())
+            .unwrap()
+            .is_empty());
     }
+    #[test]
+    fn cancelled_and_changed_results_each_notify_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let id = register(root, task("worker", "ea")).unwrap();
+        let live = BTreeSet::from(["s-worker".into()]);
+        for result in ["first blocker", "second blocker"] {
+            finish(root, 0, "worker", &id, Status::Blocked, json!(result)).unwrap();
+            let wakes = reconcile(root, 1, &live).unwrap();
+            assert_eq!(wakes.len(), 1);
+            assert_eq!(wakes[0].1, "ea");
+            assert!(wakes[0].2.contains(result));
+            finish(root, 0, "worker", &id, Status::Blocked, json!(result)).unwrap();
+            assert!(reconcile(root, 600_000, &live).unwrap().is_empty());
+        }
+        cancel_agent(root, 0, "worker").unwrap();
+        let cancelled = reconcile(root, 600_001, &BTreeSet::new()).unwrap();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].1, "ea");
+        assert!(cancelled[0].2.contains("explicitly killed"));
+        cancel_agent(root, 0, "worker").unwrap();
+        assert!(reconcile(root, 900_000, &BTreeSet::new())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn killing_an_unacknowledged_finished_session_notifies_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let id = register(root, task("worker", "ea")).unwrap();
+        let live = BTreeSet::from(["s-worker".into()]);
+        finish(root, 0, "worker", &id, Status::Completed, json!("done")).unwrap();
+        assert_eq!(reconcile(root, 0, &live).unwrap().len(), 1);
+        cancel_agent(root, 0, "worker").unwrap();
+        let retired = reconcile(root, 1, &BTreeSet::new()).unwrap();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].1, "ea");
+        assert_eq!(read_state(root).unwrap().tasks[&id].result_revision, 1);
+        cancel_agent(root, 0, "worker").unwrap();
+        assert!(reconcile(root, 600_000, &BTreeSet::new())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_dead_blocked_session_preserves_its_report_and_reparents_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pm = register(root, task("pm", "ea")).unwrap();
+        let child = register(root, task("child", "pm")).unwrap();
+        finish(
+            root,
+            0,
+            "pm",
+            &pm,
+            Status::Blocked,
+            json!("need credentials"),
+        )
+        .unwrap();
+        let live = BTreeSet::from(["s-child".into()]);
+        let wakes = reconcile(root, 0, &live).unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].1, "ea");
+        let state = read_state(root).unwrap();
+        assert_eq!(
+            state.tasks[&pm].result.as_ref().unwrap()["previous_result"],
+            "need credentials"
+        );
+        assert_eq!(state.tasks[&child].parent, "ea");
+        assert!(reconcile(root, 600_000, &live).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_reused_manager_name_receives_new_child_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let old = register(root, task("pm", "ea")).unwrap();
+        cancel_agent(root, 0, "pm").unwrap();
+        acknowledge(root, 0, "ea", &old, 1).unwrap();
+        register(root, task("pm", "ea")).unwrap();
+        let child = register(root, task("child", "pm")).unwrap();
+        finish(
+            root,
+            0,
+            "child",
+            &child,
+            Status::Completed,
+            json!("new work"),
+        )
+        .unwrap();
+        let live = BTreeSet::from(["s-pm".into(), "s-child".into()]);
+        let wakes = reconcile(root, 0, &live).unwrap();
+        assert!(wakes.iter().any(|(_, parent, _)| parent == "pm"));
+    }
+
+    #[test]
+    fn failed_queue_handoff_preserves_the_delivery_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let id = register(root, task("worker", "ea")).unwrap();
+        let live = BTreeSet::from(["s-worker".into()]);
+        finish(root, 0, "worker", &id, Status::Failed, json!("failure")).unwrap();
+        assert!(super::reconcile(root, &live, |_| { bail!("queue unavailable") }).is_err());
+        let wakes = reconcile(root, 2, &live).unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].1, "ea");
+        assert!(reconcile(root, 3, &live).unwrap().is_empty());
+    }
+
+    #[test]
+    fn handoff_releases_ledger_lock_and_cannot_clear_a_newer_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let id = register(root, task("worker", "ea")).unwrap();
+        let live = BTreeSet::from(["s-worker".into()]);
+        finish(root, 0, "worker", &id, Status::Blocked, json!("first")).unwrap();
+        super::reconcile(root, &live, |wakes| {
+            assert_eq!(wakes.len(), 1);
+            // The queue handoff may overlap another process's ledger change.
+            finish(root, 0, "worker", &id, Status::Blocked, json!("second"))?;
+            Ok(())
+        })
+        .unwrap();
+        let next = reconcile(root, 1, &live).unwrap();
+        assert_eq!(next.len(), 1);
+        assert!(next[0].2.contains("second"));
+        assert!(reconcile(root, 2, &live).unwrap().is_empty());
+    }
+
     #[test]
     fn corrupt_ledger_is_never_silently_replaced() {
         let dir = tempfile::tempdir().unwrap();
@@ -868,6 +1006,7 @@ mod tests {
         assert!(wakes
             .iter()
             .any(|(_, recipient, body)| recipient == "ea" && body.contains(&child)));
+        assert!(reconcile(root, now_ms() + 1, &live).unwrap().is_empty());
         finish(
             root,
             0,

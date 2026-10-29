@@ -20,7 +20,7 @@ def main():
             session_prefix='test-', default_command='cat', default_workdir=str(root), health_idle_warning=15)))
         task = dict(id='durable-proof', ea_id=0, agent='worker', session='test-worker', parent='ea',
             project_id=1, assignment='restore fresh state', status='running', result=None,
-            acknowledged=False, retired=False, next_check_ms=9999999999999)
+            acknowledged=False, retired=False)
         ledger = root / 'task-lifecycle.json'
         ledger.write_text(json.dumps({'tasks': {task['id']: task}}))
 
@@ -82,10 +82,10 @@ const compact = { context: ['default summary policy'] };
 await plugin['experimental.session.compacting']({}, compact);
 if (compact.context[0] !== 'default summary policy' || !compact.context[1].includes('fresh after compaction')) throw Error('stale compaction');
 await plugin.event({ event: { type: 'session.idle' } });
-if (JSON.parse(readFileSync('./task-lifecycle.json')).tasks['durable-proof'].next_check_ms !== 0) throw Error('idle did not arm runtime');
+if (Object.keys(JSON.parse(readFileSync('./task-lifecycle.json')).pending_wakes ?? {}).length) throw Error('idle hook created an unsolicited wake');
 ''')
         subprocess.run(['node', str(harness)], cwd=root, check=True)
-        print('PASS: actual OpenCode plugin refreshes each request/compaction, preserves base policy, and arms idle recovery', flush=True)
+        print('PASS: actual OpenCode plugin refreshes each request/compaction, preserves base policy, and leaves idle detection to the runtime', flush=True)
 
 
 if __name__ == '__main__':
