@@ -243,6 +243,12 @@ pub trait Backend: Send + Sync {
     fn readiness_markers(&self) -> &'static [&'static str] {
         &[]
     }
+    /// Whether a launch with no startup dialog on screen has finished
+    /// starting: its banner by default.
+    fn startup_finished(&self, screen: &str, _pane_pid: u32) -> bool {
+        let markers = self.readiness_markers();
+        !markers.is_empty() && markers.iter().all(|marker| screen.contains(marker))
+    }
     /// How a caller learns that a launched pane can take work. A launch under
     /// OMAR's protocol runner has no banner: the runner's socket is the proof,
     /// and delivery waits on it. Otherwise the backend's banner, or nothing

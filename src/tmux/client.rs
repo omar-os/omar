@@ -475,6 +475,7 @@ impl TmuxClient {
             .context("missing startup backend")?;
         let backend = crate::backend::by_name(&name).context("unknown startup backend")?;
         let target = exact_pane_target(session);
+        let pane_pid = self.get_pane_pid(session)?;
         let start = Instant::now();
         // Scheduler deliveries have a zero wait budget. Persist observations
         // so their next poll can advance the handshake without blocking.
@@ -511,12 +512,7 @@ impl TmuxClient {
                     acted_at = Instant::now();
                     answered_gate = self.startup_state(session, "@omar_startup_answered");
                 }
-            } else if !backend.readiness_markers().is_empty()
-                && backend
-                    .readiness_markers()
-                    .iter()
-                    .all(|marker| screen.contains(marker))
-            {
+            } else if backend.startup_finished(&screen, pane_pid) {
                 self.run(&[
                     "set-option",
                     "-u",
@@ -655,13 +651,23 @@ impl TmuxClient {
         if self.finish_backend_startup(session, timeout).is_err() {
             return false;
         }
+        // A resumed conversation may never paint the banner; its backend can
+        // still know it has started.
+        let backend = self
+            .session_backend(session)
+            .and_then(|name| crate::backend::by_name(&name));
+        let pane_pid = self.get_pane_pid(session).ok();
         while start.elapsed() < timeout {
             // Use plain capture (no ANSI escapes) so multi-word markers like
             // "Claude Code" match even when the TUI styles each word
             // independently (Claude Code inserts a reset between them).
             if let Ok(content) = self.capture_pane_plain(session, 120) {
                 let hay = content.to_ascii_lowercase();
-                if needles.iter().all(|needle| hay.contains(needle)) {
+                if needles.iter().all(|needle| hay.contains(needle))
+                    || backend
+                        .zip(pane_pid)
+                        .is_some_and(|(backend, pid)| backend.startup_finished(&content, pid))
+                {
                     return true;
                 }
             }
@@ -1236,6 +1242,70 @@ with Path(sys.argv[1]).open('ab', buffering=0) as log:
         ));
         // Trust: Down, Enter. Then the warning: Down, Enter.
         assert_eq!(std::fs::read(&log).unwrap(), b"\x1b[B\r\x1b[B\r");
+    }
+
+    #[test]
+    fn a_resumed_claude_without_its_banner_finishes_starting_on_its_peer_socket() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let _env = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home.path());
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"crossSessionInbound":"accept"}"#,
+        )
+        .unwrap();
+        let script = home.path().join("resumed.py");
+        let log = home.path().join("keys");
+        let spool = home.path().join("events");
+        std::fs::write(
+            &script,
+            include_str!("../../tests/fixtures/delivery/claude_resumed.py"),
+        )
+        .unwrap();
+        let session = format!("omar-test-resumed-claude-{}", std::process::id());
+        let _guard = SessionGuard(session.clone());
+        let client = TmuxClient::new("");
+        let command = format!(
+            "python3 {} {} {}",
+            crate::manager::shell_single_quote(&script.display().to_string()),
+            crate::manager::shell_single_quote(&home.path().display().to_string()),
+            crate::manager::shell_single_quote(&log.display().to_string())
+        );
+        client
+            .new_session_with_backend(&session, &command, None, Some("claude"))
+            .unwrap();
+        client
+            .set_session_delivery(&session, &format!("spool:{}", spool.display()))
+            .unwrap();
+        let options = DeliveryOptions {
+            startup_timeout: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(50),
+        };
+        let delivered = client.deliver_prompt(&session, "after the resume", &options);
+        let ready = client.wait_for_markers(
+            &session,
+            &["Claude Code", "❯"],
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        );
+        match previous {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        delivered.unwrap();
+        assert!(ready, "a resumed agent never became ready");
+        assert_eq!(
+            crate::backend::spool::drain_spool(&spool),
+            ["after the resume"]
+        );
+        assert_eq!(client.startup_state(&session, SESSION_STARTUP_VAR), None);
+        assert!(std::fs::read(&log).unwrap_or_default().is_empty());
     }
 
     #[test]

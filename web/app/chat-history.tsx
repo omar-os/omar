@@ -33,12 +33,14 @@ export function SidebarIcon({ direction }: { direction: "open" | "close" }) {
   );
 }
 
-export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, onClose, onSelect, onSwitchingChange }: {
+export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, readOnly = false, onClose, onSelect, onSwitchingChange }: {
   serveUrl: string;
   activeId: string;
   mobile: boolean;
   revision: string;
   collapsed: boolean;
+  /** A view port refuses `activate`: selecting stays in this tab. */
+  readOnly?: boolean;
   onClose: () => void;
   onSelect: (conversation: ConversationSummary) => void;
   onSwitchingChange: (switching: boolean) => void;
@@ -102,6 +104,11 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
       if (mobile) onClose();
       return;
     }
+    if (readOnly) {
+      const conversation = chats.find((chat) => chat.id === id);
+      if (conversation) onSelect(conversation);
+      return;
+    }
     setSwitching(true);
     onSwitchingChange(true);
     setError("");
@@ -138,7 +145,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
       <span className="workflow-count">{chats.length}</span>
     </div>
     <div className="history-actions">
-      <button className="new-workflow" type="button" disabled={loading || switching} onClick={() => void select()}><span className="new-icon"><WorkflowIcon name="plus" size={15} /></span>New workflow</button>
+      {readOnly ? null : <button className="new-workflow" type="button" disabled={loading || switching} onClick={() => void select()}><span className="new-icon"><WorkflowIcon name="plus" size={15} /></span>New workflow</button>}
       <label className="workflow-search"><WorkflowIcon name="search" size={15} /><input aria-label="Search workflows" placeholder="Search workflows…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
     </div>
     <div className="history-label"><span>{sort === "recent" ? "RECENT" : sort === "name" ? "NAME" : "STATUS"}</span><WorkflowSortMenu value={sort} onChange={setSort} /></div>

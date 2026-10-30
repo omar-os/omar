@@ -45,6 +45,8 @@ export async function startFakeServe({
   terminalReflow = false,
   /** Fail a parked Web step without making tests wait for a real deadline. */
   webFailure = /** @type {string | null} */ (null),
+  /** Also serve a view-only port over the same state, as `omar serve` can. */
+  viewPort = /** @type {number | null} */ (null),
 } = {}) {
   const golden = JSON.parse(
     await readFile(new URL(`./fixtures/${snapshotFile}`, import.meta.url), "utf8"),
@@ -53,7 +55,7 @@ export async function startFakeServe({
   /** @type {Map<string, {record: object, snapshot: object, subscribers: Set<import("node:http").ServerResponse>, sequence: number}>} */
   const runs = new Map();
 
-  const server = createServer(async (request, response) => {
+  const handle = async (request, response) => {
     const url = new URL(request.url, `http://${request.headers.host}`);
     const scoped = /^\/chats\/([^/]+)(\/.*)$/.exec(url.pathname);
     const chat = scoped ? chats.get(scoped[1]) : activeChat;
@@ -65,7 +67,7 @@ export async function startFakeServe({
       return;
     }
     if (request.method === "GET" && url.pathname === "/health") {
-      return json(response, 200, { status: "ok", protocol_version: 1 });
+      return json(response, 200, { status: "ok", protocol_version: 1, access: "full" });
     }
     if (request.method === "POST" && url.pathname === "/v1/programs/check") {
       return readBody(request).then((body) => checkProgram(body, response));
@@ -403,13 +405,38 @@ export async function startFakeServe({
       return subscribeChat(response, chat);
     }
     json(response, 404, { error: "not found" });
+  };
+  const server = createServer(handle);
+
+  /**
+   * The view port: the same pages and reads, no writes. Host files and what a
+   * web agent is owed stay private, and the loopback diagram server is relayed
+   * under its run because a remote viewer cannot reach it.
+   */
+  const viewServer = viewPort === null ? null : createServer((request, response) => {
+    const path = new URL(request.url, "http://view").pathname.replace(/^\/chats\/[^/]+/, "");
+    if (request.method === "GET" && path === "/health") {
+      return json(response, 200, { status: "ok", protocol_version: 1, access: "view" });
+    }
+    const refused = (request.method !== "GET" && request.method !== "OPTIONS") ||
+      path.startsWith("/v1/workspaces") || /^\/v1\/runs\/[^/]+\/panel$/.test(path);
+    if (refused) return json(response, 403, { error: "read-only view" });
+    const relay = /^\/v1\/runs\/([^/]+)\/diagram(\/v1\/(?:diagram|events))$/.exec(path);
+    if (relay) {
+      const entry = runs.get(decodeURIComponent(relay[1]));
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return relay[2] === "/v1/diagram" ? json(response, 200, entry.snapshot) : subscribe(response, entry);
+    }
+    return handle(request, response);
   });
+  /** Frames a client sent up a view port's terminal, which it should not. */
+  let viewTerminalFrames = 0;
 
   // A stand-in for the agent's tmux session: it announces a size the way the
   // daemon does, then echoes what is typed so a test can prove keystrokes
   // travelled up the same socket the screen comes down.
   const terminals = new WebSocketServer({ noServer: true });
-  server.on("upgrade", (request, socket, head) => {
+  const upgrade = (view) => (request, socket, head) => {
     const url = new URL(request.url, "http://127.0.0.1");
     url.pathname = url.pathname.replace(/^\/chats\/[^/]+/, "");
     // The assistant has a route of its own: its tmux session is not named
@@ -446,6 +473,11 @@ export async function startFakeServe({
       draw();
       if (!terminalReflow) client.send(Buffer.from(`${agent} $ `));
       client.on("message", (data, isBinary) => {
+        // A view port discards keystrokes and resizes alike.
+        if (view) {
+          viewTerminalFrames += 1;
+          return;
+        }
         // Text is a resize control frame, binary is keystrokes. The daemon
         // reflows the session and answers with the shape it settled on;
         // echoing a control frame back would type it at the shell instead.
@@ -458,7 +490,9 @@ export async function startFakeServe({
         client.send(Buffer.from(data));
       });
     });
-  });
+  };
+  server.on("upgrade", upgrade(false));
+  viewServer?.on("upgrade", upgrade(true));
 
   let backend = "codex";
   function newChat() {
@@ -942,8 +976,13 @@ export async function startFakeServe({
   }
 
   await new Promise((resolve) => server.listen(port, host, resolve));
+  if (viewServer) await new Promise((resolve) => viewServer.listen(viewPort, host, resolve));
   return {
     url: `http://${host}:${server.address().port}`,
+    viewUrl: viewServer ? `http://${host}:${viewServer.address().port}` : null,
+    get viewTerminalFrames() {
+      return viewTerminalFrames;
+    },
     agentToken,
     async close() {
       for (const client of terminals.clients) client.terminate();
@@ -958,6 +997,10 @@ export async function startFakeServe({
       // idle out, adding seconds to every test.
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
+      if (viewServer) {
+        viewServer.closeAllConnections();
+        await new Promise((resolve) => viewServer.close(resolve));
+      }
     },
   };
 }

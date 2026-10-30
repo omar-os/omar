@@ -50,12 +50,12 @@ Control pointed at it, and opens a browser. Ctrl-C stops both.
 make dev
 ```
 
-`OMAR_SERVE_ADDRESS`, `OMAR_WEB_PORT` and `OMAR_DEV_OPEN=0` adjust it.
+`OMAR_SERVE_PORT`, `OMAR_WEB_PORT` and `OMAR_DEV_OPEN=0` adjust it.
 `OMAR_DEV_NO_EA=1` starts without an assistant for frontend-only development. The two
 halves separately, if you want them in separate terminals:
 
 ```bash
-cargo run --bin omar -- serve --address 127.0.0.1:7340   # from the repository root
+cargo run --bin omar -- serve --port 7340                 # from the repository root
 OMAR_SERVE_URL=http://127.0.0.1:7340 npm run dev         # from web/
 ```
 
