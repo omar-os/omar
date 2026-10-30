@@ -86,7 +86,7 @@ while True: time.sleep(1)
     def launch():
         output = open(root / f"daemon-{len(daemons)}.log", "w")
         name = f"mc{len(daemons)}"
-        daemon = subprocess.Popen([BINARY, "--config", str(config), "serve", "--name", name, "--port", str(port)], env=env, stdout=output, stderr=output)
+        daemon = subprocess.Popen([BINARY, "--config", str(config), "serve", "-s", name, "--port", str(port)], env=env, stdout=output, stderr=output)
         output.close()
         daemons.append(daemon)
         eventually(lambda: api("GET", "/health"))

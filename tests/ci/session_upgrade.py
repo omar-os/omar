@@ -93,7 +93,7 @@ def main():
         sessions = {}
 
         def up(name, *extra, binary=BIN, check=True):
-            result = subprocess.run([str(binary), "up", "--no-ea", "--name", name, "--json", *extra], cwd=source,
+            result = subprocess.run([str(binary), "up", "--no-ea", "-s", name, "--json", *extra], cwd=source,
                                     env=env, text=True, capture_output=True, timeout=90)
             if not check:
                 return result
@@ -198,7 +198,7 @@ def main():
             lines_before = log_lines(worktree("alpha", "Ticker", "w"))
             paused_tree = worktree("alpha", "Ticker", "w")
             text = omar("alpha", "down")
-            assert "2 paused workflow(s) kept" in text and "omar up --name alpha" in text and "omar rm -s alpha" in text, text
+            assert "2 paused workflow(s) kept" in text and "omar up -s alpha" in text and "omar rm -s alpha" in text, text
             stopped = ls()["alpha"]
             assert stopped["state"] == "stopped", stopped
             assert listed_runs("alpha") == {"Ticker": "paused", "Sleeper": "paused"}, stopped
@@ -214,7 +214,7 @@ def main():
             # 2. The binary is replaced (brew, the install script), and the new
             #    build restarts the session by name: same URL, new build id,
             #    the paused workflows listed and waiting for `resume`.
-            restarted = subprocess.run([str(v2_omar), "up", "--name", "alpha"], cwd=source, env=env, text=True,
+            restarted = subprocess.run([str(v2_omar), "up", "-s", "alpha"], cwd=source, env=env, text=True,
                                        capture_output=True, timeout=90)
             assert restarted.returncode == 0, restarted.stderr
             banner = restarted.stdout

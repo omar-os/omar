@@ -46,7 +46,7 @@ default_command = "bash"
 default_workdir = "."
 EOF
 
-session_json="$(cd "$REPO_ROOT" && HOME="$home_dir" "$OMAR_BIN" up --name selector --no-ea --json)"
+session_json="$(cd "$REPO_ROOT" && HOME="$home_dir" "$OMAR_BIN" up -s selector --no-ea --json)"
 session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$session_json")"
 server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
 state_dir="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["directory"])' <<<"$session_json")"

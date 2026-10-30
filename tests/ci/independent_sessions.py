@@ -39,7 +39,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         return result.stdout if ok else result.stderr
 
     def up(name, context=None):
-        result = json.loads(cli("up", "--name", name, "--no-ea", "--json", context=context))
+        result = json.loads(cli("up", "-s", name, "--no-ea", "--json", context=context))
         sessions.append(result)
         assert result["state"] == "ready"
         assert hashlib.sha256(Path(result["executable"]).read_bytes()).hexdigest() == result["build_id"]
@@ -102,7 +102,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         assert "--tui" in cli("attach", "-s", "outer", ok=False) or "--web" in cli("attach", "-s", "outer", ok=False)
         assert outer["tmux_server"] != inner["tmux_server"]
         assert len(json.loads(cli("ls", "--json"))) == 2
-        cli("up", "--name", "outer", "--no-ea", ok=False)
+        cli("up", "-s", "outer", "--no-ea", ok=False)
         cli("--session", "inner", "ea", "list", context=inherited)
         assert json.loads(cli("--session", "outer", "ea", "create", "--name", "Second"))["id"] == 1
         assert len(info("inner")["eas"]) == 1
@@ -111,7 +111,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         cli("-sinner", "ea", "event", "list")
         # Same-name startup is serialized before either daemon is ready.
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            results = list(pool.map(lambda _: subprocess.run([str(BIN), "up", "--name", "race", "--no-ea", "--json"],
+            results = list(pool.map(lambda _: subprocess.run([str(BIN), "up", "-s", "race", "--no-ea", "--json"],
                                   env=env, text=True, capture_output=True, timeout=90), range(2)))
         assert sorted(p.returncode == 0 for p in results) == [False, True]
         sessions.append(json.loads(next(p.stdout for p in results if p.returncode == 0)))
@@ -129,7 +129,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         assert not Path(doomed["directory"]).exists() and "doomed" not in {s["name"] for s in json.loads(cli("ls", "--json"))}
         sessions.remove(doomed)
         # Foreground serve honours --json for its startup record.
-        foreground = subprocess.Popen([str(BIN), "--json", "serve", "--name", "fg", "--no-ea"], cwd=root, env=env,
+        foreground = subprocess.Popen([str(BIN), "--json", "serve", "-s", "fg", "--no-ea"], cwd=root, env=env,
                                       text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         lines = []
         for line in foreground.stdout:
@@ -143,7 +143,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         # Occupied endpoint fails readiness instead of advertising a dead URL.
         with socket.socket() as occupied:
             occupied.bind(("127.0.0.1", 0)); occupied.listen()
-            error = cli("up", "--name", "conflict", "--no-ea", "--port",
+            error = cli("up", "-s", "conflict", "--no-ea", "--port",
                         str(occupied.getsockname()[1]), ok=False)
             assert "startup failed" in error and "runtime.log" in error
         assert info("conflict")["session"]["state"] == "failed"
@@ -157,7 +157,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             (built / "omarc").write_text(marker)
             (built / "omarc").chmod(0o700)
             context = dict(inherited, OMARC_BIN=str(Path(outer["directory"]) / "bin/omarc"))
-            output = subprocess.run([str(built / "omar"), "up", "--name", "build", "--no-ea", "--json"],
+            output = subprocess.run([str(built / "omar"), "up", "-s", "build", "--no-ea", "--json"],
                                     cwd=root, env=context, text=True, capture_output=True, timeout=90)
             assert output.returncode == 0, output.stderr
             selected = json.loads(output.stdout)
@@ -255,7 +255,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
             time.sleep(.2)
         wait_status("outer", run_a, "running")
         # A graceful stop pauses the session's running workflow and keeps the
-        # session for `up --name`; ls lists it, stopped, with the paused run.
+        # session for `up -s`; ls lists it, stopped, with the paused run.
         listed = {s["name"]: s for s in json.loads(cli("ls", "--json"))}
         assert listed["inner"]["state"] == "stopped" and {r["run_id"]: r["status"] for r in listed["inner"]["runs"]} == {run_b: "paused"}, listed["inner"]
         cli("rm", "-s", "inner")
@@ -270,7 +270,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         fake.write_text("#!/usr/bin/env python3\nimport time\nprint('Claude Code ready', flush=True)\nwhile True: time.sleep(1)\n")
         fake.chmod(0o700)
         fake_env = dict(env, PATH=str(fake_bin) + os.pathsep + env["PATH"])
-        managed = json.loads(cli("-a", "claude", "up", "--name", "assistants", "--json", context=fake_env))
+        managed = json.loads(cli("-a", "claude", "up", "-s", "assistants", "--json", context=fake_env))
         sessions.append(managed)
         cli("-s", "assistants", "ea", "create", "--name", "Research", "--agent", "claude")
         cli("-s", "assistants", "ea", "start", "Research")

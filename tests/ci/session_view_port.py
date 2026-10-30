@@ -95,11 +95,11 @@ def main():
 
         try:
             # The session's own port is picked with --port, and always on loopback.
-            assert omar("up", "--no-ea", "--name", "shown", "--address", "0.0.0.0:8080", check=False).returncode != 0
+            assert omar("up", "--no-ea", "-s", "shown", "--address", "0.0.0.0:8080", check=False).returncode != 0
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
-            session = json.loads(omar("up", "--no-ea", "--name", "shown", "--json", "--port", str(port),
+            session = json.loads(omar("up", "--no-ea", "-s", "shown", "--json", "--port", str(port),
                                       "--view-address", "127.0.0.1:0").stdout)
             full, view = session["url"], session["view_url"]
             assert full == f"http://127.0.0.1:{port}" and full != view, session
@@ -138,14 +138,27 @@ def main():
             assert stopped[0] in (200, 202), stopped
 
             omar("down", "-s", "shown")
-            restarted = json.loads(omar("up", "--name", "shown", "--json").stdout)
+            restarted = json.loads(omar("up", "-s", "shown", "--json").stdout)
             assert restarted["url"] == full and restarted["view_url"] == view, restarted
             assert http("GET", f"{view}/health")[1]["access"] == "view"
+            # A stopped session restarts by -s with new ports; --name is a deprecated alias.
+            omar("down", "-s", "shown")
+            both = omar("up", "-s", "shown", "--name", "shown", check=False)
+            assert both.returncode != 0 and "name the session once" in both.stderr, both.stderr
+            moved = json.loads(omar("up", "-s", "shown", "--port", str(port), "--view-address", "127.0.0.1:0",
+                                    "--json").stdout)
+            assert moved["url"] == full and moved["view_url"] != view, moved
+            assert http("GET", f"{moved['view_url']}/health")[1]["access"] == "view"
+            omar("down", "-s", "shown")
+            alias = omar("up", "--name", "shown", "--json")
+            assert "--name is deprecated; use -s NAME" in alias.stderr, alias.stderr
+            assert json.loads(alias.stdout)["url"] == full
 
-            plain = json.loads(omar("up", "--no-ea", "--name", "plain", "--json").stdout)
+            plain = json.loads(omar("up", "--no-ea", "-s", "plain", "--json").stdout)
             assert "view_url" not in plain, plain
             print("PASS: the view port shows a live run, its diagram and terminals, refuses writes, "
-                  "and survives a restart; a session without it serves none")
+                  "and survives a restart; up -s restarts with new ports, --name is a warned alias; "
+                  "a session without a view port serves none")
         finally:
             for name in ("shown", "plain"):
                 omar("rm", "-s", name, check=False)
