@@ -632,11 +632,13 @@ mod tests {
         assert!(claude.contains("--session-id '11111111-1111-4111-8111-111111111111'"));
         let (codex, _) = crate::manager::build_ea_command("codex", 0, "test", dir.path(), &context);
         assert!(
-            codex.contains("codex resume 'saved-codex' --remote"),
+            codex.contains(
+                "codex resume 'saved-codex' -c check_for_update_on_startup=false --remote"
+            ),
             "{codex}"
         );
         assert!(!codex.contains("codex resume 'saved-codex' --dangerously"));
-        assert!(codex.contains("|| codex --dangerously-bypass-approvals-and-sandbox --remote"));
+        assert!(codex.contains("|| codex --dangerously-bypass-approvals-and-sandbox -c check_for_update_on_startup=false --remote"));
         let (managed, _) = crate::manager::build_ea_command(
             "codex --profile work",
             0,

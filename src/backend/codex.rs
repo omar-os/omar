@@ -165,6 +165,11 @@ fn resume_command(command: &str, id: &str) -> String {
     resumed.join(" ")
 }
 
+/// An agent's TUI never checks for updates. Its update prompt can open after
+/// the banner OMAR waits for, and holds the thread an event needs until a
+/// key that nobody presses; the operator updates codex on their own.
+const NO_UPDATE_CHECK: &str = "-c check_for_update_on_startup=false";
+
 pub(crate) fn ensure_codex_runtime_flags(base_command: &str) -> String {
     if !detect(base_command).is_some_and(|b| b.kind() == Kind::Codex) {
         return base_command.to_string();
@@ -368,7 +373,7 @@ pub(crate) fn codex_server_command(
         })
         .unwrap_or_default();
     let endpoint = shell_single_quote(&format!("unix://{}", socket.display()));
-    let mut tui = format!("{tui_command} --remote {endpoint}");
+    let mut tui = format!("{tui_command} {NO_UPDATE_CHECK} --remote {endpoint}");
     if let Some(words) =
         super::saved_conversation(context, "codex").and_then(|_| shlex::split(tui_command))
     {
@@ -385,7 +390,7 @@ pub(crate) fn codex_server_command(
                 .collect::<Vec<_>>()
                 .join(" ");
             tui.push_str(&format!(
-                " || {} --remote {endpoint}",
+                " || {} {NO_UPDATE_CHECK} --remote {endpoint}",
                 ensure_codex_runtime_flags(&fresh)
             ));
         }

@@ -31,10 +31,11 @@ CI's `Repository Rules` job enforces 1 and 2 on files a change adds.
 10. Format code before pushing.
 11. Squash commits when merging.
 12. Keep writing concise, to the point where grammar can be sacrificed: README, comments, PR descriptions. Human-readable, not essays.
+13. A PR that fixes an issue links it in its description (`Fixes #N`), so merging closes it. No issue yet: open one first.
 
 ## Tests and CI
 
-13. Every feature comes with a test, and every test runs in CI.
-14. When CI fails, find out why and iterate until it passes.
-15. Flaky tests: if a re-run passes, say so in the PR and open an issue for the flake. Don't just re-run.
-16. Once CI passes, request a review from GitHub Copilot and address it judiciously.
+14. Every feature comes with a test, and every test runs in CI.
+15. When CI fails, find out why and iterate until it passes.
+16. Flaky tests: if a re-run passes, say so in the PR and open an issue for the flake. Don't just re-run.
+17. Once CI passes, request a review from GitHub Copilot and address it judiciously.
