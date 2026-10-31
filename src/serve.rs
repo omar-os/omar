@@ -1538,7 +1538,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
     // A viewer watches without counting as an operator window, and without
     // waking the assistant the way an operator's arrival does.
     if access == Access::View && method == "GET" && path == "/v1/chat/events" {
-        return stream_chat(stream, &context, None);
+        return stream_chat(stream, &context, None, admission);
     }
     // Streams for as long as the operator keeps Mission Control open.
     if method == "GET" && path == "/v1/chat/events" {
