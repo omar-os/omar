@@ -701,6 +701,10 @@ def testProve : IO Unit := do
       >>= fromJson? (α := Omar.Prove.Request) with
     | .ok request => pure request
     | .error message => throw (IO.userError message)
+  -- Lemmas are optional in a request.
+  match Json.parse "{\"properties\": []}" >>= fromJson? (α := Omar.Prove.Request) with
+  | .ok bare => assertEqual "no lemmas" bare.lemmas ""
+  | .error message => throw (IO.userError s!"a request without lemmas: {message}")
   let extra : Array Omar.Prove.Property := #[
     { name := "cheat", statement := "False", proof := "sorry" },
     { name := "elsewhere", statement := "True", proof := "trivial" },

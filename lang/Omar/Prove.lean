@@ -42,7 +42,12 @@ structure Property where
 structure Request where
   lemmas : String := ""
   properties : Array Property
-  deriving FromJson
+
+/-- `lemmas` may be left out; a derived instance would insist on it. -/
+instance : FromJson Request where
+  fromJson? json := do
+    let properties ← json.getObjValAs? (Array Property) "properties"
+    pure { properties, lemmas := (json.getObjValAs? String "lemmas").toOption.getD "" }
 
 /-- Words that change what Lean checks or assumes rather than prove anything. -/
 def refused : List String :=
