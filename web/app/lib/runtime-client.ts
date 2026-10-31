@@ -73,6 +73,18 @@ export async function switchBackend(
   if (!response.ok) throw new Error(await readError(response));
 }
 
+/** Browsers word a failed request differently ("Load failed" in Safari,
+    "Failed to fetch" in Chrome, "NetworkError…" in Firefox); all mean the
+    runtime did not answer. */
+const UNREACHABLE = /^(load failed|failed to fetch|networkerror\b|network error)/i;
+
+/** What to show for a failed call: the runtime's own message, or one plain
+    sentence when the request never reached it. */
+export function describeError(cause: unknown): string {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return UNREACHABLE.test(message) ? "Can't reach the runtime." : message;
+}
+
 async function readError(response: Response): Promise<string> {
   // `omar serve` reports compile and validation failures as {"error": "..."};
   // surfacing that beats a bare status code for a rejected design.

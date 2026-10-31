@@ -5,7 +5,7 @@ import { saveWorkflowName, useWorkflowNames } from "./lib/workflow-names";
 import { WorkflowIcon } from "./workflow-icon";
 import { WorkflowSortMenu, type WorkflowSort } from "./workflow-sort-menu";
 import type { ConversationSummary } from "./lib/protocol";
-import { fetchConversations, selectConversation } from "./lib/runtime-client";
+import { describeError, fetchConversations, selectConversation } from "./lib/runtime-client";
 
 const mobileQuery = "(max-width: 900px)";
 function subscribeViewport(onChange: () => void) {
@@ -33,7 +33,7 @@ export function SidebarIcon({ direction }: { direction: "open" | "close" }) {
   );
 }
 
-export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, readOnly = false, onClose, onSelect, onSwitchingChange }: {
+export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, readOnly = false, offline = false, onClose, onSelect, onSwitchingChange }: {
   serveUrl: string;
   activeId: string;
   mobile: boolean;
@@ -41,6 +41,9 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
   collapsed: boolean;
   /** A view port refuses `activate`: selecting stays in this tab. */
   readOnly?: boolean;
+  /** The runtime is down, which the studio already says: keep the last list,
+      dimmed, rather than a second error. It reloads once the runtime is back. */
+  offline?: boolean;
   onClose: () => void;
   onSelect: (conversation: ConversationSummary) => void;
   onSwitchingChange: (switching: boolean) => void;
@@ -90,7 +93,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
         setLoading(false);
       }).catch((cause) => {
         if (abort.signal.aborted) return;
-        setError(cause instanceof Error ? cause.message : String(cause));
+        setError(describeError(cause));
         setLoading(false);
       });
     };
@@ -118,7 +121,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
       setChats((current) => [conversation, ...current.filter((chat) => chat.id !== conversation.id)]);
       onSelect(conversation);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(describeError(cause));
     } finally {
       setSwitching(false);
       onSwitchingChange(false);
@@ -149,8 +152,8 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
       <label className="workflow-search"><WorkflowIcon name="search" size={15} /><input aria-label="Search workflows" placeholder="Search workflows…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
     </div>
     <div className="history-label"><span>{sort === "recent" ? "RECENT" : sort === "name" ? "NAME" : "STATUS"}</span><WorkflowSortMenu value={sort} onChange={setSort} /></div>
-    {error ? <div className="history-error"><p role="alert">{error}</p><button type="button" onClick={() => setRetry((current) => current + 1)}>Retry</button></div> : null}
-    <ul aria-label="Saved chats" aria-busy={loading || switching}>
+    {error && !offline ? <div className="history-error" role="alert"><span>{error.startsWith("Can't reach") ? "Couldn't load workflows." : error}</span><button type="button" className="link-button" onClick={() => setRetry((current) => current + 1)}>Retry</button></div> : null}
+    <ul aria-label="Saved chats" aria-busy={loading || switching} className={offline ? "stale" : undefined}>
       {visible.map((chat) => (
         <li key={chat.id} className="workflow-row">
           <button type="button" disabled={switching} aria-current={chat.id === activeId ? "true" : undefined} aria-keyshortcuts="F2" onKeyDown={(event) => { if (event.key === "F2") { event.preventDefault(); cancelRename.current = false; setEditedName(displayName(chat)); setEditing(chat.id); } }} onClick={() => void select(chat.id)}>
