@@ -216,6 +216,23 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     if ("access" in r.body) assert.equal(f.body.access, r.body.access);
   });
 
+  test("backend sign-in status has the same shape", async () => {
+    const { real: r, fake: f } = await both("/v1/agent/backends");
+    assert.equal(r.status, 200);
+    assert.equal(f.status, r.status);
+    const statuses = ["connected", "signed_out", "not_installed", "unknown"];
+    for (const body of [r.body, f.body]) {
+      assert.deepEqual(
+        body.backends.map((b) => b.name),
+        ["claude", "codex", "cursor", "opencode", "pi", "agy"],
+      );
+      for (const backend of body.backends) {
+        assert.ok(statuses.includes(backend.status), backend.status);
+        assert.equal(typeof backend.login, "string");
+      }
+    }
+  });
+
   test("an empty run listing has the same shape", async () => {
     const { real: r, fake: f } = await both("/v1/runs");
     assert.equal(r.status, 200);

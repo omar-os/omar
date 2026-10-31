@@ -14,10 +14,13 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use crate::manager::McpLaunchContext;
+pub use connection::Connection;
 
 pub(crate) mod antigravity;
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod connect;
+pub(crate) mod connection;
 pub(crate) mod cursor;
 pub(crate) mod jev;
 pub(crate) mod managed;
@@ -198,6 +201,13 @@ pub struct StartupGate {
 
 /// A topology prompt evaluated directly by a backend, without a coding-agent pane.
 /// Output types are the canonical types already resolved and checked by the VM.
+/// A CLI's own sign-in: `program args`, attached to the operator's terminal.
+pub struct Login {
+    pub args: &'static [&'static str],
+    /// Said before it starts, when the CLI does not say it itself.
+    pub note: Option<&'static str>,
+}
+
 pub struct TopologyInvocation<'a> {
     pub effects: &'a BTreeMap<String, String>,
     pub triggers: &'a BTreeMap<String, Value>,
@@ -228,6 +238,24 @@ pub trait Backend: Send + Sync {
         false
     }
     fn startup_gate(&self, _screen: &str) -> Option<StartupGate> {
+        None
+    }
+
+    /// Whether this backend's installed CLI, run as `program`, is signed in.
+    fn connection(&self, _program: &str) -> Connection {
+        Connection::unknown("no sign-in check for this backend")
+    }
+    /// The vendor's official installer, which `omar connect` runs.
+    fn install_command(&self) -> Option<&'static str> {
+        None
+    }
+    /// How `omar connect` has the installed CLI sign itself in. `headless`:
+    /// no browser can open here, so prefer a code the operator types elsewhere.
+    fn login(&self, _headless: bool) -> Option<Login> {
+        None
+    }
+    /// How the connect picker has the CLI sign itself out.
+    fn logout(&self) -> Option<Login> {
         None
     }
 

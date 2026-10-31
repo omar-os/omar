@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use super::{connection, Connection, Login};
 use super::{managed, spool, PaneSetup};
 use super::{Backend, Kind, Launch};
 use crate::ea::EaId;
@@ -26,6 +27,30 @@ impl Backend for Antigravity {
     }
     fn default_command(&self) -> &'static str {
         "agy --dangerously-skip-permissions"
+    }
+    /// agy has no status command and keeps its sign-in in the OS keyring;
+    /// listing models is the cheapest thing that needs one.
+    fn connection(&self, program: &str) -> Connection {
+        match connection::run(program, &["models"]) {
+            Some(output) => models_status(output.success, &output.text),
+            None => Connection::unknown("`agy models` did not answer"),
+        }
+    }
+    fn install_command(&self) -> Option<&'static str> {
+        Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
+    }
+    /// agy has no login command; it signs in on first launch.
+    fn login(&self, _headless: bool) -> Option<Login> {
+        Some(Login {
+            args: &[],
+            note: Some("agy signs in on first launch; quit it once you are in."),
+        })
+    }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: &[],
+            note: Some("In agy, type /logout, then quit it."),
+        })
     }
     // No readiness banner is pinned: `agy` is not available in CI or local
     // discovery, so a marker would be an unverified guess.
@@ -307,8 +332,39 @@ pub(crate) fn install_antigravity_hook() -> bool {
     spool::write_json_atomically(&path, &config)
 }
 
+fn models_status(success: bool, text: &str) -> Connection {
+    if success {
+        Connection::Connected { via: None }
+    } else if text.to_ascii_lowercase().contains("sign in") {
+        Connection::SignedOut
+    } else {
+        let line = text.lines().map(str::trim).find(|line| !line.is_empty());
+        Connection::unknown(line.unwrap_or("`agy models` failed"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn models_status_tells_signed_out_from_other_failures() {
+        use super::{models_status, Connection};
+        assert_eq!(
+            models_status(
+                false,
+                "Error: Please sign in to view available models. Launch the CLI without arguments to sign in."
+            ),
+            Connection::SignedOut
+        );
+        assert_eq!(
+            models_status(true, "gemini-3-pro\n"),
+            Connection::Connected { via: None }
+        );
+        assert_eq!(
+            models_status(false, "\nError: network unreachable\n"),
+            Connection::unknown("Error: network unreachable")
+        );
+    }
+
     use super::*;
     use crate::manager::global_home_env_lock;
     use crate::manager::tests::*;

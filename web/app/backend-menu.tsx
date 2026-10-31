@@ -1,7 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { fetchBackends, switchBackend } from "./lib/runtime-client";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  fetchBackendStatus,
+  fetchBackends,
+  switchBackend,
+  type BackendStatus,
+} from "./lib/runtime-client";
 
 /** How each backend is written for a human. */
 const LABELS: Record<string, string> = {
@@ -15,6 +20,28 @@ const LABELS: Record<string, string> = {
 
 function label(backend: string): string {
   return LABELS[backend] ?? backend;
+}
+
+/** One line on how a backend is signed in, or what it still needs. */
+function note(status: BackendStatus | undefined): ReactNode {
+  switch (status?.status) {
+    case "connected":
+      return status.via ?? "signed in";
+    case "signed_out":
+    case "not_installed": {
+      const state =
+        status.status === "signed_out" ? "not signed in" : "not installed";
+      return status.login ? (
+        <>
+          {state} · run <code>{status.login}</code>
+        </>
+      ) : (
+        state
+      );
+    }
+    default:
+      return null;
+  }
 }
 
 /**
@@ -36,6 +63,7 @@ export function BackendMenu({
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [statuses, setStatuses] = useState<Record<string, BackendStatus>>({});
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -53,6 +81,23 @@ export function BackendMenu({
       cancelled = true;
     };
   }, [serveUrl, live]);
+
+  // Asked each time the menu opens: a sign-in may have happened meanwhile.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    fetchBackendStatus(serveUrl)
+      .then((list) => {
+        if (!cancelled) {
+          setStatuses(Object.fromEntries(list.map((s) => [s.name, s])));
+        }
+      })
+      // A runtime that predates this endpoint just shows no status.
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [serveUrl, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -114,20 +159,36 @@ export function BackendMenu({
               </span>
             </div>
           ) : (
-            available.map((backend) => (
-              <button
-                key={backend}
-                type="button"
-                role="menuitem"
-                className={backend === current ? "current" : undefined}
-                onClick={() =>
-                  backend === current ? setOpen(false) : setPending(backend)
-                }
-              >
-                {label(backend)}
-                {backend === current ? <span aria-hidden="true">✓</span> : null}
-              </button>
-            ))
+            available.map((backend) => {
+              const status = statuses[backend];
+              // Launching one that cannot sign in would only hang.
+              const unusable =
+                status?.status === "signed_out" ||
+                status?.status === "not_installed";
+              return (
+                <button
+                  key={backend}
+                  type="button"
+                  role="menuitem"
+                  data-status={status?.status}
+                  className={backend === current ? "current" : undefined}
+                  disabled={unusable && backend !== current}
+                  onClick={() =>
+                    backend === current ? setOpen(false) : setPending(backend)
+                  }
+                >
+                  <span className="backend-name">
+                    {label(backend)}
+                    {status && note(status) ? (
+                      <small className="backend-note">{note(status)}</small>
+                    ) : null}
+                  </span>
+                  {backend === current ? (
+                    <span aria-hidden="true">✓</span>
+                  ) : null}
+                </button>
+              );
+            })
           )}
         </div>
       ) : null}

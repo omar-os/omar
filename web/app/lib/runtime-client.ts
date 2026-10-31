@@ -54,6 +54,28 @@ export async function fetchBackends(serveUrl: string): Promise<AgentBackends> {
   };
 }
 
+/** Whether a backend is installed and signed in, as its own CLI says. */
+export type BackendStatus = {
+  name: string;
+  status: "connected" | "signed_out" | "not_installed" | "unknown";
+  /** The account or credential it signed in with. */
+  via?: string;
+  /** Why the status is unknown. */
+  reason?: string;
+  /** What to run to install and sign it in. */
+  login?: string;
+};
+
+export async function fetchBackendStatus(
+  serveUrl: string,
+): Promise<BackendStatus[]> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/agent/backends`);
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { backends?: unknown };
+  return Array.isArray(body.backends) ? (body.backends as BackendStatus[]) : [];
+}
+
 /**
  * Move the assistant to another backend.
  *

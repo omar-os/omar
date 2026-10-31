@@ -343,6 +343,18 @@ export async function startFakeServe({
         available: ["claude", "codex", "cursor", "opencode", "agy"],
       });
     }
+    if (request.method === "GET" && url.pathname === "/v1/agent/backends") {
+      return json(response, 200, {
+        backends: [
+          ["claude", { status: "connected", via: "Claude Max" }],
+          ["codex", { status: "connected", via: "ChatGPT" }],
+          ["cursor", { status: "signed_out" }],
+          ["opencode", { status: "unknown", reason: "no answer" }],
+          ["pi", { status: "not_installed" }],
+          ["agy", { status: "not_installed" }],
+        ].map(([name, status]) => ({ name, ...status, login: `omar connect ${name}` })),
+      });
+    }
     if (request.method === "POST" && url.pathname === "/v1/agent/backend") {
       return readBody(request).then((body) => {
         let chosen;

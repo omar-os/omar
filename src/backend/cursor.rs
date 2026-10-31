@@ -1,5 +1,6 @@
 //! Cursor: driven over its protocol by OMAR's runner.
 
+use super::{connection, Connection, Login};
 use super::{managed, spool, PaneSetup};
 use super::{Backend, Kind, Launch};
 use crate::manager::{managed_agent_command, materialize_prompt_file, shell_single_quote};
@@ -21,6 +22,44 @@ impl Backend for Cursor {
     }
     fn default_command(&self) -> &'static str {
         command_for(on_path)
+    }
+    /// The status command ignores `CURSOR_API_KEY`, so that is checked first.
+    fn connection(&self, program: &str) -> Connection {
+        if let Some(name) = connection::env_credential(&["CURSOR_API_KEY"]) {
+            return Connection::connected(name);
+        }
+        let args: &[&str] = if program == "cursor" {
+            &["agent", "status", "--format", "json"]
+        } else {
+            &["status", "--format", "json"]
+        };
+        match connection::run(program, args) {
+            Some(output) => agent_status(&output.stdout),
+            None => Connection::unknown("`cursor agent status` did not answer"),
+        }
+    }
+    fn install_command(&self) -> Option<&'static str> {
+        Some("curl -fsS https://cursor.com/install | bash")
+    }
+    fn login(&self, _headless: bool) -> Option<Login> {
+        Some(Login {
+            args: if command_for(on_path).starts_with("cursor ") {
+                &["agent", "login"]
+            } else {
+                &["login"]
+            },
+            note: None,
+        })
+    }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: if command_for(on_path).starts_with("cursor ") {
+                &["agent", "logout"]
+            } else {
+                &["logout"]
+            },
+            note: None,
+        })
     }
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["Cursor Agent"]
@@ -190,8 +229,39 @@ pub(crate) fn install_cursor_hook() -> bool {
     spool::write_json_atomically(&path, &config)
 }
 
+/// `status --format json` exits 0 signed in or not.
+fn agent_status(stdout: &str) -> Connection {
+    let Ok(status) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return Connection::unknown("`cursor agent status` gave no JSON");
+    };
+    match status["isAuthenticated"].as_bool() {
+        Some(true) => Connection::Connected { via: None },
+        Some(false) => Connection::SignedOut,
+        None => Connection::unknown("`cursor agent status` gave no answer OMAR knows"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_status_reads_is_authenticated() {
+        use super::{agent_status, Connection};
+        assert_eq!(
+            agent_status(
+                r#"{"status":"unauthenticated","isAuthenticated":false,"message":"Not logged in"}"#
+            ),
+            Connection::SignedOut
+        );
+        assert_eq!(
+            agent_status(r#"{"isAuthenticated":true}"#),
+            Connection::Connected { via: None }
+        );
+        assert!(matches!(
+            agent_status("Not logged in"),
+            Connection::Unknown { .. }
+        ));
+    }
+
     use super::*;
 
     #[test]

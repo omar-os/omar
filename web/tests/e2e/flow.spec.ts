@@ -1463,13 +1463,17 @@ test("the composer says which assistant is answering, and can change it", async 
   await trigger.click();
   const menu = page.getByRole("menu");
   await expect(menu).toBeVisible();
+  // Each says how it is signed in, as its own CLI reports.
   await expect(menu.getByRole("menuitem")).toHaveText([
-    "Claude Code",
-    "Codex✓",
-    "Cursor",
+    "Claude CodeClaude Max",
+    "CodexChatGPT✓",
+    "Cursornot signed in · run omar connect cursor",
     "opencode",
-    "agy",
+    "agynot installed · run omar connect agy",
   ]);
+  // One that cannot sign in would only hang, so it cannot be chosen.
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();
+  await expect(menu.getByRole("menuitem", { name: /agy/ })).toBeDisabled();
 
   // It opens upward: it lives at the bottom of the composer.
   const menuBox = (await menu.boundingBox())!;
@@ -1477,7 +1481,7 @@ test("the composer says which assistant is answering, and can change it", async 
   expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(triggerBox.y + 1);
 
   // Choosing another restarts the assistant, so it asks first.
-  await menu.getByRole("menuitem", { name: "Claude Code" }).click();
+  await menu.getByRole("menuitem", { name: /Claude Code/ }).click();
   await expect(page.locator(".backend-confirm")).toContainText(
     "session is lost",
   );

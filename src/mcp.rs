@@ -15,7 +15,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::app::AgentInfo;
-use crate::backend_probe;
 use crate::computer;
 use crate::ea::{self, EaId};
 use crate::manager::{self, McpLaunchContext};
@@ -349,14 +348,6 @@ fn clean_human_output(output: &str) -> String {
     let output = ansi_re.replace_all(output, "");
     let output = escaped_ansi_re.replace_all(&output, "");
     control_re.replace_all(&output, "").to_string()
-}
-
-fn backend_available_from_command(command: &str, fallback_executable: &str) -> bool {
-    let executable = command
-        .split_whitespace()
-        .next()
-        .unwrap_or(fallback_executable);
-    backend_probe::backend_version_probe_succeeds(executable)
 }
 
 #[cfg(test)]
@@ -934,18 +925,14 @@ impl OmarMcpServer {
     }
 
     fn list_backends(&self) -> Result<Value> {
-        let infos: Vec<Value> = crate::backend::ASSISTANT
-            .iter()
-            .map(|kind| crate::backend::of(*kind))
-            .map(|backend| {
-                let name = backend.kind().name();
-                let command = backend.default_command().to_string();
-                let available = backend_available_from_command(&command, name);
-                json!({
-                    "name": name,
-                    "available": available,
-                    "command": command,
-                })
+        use crate::backend::{connection, Connection};
+        let infos: Vec<Value> = connection::assistants()
+            .into_iter()
+            .map(|(backend, status)| {
+                let mut info = connection::describe(backend, &status);
+                info["available"] = (status != Connection::NotInstalled).into();
+                info["command"] = backend.default_command().into();
+                info
             })
             .collect();
         Ok(json!({ "backends": infos }))
@@ -2261,7 +2248,7 @@ fn tool_definitions() -> Vec<Value> {
         tool("resume_task", "Resume a blocked child after resolving its blocker. The runtime wakes the child with its task state.", json!({"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"]})),
         tool(
             "list_backends",
-            "List installed OMAR agent backends and their commands. Use before choosing a backend/model override when availability is unclear. Read-only and safe to retry.",
+            "List OMAR agent backends: whether each is installed and signed in (status, via, login command), and its command. Use before choosing a backend/model override; a signed_out or not_installed backend needs the user to run its login command first. Read-only and safe to retry.",
             json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(
@@ -3227,6 +3214,8 @@ mod tests {
 
         assert_eq!(agy["command"], "agy --dangerously-skip-permissions");
         assert!(agy["available"].is_boolean());
+        assert!(agy["status"].is_string());
+        assert!(agy["login"].is_string());
     }
 
     #[test]
@@ -3580,30 +3569,6 @@ mod tests {
         assert!(path.exists());
         drop(lock);
         assert!(!path.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn list_backends_probe_treats_hanging_command_as_unavailable() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use std::time::Instant;
-
-        let temp = tempfile::tempdir().unwrap();
-        let slow = temp.path().join("slow-backend");
-        fs::write(&slow, "#!/bin/sh\nsleep 5\n").unwrap();
-        let mut perms = fs::metadata(&slow).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&slow, perms).unwrap();
-
-        let start = Instant::now();
-        let available = backend_available_from_command(slow.to_str().unwrap(), "slow-backend");
-
-        assert!(!available);
-        assert!(
-            start.elapsed() < Duration::from_secs(3),
-            "list_backends should not block indefinitely on backend --version"
-        );
     }
 
     #[test]

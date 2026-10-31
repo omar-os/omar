@@ -233,6 +233,19 @@ enum Commands {
     /// Configure tmux for optimal omar experience
     SetupTmux,
 
+    /// Show which agent backends are installed and signed in
+    Backends {
+        /// Print JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Install an agent backend and sign it in
+    Connect {
+        /// claude, codex, cursor, opencode, pi or agy; omit to pick from a list
+        backend: Option<String>,
+    },
+
     /// Restore authoritative coordination state to a backend lifecycle hook.
     AgentHook {
         #[arg(long)]
@@ -451,8 +464,19 @@ fn open_browser(url: &str) {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::from_arg_matches(&Cli::command().help_template(help_template()).get_matches())
-        .unwrap_or_else(|error| error.exit());
+    // Before any thread starts: installers' directories join PATH.
+    crate::backend::connect::extend_path();
+    // Only help shows backend status, and only then is it worth asking.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let help = args.is_empty()
+        || matches!(args.as_slice(), [arg] if arg == "-h" || arg == "--help" || arg == "help");
+    let backends = help.then(backends_help);
+    let cli = Cli::from_arg_matches(
+        &Cli::command()
+            .help_template(help_template(backends.as_deref()))
+            .get_matches(),
+    )
+    .unwrap_or_else(|error| error.exit());
     sessions::prepare_process(&cli)?;
     // Install the persisted-panic hook FIRST, before tokio builds its
     // runtime (and spawns worker threads). If the tmux parent dies it
@@ -609,6 +633,30 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             status_deployment(&omar_dir, target.id, &deployment)
         }
         Some(Commands::SetupTmux) => setup_tmux(),
+        Some(Commands::Backends { json }) => {
+            print!("{}", backends_report(json));
+            Ok(())
+        }
+        Some(Commands::Connect { backend: None }) => {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                crate::backend::connect::wizard()
+            } else {
+                print!("{}", backends_report(false));
+                Ok(())
+            }
+        }
+        Some(Commands::Connect {
+            backend: Some(name),
+        }) => {
+            let backend = crate::backend::resolve(&name).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                crate::backend::ASSISTANT.contains(&backend.kind()),
+                "{} is not an agent backend to connect",
+                backend.kind().name()
+            );
+            crate::backend::connect::host(backend)
+        }
         Some(Commands::Ea {
             action: sessions::EaAction::Event { action },
         }) => {
@@ -718,6 +766,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
 /// `omar --help` lists commands by what they are for. The last section is
 /// what OMAR launches inside agent panes and hooks; a person never types it.
 const HELP_SECTIONS: &[(&str, &[&str])] = &[
+    ("Backends", &["connect", "backends"]),
     (
         "Sessions",
         &["up", "ls", "info", "attach", "logs", "down", "rm", "serve"],
@@ -748,7 +797,24 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
     ),
 ];
 
-fn help_template() -> String {
+/// Each backend's status, under the Backends commands in help.
+fn backends_help() -> String {
+    use crate::backend::{connection, Connection};
+    let mut out = String::new();
+    for (backend, status) in connection::assistants() {
+        let name = backend.kind().name();
+        let next = match status {
+            Connection::Connected { .. } => String::new(),
+            _ => format!("omar connect {name}"),
+        };
+        let row = format!("    {name:<10}{:<26}{next}", connection::label(&status));
+        out += row.trim_end();
+        out.push('\n');
+    }
+    out
+}
+
+fn help_template(backends: Option<&str>) -> String {
     let command = Cli::command();
     let about: std::collections::BTreeMap<String, String> = command
         .get_subcommands()
@@ -783,6 +849,11 @@ fn help_template() -> String {
     let mut listed = std::collections::BTreeSet::new();
     for (title, names) in HELP_SECTIONS {
         section(title, names, &about, width, &mut listed, &mut sections);
+        if let (&"Backends", Some(backends)) = (title, backends) {
+            sections.pop();
+            sections.push_str(backends);
+            sections.push('\n');
+        }
     }
     let rest: Vec<&str> = about
         .keys()
@@ -1421,6 +1492,31 @@ fn sync_tmux_setup_warning(app: &mut app::App) {
 }
 
 /// Interactive tmux configuration setup.
+/// Every assistant backend's sign-in, as a table or as JSON.
+fn backends_report(json: bool) -> String {
+    use crate::backend::{connection, Connection};
+    let statuses = connection::assistants();
+    if json {
+        let rows: Vec<_> = statuses
+            .iter()
+            .map(|(backend, status)| connection::describe(*backend, status))
+            .collect();
+        return format!("{}\n", serde_json::Value::Array(rows));
+    }
+    let mut out = format!("{:<10}{:<28}NEXT\n", "BACKEND", "STATUS");
+    for (backend, status) in &statuses {
+        let name = backend.kind().name();
+        let next = match status {
+            Connection::Connected { .. } => String::new(),
+            _ => format!("omar connect {name}"),
+        };
+        let row = format!("{name:<10}{:<28}{next}", connection::label(status));
+        out += row.trim_end();
+        out.push('\n');
+    }
+    out
+}
+
 fn setup_tmux() -> Result<()> {
     use std::io::Write;
 
