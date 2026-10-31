@@ -69,6 +69,13 @@ export async function startFakeServe({
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, { status: "ok", protocol_version: 1, access: "full" });
     }
+    // Serve relays each run's diagram server, which only its own host can reach.
+    const relay = /^\/v1\/runs\/([^/]+)\/diagram(\/v1\/(?:diagram|events))$/.exec(url.pathname);
+    if (request.method === "GET" && relay) {
+      const entry = runs.get(decodeURIComponent(relay[1]));
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return relay[2] === "/v1/diagram" ? json(response, 200, entry.snapshot) : subscribe(response, entry);
+    }
     if (request.method === "POST" && url.pathname === "/v1/programs/check") {
       return readBody(request).then((body) => checkProgram(body, response));
     }
@@ -421,12 +428,6 @@ export async function startFakeServe({
     const refused = (request.method !== "GET" && request.method !== "OPTIONS") ||
       path.startsWith("/v1/workspaces") || /^\/v1\/runs\/[^/]+\/panel$/.test(path);
     if (refused) return json(response, 403, { error: "read-only view" });
-    const relay = /^\/v1\/runs\/([^/]+)\/diagram(\/v1\/(?:diagram|events))$/.exec(path);
-    if (relay) {
-      const entry = runs.get(decodeURIComponent(relay[1]));
-      if (!entry) return json(response, 404, { error: "unknown run" });
-      return relay[2] === "/v1/diagram" ? json(response, 200, entry.snapshot) : subscribe(response, entry);
-    }
     return handle(request, response);
   });
   /** Frames a client sent up a view port's terminal, which it should not. */

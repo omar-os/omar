@@ -35,8 +35,7 @@ test("health without an access field is full access", async () => {
   assert.deepEqual(await healthWith({ status: "ok", protocol_version: 1, access: "view" }), { ok: true, access: "view" });
 });
 
-test("a run's diagram is on loopback, or relayed by a view port", () => {
-  assert.equal(diagramUrlFor(record), "http://127.0.0.1:4100");
+test("a run's diagram is reached through serve's relay", () => {
   assert.equal(
     diagramUrlFor(record, "http://viewer.example:8080/chats/abc/"),
     "http://viewer.example:8080/chats/abc/v1/runs/run%2F1/diagram",
