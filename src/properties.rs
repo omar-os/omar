@@ -77,6 +77,38 @@ pub fn lean_library() -> std::path::PathBuf {
         .join("../lib/lean")
 }
 
+/// Pin the library beside a pinned compiler, the way the compiler itself is
+/// pinned: `<session>/bin/omarc` looks in `<session>/lib/lean`, and a session
+/// keeps checking against the semantics it started with whatever is rebuilt
+/// later. Only `Omar`'s modules are copied; Lean's own come with Lean.
+pub fn pin_library(compiler: &Path, pinned: &Path) -> Result<()> {
+    let source = compiler
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("../lib/lean/Omar");
+    let Ok(entries) = fs::read_dir(&source) else {
+        // A compiler built without the library checks no properties, and says
+        // so when asked to; it still compiles programs.
+        return Ok(());
+    };
+    let dest = pinned
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("../lib/lean/Omar");
+    let _ = fs::remove_dir_all(&dest);
+    fs::create_dir_all(&dest)?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("olean" | "ilean")
+        ) {
+            fs::copy(&path, dest.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
 /// The toolchain the library was built with, which a Lean editor must use.
 pub const LEAN_TOOLCHAIN: &str = include_str!("../lang/lean-toolchain");
 
@@ -149,6 +181,43 @@ pub fn prove(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pinned compiler finds the library where it looks, `bin/../lib/lean`,
+    /// as it was when pinned.
+    #[test]
+    fn the_library_is_pinned_beside_the_pinned_compiler() {
+        let build = tempfile::tempdir().unwrap();
+        fs::create_dir_all(build.path().join("bin")).unwrap();
+        fs::create_dir_all(build.path().join("lib/lean/Omar")).unwrap();
+        fs::write(build.path().join("bin/omarc"), "").unwrap();
+        fs::write(
+            build.path().join("lib/lean/Omar/Reactor.olean"),
+            "semantics",
+        )
+        .unwrap();
+        fs::write(
+            build.path().join("lib/lean/Omar/Reactor.trace"),
+            "build noise",
+        )
+        .unwrap();
+        let session = tempfile::tempdir().unwrap();
+        fs::create_dir_all(session.path().join("bin")).unwrap();
+        let pinned = session.path().join("bin/omarc");
+        pin_library(&build.path().join("bin/omarc"), &pinned).unwrap();
+        let library = session.path().join("lib/lean/Omar");
+        assert_eq!(
+            fs::read_to_string(library.join("Reactor.olean")).unwrap(),
+            "semantics"
+        );
+        assert!(!library.join("Reactor.trace").exists());
+        // Rebuilt and re-pinned, the session takes the new library whole.
+        fs::write(build.path().join("lib/lean/Omar/Reactor.olean"), "revised").unwrap();
+        pin_library(&build.path().join("bin/omarc"), &pinned).unwrap();
+        assert_eq!(
+            fs::read_to_string(library.join("Reactor.olean")).unwrap(),
+            "revised"
+        );
+    }
 
     /// The trading desk's properties are proved by the real compiler, and a
     /// proof that only assumes its conclusion is not.

@@ -704,6 +704,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
     };
     if let Ok(compiler) = executable_on_path(compiler) {
         pin_executable(&compiler, &directory.join("bin/omarc"))?;
+        crate::properties::pin_library(&compiler, &directory.join("bin/omarc"))?;
     }
     let config_path = cli
         .config
@@ -897,6 +898,7 @@ fn relaunch(
     };
     if let Some(compiler) = compiler {
         repin_executable(compiler, &directory.join("bin/omarc"))?;
+        crate::properties::pin_library(compiler, &directory.join("bin/omarc"))?;
     }
     let version = Command::new(directory.join("bin/omar"))
         .arg("--version")
