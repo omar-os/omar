@@ -12,7 +12,6 @@ use super::{connection, sbx, Backend, Connection, Kind};
 /// Connect `backend` on this machine.
 pub fn host(backend: &dyn Backend) -> Result<()> {
     let name = backend.kind().name();
-    let program = program(backend);
     let original = std::env::var_os("PATH").unwrap_or_default();
     // Installers drop binaries here, often before the shell's PATH has them.
     std::env::set_var("PATH", with_install_dirs(&original));
@@ -23,9 +22,12 @@ pub fn host(backend: &dyn Backend) -> Result<()> {
         status = connection::connection(backend);
         ensure!(
             status != Connection::NotInstalled,
-            "{name} installed, but `{program}` still does not run; open a new shell and run `omar connect {name}` again"
+            "{name} installed, but `{}` still does not run; open a new shell and run `omar connect {name}` again",
+            program(backend)
         );
     }
+    // Resolved after installing: an installer can change which one runs.
+    let program = program(backend);
     if !matches!(status, Connection::Connected { .. }) {
         let login = backend
             .login(headless())
@@ -126,9 +128,6 @@ fn install(backend: &dyn Backend) -> Result<()> {
         .status()
         .context("starting sh")?;
     ensure!(status.success(), "installing {name} failed");
-    if backend.kind() == Kind::Cursor {
-        super::cursor::link_cursor_command()?;
-    }
     Ok(())
 }
 
