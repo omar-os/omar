@@ -2799,3 +2799,204 @@ h2 {
 .artifact-tabs [role="tab"]:hover { color: var(--text, #eee); }
 .artifact-tabs [role="tab"]:focus-visible { outline: 2px solid var(--accent, #8b5cf6); outline-offset: 3px; }
 .workflow-editor-controls { align-items: center; }
+
+/* A formal property's components, singled out on the diagram; everything it
+   is not about steps back. */
+.in-focus .omar-port,
+.in-focus .omar-action,
+.in-focus .omar-reaction-body {
+  stroke: #3fb950;
+  stroke-width: 1.8;
+}
+
+.omar-team.in-focus .omar-team-body {
+  stroke: #3fb950;
+}
+
+.off-focus {
+  opacity: 0.22;
+}
+
+.properties {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 10px;
+}
+
+.properties-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+
+.properties-header span {
+  color: var(--text-3);
+  font-size: 0.8125rem;
+}
+
+.properties-header span.all-proved {
+  color: #3fb950;
+}
+
+.properties-guidance {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.properties-stale {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #b08800;
+  border-radius: 8px;
+  background: rgba(187, 128, 9, 0.12);
+  font-size: 0.8125rem;
+}
+
+.properties-editor {
+  justify-self: start;
+}
+
+.properties-error {
+  margin: 0;
+  color: var(--danger, #e5484d);
+  font-size: 0.8125rem;
+}
+
+.property-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+
+.property {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.property.selected {
+  border-color: #3fb950;
+}
+
+.property.unproved.selected {
+  border-color: var(--danger, #e5484d);
+}
+
+.property-summary {
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 10px;
+  padding: 10px 12px;
+  border: 0;
+  background: none;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.property-status {
+  grid-row: span 2;
+  align-self: start;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.proved .property-status {
+  color: #3fb950;
+  background: rgba(46, 160, 67, 0.15);
+}
+
+.unproved .property-status {
+  color: #f85149;
+  background: rgba(248, 81, 73, 0.15);
+}
+
+.property-description {
+  font-size: 0.875rem;
+  line-height: 1.4;
+}
+
+.property-name {
+  color: var(--text-3);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.property-detail {
+  padding: 0 12px 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+
+.property-mentions {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.lean-code {
+  margin: 0;
+  padding: 10px 0;
+  overflow-x: auto;
+  border-radius: 6px;
+  background: var(--pre-bg);
+  font: 0.75rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--code-text);
+}
+
+.lean-line {
+  display: block;
+  padding-right: 12px;
+  white-space: pre;
+}
+
+.lean-line.has-problem {
+  background: rgba(248, 81, 73, 0.14);
+}
+
+.lean-line-number {
+  display: inline-block;
+  width: 2.6em;
+  padding-right: 0.9em;
+  text-align: right;
+  color: var(--text-3);
+  opacity: 0.6;
+  user-select: none;
+}
+
+.property-problems {
+  margin: 0;
+  padding-left: 18px;
+  color: #f85149;
+  font: 0.75rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+}
+
+.tab-count {
+  margin-left: 4px;
+  color: var(--text-3);
+  font-size: 0.6875rem;
+}

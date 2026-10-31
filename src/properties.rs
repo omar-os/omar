@@ -47,6 +47,12 @@ pub struct PropertyVerdict {
     #[serde(default)]
     pub description: String,
     pub proved: bool,
+    /// The statement and proof as written, so the property can be checked
+    /// again against an edited program.
+    #[serde(default)]
+    pub statement: String,
+    #[serde(default)]
+    pub proof: String,
     /// The theorem as it was checked.
     pub theorem: String,
     /// The whole Lean file: the model, the shared lemmas and the theorem.
@@ -57,6 +63,22 @@ pub struct PropertyVerdict {
     #[serde(default)]
     pub problems: Vec<ProofProblem>,
 }
+
+/// Where the Lean library a property file imports lives: `OMAR_LEAN_PATH`,
+/// or beside `omarc` in Lake's layout, as `omarc --prove` looks for it.
+pub fn lean_library() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("OMAR_LEAN_PATH") {
+        return path.into();
+    }
+    let compiler = crate::topology::resolve_omarc();
+    compiler
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("../lib/lean")
+}
+
+/// The toolchain the library was built with, which a Lean editor must use.
+pub const LEAN_TOOLCHAIN: &str = include_str!("../lang/lean-toolchain");
 
 /// Check `properties` of the program at `program`, which is staged with the
 /// files it imports. `lemmas` are Lean declarations every property may use.
@@ -114,10 +136,12 @@ pub fn prove(
     let _ = fs::remove_file(&request);
     let _ = fs::remove_file(&verdicts);
     let _ = fs::remove_dir_all(directory.join(".verdicts.json.d"));
-    // omarc answers in the order it was asked; the description is the
-    // operator's, carried across rather than sent through Lean.
+    // omarc answers in the order it was asked; what Lean has no use for is
+    // carried across rather than sent through it.
     for (verdict, property) in checked.iter_mut().zip(properties) {
         verdict.description = property.description.clone();
+        verdict.statement = property.statement.clone();
+        verdict.proof = property.proof.clone();
     }
     Ok(checked)
 }

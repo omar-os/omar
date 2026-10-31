@@ -1212,6 +1212,58 @@ fn workspace_request(
         }
         return Ok(json!({"workspace": ws}));
     }
+    // A program's proved properties as Lean files, to open in the editor and
+    // work on interactively. Only Lean's own files go in; nothing here runs.
+    if method == "POST" && path == "/v1/workspaces/properties" {
+        #[derive(Deserialize)]
+        struct ProofFile {
+            name: String,
+            source: String,
+        }
+        #[derive(Deserialize)]
+        struct ProofWorkspace {
+            properties: Vec<ProofFile>,
+        }
+        let request: ProofWorkspace = serde_json::from_slice(body)?;
+        anyhow::ensure!(!request.properties.is_empty(), "no properties to open");
+        for file in &request.properties {
+            anyhow::ensure!(
+                !file.name.is_empty()
+                    && file
+                        .name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "'{}' is not a property name",
+                file.name
+            );
+        }
+        let key = format!("properties:{}", crate::checkpoint::sha256(body));
+        if let Some(ws) = crate::workspace::list(root, context.ea_id)?
+            .into_iter()
+            .find(|ws| ws.deployment_id == key)
+        {
+            return Ok(json!({"workspace": ws}));
+        }
+        let ws =
+            crate::workspace::Workspace::create(root, context.ea_id, &key, "Properties", None)?;
+        let result = (|| -> Result<()> {
+            let tree = ws.worktree(root);
+            fs::write(
+                tree.join("lean-toolchain"),
+                crate::properties::LEAN_TOOLCHAIN,
+            )?;
+            for file in &request.properties {
+                fs::write(tree.join(format!("{}.lean", file.name)), &file.source)?;
+            }
+            ws.snapshot(root, "Properties as proved")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = ws.remove(root);
+            return Err(error);
+        }
+        return Ok(json!({"workspace": ws}));
+    }
     let rest = path
         .strip_prefix("/v1/workspaces/")
         .context("unknown workspace route")?;

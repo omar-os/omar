@@ -122,6 +122,11 @@ line: number, column: number, message: string, };
 
 export type PropertyVerdict = { name: string, description: string, proved: boolean,
 /**
+ * The statement and proof as written, so the property can be checked
+ * again against an edited program.
+ */
+statement: string, proof: string,
+/**
  * The theorem as it was checked.
  */
 theorem: string,

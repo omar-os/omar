@@ -29,6 +29,8 @@ export type {
   DiagramTimer,
   EdgeKind,
   PortKind,
+  PropertyVerdict,
+  ProofProblem,
   ProposedDesign,
   ReactionStatus,
   RunRecord,

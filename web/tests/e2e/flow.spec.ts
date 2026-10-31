@@ -2867,3 +2867,71 @@ test("workflow tabs support keyboard navigation and saved VS Code edits reach de
   await deploy(page);
   expect((await deployment).postDataJSON().files).toEqual(savedFiles);
 });
+
+test("a design's safety properties show their Lean proofs and single out what they are about", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByLabel("Describe a workflow").fill("Review the release plan, and prove it is safe");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.locator(".messages")).toContainText("Which agent should own");
+  await page.getByLabel("Describe a workflow").fill("The planner");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
+
+  // Lean's verdicts arrive with the design: two proved, one not.
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+  const tab = page.getByRole("tab", { name: /Properties/ });
+  await expect(tab).toContainText("2/3");
+  await tab.click();
+  const panel = page.getByRole("tabpanel", { name: "Formal properties" });
+  await expect(panel).toContainText("2 of 3 proved by Lean");
+  const items = panel.locator(".property");
+  await expect(items).toHaveCount(3);
+  await expect(items.nth(0).locator(".property-status")).toHaveText("Proved");
+  await expect(items.nth(2).locator(".property-status")).toHaveText("Not proved");
+
+  // Nothing is singled out until a property is chosen.
+  await expect(page.locator(".off-focus")).toHaveCount(0);
+  await items.nth(0).locator(".property-summary").click();
+  const proof = items.nth(0).getByLabel("Lean proof");
+  await expect(proof).toContainText("theorem critique_comes_from_reviewer");
+  await expect(proof.locator(".omar-tok-keyword").first()).toHaveText("theorem");
+  await expect(proof.locator(".omar-tok-string").first()).toHaveText('"flow.critique"');
+  // It is about the critique and the reviewer that writes it; the planner's
+  // two reactions and the other ports step back.
+  await expect(page.locator(".omar-reaction.in-focus")).toHaveCount(1);
+  await expect(page.locator(".omar-reaction.off-focus")).toHaveCount(2);
+  await expect(page.locator(".omar-action-group.in-focus")).toHaveCount(1);
+  await expect(page.locator(".omar-team.in-focus")).toHaveCount(1);
+
+  // One that does not hold says where Lean stopped.
+  await items.nth(2).locator(".property-summary").click();
+  await expect(items.nth(2).getByLabel("What Lean objected to")).toContainText("unsolved goals");
+  await expect(items.nth(2).locator(".lean-line.has-problem").first()).toBeVisible();
+  await items.nth(2).locator(".property-summary").click();
+  await expect(page.locator(".off-focus")).toHaveCount(0);
+
+  // An edited program is not what Lean checked; checking again is one click.
+  await page.getByRole("tab", { name: "Source" }).click();
+  const editor = page.getByLabel("OMAR program");
+  await editor.locator(".cm-line", { hasText: "Find risks and omissions" }).click();
+  await editor.press("End");
+  await editor.pressSequentially(" Note any gaps.");
+  await tab.click();
+  await expect(panel.getByRole("status")).toContainText("The source has changed");
+  await panel.getByRole("button", { name: "Check again" }).click();
+  await expect(panel.getByRole("status")).toHaveCount(0);
+  const asked = await (await fetch(`${FAKE_SERVE_URL}/v1/proofs`)).json();
+  expect(asked.checks).toBe(1);
+
+  // The proofs open in Web VS Code, one Lean file a property.
+  const popup = page.waitForEvent("popup");
+  await panel.getByRole("button", { name: "Open in Web VS Code" }).click();
+  const opened = await popup;
+  await expect(opened).toHaveURL(/\/fake-editor\/proofs$/);
+  const workspace = (await (await fetch(`${FAKE_SERVE_URL}/v1/proofs`)).json()).workspace;
+  expect(workspace.properties.map((file: { name: string }) => file.name)).toEqual([
+    "critique_comes_from_reviewer", "answer_only_after_critique", "plan_always_reviewed",
+  ]);
+  expect(workspace.properties[0].source).toContain("def topology : Omar.Reactor.Topology");
+  await opened.close();
+});
