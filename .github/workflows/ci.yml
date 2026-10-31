@@ -795,6 +795,8 @@ jobs:
           make install INSTALL_DIR="$RUNNER_TEMP/bin"
           test -x "$RUNNER_TEMP/bin/omar"
           test -x "$RUNNER_TEMP/bin/omarc"
+          # What omarc --prove's property files import, where it looks.
+          test -f "$RUNNER_TEMP/lib/lean/Omar/Reactor.olean"
 
       # The reason to install omarc at all: the runtime finds it as a sibling.
       # The source tree's compiler has to go out of reach first, or the
@@ -814,12 +816,13 @@ jobs:
         run: |
           make uninstall INSTALL_DIR="$RUNNER_TEMP/bin"
           test ! -e "$RUNNER_TEMP/bin/omarc"
+          test ! -e "$RUNNER_TEMP/lib/lean/Omar"
 
       # web.yml smoke-tests dev.sh by calling it directly, which cannot see the
       # Makefile. This is the half that would drift: deploying from Mission
       # Control compiles a program, so the compiler precedes the daemon.
       - name: make dev builds the compiler first
-        run: make -n dev | grep -Fq 'lake build omarc'
+        run: make -n dev | grep -Fxq 'cd lang && lake build'
 
       # elan is a hard dependency of a source build. Failing without it is
       # intended; failing as `lake: command not found` is not.
