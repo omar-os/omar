@@ -24,7 +24,7 @@ const bytecode = {version:1, team:'Artifacts', instructions:[
 await writeFile(compiler, `#!${process.execPath}\nrequire('fs').writeFileSync(process.argv.at(-1), ${JSON.stringify(JSON.stringify(bytecode))});\n`, {mode:0o700});
 const program = join(root,'artifacts.omar'); await writeFile(program,'// Compiler fixture\n');
 const env = {...process.env,HOME:home,OMARC_BIN:compiler,CARGO_HOME:process.env.CARGO_HOME||join(homedir(),'.cargo'),RUSTUP_HOME:process.env.RUSTUP_HOME||join(homedir(),'.rustup')};
-const runtime = spawn(binary,['serve','--name','editor-smoke','--address','127.0.0.1:0','--no-ea'],{cwd:source,env});
+const runtime = spawn(binary,['serve','-s','editor-smoke','--port','0','--no-ea'],{cwd:source,env});
 let logs='',base;
 runtime.stdout.on('data',c=>{logs+=c;base=/URL:\s+(http:\/\/[^\s]+)/.exec(logs)?.[1];});
 runtime.stderr.on('data',c=>{logs+=c;});

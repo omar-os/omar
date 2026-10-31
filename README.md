@@ -84,7 +84,7 @@ cd omar && make install
 #### Step 1: Launch Mission Control
 
 ```bash
-$ omar up --name dev
+$ omar up -s dev
 $ omar attach -s dev --web
 ```
 
@@ -110,7 +110,9 @@ This example requires both Claude Code and Codex to be installed and configured.
 
 | Command | What it does |
 |---------|--------------|
-| `omar up --name dev` | Start a background session, or restart the stopped session named `dev`. |
+| `omar up -s dev` | Start a background session, or restart the stopped session named `dev`. |
+| `omar up --port 34223` | Pick the session's port. Always on 127.0.0.1; reach it remotely through an SSH tunnel. Kept across restarts. |
+| `omar up --view-address 0.0.0.0:8080` | Also serve a read-only Mission Control: conversations, live diagram, terminals; no writes, no credential. IP picks who can watch: `127.0.0.1` this machine, one of its IPs (e.g. `10.0.1.5`) whoever reaches that IP, `0.0.0.0` every interface. |
 | `omar attach -s dev --web` | Open Mission Control for that session. Use `--tui` for the terminal UI. |
 | `omar down -s dev` | Stop the session and keep its state. |
 | `omar rm -s dev` | Remove the session and its state, stopping it first if running. |
@@ -162,7 +164,7 @@ Shutdown the test project and its agents.
 | [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy up` |
 | [Pi](https://pi.dev) | `omar -a pi up` |
 
-Each `omar -a <backend> up` starts a new independent session. Add `--name dev`
+Each `omar -a <backend> up` starts a new independent session. Add `-s dev`
 to name it, and `--web` or `--tui` to open a client immediately.
 
 No need to install them yourself: `omar connect <backend>` runs the vendor's

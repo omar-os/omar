@@ -107,6 +107,15 @@ impl Backend for Claude {
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["Claude Code", "❯"]
     }
+    /// A resumed conversation repaints its history and no banner, so a live
+    /// peer socket counts too. Claude opens it only once the workspace trust
+    /// dialog is answered.
+    fn startup_finished(&self, screen: &str, pane_pid: u32) -> bool {
+        self.readiness_markers()
+            .iter()
+            .all(|marker| screen.contains(marker))
+            || resolve_peer(pane_pid).is_some()
+    }
     fn launch_command(&self, launch: &Launch<'_>) -> String {
         let base_command = with_coordination_hooks(launch.base_command, launch.context);
         match materialize_claude_mcp_config(launch.context) {
