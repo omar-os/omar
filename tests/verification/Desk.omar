@@ -1,0 +1,23 @@
+team Analyst[agent : Claude] {
+    input brief : string
+    output proposal : string
+    task agent(brief) -> proposal "Propose a trade for $(brief)."
+}
+team Risk[agent : Claude] {
+    input proposal : string
+    output approved : string
+    output rejected : string
+    task agent(proposal) -> (approved | rejected) "Approve or reject $(proposal)."
+}
+team Executor[agent : Codex] {
+    input order : string
+    output receipt : string
+    task agent(order) -> receipt "Execute $(order)."
+}
+main Desk {
+    a = Analyst()
+    r = Risk()
+    x = Executor()
+    a.proposal -> r.proposal
+    r.approved -> x.order
+}

@@ -46,7 +46,7 @@ jobs:
           lake-package-directory: lang
           auto-config: false
           build: true
-          build-args: omarc
+          build-args: Omar omarc
           test: false
 
       - name: Install tmux (Linux)
@@ -82,10 +82,13 @@ jobs:
 
       - name: Package
         run: |
-          mkdir omar-${{ matrix.suffix }}
+          mkdir -p omar-${{ matrix.suffix }}/lib/lean/Omar
           cp target/${{ matrix.target }}/release/omar \
              lang/.lake/build/bin/omarc \
              omar-${{ matrix.suffix }}/
+          # What omarc --prove's property files import: bin/../lib/lean.
+          cp lang/.lake/build/lib/lean/Omar/*.olean lang/.lake/build/lib/lean/Omar/*.ilean \
+             omar-${{ matrix.suffix }}/lib/lean/Omar/
           tar czf omar-${{ matrix.suffix }}.tar.gz omar-${{ matrix.suffix }}/
 
       - name: Upload artifact

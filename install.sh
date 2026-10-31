@@ -61,6 +61,12 @@ $SUDO install "$TMP/omar" "$INSTALL_DIR/"
 if [ -f "$TMP/omarc" ]; then
   $SUDO install "$TMP/omarc" "$INSTALL_DIR/"
 fi
+# The semantics the compiler checks properties against, where it looks for
+# them: beside its directory, in lib/lean.
+if [ -d "$TMP/lib/lean/Omar" ]; then
+  $SUDO mkdir -p "$INSTALL_DIR/../lib/lean/Omar"
+  $SUDO cp "$TMP/lib/lean/Omar/"* "$INSTALL_DIR/../lib/lean/Omar/"
+fi
 
 echo ""
 echo "Done! Installed:"

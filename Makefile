@@ -25,9 +25,10 @@ check-elan:
 	}
 
 # The OMAR compiler. Lean-built, so cargo cannot produce it; `omar run` shells
-# out to it for every `.omar` program. Needs elan; see lang/README.md.
+# out to it for every `.omar` program. Needs elan; see lang/README.md. Built
+# with its library, which the property files it checks import.
 omarc: check-elan
-	cd lang && lake build omarc
+	cd lang && lake build
 
 # Built with the UI in it, so an installed `omar serve --ui` has something to
 # serve. A plain `cargo build --release` still works and still needs no Node;
@@ -42,9 +43,13 @@ install: check-elan build omarc
 	install -d $(INSTALL_DIR)
 	install $(addprefix target/release/,$(BINARIES)) $(INSTALL_DIR)/
 	install $(OMARC) $(INSTALL_DIR)/
+	install -d $(INSTALL_DIR)/../lib/lean/Omar
+	install -m 644 lang/.lake/build/lib/lean/Omar/*.olean lang/.lake/build/lib/lean/Omar/*.ilean \
+	  $(INSTALL_DIR)/../lib/lean/Omar/
 
 uninstall:
 	rm -f $(addprefix $(INSTALL_DIR)/,$(BINARIES) omarc)
+	rm -rf $(INSTALL_DIR)/../lib/lean/Omar
 
 test-topology:
 	OMAR_TEST_CASE="$(CASE)" ./tests/topology/run_local.sh

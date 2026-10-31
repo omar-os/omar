@@ -7,6 +7,7 @@ import {
   type DiagramEvent,
   type DiagramSnapshot,
   type PendingInvocation,
+  type PropertyVerdict,
   SERVE_PROTOCOL_VERSION,
   type RunRecord,
   type RunRequest,
@@ -546,6 +547,50 @@ export async function fetchRunProgram(
     throw new Error(await readError(response));
   }
   return (await response.json()) as { filename: string; program: string };
+}
+
+/** Have Lean check properties again, against the program as it now reads. */
+export async function checkProperties(
+  serveUrl: string,
+  request: {
+    program: string;
+    files?: Record<string, string>;
+    lemmas?: string;
+    properties: { name: string; description: string; statement: string; proof: string }[];
+  },
+  signal?: AbortSignal,
+): Promise<PropertyVerdict[]> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/properties/check`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(request),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
+  return ((await response.json()) as { verdicts: PropertyVerdict[] }).verdicts;
+}
+
+/** Open properties' Lean files in Web VS Code, returning the editor's URL. */
+export async function openProofEditor(
+  serveUrl: string,
+  properties: { name: string; source: string }[],
+): Promise<string> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const post = async <T,>(path: string, body: object): Promise<T> => {
+    const response = await fetch(`${base}/v1/workspaces${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(await readError(response));
+    return (await response.json()) as T;
+  };
+  const { workspace } = await post<{ workspace: { id: string } }>("/properties", { properties });
+  const { url } = await post<{ url: string }>(`/${workspace.id}/editor`, {});
+  return url;
 }
 
 /**
