@@ -728,13 +728,15 @@ impl OmarMcpServer {
             match call.name.as_str() {
                 // Refused rather than merely unlisted, so an agent that learned
                 // the names elsewhere still cannot reach the operator.
-                "omar_reply" | "omar_propose_design" => match &self.context.serve {
-                    Some(serve) => serve_tool_call(serve, &call.name, call.arguments),
-                    None => Err(anyhow!(
-                        "Tool '{}' is only available to the executive assistant",
-                        call.name
-                    )),
-                },
+                "omar_reply" | "omar_propose_design" | "omar_check_properties" => {
+                    match &self.context.serve {
+                        Some(serve) => serve_tool_call(serve, &call.name, call.arguments),
+                        None => Err(anyhow!(
+                            "Tool '{}' is only available to the executive assistant",
+                            call.name
+                        )),
+                    }
+                }
                 "coordination_state" => crate::supervision::context_page(
                     &self.context.omar_dir,
                     self.ea_id(),
@@ -2585,19 +2587,65 @@ fn ea_tool_definitions() -> Vec<Value> {
                     "program":{"type":"string","description":"Complete .omar source (program.omar)"},
                     "files":{"type":"object","additionalProperties":{"type":"string"},"description":"Companion files keyed by relative path, e.g. schemas/decision.json. Include every imported schema."},
                     "summary":{"type":"string","description":"One or two sentences on what it does"},
-                    "inputs":{"type":"object","description":"Values for the program's declared input ports"}
+                    "inputs":{"type":"object","description":"Values for the program's declared input ports"},
+                    "lemmas":{"type":"string","description":"Lean declarations the properties share"},
+                    "properties":property_schema()
                 },
                 "required":["program","summary"],
+                "additionalProperties":false
+            }),
+        ),
+        tool(
+            "omar_check_properties",
+            "Have Lean check safety properties of an OMAR program without proposing it. Each property is a Lean theorem about every run `e` of the program's model, proved from the reactor semantics (Omar.Reactor). Returns one verdict per property: proved, or Lean's problems with lines counted from the theorem's first line, plus the model (`topology`) in `source`. Iterate until each is proved, then pass the same properties to omar_propose_design.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "program":{"type":"string","description":"Complete .omar source"},
+                    "files":{"type":"object","additionalProperties":{"type":"string"}},
+                    "lemmas":{"type":"string","description":"Lean declarations the properties share"},
+                    "properties":property_schema()
+                },
+                "required":["program","properties"],
                 "additionalProperties":false
             }),
         ),
     ]
 }
 
+/// A list of properties, as both property tools take them.
+fn property_schema() -> Value {
+    json!({
+        "type":"array",
+        "description":"Safety properties, each checked as `theorem NAME (e : Execution) (hv : Valid topology e) : STATEMENT := PROOF`.",
+        "items":{
+            "type":"object",
+            "properties":{
+                "name":{"type":"string","description":"A Lean identifier"},
+                "description":{"type":"string","description":"The guarantee in one plain sentence for the operator"},
+                "statement":{"type":"string","description":"The Lean proposition about the run `e`"},
+                "proof":{"type":"string","description":"The Lean proof, e.g. `by ...`"}
+            },
+            "required":["name","description","statement","proof"],
+            "additionalProperties":false
+        }
+    })
+}
+
 /// Minimal HTTP POST. `omar serve` is loopback-only and the payloads are tiny,
 /// so this avoids pulling in an HTTP client, matching how topology agents reach
 /// the invocation server over a raw socket.
 fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<()> {
+    post_json_within(endpoint, path, body, std::time::Duration::from_secs(5)).map(|_| ())
+}
+
+/// `post_json`, waiting up to `timeout` for the answer, which it returns.
+fn post_json_within(
+    endpoint: &str,
+    path: &str,
+    body: &Value,
+    timeout: std::time::Duration,
+) -> Result<Value> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
@@ -2605,7 +2653,7 @@ fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<()> {
     let payload = serde_json::to_vec(body)?;
     let mut stream = TcpStream::connect(endpoint)
         .with_context(|| format!("omar serve at '{endpoint}' is unavailable"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     write!(
         stream,
@@ -2618,9 +2666,7 @@ fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<()> {
     let mut reader = BufReader::new(&mut stream);
     let mut status = String::new();
     reader.read_line(&mut status)?;
-    if status.contains(" 200") || status.contains(" 201") || status.contains(" 202") {
-        return Ok(());
-    }
+    let accepted = status.contains(" 200") || status.contains(" 201") || status.contains(" 202");
 
     // The body is the whole point of a rejection. `omar serve` compiles a
     // proposed program before publishing it and answers with the compiler's
@@ -2637,6 +2683,9 @@ fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<()> {
     let mut payload = String::new();
     // `Connection: close`, so the body runs to the end of the stream.
     let _ = reader.read_to_string(&mut payload);
+    if accepted {
+        return Ok(serde_json::from_str(&payload).unwrap_or(Value::Null));
+    }
 
     let detail = serde_json::from_str::<Value>(&payload)
         .ok()
@@ -2662,6 +2711,7 @@ fn serve_tool_call(
     let path = match name {
         "omar_reply" => "/v1/agent/reply",
         "omar_propose_design" => "/v1/agent/proposals",
+        "omar_check_properties" => "/v1/agent/properties",
         other => bail!("unknown serve tool '{other}'"),
     };
     // Arguments come from a model, so the shape is not guaranteed. Indexing a
@@ -2673,8 +2723,23 @@ fn serve_tool_call(
         other => bail!("{name} expects an object of arguments, got {other}"),
     };
     body.insert("token".to_string(), json!(serve.token));
-    post_json(&serve.endpoint, path, &Value::Object(body))?;
-    Ok(json!({"status":"delivered"}))
+    if name == "omar_reply" {
+        post_json(&serve.endpoint, path, &Value::Object(body))?;
+        return Ok(json!({"status":"delivered"}));
+    }
+    // Lean checks properties before serve answers, which takes longer than a
+    // message does to deliver.
+    let answer = post_json_within(
+        &serve.endpoint,
+        path,
+        &Value::Object(body),
+        std::time::Duration::from_secs(330),
+    )?;
+    Ok(if name == "omar_check_properties" {
+        answer
+    } else {
+        json!({"status":"delivered"})
+    })
 }
 
 fn topology_tool_definitions() -> Vec<Value> {
@@ -2889,11 +2954,13 @@ mod tests {
         let ea = listed_tools(ea_context());
         assert!(ea.contains(&"omar_reply".to_string()));
         assert!(ea.contains(&"omar_propose_design".to_string()));
+        assert!(ea.contains(&"omar_check_properties".to_string()));
 
         // A plain spawned agent has no serve context, so it must not see them.
         let agent = listed_tools(test_context());
         assert!(!agent.contains(&"omar_reply".to_string()));
         assert!(!agent.contains(&"omar_propose_design".to_string()));
+        assert!(!agent.contains(&"omar_check_properties".to_string()));
 
         // Workflow agents are restricted to the port protocol.
         let workflow = listed_tools(McpLaunchContext {
@@ -2950,7 +3017,7 @@ mod tests {
             },
         ] {
             let server = OmarMcpServer::new(context);
-            for name in ["omar_reply", "omar_propose_design"] {
+            for name in ["omar_reply", "omar_propose_design", "omar_check_properties"] {
                 let result = server.call_tool(ToolCallRequest {
                     name: name.to_string(),
                     arguments: json!({"text": "hello", "program": "team T() {}", "summary": "s"}),
