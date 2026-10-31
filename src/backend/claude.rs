@@ -88,10 +88,6 @@ impl Backend for Claude {
             note: None,
         })
     }
-    /// A Claude subscription cannot be shared into a sandbox; an API key can.
-    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
-        Some(&["anthropic"])
-    }
     fn conversation_id(&self, target: &Target<'_>) -> Option<String> {
         let directory = claude_sessions_dir()?;
         std::iter::once(target.pane_pid)
@@ -485,11 +481,6 @@ pub(crate) fn child_pids(parent: u32) -> Vec<u32> {
 }
 
 /// `claude auth status` prints JSON, and exits 1 when signed out.
-/// `via`, as [`auth_status`] names it, is a Claude subscription plan.
-pub(crate) fn is_subscription(via: &str) -> bool {
-    via.starts_with("Claude ")
-}
-
 fn auth_status(stdout: &str) -> Connection {
     let Ok(status) = serde_json::from_str::<serde_json::Value>(stdout) else {
         return Connection::unknown("`claude auth status` needs a newer Claude Code");

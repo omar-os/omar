@@ -74,9 +74,6 @@ impl Backend for Codex {
             }
         })
     }
-    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
-        Some(&["openai"])
-    }
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         let socket = from_stamp(target.stamp?)?;
         CodexSession::open(&socket).ok()?.only_thread().ok()

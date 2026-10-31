@@ -1924,7 +1924,7 @@ fn backend_connections() -> Value {
     use crate::backend::connection;
     let backends: Vec<Value> = connection::assistants()
         .into_iter()
-        .map(|status| connection::describe(&status))
+        .map(|(backend, status)| connection::describe(backend, &status))
         .collect();
     json!({ "backends": backends })
 }

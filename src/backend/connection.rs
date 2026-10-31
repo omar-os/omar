@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use super::{sbx, Backend};
+use super::Backend;
 use crate::backend_probe;
 
 /// A status command may reach its vendor's servers; past this it is unknown.
@@ -27,8 +27,6 @@ pub enum Connection {
     Unknown {
         reason: String,
     },
-    /// Sandboxes only: this backend cannot run in one yet.
-    Unsupported,
 }
 
 impl Connection {
@@ -107,45 +105,42 @@ pub fn connection(backend: &dyn Backend) -> Connection {
     backend.connection(program)
 }
 
-/// One backend's sign-in on the host and, when sbx is installed, in a sandbox.
-pub struct Status {
-    pub backend: &'static dyn Backend,
-    pub host: Connection,
-    pub sandbox: Option<Connection>,
-}
-
 /// Every assistant backend, asked at once so the slowest bounds the wait.
-pub fn assistants() -> Vec<Status> {
+pub fn assistants() -> Vec<(&'static dyn Backend, Connection)> {
     std::thread::scope(|scope| {
-        let keys = scope.spawn(sbx::keys);
         let asks: Vec<_> = super::ASSISTANT
             .iter()
             .map(|kind| super::of(*kind))
             .map(|backend| (backend, scope.spawn(move || connection(backend))))
             .collect();
-        let keys = keys.join().ok().flatten();
         asks.into_iter()
-            .map(|(backend, ask)| Status {
-                backend,
-                host: ask
+            .map(|(backend, ask)| {
+                let connection = ask
                     .join()
-                    .unwrap_or_else(|_| Connection::unknown("status check panicked")),
-                sandbox: keys.as_ref().map(|keys| sbx::status(backend, Some(keys))),
+                    .unwrap_or_else(|_| Connection::unknown("status check panicked"));
+                (backend, connection)
             })
             .collect()
     })
 }
 
+/// How the CLI shows a connection.
+pub fn label(connection: &Connection) -> String {
+    match connection {
+        Connection::Connected { via: Some(via) } => format!("✓ {via}"),
+        Connection::Connected { via: None } => "✓ signed in".to_string(),
+        Connection::SignedOut => "not signed in".to_string(),
+        Connection::NotInstalled => "not installed".to_string(),
+        Connection::Unknown { reason } => format!("? {reason}"),
+    }
+}
+
 /// One backend as the CLI, MCP and Mission Control report it.
-pub fn describe(status: &Status) -> serde_json::Value {
-    let mut value = serde_json::to_value(&status.host).expect("a connection serializes");
-    let name = status.backend.kind().name();
+pub fn describe(backend: &dyn Backend, connection: &Connection) -> serde_json::Value {
+    let mut value = serde_json::to_value(connection).expect("a connection serializes");
+    let name = backend.kind().name();
     value["name"] = name.into();
     value["login"] = format!("omar connect {name}").into();
-    if let Some(sandbox) = &status.sandbox {
-        value["sandbox"] = serde_json::to_value(sandbox).expect("a connection serializes");
-        value["sandbox"]["login"] = format!("omar connect {name} --sandbox").into();
-    }
     value
 }
 

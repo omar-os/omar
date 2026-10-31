@@ -26,7 +26,6 @@ pub(crate) mod jev;
 pub(crate) mod managed;
 pub(crate) mod opencode;
 pub(crate) mod pi;
-pub(crate) mod sbx;
 pub(crate) mod spool;
 pub(crate) mod stub;
 
@@ -253,11 +252,6 @@ pub trait Backend: Send + Sync {
     /// How `omar connect` has the installed CLI sign itself in. `headless`:
     /// no browser can open here, so prefer a code the operator types elsewhere.
     fn login(&self, _headless: bool) -> Option<Login> {
-        None
-    }
-    /// The sbx services whose stored key this backend can use inside a
-    /// Docker Sandbox, preferred first. `None`: it cannot run sandboxed.
-    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
         None
     }
 

@@ -6,9 +6,12 @@ stand-ins, and HOME is disposable. Run after cargo build.
 """
 import json
 import os
+import pty
+import select
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -84,11 +87,10 @@ class BackendStatus(unittest.TestCase):
         self.assertIn("not signed in", rows["codex"])
         self.assertIn("omar connect codex", rows["codex"])
         self.assertIn("not installed", rows["cursor"])
-        self.assertNotIn("SANDBOX", self.omar().splitlines()[0])
 
 
 class Connect(unittest.TestCase):
-    """`omar connect` installs, signs in and gives sandboxes a key, offline."""
+    """`omar connect` installs and signs in, offline."""
 
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="omar-connect-")
@@ -150,30 +152,41 @@ mkdir -p {pi.parent} && cp {package} {pi}""")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("still not signed in", result.stderr)
 
-    def test_sandboxes_get_a_key_and_its_approval(self):
-        stored = self.root / "sbx-secrets"
-        self.stand_in("sbx", f"""
-if [ "$*" = "secret ls --global --json" ]; then
-  printf '{{"secrets":['; [ -f {stored} ] && printf '{{"name":"%s"}}' "$(cat {stored})"; printf ']}}'
-  exit 0
-fi
-[ "$*" = "secret set anthropic" ] && printf anthropic > {stored}""")
-        self.stand_in("claude", """[ "$1 $2" = "auth status" ] && echo '{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}'""")
-        claude = lambda: next(r for r in json.loads(self.omar("backends", "--json").stdout)
-            if r["name"] == "claude")
-        self.assertEqual(claude()["sandbox"], {"status": "signed_out",
-            "login": "omar connect claude --sandbox"})
-        out = self.omar("connect", "claude", "--sandbox").stdout
-        self.assertIn("✓ claude can run in sandboxes (anthropic)", out)
-        approvals = (self.root / "config/sbx/credentials.yaml").read_text()
-        self.assertIn("  anthropic:\n    apiKey:\n      domains: [api.anthropic.com]", approvals)
-        self.assertEqual(claude()["sandbox"]["status"], "connected")
-        self.assertEqual(claude()["via"], "Claude Max")
-        # The table grows a sandbox column once sbx is there.
-        self.assertIn("SANDBOX", self.omar("backends").stdout.splitlines()[0])
-        result = self.omar("connect", "jev", "--sandbox", ok=False)
-        self.assertNotEqual(result.returncode, 0)
+    def test_the_picker_connects_with_arrow_keys(self):
+        signed_in = self.root / "codex-signed-in"
+        self.stand_in("codex", f"""
+[ "$1 $2" = "login status" ] && {{ [ -f {signed_in} ] && echo 'Logged in using ChatGPT' >&2 && exit 0; echo 'Not logged in' >&2; exit 1; }}
+[ "$*" = "login --device-auth" ] && touch {signed_in}""")
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execve(str(OMAR), [str(OMAR), "connect"], {**self.env, "TERM": "xterm"})
+        screen = b""
+        def until(text, count=1):
+            nonlocal screen
+            deadline = time.monotonic() + 30
+            while screen.count(text.encode()) < count:
+                self.assertLess(time.monotonic(), deadline, screen.decode(errors="replace"))
+                if select.select([fd], [], [], 1)[0]:
+                    try:
+                        screen += os.read(fd, 4096)
+                    except OSError:
+                        break
+        # claude is first; one step down is codex.
+        until("enter connect")
+        os.write(fd, b"\x1b[B\r")
+        until("✓ codex connected (ChatGPT)")
+        # Back at the list for the next one; q leaves.
+        until("enter connect", 2)
+        os.write(fd, b"q")
+        until("Done")
+        _, status = os.waitpid(pid, 0)
+        os.close(fd)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+        self.assertIn("Connecting codex", screen.decode())
 
+    def test_only_agent_backends_connect(self):
+        result = self.omar("connect", "jev", ok=False)
+        self.assertIn("topology-only", result.stderr)
 
 if __name__ == "__main__":
     unittest.main()

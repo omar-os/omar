@@ -916,10 +916,10 @@ impl OmarMcpServer {
         use crate::backend::{connection, Connection};
         let infos: Vec<Value> = connection::assistants()
             .into_iter()
-            .map(|status| {
-                let mut info = connection::describe(&status);
-                info["available"] = (status.host != Connection::NotInstalled).into();
-                info["command"] = status.backend.default_command().into();
+            .map(|(backend, status)| {
+                let mut info = connection::describe(backend, &status);
+                info["available"] = (status != Connection::NotInstalled).into();
+                info["command"] = backend.default_command().into();
                 info
             })
             .collect();
@@ -2229,7 +2229,7 @@ fn tool_definitions() -> Vec<Value> {
         tool("resume_task", "Resume a blocked child after resolving its blocker. The runtime wakes the child with its task state.", json!({"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"]})),
         tool(
             "list_backends",
-            "List OMAR agent backends: whether each is installed and signed in (status, via, login command; sandbox: the same for Docker Sandboxes, when sbx is installed), and its command. Use before choosing a backend/model override; a signed_out or not_installed backend needs the user to run its login command first. Read-only and safe to retry.",
+            "List OMAR agent backends: whether each is installed and signed in (status, via, login command), and its command. Use before choosing a backend/model override; a signed_out or not_installed backend needs the user to run its login command first. Read-only and safe to retry.",
             json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(

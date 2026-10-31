@@ -53,9 +53,6 @@ impl Backend for Opencode {
             note: None,
         })
     }
-    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
-        Some(super::sbx::MODEL_SERVICES)
-    }
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         from_stamp(target.stamp?).map(|(_, session)| session)
     }

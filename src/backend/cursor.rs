@@ -51,9 +51,6 @@ impl Backend for Cursor {
             note: None,
         })
     }
-    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
-        Some(&["cursor"])
-    }
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["Cursor Agent"]
     }

@@ -1,21 +1,152 @@
 //! `omar connect`: install a backend's CLI with its vendor's own installer,
-//! then let the CLI sign itself in. With `--sandbox`, give Docker Sandboxes
-//! a key of their own instead: a host sign-in never crosses into one.
+//! then let the CLI sign itself in. Credentials stay where each CLI keeps
+//! them; OMAR never reads or stores one.
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, ensure, Context, Result};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::style::Stylize;
+use crossterm::{cursor, terminal, QueueableCommand};
 
-use super::{connection, sbx, Backend, Connection, Kind};
+use super::{connection, Backend, Connection};
 
 /// Connect `backend` on this machine.
 pub fn host(backend: &dyn Backend) -> Result<()> {
-    let name = backend.kind().name();
+    connect(backend, &with_install_path())
+}
+
+/// `omar connect` on a terminal: pick a backend with the arrow keys, connect
+/// it, and come back to the list for the next one.
+pub fn wizard() -> Result<()> {
+    let original = with_install_path();
+    let mut selected = 0;
+    loop {
+        println!("{}", "Checking backends…".dim());
+        let statuses = connection::assistants();
+        let mut stdout = std::io::stdout();
+        stdout.queue(cursor::MoveToPreviousLine(1))?;
+        stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
+        let Some(index) = pick(&statuses, selected)? else {
+            return Ok(());
+        };
+        selected = index;
+        if let Err(error) = connect(statuses[index].0, &original) {
+            println!("{} {error:#}", "✗".red());
+        }
+        println!();
+    }
+}
+
+/// Raw mode for the picker, undone however it exits.
+struct RawMode;
+
+impl RawMode {
+    fn enable() -> Result<Self> {
+        terminal::enable_raw_mode()?;
+        std::io::stdout().queue(cursor::Hide)?.flush()?;
+        Ok(RawMode)
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ = std::io::stdout()
+            .queue(cursor::Show)
+            .and_then(|out| out.flush());
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+/// The index chosen, or `None` to quit. Drawn inline, so what each sign-in
+/// prints stays in the scrollback above the next list.
+fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Option<usize>> {
+    let _raw = RawMode::enable()?;
+    let mut stdout = std::io::stdout();
+    let mut selected = selected.min(statuses.len().saturating_sub(1));
+    let mut drawn = 0;
+    loop {
+        let lines = menu(statuses, selected);
+        if drawn > 0 {
+            stdout.queue(cursor::MoveToPreviousLine(drawn))?;
+        }
+        stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
+        for line in &lines {
+            write!(stdout, "{line}\r\n")?;
+        }
+        stdout.flush()?;
+        drawn = lines.len() as u16;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let choice = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.checked_sub(1).unwrap_or(statuses.len() - 1);
+                continue;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1) % statuses.len();
+                continue;
+            }
+            KeyCode::Enter => Some(selected),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => None,
+            KeyCode::Esc | KeyCode::Char('q') => None,
+            _ => continue,
+        };
+        // Leave one line behind saying what was picked.
+        stdout.queue(cursor::MoveToPreviousLine(drawn))?;
+        stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
+        let summary = match choice {
+            Some(index) => format!("Connecting {}", statuses[index].0.kind().name()),
+            None => "Done".to_string(),
+        };
+        write!(stdout, "{} {summary}\r\n", "◇".green())?;
+        stdout.flush()?;
+        return Ok(choice);
+    }
+}
+
+/// The picker's lines, `selected` marked.
+fn menu(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{} Connect an agent backend  {}",
+        "◆".cyan(),
+        "↑/↓ move · enter connect · q quit".dim()
+    )];
+    for (index, (backend, status)) in statuses.iter().enumerate() {
+        let name = format!("{:<10}", backend.kind().name());
+        let label = connection::label(status);
+        let label = match status {
+            Connection::Connected { .. } => label.green(),
+            _ => label.yellow(),
+        };
+        lines.push(if index == selected {
+            format!("{} {} {name}{label}", "│".cyan(), "●".cyan())
+        } else {
+            format!("{} {} {}{label}", "│".cyan(), "○".dim(), name.dim())
+        });
+    }
+    lines.push(format!("{}", "└".cyan()));
+    lines
+}
+
+/// Add the installers' directories to `PATH` and return what it was.
+fn with_install_path() -> OsString {
     let original = std::env::var_os("PATH").unwrap_or_default();
     // Installers drop binaries here, often before the shell's PATH has them.
     std::env::set_var("PATH", with_install_dirs(&original));
+    original
+}
 
+/// Install `backend` if needed and sign it in; `original` is the operator's
+/// own `PATH`, before the installers' directories were added.
+fn connect(backend: &dyn Backend, original: &OsString) -> Result<()> {
+    let name = backend.kind().name();
     let mut status = connection::connection(backend);
     if status == Connection::NotInstalled {
         install(backend)?;
@@ -53,56 +184,13 @@ pub fn host(backend: &dyn Backend) -> Result<()> {
         _ => bail!("{name} is still not signed in; run `omar connect {name}` again"),
     }
     if let Some(dir) = found_in(program, &std::env::var_os("PATH").unwrap_or_default()) {
-        if found_in(program, &original).is_none() {
+        if found_in(program, original).is_none() {
             println!(
                 "Add {} to PATH so OMAR finds {name} from any shell.",
                 dir.display()
             );
         }
     }
-    Ok(())
-}
-
-/// Store a key in sbx for `backend`'s sandboxed agents, and approve it for
-/// OMAR's kit. `service` picks the provider for Opencode and Pi; `api_key`
-/// makes Codex use an OpenAI key over a ChatGPT sign-in.
-pub fn sandbox(backend: &dyn Backend, service: Option<&str>, api_key: bool) -> Result<()> {
-    let name = backend.kind().name();
-    let Some(services) = backend.sandbox_services() else {
-        bail!("{name} agents cannot run in sandboxes yet");
-    };
-    let Some(default) = services.first() else {
-        println!("✓ {name} needs no key in sandboxes");
-        return Ok(());
-    };
-    let service = service.unwrap_or(default);
-    ensure!(
-        services.contains(&service),
-        "{name} in a sandbox uses one of: {}",
-        services.join(", ")
-    );
-    let oauth = backend.kind() == Kind::Codex && !api_key;
-    let keys = sbx::keys().context(
-        "Docker Sandboxes (sbx) is not installed or not answering: https://docs.docker.com/ai/sandboxes/",
-    )?;
-    if keys.stored.iter().any(|s| s == service) {
-        println!("Using the {service} key already in sbx.");
-    } else {
-        let mut set = Command::new("sbx");
-        set.args(["secret", "set", service]);
-        if oauth {
-            // Separate from the host's codex sign-in: two holders of one
-            // refresh token keep invalidating each other.
-            println!("Sign in to ChatGPT again, for sandboxes. If the link cannot reach this machine, use `omar connect codex --sandbox --api-key`.");
-            set.arg("--oauth");
-        }
-        let status = set.status().context("starting `sbx secret set`")?;
-        ensure!(status.success(), "`sbx secret set {service}` failed");
-    }
-    if sbx::approve(service, oauth)? {
-        println!("Approved {service} for OMAR's sandbox kit in sbx's credentials.yaml.");
-    }
-    println!("✓ {name} can run in sandboxes ({service})");
     Ok(())
 }
 

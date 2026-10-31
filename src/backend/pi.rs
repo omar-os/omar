@@ -54,9 +54,6 @@ impl Backend for Pi {
             note: Some("In pi, type /login and pick a provider, then /quit."),
         })
     }
-    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
-        Some(super::sbx::MODEL_SERVICES)
-    }
     fn readiness(&self, _command: &str) -> Readiness {
         Readiness::Channel
     }

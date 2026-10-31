@@ -241,17 +241,8 @@ enum Commands {
 
     /// Install an agent backend and sign it in
     Connect {
-        /// claude, codex, cursor, opencode, pi or agy; omit to list them
+        /// claude, codex, cursor, opencode, pi or agy; omit to pick from a list
         backend: Option<String>,
-        /// Give Docker Sandboxes a key of their own instead
-        #[arg(long)]
-        sandbox: bool,
-        /// With --sandbox: the provider for opencode or pi (default anthropic)
-        #[arg(long, requires = "sandbox")]
-        service: Option<String>,
-        /// With --sandbox: codex uses an OpenAI API key, not ChatGPT sign-in
-        #[arg(long, requires = "sandbox")]
-        api_key: bool,
     },
 
     /// Restore authoritative coordination state to a backend lifecycle hook.
@@ -634,15 +625,17 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             print!("{}", backends_report(json));
             Ok(())
         }
-        Some(Commands::Connect { backend: None, .. }) => {
-            print!("{}", backends_report(false));
-            Ok(())
+        Some(Commands::Connect { backend: None }) => {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                crate::backend::connect::wizard()
+            } else {
+                print!("{}", backends_report(false));
+                Ok(())
+            }
         }
         Some(Commands::Connect {
             backend: Some(name),
-            sandbox,
-            service,
-            api_key,
         }) => {
             let backend = crate::backend::resolve(&name).map_err(anyhow::Error::msg)?;
             anyhow::ensure!(
@@ -650,11 +643,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
                 "{} is not an agent backend to connect",
                 backend.kind().name()
             );
-            if sandbox {
-                crate::backend::connect::sandbox(backend, service.as_deref(), api_key)
-            } else {
-                crate::backend::connect::host(backend)
-            }
+            crate::backend::connect::host(backend)
         }
         Some(Commands::Ea {
             action: sessions::EaAction::Event { action },
@@ -1473,42 +1462,20 @@ fn backends_report(json: bool) -> String {
     use crate::backend::{connection, Connection};
     let statuses = connection::assistants();
     if json {
-        let rows: Vec<_> = statuses.iter().map(connection::describe).collect();
+        let rows: Vec<_> = statuses
+            .iter()
+            .map(|(backend, status)| connection::describe(*backend, status))
+            .collect();
         return format!("{}\n", serde_json::Value::Array(rows));
     }
-    let state = |status: &Connection| match status {
-        Connection::Connected { via: Some(via) } => format!("✓ {via}"),
-        Connection::Connected { via: None } => "✓ signed in".to_string(),
-        Connection::SignedOut => "not signed in".to_string(),
-        Connection::NotInstalled => "not installed".to_string(),
-        Connection::Unknown { reason } => format!("? {reason}"),
-        Connection::Unsupported => "not supported".to_string(),
-    };
-    // Only once sbx is installed do sandboxes have a status to show.
-    let sandboxes = statuses.iter().any(|status| status.sandbox.is_some());
-    let mut out = format!("{:<10}{:<28}", "BACKEND", "STATUS");
-    if sandboxes {
-        out += &format!("{:<18}", "SANDBOX");
-    }
-    out += "NEXT\n";
-    for status in &statuses {
-        let name = status.backend.kind().name();
-        let mut row = format!("{name:<10}{:<28}", state(&status.host));
-        let mut next = match status.host {
-            Connection::Connected { .. } => None,
-            _ => Some(format!("omar connect {name}")),
+    let mut out = format!("{:<10}{:<28}NEXT\n", "BACKEND", "STATUS");
+    for (backend, status) in &statuses {
+        let name = backend.kind().name();
+        let next = match status {
+            Connection::Connected { .. } => String::new(),
+            _ => format!("omar connect {name}"),
         };
-        if let Some(sandbox) = &status.sandbox {
-            let sandbox_state = match sandbox {
-                Connection::SignedOut => "no key".to_string(),
-                other => state(other),
-            };
-            row += &format!("{sandbox_state:<18}");
-            if matches!(sandbox, Connection::SignedOut) && next.is_none() {
-                next = Some(format!("omar connect {name} --sandbox"));
-            }
-        }
-        row += &next.unwrap_or_default();
+        let row = format!("{name:<10}{:<28}{next}", connection::label(status));
         out += row.trim_end();
         out.push('\n');
     }

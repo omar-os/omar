@@ -23,10 +23,6 @@ impl Backend for Stub {
         // to end in a test. Resolved to this binary in `launch_command`.
         "omar stub-agent"
     }
-    /// It calls no model, so a sandbox needs no key for it.
-    fn sandbox_services(&self) -> Option<&'static [&'static str]> {
-        Some(&[])
-    }
     /// The stub reads the endpoint and token straight from the topology
     /// context, so it needs no MCP server of its own.
     fn launch_command(&self, launch: &Launch<'_>) -> String {
