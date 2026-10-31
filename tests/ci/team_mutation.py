@@ -85,7 +85,7 @@ def main():
         v1.write_text(V1)
         v2.write_text(V2)
         renamed.write_text(V2.replace("main Morph", "main Other"))
-        runtime = json.loads(subprocess.run([str(BIN), "up", "--no-ea", "--name", "mutation", "--json"], cwd=source,
+        runtime = json.loads(subprocess.run([str(BIN), "up", "--no-ea", "-s", "mutation", "--json"], cwd=source,
                                             env=env, text=True, capture_output=True, timeout=90, check=True).stdout)
         server = runtime["tmux_server"]
         state_root = Path(runtime["directory"])

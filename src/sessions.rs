@@ -39,7 +39,8 @@ const MAX_FRAME: u64 = 8 * 1024 * 1024;
 
 #[derive(Args, Debug, Clone)]
 pub struct UpOptions {
-    #[arg(long)]
+    /// Deprecated: use -s NAME
+    #[arg(long, hide = true)]
     pub name: Option<String>,
     #[arg(long)]
     pub workdir: Option<PathBuf>,
@@ -615,20 +616,23 @@ fn pin_executable(source: &Path, dest: &Path) -> Result<String> {
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
-/// Start a session. Returns the stopped record it replaced when `--name`
+/// Start a session. Returns the stopped record it replaced when `-s NAME`
 /// restarted an existing session, so the caller can say what changed.
 fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, Option<Session>)> {
     anyhow::ensure!(
-        cli.session.is_none(),
-        "up creates a new session; --session selects an existing one"
+        cli.session.is_none() || options.name.is_none(),
+        "name the session once, with -s NAME"
     );
+    if options.name.is_some() {
+        eprintln!("warning: --name is deprecated; use -s NAME");
+    }
     anyhow::ensure!(
         cli.ea.is_none(),
         "a new session starts with EA 0; create more with omar --session <session> ea create"
     );
     let _lock = RegistryLock::acquire()?;
     let existing = discover()?;
-    let name = match options.name {
+    let name = match cli.session.clone().or(options.name) {
         Some(name) => {
             validate_name(&name)?;
             if let Some(stopped) = existing.iter().find(|s| s.name == name) {
@@ -1290,7 +1294,7 @@ async fn daemon(directory: &Path) -> Result<()> {
     let mut session = session.lock().unwrap();
     // Stopped is a state, not an ending: like a container, the session keeps
     // its record, logs, chats and workflows until `omar rm`, and `omar up
-    // --name` starts it again with them in place.
+    // -s NAME` starts it again with them in place.
     session.state = "stopped".into();
     publish(&session)?;
     Ok(())
@@ -1591,7 +1595,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             if cli.json { let mut v = json!(saved); v["runs"] = json!(runs); return print_value(v); }
             let summary = runs_summary(&saved, &runs);
             let kept = if summary == "-" { String::new() } else { format!(" {summary} workflow(s) kept.") };
-            println!("Stopped session {};{kept} omar up --name {} restarts it, omar rm -s {} removes it", s.name, s.name, s.name);
+            println!("Stopped session {};{kept} omar up -s {} restarts it, omar rm -s {} removes it", s.name, s.name, s.name);
             Ok(())
         }),
         Some(Commands::Run(options)) => (|| {

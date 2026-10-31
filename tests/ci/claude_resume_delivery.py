@@ -96,10 +96,10 @@ def main():
             raise AssertionError(f"{text!r} never reached the EA: {entries()}")
 
         try:
-            session = json.loads(omar("-a", "claude", "up", "--name", "resumed", "--json"))
+            session = json.loads(omar("-a", "claude", "up", "-s", "resumed", "--json"))
             delivered(session["url"], "before the restart")
             omar("down", "-s", "resumed")
-            session = json.loads(omar("up", "--name", "resumed", "--json"))
+            session = json.loads(omar("up", "-s", "resumed", "--json"))
             launches = [entry["launch"] for entry in entries() if "launch" in entry]
             assert launches[0] == "fresh" and launches[-1] == "resume", launches
             delivered(session["url"], "after the restart")
