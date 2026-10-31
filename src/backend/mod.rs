@@ -328,6 +328,10 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Best-effort: delete the native session of an ephemeral worker, just
+    /// before its pane is killed. Errors are ignored.
+    fn forget(&self, _target: &Target<'_>) {}
+
     /// An executive assistant's launch line, when it differs from a worker's.
     /// `prompt_file` holds the prompt with its placeholders intact and
     /// `prompt` is the same text with them resolved; a backend that takes the
@@ -341,6 +345,55 @@ pub trait Backend: Send + Sync {
         _context: &McpLaunchContext,
     ) -> Option<String> {
         None
+    }
+}
+
+/// A worker (or topology agent) leaves no native session behind, unless the
+/// operator sets `OMAR_PERSIST_WORKER_SESSIONS=1`. Backends with no
+/// `ea_launch_command` launch the EA through the worker path, so the EA is
+/// excluded here.
+pub(crate) fn ephemeral_worker(context: &McpLaunchContext) -> bool {
+    (context.agent_name.is_some() || context.topology.is_some()) && !persist_worker_sessions()
+}
+
+fn persist_worker_sessions() -> bool {
+    std::env::var("OMAR_PERSIST_WORKER_SESSIONS").is_ok_and(|v| v == "1")
+}
+
+/// Kill a worker's tmux session (and its process tree when `tree`), after
+/// deleting its native session. The one teardown for every worker; never call
+/// it for an EA's manager session.
+pub(crate) fn kill_worker(
+    client: &crate::tmux::TmuxClient,
+    session: &str,
+    tree: bool,
+) -> anyhow::Result<()> {
+    forget_worker(client, session);
+    if tree {
+        client.kill_session_tree(session)
+    } else {
+        client.kill_session(session)
+    }
+}
+
+/// Delete a worker's native session before its tmux session is killed.
+fn forget_worker(client: &crate::tmux::TmuxClient, session: &str) {
+    if persist_worker_sessions() {
+        return;
+    }
+    let (Some(name), Ok(pane_pid)) = (
+        client.session_backend(session),
+        client.get_pane_pid(session),
+    ) else {
+        return;
+    };
+    let stamp = client.session_delivery(session);
+    if let Some(backend) = by_name(&name) {
+        backend.forget(&Target {
+            name: session,
+            pane_pid,
+            stamp: stamp.as_deref(),
+        });
     }
 }
 

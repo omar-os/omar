@@ -51,6 +51,10 @@ pub struct Task {
     #[serde(default)]
     pub retired: bool,
     pub next_check_ms: u64,
+    /// While in the future, a held `wait_s` call is waiting on this task and
+    /// delivers its result itself, so the runtime sends no notice for it.
+    #[serde(default)]
+    pub held_until_ms: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -182,6 +186,44 @@ pub fn finish(
         // Result and parent-delivery obligation commit in the same record.
         task.next_check_ms = 0;
         Ok(task.clone())
+    })
+}
+
+pub fn task(root: &Path, ea: u32, actor: &str, id: &str) -> Result<Task> {
+    read(root, |ledger| {
+        let task = ledger.tasks.get(id).context("unknown task_id")?;
+        authorize(task, ea, actor, true)?;
+        Ok(task.clone())
+    })
+}
+
+/// The not-yet-retired task of `session` assigned exactly `assignment`, if any:
+/// a retried held spawn reattaches to it whether it is still running or
+/// finished while the orchestrator's connection was down.
+pub fn reattachable_task(
+    root: &Path,
+    ea: u32,
+    session: &str,
+    assignment: &str,
+) -> Result<Option<String>> {
+    read(root, |ledger| {
+        Ok(ledger
+            .tasks
+            .values()
+            .find(|t| {
+                t.ea_id == ea && t.session == session && !t.retired && t.assignment == assignment
+            })
+            .map(|t| t.id.clone()))
+    })
+}
+
+/// Mark `id` as held by a waiting call until `until_ms` (0 releases it).
+pub fn hold(root: &Path, ea: u32, actor: &str, id: &str, until_ms: u64) -> Result<()> {
+    transaction(root, |ledger| {
+        let task = ledger.tasks.get_mut(id).context("unknown task_id")?;
+        authorize(task, ea, actor, true)?;
+        task.held_until_ms = until_ms;
+        Ok(())
     })
 }
 
@@ -549,7 +591,7 @@ pub fn reconcile(
             .map(|t| (t.ea_id, t.parent.clone()))
             .collect();
         for task in ledger.tasks.values_mut() {
-            if task.next_check_ms > now {
+            if task.next_check_ms > now || task.held_until_ms > now {
                 continue;
             }
             if task.result.is_some()
@@ -593,6 +635,7 @@ mod tests {
             acknowledged: false,
             retired: false,
             next_check_ms: 0,
+            held_until_ms: 0,
         }
     }
     #[test]
@@ -639,6 +682,22 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(finish(root, 0, "child", &id, Status::Completed, json!("changed")).is_err());
+    }
+    #[test]
+    fn a_held_task_sends_no_notice_until_its_hold_lapses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let id = register(root, task("child", "pm")).unwrap();
+        hold(root, 0, "pm", &id, 5_000).unwrap();
+        finish(root, 0, "child", &id, Status::Completed, json!("ok")).unwrap();
+        let live = BTreeSet::from(["s-child".into()]);
+        assert!(reconcile(root, 10, &live).unwrap().is_empty());
+        assert_eq!(reconcile(root, 5_001, &live).unwrap()[0].1, "pm");
+        hold(root, 0, "pm", &id, 0).unwrap();
+        assert_eq!(
+            reconcile(root, CHECK_INTERVAL_MS * 3, &live).unwrap()[0].1,
+            "pm"
+        );
     }
     #[test]
     fn parent_cannot_finish_with_unconsumed_children_and_compaction_changes_nothing() {

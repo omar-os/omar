@@ -55,6 +55,16 @@ impl Backend for Codex {
         let socket = from_stamp(target.stamp?)?;
         CodexSession::open(&socket).ok()?.only_thread().ok()
     }
+    fn forget(&self, target: &super::Target<'_>) {
+        let Some(socket) = target.stamp.and_then(from_stamp) else {
+            return;
+        };
+        let _ = (|| {
+            let mut session = CodexSession::open(&socket)?;
+            let thread = session.only_thread()?;
+            session.call("thread/delete", serde_json::json!({ "threadId": thread }))
+        })();
+    }
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["OpenAI Codex"]
     }
@@ -810,6 +820,10 @@ mod tests {
                     &request,
                     serde_json::json!({ "data": threads, "nextCursor": null }),
                 ),
+                "thread/delete" => {
+                    answer(&mut socket, &request, serde_json::json!({}));
+                    return asked;
+                }
                 "turn/start" => {
                     // Notifications can interleave with the acknowledgement,
                     // including completion of a previously active turn.
@@ -884,6 +898,24 @@ mod tests {
         );
         // Every request is JSON-RPC; a notification carries no id.
         assert_eq!(asked[1].get("id"), None);
+    }
+
+    #[test]
+    fn forgetting_a_worker_deletes_its_one_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("forget.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || fake_app_server(listener, vec!["thread-1"]));
+        let stamp = format!("codex:{}", socket.display());
+        Codex.forget(&super::super::Target {
+            name: "pane",
+            pane_pid: 0,
+            stamp: Some(&stamp),
+        });
+        let last: serde_json::Value =
+            serde_json::from_str(server.join().unwrap().last().unwrap()).unwrap();
+        assert_eq!(last["method"], "thread/delete");
+        assert_eq!(last["params"], serde_json::json!({"threadId": "thread-1"}));
     }
 
     #[test]

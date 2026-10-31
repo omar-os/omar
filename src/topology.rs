@@ -3153,7 +3153,7 @@ fn spawn_topology_agents(
                 );
             }
             client.ensure_session_not_attached(&session)?;
-            client.kill_session_tree(&session)?;
+            crate::backend::kill_worker(client, &session, true)?;
         }
         let agent_dir = runtime_dir.join("agents").join(name);
         fs::create_dir_all(&agent_dir)?;

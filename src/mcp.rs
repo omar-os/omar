@@ -6,12 +6,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::app::AgentInfo;
@@ -202,6 +204,18 @@ mod flex_int {
             assert!(e.is_err());
         }
     }
+}
+
+thread_local! {
+    /// Set by `notifications/cancelled` for the held call running on this
+    /// thread. `serve` gives each held call its own thread and flag.
+    static CANCEL: std::cell::RefCell<Option<Arc<AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn now_ns() -> u64 {
@@ -435,7 +449,11 @@ impl Drop for FileLock {
     }
 }
 
-pub fn run_server_from_context_file(path: PathBuf, bare_tool_names: bool) -> Result<()> {
+pub fn run_server_from_context_file(
+    path: PathBuf,
+    bare_tool_names: bool,
+    hold: bool,
+) -> Result<()> {
     let mut context: McpLaunchContext = serde_json::from_str(
         &fs::read_to_string(&path)
             .with_context(|| format!("Failed to read MCP context file {}", path.display()))?,
@@ -465,6 +483,7 @@ pub fn run_server_from_context_file(path: PathBuf, bare_tool_names: bool) -> Res
     apply_context_environment(&context);
     OmarMcpServer::new(context)
         .with_bare_tool_names(bare_tool_names)
+        .with_hold(hold)
         .run()
 }
 
@@ -480,7 +499,7 @@ fn apply_context_environment(context: &McpLaunchContext) {
 /// processes that aren't spawned by a specific
 /// backend launch and need a default context derived from the current
 /// config + active EA.
-pub fn run_server_with_default_context(bare_tool_names: bool) -> Result<()> {
+pub fn run_server_with_default_context(bare_tool_names: bool, hold: bool) -> Result<()> {
     let omar_dir = std::env::var_os("OMAR_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(crate::sessions::state_root);
@@ -506,6 +525,7 @@ pub fn run_server_with_default_context(bare_tool_names: bool) -> Result<()> {
     };
     OmarMcpServer::new(context)
         .with_bare_tool_names(bare_tool_names)
+        .with_hold(hold)
         .run()
 }
 
@@ -543,7 +563,18 @@ struct OmarMcpServer {
     /// a model that takes the prompt literally calls a tool that does not
     /// exist. With bare names its prefix rebuilds exactly the documented one.
     bare_tool_names: bool,
+    /// `--hold`: spawn_agent and get_task accept `wait_s`. Only for an
+    /// orchestrator's stand-in; Omar-launched agents never get it.
+    hold: bool,
+    /// Held calls still running, by JSON-RPC request id, for cancellation.
+    inflight: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
+
+/// What a `--hold` server offers: all an orchestrator's stand-in needs.
+pub(crate) const HOLD_TOOLS: [&str; 3] = ["add_project", "spawn_agent", "get_task"];
+
+/// How long past a held call's deadline the EA's notice for its task waits.
+const HOLD_GRACE_MS: u64 = 10_000;
 
 /// The prefix bare-name clients drop from tool names and rebuild themselves.
 const TOOL_PREFIX: &str = "omar_";
@@ -562,7 +593,14 @@ impl OmarMcpServer {
             manager_session,
             scheduler,
             bare_tool_names: false,
+            hold: false,
+            inflight: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn with_hold(mut self, hold: bool) -> Self {
+        self.hold = hold;
+        self
     }
 
     fn with_bare_tool_names(mut self, bare: bool) -> Self {
@@ -586,13 +624,22 @@ impl OmarMcpServer {
         name.to_string()
     }
 
-    fn run(&self) -> Result<()> {
+    fn run(self) -> Result<()> {
         crate::supervision::start_fallback_runtime(&self.context);
-        let stdin = io::stdin();
-        let stdout = io::stdout();
-        let mut reader = BufReader::new(stdin.lock());
-        let mut writer = stdout.lock();
+        Arc::new(self).serve(BufReader::new(io::stdin().lock()), io::stdout())
+    }
 
+    /// The request loop. On a `--hold` server a `tools/call` with `wait_s` runs
+    /// on its own thread so concurrent held calls do not queue behind each
+    /// other; every thread answers through the one writer lock. At EOF the loop
+    /// ends and held threads die with the process: their workers keep running
+    /// and a retried spawn_agent reattaches to them.
+    fn serve<W: Write + Send + 'static>(
+        self: &Arc<Self>,
+        mut reader: impl BufRead,
+        writer: W,
+    ) -> Result<()> {
+        let writer = Arc::new(Mutex::new(writer));
         while let Some(message) = read_message(&mut reader)? {
             match message {
                 McpRead::Request(request, framing) => {
@@ -600,30 +647,70 @@ impl OmarMcpServer {
                         &self.context,
                         &format!("request method={} id={:?}", request.method, request.id),
                     );
-                    let maybe_response = self.handle_request(request);
-                    if let Some(response) = maybe_response {
-                        append_debug_log(
-                            &self.context,
-                            &format!(
-                                "response id={} has_error={}",
-                                response.id,
-                                response.error.is_some()
-                            ),
-                        );
-                        write_message(&mut writer, &response, framing)?;
-                        writer.flush()?;
+                    if request.method == "notifications/cancelled" {
+                        self.cancel_inflight(&request.params);
+                    } else if self.is_held_call(&request) {
+                        let flag = Arc::new(AtomicBool::new(false));
+                        let id = request.id.clone().unwrap_or_default().to_string();
+                        lock(&self.inflight).insert(id.clone(), flag.clone());
+                        let (server, writer) = (Arc::clone(self), Arc::clone(&writer));
+                        thread::spawn(move || {
+                            CANCEL.with(|cancel| *cancel.borrow_mut() = Some(flag.clone()));
+                            let response = server.handle_request(request);
+                            lock(&server.inflight).remove(&id);
+                            // A cancelled request gets no answer.
+                            if let Some(response) =
+                                response.filter(|_| !flag.load(Ordering::SeqCst))
+                            {
+                                let _ = server.send(&writer, &response, framing);
+                            }
+                        });
+                    } else if let Some(response) = self.handle_request(request) {
+                        self.send(&writer, &response, framing)?;
                     }
                 }
                 McpRead::ParseError { message, framing } => {
                     append_debug_log(&self.context, &format!("parse_error err={}", message));
                     let response = error_response(Value::Null, -32700, &message);
-                    write_message(&mut writer, &response, framing)?;
-                    writer.flush()?;
+                    self.send(&writer, &response, framing)?;
                 }
             }
         }
-
         Ok(())
+    }
+
+    fn send(
+        &self,
+        writer: &Mutex<impl Write>,
+        response: &JsonRpcResponse,
+        framing: MessageFraming,
+    ) -> Result<()> {
+        append_debug_log(
+            &self.context,
+            &format!(
+                "response id={} has_error={}",
+                response.id,
+                response.error.is_some()
+            ),
+        );
+        let mut writer = lock(writer);
+        write_message(&mut *writer, response, framing)?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn is_held_call(&self, request: &JsonRpcRequest) -> bool {
+        self.hold
+            && request.id.is_some()
+            && request.method == "tools/call"
+            && request.params["arguments"].get("wait_s").is_some()
+    }
+
+    /// `notifications/cancelled`: tell the held call it names to cancel its task.
+    fn cancel_inflight(&self, params: &Value) {
+        if let Some(flag) = lock(&self.inflight).get(&params["requestId"].to_string()) {
+            flag.store(true, Ordering::SeqCst);
+        }
     }
 
     fn handle_request(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
@@ -648,7 +735,7 @@ impl OmarMcpServer {
                 }),
             ),
             "tools/list" => {
-                let tools = if self.context.topology.is_some() {
+                let mut tools = if self.context.topology.is_some() {
                     topology_tool_definitions()
                 } else {
                     let mut tools = tool_definitions();
@@ -660,6 +747,14 @@ impl OmarMcpServer {
                     }
                     tools
                 };
+                if self.hold {
+                    tools.retain(|tool| HOLD_TOOLS.contains(&tool["name"].as_str().unwrap_or("")));
+                    for tool in &mut tools {
+                        if matches!(tool["name"].as_str(), Some("spawn_agent" | "get_task")) {
+                            tool["inputSchema"]["properties"]["wait_s"] = json!({"type":"integer","minimum":1,"maximum":600,"description":"Hold the reply until the task finishes or this many seconds pass; then it returns the result (acknowledging the task and retiring the worker) or {status:\"running\"}. Call get_task with wait_s again to keep waiting."});
+                        }
+                    }
+                }
                 let tools = if self.bare_tool_names {
                     tools
                         .into_iter()
@@ -701,7 +796,13 @@ impl OmarMcpServer {
             &self.context,
             &format!("tool_call name={} args={}", call.name, call.arguments),
         );
-        let result = if let Some(topology) = &self.context.topology {
+        let result = if self.hold && !HOLD_TOOLS.contains(&call.name.as_str()) {
+            Err(anyhow!(
+                "Tool '{}' is unavailable on a --hold server; it offers {}",
+                call.name,
+                HOLD_TOOLS.join(", ")
+            ))
+        } else if let Some(topology) = &self.context.topology {
             match call.name.as_str() {
                 "omar_set_port" => crate::topology::mcp_set_port(topology, call.arguments),
                 "omar_complete" => crate::topology::mcp_complete(topology, call.arguments),
@@ -729,12 +830,14 @@ impl OmarMcpServer {
                     self.actor(),
                     call.arguments["offset"].as_u64().unwrap_or(0) as usize,
                 ),
-                "get_task" => crate::supervision::get_task(
-                    &self.context.omar_dir,
-                    self.ea_id(),
-                    self.actor(),
-                    &call.arguments,
-                ),
+                "get_task" => self.held(call.arguments, |args| {
+                    crate::supervision::get_task(
+                        &self.context.omar_dir,
+                        self.ea_id(),
+                        self.actor(),
+                        &args,
+                    )
+                }),
                 "finish_task" => self.finish_task(call.arguments),
                 "acknowledge_task" => self.acknowledge_task(call.arguments),
                 "resume_task" => self.resume_task(call.arguments),
@@ -748,7 +851,10 @@ impl OmarMcpServer {
                 "get_agent" => self.get_agent(call.arguments),
                 "get_agent_summary" => self.get_agent_summary(call.arguments),
                 "update_agent_status" => self.update_agent_status(call.arguments),
-                "spawn_agent" => self.spawn_agent(call.arguments),
+                "spawn_agent" => {
+                    let reattach = self.hold && call.arguments.get("wait_s").is_some();
+                    self.held(call.arguments, |args| self.spawn_agent(args, reattach))
+                }
                 "kill_agent" => self.kill_agent(call.arguments),
                 "send_input" => self.send_input(call.arguments),
                 "list_projects" => self.list_projects(),
@@ -1053,9 +1159,12 @@ impl OmarMcpServer {
         }
         let mut killed = 0usize;
         for session_name in session_names {
-            client
-                .kill_session(&session_name)
-                .map_err(|e| anyhow!("Failed to kill session '{}': {}", session_name, e))?;
+            if session_name == manager_session {
+                client.kill_session(&session_name)
+            } else {
+                crate::backend::kill_worker(&client, &session_name, false)
+            }
+            .map_err(|e| anyhow!("Failed to kill session '{}': {}", session_name, e))?;
             killed += 1;
         }
         let state_dir = ea::ea_state_dir(args.ea_id, &self.context.omar_dir);
@@ -1191,7 +1300,7 @@ impl OmarMcpServer {
     }
 
     /// The single MCP spawn path. Requires an existing `project_id`.
-    fn spawn_agent(&self, args: Value) -> Result<Value> {
+    fn spawn_agent(&self, args: Value, reattach: bool) -> Result<Value> {
         #[derive(Deserialize)]
         struct Args {
             name: String,
@@ -1252,6 +1361,18 @@ impl OmarMcpServer {
             _ => generate_agent_name_in_ea(prefix),
         };
         let short_name = self.display_name(&session_name).to_string();
+        // A retried held spawn finds its worker's task (running or just
+        // finished while the connection was down): hold on that.
+        if reattach {
+            if let Some(task_id) = crate::supervision::reattachable_task(
+                &self.context.omar_dir,
+                ea_id,
+                &session_name,
+                &task,
+            )? {
+                return Ok(json!({"agent_name":short_name,"status":"running","task_id":task_id}));
+            }
+        }
         let parent_session = match parent.as_deref() {
             Some("ea") | None => manager_session.to_string(),
             Some(p) => self.qualified_session_name(p)?,
@@ -1338,6 +1459,7 @@ impl OmarMcpServer {
                         acknowledged: false,
                         retired: false,
                         next_check_ms: 0,
+                        held_until_ms: 0,
                     },
                 ) {
                     Ok(id) => id,
@@ -1465,6 +1587,94 @@ impl OmarMcpServer {
         Ok(response)
     }
 
+    /// Run `start` (spawn_agent or get_task), then, when the call carries
+    /// `wait_s`, hold the reply for the task it names. Only `--hold` servers
+    /// may do this: Omar-launched agents must never block on a worker.
+    fn held(&self, mut args: Value, start: impl FnOnce(Value) -> Result<Value>) -> Result<Value> {
+        let Some(wait) = args.as_object_mut().and_then(|a| a.remove("wait_s")) else {
+            return start(args);
+        };
+        if !self.hold {
+            bail!("wait_s requires omar mcp-server --hold");
+        }
+        let wait = wait
+            .as_u64()
+            .filter(|w| (1..=600).contains(w))
+            .context("wait_s must be an integer from 1 to 600")?;
+        let started = start(args)?;
+        let Some(id) = started["task_id"].as_str() else {
+            // An untracked worker (supervise:false, raw command, a backend
+            // without prompt delivery) can never report back: leave none behind.
+            if let Some(name) = started["agent_name"].as_str() {
+                let _ = self.kill_agent(json!({ "name": name }));
+            }
+            bail!("backend does not support tracked tasks");
+        };
+        self.hold_task(id, wait)
+    }
+
+    /// Poll the ledger about once a second until the task is terminal, blocked
+    /// or `wait_s` runs out. The held reply is the delivery, so a finished task
+    /// is acknowledged and retired (its session killed unless someone is
+    /// attached to it). A blocked task is returned as it is: its worker stays
+    /// for `resume_task`, and the EA is told as usual.
+    fn hold_task(&self, id: &str, wait_s: u64) -> Result<Value> {
+        let omar_dir = &self.context.omar_dir;
+        let deadline = Instant::now() + Duration::from_secs(wait_s);
+        let cancel = CANCEL.with(|cancel| cancel.borrow().clone());
+        // The reply is the delivery, so keep the EA's "result ready" notice
+        // away for the whole wait. If this call dies, the notice fires later.
+        let held_until = crate::supervision::now_ms() + wait_s * 1000 + HOLD_GRACE_MS;
+        crate::supervision::hold(omar_dir, self.ea_id(), self.actor(), id, held_until)?;
+        loop {
+            let task = crate::supervision::task(omar_dir, self.ea_id(), self.actor(), id)?;
+            if task.status == crate::supervision::Status::Blocked {
+                crate::supervision::hold(omar_dir, self.ea_id(), self.actor(), id, 0)?;
+                return crate::supervision::get_task(
+                    omar_dir,
+                    self.ea_id(),
+                    self.actor(),
+                    &json!({ "task_id": id }),
+                );
+            }
+            if task.status.terminal() {
+                crate::supervision::acknowledge(
+                    omar_dir,
+                    self.ea_id(),
+                    self.actor(),
+                    id,
+                    task.result_revision,
+                )?;
+                // Retire even if the session stays (a client is attached), so
+                // a retried spawn never reattaches to a delivered task.
+                crate::supervision::cancel_agent(omar_dir, self.ea_id(), &task.agent)?;
+                let _ = self.kill_agent(json!({ "name": task.session }));
+                return crate::supervision::get_task(
+                    omar_dir,
+                    self.ea_id(),
+                    self.actor(),
+                    &json!({ "task_id": id }),
+                );
+            }
+            if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                let _ = crate::supervision::finish(
+                    omar_dir,
+                    self.ea_id(),
+                    self.actor(),
+                    id,
+                    crate::supervision::Status::Failed,
+                    json!("cancelled by orchestrator"),
+                );
+                let _ = self.kill_agent(json!({ "name": task.session }));
+                bail!("cancelled by orchestrator");
+            }
+            if Instant::now() >= deadline {
+                return Ok(json!({"task_id":id,"status":"running"}));
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
     fn validate_spawn_parent(&self, project_id: usize, parent: Option<&str>) -> Result<()> {
         let client = self.client();
         let agent_projects = memory::load_agent_projects_from(self.state_dir());
@@ -1546,7 +1756,7 @@ impl OmarMcpServer {
             return Err(anyhow!("Cannot kill manager via MCP"));
         }
         let _session = client.ensure_session_not_attached(&session_name)?;
-        client.kill_session(&session_name)?;
+        crate::backend::kill_worker(&client, &session_name, false)?;
         crate::supervision::cancel_agent(
             &self.context.omar_dir,
             self.ea_id(),
@@ -1704,7 +1914,16 @@ impl OmarMcpServer {
         }
         let state_dir = self.state_dir();
         let _lock = FileLock::acquire(lock_path_for_state_dir(state_dir))?;
-        let project_id = projects::add_project_in(state_dir, name)?;
+        // A retried stand-in must land in the same project, not a duplicate.
+        let existing = self.hold.then(|| {
+            projects::load_projects_from(state_dir)
+                .into_iter()
+                .find(|p| p.name == name)
+        });
+        let project_id = match existing.flatten() {
+            Some(project) => project.id,
+            None => projects::add_project_in(state_dir, name)?,
+        };
         self.refresh_memory_locked()?;
         Ok(json!({
             "project_id": project_id,
@@ -2378,7 +2597,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "add_project",
-            "Register a new project bucket in the current EA and return its project_id for spawn_agent. Use once per user initiative or reusable workstream. Side effect: persists project metadata. Not idempotent; retrying can create duplicate project names, so call list_projects after uncertain results. Projects are not auto-created or auto-removed by agent lifecycle.",
+            "Register a new project bucket in the current EA and return its project_id for spawn_agent. Use once per user initiative or reusable workstream. Side effect: persists project metadata. Idempotent by name: an existing project with the same name is returned instead of a duplicate. Projects are not auto-created or auto-removed by agent lifecycle.",
             json!({
                 "type":"object",
                 "properties":{
@@ -2795,21 +3014,7 @@ mod tests {
     }
 
     fn listed_tools(context: McpLaunchContext) -> Vec<String> {
-        let server = OmarMcpServer::new(context);
-        let response = server
-            .handle_request(JsonRpcRequest {
-                jsonrpc: "2.0".to_string(),
-                id: Some(json!(1)),
-                method: "tools/list".to_string(),
-                params: json!({}),
-            })
-            .expect("tools/list responds");
-        response.result.expect("tools result")["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .map(|tool| tool["name"].as_str().unwrap().to_string())
-            .collect()
+        listed_tools_of(&OmarMcpServer::new(context))
     }
 
     fn ea_context() -> McpLaunchContext {
@@ -2822,32 +3027,37 @@ mod tests {
         }
     }
 
+    fn register_running(dir: &Path, agent: &str) -> String {
+        crate::supervision::register(
+            dir,
+            crate::supervision::Task {
+                id: String::new(),
+                ea_id: 0,
+                agent: agent.to_string(),
+                session: agent.to_string(),
+                parent: "ea".into(),
+                parent_task_id: None,
+                project_id: 1,
+                assignment: "task".into(),
+                status: crate::supervision::Status::Running,
+                result: None,
+                result_revision: 0,
+                acknowledged: false,
+                retired: false,
+                next_check_ms: 0,
+                held_until_ms: 0,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn coordination_tool_honors_task_pagination() {
         let dir = tempfile::tempdir().unwrap();
         let mut context = test_context();
         context.omar_dir = dir.path().into();
         for agent in ["a", "b"] {
-            crate::supervision::register(
-                dir.path(),
-                crate::supervision::Task {
-                    id: String::new(),
-                    ea_id: 0,
-                    agent: agent.into(),
-                    session: agent.into(),
-                    parent: "ea".into(),
-                    parent_task_id: None,
-                    project_id: 1,
-                    assignment: "task".into(),
-                    status: crate::supervision::Status::Running,
-                    result: None,
-                    result_revision: 0,
-                    acknowledged: false,
-                    retired: false,
-                    next_check_ms: 0,
-                },
-            )
-            .unwrap();
+            register_running(dir.path(), agent);
         }
         let server = OmarMcpServer::new(context);
         let response = server.call_tool(ToolCallRequest {
@@ -2863,6 +3073,332 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    fn schemas_with_wait_s(server: &OmarMcpServer) -> Vec<String> {
+        tool_list(server)
+            .iter()
+            .filter(|tool| tool["inputSchema"]["properties"]["wait_s"].is_object())
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn wait_s_is_offered_and_accepted_only_with_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().into();
+        let id = register_running(dir.path(), "a");
+        let plain = OmarMcpServer::new(context.clone());
+        assert!(schemas_with_wait_s(&plain).is_empty());
+        let refused = plain.call_tool(ToolCallRequest {
+            name: "get_task".into(),
+            arguments: json!({"task_id":id,"wait_s":1}),
+        });
+        assert_eq!(refused["isError"], true);
+        assert!(refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("--hold"));
+        let held = OmarMcpServer::new(context).with_hold(true);
+        assert_eq!(schemas_with_wait_s(&held), ["get_task", "spawn_agent"]);
+    }
+
+    #[test]
+    fn hold_server_lists_and_accepts_only_its_three_tools() {
+        let held = OmarMcpServer::new(ea_context()).with_hold(true);
+        assert_eq!(
+            listed_tools_of(&held),
+            ["get_task", "spawn_agent", "add_project"]
+        );
+        for name in ["omar_reply", "list_agents", "acknowledge_task"] {
+            let refused = held.call_tool(ToolCallRequest {
+                name: name.into(),
+                arguments: json!({}),
+            });
+            assert_eq!(refused["isError"], true);
+            assert!(refused["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unavailable on a --hold server"));
+        }
+    }
+
+    /// A writer the test can read while server threads still write to it.
+    #[derive(Clone, Default)]
+    struct SharedOut(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedOut {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            lock(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SharedOut {
+        fn responses(&self) -> Vec<Value> {
+            String::from_utf8(lock(&self.0).clone())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+
+        fn wait_for(&self, id: i64) -> Option<Value> {
+            for _ in 0..100 {
+                if let Some(found) = self.responses().into_iter().find(|r| r["id"] == id) {
+                    return Some(found);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            None
+        }
+    }
+
+    fn feed(server: &Arc<OmarMcpServer>, messages: &[Value]) -> SharedOut {
+        let out = SharedOut::default();
+        let input: String = messages.iter().map(|m| format!("{m}\n")).collect();
+        server
+            .serve(Cursor::new(input.into_bytes()), out.clone())
+            .unwrap();
+        out
+    }
+
+    fn held_get_task(id: i64, task: &str, wait_s: u64) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":"get_task","arguments":{"task_id":task,"wait_s":wait_s}}})
+    }
+
+    #[test]
+    fn concurrent_held_calls_complete_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().into();
+        let running = register_running(dir.path(), "a");
+        let done = register_running(dir.path(), "b");
+        crate::supervision::finish(
+            dir.path(),
+            0,
+            "ea",
+            &done,
+            crate::supervision::Status::Completed,
+            json!("ok"),
+        )
+        .unwrap();
+        let server = Arc::new(OmarMcpServer::new(context).with_hold(true));
+        // The call that waits comes first: a serial loop would answer it first.
+        let out = feed(
+            &server,
+            &[held_get_task(1, &running, 2), held_get_task(2, &done, 2)],
+        );
+        let finished = out.wait_for(2).expect("finished task answers");
+        assert!(finished["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("completed"));
+        assert!(out.responses().iter().all(|r| r["id"] != 1));
+        let waiting = out
+            .wait_for(1)
+            .expect("running task answers at its deadline");
+        assert!(waiting["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("running"));
+    }
+
+    #[test]
+    fn a_cancelled_notification_fails_the_matching_held_task_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().into();
+        let cancelled = register_running(dir.path(), "a");
+        let other = register_running(dir.path(), "b");
+        let server = Arc::new(OmarMcpServer::new(context).with_hold(true));
+        feed(
+            &server,
+            &[
+                held_get_task(1, &cancelled, 30),
+                held_get_task(2, &other, 3),
+                json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}),
+            ],
+        );
+        for _ in 0..100 {
+            let task = crate::supervision::task(dir.path(), 0, "ea", &cancelled).unwrap();
+            if task.status.terminal() {
+                assert_eq!(task.status, crate::supervision::Status::Failed);
+                assert_eq!(task.result, Some(json!("cancelled by orchestrator")));
+                let untouched = crate::supervision::task(dir.path(), 0, "ea", &other).unwrap();
+                assert_eq!(untouched.status, crate::supervision::Status::Running);
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the cancelled task never failed");
+    }
+
+    #[test]
+    fn a_retried_spawn_reattaches_only_to_the_same_unretired_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = register_running(dir.path(), "w");
+        let find = |task: &str| crate::supervision::reattachable_task(dir.path(), 0, "w", task);
+        assert_eq!(find("task").unwrap(), Some(id.clone()));
+        assert_eq!(find("another task").unwrap(), None);
+        crate::supervision::finish(
+            dir.path(),
+            0,
+            "ea",
+            &id,
+            crate::supervision::Status::Completed,
+            json!("done"),
+        )
+        .unwrap();
+        assert_eq!(find("task").unwrap(), Some(id.clone()));
+        crate::supervision::cancel_agent(dir.path(), 0, "w").unwrap();
+        assert_eq!(find("task").unwrap(), None);
+    }
+
+    #[test]
+    fn held_get_task_returns_a_finished_result_and_times_out_on_a_running_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().into();
+        let done = register_running(dir.path(), "a");
+        let running = register_running(dir.path(), "b");
+        crate::supervision::finish(
+            dir.path(),
+            0,
+            "ea",
+            &done,
+            crate::supervision::Status::Completed,
+            json!({"answer":42}),
+        )
+        .unwrap();
+        let server = OmarMcpServer::new(context).with_hold(true);
+        let finished = server
+            .held(json!({"task_id":done,"wait_s":1}), |args| {
+                crate::supervision::get_task(dir.path(), 0, "ea", &args)
+            })
+            .unwrap();
+        assert_eq!(finished["status"], "completed");
+        assert!(finished["content"].as_str().unwrap().contains("42"));
+        assert!(
+            crate::supervision::task(dir.path(), 0, "ea", &done)
+                .unwrap()
+                .acknowledged
+        );
+        let timed_out = server.hold_task(&running, 1).unwrap();
+        assert_eq!(timed_out, json!({"task_id":running,"status":"running"}));
+    }
+
+    #[test]
+    fn a_held_blocked_task_is_returned_as_blocked_and_left_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().into();
+        let id = register_running(dir.path(), "w");
+        crate::supervision::finish(
+            dir.path(),
+            0,
+            "ea",
+            &id,
+            crate::supervision::Status::Blocked,
+            json!("need the api key"),
+        )
+        .unwrap();
+        let server = OmarMcpServer::new(context).with_hold(true);
+        let reply = server.hold_task(&id, 5).unwrap();
+        assert_eq!(reply["status"], "blocked");
+        assert!(reply["content"].as_str().unwrap().contains("api key"));
+        let task = crate::supervision::task(dir.path(), 0, "ea", &id).unwrap();
+        assert!(!task.acknowledged && !task.retired);
+        assert_eq!(task.held_until_ms, 0);
+    }
+
+    #[test]
+    fn a_held_task_is_retired_once_delivered_and_is_held_while_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().into();
+        let id = register_running(dir.path(), "w");
+        let server = OmarMcpServer::new(context).with_hold(true);
+        server.hold_task(&id, 1).unwrap();
+        let held = crate::supervision::task(dir.path(), 0, "ea", &id).unwrap();
+        assert!(held.held_until_ms > crate::supervision::now_ms());
+        crate::supervision::finish(
+            dir.path(),
+            0,
+            "ea",
+            &id,
+            crate::supervision::Status::Completed,
+            json!("done"),
+        )
+        .unwrap();
+        server.hold_task(&id, 1).unwrap();
+        let task = crate::supervision::task(dir.path(), 0, "ea", &id).unwrap();
+        assert!(task.acknowledged && task.retired);
+        assert_eq!(
+            crate::supervision::reattachable_task(dir.path(), 0, "w", "task").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_held_spawn_without_a_task_id_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().into();
+        let server = OmarMcpServer::new(context).with_hold(true);
+        let error = server
+            .held(json!({"wait_s":1}), |_| Ok(json!({"agent_name":"gone"})))
+            .unwrap_err();
+        assert!(error.to_string().contains("tracked tasks"));
+    }
+
+    #[test]
+    fn only_a_hold_server_reuses_a_project_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().into();
+        let add = |server: &OmarMcpServer| {
+            server.add_project(json!({"name":"cc-workflows"})).unwrap()["project_id"].clone()
+        };
+        let held = OmarMcpServer::new(context.clone()).with_hold(true);
+        assert_eq!(add(&held), add(&held));
+        let plain = OmarMcpServer::new(context);
+        assert_ne!(add(&plain), add(&plain));
+    }
+
+    #[test]
+    fn a_held_spawn_agent_passes_a_non_claude_backend_through_and_returns_its_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().into();
+        let server = OmarMcpServer::new(context).with_hold(true);
+        assert!(crate::backend::resolve("stub").is_ok());
+        // Stands in for spawn_agent: the stub worker finishes at once.
+        let result = server
+            .held(
+                json!({"name":"w","backend":"stub","task":"t","wait_s":5}),
+                |args| {
+                    assert_eq!(args, json!({"name":"w","backend":"stub","task":"t"}));
+                    let id = register_running(dir.path(), "w");
+                    crate::supervision::finish(
+                        dir.path(),
+                        0,
+                        "ea",
+                        &id,
+                        crate::supervision::Status::Completed,
+                        json!("stub says hi"),
+                    )?;
+                    Ok(json!({ "task_id": id }))
+                },
+            )
+            .unwrap();
+        assert_eq!(result["status"], "completed");
+        assert!(result["content"].as_str().unwrap().contains("stub says hi"));
     }
 
     #[test]
@@ -3066,7 +3602,7 @@ mod tests {
         assert_eq!(ea.canonical_tool_name("omar_reply"), "omar_reply");
     }
 
-    fn listed_tools_of(server: &OmarMcpServer) -> Vec<String> {
+    fn tool_list(server: &OmarMcpServer) -> Vec<Value> {
         let response = server
             .handle_request(JsonRpcRequest {
                 jsonrpc: "2.0".to_string(),
@@ -3078,6 +3614,11 @@ mod tests {
         response.result.expect("tools result")["tools"]
             .as_array()
             .expect("tools array")
+            .clone()
+    }
+
+    fn listed_tools_of(server: &OmarMcpServer) -> Vec<String> {
+        tool_list(server)
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect()

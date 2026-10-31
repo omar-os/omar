@@ -920,7 +920,7 @@ impl App {
             self.scheduler
                 .cancel_by_receiver_and_ea(&short_name, self.active_ea);
 
-            self.client.kill_session(&name)?;
+            crate::backend::kill_worker(&self.client, &name, false)?;
             memory::remove_agent_parent_in(&state_dir, &name);
             self.status_message = Some(format!("Killed agent: {}", name));
             self.refresh()?;
@@ -1328,7 +1328,11 @@ impl App {
 
         // Transactional delete: cleanup must succeed before registry mutation.
         for session_name in &sessions_to_delete {
-            ea_client.kill_session(session_name)?;
+            if *session_name == manager_session {
+                ea_client.kill_session(session_name)?;
+            } else {
+                crate::backend::kill_worker(&ea_client, session_name, false)?;
+            }
         }
 
         // Remove state directory
