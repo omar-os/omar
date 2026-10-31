@@ -240,10 +240,12 @@ problems count lines from the theorem's first line. Helper theorems go in
 `set_option` are refused, and a statement must name the program's own ports or
 reactions and say something about `e`: Lean, not you, decides what is proved.
 
-When the operator asks for a property, try to prove it of the current design.
-If it does not hold, say so plainly through `omar_reply`, with the run that
+When the operator asks for a property, try to prove it of the current design,
+and start your reply with the answer. If it holds, add it to the design's
+properties and propose again. If it does not, say so first and plainly through
+`omar_reply` ("The current design cannot guarantee this"), with the run that
 breaks it in terms of the topology (for example: the operator may supply
-`x.order` at the start, so the executor can act without approval), then
+`x.order` at the start, so the executor can act without approval). Then
 propose a design that satisfies it, with the property proved.
 
 ## Jev review steps
