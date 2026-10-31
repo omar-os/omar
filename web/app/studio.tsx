@@ -473,7 +473,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   /** Watch a live run until it reaches a terminal status. */
   const observe = useCallback(
     (record: RunRecord) => {
-      const diagramUrl = diagramUrlFor(record, readOnly ? serveUrl : undefined);
+      const diagramUrl = diagramUrlFor(record, serveUrl);
       disconnectRef.current?.();
       let connected = true;
 
@@ -586,7 +586,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         unsubscribe();
       };
     },
-    [serveUrl, loadPanel, readOnly],
+    [serveUrl, loadPanel],
   );
 
   // A chat can be reopened during admission, before its diagram binds.
@@ -714,7 +714,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           // and its live snapshot is fetched. Commit them in one React batch.
           // A paused run's diagram server is gone; serve kept its last picture.
           const liveSnapshot = activeRun && conversation.run?.diagram_address
-            ? await fetchDiagram(diagramUrlFor(conversation.run, readOnly ? serveUrl : undefined), abort.signal).catch(() => null)
+            ? await fetchDiagram(diagramUrlFor(conversation.run, serveUrl), abort.signal).catch(() => null)
             : conversation.run?.status === "paused"
               ? await fetchRunSnapshot(serveUrl, conversation.run.run_id, abort.signal).catch(() => null)
               : null;
@@ -772,7 +772,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       disconnectRef.current?.();
       disconnectRef.current = null;
     };
-  }, [agent, restoreConversation, observe, loadPanel, serveUrl, historyUrl, onSelect, readOnly]);
+  }, [agent, restoreConversation, observe, loadPanel, serveUrl, historyUrl, onSelect]);
 
   async function confirmDesign(options: DeployOptions) {
     if (!design || !["review", "finished", "failed"].includes(phase)) return;

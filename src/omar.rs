@@ -9,6 +9,7 @@ mod config;
 mod deploy;
 mod diagram;
 mod ea;
+mod ea_lifecycle;
 mod event;
 mod manager;
 mod mcp;
@@ -2053,11 +2054,8 @@ async fn run_dashboard(config: Config, session: sessions::Session) -> Result<()>
                         }
                         KeyCode::Char('D') => {
                             // Delete the currently active EA (last EA is protected)
-                            if app.session.is_some() {
-                                app.set_status(
-                                    "EA deletion is not available while attached; the runtime owns EAs",
-                                );
-                            } else if app.registered_eas.len() > 1 {
+                            app.registered_eas = ea::load_registry(&app.omar_dir);
+                            if app.registered_eas.len() > 1 {
                                 app.pending_confirm = Some(app::ConfirmAction::DeleteEa);
                             } else {
                                 app.set_status("Cannot delete the only EA");

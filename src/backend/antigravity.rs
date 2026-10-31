@@ -248,6 +248,31 @@ where
     Ok(())
 }
 
+pub(crate) fn remove_session_mcp_config(root: &std::path::Path, ea_id: EaId) -> Result<()> {
+    let Some(config_dir) = antigravity_config_dir() else {
+        return Ok(());
+    };
+    let path = config_dir
+        .join("plugins")
+        .join(format!("omar-ea-{ea_id}"))
+        .join("mcp_config.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let key = format!("omar-ea-{ea_id}");
+    let context = value["mcpServers"][&key]["args"]
+        .as_array()
+        .and_then(|args| args.last())
+        .and_then(|arg| arg.as_str());
+    if context.is_some_and(|context| std::path::Path::new(context).starts_with(root)) {
+        remove_omar_antigravity_mcp_config(ea_id)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn remove_omar_antigravity_mcp_config(ea_id: EaId) -> Result<()> {
     let Some(config_dir) = antigravity_config_dir() else {
         return Ok(());

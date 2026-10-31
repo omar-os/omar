@@ -559,19 +559,15 @@ export async function fetchRunProgram(
 }
 
 /**
- * `omar serve` reports `host:port`; the diagram API is plain HTTP on loopback.
- *
- * A remote viewer cannot reach loopback, so a view port relays the same API
- * under the run: pass its URL as `relay`.
+ * Where to watch a run's diagram: serve relays it under the run. The run's own
+ * diagram server is on serve's loopback, which a browser reaches only when it
+ * runs on the same machine, not through a tunnel or from another host.
  */
-export function diagramUrlFor(record: RunRecord, relay?: string): string {
+export function diagramUrlFor(record: RunRecord, serveUrl: string): string {
   if (!record.diagram_address) {
     throw new Error(`Run ${record.run_id} has no diagram address yet.`);
   }
-  if (relay) {
-    return `${normalizeRuntimeUrl(relay)}/v1/runs/${encodeURIComponent(record.run_id)}/diagram`;
-  }
-  return `http://${record.diagram_address}`;
+  return `${normalizeRuntimeUrl(serveUrl)}/v1/runs/${encodeURIComponent(record.run_id)}/diagram`;
 }
 
 export async function fetchDiagram(

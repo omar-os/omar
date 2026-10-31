@@ -243,7 +243,6 @@ pub fn migrate(plan: &Bytecode, state: &mut ExecutionState) -> Vec<String> {
             _ => {}
         }
     }
-    drop(drop_events);
     state.queue = queue
         .into_iter()
         .filter(|(_, events)| !events.is_empty())

@@ -127,10 +127,16 @@ test("prompt to finished run, gated on an explicit confirmation", async ({ page 
   await expect(page.locator(".source-title")).toContainText("completed");
 });
 
-test("the diagram reflects live reaction state from the run", async ({ page }) => {
+test("the diagram reflects live reaction state from the run, relayed by serve", async ({ page }) => {
+  // Like a browser on the far end of an SSH tunnel: it reaches serve, never
+  // the run's own diagram server on serve's loopback.
+  await page.route(/\/v1\/(?:diagram|events)$/, (route) =>
+    /\/v1\/runs\/[^/]+\/diagram\//.test(route.request().url()) ? route.fallback() : route.abort());
   await useFakeServe(page);
   await draftUntilProposed(page);
   await deploy(page);
+  // Live events arrive only on the run's stream.
+  await expect(page.locator(".event-strip")).toContainText("reaction completed");
   await expect(page.locator(".connection")).toContainText("finished", {
     timeout: 30_000,
   });
