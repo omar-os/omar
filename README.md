@@ -132,6 +132,9 @@ $ omar up --tui
 
 Or attach to a running session with `omar attach -s <session> --tui`. `z`
 detaches and the runtime keeps every workload running; `Q` stops the session.
+`D` asks for confirmation, then deletes the selected EA and its agents. The
+runtime and other EAs keep running; the final EA cannot be deleted. Detach
+terminals attached to that EA's agents before confirming deletion.
 
 Go [here](#supported-agent-backends) to see how to launch with specific agent backends.
 

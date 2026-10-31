@@ -337,12 +337,22 @@ struct Chat {
 struct Workspaces {
     history: Arc<Mutex<History>>,
     contexts: Mutex<BTreeMap<String, Arc<Context_>>>,
-    root: Arc<Context_>,
+    settings: Settings,
     selection: Mutex<()>,
     editors: Mutex<crate::editor::Editors>,
     presence: Mutex<Presence>,
     launch_ea: AtomicBool,
     shutdown: Arc<AtomicBool>,
+}
+
+/// Session configuration is independent of any EA's live context.
+struct Settings {
+    omar_dir: PathBuf,
+    session_prefix: String,
+    default_workdir: String,
+    health_idle_warning: i64,
+    command: String,
+    address: SocketAddr,
 }
 
 struct Context_ {
@@ -374,6 +384,11 @@ struct Context_ {
 }
 
 impl Context_ {
+    /// Hold this while serving the EA so its deletion waits for the work.
+    fn admit(&self) -> Result<crate::ea_lifecycle::Admission> {
+        crate::ea_lifecycle::Admission::acquire(&self.omar_dir, self.ea_id)
+    }
+
     fn publish(
         &self,
         role: ChatRole,
@@ -392,6 +407,7 @@ impl Context_ {
         design: Option<ProposedDesign>,
         selection: Vec<String>,
     ) -> Result<ChatMessage> {
+        let _admission = self.admit()?;
         let mut chat = self.chat.lock().expect("serve chat poisoned");
         let message = self.history.lock().expect("history poisoned").append_to(
             &self.conversation_id,
@@ -442,6 +458,82 @@ pub struct Serve {
 }
 
 impl Serve {
+    pub(crate) fn session_delete_ea(
+        &self,
+        id: EaId,
+        scheduler: &crate::scheduler::Scheduler,
+    ) -> Result<Value> {
+        let root = &self.workspaces.settings.omar_dir;
+        let result = crate::ea_lifecycle::delete(
+            root,
+            id,
+            &self.workspaces.settings.session_prefix,
+            scheduler,
+            || {
+                let contexts = self
+                    .workspaces
+                    .contexts
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|context| context.ea_id == id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for workspace in crate::workspace::list(root, id)? {
+                    self.workspaces.editors.lock().unwrap().stop(&workspace.id);
+                }
+                for context in &contexts {
+                    // Mutation continuations must not launch a replacement after a stop.
+                    context.mutations.lock().unwrap().clear();
+                    let ids = context
+                        .runs
+                        .lock()
+                        .unwrap()
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for run in ids {
+                        let (status, value) = stop_run(context, &run);
+                        anyhow::ensure!(status < 400, "cannot stop run: {}", value["error"]);
+                    }
+                }
+                crate::ea_lifecycle::wait_until(
+                    40,
+                    "EA deletion is fenced; waiting for topology termination timed out; retry deletion",
+                    || {
+                        !contexts.iter().any(|context| {
+                            context
+                                .runs
+                                .lock()
+                                .unwrap()
+                                .values()
+                                .any(|run| run.status.is_active())
+                        })
+                    },
+                )?;
+                for context in &contexts {
+                    context.agent_token.lock().unwrap().clear();
+                    context.chat.lock().unwrap().subscribers.clear();
+                    context.panels.lock().unwrap().clear();
+                }
+                Ok(())
+            },
+            |survivor| {
+                self.workspaces
+                    .history
+                    .lock()
+                    .unwrap()
+                    .remove_ea(id, survivor)
+            },
+        )?;
+        self.workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .retain(|_, context| context.ea_id != id);
+        Ok(json!(result))
+    }
+
     pub(crate) fn session_runs(&self, ea: Option<EaId>) -> Vec<Value> {
         self.workspaces
             .contexts
@@ -466,6 +558,8 @@ impl Serve {
     }
 
     pub(crate) fn session_start(&self, ea: EaId, body: Value) -> Result<Value> {
+        let _ea_admission =
+            crate::ea_lifecycle::Admission::acquire(&self.workspaces.settings.omar_dir, ea)?;
         let admission = self.workspaces.presence.lock().unwrap();
         anyhow::ensure!(
             !self.workspaces.shutdown.load(Ordering::SeqCst),
@@ -484,7 +578,7 @@ impl Serve {
     pub(crate) fn session_create_ea(&self, name: &str, command: Option<&str>) -> Result<EaId> {
         // Browser-created chats allocate from this same registry.
         let _selection = self.workspaces.selection.lock().unwrap();
-        let root = &self.workspaces.root.omar_dir;
+        let root = &self.workspaces.settings.omar_dir;
         let id = crate::ea::register_ea(root, name, None)?;
         if let Some(command) = command {
             crate::manager::write_private_file(
@@ -496,6 +590,8 @@ impl Serve {
     }
 
     pub(crate) fn session_start_manager(&self, ea: EaId) -> Result<Value> {
+        let _ea_admission =
+            crate::ea_lifecycle::Admission::acquire(&self.workspaces.settings.omar_dir, ea)?;
         let _admission = self.workspaces.presence.lock().unwrap();
         anyhow::ensure!(
             !self.workspaces.shutdown.load(Ordering::SeqCst),
@@ -605,6 +701,8 @@ impl Serve {
         selector: &str,
         eligible: impl Fn(&RunRecord) -> bool,
     ) -> Result<(Arc<Context_>, String)> {
+        let _admission =
+            crate::ea_lifecycle::Admission::acquire(&self.workspaces.settings.omar_dir, ea)?;
         // The EA's chat context is where its parked runs are offered again
         // after a restart; it exists once something asks for the EA.
         let id = self.workspaces.history.lock().unwrap().chat_for_ea(ea)?;
@@ -709,8 +807,7 @@ impl Serve {
             .with_context(|| format!("failed to bind serve at {address}"))?;
         let address = listener.local_addr()?;
         let agent_token = Uuid::new_v4().to_string();
-        let mut history =
-            History::load(crate::ea::ea_state_dir(ea_id, omar_dir).join("chats.json"))?;
+        let mut history = History::load_session(omar_dir)?;
         let has_history = !history.active().messages.is_empty();
         let conversation_id = history.active_id.clone();
         let workspace_ea = match history.active().ea_id {
@@ -771,7 +868,14 @@ impl Serve {
         let workspaces = Arc::new(Workspaces {
             history,
             contexts: Mutex::new(BTreeMap::from([(conversation_id, context.clone())])),
-            root: context.clone(),
+            settings: Settings {
+                omar_dir: omar_dir.to_path_buf(),
+                session_prefix: config.dashboard.session_prefix.clone(),
+                default_workdir: config.agent.default_workdir.clone(),
+                health_idle_warning: config.health.idle_warning,
+                command: config.agent.default_command.clone(),
+                address,
+            },
             selection: Mutex::new(()),
             editors: Mutex::new(crate::editor::Editors::default()),
             presence: Mutex::new(Presence::default()),
@@ -900,8 +1004,15 @@ impl Serve {
         restart: bool,
         launch: bool,
     ) -> Result<AttachEa> {
+        let _admission = crate::ea_lifecycle::Admission::acquire(omar_dir, self.ea_id)?;
         self.workspaces.launch_ea.store(launch, Ordering::Relaxed);
-        let context = &self.workspaces.root;
+        let id = self
+            .workspaces
+            .history
+            .lock()
+            .unwrap()
+            .chat_for_ea(self.ea_id)?;
+        let context = &self.workspaces.get(&id)?;
         let _operation = context
             .chat_operation
             .lock()
@@ -1317,6 +1428,18 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
     };
 
+    let admission = match context.admit() {
+        Ok(admission) => admission,
+        Err(error) => {
+            return write_json(
+                &mut stream,
+                410,
+                &json!({"error":error.to_string()}),
+                origin,
+            )
+        }
+    };
+
     if path == "/v1/workspaces" || path.starts_with("/v1/workspaces/") {
         // Workspace reads expose host files; editor launch grants shell access.
         // Reject cross-site requests, including simple POSTs, rather than only
@@ -1360,6 +1483,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             crate::ea::ea_prefix(context.ea_id, &context.session_prefix),
             crate::tmux::flatten_agent_name(&agent)
         );
+        drop(admission);
         return attach_terminal(
             stream,
             &session,
@@ -1387,6 +1511,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             );
         }
         let session = crate::ea::ea_manager_session(context.ea_id, &context.session_prefix);
+        drop(admission);
         return attach_terminal(
             stream,
             &session,
@@ -1432,6 +1557,9 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
                     .chat_operation
                     .lock()
                     .expect("chat operation poisoned");
+                let Ok(_admission) = context.admit() else {
+                    return;
+                };
                 if context.chat.lock().expect("chat poisoned").needs_relaunch {
                     let command = context.command.lock().expect("command poisoned").clone();
                     match relaunch_ea(&context, &command) {
@@ -1441,7 +1569,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
                 }
             });
         }
-        return stream_chat(stream, &context, origin);
+        return stream_chat(stream, &context, origin, admission);
     }
 
     if method == "GET" {
@@ -2109,6 +2237,7 @@ impl Workspaces {
     fn get(&self, id: &str) -> Result<Arc<Context_>> {
         let mut contexts = self.contexts.lock().expect("workspaces poisoned");
         if let Some(context) = contexts.get(id) {
+            let _admission = context.admit()?;
             return Ok(context.clone());
         }
         let mut history = self.history.lock().expect("history poisoned");
@@ -2121,9 +2250,9 @@ impl Workspaces {
         let ea_id = match saved.ea_id {
             Some(ea_id) => ea_id,
             None => {
-                crate::ea::ensure_default_ea(&self.root.omar_dir)?;
+                crate::ea::ensure_default_ea(&self.settings.omar_dir)?;
                 let ea_id = crate::ea::register_ea(
-                    &self.root.omar_dir,
+                    &self.settings.omar_dir,
                     &format!("chat-{id}"),
                     Some("Mission Control chat"),
                 )?;
@@ -2131,8 +2260,9 @@ impl Workspaces {
                 ea_id
             }
         };
+        let _admission = crate::ea_lifecycle::Admission::acquire(&self.settings.omar_dir, ea_id)?;
         // The EA's parked runs, unless a chat already offers them.
-        let mut parked = paused_runs(&self.root.omar_dir, ea_id);
+        let mut parked = paused_runs(&self.settings.omar_dir, ea_id);
         for other in contexts.values() {
             let held = other.runs.lock().expect("runs poisoned");
             parked.retain(|run_id, _| !held.contains_key(run_id));
@@ -2144,11 +2274,11 @@ impl Workspaces {
         let context = Arc::new(Context_ {
             history: self.history.clone(),
             conversation_id: id.to_string(),
-            omar_dir: self.root.omar_dir.clone(),
+            omar_dir: self.settings.omar_dir.clone(),
             ea_id,
-            session_prefix: self.root.session_prefix.clone(),
-            default_workdir: self.root.default_workdir.clone(),
-            health_idle_warning: self.root.health_idle_warning,
+            session_prefix: self.settings.session_prefix.clone(),
+            default_workdir: self.settings.default_workdir.clone(),
+            health_idle_warning: self.settings.health_idle_warning,
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             mutations: Mutex::default(),
@@ -2163,11 +2293,11 @@ impl Workspaces {
             agent_token: Mutex::new(Uuid::new_v4().to_string()),
             chat_operation: Mutex::new(()),
             command: Arc::new(Mutex::new(assistant_command(
-                &self.root.omar_dir,
+                &self.settings.omar_dir,
                 ea_id,
-                &self.root.command.lock().expect("command poisoned"),
+                &self.settings.command,
             ))),
-            address: self.root.address,
+            address: self.settings.address,
             shutdown: self.shutdown.clone(),
         });
         contexts.insert(id.to_string(), context.clone());
@@ -2234,8 +2364,17 @@ fn select_chat(workspaces: &Arc<Workspaces>, id: Option<&str>) -> (u16, Value) {
     let _selection = workspaces.selection.lock().expect("selection poisoned");
     let selected = {
         let mut history = workspaces.history.lock().expect("history poisoned");
-        if id.is_some_and(|id| !history.conversations.iter().any(|chat| chat.id == id)) {
-            return (404, json!({"error": "unknown chat"}));
+        if let Some(id) = id {
+            let Some(chat) = history.conversations.iter().find(|chat| chat.id == id) else {
+                return (404, json!({"error": "unknown chat"}));
+            };
+            let omar_dir = &workspaces.settings.omar_dir;
+            if chat
+                .ea_id
+                .is_some_and(|ea| crate::ea_lifecycle::fenced(omar_dir, ea))
+            {
+                return (410, json!({"error":"EA is deleting or deleted"}));
+            }
         }
         if let Err(error) = history.select(id) {
             return (500, json!({"error": error.to_string()}));
@@ -2536,7 +2675,12 @@ fn compile_preview(program: &str, files: &BTreeMap<String, String>) -> Result<Vm
     staged.finish(outcome).map_err(anyhow::Error::msg)
 }
 
-fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&str>) -> Result<()> {
+fn stream_chat(
+    mut stream: TcpStream,
+    context: &Arc<Context_>,
+    origin: Option<&str>,
+    admission: crate::ea_lifecycle::Admission,
+) -> Result<()> {
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n{}Vary: Origin\r\n\r\n",
@@ -2551,6 +2695,7 @@ fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&s
         (saved.summary(), saved.messages.clone())
     };
     context.live_summary(&mut conversation);
+    drop(admission);
     writeln!(
         stream,
         "event: conversation\ndata: {}\n",
@@ -2627,6 +2772,10 @@ fn write_chat_event(stream: &mut TcpStream, message: &ChatMessage) -> Result<()>
 }
 
 fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    let _admission = match context.admit() {
+        Ok(admission) => admission,
+        Err(error) => return (410, json!({"error":error.to_string()})),
+    };
     let _operation = context
         .chat_operation
         .lock()
@@ -3729,6 +3878,9 @@ fn promote(from: &Path, to: &Path) -> Result<()> {
 /// the mutation's and not the operator's; not resumed while the runtime is
 /// shutting down, which wanted the run paused anyway.
 fn complete_mutation(context: &Arc<Context_>, run_id: &str) {
+    let Ok(_admission) = context.admit() else {
+        return;
+    };
     let Some((bytecode, staged)) = context
         .mutations
         .lock()
@@ -3772,6 +3924,10 @@ fn complete_mutation(context: &Arc<Context_>, run_id: &str) {
 /// same run id. The program it was admitted with is still staged beside the
 /// run, so generated code lands where the original run put it.
 fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let _admission = match context.admit() {
+        Ok(admission) => admission,
+        Err(error) => return (410, json!({"error":error.to_string()})),
+    };
     // Serialised with admission: a fresh start's team check and this run's
     // return to `Starting` must not interleave, or both would launch.
     let _operation = context
@@ -4532,6 +4688,79 @@ mod tests {
     }
 
     #[test]
+    fn deleting_zero_retires_live_contexts_and_preserves_survivor_history() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::ea::ensure_default_ea(dir.path()).unwrap();
+        let mut config = Config::default();
+        config.dashboard.session_prefix = format!("retire-{}-", Uuid::new_v4());
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let first_message = |server: &Serve, chat: &str| {
+            let history = server.workspaces.history.lock().unwrap();
+            history.conversation(chat).messages[0].text.clone()
+        };
+        let survivor = server.session_create_ea("survivor", None).unwrap();
+        let chat = server
+            .workspaces
+            .history
+            .lock()
+            .unwrap()
+            .chat_for_ea(survivor)
+            .unwrap();
+        let other = server.workspaces.get(&chat).unwrap();
+        other
+            .publish(ChatRole::Assistant, "Keep this".into(), false, None)
+            .unwrap();
+        let saved = record("surviving", RunStatus::Paused);
+        other
+            .runs
+            .lock()
+            .unwrap()
+            .insert(saved.run_id.clone(), saved);
+        for status in [RunStatus::Paused, RunStatus::Completed] {
+            let saved = record("target", status);
+            server
+                .context
+                .runs
+                .lock()
+                .unwrap()
+                .insert(saved.run_id.clone(), saved);
+        }
+        let scheduler = crate::scheduler::Scheduler::with_store(
+            crate::scheduler::events_store_path(dir.path()),
+        );
+        assert_eq!(
+            server.session_delete_ea(0, &scheduler).unwrap()["deleted_ea"],
+            0
+        );
+        assert!(server
+            .workspaces
+            .get(&server.context.conversation_id)
+            .is_err());
+        assert!(server.context.agent_token.lock().unwrap().is_empty());
+        assert!(server
+            .workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .values()
+            .all(|context| context.ea_id == survivor));
+        assert!(server.session_runs(Some(0)).is_empty());
+        assert_eq!(server.session_runs(Some(survivor)).len(), 1);
+        assert_eq!(first_message(&server, &chat), "Keep this");
+        assert!(!crate::ea::ea_state_dir(0, dir.path()).exists());
+        drop(server);
+        let restarted = Serve::start(
+            "127.0.0.1:0".parse().unwrap(),
+            &config,
+            dir.path(),
+            survivor,
+        )
+        .unwrap();
+        assert_eq!(first_message(&restarted, &chat), "Keep this");
+        assert!(!crate::ea::ea_state_dir(0, dir.path()).exists());
+    }
+
+    #[test]
     #[ignore = "requires omarc"]
     fn builder_proposals_compile_and_preserve_imported_schema_files() {
         let server = test_server();
@@ -5067,7 +5296,7 @@ mod tests {
     #[test]
     fn history_save_errors_are_returned_before_a_reply_is_published() {
         let server = test_server();
-        let path = crate::ea::ea_state_dir(0, &server.context.omar_dir).join("chats.json");
+        let path = server.context.omar_dir.join("chats.json");
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
         let body = json!({"token": server.agent_token, "text": "Cannot persist this"}).to_string();

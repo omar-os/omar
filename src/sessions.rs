@@ -181,6 +181,16 @@ pub fn state_root() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(home_root)
 }
+/// Resolve an MCP context's owner from its private launch record, rather than
+/// routing through environment inherited from a different session.
+pub(crate) fn owner(directory: &Path) -> Result<Option<Session>> {
+    match fs::read(directory.join("launch.json")) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice::<Launch>(&bytes)?.session)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub fn is_managed() -> bool {
     std::env::var_os("OMAR_SESSION_ID").is_some() && std::env::var_os("OMAR_STATE_DIR").is_some()
 }
@@ -331,7 +341,13 @@ fn ea_selector(cli: &Cli) -> String {
                 None
             }
         })
-        .unwrap_or_else(|| "0".into())
+        .unwrap_or_else(|| {
+            target(cli)
+                .ok()
+                .and_then(|s| ea::load_registry(&s.directory).iter().map(|ea| ea.id).min())
+                .unwrap_or(0)
+                .to_string()
+        })
 }
 fn read_frame(stream: impl Read) -> Result<Value> {
     let mut raw = String::new();
@@ -1023,7 +1039,12 @@ fn request_graceful(server: &Arc<Serve>, session: &Mutex<Session>) -> Result<()>
     Ok(())
 }
 
-fn handle_operation(server: &Serve, session: &mut Session, operation: Value) -> Result<Value> {
+fn handle_operation(
+    server: &Serve,
+    scheduler: &crate::scheduler::Scheduler,
+    session: &mut Session,
+    operation: Value,
+) -> Result<Value> {
     let op = operation["op"].as_str().context("operation is required")?;
     if op == "hello" {
         return Ok(json!(session));
@@ -1035,23 +1056,36 @@ fn handle_operation(server: &Serve, session: &mut Session, operation: Value) -> 
         session.state == "ready",
         "runtime is stopping; no new operations admitted"
     );
+    if op == "eas" {
+        return Ok(json!(ea::load_registry(&session.directory)));
+    }
+    if op == "create_ea" {
+        let name = operation["name"].as_str().context("EA name is required")?;
+        let command = operation["agent"]
+            .as_str()
+            .map(|name| {
+                crate::backend::resolve(name)
+                    .map(|b| b.default_command().to_string())
+                    .map_err(anyhow::Error::msg)
+            })
+            .transpose()?;
+        let id = server.session_create_ea(name, command.as_deref())?;
+        return Ok(json!({"id":id,"name":name}));
+    }
     let ea = operation["ea"].as_str().unwrap_or("0");
-    let target = ea::resolve_ea_selector(&session.directory, Some(ea))?;
-    match op {
-        "eas" => Ok(json!(ea::load_registry(&session.directory))),
-        "create_ea" => {
-            let name = operation["name"].as_str().context("EA name is required")?;
-            let command = operation["agent"]
-                .as_str()
-                .map(|name| {
-                    crate::backend::resolve(name)
-                        .map(|b| b.default_command().to_string())
-                        .map_err(anyhow::Error::msg)
-                })
-                .transpose()?;
-            let id = server.session_create_ea(name, command.as_deref())?;
-            Ok(json!({"id":id,"name":name}))
+    if op == "delete_ea" {
+        let id = ea
+            .parse()
+            .or_else(|_| ea::resolve_ea_selector(&session.directory, Some(ea)).map(|ea| ea.id))?;
+        let result = server.session_delete_ea(id, scheduler);
+        if let Err(error) = &result {
+            eprintln!("EA {id} deletion failed: {error:#}");
         }
+        return result;
+    }
+    let target = ea::resolve_ea_selector(&session.directory, Some(ea))?;
+    let _admission = crate::ea_lifecycle::Admission::acquire(&session.directory, target.id)?;
+    match op {
         "manager_start" => server.session_start_manager(target.id),
         "start" => server.session_start(target.id, operation["request"].clone()),
         "runs" => Ok(json!(server.session_runs(
@@ -1187,8 +1221,22 @@ async fn daemon(directory: &Path) -> Result<()> {
     let config = Config::load(directory.join("config.toml").to_str())?;
     crate::metrics::configure(config.metrics.spawn_metrics_enabled);
     ea::ensure_default_ea(directory)?;
-    let server = Arc::new(Serve::start(launch.address, &config, directory, 0)?);
-    match server.attach_ea(&config, directory, 0, false, !launch.no_ea)? {
+    let scheduler = Arc::new(crate::scheduler::Scheduler::with_store(
+        crate::scheduler::events_store_path(directory),
+    ));
+    crate::ea_lifecycle::recover(directory, &config.dashboard.session_prefix, &scheduler)?;
+    let initial_ea = ea::load_registry(directory)
+        .iter()
+        .map(|ea| ea.id)
+        .min()
+        .context("session has no EAs")?;
+    let server = Arc::new(Serve::start(
+        launch.address,
+        &config,
+        directory,
+        initial_ea,
+    )?);
+    match server.attach_ea(&config, directory, initial_ea, false, !launch.no_ea)? {
         crate::serve::AttachEa::Attached(_) if launch.no_ea => {}
         crate::serve::AttachEa::Attached(session) => eprintln!("Executive assistant running in {session}"),
         crate::serve::AttachEa::AlreadyRunningWithoutServe(session) => eprintln!(
@@ -1199,11 +1247,8 @@ async fn daemon(directory: &Path) -> Result<()> {
         }
     }
     // A session owns exactly one scheduled-event delivery loop, even with no clients.
-    let scheduler = Arc::new(crate::scheduler::Scheduler::with_store(
-        crate::scheduler::events_store_path(directory),
-    ));
     let scheduler_task = tokio::spawn(crate::scheduler::run_event_loop(
-        scheduler,
+        scheduler.clone(),
         crate::scheduler::TickerBuffer::new(),
         config.dashboard.session_prefix.clone(),
     ));
@@ -1230,6 +1275,7 @@ async fn daemon(directory: &Path) -> Result<()> {
                 let session = session.clone();
                 let force = force.clone();
                 let operations = operations.clone();
+                let scheduler = scheduler.clone();
                 std::thread::spawn(move || {
                     let request = read_control_request(&stream);
                     // `down` must not queue behind a stuck operation it exists to end.
@@ -1250,7 +1296,7 @@ async fn daemon(directory: &Path) -> Result<()> {
                             let forced = request.operation["force"].as_bool().unwrap_or(false);
                             return begin_shutdown(&server, &session, &mut record, &force, forced);
                         }
-                        handle_operation(&server, &mut record, request.operation)
+                        handle_operation(&server, &scheduler, &mut record, request.operation)
                     });
                     if record.state != before {
                         *session.lock().unwrap() = record.clone();
