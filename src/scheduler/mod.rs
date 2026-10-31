@@ -160,20 +160,18 @@ fn load_events_from_store(store_path: &Path) -> Vec<ScheduledEvent> {
         .unwrap_or_default()
 }
 
-fn save_events_to_store(store_path: &Path, queue: &BinaryHeap<ScheduledEvent>) {
+fn save_events_to_store(
+    store_path: &Path,
+    queue: &BinaryHeap<ScheduledEvent>,
+) -> std::io::Result<()> {
     let mut events: Vec<ScheduledEvent> = queue.iter().cloned().collect();
     events.sort_by_key(|event| (event.timestamp, event.created_at));
     if let Some(parent) = store_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
     let tmp = store_path.with_extension("tmp");
-    if let Ok(content) = serde_json::to_string_pretty(&events) {
-        if fs::write(&tmp, content).is_ok() {
-            let _ = fs::rename(&tmp, store_path);
-        } else {
-            let _ = fs::remove_file(&tmp);
-        }
-    }
+    fs::write(&tmp, serde_json::to_string_pretty(&events)?)?;
+    fs::rename(&tmp, store_path)
 }
 
 impl Scheduler {
@@ -202,11 +200,12 @@ impl Scheduler {
         self.store_path.is_some()
     }
 
+    /// Returns the operation result and whether its persistent write succeeded.
     fn transaction<R>(
         &self,
         persist: bool,
         f: impl FnOnce(&mut BinaryHeap<ScheduledEvent>) -> R,
-    ) -> R {
+    ) -> (R, bool) {
         match &self.store_path {
             Some(store_path) => {
                 // If the on-disk lock can't be acquired (stuck peer, slow FS),
@@ -236,7 +235,7 @@ impl Scheduler {
                             );
                         }
                         let mut queue = self.queue.lock().unwrap();
-                        return f(&mut queue);
+                        return (f(&mut queue), false);
                     }
                 };
                 let mut queue = BinaryHeap::new();
@@ -244,15 +243,13 @@ impl Scheduler {
                     queue.push(event);
                 }
                 let result = f(&mut queue);
-                if persist {
-                    save_events_to_store(store_path, &queue);
-                }
+                let persisted = !persist || save_events_to_store(store_path, &queue).is_ok();
                 *self.queue.lock().unwrap() = queue;
-                result
+                (result, persisted)
             }
             None => {
                 let mut queue = self.queue.lock().unwrap();
-                f(&mut queue)
+                (f(&mut queue), false)
             }
         }
     }
@@ -277,7 +274,7 @@ impl Scheduler {
     ///   Err(true)  if found but ea_id doesn't match (event stays in queue)
     ///   Err(false) if not found
     pub fn cancel_if_ea(&self, event_id: &str, ea_id: u32) -> Result<ScheduledEvent, bool> {
-        let result = self.transaction(true, |queue| {
+        let (result, _) = self.transaction(true, |queue| {
             let events: Vec<ScheduledEvent> = queue.drain().collect();
             let mut cancelled = None;
             let mut wrong_ea = false;
@@ -309,11 +306,12 @@ impl Scheduler {
         self.transaction(false, |queue| {
             queue.iter().filter(|e| e.ea_id == ea_id).cloned().collect()
         })
+        .0
     }
 
     /// Cancel all events for a specific EA. Returns the number cancelled.
     pub fn cancel_by_ea(&self, ea_id: u32) -> usize {
-        let count = self.transaction(true, |queue| {
+        let (count, _) = self.transaction(true, |queue| {
             let events: Vec<ScheduledEvent> = queue.drain().collect();
             let mut count = 0;
             let mut remaining = BinaryHeap::new();
@@ -334,7 +332,7 @@ impl Scheduler {
     /// Cancel all events for a given receiver within a specific EA only.
     /// Fix V5: EA-scoped receiver cancellation prevents cross-EA event leaks.
     pub fn cancel_by_receiver_and_ea(&self, receiver: &str, ea_id: u32) -> usize {
-        let count = self.transaction(true, |queue| {
+        let (count, _) = self.transaction(true, |queue| {
             let events: Vec<ScheduledEvent> = queue.drain().collect();
             let mut count = 0;
             let mut remaining = BinaryHeap::new();
@@ -356,7 +354,7 @@ impl Scheduler {
     /// Fix V7: EA-scoped batching prevents cross-EA event delivery.
     #[cfg(test)]
     pub fn pop_batch(&self, receiver: &str, ea_id: u32, timestamp: u64) -> Vec<ScheduledEvent> {
-        let batch = self.transaction(true, |queue| {
+        let (batch, _) = self.transaction(true, |queue| {
             let events: Vec<ScheduledEvent> = queue.drain().collect();
             let mut batch = Vec::new();
             let mut remaining = BinaryHeap::new();
@@ -376,6 +374,7 @@ impl Scheduler {
 
     fn next_timestamp(&self) -> Option<u64> {
         self.transaction(false, |queue| queue.peek().map(|event| event.timestamp))
+            .0
     }
     fn take_due_deliveries(&self) -> Vec<DueDelivery> {
         self.transaction(true, |queue| {
@@ -452,6 +451,7 @@ impl Scheduler {
             *queue = remaining;
             deliveries
         })
+        .0
     }
 }
 
@@ -569,31 +569,32 @@ pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer, bas
                                 .filter(|s| client.session_has_live_pane(&s.name).unwrap_or(true))
                                 .map(|s| s.name)
                                 .collect();
-                            match crate::supervision::reconcile(
-                                root,
-                                crate::supervision::now_ms(),
-                                &live,
-                            ) {
-                                Ok(wakes) => {
-                                    for (ea_id, receiver, payload) in wakes {
-                                        let id = format!("supervisor-{ea_id}-{receiver}");
-                                        // Upsert preserves bounded queue size through outages.
-                                        scheduler.transaction(true, |queue| {
-                                            queue.retain(|event| event.id != id);
-                                            queue.push(ScheduledEvent {
-                                                id,
-                                                sender: "omar-runtime".into(),
-                                                receiver,
-                                                timestamp: now_ns(),
-                                                created_at: now_ns(),
-                                                payload,
-                                                recurring_ns: None,
-                                                ea_id,
-                                            });
+                            let result = crate::supervision::reconcile(root, &live, |wakes| {
+                                for (ea_id, receiver, payload) in wakes.iter().cloned() {
+                                    let id = format!("supervisor-{ea_id}-{receiver}");
+                                    // Upsert preserves bounded queue size through outages.
+                                    let (_, persisted) = scheduler.transaction(true, |queue| {
+                                        queue.retain(|event| event.id != id);
+                                        queue.push(ScheduledEvent {
+                                            id,
+                                            sender: "omar-runtime".into(),
+                                            receiver,
+                                            timestamp: now_ns(),
+                                            created_at: now_ns(),
+                                            payload,
+                                            recurring_ns: None,
+                                            ea_id,
                                         });
-                                    }
+                                    });
+                                    anyhow::ensure!(
+                                        persisted,
+                                        "supervision queue write was not persisted"
+                                    );
                                 }
-                                Err(error) => ticker.push(format!("supervision: {error}")),
+                                Ok(())
+                            });
+                            if let Err(error) = result {
+                                ticker.push(format!("supervision: {error}"));
                             }
                         }
                         Err(error) => ticker.push(format!("supervision inventory: {error}")),
@@ -1192,6 +1193,73 @@ mod tests {
             "event must still be deferred; delta={}s",
             delta_secs
         );
+    }
+
+    #[test]
+    fn wake_handoff_crash_after_queue_write_can_only_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = events_store_path(root);
+        let scheduler = Scheduler::with_store(store.clone());
+        let task = serde_json::from_value(serde_json::json!({
+            "id":"", "ea_id":0, "agent":"worker", "session":"s-worker", "parent":"ea",
+            "project_id":1, "assignment":"work", "status":"running", "result":null,
+            "acknowledged":false, "retired":false
+        }))
+        .unwrap();
+        let id = crate::supervision::register(root, task).unwrap();
+        crate::supervision::finish(
+            root,
+            0,
+            "worker",
+            &id,
+            crate::supervision::Status::Completed,
+            serde_json::json!("done"),
+        )
+        .unwrap();
+        let live = std::collections::BTreeSet::from(["s-worker".into()]);
+        let handoff = crate::supervision::reconcile(root, &live, |wakes| {
+            let (_, persisted) = scheduler.transaction(true, |queue| {
+                for (_, receiver, payload) in wakes {
+                    queue.push(make_event(receiver, "omar-runtime", now_ns(), payload));
+                }
+            });
+            assert!(persisted);
+            // Simulate process death before the ledger-clear transaction.
+            anyhow::bail!("crash after persistent queue write")
+        });
+        assert!(handoff.is_err());
+        let restarted = Scheduler::with_store(store);
+        assert_eq!(restarted.list_by_ea(0).len(), 1);
+        assert_eq!(restarted.list_by_ea(0)[0].receiver, "ea");
+        crate::supervision::reconcile(root, &live, |wakes| {
+            assert_eq!(wakes.len(), 1, "ledger still owes the wake");
+            Ok(())
+        })
+        .unwrap();
+        crate::supervision::reconcile(root, &live, |wakes| {
+            assert!(wakes.is_empty());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            restarted.list_by_ea(0).len(),
+            1,
+            "durable wake was never lost"
+        );
+    }
+
+    #[test]
+    fn queue_transaction_reports_failed_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = Scheduler::with_store(events_store_path(dir.path()));
+        fs::create_dir(dir.path().join("scheduled_events.tmp")).unwrap();
+        assert!(!scheduler.transaction(true, |_| ()).1);
+        // A live lock owner must not be mistaken for a successful disk write.
+        let lock =
+            StoreLock::acquire(store_lock_path(scheduler.store_path.as_ref().unwrap())).unwrap();
+        assert!(!scheduler.transaction(true, |_| ()).1);
+        drop(lock);
     }
 
     #[test]

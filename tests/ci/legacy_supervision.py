@@ -3,9 +3,9 @@
 
 No provider credentials or model calls. Parent uses the OpenCode HTTP contract;
 children are terminal processes driven via the same MCP tools a model uses.
-Exercises durable completion, complete process restart, redelivery without a
-human prompt, consumption, retirement, and Claude post-compaction hooks.
+Exercises one-shot completion, process restart without duplicate notices, orphan detection, and post-compaction hooks.
 """
+import contextlib
 import http.server
 import json
 import os
@@ -76,7 +76,8 @@ def main():
         return subprocess.run(["tmux", "-L", server_name, *args], check=True, capture_output=True, text=True)
 
     try:
-        with tempfile.TemporaryDirectory(prefix="omar-supervision-") as directory:
+        with tempfile.TemporaryDirectory(prefix="omar-supervision-") as directory, contextlib.ExitStack() as cleanup:
+            cleanup.callback(lambda: [process.stop() for process in processes])
             root = Path(directory)
             context = {"omar_dir": str(root), "ea_id": 0, "session_prefix": "reg-",
                        "default_command": "cat", "default_workdir": str(root), "health_idle_warning": 15,
@@ -112,7 +113,12 @@ def main():
             assert len(body["parts"][0]["text"]) < 5000, "large result leaked into wake context"
             print("PASS: worker completion automatically starts parent inference; wake context bounded", flush=True)
 
-            # Lose every model/MCP process after transport acceptance, before ack.
+            # Let the transport response commit before restarting the runtime.
+            deadline = time.monotonic() + 5
+            while json.loads((root / "scheduled_events.json").read_text()):
+                assert time.monotonic() < deadline, "accepted delivery did not settle"
+                time.sleep(0.02)
+            # Lose every model/MCP process before result acknowledgement.
             for process in processes:
                 process.stop()
             processes.clear()
@@ -120,11 +126,16 @@ def main():
                 receipts.get_nowait()
             parent = MCP(parent_file, env)
             processes.append(parent)
-            # No MCP request or user prompt triggers this retry. It comes from
-            # the persisted obligation and newly elected runtime alone.
-            endpoint, body = receipts.get(timeout=75)
-            assert task_id in body["parts"][0]["text"]
-            print("PASS: full process restart redelivers an accepted but unconsumed result autonomously", flush=True)
+            # Accepted notices do not recur, including after the old 60s interval.
+            try:
+                duplicate = receipts.get(timeout=65)
+                raise AssertionError(f"accepted completion was repeated: {duplicate}")
+            except queue.Empty:
+                pass
+            state = parent.call("coordination_state")
+            assert state["tasks"][0]["task_id"] == task_id
+            assert not state["tasks"][0]["acknowledged"]
+            print("PASS: restart preserves unconsumed results without repeating accepted notices", flush=True)
 
             # Native compaction hook reads disk, not a transcript or model summary.
             hook = subprocess.run([str(BIN), "agent-hook", "--context-file", str(parent_file)],
@@ -145,9 +156,25 @@ def main():
             assert json.loads(text)["result"] == result
             parent.call("acknowledge_task", task_id=task_id, result_revision=page["result_revision"])
             parent.call("kill_agent", name="child")
-            parent.call("complete_project", project_id=project)
             assert parent.call("coordination_state")["tasks"] == []
             print("PASS: compact/stop hooks restore obligations; full result pages survive; ack and retirement settle work", flush=True)
+
+            orphan_child = parent.call("spawn_agent", name="idle-child", project_id=project,
+                                       task="Report a result", command="cat", supervise=True)
+            idle_id = orphan_child["task_id"]
+            tmux("kill-session", "-t", "reg-0-idle-child")
+            endpoint, body = receipts.get(timeout=15)
+            assert endpoint == "/session/ses_parent/prompt_async", endpoint
+            assert "exited without" in body["parts"][0]["text"]
+            try:
+                duplicate = receipts.get(timeout=7)
+                raise AssertionError(f"orphan event repeated: {duplicate}")
+            except queue.Empty:
+                pass
+            orphan = parent.call("get_task", task_id=idle_id)
+            parent.call("acknowledge_task", task_id=idle_id, result_revision=orphan["result_revision"])
+            parent.call("complete_project", project_id=project)
+            print("PASS: dead session sends one parent notice", flush=True)
     finally:
         for process in processes:
             process.stop()
