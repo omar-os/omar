@@ -278,6 +278,10 @@ jobs:
           sudo apt-get update && sudo apt-get install -y tmux
           cargo build --bin omar
           python3 tests/ci/team_mutation.py
+      - name: Verify safety properties are proved through serve
+        run: |
+          cargo build --bin omar
+          python3 tests/ci/property_proofs.py
 
       - name: Compile topology corpus to bytecode (offline)
         working-directory: lang
