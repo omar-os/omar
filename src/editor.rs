@@ -95,7 +95,7 @@ fn ensure_lean_extension(executable: &std::ffi::OsStr, extensions: &Path) -> Res
         .arg(extensions)
         .args(["--install-extension", "leanprover.lean4"])
         .output()
-        .context("Could not install Lean's extension into code-server")?;
+        .context("Could not start code-server. Install code-server from https://coder.com/docs/code-server/install, then try again (or set OMAR_CODE_SERVER_BIN).")?;
     anyhow::ensure!(
         output.status.success(),
         "Could not install Lean's extension into code-server: {}",
@@ -149,6 +149,16 @@ impl Editor {
         let proofs = workspace.deployment_id.starts_with("properties:");
         if proofs {
             ensure_lean_extension(&executable, &root.join("editors/extensions"))?;
+            // Restricted Mode disables every extension, Lean's included. A
+            // proof workspace holds only the Lean files OMAR wrote.
+            let settings = data.join("data/User/settings.json");
+            if !settings.exists() {
+                fs::create_dir_all(settings.parent().expect("settings have a directory"))?;
+                fs::write(
+                    &settings,
+                    "{\n  \"security.workspace.trust.enabled\": false\n}\n",
+                )?;
+            }
         }
         let mut command = Command::new(&executable);
         if proofs {

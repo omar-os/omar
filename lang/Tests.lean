@@ -707,6 +707,7 @@ def testProve : IO Unit := do
   | .error message => throw (IO.userError s!"a request without lemmas: {message}")
   let extra : Array Omar.Prove.Property := #[
     { name := "cheat", statement := "False", proof := "sorry" },
+    { name := "runs", statement := "True", proof := "by\n  trivial\n#eval IO.println \"ran\"" },
     { name := "elsewhere", statement := "True", proof := "trivial" },
     { name := "misspelled", statement := "∀ g, e.present g \"x.ordr\" = none → True",
       proof := "by\n  intro _ _\n  trivial" },
@@ -720,9 +721,11 @@ def testProve : IO Unit := do
     let some v := verdict name | throw (IO.userError s!"no verdict for {name}")
     if !v.proved then throw (IO.userError s!"{name} not proved: {reprStr (v.problems.map (·.message))}")
   assertEqual "mentions" (verdict "orders_are_approved" |>.map (·.mentions)) (some #["x.order", "r.approved"])
-  for name in ["cheat", "wrong"] do
+  for name in ["cheat", "wrong", "runs"] do
     if (verdict name).any (·.proved) then throw (IO.userError s!"{name} was accepted")
   assertEqual "sorry is refused unread" ((verdict "cheat").map (·.problems.map (·.line))) (some #[0])
+  -- Checking a proof must not run code it carries.
+  assertEqual "#eval is refused unread" ((verdict "runs").map (·.problems.map (·.line))) (some #[0])
   -- `True` is proved, but it is not a property of the program.
   let some elsewhere := verdict "elsewhere" | throw (IO.userError "no verdict for elsewhere")
   if elsewhere.proved || !elsewhere.problems.any (mentions ·.message "nothing about the run") then

@@ -52,7 +52,7 @@ instance : FromJson Request where
 /-- Words that change what Lean checks or assumes rather than prove anything. -/
 def refused : List String :=
   ["sorry", "admit", "axiom", "native_decide", "implemented_by", "extern", "unsafe",
-   "opaque", "set_option", "#exit", "import", "macro", "elab", "syntax", "notation",
+   "opaque", "set_option", "#exit", "#eval", "import", "macro", "elab", "syntax", "notation",
    "attribute", "run_cmd", "run_tac", "run_elab", "ofReduceBool", "skipKernelTC", "Lean."]
 
 def validName (name : String) : Bool :=
