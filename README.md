@@ -171,9 +171,10 @@ Each `omar -a <backend> up` starts a new independent session. Add `-s dev`
 to name it, and `--web` or `--tui` to open a client immediately.
 
 No need to install them yourself: run `omar connect`, pick a backend with
-the arrow keys, and OMAR runs the vendor's official installer if needed, then
-the CLI's own sign-in (device code for Codex over SSH). `omar connect <backend>`
-does one directly. Credentials stay where each CLI keeps them; OMAR never
+the arrow keys, and OMAR runs the vendor's official installer if needed (and
+puts it on your shell's PATH), then the CLI's own sign-in (device code for
+Codex over SSH); `d` signs one out. `omar connect <backend>` does one
+directly. Credentials stay where each CLI keeps them; OMAR never
 reads or stores one. `omar backends` shows where each stands (`--json` for
 scripts); so does Mission Control's backend menu.
 

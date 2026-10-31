@@ -51,6 +51,16 @@ impl Backend for Cursor {
             note: None,
         })
     }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: if command_for(on_path).starts_with("cursor ") {
+                &["agent", "logout"]
+            } else {
+                &["logout"]
+            },
+            note: None,
+        })
+    }
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["Cursor Agent"]
     }

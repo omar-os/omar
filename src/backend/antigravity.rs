@@ -46,6 +46,12 @@ impl Backend for Antigravity {
             note: Some("agy signs in on first launch; quit it once you are in."),
         })
     }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: &[],
+            note: Some("In agy, type /logout, then quit it."),
+        })
+    }
     // No readiness banner is pinned: `agy` is not available in CI or local
     // discovery, so a marker would be an unverified guess.
     /// Antigravity takes no message from outside its protocol, so it runs

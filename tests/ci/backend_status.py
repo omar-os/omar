@@ -52,6 +52,16 @@ class BackendStatus(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
+    def test_help_leads_with_backends_and_their_status(self):
+        result = subprocess.run([str(OMAR), "--help"], env=self.env,
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sections = result.stdout.split("Usage:")[1].split("\n\n")
+        backends = sections[1]
+        self.assertTrue(backends.startswith("Backends:\n  connect"), backends)
+        self.assertIn("cursor    not installed", backends)
+        self.assertIn("omar connect cursor", backends)
+
     def test_json_reports_each_backend_as_its_cli_does(self):
         status = {row["name"]: row for row in json.loads(self.omar("--json"))}
         self.assertEqual(list(status), ["claude", "codex", "cursor", "opencode", "pi", "agy"])
@@ -127,11 +137,19 @@ mkdir -p "$HOME/.pi/agent" && echo '{"openai": {}}' > "$HOME/.pi/agent/auth.json
         self.stand_in("npm", f"""
 [ "$*" = "install -g @earendil-works/pi-coding-agent" ] || exit 1
 mkdir -p {pi.parent} && cp {package} {pi}""")
+        self.env["SHELL"] = "/bin/bash"
         out = self.omar("connect", "pi").stdout
         self.assertIn("Installing pi: npm install -g @earendil-works/pi-coding-agent", out)
         self.assertIn("/login", out)
         self.assertIn("✓ pi connected (openai)", out)
-        self.assertIn(f"Add {pi.parent} to PATH", out)
+        # The shell finds pi from its next start; OMAR finds it already.
+        bashrc = self.home / ".bashrc"
+        self.assertIn('export PATH="$PATH:$HOME/.local/bin"', bashrc.read_text())
+        self.assertIn(f"Added {pi.parent} to PATH in {bashrc}", out)
+        rows = {line.split()[0]: line for line in self.omar("backends").stdout.splitlines()}
+        self.assertIn("✓ openai", rows["pi"])
+        self.omar("connect", "pi")
+        self.assertEqual(bashrc.read_text().count("$HOME/.local/bin"), 1)
 
     def test_a_signed_out_cli_runs_its_own_sign_in(self):
         signed_in = self.root / "codex-signed-in"
@@ -152,25 +170,36 @@ mkdir -p {pi.parent} && cp {package} {pi}""")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("still not signed in", result.stderr)
 
-    def test_the_picker_connects_with_arrow_keys(self):
-        signed_in = self.root / "codex-signed-in"
-        self.stand_in("codex", f"""
-[ "$1 $2" = "login status" ] && {{ [ -f {signed_in} ] && echo 'Logged in using ChatGPT' >&2 && exit 0; echo 'Not logged in' >&2; exit 1; }}
-[ "$*" = "login --device-auth" ] && touch {signed_in}""")
+    def picker(self):
+        """`omar connect` in a pty: a function that waits for text, and the fd."""
         pid, fd = pty.fork()
         if pid == 0:
             os.execve(str(OMAR), [str(OMAR), "connect"], {**self.env, "TERM": "xterm"})
-        screen = b""
+        self.addCleanup(lambda: os.close(fd))
+        screen = bytearray()
         def until(text, count=1):
-            nonlocal screen
             deadline = time.monotonic() + 30
             while screen.count(text.encode()) < count:
                 self.assertLess(time.monotonic(), deadline, screen.decode(errors="replace"))
                 if select.select([fd], [], [], 1)[0]:
                     try:
-                        screen += os.read(fd, 4096)
+                        screen.extend(os.read(fd, 4096))
                     except OSError:
                         break
+            return screen.decode(errors="replace")
+        def exit_code():
+            return os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+        return until, fd, exit_code
+
+    def codex(self, signed_in):
+        self.stand_in("codex", f"""
+[ "$1 $2" = "login status" ] && {{ [ -f {signed_in} ] && echo 'Logged in using ChatGPT' >&2 && exit 0; echo 'Not logged in' >&2; exit 1; }}
+[ "$*" = "login --device-auth" ] && touch {signed_in}
+[ "$*" = "logout" ] && rm {signed_in}""")
+
+    def test_the_picker_connects_with_arrow_keys(self):
+        self.codex(self.root / "codex-signed-in")
+        until, fd, exit_code = self.picker()
         # claude is first; one step down is codex.
         until("enter connect")
         os.write(fd, b"\x1b[B\r")
@@ -178,11 +207,30 @@ mkdir -p {pi.parent} && cp {package} {pi}""")
         # Back at the list for the next one; q leaves.
         until("enter connect", 2)
         os.write(fd, b"q")
+        screen = until("Done")
+        self.assertEqual(exit_code(), 0)
+        self.assertIn("Connecting codex", screen)
+
+    def test_the_picker_disconnects_after_asking(self):
+        signed_in = self.root / "codex-signed-in"
+        signed_in.touch()
+        self.codex(signed_in)
+        until, fd, exit_code = self.picker()
+        until("enter connect")
+        # d asks first; anything but y leaves codex signed in.
+        os.write(fd, b"\x1b[Bd")
+        until("Sign codex out?")
+        os.write(fd, b"n")
+        os.write(fd, b"d")
+        until("Sign codex out?", 2)
+        self.assertTrue(signed_in.exists())
+        os.write(fd, b"y")
+        until("✓ codex disconnected")
+        self.assertFalse(signed_in.exists())
+        until("enter connect", 2)
+        os.write(fd, b"q")
         until("Done")
-        _, status = os.waitpid(pid, 0)
-        os.close(fd)
-        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
-        self.assertIn("Connecting codex", screen.decode())
+        self.assertEqual(exit_code(), 0)
 
     def test_only_agent_backends_connect(self):
         result = self.omar("connect", "jev", ok=False)

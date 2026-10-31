@@ -464,8 +464,19 @@ fn open_browser(url: &str) {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::from_arg_matches(&Cli::command().help_template(help_template()).get_matches())
-        .unwrap_or_else(|error| error.exit());
+    // Before any thread starts: installers' directories join PATH.
+    crate::backend::connect::extend_path();
+    // Only help shows backend status, and only then is it worth asking.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let help = args.is_empty()
+        || matches!(args.as_slice(), [arg] if arg == "-h" || arg == "--help" || arg == "help");
+    let backends = help.then(backends_help);
+    let cli = Cli::from_arg_matches(
+        &Cli::command()
+            .help_template(help_template(backends.as_deref()))
+            .get_matches(),
+    )
+    .unwrap_or_else(|error| error.exit());
     sessions::prepare_process(&cli)?;
     // Install the persisted-panic hook FIRST, before tokio builds its
     // runtime (and spawns worker threads). If the tmux parent dies it
@@ -755,6 +766,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
 /// `omar --help` lists commands by what they are for. The last section is
 /// what OMAR launches inside agent panes and hooks; a person never types it.
 const HELP_SECTIONS: &[(&str, &[&str])] = &[
+    ("Backends", &["connect", "backends"]),
     (
         "Sessions",
         &["up", "ls", "info", "attach", "logs", "down", "rm", "serve"],
@@ -785,7 +797,24 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
     ),
 ];
 
-fn help_template() -> String {
+/// Each backend's status, under the Backends commands in help.
+fn backends_help() -> String {
+    use crate::backend::{connection, Connection};
+    let mut out = String::new();
+    for (backend, status) in connection::assistants() {
+        let name = backend.kind().name();
+        let next = match status {
+            Connection::Connected { .. } => String::new(),
+            _ => format!("omar connect {name}"),
+        };
+        let row = format!("    {name:<10}{:<26}{next}", connection::label(&status));
+        out += row.trim_end();
+        out.push('\n');
+    }
+    out
+}
+
+fn help_template(backends: Option<&str>) -> String {
     let command = Cli::command();
     let about: std::collections::BTreeMap<String, String> = command
         .get_subcommands()
@@ -820,6 +849,11 @@ fn help_template() -> String {
     let mut listed = std::collections::BTreeSet::new();
     for (title, names) in HELP_SECTIONS {
         section(title, names, &about, width, &mut listed, &mut sections);
+        if let (&"Backends", Some(backends)) = (title, backends) {
+            sections.pop();
+            sections.push_str(backends);
+            sections.push('\n');
+        }
     }
     let rest: Vec<&str> = about
         .keys()

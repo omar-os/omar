@@ -254,6 +254,10 @@ pub trait Backend: Send + Sync {
     fn login(&self, _headless: bool) -> Option<Login> {
         None
     }
+    /// How the connect picker has the CLI sign itself out.
+    fn logout(&self) -> Option<Login> {
+        None
+    }
 
     fn kind(&self) -> Kind;
     /// Names an operator may type. The first is canonical.

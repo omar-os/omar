@@ -74,6 +74,12 @@ impl Backend for Codex {
             }
         })
     }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: &["logout"],
+            note: None,
+        })
+    }
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         let socket = from_stamp(target.stamp?)?;
         CodexSession::open(&socket).ok()?.only_thread().ok()

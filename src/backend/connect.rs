@@ -15,13 +15,12 @@ use super::{connection, Backend, Connection};
 
 /// Connect `backend` on this machine.
 pub fn host(backend: &dyn Backend) -> Result<()> {
-    connect(backend, &with_install_path())
+    connect(backend)
 }
 
 /// `omar connect` on a terminal: pick a backend with the arrow keys, connect
-/// it, and come back to the list for the next one.
+/// or disconnect it, and come back to the list for the next one.
 pub fn wizard() -> Result<()> {
-    let original = with_install_path();
     let mut selected = 0;
     loop {
         println!("{}", "Checking backends…".dim());
@@ -29,11 +28,18 @@ pub fn wizard() -> Result<()> {
         let mut stdout = std::io::stdout();
         stdout.queue(cursor::MoveToPreviousLine(1))?;
         stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
-        let Some(index) = pick(&statuses, selected)? else {
-            return Ok(());
+        let outcome = match pick(&statuses, selected)? {
+            Choice::Quit => return Ok(()),
+            Choice::Connect(index) => {
+                selected = index;
+                connect(statuses[index].0)
+            }
+            Choice::Disconnect(index) => {
+                selected = index;
+                disconnect(statuses[index].0)
+            }
         };
-        selected = index;
-        if let Err(error) = connect(statuses[index].0, &original) {
+        if let Err(error) = outcome {
             println!("{} {error:#}", "✗".red());
         }
         println!();
@@ -60,15 +66,22 @@ impl Drop for RawMode {
     }
 }
 
-/// The index chosen, or `None` to quit. Drawn inline, so what each sign-in
-/// prints stays in the scrollback above the next list.
-fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Option<usize>> {
+enum Choice {
+    Connect(usize),
+    Disconnect(usize),
+    Quit,
+}
+
+/// What to do next. Drawn inline, so what each sign-in prints stays in the
+/// scrollback above the next list.
+fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choice> {
     let _raw = RawMode::enable()?;
     let mut stdout = std::io::stdout();
     let mut selected = selected.min(statuses.len().saturating_sub(1));
+    let mut confirming = false;
     let mut drawn = 0;
     loop {
-        let lines = menu(statuses, selected);
+        let lines = menu(statuses, selected, confirming);
         if drawn > 0 {
             stdout.queue(cursor::MoveToPreviousLine(drawn))?;
         }
@@ -84,7 +97,15 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Opti
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        // Only `y` answers the sign-out question; any other key drops it.
+        let answering = std::mem::take(&mut confirming);
         let choice = match key.code {
+            KeyCode::Char('y') if answering => Choice::Disconnect(selected),
+            _ if answering => continue,
+            KeyCode::Char('d') => {
+                confirming = matches!(statuses[selected].1, Connection::Connected { .. });
+                continue;
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 selected = selected.checked_sub(1).unwrap_or(statuses.len() - 1);
                 continue;
@@ -93,17 +114,20 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Opti
                 selected = (selected + 1) % statuses.len();
                 continue;
             }
-            KeyCode::Enter => Some(selected),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => None,
-            KeyCode::Esc | KeyCode::Char('q') => None,
+            KeyCode::Enter => Choice::Connect(selected),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Choice::Quit,
+            KeyCode::Esc | KeyCode::Char('q') => Choice::Quit,
             _ => continue,
         };
         // Leave one line behind saying what was picked.
         stdout.queue(cursor::MoveToPreviousLine(drawn))?;
         stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
         let summary = match choice {
-            Some(index) => format!("Connecting {}", statuses[index].0.kind().name()),
-            None => "Done".to_string(),
+            Choice::Connect(index) => format!("Connecting {}", statuses[index].0.kind().name()),
+            Choice::Disconnect(index) => {
+                format!("Disconnecting {}", statuses[index].0.kind().name())
+            }
+            Choice::Quit => "Done".to_string(),
         };
         write!(stdout, "{} {summary}\r\n", "◇".green())?;
         stdout.flush()?;
@@ -111,12 +135,13 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Opti
     }
 }
 
-/// The picker's lines, `selected` marked.
-fn menu(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Vec<String> {
+/// The picker's lines, `selected` marked; `confirming` asks before signing
+/// it out.
+fn menu(statuses: &[(&dyn Backend, Connection)], selected: usize, confirming: bool) -> Vec<String> {
     let mut lines = vec![format!(
         "{} Connect an agent backend  {}",
         "◆".cyan(),
-        "↑/↓ move · enter connect · q quit".dim()
+        "↑/↓ move · enter connect · d disconnect · q quit".dim()
     )];
     for (index, (backend, status)) in statuses.iter().enumerate() {
         let name = format!("{:<10}", backend.kind().name());
@@ -131,21 +156,35 @@ fn menu(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Vec<String>
             format!("{} {} {}{label}", "│".cyan(), "○".dim(), name.dim())
         });
     }
-    lines.push(format!("{}", "└".cyan()));
+    lines.push(if confirming {
+        let name = statuses[selected].0.kind().name();
+        format!("{} Sign {name} out? {}", "└".cyan(), "y / n".dim())
+    } else {
+        format!("{}", "└".cyan())
+    });
     lines
 }
 
-/// Add the installers' directories to `PATH` and return what it was.
-fn with_install_path() -> OsString {
+/// `PATH` as the operator's shell gave it, before [`extend_path`].
+static SHELL_PATH: std::sync::OnceLock<OsString> = std::sync::OnceLock::new();
+
+/// Let OMAR find CLIs in the directories vendor installers use, even when
+/// the operator's shell doesn't have them on `PATH` yet. Call once, first.
+pub fn extend_path() {
     let original = std::env::var_os("PATH").unwrap_or_default();
-    // Installers drop binaries here, often before the shell's PATH has them.
     std::env::set_var("PATH", with_install_dirs(&original));
-    original
+    let _ = SHELL_PATH.set(original);
 }
 
-/// Install `backend` if needed and sign it in; `original` is the operator's
-/// own `PATH`, before the installers' directories were added.
-fn connect(backend: &dyn Backend, original: &OsString) -> Result<()> {
+fn shell_path() -> OsString {
+    SHELL_PATH
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// Install `backend` if needed and sign it in.
+fn connect(backend: &dyn Backend) -> Result<()> {
     let name = backend.kind().name();
     let mut status = connection::connection(backend);
     if status == Connection::NotInstalled {
@@ -184,14 +223,90 @@ fn connect(backend: &dyn Backend, original: &OsString) -> Result<()> {
         _ => bail!("{name} is still not signed in; run `omar connect {name}` again"),
     }
     if let Some(dir) = found_in(program, &std::env::var_os("PATH").unwrap_or_default()) {
-        if found_in(program, original).is_none() {
-            println!(
-                "Add {} to PATH so OMAR finds {name} from any shell.",
-                dir.display()
-            );
+        if found_in(program, &shell_path()).is_none() {
+            add_to_shell_path(&dir, name);
         }
     }
     Ok(())
+}
+
+/// Have `backend`'s CLI sign itself out, then check that it took.
+fn disconnect(backend: &dyn Backend) -> Result<()> {
+    let name = backend.kind().name();
+    let logout = backend
+        .logout()
+        .with_context(|| format!("{name} has no sign-out OMAR can start"))?;
+    if let Some(note) = logout.note {
+        println!("{note}");
+    }
+    let program = program(backend);
+    Command::new(program)
+        .args(logout.args)
+        .status()
+        .with_context(|| format!("starting `{program}`"))?;
+    match connection::connection(backend) {
+        // A credential in the environment outlives any sign-out.
+        Connection::Connected { via: Some(via) } if std::env::var_os(&via).is_some() => {
+            bail!("{name} still connects with ${via}; unset it to disconnect")
+        }
+        Connection::Connected { .. } => bail!("{name} is still signed in"),
+        _ => println!("✓ {name} disconnected"),
+    }
+    Ok(())
+}
+
+/// Put `dir` on the operator's shell `PATH` from the next shell on, through
+/// the startup file their shell reads; say how when the shell is unknown.
+fn add_to_shell_path(dir: &Path, name: &str) {
+    let home = dirs::home_dir().unwrap_or_default();
+    let shown = match dir.strip_prefix(&home) {
+        Ok(rest) => format!("$HOME/{}", rest.display()),
+        Err(_) => dir.display().to_string(),
+    };
+    let rc = match std::env::var("SHELL")
+        .unwrap_or_default()
+        .rsplit('/')
+        .next()
+    {
+        Some("bash") => Some(home.join(".bashrc")),
+        Some("zsh") => Some(
+            std::env::var_os("ZDOTDIR")
+                .map(PathBuf::from)
+                .unwrap_or(home.clone())
+                .join(".zshrc"),
+        ),
+        _ => None,
+    };
+    let line = format!("export PATH=\"$PATH:{shown}\"");
+    let Some(rc) = rc else {
+        println!("Add {} to PATH so your shell finds {name}.", dir.display());
+        return;
+    };
+    let existing = std::fs::read_to_string(&rc).unwrap_or_default();
+    if !existing.contains(&line) {
+        let appended = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&rc)
+            .and_then(|mut file| {
+                let gap = if existing.is_empty() || existing.ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                };
+                writeln!(file, "{gap}\n# Added by omar connect\n{line}")
+            });
+        if appended.is_err() {
+            println!("Add {} to PATH so your shell finds {name}.", dir.display());
+            return;
+        }
+    }
+    println!(
+        "Added {} to PATH in {}; open a new shell, or run: source {}",
+        dir.display(),
+        rc.display(),
+        rc.display()
+    );
 }
 
 /// The executable the backend's default command runs.
@@ -269,12 +384,13 @@ mod tests {
     }
 
     #[test]
-    fn every_assistant_can_be_installed_and_signed_in() {
+    fn every_assistant_can_be_installed_signed_in_and_out() {
         for kind in super::super::ASSISTANT {
             let backend = super::super::of(kind);
             assert!(backend.install_command().is_some(), "{kind:?}");
             assert!(backend.login(false).is_some(), "{kind:?}");
             assert!(backend.login(true).is_some(), "{kind:?}");
+            assert!(backend.logout().is_some(), "{kind:?}");
         }
     }
 }

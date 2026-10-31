@@ -53,6 +53,12 @@ impl Backend for Opencode {
             note: None,
         })
     }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: &["auth", "logout"],
+            note: None,
+        })
+    }
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         from_stamp(target.stamp?).map(|(_, session)| session)
     }

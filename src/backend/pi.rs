@@ -54,6 +54,12 @@ impl Backend for Pi {
             note: Some("In pi, type /login and pick a provider, then /quit."),
         })
     }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: &[],
+            note: Some("In pi, type /logout and pick the provider, then /quit."),
+        })
+    }
     fn readiness(&self, _command: &str) -> Readiness {
         Readiness::Channel
     }

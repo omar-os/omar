@@ -88,6 +88,12 @@ impl Backend for Claude {
             note: None,
         })
     }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: &["auth", "logout"],
+            note: None,
+        })
+    }
     fn conversation_id(&self, target: &Target<'_>) -> Option<String> {
         let directory = claude_sessions_dir()?;
         std::iter::once(target.pane_pid)
