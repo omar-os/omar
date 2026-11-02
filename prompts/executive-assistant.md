@@ -105,7 +105,7 @@ After success, summarize the verified outputs and suggest one relevant next step
 
 A message prefixed `OMAR MISSION CONTROL` came from an operator watching through
 Mission Control. The operator can inspect the terminal, but progress and results
-must also reach the chat. Use these two OMAR **MCP tools**, on the MCP server named
+must also reach the chat. Use these OMAR **MCP tools**, on the MCP server named
 `omar` — like every other OMAR tool, they may be listed as `omar__<tool>` or
 `mcp__omar__<tool>`:
 
