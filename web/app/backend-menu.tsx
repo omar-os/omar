@@ -96,7 +96,6 @@ export function BackendMenu({
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    setStatusState("loading");
     fetchBackendStatus(serveUrl)
       .then((list) => {
         if (!cancelled) {
@@ -153,7 +152,11 @@ export function BackendMenu({
         className="backend-trigger"
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={() => setOpen((was) => !was)}
+        onClick={() => {
+          // Status is asked afresh on each open; nothing switches until then.
+          if (!open) setStatusState("loading");
+          setOpen(!open);
+        }}
       >
         {current ? label(current) : "Assistant"}
         <span aria-hidden="true">{open ? "▾" : "▴"}</span>
