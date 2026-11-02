@@ -9,11 +9,13 @@ mod config;
 mod deploy;
 mod diagram;
 mod ea;
+mod ea_lifecycle;
 mod event;
 mod manager;
 mod mcp;
 mod memory;
 mod metrics;
+mod mutation;
 mod panic_hook;
 mod paths;
 mod process;
@@ -87,7 +89,8 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Target an existing runtime session by id or name
+    /// Target a runtime session by id or name; for up and serve, the name of
+    /// the session to start, or of a stopped one to restart
     #[arg(short = 's', long, global = true)]
     session: Option<String>,
 
@@ -143,7 +146,7 @@ enum Commands {
     },
     /// Remove a session and everything it kept; a running one is killed first
     Rm,
-    /// Stop one runtime: running workflows pause at their next tag boundary, and the stopped session keeps its state until `rm`, so `up --name` restarts it
+    /// Stop one runtime: running workflows pause at their next tag boundary, and the stopped session keeps its state until `rm`, so `up -s NAME` restarts it
     Down {
         #[arg(long)]
         force: bool,
@@ -280,6 +283,21 @@ enum Commands {
         deployment: String,
     },
 
+    /// Change a running or paused topology's program. A running one pauses at
+    /// its next tag boundary, takes the change, and resumes.
+    Mutate {
+        /// Team name or run id
+        deployment: String,
+        /// The new version of the program; its `main` must keep its name
+        program: PathBuf,
+        /// Print the changes and apply nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Wait until the change is applied
+        #[arg(long)]
+        wait: bool,
+    },
+
     /// Move a paused topology's resume point back to an earlier checkpoint.
     /// Nothing is deleted; `omar resume` then continues from there.
     Rollback {
@@ -306,12 +324,12 @@ enum Commands {
 
     /// Accept OMAR programs over HTTP and supervise their runs
     Serve {
-        /// Name for a new independent foreground session
-        #[arg(long)]
+        /// Deprecated: use -s NAME
+        #[arg(long, hide = true)]
         name: Option<String>,
-        /// Loopback address to bind the admission API
+        /// Port for the admission API, on 127.0.0.1
         #[arg(long)]
-        address: Option<std::net::SocketAddr>,
+        port: Option<u16>,
 
         /// Serve the API without starting an executive assistant. The agent
         /// context is still written, so a test harness can stand in for one.
@@ -501,6 +519,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Runs { .. }
             | Commands::Pause { .. }
             | Commands::Resume { .. }
+            | Commands::Mutate { .. }
             | Commands::Rollback { .. }
             | Commands::SessionDaemon { .. }
             | Commands::SessionExec { .. }
@@ -712,6 +731,7 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
             "stop",
             "pause",
             "resume",
+            "mutate",
             "rollback",
             "checkpoint",
             "workspace",
@@ -1972,11 +1992,8 @@ async fn run_dashboard(config: Config, session: sessions::Session) -> Result<()>
                         }
                         KeyCode::Char('D') => {
                             // Delete the currently active EA (last EA is protected)
-                            if app.session.is_some() {
-                                app.set_status(
-                                    "EA deletion is not available while attached; the runtime owns EAs",
-                                );
-                            } else if app.registered_eas.len() > 1 {
+                            app.registered_eas = ea::load_registry(&app.omar_dir);
+                            if app.registered_eas.len() > 1 {
                                 app.pending_confirm = Some(app::ConfirmAction::DeleteEa);
                             } else {
                                 app.set_status("Cannot delete the only EA");

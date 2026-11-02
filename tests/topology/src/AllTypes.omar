@@ -42,6 +42,55 @@ team AllTypes[codec : Codex]
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+// A body binds scalars only. list_out, option_out and nested_out are
+// written by the same invocation under the same mandatory contract, so
+// they arrive whenever these do.
+team Smoke
+{
+    input bool_out : bool
+    input int_out : int
+    input float_out : float
+    input string_out : string
+    input path_out : path
+    input bytes_out : bytes
+    state got_bool_out : bool = false
+    state got_int_out : bool = false
+    state got_float_out : bool = false
+    state got_string_out : bool = false
+    state got_path_out : bool = false
+    state got_bytes_out : bool = false
+    timer deadline(10min, 0)
+
+    reaction(bool_out, int_out, float_out, string_out, path_out, bytes_out) -> {=
+        if bool_out.is_some() { self.got_bool_out = true; }
+        if int_out.is_some() { self.got_int_out = true; }
+        if float_out.is_some() { self.got_float_out = true; }
+        if string_out.is_some() { self.got_string_out = true; }
+        if path_out.is_some() { self.got_path_out = true; }
+        if bytes_out.is_some() { self.got_bytes_out = true; }
+        if self.got_bool_out && self.got_int_out && self.got_float_out && self.got_string_out && self.got_path_out && self.got_bytes_out { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_bool_out, "no types.bool_out by the deadline");
+        assert!(self.got_int_out, "no types.int_out by the deadline");
+        assert!(self.got_float_out, "no types.float_out by the deadline");
+        assert!(self.got_string_out, "no types.string_out by the deadline");
+        assert!(self.got_path_out, "no types.path_out by the deadline");
+        assert!(self.got_bytes_out, "no types.bytes_out by the deadline");
+    =}
+}
+
 main {
     types = AllTypes()
+
+    smoke = Smoke()
+    types.bool_out -> smoke.bool_out
+    types.int_out -> smoke.int_out
+    types.float_out -> smoke.float_out
+    types.string_out -> smoke.string_out
+    types.path_out -> smoke.path_out
+    types.bytes_out -> smoke.bytes_out
 }

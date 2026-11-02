@@ -10,7 +10,7 @@ import {
   SERVE_PROTOCOL_VERSION,
   type RunRecord,
   type RunRequest,
-} from "./protocol";
+} from "./protocol.ts";
 
 export function normalizeRuntimeUrl(value: string): string {
   const parsed = new URL(value.trim());
@@ -71,6 +71,18 @@ export async function switchBackend(
     body: JSON.stringify({ backend }),
   });
   if (!response.ok) throw new Error(await readError(response));
+}
+
+/** Browsers word a failed request differently ("Load failed" in Safari,
+    "Failed to fetch" in Chrome, "NetworkError…" in Firefox); all mean the
+    runtime did not answer. */
+const UNREACHABLE = /^(load failed|failed to fetch|networkerror\b|network error)/i;
+
+/** What to show for a failed call: the runtime's own message, or one plain
+    sentence when the request never reached it. */
+export function describeError(cause: unknown): string {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return UNREACHABLE.test(message) ? "Can't reach the runtime." : message;
 }
 
 async function readError(response: Response): Promise<string> {
@@ -135,6 +147,9 @@ export function subscribeToChat(
   return () => stream.close();
 }
 
+/** A view port serves the same pages but refuses every write. */
+export type ServeAccess = "full" | "view";
+
 /**
  * Ask `omar serve` whether it is up and speaking a protocol we understand.
  * A version mismatch is reported rather than discovered later on a failed run.
@@ -142,21 +157,22 @@ export function subscribeToChat(
 export async function checkServeHealth(
   serveUrl: string,
   signal?: AbortSignal,
-): Promise<{ ok: true } | { ok: false; reason: string }> {
+): Promise<{ ok: true; access: ServeAccess } | { ok: false; reason: string }> {
   try {
     const base = normalizeRuntimeUrl(serveUrl);
     const response = await fetch(`${base}/health`, { signal });
     if (!response.ok) {
       return { ok: false, reason: `HTTP ${response.status}` };
     }
-    const body = (await response.json()) as { protocol_version?: unknown };
+    const body = (await response.json()) as { protocol_version?: unknown; access?: unknown };
     if (body.protocol_version !== SERVE_PROTOCOL_VERSION) {
       return {
         ok: false,
         reason: `serve speaks protocol ${String(body.protocol_version)}, this client speaks ${SERVE_PROTOCOL_VERSION}`,
       };
     }
-    return { ok: true };
+    // A daemon that predates view ports does not say, and is full access.
+    return { ok: true, access: body.access === "view" ? "view" : "full" };
   } catch (cause) {
     return { ok: false, reason: cause instanceof Error ? cause.message : String(cause) };
   }
@@ -338,10 +354,12 @@ export interface CheckpointSummary {
   id: string;
   sequence: number;
   parent: string | null;
-  trigger: "automatic" | "manual" | "pause";
+  trigger: "automatic" | "manual" | "pause" | "mutation";
   completed_tag: [number, number] | null;
   next_tag: [number, number] | null;
   created_at: number;
+  /** A mutation checkpoint's plan, one line per instruction. */
+  mutation?: string[];
 }
 
 export interface CheckpointListing {
@@ -443,6 +461,31 @@ export async function rollbackRun(
   return typeof body.resume_point === "string" ? body.resume_point : null;
 }
 
+/**
+ * Change a running or paused run's program to `program`. A dry run, or a
+ * program that changes nothing, answers with the plan alone; otherwise the
+ * run's record, whose `mutation` is `pending` while a running run pauses.
+ */
+export async function mutateRun(
+  serveUrl: string,
+  runId: string,
+  request: { program: string; filename?: string; files?: Record<string, string>; dry_run?: boolean },
+  signal?: AbortSignal,
+): Promise<{ changes: string[]; record: RunRecord | null }> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/mutate`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request), signal },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { changes?: unknown; run_id?: unknown };
+  if (typeof body.run_id === "string") {
+    const record = assertRunRecord(body);
+    return { changes: record.mutation?.changes ?? [], record };
+  }
+  return { changes: Array.isArray(body.changes) ? (body.changes as string[]) : [], record: null };
+}
+
 /** Ask a run to checkpoint at its next tag boundary and park; answers `pausing`. */
 export async function pauseRun(
   serveUrl: string,
@@ -491,12 +534,30 @@ export async function fetchRun(
   return assertRunRecord(await response.json());
 }
 
-/** `omar serve` reports `host:port`; the diagram API is plain HTTP on loopback. */
-export function diagramUrlFor(record: RunRecord): string {
+/** The source a run executes now: what an edit to it is compared against. */
+export async function fetchRunProgram(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<{ filename: string; program: string }> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/program`, { signal });
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
+  return (await response.json()) as { filename: string; program: string };
+}
+
+/**
+ * Where to watch a run's diagram: serve relays it under the run. The run's own
+ * diagram server is on serve's loopback, which a browser reaches only when it
+ * runs on the same machine, not through a tunnel or from another host.
+ */
+export function diagramUrlFor(record: RunRecord, serveUrl: string): string {
   if (!record.diagram_address) {
     throw new Error(`Run ${record.run_id} has no diagram address yet.`);
   }
-  return `http://${record.diagram_address}`;
+  return `${normalizeRuntimeUrl(serveUrl)}/v1/runs/${encodeURIComponent(record.run_id)}/diagram`;
 }
 
 export async function fetchDiagram(

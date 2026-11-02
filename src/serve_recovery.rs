@@ -139,8 +139,8 @@ fn followup_marker(context: &Context_, run_id: &str) -> PathBuf {
     run_record_path(context, run_id).with_file_name("assistant-followup-delivered")
 }
 
-/// A failed run remains actionable after a restart. Reopening its assistant
-/// requests a diagnosis once, unless delivery already succeeded.
+/// Finished runs still owe a diagnosis or result handoff after a restart,
+/// unless delivery already succeeded.
 pub(super) fn revisit(context: &Arc<Context_>) {
     let latest = context
         .chat
@@ -156,7 +156,9 @@ pub(super) fn revisit(context: &Arc<Context_>) {
             .get(&id)
             .cloned()
     });
-    if let Some(record) = record.filter(|run| run.status == RunStatus::Failed) {
+    if let Some(record) =
+        record.filter(|run| matches!(run.status, RunStatus::Failed | RunStatus::Completed))
+    {
         finished(context, &record);
     }
 }
@@ -369,6 +371,7 @@ mod tests {
             present: Vec::new(),
             outputs: BTreeMap::new(),
             state: BTreeMap::new(),
+            mutation: None,
         };
         let mut chat = context.chat.lock().unwrap();
         chat.latest_run = Some(record.run_id.clone());
@@ -519,5 +522,67 @@ mod tests {
             .text
             .contains("Resume the assistant"));
         assert!(!messages.last().unwrap().progress);
+    }
+
+    #[test]
+    fn undelivered_finished_runs_are_revisited_after_restart() {
+        for status in [RunStatus::Failed, RunStatus::Completed] {
+            let server = server();
+            let context = &server.context;
+            let mut record = failure(context);
+            record.status = status;
+            if status == RunStatus::Completed {
+                record.error = None;
+                record
+                    .outputs
+                    .insert("report".into(), json!("verified output"));
+            }
+            persist_run(context, &record);
+            queue_finished(context, &record);
+            let root = context.omar_dir.clone();
+            drop(server);
+
+            let resumed =
+                Serve::start("127.0.0.1:0".parse().unwrap(), &Config::default(), &root, 0).unwrap();
+            let context = &resumed.context;
+            context.chat.lock().unwrap().busy = true;
+            revisit(context);
+            let chat = context.chat.lock().unwrap();
+            let pending = chat
+                .pending_followup
+                .as_ref()
+                .expect("saved run needs a handoff");
+            assert_eq!(pending.run_id, record.run_id);
+            assert_eq!(
+                context.runs.lock().unwrap()[&record.run_id].outputs,
+                record.outputs
+            );
+        }
+    }
+
+    #[test]
+    fn delivered_followups_are_not_repeated_after_restart() {
+        for status in [RunStatus::Failed, RunStatus::Completed] {
+            let server = server();
+            let context = &server.context;
+            let mut record = failure(context);
+            record.status = status;
+            persist_run(context, &record);
+            queue_finished(context, &record);
+            context.chat.lock().unwrap().busy = false;
+            drain_with(context, |_, _, _| Ok(()));
+            assert!(followup_marker(context, &record.run_id).exists());
+            let root = context.omar_dir.clone();
+            drop(server);
+
+            let resumed =
+                Serve::start("127.0.0.1:0".parse().unwrap(), &Config::default(), &root, 0).unwrap();
+            let context = &resumed.context;
+            context.chat.lock().unwrap().busy = true;
+            let before = messages(context).len();
+            revisit(context);
+            assert!(context.chat.lock().unwrap().pending_followup.is_none());
+            assert_eq!(messages(context).len(), before);
+        }
     }
 }

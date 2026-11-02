@@ -39,12 +39,22 @@ const MAX_FRAME: u64 = 8 * 1024 * 1024;
 
 #[derive(Args, Debug, Clone)]
 pub struct UpOptions {
-    #[arg(long)]
+    /// Deprecated: use -s NAME
+    #[arg(long, hide = true)]
     pub name: Option<String>,
     #[arg(long)]
     pub workdir: Option<PathBuf>,
-    #[arg(long, default_value = "127.0.0.1:0")]
-    pub address: SocketAddr,
+    /// Port for Mission Control, on 127.0.0.1 only: reach it from elsewhere
+    /// through an SSH tunnel. Default: a free port. Kept across restarts
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Also serve a read-only Mission Control, with no credential. The IP
+    /// picks who can watch:
+    ///   127.0.0.1:8080  this machine only (SSH tunnel)
+    ///   10.0.1.5:8080   one of this machine's IPs: whoever can reach it
+    ///   0.0.0.0:8080    every interface: whoever the firewall lets in
+    #[arg(long, verbatim_doc_comment)]
+    pub view_address: Option<SocketAddr>,
     #[arg(long)]
     pub no_ea: bool,
     #[arg(long, default_value_t = 60)]
@@ -61,7 +71,8 @@ impl Default for UpOptions {
         Self {
             name: None,
             workdir: None,
-            address: "127.0.0.1:0".parse().unwrap(),
+            port: None,
+            view_address: None,
             no_ea: false,
             startup_timeout: 60,
             web: false,
@@ -126,6 +137,9 @@ pub struct Session {
     pub state: String,
     pub pid: u32,
     pub url: String,
+    /// The read-only Mission Control, when the session serves one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_url: Option<String>,
     pub socket: PathBuf,
     pub directory: PathBuf,
     pub executable: PathBuf,
@@ -138,6 +152,8 @@ pub struct Session {
 struct Launch {
     session: Session,
     address: SocketAddr,
+    #[serde(default)]
+    view_address: Option<SocketAddr>,
     no_ea: bool,
     /// Foreground startup prints the session record in the requested mode.
     #[serde(default)]
@@ -165,6 +181,16 @@ pub fn state_root() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(home_root)
 }
+/// Resolve an MCP context's owner from its private launch record, rather than
+/// routing through environment inherited from a different session.
+pub(crate) fn owner(directory: &Path) -> Result<Option<Session>> {
+    match fs::read(directory.join("launch.json")) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice::<Launch>(&bytes)?.session)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub fn is_managed() -> bool {
     std::env::var_os("OMAR_SESSION_ID").is_some() && std::env::var_os("OMAR_STATE_DIR").is_some()
 }
@@ -315,7 +341,13 @@ fn ea_selector(cli: &Cli) -> String {
                 None
             }
         })
-        .unwrap_or_else(|| "0".into())
+        .unwrap_or_else(|| {
+            target(cli)
+                .ok()
+                .and_then(|s| ea::load_registry(&s.directory).iter().map(|ea| ea.id).min())
+                .unwrap_or(0)
+                .to_string()
+        })
 }
 fn read_frame(stream: impl Read) -> Result<Value> {
     let mut raw = String::new();
@@ -596,24 +628,27 @@ fn pin_executable(source: &Path, dest: &Path) -> Result<String> {
     std::io::copy(&mut File::open(dest)?, &mut hash)?;
     Ok(format!("{:x}", hash.finalize()))
 }
-/// Start a session. Returns the stopped record it replaced when `--name`
+/// Session APIs bind only to loopback.
+fn loopback(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+/// Start a session. Returns the stopped record it replaced when `-s NAME`
 /// restarted an existing session, so the caller can say what changed.
 fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, Option<Session>)> {
     anyhow::ensure!(
-        cli.session.is_none(),
-        "up creates a new session; --session selects an existing one"
+        cli.session.is_none() || options.name.is_none(),
+        "name the session once, with -s NAME"
     );
-    anyhow::ensure!(
-        options.address.ip().is_loopback(),
-        "session APIs bind only to loopback"
-    );
+    if options.name.is_some() {
+        eprintln!("warning: --name is deprecated; use -s NAME");
+    }
     anyhow::ensure!(
         cli.ea.is_none(),
         "a new session starts with EA 0; create more with omar --session <session> ea create"
     );
     let _lock = RegistryLock::acquire()?;
     let existing = discover()?;
-    let name = match options.name {
+    let name = match cli.session.clone().or(options.name) {
         Some(name) => {
             validate_name(&name)?;
             if let Some(stopped) = existing.iter().find(|s| s.name == name) {
@@ -631,13 +666,12 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
                 drop(_lock);
                 let source = fs::canonicalize(std::env::current_exe()?)?;
                 let compiler = executable_on_path(crate::topology::resolve_omarc()).ok();
-                let address =
-                    (options.address != UpOptions::default().address).then_some(options.address);
                 return relaunch(
                     stopped,
                     Some(&source),
                     compiler.as_deref(),
-                    address,
+                    options.port.map(loopback),
+                    options.view_address,
                     options.startup_timeout,
                 )
                 .map(|started| (started, Some(stopped.clone())));
@@ -704,6 +738,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
         state: "starting".into(),
         pid: 0,
         url: String::new(),
+        view_url: None,
         socket,
         directory: directory.clone(),
         executable,
@@ -716,7 +751,8 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
         &directory.join("launch.json"),
         &Launch {
             session: session.clone(),
-            address: options.address,
+            address: loopback(options.port.unwrap_or(0)),
+            view_address: options.view_address,
             no_ea: options.no_ea,
             json: foreground && cli.json,
         },
@@ -828,12 +864,14 @@ fn repin_executable(source: &Path, dest: &Path) -> Result<String> {
 /// Start a stopped session again over its own state directory, on the given
 /// build. The registry record keeps its name, URL and directory; the runtime
 /// is a new incarnation. `address` None keeps the port the session had, so
-/// clients that know its URL find it again.
+/// clients that know its URL find it again; `view_address` None likewise keeps
+/// its view port, if it had one.
 fn relaunch(
     stopped: &Session,
     executable: Option<&Path>,
     compiler: Option<&Path>,
     address: Option<SocketAddr>,
+    view_address: Option<SocketAddr>,
     startup_timeout: u64,
 ) -> Result<Session> {
     let lock = RegistryLock::acquire()?;
@@ -895,6 +933,14 @@ fn relaunch(
             .parse()
             .unwrap_or(launch.address),
     };
+    let bound_view: Option<SocketAddr> = current
+        .view_url
+        .as_deref()
+        .and_then(|url| url.trim_start_matches("http://").parse().ok());
+    launch.view_address = view_address.or_else(|| {
+        let asked = launch.view_address?;
+        Some(bound_view.map_or(asked, |bound| SocketAddr::new(asked.ip(), bound.port())))
+    });
     launch.json = false;
     write_json(&directory.join("launch.json"), &launch)?;
     let config = Config::load(directory.join("config.toml").to_str())?;
@@ -993,7 +1039,12 @@ fn request_graceful(server: &Arc<Serve>, session: &Mutex<Session>) -> Result<()>
     Ok(())
 }
 
-fn handle_operation(server: &Serve, session: &mut Session, operation: Value) -> Result<Value> {
+fn handle_operation(
+    server: &Serve,
+    scheduler: &crate::scheduler::Scheduler,
+    session: &mut Session,
+    operation: Value,
+) -> Result<Value> {
     let op = operation["op"].as_str().context("operation is required")?;
     if op == "hello" {
         return Ok(json!(session));
@@ -1005,23 +1056,36 @@ fn handle_operation(server: &Serve, session: &mut Session, operation: Value) -> 
         session.state == "ready",
         "runtime is stopping; no new operations admitted"
     );
+    if op == "eas" {
+        return Ok(json!(ea::load_registry(&session.directory)));
+    }
+    if op == "create_ea" {
+        let name = operation["name"].as_str().context("EA name is required")?;
+        let command = operation["agent"]
+            .as_str()
+            .map(|name| {
+                crate::backend::resolve(name)
+                    .map(|b| b.default_command().to_string())
+                    .map_err(anyhow::Error::msg)
+            })
+            .transpose()?;
+        let id = server.session_create_ea(name, command.as_deref())?;
+        return Ok(json!({"id":id,"name":name}));
+    }
     let ea = operation["ea"].as_str().unwrap_or("0");
-    let target = ea::resolve_ea_selector(&session.directory, Some(ea))?;
-    match op {
-        "eas" => Ok(json!(ea::load_registry(&session.directory))),
-        "create_ea" => {
-            let name = operation["name"].as_str().context("EA name is required")?;
-            let command = operation["agent"]
-                .as_str()
-                .map(|name| {
-                    crate::backend::resolve(name)
-                        .map(|b| b.default_command().to_string())
-                        .map_err(anyhow::Error::msg)
-                })
-                .transpose()?;
-            let id = server.session_create_ea(name, command.as_deref())?;
-            Ok(json!({"id":id,"name":name}))
+    if op == "delete_ea" {
+        let id = ea
+            .parse()
+            .or_else(|_| ea::resolve_ea_selector(&session.directory, Some(ea)).map(|ea| ea.id))?;
+        let result = server.session_delete_ea(id, scheduler);
+        if let Err(error) = &result {
+            eprintln!("EA {id} deletion failed: {error:#}");
         }
+        return result;
+    }
+    let target = ea::resolve_ea_selector(&session.directory, Some(ea))?;
+    let _admission = crate::ea_lifecycle::Admission::acquire(&session.directory, target.id)?;
+    match op {
         "manager_start" => server.session_start_manager(target.id),
         "start" => server.session_start(target.id, operation["request"].clone()),
         "runs" => Ok(json!(server.session_runs(
@@ -1055,6 +1119,11 @@ fn handle_operation(server: &Serve, session: &mut Session, operation: Value) -> 
         "resume" => server.session_resume(
             target.id,
             operation["run"].as_str().context("run id required")?,
+        ),
+        "mutate" => server.session_mutate(
+            target.id,
+            operation["run"].as_str().context("run id required")?,
+            &operation["request"],
         ),
         "rollback" => server.session_rollback(
             target.id,
@@ -1152,8 +1221,22 @@ async fn daemon(directory: &Path) -> Result<()> {
     let config = Config::load(directory.join("config.toml").to_str())?;
     crate::metrics::configure(config.metrics.spawn_metrics_enabled);
     ea::ensure_default_ea(directory)?;
-    let server = Arc::new(Serve::start(launch.address, &config, directory, 0)?);
-    match server.attach_ea(&config, directory, 0, false, !launch.no_ea)? {
+    let scheduler = Arc::new(crate::scheduler::Scheduler::with_store(
+        crate::scheduler::events_store_path(directory),
+    ));
+    crate::ea_lifecycle::recover(directory, &config.dashboard.session_prefix, &scheduler)?;
+    let initial_ea = ea::load_registry(directory)
+        .iter()
+        .map(|ea| ea.id)
+        .min()
+        .context("session has no EAs")?;
+    let server = Arc::new(Serve::start(
+        launch.address,
+        &config,
+        directory,
+        initial_ea,
+    )?);
+    match server.attach_ea(&config, directory, initial_ea, false, !launch.no_ea)? {
         crate::serve::AttachEa::Attached(_) if launch.no_ea => {}
         crate::serve::AttachEa::Attached(session) => eprintln!("Executive assistant running in {session}"),
         crate::serve::AttachEa::AlreadyRunningWithoutServe(session) => eprintln!(
@@ -1164,17 +1247,18 @@ async fn daemon(directory: &Path) -> Result<()> {
         }
     }
     // A session owns exactly one scheduled-event delivery loop, even with no clients.
-    let scheduler = Arc::new(crate::scheduler::Scheduler::with_store(
-        crate::scheduler::events_store_path(directory),
-    ));
     let scheduler_task = tokio::spawn(crate::scheduler::run_event_loop(
-        scheduler,
+        scheduler.clone(),
         crate::scheduler::TickerBuffer::new(),
         config.dashboard.session_prefix.clone(),
     ));
     let listener = UnixListener::bind(&session.socket)?;
     listener.set_nonblocking(true)?;
     session.url = format!("http://{}", server.address());
+    session.view_url = match launch.view_address {
+        Some(address) => Some(format!("http://{}", server.start_viewer(address)?)),
+        None => None,
+    };
     session.state = "ready".into();
     publish(&session)?;
     print_started(&session, None, launch.json)?;
@@ -1191,6 +1275,7 @@ async fn daemon(directory: &Path) -> Result<()> {
                 let session = session.clone();
                 let force = force.clone();
                 let operations = operations.clone();
+                let scheduler = scheduler.clone();
                 std::thread::spawn(move || {
                     let request = read_control_request(&stream);
                     // `down` must not queue behind a stuck operation it exists to end.
@@ -1211,7 +1296,7 @@ async fn daemon(directory: &Path) -> Result<()> {
                             let forced = request.operation["force"].as_bool().unwrap_or(false);
                             return begin_shutdown(&server, &session, &mut record, &force, forced);
                         }
-                        handle_operation(&server, &mut record, request.operation)
+                        handle_operation(&server, &scheduler, &mut record, request.operation)
                     });
                     if record.state != before {
                         *session.lock().unwrap() = record.clone();
@@ -1255,7 +1340,7 @@ async fn daemon(directory: &Path) -> Result<()> {
     let mut session = session.lock().unwrap();
     // Stopped is a state, not an ending: like a container, the session keeps
     // its record, logs, chats and workflows until `omar rm`, and `omar up
-    // --name` starts it again with them in place.
+    // -s NAME` starts it again with them in place.
     session.state = "stopped".into();
     publish(&session)?;
     Ok(())
@@ -1383,9 +1468,13 @@ fn print_started(session: &Session, previous: Option<&Session>, json_output: boo
         if json_output {
             return print_value(json!(session));
         }
+        println!("Started session {}\nURL:    {}", session.name, session.url);
+        if let Some(view_url) = &session.view_url {
+            println!("View:   {view_url} (read-only, no credential)");
+        }
         println!(
-            "Started session {}\nURL:    {}\nTUI:    omar attach -s {} --tui\nWeb:    omar attach -s {} --web\nStop:   omar down -s {}",
-            session.name, session.url, session.name, session.name, session.name
+            "TUI:    omar attach -s {} --tui\nWeb:    omar attach -s {} --web\nStop:   omar down -s {}",
+            session.name, session.name, session.name
         );
         return Ok(());
     };
@@ -1419,6 +1508,9 @@ fn print_started(session: &Session, previous: Option<&Session>, json_output: boo
         "Restarted session {} on {build}\nURL:    {}",
         session.name, session.url
     );
+    if let Some(view_url) = &session.view_url {
+        println!("View:   {view_url} (read-only, no credential)");
+    }
     if paused.is_empty() {
         println!("No paused workflows.");
         return Ok(());
@@ -1490,10 +1582,10 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         return Some(attach_dashboard().await);
     }
     let result = match &cli.command {
-        Some(Commands::Serve { name, address, no_ea, ui }) => {
+        Some(Commands::Serve { name, port, no_ea, ui }) => {
             // The runtime serves Mission Control whenever the build has it; `--ui` insists on it.
             if *ui && !crate::web_assets::is_bundled() { return Some(Err(anyhow::anyhow!("{}", crate::web_assets::MISSING))); }
-            launch(cli, UpOptions { name: name.clone(), address: address.unwrap_or_else(|| UpOptions::default().address), no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
+            launch(cli, UpOptions { name: name.clone(), port: *port, no_ea: *no_ea, ..UpOptions::default() }, true).map(|_| ())
         },
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
         None => Err(anyhow::anyhow!("a command is required; see omar --help")),
@@ -1549,7 +1641,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             if cli.json { let mut v = json!(saved); v["runs"] = json!(runs); return print_value(v); }
             let summary = runs_summary(&saved, &runs);
             let kept = if summary == "-" { String::new() } else { format!(" {summary} workflow(s) kept.") };
-            println!("Stopped session {};{kept} omar up --name {} restarts it, omar rm -s {} removes it", s.name, s.name, s.name);
+            println!("Stopped session {};{kept} omar up -s {} restarts it, omar rm -s {} removes it", s.name, s.name, s.name);
             Ok(())
         }),
         Some(Commands::Run(options)) => (|| {
@@ -1627,6 +1719,24 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             print_value(state)
         }),
         Some(Commands::Resume { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"resume","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(120))).and_then(print_value),
+        Some(Commands::Mutate { deployment, program, dry_run, wait }) => target(cli).and_then(|s| {
+            let ea = ea_selector(cli);
+            let source = fs::read_to_string(program)?;
+            let files = crate::topology::imported_files(program, &source)?;
+            let filename = program.file_name().map(|name| name.to_string_lossy().into_owned());
+            let request = json!({"program":source,"filename":filename,"files":files,"dry_run":dry_run});
+            let mut state = rpc(&s,json!({"op":"mutate","ea":ea,"run":deployment,"request":request}),Duration::from_secs(120))?;
+            // As long as a pause may take: the tag in progress closes first.
+            let deadline = Instant::now() + Duration::from_secs(420);
+            while *wait && state["mutation"]["status"] == "pending" && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(200));
+                state = rpc(&s,json!({"op":"status","ea":ea,"run":state["run_id"]}),Duration::from_secs(5))?;
+            }
+            if *wait && state.get("mutation").is_some() {
+                anyhow::ensure!(state["mutation"]["status"] == "applied", "mutation {}: {}", state["mutation"]["status"], state["mutation"]["error"]);
+            }
+            print_value(state)
+        }),
         Some(Commands::Rollback { deployment, checkpoint }) => target(cli).and_then(|s|rpc(&s,json!({"op":"rollback","ea":ea_selector(cli),"run":deployment,"checkpoint":checkpoint}),Duration::from_secs(10))).and_then(print_value),
         Some(Commands::Spawn{..}|Commands::List{..}|Commands::Kill{..}|Commands::Workspace{..}|Commands::Checkpoint{..}|Commands::Ea{action:EaAction::Event{..}}) => target(cli).and_then(|s| {
             let args=strip_target_args(std::env::args().skip(1));

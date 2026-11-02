@@ -45,6 +45,8 @@ export async function startFakeServe({
   terminalReflow = false,
   /** Fail a parked Web step without making tests wait for a real deadline. */
   webFailure = /** @type {string | null} */ (null),
+  /** Also serve a view-only port over the same state, as `omar serve` can. */
+  viewPort = /** @type {number | null} */ (null),
 } = {}) {
   const golden = JSON.parse(
     await readFile(new URL(`./fixtures/${snapshotFile}`, import.meta.url), "utf8"),
@@ -53,7 +55,7 @@ export async function startFakeServe({
   /** @type {Map<string, {record: object, snapshot: object, subscribers: Set<import("node:http").ServerResponse>, sequence: number}>} */
   const runs = new Map();
 
-  const server = createServer(async (request, response) => {
+  const handle = async (request, response) => {
     const url = new URL(request.url, `http://${request.headers.host}`);
     const scoped = /^\/chats\/([^/]+)(\/.*)$/.exec(url.pathname);
     const chat = scoped ? chats.get(scoped[1]) : activeChat;
@@ -65,7 +67,14 @@ export async function startFakeServe({
       return;
     }
     if (request.method === "GET" && url.pathname === "/health") {
-      return json(response, 200, { status: "ok", protocol_version: 1 });
+      return json(response, 200, { status: "ok", protocol_version: 1, access: "full" });
+    }
+    // Serve relays each run's diagram server, which only its own host can reach.
+    const relay = /^\/v1\/runs\/([^/]+)\/diagram(\/v1\/(?:diagram|events))$/.exec(url.pathname);
+    if (request.method === "GET" && relay) {
+      const entry = runs.get(decodeURIComponent(relay[1]));
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return relay[2] === "/v1/diagram" ? json(response, 200, entry.snapshot) : subscribe(response, entry);
     }
     if (request.method === "POST" && url.pathname === "/v1/programs/check") {
       return readBody(request).then((body) => checkProgram(body, response));
@@ -95,6 +104,41 @@ export async function startFakeServe({
       entry.record.status = "pausing";
       // The walk parks at its next tag boundary, as the runtime does.
       return json(response, 202, entry.record);
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/mutate")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/mutate".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      if (!["running", "paused"].includes(entry.record.status)) {
+        return json(response, 409, { error: `run is ${entry.record.status}; only a running or paused run can mutate` });
+      }
+      const body = JSON.parse((await readBody(request)) || "{}");
+      // The plan the daemon would diff out of the edit: one line per change.
+      const changes = body.program === entry.program ? [] : ["update_reaction review.reaction.0 on review.reviewer"];
+      if (changes.length === 0 || body.dry_run) return json(response, 200, { changes });
+      entry.program = body.program;
+      entry.record.mutation = { status: "pending", changes };
+      if (entry.record.status === "paused") {
+        applyMutation(entry);
+        return json(response, 200, entry.record);
+      }
+      // A running run pauses first; the walk applies it at the boundary.
+      entry.record.status = "pausing";
+      return json(response, 202, entry.record);
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/program")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/program".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return json(response, 200, { filename: entry.filename ?? "program.omar", program: entry.program });
     }
     if (
       request.method === "GET" &&
@@ -368,13 +412,32 @@ export async function startFakeServe({
       return subscribeChat(response, chat);
     }
     json(response, 404, { error: "not found" });
+  };
+  const server = createServer(handle);
+
+  /**
+   * The view port: the same pages and reads, no writes. Host files and what a
+   * web agent is owed stay private, and the loopback diagram server is relayed
+   * under its run because a remote viewer cannot reach it.
+   */
+  const viewServer = viewPort === null ? null : createServer((request, response) => {
+    const path = new URL(request.url, "http://view").pathname.replace(/^\/chats\/[^/]+/, "");
+    if (request.method === "GET" && path === "/health") {
+      return json(response, 200, { status: "ok", protocol_version: 1, access: "view" });
+    }
+    const refused = (request.method !== "GET" && request.method !== "OPTIONS") ||
+      path.startsWith("/v1/workspaces") || /^\/v1\/runs\/[^/]+\/panel$/.test(path);
+    if (refused) return json(response, 403, { error: "read-only view" });
+    return handle(request, response);
   });
+  /** Frames a client sent up a view port's terminal, which it should not. */
+  let viewTerminalFrames = 0;
 
   // A stand-in for the agent's tmux session: it announces a size the way the
   // daemon does, then echoes what is typed so a test can prove keystrokes
   // travelled up the same socket the screen comes down.
   const terminals = new WebSocketServer({ noServer: true });
-  server.on("upgrade", (request, socket, head) => {
+  const upgrade = (view) => (request, socket, head) => {
     const url = new URL(request.url, "http://127.0.0.1");
     url.pathname = url.pathname.replace(/^\/chats\/[^/]+/, "");
     // The assistant has a route of its own: its tmux session is not named
@@ -411,6 +474,11 @@ export async function startFakeServe({
       draw();
       if (!terminalReflow) client.send(Buffer.from(`${agent} $ `));
       client.on("message", (data, isBinary) => {
+        // A view port discards keystrokes and resizes alike.
+        if (view) {
+          viewTerminalFrames += 1;
+          return;
+        }
         // Text is a resize control frame, binary is keystrokes. The daemon
         // reflows the session and answers with the shape it settled on;
         // echoing a control frame back would type it at the shell instead.
@@ -423,7 +491,9 @@ export async function startFakeServe({
         client.send(Buffer.from(data));
       });
     });
-  });
+  };
+  server.on("upgrade", upgrade(false));
+  viewServer?.on("upgrade", upgrade(true));
 
   let backend = "codex";
   function newChat() {
@@ -516,6 +586,19 @@ export async function startFakeServe({
       Math.max(10, stepMs / 3),
     );
     setTimeout(() => {
+      // Asked while the chat's run is live, it changes that run's program,
+      // as the envelope tells the real EA to: same main, edited in place.
+      const live = latest(chat);
+      if (live && ["running", "paused"].includes(live.record.status)) {
+        const preview = structuredClone(golden);
+        preview.status = "ready";
+        publish("assistant", "Tightened the reviewer's prompt in the running workflow.", {
+          program: `${live.program ?? PROPOSED_PROGRAM}\n// tightened by OMAR\n`,
+          inputs: {},
+          preview,
+        });
+        return;
+      }
       if (!asked) {
         publish(
           "assistant",
@@ -700,6 +783,9 @@ export async function startFakeServe({
         finished_at: null,
         error: null,
       },
+      // What the run executes, so a mutation can tell an edit from none.
+      program: request.program,
+      filename: request.filename,
       // What the operator chose at the confirmation, so a test can read it back.
       options: {
         keep_workspaces: request.keep_workspaces === true,
@@ -765,6 +851,26 @@ export async function startFakeServe({
     return entry.checkpoints;
   }
 
+  /** A mutation lands as a checkpoint of its own, the new resume point. */
+  function applyMutation(entry) {
+    const checkpoints = checkpointsOf(entry);
+    const parent = entry.resumePoint;
+    const sequence = checkpoints.length + 1;
+    const id = `cp-${sequence}`;
+    checkpoints.push({
+      id,
+      sequence,
+      parent,
+      trigger: "mutation",
+      completed_tag: [0, 1],
+      next_tag: [0, 2],
+      created_at: sequence,
+      mutation: entry.record.mutation.changes,
+    });
+    entry.resumePoint = id;
+    entry.record.mutation = { ...entry.record.mutation, status: "applied", checkpoint: id };
+  }
+
   function publish(entry, kind, payload, tag = null) {
     entry.sequence += 1;
     entry.snapshot.sequence = entry.sequence;
@@ -805,6 +911,12 @@ export async function startFakeServe({
       entry.snapshot.status = "paused";
       publish(entry, "run_checkpointed", { checkpoint: "cp-2", trigger: "pause" }, { timestamp: 0, microstep: 1 });
       publish(entry, "run_paused", { checkpoint: "cp-2" });
+      // A pause a mutation asked for: apply it, then resume on our own.
+      if (entry.record.mutation?.status === "pending") {
+        applyMutation(entry);
+        entry.record.status = "running";
+        entry.record.finished_at = null;
+      }
       while (entry.record.status === "paused") await wait();
       entry.snapshot.status = "running";
       publish(entry, "run_started", {});
@@ -866,8 +978,13 @@ export async function startFakeServe({
   }
 
   await new Promise((resolve) => server.listen(port, host, resolve));
+  if (viewServer) await new Promise((resolve) => viewServer.listen(viewPort, host, resolve));
   return {
     url: `http://${host}:${server.address().port}`,
+    viewUrl: viewServer ? `http://${host}:${viewServer.address().port}` : null,
+    get viewTerminalFrames() {
+      return viewTerminalFrames;
+    },
     agentToken,
     publishRuntime(text) {
       return publishChat("assistant", text, null, false, [], activeChat, true);
@@ -885,6 +1002,10 @@ export async function startFakeServe({
       // idle out, adding seconds to every test.
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
+      if (viewServer) {
+        viewServer.closeAllConnections();
+        await new Promise((resolve) => viewServer.close(resolve));
+      }
     },
   };
 }

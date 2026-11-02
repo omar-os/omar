@@ -1,4 +1,5 @@
 import Omar.Compiler
+import Omar.Mutation
 
 open Lean
 open Omar
@@ -22,49 +23,49 @@ structure TopologyCase where
   codexOnly : Bool := true
 
 def topologyCases : Array TopologyCase := #[
-  { file := "AllTypes.omar", team := "AllTypes", agents := 1, ports := 18,
-    reactions := 1, instructions := 23 },
+  { file := "AllTypes.omar", team := "AllTypes", agents := 1, ports := 24,
+    connections := 6, reactions := 4, states := 6, instructions := 47 },
   { file := "BusinessLoop.omar", team := "BusinessLoop", agents := 8,
-    ports := 20, reactions := 11, instructions := 42 },
+    ports := 21, connections := 1, reactions := 14, states := 1, instructions := 51 },
   -- `main WithinTest` names the program, so the team is not the file stem.
-  { file := "DeadlineProbe.omar", team := "WithinTest", agents := 3, ports := 3,
-    reactions := 3, instructions := 13, codexOnly := false },
+  { file := "DeadlineProbe.omar", team := "WithinTest", agents := 3, ports := 4,
+    connections := 1, reactions := 6, states := 1, instructions := 22, codexOnly := false },
   -- Every agent is a Stub, so the shared-backend assertion does not apply.
-  { file := "Depths.omar", team := "Depths", agents := 4, ports := 9,
-    connections := 4, reactions := 4, instructions := 27, codexOnly := false },
-  { file := "EffectContracts.omar", team := "EffectContracts", agents := 1, ports := 6,
-    reactions := 3, instructions := 13 },
-  { file := "FanOutFanIn.omar", team := "FanOutFanIn", agents := 4, ports := 5,
-    reactions := 4, instructions := 16 },
-  { file := "HR.omar", team := "HR", agents := 3, ports := 6,
-    reactions := 4, instructions := 16, codexOnly := false },
-  { file := "HRCodex.omar", team := "HRCodex", agents := 3, ports := 6,
-    reactions := 4, instructions := 16 },
-  { file := "OrTriggers.omar", team := "OrTriggers", agents := 3, ports := 5,
-    reactions := 3, instructions := 14 },
-  { file := "OrderedWrites.omar", team := "OrderedWrites", agents := 4, ports := 3,
-    reactions := 4, instructions := 14 },
+  { file := "Depths.omar", team := "Depths", agents := 4, ports := 11,
+    connections := 5, reactions := 8, states := 1, instructions := 38, codexOnly := false },
+  { file := "EffectContracts.omar", team := "EffectContracts", agents := 1, ports := 7,
+    connections := 1, reactions := 6, states := 1, instructions := 22 },
+  { file := "FanOutFanIn.omar", team := "FanOutFanIn", agents := 4, ports := 6,
+    connections := 1, reactions := 7, states := 1, instructions := 25 },
+  { file := "HR.omar", team := "HR", agents := 3, ports := 7,
+    connections := 1, reactions := 7, states := 1, instructions := 25, codexOnly := false },
+  { file := "HRCodex.omar", team := "HRCodex", agents := 3, ports := 7,
+    connections := 1, reactions := 7, states := 1, instructions := 25 },
+  { file := "OrTriggers.omar", team := "OrTriggers", agents := 3, ports := 6,
+    connections := 1, reactions := 6, states := 1, instructions := 23 },
+  { file := "OrderedWrites.omar", team := "OrderedWrites", agents := 4, ports := 4,
+    connections := 1, reactions := 7, states := 1, instructions := 23 },
   -- A `ClaudeCode` and a `Web`, so the shared backend assertion does not apply.
   { file := "PortManager.omar", team := "WebPanel", agents := 2, ports := 4,
     connections := 2, reactions := 2, instructions := 15, codexOnly := false },
-  { file := "Recurrence.omar", team := "Recurrence", agents := 1, ports := 3,
-    reactions := 1, instructions := 8 },
+  { file := "Recurrence.omar", team := "Recurrence", agents := 1, ports := 4,
+    connections := 1, reactions := 4, states := 1, instructions := 17 },
   -- Three instances of one team, so every count is the team's times three.
-  { file := "Ring.omar", team := "Ring", agents := 3, ports := 9,
-    connections := 3, reactions := 3, instructions := 26 },
+  { file := "Ring.omar", team := "Ring", agents := 3, ports := 10,
+    connections := 4, reactions := 6, states := 1, instructions := 35 },
   -- Same shape as Ring with the reaction written as code, so no agent at all.
   { file := "RingCode.omar", team := "RingCode", agents := 0, ports := 9,
     connections := 3, reactions := 3, instructions := 23 },
   -- The issue's sketch: a counter kept in state rather than carried in the token.
   { file := "RingLeader.omar", team := "RingLeader", agents := 0, ports := 3,
     connections := 1, reactions := 2, states := 1, instructions := 11 },
-  { file := "SameAgentSerial.omar", team := "SameAgentSerial", agents := 2, ports := 4,
-    reactions := 3, instructions := 12 },
-  { file := "SuperdenseTime.omar", team := "SuperdenseTime", agents := 3, ports := 6,
-    connections := 1, reactions := 3, instructions := 16 },
+  { file := "SameAgentSerial.omar", team := "SameAgentSerial", agents := 2, ports := 5,
+    connections := 1, reactions := 6, states := 1, instructions := 21 },
+  { file := "SuperdenseTime.omar", team := "SuperdenseTime", agents := 3, ports := 8,
+    connections := 3, reactions := 6, states := 2, instructions := 28 },
   -- `main WorldNewsEveryTwoMinutes` names the program; a 2min periodic timer.
-  { file := "WorldNews.omar", team := "WorldNewsEveryTwoMinutes", agents := 2, ports := 3,
-    connections := 1, reactions := 2, instructions := 13 }
+  { file := "WorldNews.omar", team := "WorldNewsEveryTwoMinutes", agents := 2, ports := 4,
+    connections := 2, reactions := 5, states := 1, instructions := 22 }
 ]
 
 def testTopology (test : TopologyCase) : IO Unit := do
@@ -135,9 +136,10 @@ def testTopology (test : TopologyCase) : IO Unit := do
     -- Instances are structure, not a naming convention: the bytecode says which
     -- container each name belongs to rather than leaving it to be guessed from
     -- the dot.
-    assertEqual "one instance per instantiation" program.instances.size 3
+    -- Three nodes, and the Smoke team that checks the ring.
+    assertEqual "one instance per instantiation" program.instances.size 4
     assertEqual "instances name their team"
-      (program.instances.all (·.team == "Node")) true
+      ((program.instances.filter (·.name != "smoke")).all (·.team == "Node")) true
     assertEqual "every port belongs to an instance"
       (program.ports.all (fun port => port.instance_ != "")) true
     assertEqual "members are grouped by instance"
@@ -164,7 +166,7 @@ def testTopology (test : TopologyCase) : IO Unit := do
       (program.reactions.all (fun reaction => !mentions reaction.prompt "$(idx)")) true
     assertEqual "ring is wired head to tail"
       (program.connections.map fun connection => s!"{connection.source}->{connection.target}")
-      #["n1.out->n2.token", "n2.out->n3.token", "n3.out->n1.token"]
+      #["n1.out->n2.token", "n2.out->n3.token", "n3.out->n1.token", "n1.done->smoke.done"]
   if test.file == "PortManager.omar" then
     -- The backend is the whole point of the sample, and `codexOnly` is off, so
     -- nothing else would check it.
@@ -350,6 +352,11 @@ def rejectionCases : Array (String × String × String) := #[
   ("a parameter named like a port",
     "team Wire(src : int) { input src : int output dst : int }
      main { w = Wire(1) }", "is also a port"),
+  -- `shutdown` is the runtime's trigger, and no team may declare its own.
+  ("a timer named shutdown",
+    wireTeam "timer shutdown(1s, 0)", "the trigger the run's last tag fires"),
+  ("a port named shutdown",
+    wireTeam "input shutdown : int", "the trigger the run's last tag fires"),
   ("a parameter named like a state variable",
     "team Wire(n : int) { input src : int output dst : int state n : int = 0 }
      main { w = Wire(1) }", "is also a port, timer or state")
@@ -366,6 +373,24 @@ def testStateLiterals : IO Unit :=
       assertEqual "string state"
         (program.states.any (fun v => v.name == "w.name" && v.initial == .str "x")) true
   | .error message => throw (IO.userError s!"state literals: {message}")
+
+/-- Reacting to `shutdown` declares it, once per instance, as a timer the
+    clock never fires; a team that does not react to it has none. -/
+def testShutdown : IO Unit := do
+  let source := "team T { input a : int state seen : bool = false
+     reaction(a) -> {= self.seen = true; request_stop(); =}
+     reaction(shutdown) -> {= assert!(self.seen); =} }
+     main { x = T() y = T() }"
+  match compileSource "Smoke" source with
+  | .ok bytecode =>
+      assertEqual "one shutdown trigger per instance"
+        ((bytecode.splitOn "\"shutdown\": true").length - 1) 2
+  | .error message => throw (IO.userError s!"shutdown: {message}")
+  match lex (wireTeam "src -> dst") >>= parse "Wire" with
+  | .ok program =>
+      assertEqual "no shutdown without a reaction to it"
+        (program.timers.any (·.shutdown)) false
+  | .error message => throw (IO.userError s!"no shutdown: {message}")
 
 /-- `{= ... =}` promises raw Rust, so a `=}` that Rust is holding — in a
     string, a raw string, a character literal or a comment — closes nothing. -/
@@ -564,6 +589,65 @@ def testSchemaTypeResolution : IO Unit := do
     | .ok _ => throw (IO.userError "accepted unknown, incompatible, or inline schema type")
   IO.println "schema type resolution tests passed"
 
+/-- The plan `omarc --diff` writes, as one string per instruction. -/
+def mutationPlan (old new : String) (newName : String := "Relay") : Except String (Array String) := do
+  let plan ← compileDiffSourcesWithSchemas "Relay" old #[] newName new #[]
+  let instructions ← Json.parse plan >>= (·.getObjValAs? (Array Json) "instructions")
+  pure (instructions.map (·.compress))
+
+def planOf (old new : String) : IO (Array String) :=
+  match mutationPlan old new with
+  | .ok plan => pure plan
+  | .error error => throw (IO.userError s!"plan: {error}")
+
+def relaySource (second : String) (prompt : String) (extra : String := "") : String :=
+  "team Node(idx : int)[agent : Stub] { input token : int output out : int state seen : int = 0 " ++
+  extra ++ " task agent(token) -> out \"" ++ prompt ++ " $(idx)\" } " ++
+  "main Relay { n1 = Node(1) n2 = Node(" ++ second ++ ") n1.out -> n2.token }"
+
+def testMutation : IO Unit := do
+  let v1 := relaySource "2" "go"
+  -- Unchanged: the frame and nothing else.
+  let same ← planOf v1 v1
+  assertEqual "unchanged plan" same.size 2
+  -- A prompt edited: both reactions updated in place, nothing else.
+  let edited ← planOf v1 (relaySource "2" "go faster")
+  assertEqual "edited prompt" (edited.filter (mentions · "update_reaction")).size 2
+  assertEqual "edited prompt only" edited.size 4
+  -- An argument changed: that instance replaced whole, the other untouched.
+  let replaced ← planOf v1 (relaySource "5" "go")
+  for expected in ["kill_agent", "remove_instance", "remove_state", "declare_instance",
+      "\"name\":\"n2.seen\""] do
+    unless replaced.any (mentions · expected) do
+      throw (IO.userError s!"replaced instance: {expected} missing from {replaced}")
+  if replaced.any (mentions · "n1.") then
+    throw (IO.userError s!"replacing n2 touched n1: {replaced}")
+  -- Removals come before declarations.
+  let firstDeclare := (replaced.findIdx? (mentions · "declare_instance")).getD 0
+  let lastRemoval := (replaced.toList.reverse.findIdx? (mentions · "remove_")).map
+    (replaced.size - 1 - ·) |>.getD replaced.size
+  unless lastRemoval < firstDeclare do
+    throw (IO.userError s!"a removal follows a declaration: {replaced}")
+  -- A connection taken out and a port added.
+  let rewired ← planOf v1
+    ("team Node(idx : int)[agent : Stub] { input token : int output out : int state seen : int = 0 " ++
+     "output echo : int task agent(token) -> out \"go $(idx)\" } " ++
+     "main Relay { n1 = Node(1) n2 = Node(2) }")
+  for expected in ["disconnect_ports", "\"name\":\"n1.echo\"", "\"name\":\"n2.echo\""] do
+    unless rewired.any (mentions · expected) do
+      throw (IO.userError s!"rewired: {expected} missing from {rewired}")
+  -- A renamed main is another program.
+  match mutationPlan v1 (v1.replace "main Relay" "main Other") "Other" with
+  | .error error => unless mentions error "keeps the program's main" do
+      throw (IO.userError s!"renamed main: {error}")
+  | .ok _ => throw (IO.userError "a renamed main was planned as a mutation")
+  -- The theorems hold of what is shipped: these are what `plan_sound`,
+  -- `plan_minimal` and `compiled_plan_sound` are about.
+  let _ := @Omar.Mutation.plan_sound
+  let _ := @Omar.Mutation.plan_minimal
+  let _ := @Omar.Mutation.compiled_plan_sound
+  IO.println "mutation tests passed"
+
 def main : IO UInt32 := do
   try
     for test in topologyCases do
@@ -575,9 +659,11 @@ def main : IO UInt32 := do
     testWithin
     testDelayUnits
     testStateLiterals
+    testShutdown
     testCodeTerminator
     testExternalSchemas
     testSchemaTypeResolution
+    testMutation
     IO.println "compiler rejection tests passed"
     pure 0
   catch error =>

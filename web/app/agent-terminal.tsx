@@ -19,10 +19,13 @@ const SETTLE_MS = 100;
 export function AgentTerminal({
   serveUrl,
   agent,
+  readOnly = false,
   onClose,
 }: {
   serveUrl: string;
   agent: string;
+  /** A view port drops keystrokes and resizes, so neither is sent. */
+  readOnly?: boolean;
   onClose: () => void;
 }) {
   const screenRef = useRef<HTMLDivElement | null>(null);
@@ -36,7 +39,8 @@ export function AgentTerminal({
 
     const terminal = new Terminal({
       convertEol: false,
-      cursorBlink: true,
+      cursorBlink: !readOnly,
+      disableStdin: readOnly,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
       fontSize: 15,
       theme: { background: "#0b0b0e", foreground: "#d8d5e0" },
@@ -61,7 +65,7 @@ export function AgentTerminal({
     let frame = 0;
 
     const tell = (cols: number, rows: number) => {
-      if (socket.readyState !== WebSocket.OPEN) return;
+      if (readOnly || socket.readyState !== WebSocket.OPEN) return;
       asked = { cols, rows };
       socket.send(JSON.stringify(asked));
     };
@@ -128,7 +132,7 @@ export function AgentTerminal({
 
     // Keystrokes go up the same socket, which is why this is a socket at all.
     const typing = terminal.onData((data) => {
-      if (socket.readyState === WebSocket.OPEN) {
+      if (!readOnly && socket.readyState === WebSocket.OPEN) {
         socket.send(new TextEncoder().encode(data));
       }
     });
@@ -145,7 +149,7 @@ export function AgentTerminal({
       socket.close();
       terminal.dispose();
     };
-  }, [serveUrl, agent]);
+  }, [serveUrl, agent, readOnly]);
 
   useEffect(() => {
     const close = (event: KeyboardEvent) => {
@@ -195,8 +199,10 @@ export function AgentTerminal({
           <div className="terminal-screen" ref={screenRef} />
         </div>
         <p className="terminal-note">
-          Escape goes to the agent. Close with Ctrl+Shift+Escape or the Close button.{" "}
-          {agent === ASSISTANT
+          {readOnly ? "" : "Escape goes to the agent. "}Close with Ctrl+Shift+Escape or the Close button.{" "}
+          {readOnly
+            ? "View only: typing here is not sent. Closing detaches."
+            : agent === ASSISTANT
             ? // Worth saying: the chat and this terminal drive one pane, so a
               // half-typed line here collides with the next reply delivered.
               "This is the same session the chat talks to. Typing here shares the pane with it. Closing detaches; the assistant keeps running."
