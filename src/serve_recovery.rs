@@ -60,7 +60,7 @@ fn queue_finished(context: &Arc<Context_>, record: &RunRecord) {
             record.team, failure_guidance(detail)
         ),
         RunStatus::Completed => format!(
-            "**{} finished.** Review its outputs in Files & versions. OMAR will check the result and suggest the next useful step.", record.team
+            "**{} finished.** OMAR will check its recorded outputs, summarize the result in chat, and suggest the next useful step.", record.team
         ),
         RunStatus::Paused => format!(
             "**{} is paused.** Its checkpoint is saved; choose Resume to continue from it.", record.team
