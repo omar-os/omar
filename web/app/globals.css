@@ -1457,80 +1457,6 @@ p.connection-error { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; 
   margin-bottom: 0;
 }
 
-/* One web component's panel, opened from the diagram rather than docked. A
-   program may declare several web agents with different interfaces, so this is
-   scoped to one and says whose it is. Not full-window like a terminal: the
-   diagram behind it is the context for what is being answered. */
-.port-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 40;
-  display: grid;
-  place-items: center;
-  background: rgba(6, 6, 9, 0.72);
-}
-
-.port-panel {
-  display: flex;
-  flex-direction: column;
-  width: min(560px, 92vw);
-  max-height: 84vh;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--panel);
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
-}
-
-.port-panel-head {
-  flex: none;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 16px 18px;
-  border-bottom: 1px solid var(--line);
-}
-
-.port-panel-head h2 {
-  margin: 3px 0 0;
-  font-size: 1.0625rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
-.port-panel-close {
-  flex: none;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 5px 10px;
-  background: var(--panel-2);
-  color: var(--muted);
-  font-size: 0.8125rem;
-}
-
-.port-panel-close:hover {
-  color: var(--text);
-  border-color: var(--purple);
-}
-
-.port-panel-body {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  padding: 14px 18px 18px;
-}
-
-.port-panel-idle {
-  margin: 0 0 16px;
-  color: var(--muted);
-  font-size: 0.875rem;
-  line-height: 1.6;
-}
-
-.port-list + .port-list {
-  margin-top: 14px;
-}
-
 /* An invocation owed comes first: it is the only part with a deadline. */
 .port-waiting {
   display: flex;
@@ -2900,20 +2826,7 @@ p.connection-error { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; 
 .diagram-heading > div:first-child { min-width: 0; overflow-wrap: anywhere; }
 
 .artifact-toolbar { display: flex; align-items: center; gap: 20px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
-/* Response dialogs must reflow long instructions and nested JSON at every zoom. */
-dialog.port-panel {
-  padding: 0;
-  color: var(--text);
-  width: min(640px, calc(100dvw - 32px));
-  max-width: calc(100dvw - 32px);
-  max-height: calc(100dvh - 32px);
-  margin: auto;
-}
-dialog.port-panel:not([open]) { display: none; }
-dialog.port-panel::backdrop { background: rgba(6, 6, 9, .72); }
-.port-panel-head > div, .port-panel-body, .port-waiting, .port-field, .port-row { min-width: 0; }
-.port-panel-head h2 { font-family: inherit; overflow-wrap: anywhere; }
-.port-panel-body { overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
+.port-waiting, .port-field, .port-row { min-width: 0; }
 .port-waiting { padding: 0; border: 0; background: transparent; gap: 14px; }
 .port-response-summary { margin: 0; line-height: 1.5; }
 .port-instructions { margin: 0; padding-left: 22px; color: var(--muted); line-height: 1.5; }
@@ -2938,7 +2851,7 @@ dialog.port-panel::backdrop { background: rgba(6, 6, 9, .72); }
 .port-response-footer .primary-button { width: 100%; white-space: normal; }
 .run-feedback.run-waiting { padding: 12px 18px; }
 .run-feedback.run-waiting p { margin: 5px 0 10px; }
-@media (max-width: 600px) { .port-panel-head, .port-panel-body { padding: 12px; } .port-response-footer { bottom: -12px; } }
+
 
 .artifact-tabs { display: flex; gap: 24px; min-width: 0; }
 .artifact-editor-button { margin-left: auto; flex-shrink: 0; margin-bottom: 6px; }

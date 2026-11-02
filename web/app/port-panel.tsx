@@ -1,58 +1,91 @@
 "use client";
 
-import { type FormEvent, useEffect, useId, useMemo, useRef, useState } from "react";
-import { formatDuration, parseInputValue, type DiagramSnapshot, type PendingInvocation } from "./lib/protocol";
-import { exclusiveOutputs, fieldLabel, prettyValue, responseGuide, type ResponseGuide } from "./lib/response-guide";
+import { type FormEvent, useState } from "react";
+import { parseInputValue, type DiagramSnapshot, type PendingInvocation } from "./lib/protocol";
+import { approvalFor, exclusiveOutputs, fieldLabel, nextSteps, prettyValue, responseGuide, type ResponseGuide } from "./lib/response-guide";
 
-type Answer = (invocation: PendingInvocation, values: Record<string, unknown>) => Promise<void>;
-export function PortPanel({ agent, snapshot, pending, sending, guides = {}, onAnswer, onClose }: {
-  agent: string; snapshot: DiagramSnapshot; pending: PendingInvocation[]; sending: boolean;
-  guides?: Record<string, ResponseGuide>; onAnswer: Answer; onClose: () => void;
+export type Answer = (invocation: PendingInvocation, values: Record<string, unknown>, receipt: string) => Promise<void>;
+
+/** The selected workflow step owns its controls. No separate modal or focus trap. */
+export function StepResponse({ invocation, snapshot, sending, guide = {}, onAnswer, onCheck, onConfigure }: {
+  invocation: PendingInvocation; snapshot: DiagramSnapshot; sending: boolean; guide?: ResponseGuide;
+  onAnswer: Answer; onCheck: () => Promise<boolean>; onConfigure: () => void;
 }) {
-  const dialog = useRef<HTMLDialogElement>(null);
-  const titleId = useId();
-  useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
-    const element = dialog.current;
-    element?.showModal();
-    return () => { element?.close(); if (previous?.isConnected) previous.focus(); };
-  }, []);
-  const wiring = useMemo(() => {
-    const id = snapshot.agents.find(a => a.name === agent)?.id;
-    const mine = snapshot.reactions.filter(r => r.agent === id);
-    const ports = (ids: string[]) => snapshot.ports.filter(p => ids.includes(p.id));
-    return { reads: ports(mine.flatMap(r => r.triggers)), writes: ports(mine.flatMap(r => r.effects)) };
-  }, [agent, snapshot]);
-  const first = pending[0] ? responseGuide(pending[0], guides[agent]) : null;
-  return (
-    <dialog ref={dialog} className="port-panel" aria-labelledby={titleId} onCancel={onClose}>
-      <header className="port-panel-head">
-        <div><span className="eyebrow">{first ? "NEEDS YOUR RESPONSE" : "STEP DETAILS"}</span><h2 id={titleId}>{first?.title || "No response needed"}</h2></div>
-        <button type="button" className="port-panel-close" onClick={onClose} autoFocus>Close</button>
-      </header>
-      <div className="port-panel-body">
-        {pending.map(invocation => <Waiting key={invocation.task_id} invocation={invocation} sending={sending} guide={guides[agent]} onAnswer={onAnswer} />)}
-        {!pending.length ? <p className="port-panel-idle">This step is not waiting for a response. You can close this panel.</p> : null}
-        <details className="port-details"><summary>Technical details</summary>
-          <p>Step: <code>{agent}</code></p>
-          <PortList label="Input values" ports={wiring.reads} /><PortList label="Output values" ports={wiring.writes} />
-        </details>
+  const copy = responseGuide(invocation, guide);
+  const [checking, setChecking] = useState(false);
+  const [checkResult, setCheckResult] = useState("");
+  async function check() {
+    setChecking(true); setCheckResult("");
+    try { setCheckResult(await onCheck() ? "This step is still blocked. Complete the setup above, then check again." : "This step is no longer waiting for setup. Check its current status in the workflow."); }
+    catch { setCheckResult("Could not check the runtime. Try again when it is connected."); }
+    finally { setChecking(false); }
+  }
+  return <section className="step-response" aria-label={copy.label}>
+    <span className="interaction-kind" data-kind={copy.kind}>{copy.label}</span>
+    <p className="port-response-summary">{copy.summary}</p>
+    <p className="response-required">{copy.required}</p>
+    {copy.kind === "setup" ? <>
+      <ol className="port-instructions">{copy.instructions.map((line, i) => <li key={i}>{line}</li>)}</ol>
+      <div className="response-actions">
+        {copy.setupUrl ? <a className="primary-button" href={copy.setupUrl} target="_blank" rel="noopener noreferrer">Open setup</a> : <button type="button" className="primary-button" onClick={onConfigure}>Configure with OMAR</button>}
+        <button type="button" className="secondary-button" disabled={checking} onClick={() => void check()}>{checking ? "Checking…" : "Check status"}</button>
       </div>
-    </dialog>
-  );
+      <p className="response-next">Checking reads the runtime status. The step continues only when its requirements are resolved.</p>
+      {checkResult ? <p role="status">{checkResult}</p> : null}
+    </> : copy.kind === "approval" ? <Approval invocation={invocation} snapshot={snapshot} sending={sending} guide={guide} onAnswer={onAnswer} onConfigure={onConfigure} />
+      : <ResponseFields invocation={invocation} snapshot={snapshot} sending={sending} guide={guide} onAnswer={onAnswer} />}
+    <details className="port-details"><summary>Full instructions</summary><p className="port-waiting-prompt">{invocation.prompt}</p></details>
+    <details className="port-details"><summary>Technical details</summary>
+      <p>Step: <code>{invocation.agent}</code></p>
+      {Object.entries(invocation.trigger_values).map(([name, value]) => <div className="port-row" key={name}><span className="port-row-name">{name}</span><pre className="port-row-value">{prettyValue(value)}</pre></div>)}
+      <p className="port-waiting-contract">{invocation.contract}</p>
+    </details>
+  </section>;
 }
-function PortList({ label, ports }: { label: string; ports: DiagramSnapshot["ports"] }) {
-  if (!ports.length) return null;
-  return <div className="port-list"><h3>{label}</h3>{ports.map(port => <div key={port.id} className="port-row">
-    <span className="port-row-name">{port.name}</span><span className="port-row-type">{port.type}</span>
-    <pre className="port-row-value">{port.value === null ? "—" : prettyValue(port.value)}</pre>
-    <span className="port-row-tag">{port.last_tag ? `${formatDuration(port.last_tag.timestamp)}:${port.last_tag.microstep}` : ""}</span>
-  </div>)}</div>;
+
+function Approval({ invocation, snapshot, sending, guide, onAnswer, onConfigure }: {
+  invocation: PendingInvocation; snapshot: DiagramSnapshot; sending: boolean; guide: ResponseGuide; onAnswer: Answer; onConfigure: () => void;
+}) {
+  const binding = approvalFor(invocation, guide);
+  const [revising, setRevising] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [error, setError] = useState("");
+  const [submitted, setSubmitted] = useState(false);
+  if (!binding) return <div className="response-configuration"><p>This approval needs a reviewable result and valid decision outputs before it can be submitted.</p><button type="button" className="secondary-button" onClick={onConfigure}>Configure approval</button></div>;
+  const revisions = nextSteps(snapshot, binding.changes);
+  const following = nextSteps(snapshot, binding.approve);
+  async function decide(changes: boolean) {
+    if (!binding || sending || submitted || (changes && (!feedback.trim() || !revisions.length))) return;
+    setError("");
+    const port = changes ? binding.changes : binding.approve;
+    const receipt = changes ? `Changes requested. Feedback sent to ${revisions.join(", ")}.`
+      : following.length ? `Approved. Result sent to ${following.join(", ")}.` : "Approved. The result was accepted by the workflow.";
+    try { await onAnswer(invocation, { [port]: changes ? feedback.trim() : binding.value }, receipt); setSubmitted(true); }
+    catch (cause) { setError(`${cause instanceof Error ? cause.message : "Submission failed."} Your feedback has been kept.`); }
+  }
+  return <div className="approval-response">
+    <h4>Result to review</h4>
+    <div className="approval-artifact">{prettyValue(binding.value)}</div>
+    <p className="response-next">{following.length ? `Approval sends this result to ${following.join(", ")}.` : "Approval accepts this result as the workflow output."}</p>
+    {revising ? <div className="revision-feedback">
+      <label className="port-field"><span className="port-field-name">What should change?</span><textarea autoFocus rows={3} value={feedback} onChange={event => setFeedback(event.target.value)} disabled={sending || submitted} placeholder="Describe the changes you need…" /></label>
+      <p className="response-next">Your feedback goes to {revisions.join(", ")}.</p>
+      <div className="response-actions"><button type="button" className="primary-button" disabled={sending || submitted || !feedback.trim()} onClick={() => void decide(true)}>{sending ? "Sending…" : "Send change request"}</button><button type="button" className="secondary-button" disabled={sending || submitted} onClick={() => setRevising(false)}>Cancel</button></div>
+    </div> : <div className="response-actions">
+      <button type="button" className="primary-button" disabled={sending || submitted} onClick={() => void decide(false)}>{sending ? "Submitting…" : "Approve"}</button>
+      <button type="button" className="secondary-button" disabled={sending || submitted || !revisions.length} onClick={() => setRevising(true)}>Request changes</button>
+    </div>}
+    {!revisions.length ? <p className="response-next">This workflow has no revision path. <button type="button" className="link-button" onClick={onConfigure}>Configure a revision step</button> to enable change requests.</p> : null}
+    {error ? <p className="port-field-problem" role="alert">{error}</p> : null}
+  </div>;
 }
-function Waiting({ invocation, sending, guide, onAnswer }: { invocation: PendingInvocation; sending: boolean; guide?: ResponseGuide; onAnswer: Answer }) {
+
+function ResponseFields({ invocation, snapshot, sending, guide, onAnswer }: {
+  invocation: PendingInvocation; snapshot: DiagramSnapshot; sending: boolean; guide: ResponseGuide; onAnswer: Answer;
+}) {
   const copy = responseGuide(invocation, guide);
   const alternatives = exclusiveOutputs(invocation);
-  const [selected, setSelected] = useState(copy.setupOnly ? copy.blocked! : alternatives?.find(p => p !== copy.blocked) || "");
+  const [selected, setSelected] = useState(alternatives?.find(p => p !== copy.blocked) || "");
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [signals, setSignals] = useState<Record<string, boolean>>({});
   const [error, setError] = useState("");
@@ -65,44 +98,33 @@ function Waiting({ invocation, sending, guide, onAnswer }: { invocation: Pending
     const text = draft[port] ?? "";
     if (!text.trim()) continue;
     const parsed = parseInputValue(type, text);
-    const expectsJson = copy.outcomes[port]?.format === "json" || (copy.setupOnly && port === copy.blocked);
     let invalid = parsed === undefined;
-    if (expectsJson) { try { JSON.parse(text); } catch { invalid = true; } }
+    if (copy.outcomes[port]?.format === "json") { try { JSON.parse(text); } catch { invalid = true; } }
     if (invalid) bad.push(port); else values[port] = parsed;
   }
-  const valid = !bad.length && (!alternatives || Object.keys(values).length === 1)
-    && (!copy.setupOnly || (Object.hasOwn(values, copy.blocked!) && Object.keys(values).length === 1));
-  const blockedSelected = selected === copy.blocked;
-  const button = copy.setupOnly ? "Report setup blocker" : copy.outcomes[selected]?.button || (blockedSelected ? "Report blocker" : alternatives ? `Submit ${fieldLabel(selected).toLowerCase()} & continue` : "Submit response & continue");
+  const valid = !bad.length && Object.keys(values).length > 0 && (!alternatives || Object.keys(values).length === 1);
+  const button = copy.outcomes[selected]?.button || (selected === copy.blocked ? "Report blocker" : copy.kind === "input" ? "Save and continue" : "Submit result and continue");
   async function submit(event: FormEvent) {
     event.preventDefault(); if (!valid || sending || submitted) return;
     setError("");
-    try { await onAnswer(invocation, values); setSubmitted(true); setDraft({}); }
-    catch (cause) {
-      const message = cause instanceof Error ? cause.message : "Submission failed. Your response has been kept.";
-      setError(message.includes("effect contract") && message.includes("not satisfied") ? "This step still needs a required output. Complete the remaining fields and try again. Your response has been kept." : message);
-    }
+    const destinations = [...new Set(Object.keys(values).flatMap(port => nextSteps(snapshot, port)))];
+    const receipt = `${copy.kind === "input" ? "Information saved" : "Response accepted"}.${destinations.length ? ` Sent to ${destinations.join(", ")}.` : " The workflow received your result."}`;
+    try { await onAnswer(invocation, values, receipt); setSubmitted(true); }
+    catch (cause) { setError(`${cause instanceof Error ? cause.message : "Submission failed."} Your response has been kept.`); }
   }
   return <form className="port-waiting" onSubmit={submit}>
-    <p className="port-response-summary">{copy.summary}</p>
-    <ol className="port-instructions">{copy.instructions.map((line, i) => <li key={i}>{line}</li>)}</ol>
-    <details className="port-details"><summary>Full instructions</summary><p className="port-waiting-prompt">{invocation.prompt}</p></details>
+    {copy.kind === "manual" ? <ol className="port-instructions">{copy.instructions.map((line, i) => <li key={i}>{line}</li>)}</ol> : null}
     {alternatives ? <fieldset className="port-outcomes"><legend>What are you submitting?</legend>{alternatives.map(port => <label key={port}>
-      <input type="radio" name={`outcome-${invocation.task_id}`} value={port} checked={selected === port} disabled={sending || (copy.setupOnly && port !== copy.blocked)} onChange={() => { setSelected(port); setError(""); }} />
-      {copy.outcomes[port]?.label || fieldLabel(port)}
+      <input type="radio" name={`outcome-${invocation.task_id}`} value={port} checked={selected === port} disabled={sending || submitted} onChange={() => { setSelected(port); setError(""); }} />{copy.outcomes[port]?.label || fieldLabel(port)}
     </label>)}</fieldset> : null}
     {effects.map(([port, type]) => <label className={`port-field${bad.includes(port) ? " invalid" : ""}`} key={port}>
       <span className="port-field-name">{copy.outcomes[port]?.label || fieldLabel(port)}</span>
-      <span className="port-field-help">{copy.outcomes[port]?.help || (copy.setupOnly ? "Paste a JSON failure report describing the missing requirements." : type === "signal" ? "Check to send this signal." : `Enter the requested ${type === "string" ? "text" : type} value.`)}</span>
-      {type === "signal" ? <input type="checkbox" checked={!!signals[port]} onChange={e => setSignals(v => ({ ...v, [port]: e.target.checked }))} disabled={sending} /> :
-        <textarea rows={4} value={draft[port] ?? ""} disabled={sending || submitted} onChange={e => { setDraft(v => ({ ...v, [port]: e.target.value })); setError(""); }} aria-invalid={bad.includes(port) || undefined} placeholder={copy.setupOnly ? '{"status":"blocked","reason":"Describe the missing requirements"}' : "Paste your response here…"} />}
-      {bad.includes(port) ? <span className="port-field-problem" role="alert">{copy.outcomes[port]?.format === "json" || copy.setupOnly ? "Enter valid JSON." : `Enter a valid ${type} value.`}</span> : null}
+      <span className="port-field-help">{copy.outcomes[port]?.help || (type === "signal" ? "Check to send this signal." : `Enter the requested ${type === "string" ? "text" : type} value.`)}</span>
+      {type === "signal" ? <input type="checkbox" checked={!!signals[port]} onChange={e => setSignals(v => ({ ...v, [port]: e.target.checked }))} disabled={sending || submitted} /> : <textarea rows={3} value={draft[port] ?? ""} disabled={sending || submitted} onChange={e => { setDraft(v => ({ ...v, [port]: e.target.value })); setError(""); }} aria-invalid={bad.includes(port) || undefined} placeholder="Enter your response…" />}
+      {bad.includes(port) ? <span className="port-field-problem" role="alert">{copy.outcomes[port]?.format === "json" ? "Enter valid JSON." : `Enter a valid ${type} value.`}</span> : null}
     </label>)}
-    <div className="port-response-footer"><p>{copy.next}</p>
-      {error ? <p role="alert" className="port-field-problem">{error}</p> : null}
-      {submitted ? <p role="status">Response accepted.</p> : null}
-      <button className="primary-button" type="submit" disabled={sending || submitted || !valid}>{sending ? "Submitting…" : button}</button>
-    </div>
-    <details className="port-details"><summary>Connection rules</summary><p className="port-waiting-contract">{invocation.contract}</p></details>
+    <p className="response-next">{copy.next}</p>
+    {error ? <p role="alert" className="port-field-problem">{error}</p> : null}
+    <button className="primary-button" type="submit" disabled={sending || submitted || !valid}>{sending ? "Submitting…" : button}</button>
   </form>;
 }

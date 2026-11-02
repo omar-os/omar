@@ -90,12 +90,47 @@ Keep backend/agent names in execution settings. Never imply that configured
 connections have been tested. When instructions or connections change, reconsider
 both title and description; do not carry obsolete claims into the revised design.
 
-The canvas shows the title; the details popup shows the full description.
+The canvas shows the title; the step inspector shows the full description.
 The execution prompt remains the complete instructions. Task copy does not
 change IDs, agents, triggers, output contracts, deadlines or connections.
 Supply it for every task and code reaction, including nested teams, and keep
 it accurate when revising a step. The proposal endpoint rejects missing copy
 and returns the steps to fix. Older source still compiles without task metadata.
+
+For any step requiring a person, also include `omar.response.json` in the proposal's
+`files`. Its `steps` object maps a qualified reaction name (preferred) or agent
+name to the interaction guide. Generate the guide from the actual workflow:
+
+```json
+{"steps":{"review.reaction.0":{"kind":"approval","title":"Review the release brief","summary":"The draft is ready for review.","required":"Approve the draft or explain what should change.","approval":{"artifact":"review.draft","approve":"review.approved","changes":"review.changes"}}}}
+```
+
+Choose the interaction explicitly:
+- `approval`: show the existing result with Approve and Request changes. The
+  `artifact` names a string input of that invocation; `approve` and `changes`
+  name the two exclusive string outputs. Approval forwards the original result.
+  Changes forwards the user's required feedback. Connect changes to a real
+  revision step and return its revised result to review. Never substitute a
+  terminal blocker report for a revision path. Other output shapes need a
+  manual guide until an explicit decision binding is supported.
+- `input`: ask for specific missing information, with `outcomes` keyed by qualified
+  output name and containing `label`, `help`, and optional `format: "json"`.
+- `manual`: work a person must actually perform. Include `instructions` (short
+  ordered actions), `outcomes` describing the expected result, and `next` stating
+  where submission goes. Do not ask a person to repeat automated work.
+- `setup`: compatibility presentation for an existing setup-only request. Include
+  the exact requirements, `instructions`, and a verified provider `setupUrl`
+  only when a real HTTPS setup interface exists. No credentials in the guide.
+  The UI checks runtime status; it does not claim a connection was verified or
+  resume a task just because the link was opened. Do not add Web tasks to model
+  missing tools, credentials, or connections: attach those requirements to the
+  automated step, explain the actual blocker, and use the available setup path.
+
+All guides support `title`, `summary` (what happened), `required` (what the person
+must do), `instructions`, and `next`. Keep copy concrete. Never invent a setup
+URL, verified connection, automatic repair, or revision path. Actions live inside
+the selected workflow step; the notice above the canvas only explains what is
+needed and opens that step. After submission the UI names the connected next step.
 
 A reaction can also be triggered by a timer, which the runtime fires from its
 own logical clock. Nothing feeds a timer and nothing can write to it:
