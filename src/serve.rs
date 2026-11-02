@@ -2063,10 +2063,6 @@ fn backend_connections() -> Value {
 /// process. Each backend resumes its own saved conversation when available;
 /// the durable OMAR transcript supplies context across backend changes.
 fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
-    let _operation = context
-        .chat_operation
-        .lock()
-        .expect("chat operation poisoned");
     #[derive(Deserialize)]
     struct Request {
         backend: String,
@@ -2085,6 +2081,16 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": format!("'{}' is not an assistant backend", request.backend)}),
         );
     }
+    // Asked before the running assistant is touched, and before the chat
+    // lock: a status check can take seconds.
+    let status = crate::backend::connection::connection(backend);
+    if let Some(reason) = unusable(backend, &status) {
+        return (409, json!({"error": reason, "status": status}));
+    }
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     let command = backend.default_command().to_string();
 
     match relaunch_ea(context, &command) {
@@ -2098,6 +2104,23 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         }
         Err(error) => (502, json!({"error": format!("{error:#}")})),
     }
+}
+
+/// Why the assistant cannot move to `backend`, if it cannot: launching one that
+/// is missing or signed out would stop the working assistant for one that hangs.
+/// An unreadable status is let through, as Mission Control does.
+fn unusable(
+    backend: &dyn crate::backend::Backend,
+    status: &crate::backend::connection::Connection,
+) -> Option<String> {
+    use crate::backend::connection::Connection;
+    let name = backend.kind().name();
+    let state = match status {
+        Connection::NotInstalled => "not installed",
+        Connection::SignedOut => "not signed in",
+        Connection::Connected { .. } | Connection::Unknown { .. } => return None,
+    };
+    Some(format!("{name} is {state}; run `omar connect {name}`"))
 }
 
 fn assistant_command(root: &Path, ea_id: EaId, fallback: &str) -> String {
@@ -6150,6 +6173,22 @@ while True:
         );
         assert!(stub.starts_with("HTTP/1.1 400"), "{stub}");
         assert!(stub.contains("not an assistant backend"), "{stub}");
+    }
+
+    #[test]
+    fn a_backend_that_cannot_start_is_refused_with_how_to_connect_it() {
+        use crate::backend::connection::Connection;
+        let cursor = crate::backend::by_name("cursor").unwrap();
+        assert_eq!(
+            unusable(cursor, &Connection::SignedOut).as_deref(),
+            Some("cursor is not signed in; run `omar connect cursor`")
+        );
+        assert_eq!(
+            unusable(cursor, &Connection::NotInstalled).as_deref(),
+            Some("cursor is not installed; run `omar connect cursor`")
+        );
+        assert_eq!(unusable(cursor, &Connection::connected("me")), None);
+        assert_eq!(unusable(cursor, &Connection::unknown("timed out")), None);
     }
 
     #[test]

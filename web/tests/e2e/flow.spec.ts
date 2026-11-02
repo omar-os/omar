@@ -1457,6 +1457,21 @@ test("no backend can be chosen before its status is known", async ({ page }) => 
   await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();
 });
 
+test("a backend the runtime finds signed out is refused with how to sign in", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  // Its status was unreadable, so the menu lets it through; the runtime checks.
+  await page.getByRole("menu").getByRole("menuitem", { name: /opencode/ }).click();
+  await page.getByRole("button", { name: "Restart" }).click();
+
+  await expect(page.locator(".backend-error")).toHaveText(
+    "opencode is not signed in; run `omar connect opencode`",
+  );
+  await expect(page.getByRole("button", { name: /Codex/ })).toBeVisible();
+});
+
 test("a runtime without backend status still switches", async ({ page }) => {
   await useFakeServe(page);
   await page.route("**/v1/agent/backends", (route) =>

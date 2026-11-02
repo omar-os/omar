@@ -368,6 +368,12 @@ export async function startFakeServe({
             error: `Unknown backend '${chosen}'.`,
           });
         }
+        // Status read as unknown, but the runtime finds it signed out.
+        if (chosen === "opencode") {
+          return json(response, 409, {
+            error: "opencode is not signed in; run `omar connect opencode`",
+          });
+        }
         backend = chosen;
         return json(response, 200, { backend });
       });
