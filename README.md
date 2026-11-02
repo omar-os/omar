@@ -221,7 +221,7 @@ change the ID. Runtime shutdown and Ctrl+C on the connector are separate operati
 The shared core lives in `src/messaging/`; Slack owns authentication, mentions,
 thread mapping, transport and formatting. IDs are platform/account scoped and
 thread IDs optional. Mock adapters exercise the same Rust gateway. No messaging
-JavaScript, Discord/WhatsApp adapter, arbitrary chat-supplied inputs, durable
+JavaScript, WhatsApp adapter, arbitrary chat-supplied inputs, durable
 inbox/outbox or cross-process queue. In-memory deduplication expires after one hour
 (2,000 events) and is lost on restart. Unknown admission/monitoring outcomes block
 new runs pending operator reconciliation; reply failures never restart workflows.
@@ -238,6 +238,57 @@ python3 tests/ci/slack_credentials.py
 The runtime harness executes the demo, Stub research graph with imported schema,
 neutral mock platform, and sequential multi-workflow registry. The credential
 harness tests hidden input, permissions, cancellation and logout with fake tokens.
+
+## Discord DMs (Rust)
+
+The Discord adapter reuses the messaging gateway, workflow catalog, runtime client,
+authorization, deduplication and busy handling above. Only one-to-one DMs from
+`allowedUsers` are accepted; server channels, group DMs and bots are ignored.
+Use `list` and `run <workflow>` directly in the DM, without a mention.
+
+Create an application/bot at https://discord.com/developers/applications and invite
+it to a private test server with the `bot` scope (no Administrator permission).
+Open its profile and message it; Discord privacy settings must permit the DM.
+Enable Developer Mode in Discord to copy your user ID. Copy the application's
+bot user ID for `accountId`. No privileged Message Content intent is needed:
+the connector requests only the Direct Messages Gateway intent. The connection
+is outbound WSS; no public endpoint, tunnel or incoming firewall port is needed.
+
+```sh
+cargo build --bin omar
+./target/debug/omar messaging discord login
+cp integrations/discord/config.example.json integrations/discord/config.local.json
+```
+
+Edit the copy: set `runtimeUrl`, bot `accountId`, your `allowedUsers`, and
+`workflowCatalog` to the existing approved catalog. The catalog's paths resolve
+relative to that catalog file, not the Discord config. It can be your existing
+Slack config: no workflow entries or `.omar` files need copying. Restart the
+connector after catalog changes. `allowedConversations` is omitted for Discord;
+startup resolves and verifies one-to-one DM channels for the approved users.
+
+```sh
+./target/debug/omar messaging discord integrations/discord/config.local.json
+```
+
+Keep the named local runtime running, as described above. DM `list`, then `run
+demo` or another listed workflow. Results reply to the original message; long
+reports are split into messages and automatic mentions/link previews are disabled.
+An unknown workflow returns a hint; an unauthorized user receives no response.
+The bot never starts a workflow merely because it was invited to a server.
+
+The token is stored once in `~/.config/omar/credentials/discord.json` (or the XDG
+config directory), using the same private-file protection as Slack. It is not
+encrypted. `DISCORD_BOT_TOKEN` overrides it. `omar messaging discord logout`
+removes the saved copy without revoking the token or stopping a running connector.
+Each bot installation must have only one connector. Slack and Discord have
+separate in-memory busy/dedup state; the runtime remains responsible for rejecting
+conflicting admissions. Disconnects preserve state within the connector process;
+restarts do not. Failed result delivery never re-executes a workflow.
+
+Credential-free adapter and shared-core checks run with `cargo test --bin omar
+messaging::` in CI. A real Discord token and a permitted DM are needed for the
+live check; automated tests never contact Discord.
 
 ## Supported Agent Backends
 

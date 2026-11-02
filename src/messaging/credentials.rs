@@ -1,11 +1,7 @@
-//! One local Slack installation. Secrets never enter workflow config or logs.
+//! Local messaging credentials. Secrets never enter workflow config or logs.
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    io::{Read, Write},
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
 pub struct Credentials {
@@ -33,104 +29,15 @@ fn path() -> Result<PathBuf> {
         .join("omar/credentials/slack.json"))
 }
 
-fn private_directory(path: &Path, create: bool) -> Result<()> {
-    if create {
-        fs::create_dir_all(path.parent().context("Invalid credential path")?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            match fs::DirBuilder::new().mode(0o700).create(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        #[cfg(not(unix))]
-        anyhow::bail!("Saved Slack credentials currently require Unix file permissions; use environment variables");
-    }
-    let meta = fs::symlink_metadata(path).context("Cannot inspect Slack credentials directory")?;
-    ensure!(
-        meta.is_dir() && !meta.file_type().is_symlink(),
-        "Slack credentials directory must not be a symlink"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        ensure!(
-            meta.uid() == unsafe { libc::geteuid() },
-            "Slack credentials directory has another owner"
-        );
-        if create {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        } else {
-            ensure!(
-                meta.permissions().mode() & 0o077 == 0,
-                "Slack credentials directory must be owner-only (0700)"
-            );
-        }
-    }
-    Ok(())
-}
-
 fn save(path: &Path, credentials: &Credentials) -> Result<()> {
     credentials.validate()?;
-    let parent = path.parent().context("Invalid Slack credentials path")?;
-    private_directory(parent, true)?;
-    let temporary = parent.join(format!(".slack-{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut file = crate::paths::create_private_file(&temporary)?;
-        file.write_all(&serde_json::to_vec(credentials)?)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    super::credential_store::save(path, credentials)
 }
-
 fn read(path: &Path) -> Result<Credentials> {
-    private_directory(
-        path.parent().context("Invalid Slack credentials path")?,
-        false,
-    )?;
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options
-        .open(path)
-        .context("Cannot open saved Slack credentials")?;
-    let meta = file.metadata()?;
-    ensure!(
-        meta.is_file() && meta.len() <= 16 * 1024,
-        "Invalid Slack credentials file"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        ensure!(
-            meta.uid() == unsafe { libc::geteuid() }
-                && meta.permissions().mode() & 0o077 == 0
-                && meta.nlink() == 1,
-            "Slack credentials file must have one owner-only link (0600)"
-        );
-    }
-    let mut bytes = Vec::new();
-    file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= 16 * 1024, "Invalid Slack credentials file");
-    let credentials: Credentials = serde_json::from_slice(&bytes).map_err(|_| {
-        anyhow::anyhow!("Invalid saved Slack credentials; run `omar messaging slack login`")
-    })?;
+    let credentials: Credentials = super::credential_store::read(path)?;
     credentials.validate()?;
     Ok(credentials)
 }
-
 fn resolve(path: &Path, bot: Option<String>, app: Option<String>) -> Result<Credentials> {
     let saved = if bot.is_none() || app.is_none() {
         Some(read(path).with_context(|| "Configure Slack once with `omar messaging slack login`, or set SLACK_BOT_TOKEN and SLACK_APP_TOKEN")?)
@@ -176,19 +83,7 @@ pub fn login() -> Result<()> {
 }
 
 fn remove(path: &Path) -> Result<()> {
-    let parent = path.parent().context("Invalid Slack credentials path")?;
-    if !parent.exists() {
-        return Ok(());
-    }
-    private_directory(parent, false)?;
-    match fs::remove_file(path) {
-        Ok(()) => {
-            fs::File::open(parent)?.sync_all()?;
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+    super::credential_store::remove(path)
 }
 pub fn logout() -> Result<()> {
     remove(&path()?)?;
@@ -199,6 +94,7 @@ pub fn logout() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     fn tokens() -> Credentials {
         Credentials {
             bot_token: "xoxb-test-bot".into(),
@@ -329,5 +225,97 @@ mod tests {
         remove(&path).unwrap();
         assert!(!path.exists());
         assert!(other.exists());
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct DiscordCredentials {
+    token: String,
+}
+fn discord_path() -> Result<PathBuf> {
+    Ok(dirs::config_dir()
+        .context("Cannot locate user configuration directory")?
+        .join("omar/credentials/discord.json"))
+}
+fn validate_discord(token: &str) -> Result<()> {
+    ensure!(
+        !token.is_empty()
+            && token.len() <= 4096
+            && token.is_ascii()
+            && !token
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
+        "Invalid Discord token format; run `omar messaging discord login`"
+    );
+    Ok(())
+}
+pub(super) fn discord_load() -> Result<String> {
+    let token = match std::env::var("DISCORD_BOT_TOKEN") {
+        Ok(token) => token,
+        Err(std::env::VarError::NotPresent) => {
+            let saved: DiscordCredentials = super::credential_store::read(&discord_path()?)
+                .context(
+                "Configure Discord with `omar messaging discord login`, or set DISCORD_BOT_TOKEN",
+            )?;
+            saved.token
+        }
+        Err(_) => anyhow::bail!("Invalid DISCORD_BOT_TOKEN"),
+    };
+    validate_discord(&token)?;
+    Ok(token)
+}
+pub(super) fn discord_login() -> Result<()> {
+    eprintln!("Save Discord bot token locally (hidden input; protected by Unix file permissions).");
+    let token = rpassword::prompt_password("Discord bot token: ")?;
+    validate_discord(&token)?;
+    super::credential_store::save(&discord_path()?, &DiscordCredentials { token })?;
+    println!("Saved Discord credentials. Discord validates the token at connector startup. DISCORD_BOT_TOKEN overrides the saved token.");
+    Ok(())
+}
+pub(super) fn discord_logout() -> Result<()> {
+    super::credential_store::remove(&discord_path()?)?;
+    println!("Removed saved Discord credentials. Environment tokens and running connectors are unchanged; the token is not revoked.");
+    Ok(())
+}
+
+#[cfg(test)]
+mod discord_tests {
+    use super::*;
+    #[test]
+    fn discord_store_is_private_and_does_not_overwrite_slack() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let slack = dir.path().join("credentials/slack.json");
+        let discord = dir.path().join("credentials/discord.json");
+        save(
+            &slack,
+            &Credentials {
+                bot_token: "xoxb-fixture".into(),
+                app_token: "xapp-fixture".into(),
+            },
+        )
+        .unwrap();
+        let original = std::fs::read(&slack).unwrap();
+        super::super::credential_store::save(
+            &discord,
+            &DiscordCredentials {
+                token: "fixture-discord-token".into(),
+            },
+        )
+        .unwrap();
+        let saved: DiscordCredentials = super::super::credential_store::read(&discord).unwrap();
+        assert_eq!(saved.token, "fixture-discord-token");
+        assert_eq!(
+            std::fs::metadata(&discord).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        super::super::credential_store::remove(&discord).unwrap();
+        assert_eq!(std::fs::read(&slack).unwrap(), original);
+        for token in ["", "private token", "private\nsecret"] {
+            let error = validate_discord(token).unwrap_err();
+            if !token.is_empty() {
+                assert!(!error.to_string().contains(token));
+            }
+        }
     }
 }

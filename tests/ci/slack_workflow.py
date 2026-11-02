@@ -77,6 +77,13 @@ with tempfile.TemporaryDirectory(prefix="omar-rust-messaging-") as folder:
         exercise(neutral, "Mock adapter -> Rust core -> OMAR", 3)
         print("PASS: mock adapter -> Rust shared core -> real OMAR -> threadless reply")
 
+        discord = dict(runtimeUrl=runtime_url, platform="discord", accountId="999",
+                       allowedUsers=["123"], command="demo", outputPort="run.result",
+                       programPath=str(REPO / "integrations/slack/demo.omar"),
+                       rawInputs=["run.request=Discord DM -> Rust core -> OMAR"])
+        exercise(discord, "Discord DM -> Rust core -> OMAR", 4)
+        print("PASS: Discord DM normalization -> duplicate -> one real OMAR run -> reply destination")
+
         # One gateway, one registry, sequentially execute three different real graphs.
         workflow_keys = ["programPath", "outputPort", "timeoutSeconds", "files", "inputs", "rawInputs"]
         registry = {key: config[key] for key in ["runtimeUrl", "workspaceId", "allowedUsers", "allowedChannels"]}
@@ -97,7 +104,7 @@ with tempfile.TemporaryDirectory(prefix="omar-rust-messaging-") as folder:
         ], cwd=REPO, env=registry_env, text=True, capture_output=True, timeout=180)
         assert result.returncode == 0, (result.stdout, result.stderr)
         runs = get("/v1/runs")["runs"]
-        assert len(runs) == 6, runs
+        assert len(runs) == 7, runs
         assert all(run["status"] == "completed" for run in runs), runs
         print("PASS: one Rust registry/gateway -> list -> newly added checklist + demo + research sequentially; duplicates suppressed")
 

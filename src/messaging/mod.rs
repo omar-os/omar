@@ -1,5 +1,7 @@
 pub mod config;
+mod credential_store;
 mod credentials;
+pub mod discord;
 pub mod runtime;
 pub mod slack;
 #[cfg(test)]
@@ -233,38 +235,78 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
 
 pub async fn run(command: &Command) -> Result<()> {
     match command {
+        Command::Discord {
+            action: Some(CredentialAction::Login),
+            ..
+        } => credentials::discord_login(),
+        Command::Discord {
+            action: Some(CredentialAction::Logout),
+            ..
+        } => credentials::discord_logout(),
+        Command::Discord {
+            config: Some(path),
+            action: None,
+        } => discord::run(Config::load(path)?).await,
         Command::Slack {
-            action: Some(SlackAction::Login),
+            action: Some(CredentialAction::Login),
             ..
         } => credentials::login(),
         Command::Slack {
-            action: Some(SlackAction::Logout),
+            action: Some(CredentialAction::Logout),
             ..
         } => credentials::logout(),
         Command::Slack {
             config: Some(path),
             action: None,
         } => slack::run(Config::load(path)?).await,
-        _ => anyhow::bail!("Provide a config file, or use `omar messaging slack login`"),
+        _ => anyhow::bail!("Provide a config file, or use `omar messaging <platform> login`"),
     }
 }
 
 #[derive(clap::Subcommand)]
 pub enum Command {
+    /// Connect approved Discord DMs to local workflows; manage saved credentials
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Discord {
+        #[arg(required = true)]
+        config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: Option<CredentialAction>,
+    },
     /// Run Slack with a config, or manage saved credentials with login/logout
     #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Slack {
         #[arg(required = true)]
         config: Option<std::path::PathBuf>,
         #[command(subcommand)]
-        action: Option<SlackAction>,
+        action: Option<CredentialAction>,
     },
 }
 
 #[derive(clap::Subcommand)]
-pub enum SlackAction {
-    /// Save bot/app tokens once using hidden input and a private local file
+pub enum CredentialAction {
+    /// Save tokens once using hidden input and a private local file
     Login,
     /// Remove saved tokens (does not revoke tokens or unset environment variables)
     Logout,
+}
+
+pub(super) fn shutdown_signal() -> (
+    tokio::sync::watch::Receiver<bool>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            tokio::select! { result = tokio::signal::ctrl_c() => result?, _ = term.recv() => {} }
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await?;
+        let _ = tx.send(true);
+        Ok(())
+    });
+    (rx, task)
 }

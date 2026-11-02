@@ -195,19 +195,7 @@ pub async fn run(config: Config) -> Result<()> {
     let runtime = OmarRuntime::new(config.runtime_url.clone())?;
     runtime.call("/v1/chat", None).await?;
     let gateway = Arc::new(Gateway::new(config, runtime, api));
-    let (stop_tx, mut stop) = watch::channel(false);
-    let signal = tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            tokio::select! { result = tokio::signal::ctrl_c() => result?, _ = term.recv() => {} }
-        }
-        #[cfg(not(unix))]
-        tokio::signal::ctrl_c().await?;
-        let _ = stop_tx.send(true);
-        Ok::<_, std::io::Error>(())
-    });
+    let (mut stop, signal) = super::shutdown_signal();
     let mut tasks = JoinSet::new();
     let mut delay = 1;
     while !*stop.borrow() {
@@ -254,4 +242,4 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

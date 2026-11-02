@@ -13,6 +13,7 @@ pub struct Config {
     pub account_id: String,
     pub allowed_users: Vec<String>,
     #[serde(alias = "allowedChannels")]
+    #[serde(default)]
     pub allowed_conversations: Vec<String>,
     #[serde(default)]
     pub command: String,
@@ -32,6 +33,8 @@ pub struct Config {
     pub request: Value,
     #[serde(default)]
     pub workflows: BTreeMap<String, Workflow>,
+    #[serde(default)]
+    pub workflow_catalog: Option<String>,
 }
 fn slack() -> String {
     "slack".into()
@@ -45,11 +48,38 @@ impl Config {
         let mut config: Self =
             serde_json::from_slice(&std::fs::read(path).context("Read messaging configuration")?)
                 .context("Invalid messaging configuration")?;
+        let mut folder = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        if let Some(catalog) = &config.workflow_catalog {
+            ensure!(
+                config.workflows.is_empty()
+                    && config.program_path.is_empty()
+                    && config.command.is_empty()
+                    && config.output_port.is_empty()
+                    && config.files.is_empty()
+                    && config.inputs.is_empty()
+                    && config.raw_inputs.is_empty(),
+                "Use workflowCatalog or inline workflow fields, not both"
+            );
+            let catalog_path = folder.join(catalog);
+            #[derive(Deserialize)]
+            struct Catalog {
+                workflows: BTreeMap<String, Workflow>,
+            }
+            let catalog: Catalog = serde_json::from_slice(
+                &std::fs::read(&catalog_path).context("Read workflow catalog")?,
+            )
+            .context("Invalid workflow catalog")?;
+            ensure!(!catalog.workflows.is_empty(), "Workflow catalog is empty");
+            config.workflows = catalog.workflows;
+            folder = catalog_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+        }
         config.validate()?;
-        let folder = path.parent().unwrap_or(Path::new("."));
         if config.workflows.is_empty() {
             config.request = load_request(
-                folder,
+                &folder,
                 &config.program_path,
                 &config.files,
                 &config.inputs,
@@ -59,7 +89,7 @@ impl Config {
         } else {
             for workflow in config.workflows.values_mut() {
                 workflow.request = load_request(
-                    folder,
+                    &folder,
                     &workflow.program_path,
                     &workflow.files,
                     &workflow.inputs,
@@ -128,10 +158,15 @@ impl Config {
             }
         }
         ensure!(
-            [&self.allowed_users, &self.allowed_conversations]
+            [&self.allowed_users]
                 .iter()
                 .all(|ids| !ids.is_empty() && ids.iter().all(|id| !id.is_empty())),
             "Allowlists must contain IDs"
+        );
+        ensure!(
+            if self.platform == "discord" { self.allowed_conversations.is_empty() }
+            else { !self.allowed_conversations.is_empty() && self.allowed_conversations.iter().all(|id| !id.is_empty()) },
+            "Discord DM channels are resolved from allowedUsers; other platforms require allowedConversations"
         );
         self.runtime_url = url.as_str().trim_end_matches('/').to_string();
         Ok(())

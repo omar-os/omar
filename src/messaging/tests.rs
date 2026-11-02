@@ -368,7 +368,10 @@ fn legacy_config_resolves_bundle_relative_to_config_without_changing_inputs() {
 #[ignore = "requires test runtime; run through tests/ci/slack_workflow.py"]
 async fn real_runtime() {
     let path = std::env::var("OMAR_MESSAGING_TEST_CONFIG").unwrap();
-    let c = Config::load(std::path::Path::new(&path)).unwrap();
+    let mut c = Config::load(std::path::Path::new(&path)).unwrap();
+    if c.platform == "discord" {
+        c.allowed_conversations = vec!["456".into()];
+    }
     let runtime = OmarRuntime::new(c.runtime_url.clone()).unwrap();
     let g = Gateway::new(c.clone(), runtime, FakeMessenger::default());
     let m = Incoming {
@@ -386,6 +389,9 @@ async fn real_runtime() {
     };
     let m = if c.platform == "slack" {
         slack::normalize(&json!({"type":"event_callback","team_id":c.account_id,"event_id":"fixture-event","event":{"type":"app_mention","user":m.sender_id,"channel":m.destination.conversation_id,"ts":"message","thread_ts":"parent","text":format!("<@BOT> run {}",c.command)}}),"BOT").unwrap()
+    } else if c.platform == "discord" {
+        discord::normalize(&json!({"id":"789","type":0,"channel_id":"456","author":{"id":m.sender_id},"content":m.command}),
+            &c.account_id, &std::collections::HashMap::from([(c.allowed_users[0].clone(), "456".into())])).unwrap()
     } else {
         m
     };
@@ -445,17 +451,20 @@ fn research_launcher_forwards_arguments_without_global_configuration_changes() {
 #[test]
 fn cli_preserves_config_argument_and_supports_login_logout() {
     use clap::Parser;
-    for args in [
-        vec!["omar", "messaging", "slack", "config.json"],
-        vec!["omar", "messaging", "slack", "login"],
-        vec!["omar", "messaging", "slack", "logout"],
-    ] {
-        assert!(crate::Cli::try_parse_from(args).is_ok());
+    for platform in ["slack", "discord"] {
+        for action in ["config.json", "login", "logout"] {
+            assert!(crate::Cli::try_parse_from(["omar", "messaging", platform, action]).is_ok());
+        }
+        assert!(crate::Cli::try_parse_from(["omar", "messaging", platform]).is_err());
+        assert!(crate::Cli::try_parse_from([
+            "omar",
+            "messaging",
+            platform,
+            "config.json",
+            "login"
+        ])
+        .is_err());
     }
-    assert!(crate::Cli::try_parse_from(["omar", "messaging", "slack"]).is_err());
-    assert!(
-        crate::Cli::try_parse_from(["omar", "messaging", "slack", "config.json", "login"]).is_err()
-    );
 }
 
 fn registry_config() -> Config {
