@@ -45,6 +45,8 @@ enum Access {
 }
 const TERMINAL_PREFIX: &str = "/v1/agents/";
 const TERMINAL_SUFFIX: &str = "/terminal";
+/// A backend's sign-in terminal: `/v1/backends/<name>/terminal`.
+const CONNECT_PREFIX: &str = "/v1/backends/";
 /// How long the relay waits on each side before checking the other.
 const TERMINAL_POLL: Duration = Duration::from_millis(25);
 /// A selection names diagram components, and a diagram the operator can click
@@ -1493,6 +1495,33 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             access,
         );
     }
+    // A backend's sign-in, started by `POST /v1/backends/<name>/connect`.
+    if method == "GET"
+        && terminal_path.starts_with(CONNECT_PREFIX)
+        && terminal_path.ends_with(TERMINAL_SUFFIX)
+    {
+        let name = terminal_path
+            .trim_start_matches(CONNECT_PREFIX)
+            .trim_end_matches(TERMINAL_SUFFIX);
+        let Some(backend) = connectable(name) else {
+            return write_json(
+                &mut stream,
+                404,
+                &json!({"error": format!("'{name}' is not an assistant backend")}),
+                origin_header.as_deref(),
+            );
+        };
+        let session = connect_session(&context, backend);
+        drop(admission);
+        return attach_terminal(
+            stream,
+            &session,
+            websocket_key.as_deref(),
+            origin_header.as_deref(),
+            terminal_query,
+            access,
+        );
+    }
     // The assistant is not one of the agents: its session is named
     // `<base>ea-<id>` rather than `<base><id>-<name>`, so no agent name
     // reaches it and it needs a route of its own.
@@ -1661,6 +1690,13 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         ("GET", "/v1/agent") => (200, describe_agent(&context)),
         ("GET", "/v1/agent/backends") => (200, backend_connections()),
         ("POST", "/v1/agent/backend") => switch_backend(&context, &read_body(content_length)?),
+        ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/connect") => {
+            let _ = read_body(content_length)?;
+            let name = rest
+                .trim_start_matches(CONNECT_PREFIX)
+                .trim_end_matches("/connect");
+            start_connect(&context, name)
+        }
         // EA-only, authenticated with the token handed to its MCP sidecar.
         ("POST", "/v1/agent/reply") => agent_reply(&context, &read_body(content_length)?),
         ("POST", "/v1/agent/proposals") => {
@@ -2102,6 +2138,58 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             chat.busy = false;
             (200, json!({"backend": request.backend, "session": session}))
         }
+        Err(error) => (502, json!({"error": format!("{error:#}")})),
+    }
+}
+
+/// An assistant backend by name; anything else has no sign-in to run here.
+fn connectable(name: &str) -> Option<&'static dyn crate::backend::Backend> {
+    crate::backend::by_name(name)
+        .filter(|backend| crate::backend::ASSISTANT.contains(&backend.kind()))
+}
+
+/// The tmux session a backend's sign-in runs in. Named apart from agents
+/// (`<base><ea>-<agent>`) and the assistant (`<base>ea-<ea>`).
+fn connect_session(context: &Context_, backend: &dyn crate::backend::Backend) -> String {
+    format!(
+        "{}connect-{}-{}",
+        context.session_prefix,
+        context.ea_id,
+        backend.kind().name()
+    )
+}
+
+/// Run `omar connect <backend>` (install, then the CLI's own sign-in) in a
+/// session Mission Control attaches a terminal to. One already running is
+/// reused, so a second click shows the same sign-in.
+fn start_connect(context: &Context_, name: &str) -> (u16, Value) {
+    let Some(backend) = connectable(name) else {
+        return (
+            404,
+            json!({"error": format!("'{name}' is not an assistant backend")}),
+        );
+    };
+    let Some(omar) = crate::manager::omar_server_exe() else {
+        return (500, json!({"error": "cannot find the omar executable"}));
+    };
+    let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
+    let session = connect_session(context, backend);
+    let name = backend.kind().name();
+    // A failed connect leaves its message on screen until a key is pressed;
+    // a successful one ends the session, and the page sees it connected.
+    let command = format!(
+        "{} connect {name} || {{ printf '\\nPress Enter to close.'; read _; }}",
+        crate::manager::shell_single_quote(&omar.display().to_string())
+    );
+    let started = match client.has_session(&session) {
+        Ok(true) => Ok(()),
+        _ => client.new_session(&session, &command, None),
+    };
+    match started {
+        Ok(()) => (
+            200,
+            json!({"session": session, "terminal": format!("{CONNECT_PREFIX}{name}{TERMINAL_SUFFIX}")}),
+        ),
         Err(error) => (502, json!({"error": format!("{error:#}")})),
     }
 }
@@ -6173,6 +6261,23 @@ while True:
         );
         assert!(stub.starts_with("HTTP/1.1 400"), "{stub}");
         assert!(stub.contains("not an assistant backend"), "{stub}");
+    }
+
+    #[test]
+    fn only_an_assistant_backend_has_a_sign_in_to_start() {
+        let server = test_server();
+        for name in ["notabackend", "stub", "jev"] {
+            let refused = request(
+                server.address(),
+                "POST",
+                &format!("/v1/backends/{name}/connect"),
+                Some("{}"),
+            );
+            assert!(refused.starts_with("HTTP/1.1 404"), "{name}: {refused}");
+            assert!(refused.contains("not an assistant backend"), "{refused}");
+        }
+        assert!(connectable("codex").is_some());
+        assert!(connectable("pi").is_some());
     }
 
     #[test]

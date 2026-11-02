@@ -20,10 +20,19 @@ export function AgentTerminal({
   serveUrl,
   agent,
   readOnly = false,
+  url: socketUrl,
+  title,
+  note,
   onClose,
 }: {
   serveUrl: string;
   agent: string;
+  /** A terminal that is not an agent's, such as a backend's sign-in. */
+  url?: string;
+  /** Its heading, when `url` is given. */
+  title?: string;
+  /** What the footer says in place of the agent's, when `url` is given. */
+  note?: string;
   /** A view port drops keystrokes and resizes, so neither is sent. */
   readOnly?: boolean;
   onClose: () => void;
@@ -52,7 +61,7 @@ export function AgentTerminal({
     // Fit before any bytes arrive, and start the PTY at this same geometry.
     // Otherwise the first full redraw wraps in xterm's default 80x24 buffer.
     fit.fit();
-    const url = new URL(terminalUrlFor(serveUrl, agent));
+    const url = new URL(socketUrl ?? terminalUrlFor(serveUrl, agent));
     url.searchParams.set("cols", String(terminal.cols));
     url.searchParams.set("rows", String(terminal.rows));
     const socket = new WebSocket(url);
@@ -149,7 +158,7 @@ export function AgentTerminal({
       socket.close();
       terminal.dispose();
     };
-  }, [serveUrl, agent, readOnly]);
+  }, [serveUrl, agent, readOnly, socketUrl]);
 
   useEffect(() => {
     const close = (event: KeyboardEvent) => {
@@ -169,7 +178,7 @@ export function AgentTerminal({
     <div
       className="terminal-overlay"
       role="dialog"
-      aria-label={`Terminal for ${agent === ASSISTANT ? "the assistant" : agent}`}
+      aria-label={`Terminal for ${title ?? (agent === ASSISTANT ? "the assistant" : agent)}`}
       // Clicking the backdrop closes, but a click inside must not.
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
@@ -177,7 +186,7 @@ export function AgentTerminal({
     >
       <div className="terminal-panel">
         <header className="terminal-heading">
-          <h2>{agent === ASSISTANT ? "assistant" : agent}</h2>
+          <h2>{title ?? (agent === ASSISTANT ? "assistant" : agent)}</h2>
           <span>
             {error
               ? error
@@ -199,8 +208,8 @@ export function AgentTerminal({
           <div className="terminal-screen" ref={screenRef} />
         </div>
         <p className="terminal-note">
-          {readOnly ? "" : "Escape goes to the agent. "}Close with Ctrl+Shift+Escape or the Close button.{" "}
-          {readOnly
+          {note ? `${note} ` : readOnly ? "" : "Escape goes to the agent. "}Close with Ctrl+Shift+Escape or the Close button.{" "}
+          {note ? null : readOnly
             ? "View only: typing here is not sent. Closing detaches."
             : agent === ASSISTANT
             ? // Worth saying: the chat and this terminal drive one pane, so a

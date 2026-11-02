@@ -37,6 +37,30 @@ export function terminalUrlFor(serveUrl: string, agent: string): string {
   return `${root}/v1/agents/${encodeURIComponent(agent)}/terminal`;
 }
 
+/** The terminal a backend's sign-in runs in. */
+export function connectTerminalUrl(serveUrl: string, backend: string): string {
+  const base = new URL(normalizeRuntimeUrl(serveUrl));
+  base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
+  const root = base.toString().replace(/\/$/, "");
+  return `${root}/v1/backends/${encodeURIComponent(backend)}/terminal`;
+}
+
+/**
+ * Start `omar connect <backend>` (install, then the CLI's own sign-in) on the
+ * runtime, for {@link connectTerminalUrl} to attach to.
+ */
+export async function startConnect(
+  serveUrl: string,
+  backend: string,
+): Promise<void> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/backends/${encodeURIComponent(backend)}/connect`,
+    { method: "POST", body: "{}" },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+}
+
 /** Stands for the assistant wherever an agent name is expected. */
 export const ASSISTANT = "\u0000assistant";
 

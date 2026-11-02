@@ -18,7 +18,7 @@ const LABELS: Record<string, string> = {
   pi: "pi",
 };
 
-function label(backend: string): string {
+export function backendLabel(backend: string): string {
   return LABELS[backend] ?? backend;
 }
 
@@ -59,9 +59,12 @@ function unusable(status: BackendStatus | undefined): boolean {
 export function BackendMenu({
   serveUrl,
   live,
+  onConnectMore,
 }: {
   serveUrl: string;
   live: boolean;
+  /** Opens the Backends page, offered while some backend is not connected. */
+  onConnectMore?: () => void;
 }) {
   const [current, setCurrent] = useState<string | null>(null);
   const [available, setAvailable] = useState<string[]>([]);
@@ -168,7 +171,7 @@ export function BackendMenu({
           setOpen(!open);
         }}
       >
-        {current ? label(current) : "Assistant"}
+        {current ? backendLabel(current) : "Assistant"}
         <span aria-hidden="true">{open ? "▾" : "▴"}</span>
       </button>
 
@@ -178,8 +181,8 @@ export function BackendMenu({
             <div className="backend-confirm">
               {/* Worth saying plainly: the running assistant is discarded. */}
               <p>
-                Restart the assistant on {label(pending)}? Its current session
-                is lost.
+                Restart the assistant on {backendLabel(pending)}? Its current
+                session is lost.
               </p>
               <span>
                 <button
@@ -210,32 +213,60 @@ export function BackendMenu({
                   </button>
                 </div>
               ) : null}
-              {available.map((backend) => {
-                const status = statuses[backend];
-                return (
-                  <button
-                    key={backend}
-                    type="button"
-                    role="menuitem"
-                    data-status={status?.status}
-                    className={backend === current ? "current" : undefined}
-                    disabled={blocked(backend) && backend !== current}
-                    onClick={() =>
-                      backend === current ? setOpen(false) : setPending(backend)
-                    }
-                  >
-                    <span className="backend-name">
-                      {label(backend)}
-                      {status && note(status) ? (
-                        <small className="backend-note">{note(status)}</small>
+              {/* Only what can run is offered; the rest are connected on the
+                  Backends page. Without status, every backend is listed. */}
+              {available
+                .filter(
+                  (backend) =>
+                    backend === current ||
+                    statusState !== "ready" ||
+                    statuses[backend]?.status === "connected",
+                )
+                .map((backend) => {
+                  const status = statuses[backend];
+                  return (
+                    <button
+                      key={backend}
+                      type="button"
+                      role="menuitem"
+                      data-status={status?.status}
+                      className={backend === current ? "current" : undefined}
+                      disabled={blocked(backend) && backend !== current}
+                      onClick={() =>
+                        backend === current
+                          ? setOpen(false)
+                          : setPending(backend)
+                      }
+                    >
+                      <span className="backend-name">
+                        {backendLabel(backend)}
+                        {status && note(status) ? (
+                          <small className="backend-note">{note(status)}</small>
+                        ) : null}
+                      </span>
+                      {backend === current ? (
+                        <span aria-hidden="true">✓</span>
                       ) : null}
-                    </span>
-                    {backend === current ? (
-                      <span aria-hidden="true">✓</span>
-                    ) : null}
-                  </button>
-                );
-              })}
+                    </button>
+                  );
+                })}
+              {onConnectMore &&
+              statusState === "ready" &&
+              available.some(
+                (backend) => statuses[backend]?.status !== "connected",
+              ) ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="backend-connect-more"
+                  onClick={() => {
+                    setOpen(false);
+                    onConnectMore();
+                  }}
+                >
+                  Connect more backends…
+                </button>
+              ) : null}
             </>
           )}
         </div>

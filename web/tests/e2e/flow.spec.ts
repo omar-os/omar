@@ -1410,17 +1410,13 @@ test("the composer says which assistant is answering, and can change it", async 
   await trigger.click();
   const menu = page.getByRole("menu");
   await expect(menu).toBeVisible();
-  // Each says how it is signed in, as its own CLI reports.
+  // Only connected backends are offered, each with how it is signed in;
+  // the rest are a click away on the Backends page.
   await expect(menu.getByRole("menuitem")).toHaveText([
     "Claude CodeClaude Max",
     "CodexChatGPT✓",
-    "Cursornot signed in · run omar connect cursor",
-    "opencode",
-    "agynot installed · run omar connect agy",
+    "Connect more backends…",
   ]);
-  // One that cannot sign in would only hang, so it cannot be chosen.
-  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();
-  await expect(menu.getByRole("menuitem", { name: /agy/ })).toBeDisabled();
 
   // It opens upward: it lives at the bottom of the composer.
   const menuBox = (await menu.boundingBox())!;
@@ -1454,20 +1450,26 @@ test("no backend can be chosen before its status is known", async ({ page }) => 
 
   answer();
   await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeEnabled();
-  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeHidden();
 });
 
 test("a backend the runtime finds signed out is refused with how to sign in", async ({
   page,
 }) => {
   await useFakeServe(page);
+  // Signed out since the menu last asked; the runtime checks again.
+  await page.route("**/v1/agent/backend", (route) =>
+    route.fulfill({
+      status: 409,
+      json: { error: "claude is not signed in; run `omar connect claude`" },
+    }),
+  );
   await page.getByRole("button", { name: /Codex/ }).click();
-  // Its status was unreadable, so the menu lets it through; the runtime checks.
-  await page.getByRole("menu").getByRole("menuitem", { name: /opencode/ }).click();
+  await page.getByRole("menu").getByRole("menuitem", { name: /Claude Code/ }).click();
   await page.getByRole("button", { name: "Restart" }).click();
 
   await expect(page.locator(".backend-error")).toHaveText(
-    "opencode is not signed in; run `omar connect opencode`",
+    "claude is not signed in; run `omar connect claude`",
   );
   await expect(page.getByRole("button", { name: /Codex/ })).toBeVisible();
 });
@@ -1490,7 +1492,72 @@ test("a failed status check blocks switching until a retry answers", async ({
   await menu.getByRole("button", { name: "Retry" }).click();
   await expect(menu.getByRole("alert")).toBeHidden();
   await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeEnabled();
-  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeHidden();
+});
+
+test("a backend is connected from the Backends page, in a terminal that closes once it is", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await expect(backends).toContainText("2 of 6 connected.");
+  await expect(backends.getByRole("listitem")).toHaveText([
+    /Claude CodeConnected · Claude Max/,
+    /CodexConnected · ChatGPT/,
+    /CursorNot signed in.*Connect/,
+    /opencodeUnknown · no answer.*Connect/,
+    /piNot installed.*Connect/,
+    /agyNot installed.*Connect/,
+  ]);
+
+  // The same `omar connect cursor` as on the command line, in a terminal.
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+  await page.keyboard.press("Enter");
+
+  // Once cursor reports connected, the terminal goes on its own.
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorConnected · fake sign-in/,
+  );
+  await expect(backends).toContainText("3 of 6 connected.");
+
+  await backends.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await expect(page.getByRole("menuitem", { name: /Cursor/ })).toBeEnabled();
+});
+
+test("with no backend connected, the Backends page comes first", async ({ page }) => {
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({
+      json: {
+        backends: ["claude", "codex", "cursor", "opencode", "pi", "agy"].map((name) => ({
+          name,
+          status: "not_installed",
+          login: `omar connect ${name}`,
+        })),
+      },
+    }),
+  );
+  await useFakeServe(page);
+
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await expect(backends).toContainText(
+    "No backend is connected yet. Connect one to start the assistant.",
+  );
+  await expect(backends.getByRole("button", { name: /^Connect / })).toHaveCount(6);
+});
+
+test("settings open the Backends page", async ({ page }) => {
+  await useFakeServe(page);
+  await expect(page.getByRole("dialog", { name: "Backends" })).toBeHidden();
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("menuitem", { name: "Connect backends…" }).click();
+  await expect(page.getByRole("dialog", { name: "Backends" })).toContainText("2 of 6 connected.");
 });
 
 test("a runtime without backend status still switches", async ({ page }) => {
