@@ -1213,12 +1213,8 @@ pub(crate) mod tests {
         // 200 KB of notes — well past MAX_ARG_STRLEN.
         let huge_notes: String = "x".repeat(200 * 1024);
 
-        for backend in [
-            "claude",
-            "codex --dangerously-bypass-approvals-and-sandbox",
-            "opencode",
-            "agy --dangerously-skip-permissions",
-        ] {
+        for kind in crate::backend::ASSISTANT {
+            let backend = crate::backend::of(kind).default_command();
             let dir = tempfile::tempdir().unwrap();
             let omar_dir = dir.path();
             let state_dir = ea::ea_state_dir(7, omar_dir);
@@ -1270,7 +1266,8 @@ pub(crate) mod tests {
         }))
         .unwrap();
         crate::knowledge::operator(dir.path(), 7, action).unwrap();
-        for backend in ["claude", "codex", "opencode", "agy", "cursor"] {
+        for kind in crate::backend::ASSISTANT {
+            let backend = crate::backend::of(kind).default_command();
             for ea in [7, 8] {
                 build_ea_command(
                     backend,
