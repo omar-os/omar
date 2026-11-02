@@ -1472,6 +1472,27 @@ test("a backend the runtime finds signed out is refused with how to sign in", as
   await expect(page.getByRole("button", { name: /Codex/ })).toBeVisible();
 });
 
+test("a failed status check blocks switching until a retry answers", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({ status: 500, json: { error: "boom" } }),
+  );
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  const menu = page.getByRole("menu");
+  // Only a missing endpoint means an older runtime; a failure is not one.
+  await expect(menu.getByRole("alert")).toContainText("Couldn't check backends");
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeDisabled();
+
+  await page.unroute("**/v1/agent/backends");
+  await menu.getByRole("button", { name: "Retry" }).click();
+  await expect(menu.getByRole("alert")).toBeHidden();
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeEnabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();
+});
+
 test("a runtime without backend status still switches", async ({ page }) => {
   await useFakeServe(page);
   await page.route("**/v1/agent/backends", (route) =>

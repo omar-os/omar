@@ -70,10 +70,12 @@ export function BackendMenu({
   const [error, setError] = useState("");
   const [statuses, setStatuses] = useState<Record<string, BackendStatus>>({});
   // Nothing switches until status has answered: "unavailable" is a runtime
-  // that predates the status endpoint, which still gets to switch.
+  // that predates the status endpoint, which still gets to switch; "failed"
+  // is any other failure, which blocks switching until a retry answers.
   const [statusState, setStatusState] = useState<
-    "loading" | "ready" | "unavailable"
+    "loading" | "ready" | "unavailable" | "failed"
   >("loading");
+  const [asked, setAsked] = useState(0);
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -98,19 +100,27 @@ export function BackendMenu({
     let cancelled = false;
     fetchBackendStatus(serveUrl)
       .then((list) => {
-        if (!cancelled) {
-          setStatuses(Object.fromEntries(list.map((s) => [s.name, s])));
-          setStatusState("ready");
-        }
+        if (cancelled) return;
+        // A runtime that predates this endpoint just shows no status.
+        setStatuses(Object.fromEntries((list ?? []).map((s) => [s.name, s])));
+        setStatusState(list ? "ready" : "unavailable");
       })
-      // A runtime that predates this endpoint just shows no status.
       .catch(() => {
-        if (!cancelled) setStatusState("unavailable");
+        if (!cancelled) setStatusState("failed");
       });
     return () => {
       cancelled = true;
     };
-  }, [serveUrl, open]);
+  }, [serveUrl, open, asked]);
+
+  /** Whether `backend` cannot be switched to as status stands. */
+  function blocked(backend: string): boolean {
+    return (
+      statusState === "loading" ||
+      statusState === "failed" ||
+      unusable(statuses[backend])
+    );
+  }
 
   useEffect(() => {
     if (!open) return;
@@ -127,7 +137,7 @@ export function BackendMenu({
   async function choose(backend: string) {
     setError("");
     // Status may have changed since Restart was offered.
-    if (statusState === "loading" || unusable(statuses[backend])) {
+    if (blocked(backend)) {
       setPending(null);
       return;
     }
@@ -174,9 +184,7 @@ export function BackendMenu({
               <span>
                 <button
                   type="button"
-                  disabled={
-                    statusState === "loading" || unusable(statuses[pending])
-                  }
+                  disabled={blocked(pending)}
                   onClick={() => void choose(pending)}
                 >
                   Restart
@@ -187,33 +195,48 @@ export function BackendMenu({
               </span>
             </div>
           ) : (
-            available.map((backend) => {
-              const status = statuses[backend];
-              const blocked = statusState === "loading" || unusable(status);
-              return (
-                <button
-                  key={backend}
-                  type="button"
-                  role="menuitem"
-                  data-status={status?.status}
-                  className={backend === current ? "current" : undefined}
-                  disabled={blocked && backend !== current}
-                  onClick={() =>
-                    backend === current ? setOpen(false) : setPending(backend)
-                  }
-                >
-                  <span className="backend-name">
-                    {label(backend)}
-                    {status && note(status) ? (
-                      <small className="backend-note">{note(status)}</small>
+            <>
+              {statusState === "failed" ? (
+                <div className="backend-status-failed" role="alert">
+                  Couldn&apos;t check backends.
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setStatusState("loading");
+                      setAsked((count) => count + 1);
+                    }}
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : null}
+              {available.map((backend) => {
+                const status = statuses[backend];
+                return (
+                  <button
+                    key={backend}
+                    type="button"
+                    role="menuitem"
+                    data-status={status?.status}
+                    className={backend === current ? "current" : undefined}
+                    disabled={blocked(backend) && backend !== current}
+                    onClick={() =>
+                      backend === current ? setOpen(false) : setPending(backend)
+                    }
+                  >
+                    <span className="backend-name">
+                      {label(backend)}
+                      {status && note(status) ? (
+                        <small className="backend-note">{note(status)}</small>
+                      ) : null}
+                    </span>
+                    {backend === current ? (
+                      <span aria-hidden="true">✓</span>
                     ) : null}
-                  </span>
-                  {backend === current ? (
-                    <span aria-hidden="true">✓</span>
-                  ) : null}
-                </button>
-              );
-            })
+                  </button>
+                );
+              })}
+            </>
           )}
         </div>
       ) : null}

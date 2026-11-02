@@ -81,18 +81,16 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
     let mut stdout = std::io::stdout();
     let mut selected = selected.min(statuses.len().saturating_sub(1));
     let mut confirming = false;
-    let mut drawn = 0;
+    // How wide each drawn line was; a resize redraws.
+    let mut drawn: Vec<usize> = Vec::new();
     loop {
         let lines = menu(statuses, selected, confirming);
-        if drawn > 0 {
-            stdout.queue(cursor::MoveToPreviousLine(drawn))?;
-        }
-        stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
+        up_over(&mut stdout, &drawn)?;
         for line in &lines {
             write!(stdout, "{line}\r\n")?;
         }
         stdout.flush()?;
-        drawn = lines.len() as u16;
+        drawn = lines.iter().map(|line| visible_width(line)).collect();
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -122,8 +120,7 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
             _ => continue,
         };
         // Leave one line behind saying what was picked.
-        stdout.queue(cursor::MoveToPreviousLine(drawn))?;
-        stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
+        up_over(&mut stdout, &drawn)?;
         let summary = match choice {
             Choice::Connect(index) => format!("Connecting {}", statuses[index].0.kind().name()),
             Choice::Disconnect(index) => {
@@ -135,6 +132,42 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
         stdout.flush()?;
         return Ok(choice);
     }
+}
+
+/// Move back to the top of lines of these widths and clear them. A line
+/// wider than the terminal wraps onto more rows, at today's width.
+fn up_over(stdout: &mut std::io::Stdout, widths: &[usize]) -> Result<()> {
+    let columns = terminal::size().map(|(columns, _)| columns).unwrap_or(80);
+    let rows = rows(widths, columns);
+    if rows > 0 {
+        stdout.queue(cursor::MoveToPreviousLine(rows))?;
+    }
+    stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
+    Ok(())
+}
+
+fn rows(widths: &[usize], columns: u16) -> u16 {
+    let columns = usize::from(columns.max(1));
+    let rows: usize = widths
+        .iter()
+        .map(|width| width.div_ceil(columns).max(1))
+        .sum();
+    rows.try_into().unwrap_or(u16::MAX)
+}
+
+/// Columns a styled line takes: its characters, without colour codes.
+fn visible_width(line: &str) -> usize {
+    let mut width = 0;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // CSI: ESC [ … final byte in @..~
+            chars.find(|c| ('@'..='~').contains(c) && *c != '[');
+        } else {
+            width += 1;
+        }
+    }
+    width
 }
 
 /// The picker's lines, `selected` marked; `confirming` asks before signing
@@ -382,6 +415,30 @@ fn headless() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_redraw_moves_up_over_every_wrapped_row() {
+        use crossterm::style::Stylize;
+        let line = format!("{} {}", "│".cyan(), "codex".dim());
+        assert_eq!(visible_width(&line), 7);
+        // The heading is 78 columns: one row at 80, two at 60.
+        let lines = menu_widths();
+        assert_eq!(rows(&lines, 80), lines.len() as u16);
+        assert_eq!(rows(&lines, 60), lines.len() as u16 + 1);
+        // A blank line still takes a row; an exact fit takes one.
+        assert_eq!(rows(&[0, 60], 60), 2);
+    }
+
+    fn menu_widths() -> Vec<usize> {
+        let statuses: Vec<_> = crate::backend::ASSISTANT
+            .iter()
+            .map(|kind| (crate::backend::of(*kind), Connection::SignedOut))
+            .collect();
+        menu(&statuses, 0, false)
+            .iter()
+            .map(|line| visible_width(line))
+            .collect()
+    }
 
     #[test]
     fn install_dirs_come_after_the_operators_own() {

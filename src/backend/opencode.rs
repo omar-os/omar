@@ -29,17 +29,18 @@ impl Backend for Opencode {
         "opencode"
     }
     /// `--standalone` keeps a running opencode daemon, whose environment may
-    /// not be ours, from answering.
+    /// not be ours, from answering. Both attempts share one deadline.
     fn connection(&self, program: &str) -> Connection {
+        let deadline = connection::status_deadline();
         let args = ["auth", "list", "--format", "json", "--standalone"];
-        let Some(output) = connection::run(program, &args) else {
+        let Some(output) = connection::run_until(program, &args, deadline) else {
             return Connection::unknown("`opencode auth list` did not answer");
         };
         if let Some(connection) = auth_list(&output.stdout) {
             return connection;
         }
         // opencode 1 has no JSON, only its table.
-        match connection::run(program, &["auth", "list"]) {
+        match connection::run_until(program, &["auth", "list"], deadline) {
             Some(output) => auth_table(&output.stdout),
             None => Connection::unknown("`opencode auth list` did not answer"),
         }

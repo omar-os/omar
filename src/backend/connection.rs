@@ -54,11 +54,22 @@ pub struct Output {
 
 /// Run a status command with no terminal, giving up after [`STATUS_TIMEOUT`].
 pub(crate) fn run(program: &str, args: &[&str]) -> Option<Output> {
-    run_with_timeout(program, args, STATUS_TIMEOUT)
+    run_until(program, args, status_deadline())
 }
 
+/// When a status check that starts now must be done, however many commands
+/// it runs.
+pub(crate) fn status_deadline() -> Instant {
+    Instant::now() + STATUS_TIMEOUT
+}
+
+#[cfg(test)]
 fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<Output> {
-    let deadline = Instant::now() + timeout;
+    run_until(program, args, Instant::now() + timeout)
+}
+
+/// Run a status command with no terminal, giving up at `deadline`.
+pub(crate) fn run_until(program: &str, args: &[&str], deadline: Instant) -> Option<Output> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())

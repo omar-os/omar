@@ -2565,6 +2565,26 @@ h2 {
   color: white;
 }
 
+.backend-status-failed {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 11px;
+  color: #e0777f;
+  font-size: 1rem;
+}
+
+.backend-status-failed button {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 1rem;
+}
+
 .backend-error {
   overflow: hidden;
   text-overflow: ellipsis;
