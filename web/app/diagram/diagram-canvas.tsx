@@ -23,6 +23,8 @@ import {
  * without changing the topology or its connections.
  */
 
+import { taskCopy, taskTitleLines } from "../lib/task-copy";
+
 type Point = { x: number; y: number };
 
 type ElkPort = {
@@ -61,7 +63,7 @@ type ElkNode = {
 
 type Box = { x: number; y: number; width: number; height: number };
 
-const REACTION_SIZE = { width: 210, height: 88 };
+const REACTION_SIZE = { width: 300, height: 110 };
 /** Task text starts after the order badge and leaves room for the deadline. */
 const REACTION_TEXT_X = 48;
 /**
@@ -74,7 +76,7 @@ const REACTION_TEXT_X = 48;
  */
 const WITHIN_RADIUS = 7;
 const WITHIN_ROOM = 40;
-const REACTION_MAX_WIDTH = 340;
+const REACTION_MAX_WIDTH = 380;
 const ACTION_SIZE = { width: 26, height: 26 };
 /** A timer's clock face. Larger than an action: it carries two hands. */
 const CLOCK_SIZE = { width: 34, height: 34 };
@@ -433,28 +435,18 @@ function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> 
   const agents = new Map(
     snapshot.agents.map((agent) => [
       agent.id,
-      { name: agent.name, backend: agent.backend },
+      agent,
     ]),
   );
   return new Map(
     snapshot.reactions.map((reaction) => {
       const owner = agents.get(reaction.agent);
-      // The agent's own name: the instance it belongs to is the box around it.
-      const agent = localName(owner?.name ?? reaction.agent, reaction.instance);
-      // Which model is behind an agent changes how you read what it did, and
-      // the program picked it deliberately, so it belongs on the task card.
-      const detail = [owner?.backend, reaction.status]
-        .filter(Boolean)
-        .join(" \u00b7 ");
-      // The runtime names reactions `reaction.N` because OMAR prompts are
-      // anonymous, which makes a poor headline. Lead with the agent and let the
-      // contract say what it writes; honour a real name if one ever arrives.
-      const generated = /(?:^|\.)reaction\.\d+$/.test(reaction.name);
+      const detail = [owner?.backend, reaction.status].filter(Boolean).join(" · ");
       return [
         reaction.id,
         {
-          name: generated ? agent : reaction.name,
-          meta: generated ? detail : `${agent} \u00b7 ${detail}`,
+          name: taskCopy(reaction, owner, snapshot).title,
+          meta: owner ? detail : `Code · ${reaction.status}`,
         },
       ];
     }),
@@ -930,8 +922,8 @@ function buildLayout(
       name: label.name,
       meta: label.meta,
       contract: reaction.contract,
-      summary: reaction.prompt ? summarisePrompt(reaction.prompt) : reaction.contract,
-      backend: snapshot.agents.find((agent) => agent.id === reaction.agent)?.backend ?? "Agent",
+      summary: taskCopy(reaction, snapshot.agents.find((agent) => agent.id === reaction.agent), snapshot).description,
+      backend: snapshot.agents.find((agent) => agent.id === reaction.agent)?.backend ?? "Code",
       status: reaction.status,
       box: nodeBoxes.get(reaction.id) ?? { x: 0, y: 0, ...REACTION_SIZE },
       agent: componentName(reaction.agent),
@@ -1805,6 +1797,8 @@ export function DiagramCanvas({
                     reaction.id,
                     `omar-reaction ${reaction.status}${reaction.web ? " web" : ""}`,
                   )}
+                  aria-label={`Inspect ${reaction.name}`}
+                  data-component={componentName(reaction.id)}
                   onDoubleClick={(event) => {
                     // The canvas resets the view on double click; a reaction
                     // opens the agent that runs it. A web agent has no pane to
@@ -1817,6 +1811,7 @@ export function DiagramCanvas({
                   }}
                   transform={`translate(${reaction.box.x},${reaction.box.y})`}
                 >
+                  <title>{`${reaction.name}: ${reaction.summary}`}</title>
                   <rect className="omar-reaction-body" width={reaction.box.width} height={reaction.box.height} rx={9} />
                   <path className="omar-reaction-accent" d={`M9 1.5 H${reaction.box.width - 9}`} />
                   <circle className="node-connection" cx={0} cy={reaction.box.height / 2} r={4} />
@@ -1843,16 +1838,16 @@ export function DiagramCanvas({
                     x={REACTION_TEXT_X}
                     y={29}
                   >
-                    {reaction.name}
+                    {taskTitleLines(reaction.name, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING - (reaction.within === null ? 0 : WITHIN_ROOM)).map((line, index, lines) => <tspan key={index} x={REACTION_TEXT_X} dy={index ? 18 : 0}>{line}{index < lines.length - 1 ? " " : ""}</tspan>)}
                   </text>
-                  <text className="omar-reaction-description" x={REACTION_TEXT_X} y={46}>
-                    {fitText(reaction.summary, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING, 6.7)}
+                  <text className="omar-reaction-description" x={REACTION_TEXT_X} y={68}>
+                    {fitText(reaction.summary, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING - (reaction.within === null ? 0 : WITHIN_ROOM), 6.7)}
                   </text>
-                  <rect className="omar-model-badge" x={REACTION_TEXT_X} y={57} width={16} height={16} rx={5} />
-                  <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 59) scale(0.5)`}>
+                  <rect className="omar-model-badge" x={REACTION_TEXT_X} y={80} width={16} height={16} rx={5} />
+                  <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 82) scale(0.5)`}>
                     <BackendMark backend={reaction.backend} />
                   </g>
-                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={68}>{reaction.meta}</text>
+                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={91}>{reaction.meta}</text>
                   {/* A deadline the program set for itself. A stopwatch rather
                       than a clock: a timer fires on its own, this counts down
                       against work already running. */}

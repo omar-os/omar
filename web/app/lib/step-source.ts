@@ -3,6 +3,9 @@ import type { DiagramReaction, DiagramSnapshot } from "./protocol";
 type Token = { text: string; start: number; end: number; string: boolean };
 type Span = { start: number; end: number };
 export type StepSource = {
+  title?: string;
+  description?: string;
+  metadataSpan?: Span;
   team: string;
   backend: string;
   prompt: string;
@@ -78,14 +81,22 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
     const backend = all[agent + 2];
     const close = all.findIndex((token, i) => i > position + 2 && !token.string && token.text === ")");
     if (close < 0 || all[close + 1]?.text !== "->") return null;
-    const body = all.findIndex((token, i) => i > close + 1 && token.string);
+    const firstString = all.findIndex((token, i) => i > close + 1 && token.string);
     // Constant strings in output contracts are deliberately left to source editing.
-    if (body < 0 || all[body - 1]?.text === "=" || body >= end) return null;
+    if (firstString < 0 || all[firstString - 1]?.text === "=" || firstString >= end) return null;
+    const hasTask = all[firstString - 2]?.text === "display" && all[firstString - 1]?.text === "(";
+    // Display strings must never be edited as the agent's execution prompt.
+    const body = hasTask ? firstString + 4 : firstString;
+    if (hasTask && (all[firstString + 1]?.text !== "," || !all[firstString + 2]?.string || all[firstString + 3]?.text !== ")")) return null;
+    if (!all[body]?.string || body >= end) return null;
     const deadline = all.findIndex((token, i) => i > close + 1 && i < body && !token.string && token.text === "within");
-    const contractEnd = deadline < 0 ? body : deadline;
+    const contractEnd = deadline < 0 ? (hasTask ? firstString - 2 : body) : deadline;
     const triggersSpan = { start: all[position + 2].end, end: all[close].start };
     const contractSpan = { start: all[close + 2].start, end: all[contractEnd - 1].end };
     return {
+      title: hasTask ? all[firstString].text : undefined,
+      description: hasTask ? all[firstString + 2].text : undefined,
+      metadataSpan: hasTask ? {start: all[firstString - 2].start, end: all[firstString + 3].end} : undefined,
       team, backend: backend.text, prompt: all[body].text,
       triggers: source.slice(triggersSpan.start, triggersSpan.end).split(",").map((s) => s.trim()).filter(Boolean),
       contract: source.slice(contractSpan.start, contractSpan.end),
@@ -94,13 +105,24 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
   } catch { return null; }
 }
 
-export function replaceStep(source: string, step: StepSource, changes: { backend: string; prompt: string; triggers: string[]; contract: string }): string {
+export function replaceStep(source: string, step: StepSource, changes: { backend: string; prompt: string; triggers: string[]; contract: string; title?: string; description?: string }): string {
   if (!/^[A-Za-z_][A-Za-z_0-9]*$/.test(changes.backend)) throw new Error("Choose a supported execution backend.");
   const replacements = [
     { ...step.backendSpan, value: changes.backend },
     { ...step.promptSpan, value: `"${changes.prompt.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` },
     { ...step.triggersSpan, value: changes.triggers.join(", ") },
     { ...step.contractSpan, value: changes.contract },
-  ].sort((a, b) => b.start - a.start);
+  ];
+  // Changed instructions invalidate old copy unless the editor explicitly
+  // supplies a revised title and description. Backend-only edits preserve it.
+  const explicitCopy = changes.title !== undefined && changes.description !== undefined;
+  const changedInstructions = changes.prompt !== step.prompt || changes.contract !== step.contract || changes.triggers.join(",") !== step.triggers.join(",");
+  if (explicitCopy || (step.metadataSpan && changedInstructions)) {
+    const quote = (value: string) => `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    const value = explicitCopy && changes.title?.trim() && changes.description?.trim()
+      ? `display(${quote(changes.title.trim())}, ${quote(changes.description.trim())}) ` : "";
+    replacements.push({ ...(step.metadataSpan ?? {start: step.promptSpan.start, end: step.promptSpan.start}), value });
+  }
+  replacements.sort((a, b) => b.start - a.start || b.end - a.end);
   return replacements.reduce((text, edit) => text.slice(0, edit.start) + edit.value + text.slice(edit.end), source);
 }
