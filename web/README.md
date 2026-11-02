@@ -161,6 +161,34 @@ npm run test:conformance
 It skips itself when those binaries are absent, so a Node-only checkout is
 unaffected. `OMAR_BIN` and `OMARC_BIN` override the paths.
 
+### Manual response panels
+
+Optional companion file `omar.response.json` provides human-facing copy for Web
+steps. It does not change port types, contracts, execution, or authorization:
+
+```json
+{
+  "steps": {
+    "prepare.chatgpt": {
+      "title": "Paste the prepared production packet",
+      "summary": "Complete preparation in ChatGPT, then return its result here.",
+      "instructions": ["Follow the full task instructions in ChatGPT.", "Paste the verified result below."],
+      "next": "A valid packet starts the connected production step.",
+      "outcomes": {
+        "prepare.packet": {"label": "Prepared packet", "format": "json", "help": "Paste the complete JSON packet."},
+        "prepare.blocked": {"label": "Blocker report", "format": "json", "help": "Describe what prevents preparation."}
+      }
+    }
+  }
+}
+```
+
+Existing workflows still work without this file. Setup-review inputs explicitly
+marked `mode: setup_review_only` or `productionAuthorized: false`, with a wired
+`blocked` output, surface their setup requirements and only offer reporting a
+blocker. Providing new setup details requires editing the request; submitting a
+blocker is not authorization to produce or publish.
+
 `tests/fixtures/diagram-snapshot.v1.json` was captured from a real `omar serve`
 run. `tests/protocol-contract.test.mjs` asserts the client's and renderer's
 requirements against it, so a runtime field rename fails here rather than
