@@ -93,6 +93,7 @@ export function OmarEditor({
   status,
   errors,
   checking,
+  readOnly = false,
   onSourceChange,
   onFilenameChange,
 }: {
@@ -104,6 +105,8 @@ export function OmarEditor({
   status: string;
   errors: string[];
   checking: boolean;
+  /** Shown, highlighted and scrollable, but not editable. */
+  readOnly?: boolean;
   onSourceChange: (source: string) => void;
   onFilenameChange: (filename: string) => void;
 }) {
@@ -115,7 +118,7 @@ export function OmarEditor({
     onChange.current = onSourceChange;
   });
   // The first values, for the editor's creation; later ones arrive below.
-  const initial = useRef({ source, base });
+  const initial = useRef({ source, base, readOnly });
   // Null until the operator types: the name shown is the one they were given
   // until it is the one they are writing. Derived rather than synchronised, so
   // a rename in progress is never overwritten by a re-render.
@@ -140,6 +143,8 @@ export function OmarEditor({
             }
           }),
           diff.current.of(diffAgainst(initial.current.base)),
+          EditorState.readOnly.of(initial.current.readOnly),
+          EditorView.editable.of(!initial.current.readOnly),
         ],
       }),
     });
@@ -176,6 +181,7 @@ export function OmarEditor({
           className="source-name"
           value={name}
           spellCheck={false}
+          readOnly={readOnly}
           aria-label="Program file name"
           onChange={(event) => setEdited(event.target.value)}
           onBlur={commit}

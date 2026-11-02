@@ -9,6 +9,7 @@ mod config;
 mod deploy;
 mod diagram;
 mod ea;
+mod ea_lifecycle;
 mod event;
 mod manager;
 mod mcp;
@@ -89,7 +90,8 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Target an existing runtime session by id or name
+    /// Target a runtime session by id or name; for up and serve, the name of
+    /// the session to start, or of a stopped one to restart
     #[arg(short = 's', long, global = true)]
     session: Option<String>,
 
@@ -150,7 +152,7 @@ enum Commands {
     },
     /// Remove a session and everything it kept; a running one is killed first
     Rm,
-    /// Stop one runtime: running workflows pause at their next tag boundary, and the stopped session keeps its state until `rm`, so `up --name` restarts it
+    /// Stop one runtime: running workflows pause at their next tag boundary, and the stopped session keeps its state until `rm`, so `up -s NAME` restarts it
     Down {
         #[arg(long)]
         force: bool,
@@ -328,12 +330,12 @@ enum Commands {
 
     /// Accept OMAR programs over HTTP and supervise their runs
     Serve {
-        /// Name for a new independent foreground session
-        #[arg(long)]
+        /// Deprecated: use -s NAME
+        #[arg(long, hide = true)]
         name: Option<String>,
-        /// Loopback address to bind the admission API
+        /// Port for the admission API, on 127.0.0.1
         #[arg(long)]
-        address: Option<std::net::SocketAddr>,
+        port: Option<u16>,
 
         /// Serve the API without starting an executive assistant. The agent
         /// context is still written, so a test harness can stand in for one.
@@ -2000,11 +2002,8 @@ async fn run_dashboard(config: Config, session: sessions::Session) -> Result<()>
                         }
                         KeyCode::Char('D') => {
                             // Delete the currently active EA (last EA is protected)
-                            if app.session.is_some() {
-                                app.set_status(
-                                    "EA deletion is not available while attached; the runtime owns EAs",
-                                );
-                            } else if app.registered_eas.len() > 1 {
+                            app.registered_eas = ea::load_registry(&app.omar_dir);
+                            if app.registered_eas.len() > 1 {
                                 app.pending_confirm = Some(app::ConfirmAction::DeleteEa);
                             } else {
                                 app.set_status("Cannot delete the only EA");

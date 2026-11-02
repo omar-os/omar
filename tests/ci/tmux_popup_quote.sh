@@ -67,7 +67,7 @@ wait_for_session() {
   return 1
 }
 
-session_json="$(cd "$REPO_ROOT" && HOME="$home_dir" "$OMAR_BIN" up --name harness --json)"
+session_json="$(cd "$REPO_ROOT" && HOME="$home_dir" "$OMAR_BIN" up -s harness --json)"
 session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$session_json")"
 server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
 tmux -L "$server" new-session -d -s omar-dashboard \
