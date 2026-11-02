@@ -476,19 +476,42 @@ test("discarding a design leaves the gate without running anything", async ({
   expect(admissions, "declining a design must not admit a run").toBe(0);
 });
 
-test("an unreachable daemon is reported and blocks the run", async ({ page }) => {
+test("an unreachable daemon is reported once, blocks writes, and recovers", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);
+  const send = page.getByRole("button", { name: "Draft workflow" });
+  const deploy = page.getByRole("button", { name: "Deploy", exact: true });
+  const offline = page.locator(".runtime-offline");
 
-  // Take the daemon away underneath a drafted design.
-  await fake.close();
+  // Take the daemon away underneath a drafted design: every request to it
+  // fails as a dead port's would, and the same daemon answers again after.
+  const down = (route: import("@playwright/test").Route) => route.abort("connectionrefused");
+  await page.route(`${FAKE_SERVE_URL}/**`, down);
 
   await expect(page.locator(".daemon")).toHaveClass(/offline/, { timeout: 15_000 });
   await expect(page.locator(".daemon")).toContainText("unreachable");
-  await expect(
-    page.getByRole("button", { name: "Deploy", exact: true }),
-  ).toBeDisabled();
-  await expect(page.locator(".composer-status")).toContainText("Cannot reach omar serve");
+  // One notice for one cause: the sidebar keeps its last list, dimmed.
+  await expect(offline).toHaveCount(1);
+  await expect(offline).toContainText("Runtime offline");
+  await expect(offline).toContainText("omar up -s");
+  await expect(page.getByLabel("Saved chats")).toHaveClass(/stale/);
+  await expect(page.locator(".history-error")).toHaveCount(0);
+  await expect(page.locator(".connection-error")).toHaveCount(0);
+  await expect(page.locator(".composer-status")).toHaveText("Runtime offline");
+  // Writes wait; a draft can still be written.
+  await expect(deploy).toBeDisabled();
+  await expect(send).toBeDisabled();
+  await page.getByLabel("Describe a workflow").fill("kept while offline");
+
+  // The runtime comes back just after a health poll has failed, so the next
+  // poll is seconds away: only Retry now can find it this quickly.
+  await page.waitForEvent("requestfailed", (request) => request.url().endsWith("/health"));
+  await page.unroute(`${FAKE_SERVE_URL}/**`, down);
+  await offline.getByRole("button", { name: "Retry now" }).click();
+  await expect(offline).toHaveCount(0, { timeout: 1_500 });
+  await expect(page.getByLabel("Saved chats")).not.toHaveClass(/stale/);
+  await expect(send).toBeEnabled();
+  await expect(page.getByLabel("Describe a workflow")).toHaveValue("kept while offline");
 });
 
 test("a design the compiler rejects is reported and stays unconfirmed", async ({
@@ -515,6 +538,10 @@ test("a design the compiler rejects is reported and stays unconfirmed", async ({
   await expect(
     page.getByRole("button", { name: "Deploy", exact: true }),
   ).toBeVisible();
+  // Read and put away; the design stays at the gate.
+  await page.getByRole("button", { name: "Dismiss error" }).click();
+  await expect(page.locator(".connection-error")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Deploy", exact: true })).toBeVisible();
 });
 
 test("a feedback loop renders, and every arrow still points right", async ({
@@ -810,6 +837,32 @@ test("the workflow's buttons sit with the workflow", async ({ page }) => {
     (await page.locator(".diagram-heading h2").boundingBox())!.x,
   );
   expect(stats.x + stats.width).toBeLessThanOrEqual(first.x + 1);
+});
+
+test("a run's controls wait while the runtime is offline", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+  // Paused, so the run keeps its controls for as long as the test needs.
+  const actions = page.getByRole("group", { name: "Run controls" });
+  await actions.getByRole("button", { name: "Pause" }).click();
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  const resume = actions.getByRole("button", { name: "Resume" });
+  const stop = actions.getByRole("button", { name: "Stop" });
+  await expect(resume).toBeEnabled();
+
+  const down = (route: import("@playwright/test").Route) => route.abort("connectionrefused");
+  await page.route(`${FAKE_SERVE_URL}/**`, down);
+  await expect(page.locator(".runtime-offline")).toBeVisible({ timeout: 15_000 });
+  await expect(resume).toBeDisabled();
+  await expect(stop).toBeDisabled();
+  await expect(stop).toHaveAttribute("title", "Runtime offline");
+
+  await page.unroute(`${FAKE_SERVE_URL}/**`, down);
+  await page.locator(".runtime-offline").getByRole("button", { name: "Retry now" }).click();
+  await expect(page.locator(".runtime-offline")).toHaveCount(0);
+  await expect(resume).toBeEnabled();
+  await expect(stop).toBeEnabled();
 });
 
 test("a run can be paused and resumed from the panel that shows it", async ({ page }) => {

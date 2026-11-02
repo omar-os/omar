@@ -62,6 +62,15 @@
   --dia-chrome-text: #c4c0cb;
   --dia-chrome-hover: #2a2a31;
   --dia-chrome-shadow: rgba(0, 0, 0, 0.4);
+  /* Notices: amber for a state that clears by itself, red for a failure. */
+  --warn: #f5b84b;
+  --warn-text: #f3d9a6;
+  --warn-bg: rgba(245, 184, 75, 0.08);
+  --warn-line: rgba(245, 184, 75, 0.28);
+  --danger: #f87171;
+  --danger-text: #fecaca;
+  --danger-bg: rgba(127, 29, 29, 0.22);
+  --danger-line: rgba(248, 113, 113, 0.28);
 }
 
 /* Light is chosen from the settings menu and kept in local storage; the
@@ -85,6 +94,14 @@
   --glow: rgba(140, 99, 242, 0.1);
   --bubble: #e9e7ee;
   --bubble-text: #5d5966;
+  --warn: #c27c0e;
+  --warn-text: #7a4b05;
+  --warn-bg: #fdf4e3;
+  --warn-line: #f0d39a;
+  --danger: #dc2626;
+  --danger-text: #991b1b;
+  --danger-bg: #fef2f2;
+  --danger-line: #fecaca;
   color-scheme: light;
 
   --dia-paper: #f6f6f4;
@@ -1136,11 +1153,84 @@ h2 {
 
 .diagram-error,
 .connection-error {
-  color: #fecaca;
-  background: rgba(127, 29, 29, 0.25);
-  border: 1px solid rgba(248, 113, 113, 0.3);
-  font-size: 1rem;
+  color: var(--danger-text);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-line);
+  font-size: 0.875rem;
+  line-height: 1.45;
 }
+
+/* A failed action: one compact line with a way to put it away. */
+.connection-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.connection-error::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-top: 0.45em;
+  border-radius: 50%;
+  background: var(--danger);
+}
+.connection-error > span,
+p.connection-error { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.error-dismiss {
+  flex: none;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 1.1rem;
+  line-height: 1;
+  opacity: 0.7;
+  cursor: pointer;
+}
+.error-dismiss:hover { opacity: 1; }
+
+/* Text-weight button for actions inside a notice. */
+.link-button {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--link);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.link-button:hover { text-decoration: underline; }
+
+/* The runtime is unreachable. Pinned under the conversation header so it is
+   read before the thread, and gone once a health probe succeeds. */
+.runtime-offline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 0 16px;
+  padding: 8px 12px;
+  border: 1px solid var(--warn-line);
+  border-radius: 8px;
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  font-size: 0.875rem;
+}
+.runtime-offline > i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  animation: offline-pulse 1.6s ease-in-out infinite;
+}
+.runtime-offline > span:first-of-type { flex: 1; min-width: max-content; }
+.runtime-offline strong { font-weight: 600; }
+.runtime-offline-hint { color: var(--muted); }
+.runtime-offline-hint code { font-size: 0.8125rem; }
+@keyframes offline-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .runtime-offline > i { animation: none; } }
 
 .diagram-error {
   position: absolute;
@@ -1665,6 +1755,7 @@ h2 {
    full width, which reads badly. Hold everything to a column instead. */
 .builder-panel.solo .messages > *,
 .builder-panel.solo .prompt-box,
+.builder-panel.solo .runtime-offline,
 .builder-panel.solo .connection-error {
   width: min(100% - 32px, 720px);
   margin-left: auto;
@@ -2595,7 +2686,24 @@ h2 {
 .chat-history li button { width: 100%; text-align: left; display: grid; gap: 6px; background: transparent; border-color: transparent; }
 .chat-history li span { overflow-wrap: anywhere; font-size: 1rem; }
 .chat-history [aria-current="true"] { border-color: var(--purple); background: var(--purple-soft); }
-.chat-history .history-error p { color: #ffb4b4; }
+.chat-history .history-error {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  color: var(--danger-text);
+  font-size: 0.875rem;
+}
+.chat-history .history-error .link-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--link);
+  font-size: 0.875rem;
+}
+/* The last list loaded, kept while the runtime is offline. */
+.chat-history ul.stale { opacity: 0.55; }
 .history-drawer {
   position: fixed;
   inset: 0 auto 0 0;
