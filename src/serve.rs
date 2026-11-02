@@ -294,6 +294,14 @@ pub struct ProposedDesign {
     /// The compiled topology, so the operator sees what they are approving
     /// before any run exists.
     pub preview: crate::diagram::DiagramSnapshot,
+    /// Lean declarations the properties share.
+    #[serde(default)]
+    #[ts(optional, type = "string")]
+    pub lemmas: String,
+    /// What the assistant claims of the program, as Lean judged it.
+    #[serde(default)]
+    #[ts(optional, type = "Array<PropertyVerdict>")]
+    pub properties: Vec<crate::properties::PropertyVerdict>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,6 +321,24 @@ struct AgentProposal {
     summary: String,
     #[serde(default)]
     inputs: BTreeMap<String, Value>,
+    #[serde(default)]
+    lemmas: String,
+    #[serde(default)]
+    properties: Vec<crate::properties::Property>,
+}
+
+/// Properties to check against a program, from the assistant (with its
+/// token) or the operator.
+#[derive(Debug, Deserialize)]
+struct PropertyCheck {
+    #[serde(default)]
+    token: String,
+    program: String,
+    #[serde(default)]
+    files: BTreeMap<String, String>,
+    #[serde(default)]
+    lemmas: String,
+    properties: Vec<crate::properties::Property>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1186,6 +1212,58 @@ fn workspace_request(
         }
         return Ok(json!({"workspace": ws}));
     }
+    // A program's proved properties as Lean files, to open in the editor and
+    // work on interactively. Only Lean's own files go in; nothing here runs.
+    if method == "POST" && path == "/v1/workspaces/properties" {
+        #[derive(Deserialize)]
+        struct ProofFile {
+            name: String,
+            source: String,
+        }
+        #[derive(Deserialize)]
+        struct ProofWorkspace {
+            properties: Vec<ProofFile>,
+        }
+        let request: ProofWorkspace = serde_json::from_slice(body)?;
+        anyhow::ensure!(!request.properties.is_empty(), "no properties to open");
+        for file in &request.properties {
+            anyhow::ensure!(
+                !file.name.is_empty()
+                    && file
+                        .name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "'{}' is not a property name",
+                file.name
+            );
+        }
+        let key = format!("properties:{}", crate::checkpoint::sha256(body));
+        if let Some(ws) = crate::workspace::list(root, context.ea_id)?
+            .into_iter()
+            .find(|ws| ws.deployment_id == key)
+        {
+            return Ok(json!({"workspace": ws}));
+        }
+        let ws =
+            crate::workspace::Workspace::create(root, context.ea_id, &key, "Properties", None)?;
+        let result = (|| -> Result<()> {
+            let tree = ws.worktree(root);
+            fs::write(
+                tree.join("lean-toolchain"),
+                crate::properties::LEAN_TOOLCHAIN,
+            )?;
+            for file in &request.properties {
+                fs::write(tree.join(format!("{}.lean", file.name)), &file.source)?;
+            }
+            ws.snapshot(root, "Properties as proved")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = ws.remove(root);
+            return Err(error);
+        }
+        return Ok(json!({"workspace": ws}));
+    }
     let rest = path
         .strip_prefix("/v1/workspaces/")
         .context("unknown workspace route")?;
@@ -1372,7 +1450,10 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             return write_json(&mut stream, 403, &json!({"error": reason}), None);
         }
     }
-    let context = if path == "/v1/agent/reply" || path == "/v1/agent/proposals" {
+    let context = if path == "/v1/agent/reply"
+        || path == "/v1/agent/proposals"
+        || path == "/v1/agent/properties"
+    {
         let body: Value = match serde_json::from_slice(&raw_body) {
             Ok(body) => body,
             Err(error) => {
@@ -1667,6 +1748,17 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
                 (413, json!({"error": "program too large"}))
             } else {
                 agent_proposal(&context, &read_body(content_length)?)
+            }
+        }
+        ("POST", "/v1/agent/properties") | ("POST", "/v1/properties/check") => {
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "program too large"}))
+            } else {
+                check_properties(
+                    &context,
+                    &read_body(content_length)?,
+                    path == "/v1/agent/properties",
+                )
             }
         }
         ("POST", "/v1/programs/check") => {
@@ -2651,6 +2743,21 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
+    // Proved here rather than taken on trust: the operator is shown Lean's
+    // verdict on this program, whatever the assistant believed.
+    let properties = if proposal.properties.is_empty() {
+        Vec::new()
+    } else {
+        match prove_properties(
+            &proposal.program,
+            &proposal.files,
+            &proposal.lemmas,
+            &proposal.properties,
+        ) {
+            Ok(verdicts) => verdicts,
+            Err(error) => return (400, json!({"error": error})),
+        }
+    };
     if let Err(error) = context.publish(
         ChatRole::Assistant,
         proposal.summary,
@@ -2660,11 +2767,52 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             files: proposal.files,
             inputs: proposal.inputs,
             preview: crate::diagram::DiagramSnapshot::from_vm_state(&state),
+            lemmas: proposal.lemmas,
+            properties,
         }),
     ) {
         return (500, json!({"error": format!("{error:#}")}));
     }
     (202, json!({"status": "proposed"}))
+}
+
+/// Lean's verdict on each property of `program`.
+fn prove_properties(
+    program: &str,
+    files: &BTreeMap<String, String>,
+    lemmas: &str,
+    properties: &[crate::properties::Property],
+) -> std::result::Result<Vec<crate::properties::PropertyVerdict>, String> {
+    let staged = stage_program(program, None, files).map_err(|(_, problem)| {
+        problem["errors"][0]
+            .as_str()
+            .or(problem["error"].as_str())
+            .unwrap_or("the program could not be staged")
+            .to_string()
+    })?;
+    let outcome = crate::properties::prove(&staged.path, lemmas, properties);
+    staged.finish(outcome)
+}
+
+/// Check properties without proposing anything: how the assistant works a
+/// proof out, and how the operator re-checks after editing the program.
+fn check_properties(context: &Arc<Context_>, body: &[u8], agent: bool) -> (u16, Value) {
+    let request: PropertyCheck = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    if agent && request.token != *context.agent_token.lock().expect("agent token poisoned") {
+        return (403, json!({"error": "forbidden"}));
+    }
+    match prove_properties(
+        &request.program,
+        &request.files,
+        &request.lemmas,
+        &request.properties,
+    ) {
+        Ok(verdicts) => (200, json!({"verdicts": verdicts})),
+        Err(error) => (400, json!({"error": error})),
+    }
 }
 
 fn compile_preview(program: &str, files: &BTreeMap<String, String>) -> Result<VmState> {
@@ -5384,6 +5532,8 @@ while True:
                 "../web/tests/fixtures/diagram-snapshot.v1.json"
             ))
             .unwrap(),
+            lemmas: String::new(),
+            properties: Vec::new(),
         };
         first
             .context

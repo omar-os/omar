@@ -24,6 +24,15 @@ const CORS = {
   "access-control-allow-headers": "content-type",
 };
 
+/**
+ * What `omarc --prove` made of three properties of PROPOSED_PROGRAM: two
+ * proved, and one that does not hold (a run cut short leaves a plan
+ * unreviewed). Produced by the real compiler, not written by hand.
+ */
+const PROPERTY_VERDICTS = JSON.parse(
+  await readFile(new URL("./fixtures/review-flow-properties.json", import.meta.url), "utf8"),
+);
+
 /** Marker a test can put in a program to exercise the compile-failure path. */
 const INVALID_MARKER = "!!invalid!!";
 
@@ -300,6 +309,37 @@ export async function startFakeServe({
       // Test-only: what the admission carried.
       const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length, -"/options".length));
       return entry ? json(response, 200, entry.options) : json(response, 404, { error: "unknown run" });
+    }
+    if (request.method === "POST" && url.pathname === "/v1/properties/check") {
+      // Lean's verdicts do not depend on anything the fake can change, so a
+      // re-check answers with them; what a test checks is that it was asked.
+      return readBody(request).then((body) => {
+        const asked = JSON.parse(body);
+        chat.propertyChecks = (chat.propertyChecks ?? 0) + 1;
+        const verdicts = asked.properties.map((property) =>
+          structuredClone(PROPERTY_VERDICTS.find((verdict) => verdict.name === property.name)) ?? {
+            ...property, proved: false, theorem: "", source: "", mentions: [],
+            problems: [{ line: 0, column: 0, message: "unknown to the fake" }],
+          });
+        return json(response, 200, { verdicts });
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/v1/workspaces/properties") {
+      return readBody(request).then((body) => {
+        chat.proofWorkspace = JSON.parse(body);
+        return json(response, 200, { workspace: { id: "proofs" } });
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/v1/workspaces/proofs/editor") {
+      return json(response, 200, { url: `http://${request.headers.host}/fake-editor/proofs` });
+    }
+    if (request.method === "GET" && url.pathname === "/v1/proofs") {
+      // Test-only: what the client asked of the proof surface.
+      return json(response, 200, { checks: chat.propertyChecks ?? 0, workspace: chat.proofWorkspace ?? null });
+    }
+    if (request.method === "GET" && url.pathname === "/fake-editor/proofs") {
+      response.writeHead(200, { "content-type": "text/html" }).end("<title>Proofs</title><h1>Proof editor</h1>");
+      return;
     }
     if (url.pathname.startsWith("/v1/workspaces/")) {
       // Enough of the workspace surface for the viewer to open on a run.
@@ -620,6 +660,10 @@ export async function startFakeServe({
           program: PROPOSED_PROGRAM,
           inputs: { "flow.request": chat.messages[0]?.text ?? "" },
           preview,
+          // Asked for safety, the real EA proves properties of what it proposes.
+          ...(chat.messages.some((m) => m.role === "operator" && /\bsafe|\bprove/i.test(m.text))
+            ? { lemmas: "", properties: structuredClone(PROPERTY_VERDICTS) }
+            : {}),
         },
       );
       // Real assistants comment straight after proposing. That must not look

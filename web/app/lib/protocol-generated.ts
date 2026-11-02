@@ -114,6 +114,31 @@ timers: Array<DiagramTimer>, reactions: Array<DiagramReaction>, edges: Array<Dia
 
 export type DiagramEvent = { protocol_version: number, sequence: number, team: string, tag: DiagramTag | null, kind: DiagramEventKind, payload: Record<string, unknown>, };
 
+export type ProofProblem = {
+/**
+ * Counted from the theorem's first line; 0 when it is about the whole.
+ */
+line: number, column: number, message: string, };
+
+export type PropertyVerdict = { name: string, description: string, proved: boolean,
+/**
+ * The statement and proof as written, so the property can be checked
+ * again against an edited program.
+ */
+statement: string, proof: string,
+/**
+ * The theorem as it was checked.
+ */
+theorem: string,
+/**
+ * The whole Lean file: the model, the shared lemmas and the theorem.
+ */
+source: string,
+/**
+ * The ports, reactions and timers its statement names.
+ */
+mentions: Array<string>, problems: Array<ProofProblem>, };
+
 export type ProposedDesign = { program: string,
 /**
  * Companion files relative to program.omar.
@@ -123,7 +148,15 @@ files?: Record<string, string>, inputs: Record<string, unknown>,
  * The compiled topology, so the operator sees what they are approving
  * before any run exists.
  */
-preview: DiagramSnapshot, };
+preview: DiagramSnapshot,
+/**
+ * Lean declarations the properties share.
+ */
+lemmas?: string,
+/**
+ * What the assistant claims of the program, as Lean judged it.
+ */
+properties?: Array<PropertyVerdict>, };
 
 export type ChatMessage = { sequence: number, role: ChatRole, text: string,
 /**
