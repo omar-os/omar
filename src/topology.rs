@@ -178,6 +178,10 @@ pub enum Instruction {
         effects: Vec<String>,
         contract: String,
         prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         #[serde(default)]
         body: Option<String>,
         #[serde(default)]

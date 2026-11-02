@@ -170,6 +170,8 @@ fn update_as_install(instruction: &Instruction) -> Option<(String, Instruction)>
             effects,
             contract,
             prompt,
+            title,
+            description,
             body,
             instance,
             within,
@@ -182,6 +184,8 @@ fn update_as_install(instruction: &Instruction) -> Option<(String, Instruction)>
                 effects,
                 contract,
                 prompt,
+                title,
+                description,
                 body,
                 instance,
                 within,
@@ -583,6 +587,27 @@ mod tests {
             back,
         ]);
         check(&b, &backward, &a).unwrap();
+    }
+
+    #[test]
+    fn reaction_updates_preserve_display_metadata() {
+        let original = relay(2, "go", vec![]);
+        let mut updated = original.clone();
+        let Instruction::InstallReaction {
+            title, description, ..
+        } = &mut updated.instructions[13]
+        else {
+            panic!("expected a reaction");
+        };
+        *title = Some("Forward the supplied value".into());
+        *description = Some("Pass the supplied token to the next step.".into());
+        let mut update = serde_json::to_value(&updated.instructions[13]).unwrap();
+        update["op"] = json!("update_reaction");
+        check(&original, &plan(vec![update]), &updated).unwrap();
+
+        let mut reset = serde_json::to_value(&original.instructions[13]).unwrap();
+        reset["op"] = json!("update_reaction");
+        check(&updated, &plan(vec![reset]), &original).unwrap();
     }
 
     #[test]
