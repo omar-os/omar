@@ -254,6 +254,10 @@ pub trait Backend: Send + Sync {
     fn login(&self, _headless: bool) -> Option<Login> {
         None
     }
+    /// Environment variables that sign the CLI in, which no sign-out clears.
+    fn credential_vars(&self) -> &'static [&'static str] {
+        &[]
+    }
     /// How the connect picker has the CLI sign itself out.
     fn logout(&self) -> Option<Login> {
         None

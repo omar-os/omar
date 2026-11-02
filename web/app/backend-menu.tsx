@@ -44,6 +44,11 @@ function note(status: BackendStatus | undefined): ReactNode {
   }
 }
 
+/** Launching one that cannot sign in would only hang. */
+function unusable(status: BackendStatus | undefined): boolean {
+  return status?.status === "signed_out" || status?.status === "not_installed";
+}
+
 /**
  * Which backend the assistant runs on, and a way to change it.
  *
@@ -64,6 +69,11 @@ export function BackendMenu({
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [statuses, setStatuses] = useState<Record<string, BackendStatus>>({});
+  // Nothing switches until status has answered: "unavailable" is a runtime
+  // that predates the status endpoint, which still gets to switch.
+  const [statusState, setStatusState] = useState<
+    "loading" | "ready" | "unavailable"
+  >("loading");
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -86,14 +96,18 @@ export function BackendMenu({
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
+    setStatusState("loading");
     fetchBackendStatus(serveUrl)
       .then((list) => {
         if (!cancelled) {
           setStatuses(Object.fromEntries(list.map((s) => [s.name, s])));
+          setStatusState("ready");
         }
       })
       // A runtime that predates this endpoint just shows no status.
-      .catch(() => {});
+      .catch(() => {
+        if (!cancelled) setStatusState("unavailable");
+      });
     return () => {
       cancelled = true;
     };
@@ -113,6 +127,11 @@ export function BackendMenu({
 
   async function choose(backend: string) {
     setError("");
+    // Status may have changed since Restart was offered.
+    if (statusState === "loading" || unusable(statuses[backend])) {
+      setPending(null);
+      return;
+    }
     try {
       await switchBackend(serveUrl, backend);
       setCurrent(backend);
@@ -150,7 +169,13 @@ export function BackendMenu({
                 is lost.
               </p>
               <span>
-                <button type="button" onClick={() => void choose(pending)}>
+                <button
+                  type="button"
+                  disabled={
+                    statusState === "loading" || unusable(statuses[pending])
+                  }
+                  onClick={() => void choose(pending)}
+                >
                   Restart
                 </button>
                 <button type="button" onClick={() => setPending(null)}>
@@ -161,10 +186,7 @@ export function BackendMenu({
           ) : (
             available.map((backend) => {
               const status = statuses[backend];
-              // Launching one that cannot sign in would only hang.
-              const unusable =
-                status?.status === "signed_out" ||
-                status?.status === "not_installed";
+              const blocked = statusState === "loading" || unusable(status);
               return (
                 <button
                   key={backend}
@@ -172,7 +194,7 @@ export function BackendMenu({
                   role="menuitem"
                   data-status={status?.status}
                   className={backend === current ? "current" : undefined}
-                  disabled={unusable && backend !== current}
+                  disabled={blocked && backend !== current}
                   onClick={() =>
                     backend === current ? setOpen(false) : setPending(backend)
                   }

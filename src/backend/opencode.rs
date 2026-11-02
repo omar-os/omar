@@ -53,6 +53,9 @@ impl Backend for Opencode {
             note: None,
         })
     }
+    fn credential_vars(&self) -> &'static [&'static str] {
+        connection::PROVIDER_KEYS
+    }
     fn logout(&self) -> Option<Login> {
         Some(Login {
             args: &["auth", "logout"],

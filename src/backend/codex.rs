@@ -74,6 +74,9 @@ impl Backend for Codex {
             }
         })
     }
+    fn credential_vars(&self) -> &'static [&'static str] {
+        &["OPENAI_API_KEY", "CODEX_API_KEY"]
+    }
     fn logout(&self) -> Option<Login> {
         Some(Login {
             args: &["logout"],

@@ -175,7 +175,9 @@ the arrow keys, and OMAR runs the vendor's official installer if needed (and
 puts it on your shell's PATH), then the CLI's own sign-in (device code for
 Codex over SSH); `d` signs one out. `omar connect <backend>` does one
 directly. Credentials stay where each CLI keeps them; OMAR never
-reads or stores one. `omar backends` shows where each stands (`--json` for
+stores or sends one. Each CLI reports its own sign-in, except pi, which has
+no status command: OMAR reads only the provider names in pi's `auth.json`.
+`omar backends` shows where each stands (`--json` for
 scripts); so does Mission Control's backend menu.
 
 ```

@@ -1437,6 +1437,38 @@ test("the composer says which assistant is answering, and can change it", async 
   await expect(page.getByRole("button", { name: /Claude Code/ })).toBeVisible();
 });
 
+test("no backend can be chosen before its status is known", async ({ page }) => {
+  await useFakeServe(page);
+  let answer: () => void = () => {};
+  const held = new Promise<void>((resolve) => (answer = resolve));
+  await page.route("**/v1/agent/backends", async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  const menu = page.getByRole("menu");
+  // Still asking: a signed-out one must not slip through.
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeDisabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();
+
+  answer();
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeEnabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();
+});
+
+test("a runtime without backend status still switches", async ({ page }) => {
+  await useFakeServe(page);
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({ status: 404, json: { error: "Not found" } }),
+  );
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menu").getByRole("menuitem", { name: /Cursor/ }).click();
+  await page.getByRole("button", { name: "Restart" }).click();
+  await expect(page.getByRole("button", { name: /Cursor/ })).toBeVisible();
+});
+
 test("a chevron names the backend behind its agent", async ({ page }) => {
   await useFakeServe(page);
   await page.getByLabel("Describe a workflow").fill("Review the release plan");

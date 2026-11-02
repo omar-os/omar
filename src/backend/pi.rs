@@ -26,8 +26,9 @@ impl Backend for Pi {
     fn default_command(&self) -> &'static str {
         "pi"
     }
-    /// Pi answers for one provider at a time, so its own store is read
-    /// instead, then the keys most people sign in with.
+    /// Pi has no status command, so this lists the providers in its own
+    /// store (names only), then the keys most people sign in with. The one
+    /// place OMAR opens a credential file.
     fn connection(&self, _program: &str) -> Connection {
         let dir = std::env::var_os("PI_CODING_AGENT_DIR")
             .map(PathBuf::from)
@@ -39,7 +40,7 @@ impl Backend for Pi {
         if !stored.is_empty() {
             return Connection::connected(stored.join(", "));
         }
-        match connection::env_credential(PI_KEYS) {
+        match connection::env_credential(connection::PROVIDER_KEYS) {
             Some(name) => Connection::connected(name),
             None => Connection::SignedOut,
         }
@@ -53,6 +54,9 @@ impl Backend for Pi {
             args: &[],
             note: Some("In pi, type /login and pick a provider, then /quit."),
         })
+    }
+    fn credential_vars(&self) -> &'static [&'static str] {
+        connection::PROVIDER_KEYS
     }
     fn logout(&self) -> Option<Login> {
         Some(Login {
@@ -159,25 +163,12 @@ fn launch_command(launch: &Launch<'_>) -> Result<String> {
     ))
 }
 
-const PI_KEYS: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_OAUTH_TOKEN",
-    "OPENAI_API_KEY",
-    "GEMINI_API_KEY",
-    "OPENROUTER_API_KEY",
-    "XAI_API_KEY",
-    "GROQ_API_KEY",
-    "MISTRAL_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "COPILOT_GITHUB_TOKEN",
-];
-
 /// `auth.json` maps each provider signed in through `/login` to its credential.
+/// Only the names are kept; each credential is skipped as it is parsed.
 fn stored_providers(text: &str) -> Vec<String> {
-    match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(serde_json::Value::Object(providers)) => providers.keys().cloned().collect(),
-        _ => Vec::new(),
-    }
+    serde_json::from_str::<std::collections::BTreeMap<String, serde::de::IgnoredAny>>(text)
+        .map(|providers| providers.into_keys().collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

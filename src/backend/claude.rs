@@ -88,6 +88,13 @@ impl Backend for Claude {
             note: None,
         })
     }
+    fn credential_vars(&self) -> &'static [&'static str] {
+        &[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ]
+    }
     fn logout(&self) -> Option<Login> {
         Some(Login {
             args: &["auth", "logout"],

@@ -51,6 +51,9 @@ impl Backend for Cursor {
             note: None,
         })
     }
+    fn credential_vars(&self) -> &'static [&'static str] {
+        &["CURSOR_API_KEY"]
+    }
     fn logout(&self) -> Option<Login> {
         Some(Login {
             args: if command_for(on_path).starts_with("cursor ") {

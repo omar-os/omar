@@ -170,6 +170,41 @@ mkdir -p {pi.parent} && cp {package} {pi}""")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("still not signed in", result.stderr)
 
+    def test_a_sign_in_that_cannot_be_checked_fails(self):
+        # Its status answers in a way no one can read, before and after.
+        self.stand_in("codex", """[ "$1 $2" = "login status" ] && { echo 'huh' >&2; exit 1; }
+[ "$1" = login ] && exit 3""")
+        result = self.omar("connect", "codex", ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not confirm codex is signed in (its sign-in exit status: 3)", result.stderr)
+
+    def sign_codex_out(self, env=None):
+        """Sign codex out from the picker; what it printed."""
+        if env:
+            self.env = {**self.env, **env}
+        until, fd, exit_code = self.picker()
+        until("enter connect")
+        os.write(fd, b"\x1b[Bdy")
+        until("enter connect", 2)
+        os.write(fd, b"q")
+        screen = until("Done")
+        self.assertEqual(exit_code(), 0)
+        return screen
+
+    def test_a_key_in_the_environment_is_named_when_sign_out_cannot_clear_it(self):
+        self.stand_in("codex", """[ "$1 $2" = "login status" ] && { echo 'Logged in using an API key - sk-***' >&2; exit 0; }""")
+        screen = self.sign_codex_out({"OPENAI_API_KEY": "sk-test"})
+        self.assertIn("codex still connects with $OPENAI_API_KEY; unset it to disconnect", screen)
+
+    def test_a_sign_out_that_cannot_be_checked_is_not_called_done(self):
+        signed_in = self.root / "codex-signed-in"
+        signed_in.touch()
+        self.stand_in("codex", f"""[ "$1 $2" = "login status" ] && {{ [ -f {signed_in} ] && echo 'Logged in using ChatGPT' >&2 && exit 0; echo 'huh' >&2; exit 1; }}
+[ "$*" = "logout" ] && rm {signed_in}""")
+        screen = self.sign_codex_out()
+        self.assertIn("could not confirm codex is signed out", screen)
+        self.assertNotIn("codex disconnected", screen)
+
     def picker(self):
         """`omar connect` in a pty: a function that waits for text, and the fd."""
         pid, fd = pty.fork()

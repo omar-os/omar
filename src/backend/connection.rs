@@ -2,7 +2,9 @@
 //! reports it. Signed out is where every fresh install starts, so it is a
 //! state to show, never an error.
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -56,38 +58,57 @@ pub(crate) fn run(program: &str, args: &[&str]) -> Option<Output> {
 }
 
 fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<Output> {
+    let deadline = Instant::now() + timeout;
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Its own group, so whatever it starts is killed with it.
+        .process_group(0)
         .spawn()
         .ok()?;
-    let drain = |stream: Option<Box<dyn Read + Send>>| {
+    let (sender, outputs) = mpsc::channel();
+    let drain = |stream: Option<Box<dyn Read + Send>>, out: bool| {
+        let sender = sender.clone();
         std::thread::spawn(move || {
             let mut text = String::new();
             if let Some(mut stream) = stream {
                 let _ = stream.read_to_string(&mut text);
             }
-            text
-        })
+            let _ = sender.send((out, text));
+        });
     };
-    let stdout = drain(child.stdout.take().map(|s| Box::new(s) as _));
-    let stderr = drain(child.stderr.take().map(|s| Box::new(s) as _));
-    let start = Instant::now();
+    drain(child.stdout.take().map(|s| Box::new(s) as _), true);
+    drain(child.stderr.take().map(|s| Box::new(s) as _), false);
+    let give_up = |child: &mut std::process::Child| {
+        // SAFETY: signals only the group this call created. A reader still
+        // blocked means a member holds its pipe, so the group id is not reused.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        None
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => return give_up(&mut child),
         }
     };
-    let stdout = stdout.join().unwrap_or_default();
-    let text = format!("{stdout}\n{}", stderr.join().unwrap_or_default());
+    // A descendant can keep a pipe open after the CLI exits; the deadline
+    // covers reading too, and an unread stream is left to its thread.
+    let (mut stdout, mut stderr) = (String::new(), String::new());
+    for _ in 0..2 {
+        match outputs.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((true, text)) => stdout = text,
+            Ok((false, text)) => stderr = text,
+            Err(_) => return give_up(&mut child),
+        }
+    }
+    let text = format!("{stdout}\n{stderr}");
     Some(Output {
         success: status.success(),
         stdout,
@@ -145,6 +166,20 @@ pub fn describe(backend: &dyn Backend, connection: &Connection) -> serde_json::V
 }
 
 /// Read the first credential-bearing variable that is set.
+/// Provider keys the multi-provider CLIs (pi, opencode) sign in with.
+pub(crate) const PROVIDER_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+    "GROQ_API_KEY",
+    "MISTRAL_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "COPILOT_GITHUB_TOKEN",
+];
+
 pub(crate) fn env_credential(names: &[&str]) -> Option<String> {
     names
         .iter()
@@ -191,6 +226,20 @@ mod tests {
     fn a_hanging_status_command_is_given_up_on() {
         let start = Instant::now();
         assert!(run_with_timeout("sleep", &["5"], Duration::from_millis(100)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_holding_the_output_open_is_given_up_on() {
+        let start = Instant::now();
+        // The wrapper exits at once; the backgrounded sleep keeps stdout open.
+        let output = run_with_timeout(
+            "sh",
+            &["-c", "sleep 5 & exit 0"],
+            Duration::from_millis(200),
+        );
+        assert!(output.is_none());
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 

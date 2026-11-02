@@ -1,6 +1,8 @@
 //! `omar connect`: install a backend's CLI with its vendor's own installer,
 //! then let the CLI sign itself in. Credentials stay where each CLI keeps
-//! them; OMAR never reads or stores one.
+//! them; OMAR never stores or sends one. Status comes from each CLI, except
+//! pi's, which has no status command: OMAR lists the provider names in its
+//! `auth.json` and keeps nothing else.
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -198,6 +200,7 @@ fn connect(backend: &dyn Backend) -> Result<()> {
     }
     // Resolved after installing: an installer can change which one runs.
     let program = program(backend);
+    let mut failed = String::new();
     if !matches!(status, Connection::Connected { .. }) {
         let login = backend
             .login(headless())
@@ -206,10 +209,13 @@ fn connect(backend: &dyn Backend) -> Result<()> {
             println!("{note}");
         }
         // The CLI's own flow, on the operator's terminal.
-        Command::new(program)
+        let exit = Command::new(program)
             .args(login.args)
             .status()
             .with_context(|| format!("starting `{program}`"))?;
+        if !exit.success() {
+            failed = format!(" (its sign-in {exit})");
+        }
         status = connection::connection(backend);
     }
     match status {
@@ -219,7 +225,9 @@ fn connect(backend: &dyn Backend) -> Result<()> {
                 via.map(|v| format!(" ({v})")).unwrap_or_default()
             );
         }
-        Connection::Unknown { reason } => println!("? {name}: {reason}"),
+        Connection::Unknown { reason } => {
+            bail!("could not confirm {name} is signed in{failed}: {reason}")
+        }
         _ => bail!("{name} is still not signed in; run `omar connect {name}` again"),
     }
     if let Some(dir) = found_in(program, &std::env::var_os("PATH").unwrap_or_default()) {
@@ -245,12 +253,16 @@ fn disconnect(backend: &dyn Backend) -> Result<()> {
         .status()
         .with_context(|| format!("starting `{program}`"))?;
     match connection::connection(backend) {
-        // A credential in the environment outlives any sign-out.
-        Connection::Connected { via: Some(via) } if std::env::var_os(&via).is_some() => {
-            bail!("{name} still connects with ${via}; unset it to disconnect")
+        Connection::SignedOut | Connection::NotInstalled => println!("✓ {name} disconnected"),
+        Connection::Unknown { reason } => {
+            bail!("could not confirm {name} is signed out: {reason}")
         }
-        Connection::Connected { .. } => bail!("{name} is still signed in"),
-        _ => println!("✓ {name} disconnected"),
+        // A credential in the environment outlives any sign-out.
+        Connection::Connected { .. } => match connection::env_credential(backend.credential_vars())
+        {
+            Some(var) => bail!("{name} still connects with ${var}; unset it to disconnect"),
+            None => bail!("{name} is still signed in"),
+        },
     }
     Ok(())
 }

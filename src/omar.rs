@@ -467,7 +467,8 @@ fn main() -> Result<()> {
     // Before any thread starts: installers' directories join PATH.
     crate::backend::connect::extend_path();
     // Only help shows backend status, and only then is it worth asking.
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `args_os`: a path argument need not be UTF-8.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let help = args.is_empty()
         || matches!(args.as_slice(), [arg] if arg == "-h" || arg == "--help" || arg == "help");
     let backends = help.then(backends_help);
