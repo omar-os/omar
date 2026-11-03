@@ -170,27 +170,6 @@ Shutdown the test project and its agents.
 Each `omar -a <backend> up` starts a new independent session. Add `-s dev`
 to name it, and `--web` or `--tui` to open a client immediately.
 
-No need to install them yourself: run `omar connect`, pick a backend with
-the arrow keys, and OMAR runs the vendor's official installer if needed (and
-puts it on your shell's PATH), then the CLI's own sign-in (device code for
-Codex over SSH); `d` signs one out. `omar connect <backend>` does one
-directly. Credentials stay where each CLI keeps them; OMAR never
-stores or sends one. Each CLI reports its own sign-in, except pi, which has
-no status command: OMAR reads only the provider names in pi's `auth.json`.
-A stored key can still be rejected, so after a sign-in the CLI answers one
-short test prompt, and a failure says why. Mission Control's Backends page
-does the same, with each sign-in in a terminal on the page.
-`omar backends` shows where each stands (`--json` for
-scripts, `--check` to run the test prompts); so does Mission Control's
-backend menu.
-
-```
-BACKEND   STATUS                      NEXT
-claude    ✓ Claude Max
-codex     not signed in               omar connect codex
-cursor    not installed               omar connect cursor
-```
-
 ## License
 
 BSD 3-Clause
