@@ -2565,6 +2565,93 @@ h2 {
   color: white;
 }
 
+.backend-options > button.backend-connect-more {
+  border-top: 1px solid var(--line-2);
+  color: var(--accent-text);
+}
+
+/* Where backends are installed and signed in, over the whole window. */
+.backends-page {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(6, 6, 9, 0.8);
+}
+
+.backends-panel {
+  width: min(520px, 100%);
+  max-height: 100%;
+  overflow: auto;
+  padding: 18px 20px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--panel-2);
+  color: var(--text-2);
+}
+
+.backends-panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.backends-panel h2 {
+  font-size: 1.2rem;
+  color: var(--text);
+}
+
+.backends-intro {
+  margin-bottom: 12px;
+  color: var(--text-3);
+}
+
+.backends-error {
+  margin-bottom: 12px;
+  color: #e0777f;
+}
+
+.backends-panel ul {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  list-style: none;
+  padding: 0;
+}
+
+.backends-panel li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 4px;
+  border-top: 1px solid var(--line-2);
+}
+
+.backends-panel li small {
+  color: var(--text-3);
+  font-size: 0.82rem;
+}
+
+.backends-panel button {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 1rem;
+}
+
+.backends-panel li button {
+  border-color: transparent;
+  background: var(--purple);
+  color: white;
+}
+
 .backend-status-failed {
   display: flex;
   align-items: center;
