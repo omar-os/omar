@@ -67,4 +67,11 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## OMAR-Specific Development Guidelines
 
-Follow [CONTRIBUTING.md](CONTRIBUTING.md). It holds the project's rules for humans and agents alike.
+@CONTRIBUTING.md
+
+**Mandatory: read all of [CONTRIBUTING.md](CONTRIBUTING.md) before your first commit, and follow every rule.** Rules, not suggestions; they bind humans and agents alike. Read the whole file, not a skim or grep: rules carry sub-bullets.
+
+Before opening a PR, and after every push to one, check its description has:
+- **Evidence** and **Try it by hand** sections (rule 9), in every PR.
+- `Fixes #N` when it fixes an issue (rule 13).
+- Text matching the latest commit (rule 8).
