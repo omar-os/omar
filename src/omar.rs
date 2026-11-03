@@ -23,6 +23,7 @@ mod projects;
 // The generator runs under `cargo test`; nothing in a release build calls it.
 mod artifacts;
 mod editor;
+mod properties;
 #[cfg(test)]
 mod protocol;
 mod reaction;

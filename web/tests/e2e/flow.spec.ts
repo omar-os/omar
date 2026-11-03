@@ -476,19 +476,42 @@ test("discarding a design leaves the gate without running anything", async ({
   expect(admissions, "declining a design must not admit a run").toBe(0);
 });
 
-test("an unreachable daemon is reported and blocks the run", async ({ page }) => {
+test("an unreachable daemon is reported once, blocks writes, and recovers", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);
+  const send = page.getByRole("button", { name: "Draft workflow" });
+  const deploy = page.getByRole("button", { name: "Deploy", exact: true });
+  const offline = page.locator(".runtime-offline");
 
-  // Take the daemon away underneath a drafted design.
-  await fake.close();
+  // Take the daemon away underneath a drafted design: every request to it
+  // fails as a dead port's would, and the same daemon answers again after.
+  const down = (route: import("@playwright/test").Route) => route.abort("connectionrefused");
+  await page.route(`${FAKE_SERVE_URL}/**`, down);
 
   await expect(page.locator(".daemon")).toHaveClass(/offline/, { timeout: 15_000 });
   await expect(page.locator(".daemon")).toContainText("unreachable");
-  await expect(
-    page.getByRole("button", { name: "Deploy", exact: true }),
-  ).toBeDisabled();
-  await expect(page.locator(".composer-status")).toContainText("Cannot reach omar serve");
+  // One notice for one cause: the sidebar keeps its last list, dimmed.
+  await expect(offline).toHaveCount(1);
+  await expect(offline).toContainText("Runtime offline");
+  await expect(offline).toContainText("omar up -s");
+  await expect(page.getByLabel("Saved chats")).toHaveClass(/stale/);
+  await expect(page.locator(".history-error")).toHaveCount(0);
+  await expect(page.locator(".connection-error")).toHaveCount(0);
+  await expect(page.locator(".composer-status")).toHaveText("Runtime offline");
+  // Writes wait; a draft can still be written.
+  await expect(deploy).toBeDisabled();
+  await expect(send).toBeDisabled();
+  await page.getByLabel("Describe a workflow").fill("kept while offline");
+
+  // The runtime comes back just after a health poll has failed, so the next
+  // poll is seconds away: only Retry now can find it this quickly.
+  await page.waitForEvent("requestfailed", (request) => request.url().endsWith("/health"));
+  await page.unroute(`${FAKE_SERVE_URL}/**`, down);
+  await offline.getByRole("button", { name: "Retry now" }).click();
+  await expect(offline).toHaveCount(0, { timeout: 1_500 });
+  await expect(page.getByLabel("Saved chats")).not.toHaveClass(/stale/);
+  await expect(send).toBeEnabled();
+  await expect(page.getByLabel("Describe a workflow")).toHaveValue("kept while offline");
 });
 
 test("a design the compiler rejects is reported and stays unconfirmed", async ({
@@ -515,6 +538,10 @@ test("a design the compiler rejects is reported and stays unconfirmed", async ({
   await expect(
     page.getByRole("button", { name: "Deploy", exact: true }),
   ).toBeVisible();
+  // Read and put away; the design stays at the gate.
+  await page.getByRole("button", { name: "Dismiss error" }).click();
+  await expect(page.locator(".connection-error")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Deploy", exact: true })).toBeVisible();
 });
 
 test("a feedback loop renders, and every arrow still points right", async ({
@@ -810,6 +837,32 @@ test("the workflow's buttons sit with the workflow", async ({ page }) => {
     (await page.locator(".diagram-heading h2").boundingBox())!.x,
   );
   expect(stats.x + stats.width).toBeLessThanOrEqual(first.x + 1);
+});
+
+test("a run's controls wait while the runtime is offline", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+  // Paused, so the run keeps its controls for as long as the test needs.
+  const actions = page.getByRole("group", { name: "Run controls" });
+  await actions.getByRole("button", { name: "Pause" }).click();
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  const resume = actions.getByRole("button", { name: "Resume" });
+  const stop = actions.getByRole("button", { name: "Stop" });
+  await expect(resume).toBeEnabled();
+
+  const down = (route: import("@playwright/test").Route) => route.abort("connectionrefused");
+  await page.route(`${FAKE_SERVE_URL}/**`, down);
+  await expect(page.locator(".runtime-offline")).toBeVisible({ timeout: 15_000 });
+  await expect(resume).toBeDisabled();
+  await expect(stop).toBeDisabled();
+  await expect(stop).toHaveAttribute("title", "Runtime offline");
+
+  await page.unroute(`${FAKE_SERVE_URL}/**`, down);
+  await page.locator(".runtime-offline").getByRole("button", { name: "Retry now" }).click();
+  await expect(page.locator(".runtime-offline")).toHaveCount(0);
+  await expect(resume).toBeEnabled();
+  await expect(stop).toBeEnabled();
 });
 
 test("a run can be paused and resumed from the panel that shows it", async ({ page }) => {
@@ -3005,4 +3058,72 @@ test("workflow tabs support keyboard navigation and saved VS Code edits reach de
   const deployment = page.waitForRequest((r) => r.url().endsWith("/v1/runs") && r.method() === "POST");
   await deploy(page);
   expect((await deployment).postDataJSON().files).toEqual(savedFiles);
+});
+
+test("a design's safety properties show their Lean proofs and single out what they are about", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByLabel("Describe a workflow").fill("Review the release plan, and prove it is safe");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.locator(".messages")).toContainText("Which agent should own");
+  await page.getByLabel("Describe a workflow").fill("The planner");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
+
+  // Lean's verdicts arrive with the design: two proved, one not.
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+  const tab = page.getByRole("tab", { name: /Properties/ });
+  await expect(tab).toContainText("2/3");
+  await tab.click();
+  const panel = page.getByRole("tabpanel", { name: "Formal properties" });
+  await expect(panel).toContainText("2 of 3 proved by Lean");
+  const items = panel.locator(".property");
+  await expect(items).toHaveCount(3);
+  await expect(items.nth(0).locator(".property-status")).toHaveText("Proved");
+  await expect(items.nth(2).locator(".property-status")).toHaveText("Not proved");
+
+  // Nothing is singled out until a property is chosen.
+  await expect(page.locator(".off-focus")).toHaveCount(0);
+  await items.nth(0).locator(".property-summary").click();
+  const proof = items.nth(0).getByLabel("Lean proof");
+  await expect(proof).toContainText("theorem critique_comes_from_reviewer");
+  await expect(proof.locator(".omar-tok-keyword").first()).toHaveText("theorem");
+  await expect(proof.locator(".omar-tok-string").first()).toHaveText('"flow.critique"');
+  // It is about the critique and the reviewer that writes it; the planner's
+  // two reactions and the other ports step back.
+  await expect(page.locator(".omar-reaction.in-focus")).toHaveCount(1);
+  await expect(page.locator(".omar-reaction.off-focus")).toHaveCount(2);
+  await expect(page.locator(".omar-action-group.in-focus")).toHaveCount(1);
+  await expect(page.locator(".omar-team.in-focus")).toHaveCount(1);
+
+  // One that does not hold says where Lean stopped.
+  await items.nth(2).locator(".property-summary").click();
+  await expect(items.nth(2).getByLabel("What Lean objected to")).toContainText("unsolved goals");
+  await expect(items.nth(2).locator(".lean-line.has-problem").first()).toBeVisible();
+  await items.nth(2).locator(".property-summary").click();
+  await expect(page.locator(".off-focus")).toHaveCount(0);
+
+  // An edited program is not what Lean checked; checking again is one click.
+  await page.getByRole("tab", { name: "Source" }).click();
+  const editor = page.getByLabel("OMAR program");
+  await editor.locator(".cm-line", { hasText: "Find risks and omissions" }).click();
+  await editor.press("End");
+  await editor.pressSequentially(" Note any gaps.");
+  await tab.click();
+  await expect(panel.getByRole("status")).toContainText("The source has changed");
+  await panel.getByRole("button", { name: "Check again" }).click();
+  await expect(panel.getByRole("status")).toHaveCount(0);
+  const asked = await (await fetch(`${FAKE_SERVE_URL}/v1/proofs`)).json();
+  expect(asked.checks).toBe(1);
+
+  // The proofs open in Web VS Code, one Lean file a property.
+  const popup = page.waitForEvent("popup");
+  await panel.getByRole("button", { name: "Open in Web VS Code" }).click();
+  const opened = await popup;
+  await expect(opened).toHaveURL(/\/fake-editor\/proofs$/);
+  const workspace = (await (await fetch(`${FAKE_SERVE_URL}/v1/proofs`)).json()).workspace;
+  expect(workspace.properties.map((file: { name: string }) => file.name)).toEqual([
+    "critique_comes_from_reviewer", "answer_only_after_critique", "plan_always_reviewed",
+  ]);
+  expect(workspace.properties[0].source).toContain("def topology : Omar.Reactor.Topology");
+  await opened.close();
 });

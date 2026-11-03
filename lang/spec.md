@@ -630,6 +630,30 @@ Important verification targets are:
 - compatible retained agents are never unnecessarily restarted; and
 - equal compiler inputs produce equal bytecode.
 
+## 8. Safety properties
+
+A property is a Lean theorem about every run of a program. `Omar/Reactor.lean`
+states, as axioms, what every run satisfies: §4's tags and delays, triggers,
+timers and `shutdown`, and effect contracts, which the runtime enforces before
+an invocation completes. Prompts, agents' answers and code bodies are opaque: a
+reaction may write anything its contract allows. Axioms that something *must*
+happen hold only at tags a run completes; a failure or an operator's stop cuts
+the tag it happens at. `valid_exists` proves the axioms consistent.
+
+`omarc --lean prog.omar model.lean` prints the program's model, `topology`.
+`omarc --prove prog.omar request.json verdicts.json` checks properties, each as
+
+```lean
+theorem name (e : Execution) (hv : Valid topology e) : statement := proof
+```
+
+in its own file after the generated model and any shared `lemmas`.
+`#omar_verify` (`Omar/Verify.lean`) accepts one only if it is about every run
+of `topology`, depends on `e`, names only the program's own ports, reactions
+and timers, and uses no axiom beyond `propext`, `Classical.choice` and
+`Quot.sound`. `sorry`, `axiom`, `native_decide` and `set_option` are refused
+before Lean runs.
+
 ## External JSON Schema types
 
 Declare schema imports before teams:

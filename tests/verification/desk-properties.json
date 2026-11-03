@@ -1,0 +1,15 @@
+{
+  "lemmas": "theorem approved_orders (e : Execution) (hv : Valid topology e) :\n    ∀ g v, e.present g \"x.order\" = some v →\n      e.present g \"r.approved\" = some v ∨ g = Tag.zero := by\n  intro g v hp\n  rcases present_from hv hp with ⟨_, id, hw, -⟩ | ⟨c, hc, g', hg, hs⟩ | ⟨port, -, -, -, h0⟩\n  · simp [topology, Topology.writers, Topology.Reaction.mayWrite] at hw\n  · simp [topology, Topology.sources] at hc\n    subst hc\n    left\n    simpa [Tag.after] using hg ▸ hs\n  · exact Or.inr h0\n",
+  "properties": [
+    {
+      "name": "orders_are_approved",
+      "statement": "∀ g v, e.present g \"x.order\" = some v →\n      e.present g \"r.approved\" = some v ∨ g = Tag.zero",
+      "proof": "by\n  intro g v hp\n  rcases present_from hv hp with ⟨_, id, hw, -⟩ | ⟨c, hc, g', hg, hs⟩ | ⟨port, -, -, -, h0⟩\n  · simp [topology, Topology.writers, Topology.Reaction.mayWrite] at hw\n  · simp [topology, Topology.sources] at hc\n    subst hc\n    left\n    simpa [Tag.after] using hg ▸ hs\n  · exact Or.inr h0\n"
+    },
+    {
+      "name": "rejected_not_executed",
+      "statement": "∀ g, g ≠ Tag.zero → (e.wrote g \"r.reaction.0\" \"r.rejected\").isSome →\n      ¬ e.invoked g \"x.reaction.0\"",
+      "proof": "by\n  intro g hg hrej hinv\n  obtain ⟨r, hr, hid, t, ht, htrig⟩ := invoked_from hv hinv\n  simp [topology] at hr\n  rcases hr with rfl | rfl | rfl <;> simp at hid\n  simp at ht\n  subst ht\n  rcases htrig with hp | ⟨tm, htm, -⟩\n  · obtain ⟨v, hv'⟩ := Option.isSome_iff_exists.mp hp\n    rcases approved_orders e hv g v hv' with ha | h0\n    · rcases present_from hv ha with ⟨g', id, hw, hc, hwr, hl⟩ | ⟨c, hc, -⟩ | ⟨port, hport, hn, hk, -⟩\n      · simp [topology, Topology.writers, Topology.Reaction.mayWrite] at hw\n        subst hw\n        simp [topology, Topology.land, Topology.port?] at hl\n        subst hl\n        have hh := completed_honours hv (r := topology.reactions[1]) (by simp [topology]) hc\n        simp [honours, topology] at hh\n        have := hh.2\n        simp [hwr, hrej] at this\n      · simp [topology, Topology.sources] at hc\n      · simp [topology] at hport\n        rcases hport with rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> simp_all\n    · exact hg h0\n  · simp [topology] at htm"
+    }
+  ]
+}
