@@ -80,8 +80,10 @@ class BackendStatus(unittest.TestCase):
         Path(cursor).write_text("#!/bin/sh\nexit 0\n")
         Path(cursor).chmod(0o755)
         status = {row["name"]: row for row in json.loads(self.omar("--json"))}
+        # No sbx here, so no backend can run in sandboxes.
         self.assertEqual(status["cursor"], {"name": "cursor", "status": "connected",
-            "via": "CURSOR_API_KEY", "login": "omar connect cursor"})
+            "via": "CURSOR_API_KEY", "login": "omar connect cursor",
+            "sandbox": {"status": "not_installed", "login": "omar connect cursor --sandbox"}})
 
     def test_pi_is_signed_in_to_what_its_store_holds(self):
         store = Path(self.env["HOME"]) / ".pi/agent"
@@ -121,7 +123,10 @@ class BackendStatus(unittest.TestCase):
         self.assertIn("✗ codex is not signed in; run `omar connect codex`", result.stdout)
 
     def test_the_table_says_how_to_sign_in_what_is_signed_out(self):
-        rows = {line.split()[0]: line for line in self.omar().splitlines()[1:]}
+        table = self.omar()
+        # Sandboxes are opt-in: without sbx the table has no column for them.
+        self.assertNotIn("SANDBOX", table.splitlines()[0])
+        rows = {line.split()[0]: line for line in table.splitlines()[1:]}
         self.assertIn("✓ Claude Max", rows["claude"])
         self.assertIn("not signed in", rows["codex"])
         self.assertIn("omar connect codex", rows["codex"])
