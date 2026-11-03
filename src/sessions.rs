@@ -732,6 +732,9 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
     // like-named sessions apart.
     let tag = home_tag();
     let socket = crate::paths::private_temp_dir()?.join(format!("{name}-{tag}.sock"));
+    // The name is free in this home, so a socket here is dead: left by a crash,
+    // or by a deleted home at the same path (CI reuses one).
+    let _ = fs::remove_file(&socket);
     let mut session = Session {
         name: name.clone(),
         protocol: PROTOCOL,
