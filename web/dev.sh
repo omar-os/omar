@@ -12,7 +12,8 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
 
-serve_address=${OMAR_SERVE_ADDRESS:-127.0.0.1:7340}
+serve_port=${OMAR_SERVE_PORT:-7340}
+serve_address=127.0.0.1:$serve_port
 web_port=${OMAR_WEB_PORT:-3000}
 # Set to skip the browser: a smoke test wants the servers, not a window.
 open_browser=${OMAR_DEV_OPEN:-1}
@@ -114,7 +115,7 @@ if ((needs_install)); then
 fi
 
 printf 'Starting omar serve on %s...\n' "$serve_address"
-serve_args=(serve --address "$serve_address")
+serve_args=(serve --port "$serve_port")
 [[ ${OMAR_DEV_NO_EA:-0} == 1 ]] && serve_args+=(--no-ea)
 "$repo_root/target/debug/omar" "${serve_args[@]}" &
 serve_pid=$!

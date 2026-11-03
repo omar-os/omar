@@ -90,6 +90,45 @@ impl Conversation {
 }
 
 impl History {
+    /// Shared archive belongs to the session, including conversations of EA 0.
+    pub(crate) fn load_session(root: &Path) -> Result<Self> {
+        let path = root.join("chats.json");
+        let legacy = root.join("ea/0/chats.json");
+        if legacy.exists() {
+            Self::load(legacy.clone())?;
+            if path.exists() {
+                anyhow::ensure!(fs::read(&legacy)? == fs::read(&path)?,
+                    "conflicting session and legacy chat histories; preserve both and resolve before restarting");
+                fs::remove_file(legacy)?;
+            } else {
+                // Same-filesystem rename is atomic; after interruption exactly
+                // one canonical history exists.
+                fs::rename(legacy, &path)?;
+            }
+        }
+        Self::load(path)
+    }
+
+    pub(crate) fn remove_ea(
+        &mut self,
+        id: crate::ea::EaId,
+        survivor: crate::ea::EaId,
+    ) -> Result<()> {
+        let survivor_chat = self.chat_for_ea(survivor)?;
+        let mut next = self.clone();
+        next.conversations.retain(|chat| chat.ea_id != Some(id));
+        if !next
+            .conversations
+            .iter()
+            .any(|chat| chat.id == next.active_id)
+        {
+            next.active_id = survivor_chat;
+        }
+        next.save()?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn load(path: PathBuf) -> Result<Self> {
         match fs::read(&path) {
             Ok(bytes) => {
@@ -262,6 +301,46 @@ mod tests {
             design: None,
             selection: vec!["flow.planner".into()],
         }
+    }
+
+    #[test]
+    fn session_history_relocation_and_ea_zero_removal_preserve_other_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("ea/0/chats.json");
+        let mut old = History::load(old_path.clone()).unwrap();
+        let active = old.active_id.clone();
+        old.assign_ea(&active, 0).unwrap();
+        let survivor = old.chat_for_ea(1).unwrap();
+        old.append_to(&survivor, message("retained conversation"))
+            .unwrap();
+        let before = fs::read(&old_path).unwrap();
+        let mut migrated = History::load_session(dir.path()).unwrap();
+        assert!(!old_path.exists());
+        assert_eq!(before, fs::read(dir.path().join("chats.json")).unwrap());
+        migrated.remove_ea(0, 1).unwrap();
+        for _ in 0..2 {
+            let restarted = History::load_session(dir.path()).unwrap();
+            assert_eq!(restarted.active_id, survivor);
+            assert_eq!(
+                restarted.conversation(&survivor).messages[0].text,
+                "retained conversation"
+            );
+            assert_eq!(restarted.conversations.len(), 1);
+        }
+    }
+
+    #[test]
+    fn conflicting_histories_are_preserved_and_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("ea/0/chats.json");
+        History::load(old_path.clone()).unwrap();
+        let target = dir.path().join("chats.json");
+        History::load(target.clone()).unwrap();
+        let old = fs::read(&old_path).unwrap();
+        let new = fs::read(&target).unwrap();
+        assert!(History::load_session(dir.path()).is_err());
+        assert_eq!(old, fs::read(old_path).unwrap());
+        assert_eq!(new, fs::read(target).unwrap());
     }
 
     #[test]

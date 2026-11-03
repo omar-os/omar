@@ -67,7 +67,7 @@ wait_for_session() {
   return 1
 }
 
-session_json="$(cd "$REPO_ROOT" && HOME="$home_dir" "$OMAR_BIN" up --name harness --json)"
+session_json="$(cd "$REPO_ROOT" && HOME="$home_dir" "$OMAR_BIN" up -s harness --json)"
 session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$session_json")"
 server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
 tmux -L "$server" new-session -d -s omar-dashboard \
@@ -135,7 +135,13 @@ try:
     if not wait_for_attached("omar-dashboard"):
         fail("Dashboard did not attach through pty harness")
 
-    os.write(fd, b"\r")
+    # A dashboard that has just started can drop the first Enter (seen on
+    # loaded CI runners: a second Enter always opened the popup). Resend only
+    # while the popup is still closed, so no key reaches the EA's shell.
+    for _ in range(3):
+        os.write(fd, b"\r")
+        if wait_for_attached("omar-agent-ea-0", timeout=2.0):
+            break
 
     if not wait_for_attached("omar-agent-ea-0"):
         fail(

@@ -19,7 +19,7 @@
 //              last round has fully settled, for the same reason.
 //
 // Every period is 0, so every timer fires once and the program ends on its
-// own. A non-zero period re-arms forever and would run to the tag cap.
+// own. A non-zero period re-arms forever, until something stops it.
 //
 // Self-contained: every agent answers from its own knowledge and is told not
 // to browse, read files, or run commands.
@@ -144,6 +144,24 @@ team Chair(topic : string)[chair : ClaudeCode]
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input report : string
+    state got_report : bool = false
+    timer deadline(15min, 0)
+
+    reaction(report) -> {=
+        if report.is_some() { self.got_report = true; }
+        if self.got_report { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_report, "no chair.report by the deadline");
+    =}
+}
+
 main Cadence {
     chair = Chair("the operational risks of running many autonomous coding agents in parallel against one repository")
 
@@ -162,4 +180,7 @@ main Cadence {
     practice.finding -> desk.practice
 
     desk.digest -> chair.digest after 0
+
+    smoke = Smoke()
+    chair.report -> smoke.report
 }

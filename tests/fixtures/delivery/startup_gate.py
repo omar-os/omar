@@ -7,9 +7,19 @@ import sys
 import time
 import tty
 
+# `claude-bypass` follows the trust dialog with the bypass-permissions
+# warning, as Claude Code does on a machine that never accepted it.
+bypass = sys.argv[1] == 'claude-bypass'
+if bypass:
+    sys.argv[1] = 'claude'
 backend, log_path = sys.argv[1:]
 log = Path(log_path)
 tty.setraw(sys.stdin.fileno())
+# `claude-deaf` paints its dialog before it reads keys, as Claude Code
+# sometimes does, and loses whatever arrives in that window.
+deaf = backend == 'claude-deaf'
+if deaf:
+    backend = 'claude'
 if backend == 'claude':
     dialog = ("Accessing workspace:\r\n/tmp/team/worktree\r\n"
               "Claude Code'll be able to read, edit, and execute files here.\r\n"
@@ -35,6 +45,11 @@ time.sleep(0.2)
 sys.stdout.write('\x1b[2J\x1b[H' + dialog)
 sys.stdout.flush()
 data = b''
+if deaf:
+    until = time.monotonic() + 0.5
+    while (left := until - time.monotonic()) > 0:
+        if select.select([sys.stdin], [], [], left)[0]:
+            os.read(sys.stdin.fileno(), 1024)
 if backend == 'claude':
     while len(data) < 3:
         data += os.read(sys.stdin.fileno(), 1024)
@@ -53,6 +68,27 @@ if data != expected:
     raise RuntimeError(f'Wrong choice for {backend}: {data!r}')
 # Leave the old dialog visible briefly: it must not be answered twice.
 time.sleep(0.4)
+if bypass:
+    warning = ("WARNING: Claude Code running in Bypass Permissions mode\r\n"
+               "❯ No, exit\r\n  Yes, I accept\r\n"
+               "Enter to confirm · Esc to cancel")
+    sys.stdout.write('\x1b[2J\x1b[H' + warning)
+    sys.stdout.flush()
+    for key, repaint in ((b'\x1b[B', True), (b'\r', False)):
+        data = b''
+        while len(data) < len(key):
+            data += os.read(sys.stdin.fileno(), 1024)
+        with log.open('ab') as output:
+            output.write(data)
+        if data != key:
+            raise RuntimeError(f'Wrong choice for the bypass warning: {data!r}')
+        if repaint:
+            time.sleep(0.2)
+            warning = warning.replace('❯ No, exit', '  No, exit').replace(
+                '  Yes, I accept', '❯ Yes, I accept')
+            sys.stdout.write('\x1b[2J\x1b[H' + warning)
+            sys.stdout.flush()
+    time.sleep(0.4)
 sys.stdout.write('\x1b[2J\x1b[H' + ready)
 sys.stdout.flush()
 frame = 0

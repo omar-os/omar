@@ -11,7 +11,8 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 web_dir=$(cd "$script_dir/.." && pwd)
 
-serve_address=${SMOKE_SERVE_ADDRESS:-127.0.0.1:7351}
+serve_port=${SMOKE_SERVE_PORT:-7351}
+serve_address=127.0.0.1:$serve_port
 web_port=${SMOKE_WEB_PORT:-3021}
 web_url="http://localhost:$web_port"
 
@@ -23,7 +24,7 @@ finish() {
   [[ -n $dev_pid ]] && kill "$dev_pid" 2>/dev/null || true
   # Belt and braces: if the script leaked children, this test must not.
   pkill -f "vinext dev --port $web_port" 2>/dev/null || true
-  pkill -f "omar serve --address $serve_address" 2>/dev/null || true
+  pkill -f "omar serve --port $serve_port" 2>/dev/null || true
   for record in "$session_home"/registry/*.json; do
     [[ -f $record ]] || continue
     OMAR_HOME="$session_home" "$web_dir/../target/debug/omar" down -s "$(basename "$record" .json)" --force --timeout 5 >/dev/null 2>&1 || true
@@ -86,7 +87,7 @@ touch "$web_dir/package.json"
 
 printf 'Starting dev.sh...\n'
 OMAR_DEV_OPEN=0 OMAR_DEV_NO_EA=1 OMAR_HOME="$session_home" \
-  OMAR_SERVE_ADDRESS="$serve_address" \
+  OMAR_SERVE_PORT="$serve_port" \
   OMAR_WEB_PORT="$web_port" \
   "$web_dir/dev.sh" >"$log" 2>&1 &
 dev_pid=$!

@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
+use super::{connection, Connection, Login};
 use super::{detect, detect_token, Backend, Kind, Launch};
 use super::{managed, NotReady, PaneSetup, WRITE_TIMEOUT};
 use crate::manager::{
@@ -50,6 +51,45 @@ impl Backend for Codex {
     }
     fn default_command(&self) -> &'static str {
         "codex --dangerously-bypass-approvals-and-sandbox"
+    }
+    fn connection(&self, program: &str) -> Connection {
+        match connection::run(program, &["login", "status"]) {
+            Some(output) => login_status(&output.text),
+            None => Connection::unknown("`codex login status` did not answer"),
+        }
+    }
+    fn install_command(&self) -> Option<&'static str> {
+        Some("curl -fsSL https://chatgpt.com/codex/install.sh | sh")
+    }
+    fn login(&self, headless: bool) -> Option<Login> {
+        Some(if headless {
+            Login {
+                args: &["login", "--device-auth"],
+                note: Some("Device code sign-in must be allowed in ChatGPT: Settings → Security."),
+            }
+        } else {
+            Login {
+                args: &["login"],
+                note: None,
+            }
+        })
+    }
+    fn credential_vars(&self) -> &'static [&'static str] {
+        &["OPENAI_API_KEY", "CODEX_API_KEY"]
+    }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: &["logout"],
+            note: None,
+        })
+    }
+    /// The check runs in an empty directory, which is no git repository.
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
+        Some(vec![
+            "exec",
+            "--skip-git-repo-check",
+            connection::CHECK_PROMPT,
+        ])
     }
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         let socket = from_stamp(target.stamp?)?;
@@ -164,6 +204,11 @@ fn resume_command(command: &str, id: &str) -> String {
     }
     resumed.join(" ")
 }
+
+/// An agent's TUI never checks for updates. Its update prompt can open after
+/// the banner OMAR waits for, and holds the thread an event needs until a
+/// key that nobody presses; the operator updates codex on their own.
+const NO_UPDATE_CHECK: &str = "-c check_for_update_on_startup=false";
 
 pub(crate) fn ensure_codex_runtime_flags(base_command: &str) -> String {
     if !detect(base_command).is_some_and(|b| b.kind() == Kind::Codex) {
@@ -368,7 +413,7 @@ pub(crate) fn codex_server_command(
         })
         .unwrap_or_default();
     let endpoint = shell_single_quote(&format!("unix://{}", socket.display()));
-    let mut tui = format!("{tui_command} --remote {endpoint}");
+    let mut tui = format!("{tui_command} {NO_UPDATE_CHECK} --remote {endpoint}");
     if let Some(words) =
         super::saved_conversation(context, "codex").and_then(|_| shlex::split(tui_command))
     {
@@ -385,7 +430,7 @@ pub(crate) fn codex_server_command(
                 .collect::<Vec<_>>()
                 .join(" ");
             tui.push_str(&format!(
-                " || {} --remote {endpoint}",
+                " || {} {NO_UPDATE_CHECK} --remote {endpoint}",
                 ensure_codex_runtime_flags(&fresh)
             ));
         }
@@ -591,8 +636,41 @@ pub(crate) fn only_thread(listed: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// `codex login status` answers in a sentence, on stderr.
+fn login_status(text: &str) -> Connection {
+    if text.contains("Not logged in") {
+        return Connection::SignedOut;
+    }
+    match text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Logged in using "))
+    {
+        Some(via) if via.starts_with("an API key") => Connection::connected("API key"),
+        Some(via) => Connection::connected(via.trim()),
+        None => Connection::unknown("`codex login status` gave no answer OMAR knows"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn login_status_reads_the_sentence_codex_prints() {
+        use super::{login_status, Connection};
+        assert_eq!(
+            login_status("\nLogged in using ChatGPT\n"),
+            Connection::connected("ChatGPT")
+        );
+        assert_eq!(
+            login_status("Logged in using an API key - sk-proj-***ABCD"),
+            Connection::connected("API key")
+        );
+        assert_eq!(
+            login_status("WARNING: proceeding\nNot logged in\n"),
+            Connection::SignedOut
+        );
+        assert!(matches!(login_status(""), Connection::Unknown { .. }));
+    }
+
     #[test]
     fn startup_update_gate_skips_once_without_persistent_dismissal() {
         use super::Backend;

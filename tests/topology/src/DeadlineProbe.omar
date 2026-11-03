@@ -49,6 +49,27 @@ team DeadlineProbe[punctual : ClaudeCode, tardy : ClaudeCode, reporter : ClaudeC
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input report : string
+    state got_report : bool = false
+    timer deadline(10min, 0)
+
+    reaction(report) -> {=
+        if report.is_some() { self.got_report = true; }
+        if self.got_report { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_report, "no probe.report by the deadline");
+    =}
+}
+
 main WithinTest {
     probe = DeadlineProbe()
+
+    smoke = Smoke()
+    probe.report -> smoke.report
 }

@@ -1,6 +1,11 @@
 import { expect, test } from "@playwright/test";
 import { FAKE_SERVE_PORT, FAKE_SERVE_URL } from "../../playwright.config";
 import { startFakeServe } from "../fake-serve.mjs";
+import { readFileSync } from "node:fs";
+
+/** What the fake assistant proposes. The editor renders only the lines in
+    view, so a test reads the whole program from here rather than the page. */
+const PROPOSED_PROGRAM = readFileSync(new URL("../fixtures/review-flow.omar", import.meta.url), "utf8");
 
 type FakeServe = { url: string; agentToken: string; close(): Promise<void> };
 
@@ -101,7 +106,7 @@ test("prompt to finished run, gated on an explicit confirmation", async ({ page 
   await expect(page.getByRole("button", { name: /Codex/ })).toBeVisible();
   await expect(phase).toContainText("review");
   await page.getByRole("button", { name: "Show the source pane" }).click();
-  await expect(page.locator(".source-code")).toContainText("team ReviewFlow[");
+  await expect(page.locator(".source-editor")).toContainText("team ReviewFlow[");
   // Nothing is deployed yet, so there is no event stream to offer.
   await expect(page.locator(".tabs button")).toHaveText(["Source"]);
 
@@ -122,10 +127,16 @@ test("prompt to finished run, gated on an explicit confirmation", async ({ page 
   await expect(page.locator(".source-title")).toContainText("completed");
 });
 
-test("the diagram reflects live reaction state from the run", async ({ page }) => {
+test("the diagram reflects live reaction state from the run, relayed by serve", async ({ page }) => {
+  // Like a browser on the far end of an SSH tunnel: it reaches serve, never
+  // the run's own diagram server on serve's loopback.
+  await page.route(/\/v1\/(?:diagram|events)$/, (route) =>
+    /\/v1\/runs\/[^/]+\/diagram\//.test(route.request().url()) ? route.fallback() : route.abort());
   await useFakeServe(page);
   await draftUntilProposed(page);
   await deploy(page);
+  // Live events arrive only on the run's stream.
+  await expect(page.locator(".event-strip")).toContainText("reaction completed");
   await expect(page.locator(".connection")).toContainText("finished", {
     timeout: 30_000,
   });
@@ -465,19 +476,42 @@ test("discarding a design leaves the gate without running anything", async ({
   expect(admissions, "declining a design must not admit a run").toBe(0);
 });
 
-test("an unreachable daemon is reported and blocks the run", async ({ page }) => {
+test("an unreachable daemon is reported once, blocks writes, and recovers", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);
+  const send = page.getByRole("button", { name: "Draft workflow" });
+  const deploy = page.getByRole("button", { name: "Deploy", exact: true });
+  const offline = page.locator(".runtime-offline");
 
-  // Take the daemon away underneath a drafted design.
-  await fake.close();
+  // Take the daemon away underneath a drafted design: every request to it
+  // fails as a dead port's would, and the same daemon answers again after.
+  const down = (route: import("@playwright/test").Route) => route.abort("connectionrefused");
+  await page.route(`${FAKE_SERVE_URL}/**`, down);
 
   await expect(page.locator(".daemon")).toHaveClass(/offline/, { timeout: 15_000 });
   await expect(page.locator(".daemon")).toContainText("unreachable");
-  await expect(
-    page.getByRole("button", { name: "Deploy", exact: true }),
-  ).toBeDisabled();
-  await expect(page.locator(".composer-status")).toContainText("Cannot reach omar serve");
+  // One notice for one cause: the sidebar keeps its last list, dimmed.
+  await expect(offline).toHaveCount(1);
+  await expect(offline).toContainText("Runtime offline");
+  await expect(offline).toContainText("omar up -s");
+  await expect(page.getByLabel("Saved chats")).toHaveClass(/stale/);
+  await expect(page.locator(".history-error")).toHaveCount(0);
+  await expect(page.locator(".connection-error")).toHaveCount(0);
+  await expect(page.locator(".composer-status")).toHaveText("Runtime offline");
+  // Writes wait; a draft can still be written.
+  await expect(deploy).toBeDisabled();
+  await expect(send).toBeDisabled();
+  await page.getByLabel("Describe a workflow").fill("kept while offline");
+
+  // The runtime comes back just after a health poll has failed, so the next
+  // poll is seconds away: only Retry now can find it this quickly.
+  await page.waitForEvent("requestfailed", (request) => request.url().endsWith("/health"));
+  await page.unroute(`${FAKE_SERVE_URL}/**`, down);
+  await offline.getByRole("button", { name: "Retry now" }).click();
+  await expect(offline).toHaveCount(0, { timeout: 1_500 });
+  await expect(page.getByLabel("Saved chats")).not.toHaveClass(/stale/);
+  await expect(send).toBeEnabled();
+  await expect(page.getByLabel("Describe a workflow")).toHaveValue("kept while offline");
 });
 
 test("a design the compiler rejects is reported and stays unconfirmed", async ({
@@ -504,6 +538,10 @@ test("a design the compiler rejects is reported and stays unconfirmed", async ({
   await expect(
     page.getByRole("button", { name: "Deploy", exact: true }),
   ).toBeVisible();
+  // Read and put away; the design stays at the gate.
+  await page.getByRole("button", { name: "Dismiss error" }).click();
+  await expect(page.locator(".connection-error")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Deploy", exact: true })).toBeVisible();
 });
 
 test("a feedback loop renders, and every arrow still points right", async ({
@@ -590,7 +628,7 @@ test("the source view highlights OMAR, and its pane can be hidden", async ({
   await draftUntilProposed(page);
 
   await page.getByRole("button", { name: "Show the source pane" }).click();
-  const code = page.locator(".source-code");
+  const code = page.locator(".source-editor");
   await expect(code).toBeVisible();
   await expect(code.locator(".omar-tok-keyword").first()).toHaveText("team");
   // Backends and types are distinguished, and prompt interpolation stands out.
@@ -801,6 +839,32 @@ test("the workflow's buttons sit with the workflow", async ({ page }) => {
   expect(stats.x + stats.width).toBeLessThanOrEqual(first.x + 1);
 });
 
+test("a run's controls wait while the runtime is offline", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+  // Paused, so the run keeps its controls for as long as the test needs.
+  const actions = page.getByRole("group", { name: "Run controls" });
+  await actions.getByRole("button", { name: "Pause" }).click();
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  const resume = actions.getByRole("button", { name: "Resume" });
+  const stop = actions.getByRole("button", { name: "Stop" });
+  await expect(resume).toBeEnabled();
+
+  const down = (route: import("@playwright/test").Route) => route.abort("connectionrefused");
+  await page.route(`${FAKE_SERVE_URL}/**`, down);
+  await expect(page.locator(".runtime-offline")).toBeVisible({ timeout: 15_000 });
+  await expect(resume).toBeDisabled();
+  await expect(stop).toBeDisabled();
+  await expect(stop).toHaveAttribute("title", "Runtime offline");
+
+  await page.unroute(`${FAKE_SERVE_URL}/**`, down);
+  await page.locator(".runtime-offline").getByRole("button", { name: "Retry now" }).click();
+  await expect(page.locator(".runtime-offline")).toHaveCount(0);
+  await expect(resume).toBeEnabled();
+  await expect(stop).toBeEnabled();
+});
+
 test("a run can be paused and resumed from the panel that shows it", async ({ page }) => {
   await useFakeServe(page);
   await draftUntilProposed(page);
@@ -862,6 +926,114 @@ test("a run can be paused and resumed from the panel that shows it", async ({ pa
   await expect(actions.getByRole("button", { name: "Pause" })).toBeEnabled();
   await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
   await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
+});
+
+test("an edited source is applied to the run, and the change marks the timeline", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+  // Paused, so the fake's short walk cannot end under the test. Pausing,
+  // applying and resuming a running run is the daemon's, and covered against
+  // the real one by tests/ci/team_mutation.py.
+  const actions = page.getByRole("group", { name: "Run controls" });
+  await actions.getByRole("button", { name: "Pause" }).click();
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  const apply = actions.getByRole("button", { name: "Apply edits" });
+  await expect(apply).toBeEnabled();
+
+  // Nothing edited: nothing to apply, and the run is left alone.
+  await apply.click();
+  await expect(page.getByText("there is nothing to apply")).toBeVisible();
+
+  // An edit is previewed as the plan the daemon would run, before anything
+  // happens to the run.
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+  await page.getByRole("tab", { name: "Source" }).click();
+  const editor = page.getByLabel("OMAR program");
+  // The edit is shown against what the run executes as it is typed: a
+  // changed line is its old text in red above its new text in green.
+  await expect(page.locator(".source-editor .cm-changedLine")).toHaveCount(0);
+  await editor.locator(".cm-line", { hasText: "Find risks and omissions" }).click();
+  await editor.press("End");
+  await editor.pressSequentially(" Note any gaps.");
+  const added = page.locator(".source-editor .cm-changedLine");
+  await expect(added).toHaveCount(1);
+  await expect(added).toContainText("Find risks and omissions in this plan: Note any gaps.");
+  await expect(page.locator(".source-editor .cm-deletedChunk")).toHaveText(/^\s*Find risks and omissions in this plan:\s*$/);
+  await apply.click();
+  const plan = page.getByLabel("Mutation plan");
+  // The operator reviews code, not the instructions that carry it out.
+  await expect(plan).toContainText("green lines are added, red lines removed");
+  await expect(plan).not.toContainText("update_reaction");
+  await expect(plan).toContainText("stays paused");
+  await plan.getByRole("button", { name: "Apply" }).click();
+  await expect(plan).toHaveCount(0);
+  await expect(page.getByText("The change was not applied")).toHaveCount(0);
+  // Applied to a paused run, it stays paused until resumed.
+  await expect(actions.getByRole("button", { name: "Resume" })).toBeVisible();
+  // What the run executes now is the edit, so nothing is marked changed.
+  await expect(page.locator(".source-editor .cm-changedLine")).toHaveCount(0);
+
+  // On the timeline the change is a mark of its own, in its own colour,
+  // whose preview lists what changed; it is where a resume continues.
+  await page.getByRole("button", { name: /Run timeline/ }).click();
+  const timeline = page.getByLabel("Logical timeline");
+  const mark = timeline.getByRole("button", { name: "Checkpoint #3" });
+  await expect(mark).toHaveClass(/mutation/);
+  await expect(timeline.getByRole("button", { name: "Checkpoint #2" })).not.toHaveClass(/mutation/);
+  await mark.click();
+  const preview = timeline.getByLabel("Checkpoint preview");
+  await expect(preview).toContainText("Checkpoint #3 · mutation");
+  await expect(preview.getByLabel("Mutation")).toContainText("update_reaction review.reaction.0");
+  await expect(preview).toContainText("A resume continues from here.");
+
+  await actions.getByRole("button", { name: "Resume" }).click();
+  await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
+});
+
+test("asked mid-run, the assistant's change is offered as a plan for the live run", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+  const actions = page.getByRole("group", { name: "Run controls" });
+  // Paused, so the fake's short walk cannot end under the test.
+  await actions.getByRole("button", { name: "Pause" }).click();
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+
+  // The proposal is a change to this run, not a new design to deploy.
+  const ask = async () => {
+    await page.getByLabel("Describe a workflow").fill("Tighten the reviewer");
+    await page.getByLabel("Draft workflow").click();
+  };
+  await ask();
+  const plan = page.getByLabel("Mutation plan");
+  await expect(plan).toContainText("OMAR proposes changes to the run");
+  // The change is scrolled into view and marked as added.
+  await expect(page.locator(".source-editor .cm-changedLine", { hasText: "tightened by OMAR" })).toBeVisible();
+  await expect(page.getByRole("group", { name: "Deploy design" })).toHaveCount(0);
+
+  // Declined, the source is the running program again.
+  await plan.getByRole("button", { name: "Decline" }).click();
+  await expect(plan).toHaveCount(0);
+  await expect(page.getByLabel("OMAR program")).not.toContainText("tightened by OMAR");
+  await expect(page.locator(".source-editor .cm-changedLine")).toHaveCount(0);
+
+  // Accepted, it is applied to the run and marks the timeline.
+  await ask();
+  await plan.getByRole("button", { name: "Apply" }).click();
+  await expect(plan).toHaveCount(0);
+  await expect(page.getByText("The change was not applied")).toHaveCount(0);
+  await expect(actions.getByRole("button", { name: "Resume" })).toBeVisible();
+  await page.getByRole("button", { name: /Run timeline/ }).click();
+  await expect(page.getByLabel("Logical timeline").getByRole("button", { name: "Checkpoint #3" })).toHaveClass(/mutation/);
+  await expect(page.getByLabel("OMAR program")).toContainText("tightened by OMAR");
+  // After it, an edit by hand is read against the program the run now has.
+  await expect(page.locator(".source-editor .cm-changedLine")).toHaveCount(0);
+  const editor = page.getByLabel("OMAR program");
+  await editor.locator(".cm-line", { hasText: "tightened by OMAR" }).click();
+  await editor.press("End");
+  await editor.pressSequentially(" and by hand");
+  await expect(page.locator(".source-editor .cm-changedLine")).toContainText("tightened by OMAR and by hand");
 });
 
 test("the confirmation chooses what the run keeps and how it checkpoints", async ({ page }) => {
@@ -1291,12 +1463,12 @@ test("the composer says which assistant is answering, and can change it", async 
   await trigger.click();
   const menu = page.getByRole("menu");
   await expect(menu).toBeVisible();
+  // Only connected backends are offered, each with how it is signed in;
+  // the rest are a click away on the Backends page.
   await expect(menu.getByRole("menuitem")).toHaveText([
-    "Claude Code",
-    "Codex✓",
-    "Cursor",
-    "opencode",
-    "agy",
+    "Claude CodeClaude Max",
+    "CodexChatGPT✓",
+    "Connect more backends…",
   ]);
 
   // It opens upward: it lives at the bottom of the composer.
@@ -1305,13 +1477,205 @@ test("the composer says which assistant is answering, and can change it", async 
   expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(triggerBox.y + 1);
 
   // Choosing another restarts the assistant, so it asks first.
-  await menu.getByRole("menuitem", { name: "Claude Code" }).click();
+  await menu.getByRole("menuitem", { name: /Claude Code/ }).click();
   await expect(page.locator(".backend-confirm")).toContainText(
     "session is lost",
   );
   await page.getByRole("button", { name: "Restart" }).click();
 
   await expect(page.getByRole("button", { name: /Claude Code/ })).toBeVisible();
+});
+
+test("no backend can be chosen before its status is known", async ({ page }) => {
+  await useFakeServe(page);
+  let answer: () => void = () => {};
+  const held = new Promise<void>((resolve) => (answer = resolve));
+  await page.route("**/v1/agent/backends", async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  const menu = page.getByRole("menu");
+  // Still asking: a signed-out one must not slip through.
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeDisabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();
+
+  answer();
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeEnabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeHidden();
+});
+
+test("a backend the runtime finds signed out is refused with how to sign in", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  // Signed out since the menu last asked; the runtime checks again.
+  await page.route("**/v1/agent/backend", (route) =>
+    route.fulfill({
+      status: 409,
+      json: { error: "claude is not signed in; run `omar connect claude`" },
+    }),
+  );
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menu").getByRole("menuitem", { name: /Claude Code/ }).click();
+  await page.getByRole("button", { name: "Restart" }).click();
+
+  await expect(page.locator(".backend-error")).toHaveText(
+    "claude is not signed in; run `omar connect claude`",
+  );
+  await expect(page.getByRole("button", { name: /Codex/ })).toBeVisible();
+});
+
+test("a failed status check blocks switching until a retry answers", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({ status: 500, json: { error: "boom" } }),
+  );
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  const menu = page.getByRole("menu");
+  // Only a missing endpoint means an older runtime; a failure is not one.
+  await expect(menu.getByRole("alert")).toContainText("Couldn't check backends");
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeDisabled();
+
+  await page.unroute("**/v1/agent/backends");
+  await menu.getByRole("button", { name: "Retry" }).click();
+  await expect(menu.getByRole("alert")).toBeHidden();
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeEnabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeHidden();
+});
+
+test("a backend is connected from the Backends page, in a terminal that closes once it is", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await expect(backends).toContainText("2 of 6 connected.");
+  await expect(backends.getByRole("listitem")).toHaveText([
+    /Claude CodeConnected · Claude Max/,
+    /CodexConnected · ChatGPT/,
+    /CursorNot signed in.*Connect/,
+    /opencodeUnknown · no answer.*Connect/,
+    /piNot installed.*Connect/,
+    /agyNot installed.*Connect/,
+  ]);
+
+  // The same `omar connect cursor` as on the command line, in a terminal.
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+  await page.keyboard.press("Enter");
+
+  // Once cursor reports connected, the terminal goes on its own.
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorConnected · fake sign-in/,
+  );
+  await expect(backends).toContainText("3 of 6 connected.");
+
+  await backends.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await expect(page.getByRole("menuitem", { name: /Cursor/ })).toBeEnabled();
+});
+
+test("a sign-in whose test prompt fails keeps its terminal open until one works", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+
+  // Signed in with a key its vendor rejects: status says connected, the
+  // test prompt says otherwise, and the terminal stays for another try.
+  await page.keyboard.type("bad");
+  await page.keyboard.press("Enter");
+  const alert = terminal.getByRole("alert");
+  await expect(alert).toContainText(
+    "cursor is signed in, but its test prompt failed: 401 Invalid API Key",
+    { timeout: 10_000 },
+  );
+  await expect(terminal).toBeVisible();
+
+  // Signed in again, with a key that works.
+  await page.keyboard.type("good");
+  await page.keyboard.press("Enter");
+  await alert.getByRole("button", { name: "Check again" }).click();
+  await expect(terminal).toBeHidden();
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorConnected · fake sign-in/,
+  );
+  await expect(backends).toContainText("3 of 6 connected.");
+});
+
+test("a backend whose test prompt failed can be connected again", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+  await page.keyboard.type("bad");
+  await page.keyboard.press("Enter");
+  await expect(terminal.getByRole("alert")).toBeVisible({ timeout: 10_000 });
+  await terminal.getByRole("button", { name: "Close" }).click();
+
+  // It reads as connected, but is not counted, and offers Connect again.
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorSigned in, but its test prompt failed.*Connect/,
+  );
+  await expect(backends).toContainText("2 of 6 connected.");
+});
+
+test("with no backend connected, the Backends page comes first", async ({ page }) => {
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({
+      json: {
+        backends: ["claude", "codex", "cursor", "opencode", "pi", "agy"].map((name) => ({
+          name,
+          status: "not_installed",
+          login: `omar connect ${name}`,
+        })),
+      },
+    }),
+  );
+  await useFakeServe(page);
+
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await expect(backends).toContainText(
+    "No backend is connected yet. Connect one to start the assistant.",
+  );
+  await expect(backends.getByRole("button", { name: /^Connect / })).toHaveCount(6);
+});
+
+test("settings open the Backends page", async ({ page }) => {
+  await useFakeServe(page);
+  await expect(page.getByRole("dialog", { name: "Backends" })).toBeHidden();
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("menuitem", { name: "Connect backends…" }).click();
+  await expect(page.getByRole("dialog", { name: "Backends" })).toContainText("2 of 6 connected.");
+});
+
+test("a runtime without backend status still switches", async ({ page }) => {
+  await useFakeServe(page);
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({ status: 404, json: { error: "Not found" } }),
+  );
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menu").getByRole("menuitem", { name: /Cursor/ }).click();
+  await page.getByRole("button", { name: "Restart" }).click();
+  await expect(page.getByRole("button", { name: /Cursor/ })).toBeVisible();
 });
 
 test("a chevron names the backend behind its agent", async ({ page }) => {
@@ -1661,7 +2025,7 @@ test("the diagram follows the text", async ({ page }) => {
   await page.getByRole("button", { name: "Show the source pane" }).click();
   const editor = page.getByLabel("OMAR program");
   await expect(editor).toBeVisible();
-  const source = await editor.inputValue();
+  const source = PROPOSED_PROGRAM;
   await editor.fill(source.replace(/\bmain\b/, "main Renamed"));
 
   // No deploy, no reload: the drawing is recompiled from the text on the pause
@@ -2119,7 +2483,7 @@ test("chat history restores messages and proposals after switching and reloading
   await expect(page.locator(".messages")).not.toContainText("Prepare a product launch");
   await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
   await page.getByRole("button", { name: "Show the source pane" }).click();
-  await expect(page.locator(".source-code")).toContainText("team ReviewFlow[");
+  await expect(page.locator(".source-editor")).toContainText("team ReviewFlow[");
   await expect(page.locator(".connection")).toHaveText("review");
   await page.screenshot({ path: "/tmp/omar-history-sidebar-desktop.png" });
   expect(errors).toEqual([]);
@@ -2607,8 +2971,8 @@ test("step configuration validates real source edits and never starts a run", as
   await expect(inspector.getByLabel("Step prompt")).toHaveValue('Read $(request), then produce a "reviewed" plan.');
   await inspector.getByRole("button", { name: "Edit prompt & backend in source" }).click();
   const program = page.getByRole("textbox", { name: "OMAR program", exact: true });
-  await expect(program).toHaveValue(/planner\s+: ClaudeCode/);
-  await expect(program).toHaveValue(/\\"reviewed\\"/);
+  await expect(program).toContainText(/planner\s+: ClaudeCode/);
+  await expect(program).toContainText(/\\"reviewed\\"/);
   await page.getByRole("separator", { name: "Resize the source pane" }).hover();
   await page.getByRole("button", { name: "Hide the source pane" }).click();
   await page.route("**/v1/programs/check", (route) => {
@@ -2747,4 +3111,72 @@ test("workflow tabs support keyboard navigation and saved VS Code edits reach de
   const deployment = page.waitForRequest((r) => r.url().endsWith("/v1/runs") && r.method() === "POST");
   await deploy(page);
   expect((await deployment).postDataJSON().files).toEqual(savedFiles);
+});
+
+test("a design's safety properties show their Lean proofs and single out what they are about", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByLabel("Describe a workflow").fill("Review the release plan, and prove it is safe");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.locator(".messages")).toContainText("Which agent should own");
+  await page.getByLabel("Describe a workflow").fill("The planner");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
+
+  // Lean's verdicts arrive with the design: two proved, one not.
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+  const tab = page.getByRole("tab", { name: /Properties/ });
+  await expect(tab).toContainText("2/3");
+  await tab.click();
+  const panel = page.getByRole("tabpanel", { name: "Formal properties" });
+  await expect(panel).toContainText("2 of 3 proved by Lean");
+  const items = panel.locator(".property");
+  await expect(items).toHaveCount(3);
+  await expect(items.nth(0).locator(".property-status")).toHaveText("Proved");
+  await expect(items.nth(2).locator(".property-status")).toHaveText("Not proved");
+
+  // Nothing is singled out until a property is chosen.
+  await expect(page.locator(".off-focus")).toHaveCount(0);
+  await items.nth(0).locator(".property-summary").click();
+  const proof = items.nth(0).getByLabel("Lean proof");
+  await expect(proof).toContainText("theorem critique_comes_from_reviewer");
+  await expect(proof.locator(".omar-tok-keyword").first()).toHaveText("theorem");
+  await expect(proof.locator(".omar-tok-string").first()).toHaveText('"flow.critique"');
+  // It is about the critique and the reviewer that writes it; the planner's
+  // two reactions and the other ports step back.
+  await expect(page.locator(".omar-reaction.in-focus")).toHaveCount(1);
+  await expect(page.locator(".omar-reaction.off-focus")).toHaveCount(2);
+  await expect(page.locator(".omar-action-group.in-focus")).toHaveCount(1);
+  await expect(page.locator(".omar-team.in-focus")).toHaveCount(1);
+
+  // One that does not hold says where Lean stopped.
+  await items.nth(2).locator(".property-summary").click();
+  await expect(items.nth(2).getByLabel("What Lean objected to")).toContainText("unsolved goals");
+  await expect(items.nth(2).locator(".lean-line.has-problem").first()).toBeVisible();
+  await items.nth(2).locator(".property-summary").click();
+  await expect(page.locator(".off-focus")).toHaveCount(0);
+
+  // An edited program is not what Lean checked; checking again is one click.
+  await page.getByRole("tab", { name: "Source" }).click();
+  const editor = page.getByLabel("OMAR program");
+  await editor.locator(".cm-line", { hasText: "Find risks and omissions" }).click();
+  await editor.press("End");
+  await editor.pressSequentially(" Note any gaps.");
+  await tab.click();
+  await expect(panel.getByRole("status")).toContainText("The source has changed");
+  await panel.getByRole("button", { name: "Check again" }).click();
+  await expect(panel.getByRole("status")).toHaveCount(0);
+  const asked = await (await fetch(`${FAKE_SERVE_URL}/v1/proofs`)).json();
+  expect(asked.checks).toBe(1);
+
+  // The proofs open in Web VS Code, one Lean file a property.
+  const popup = page.waitForEvent("popup");
+  await panel.getByRole("button", { name: "Open in Web VS Code" }).click();
+  const opened = await popup;
+  await expect(opened).toHaveURL(/\/fake-editor\/proofs$/);
+  const workspace = (await (await fetch(`${FAKE_SERVE_URL}/v1/proofs`)).json()).workspace;
+  expect(workspace.properties.map((file: { name: string }) => file.name)).toEqual([
+    "critique_comes_from_reviewer", "answer_only_after_critique", "plan_always_reviewed",
+  ]);
+  expect(workspace.properties[0].source).toContain("def topology : Omar.Reactor.Topology");
+  await opened.close();
 });

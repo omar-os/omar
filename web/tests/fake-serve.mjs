@@ -24,6 +24,15 @@ const CORS = {
   "access-control-allow-headers": "content-type",
 };
 
+/**
+ * What `omarc --prove` made of three properties of PROPOSED_PROGRAM: two
+ * proved, and one that does not hold (a run cut short leaves a plan
+ * unreviewed). Produced by the real compiler, not written by hand.
+ */
+const PROPERTY_VERDICTS = JSON.parse(
+  await readFile(new URL("./fixtures/review-flow-properties.json", import.meta.url), "utf8"),
+);
+
 /** Marker a test can put in a program to exercise the compile-failure path. */
 const INVALID_MARKER = "!!invalid!!";
 
@@ -45,6 +54,8 @@ export async function startFakeServe({
   terminalReflow = false,
   /** Fail a parked Web step without making tests wait for a real deadline. */
   webFailure = /** @type {string | null} */ (null),
+  /** Also serve a view-only port over the same state, as `omar serve` can. */
+  viewPort = /** @type {number | null} */ (null),
 } = {}) {
   const golden = JSON.parse(
     await readFile(new URL(`./fixtures/${snapshotFile}`, import.meta.url), "utf8"),
@@ -53,7 +64,7 @@ export async function startFakeServe({
   /** @type {Map<string, {record: object, snapshot: object, subscribers: Set<import("node:http").ServerResponse>, sequence: number}>} */
   const runs = new Map();
 
-  const server = createServer(async (request, response) => {
+  const handle = async (request, response) => {
     const url = new URL(request.url, `http://${request.headers.host}`);
     const scoped = /^\/chats\/([^/]+)(\/.*)$/.exec(url.pathname);
     const chat = scoped ? chats.get(scoped[1]) : activeChat;
@@ -65,7 +76,14 @@ export async function startFakeServe({
       return;
     }
     if (request.method === "GET" && url.pathname === "/health") {
-      return json(response, 200, { status: "ok", protocol_version: 1 });
+      return json(response, 200, { status: "ok", protocol_version: 1, access: "full" });
+    }
+    // Serve relays each run's diagram server, which only its own host can reach.
+    const relay = /^\/v1\/runs\/([^/]+)\/diagram(\/v1\/(?:diagram|events))$/.exec(url.pathname);
+    if (request.method === "GET" && relay) {
+      const entry = runs.get(decodeURIComponent(relay[1]));
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return relay[2] === "/v1/diagram" ? json(response, 200, entry.snapshot) : subscribe(response, entry);
     }
     if (request.method === "POST" && url.pathname === "/v1/programs/check") {
       return readBody(request).then((body) => checkProgram(body, response));
@@ -95,6 +113,41 @@ export async function startFakeServe({
       entry.record.status = "pausing";
       // The walk parks at its next tag boundary, as the runtime does.
       return json(response, 202, entry.record);
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/mutate")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/mutate".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      if (!["running", "paused"].includes(entry.record.status)) {
+        return json(response, 409, { error: `run is ${entry.record.status}; only a running or paused run can mutate` });
+      }
+      const body = JSON.parse((await readBody(request)) || "{}");
+      // The plan the daemon would diff out of the edit: one line per change.
+      const changes = body.program === entry.program ? [] : ["update_reaction review.reaction.0 on review.reviewer"];
+      if (changes.length === 0 || body.dry_run) return json(response, 200, { changes });
+      entry.program = body.program;
+      entry.record.mutation = { status: "pending", changes };
+      if (entry.record.status === "paused") {
+        applyMutation(entry);
+        return json(response, 200, entry.record);
+      }
+      // A running run pauses first; the walk applies it at the boundary.
+      entry.record.status = "pausing";
+      return json(response, 202, entry.record);
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/program")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/program".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return json(response, 200, { filename: entry.filename ?? "program.omar", program: entry.program });
     }
     if (
       request.method === "GET" &&
@@ -257,6 +310,37 @@ export async function startFakeServe({
       const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length, -"/options".length));
       return entry ? json(response, 200, entry.options) : json(response, 404, { error: "unknown run" });
     }
+    if (request.method === "POST" && url.pathname === "/v1/properties/check") {
+      // Lean's verdicts do not depend on anything the fake can change, so a
+      // re-check answers with them; what a test checks is that it was asked.
+      return readBody(request).then((body) => {
+        const asked = JSON.parse(body);
+        chat.propertyChecks = (chat.propertyChecks ?? 0) + 1;
+        const verdicts = asked.properties.map((property) =>
+          structuredClone(PROPERTY_VERDICTS.find((verdict) => verdict.name === property.name)) ?? {
+            ...property, proved: false, theorem: "", source: "", mentions: [],
+            problems: [{ line: 0, column: 0, message: "unknown to the fake" }],
+          });
+        return json(response, 200, { verdicts });
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/v1/workspaces/properties") {
+      return readBody(request).then((body) => {
+        chat.proofWorkspace = JSON.parse(body);
+        return json(response, 200, { workspace: { id: "proofs" } });
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/v1/workspaces/proofs/editor") {
+      return json(response, 200, { url: `http://${request.headers.host}/fake-editor/proofs` });
+    }
+    if (request.method === "GET" && url.pathname === "/v1/proofs") {
+      // Test-only: what the client asked of the proof surface.
+      return json(response, 200, { checks: chat.propertyChecks ?? 0, workspace: chat.proofWorkspace ?? null });
+    }
+    if (request.method === "GET" && url.pathname === "/fake-editor/proofs") {
+      response.writeHead(200, { "content-type": "text/html" }).end("<title>Proofs</title><h1>Proof editor</h1>");
+      return;
+    }
     if (url.pathname.startsWith("/v1/workspaces/")) {
       // Enough of the workspace surface for the viewer to open on a run.
       const [id, action = ""] = url.pathname.slice("/v1/workspaces/".length).split("/");
@@ -298,6 +382,32 @@ export async function startFakeServe({
         backend,
         available: ["claude", "codex", "cursor", "opencode", "agy"],
       });
+    }
+    if (request.method === "GET" && url.pathname === "/v1/agent/backends") {
+      return json(response, 200, {
+        backends: Object.entries(backendStatus).map(([name, status]) => ({ name, ...status, login: `omar connect ${name}` })),
+      });
+    }
+    // The daemon starts `omar connect <name>` in a session; here, pressing
+    // Enter in its terminal stands for finishing the sign-in.
+    const connect = /^\/v1\/backends\/([^/]+)\/connect$/.exec(url.pathname);
+    if (request.method === "POST" && connect) {
+      return readBody(request).then(() =>
+        connect[1] in backendStatus
+          ? json(response, 200, { terminal: `/v1/backends/${connect[1]}/terminal` })
+          : json(response, 404, { error: `'${connect[1]}' is not an assistant backend` }),
+      );
+    }
+    // The test prompt: fails for a key typed as "bad".
+    const check = /^\/v1\/backends\/([^/]+)\/check$/.exec(url.pathname);
+    if (request.method === "POST" && check) {
+      return readBody(request).then(() =>
+        !(check[1] in backendStatus)
+          ? json(response, 404, { error: `'${check[1]}' is not an assistant backend` })
+          : rejectedKeys[check[1]]
+            ? json(response, 422, { error: `${check[1]} is signed in, but its test prompt failed: 401 Invalid API Key` })
+            : json(response, 200, { ok: true }),
+      );
     }
     if (request.method === "POST" && url.pathname === "/v1/agent/backend") {
       return readBody(request).then((body) => {
@@ -368,21 +478,41 @@ export async function startFakeServe({
       return subscribeChat(response, chat);
     }
     json(response, 404, { error: "not found" });
+  };
+  const server = createServer(handle);
+
+  /**
+   * The view port: the same pages and reads, no writes. Host files and what a
+   * web agent is owed stay private, and the loopback diagram server is relayed
+   * under its run because a remote viewer cannot reach it.
+   */
+  const viewServer = viewPort === null ? null : createServer((request, response) => {
+    const path = new URL(request.url, "http://view").pathname.replace(/^\/chats\/[^/]+/, "");
+    if (request.method === "GET" && path === "/health") {
+      return json(response, 200, { status: "ok", protocol_version: 1, access: "view" });
+    }
+    const refused = (request.method !== "GET" && request.method !== "OPTIONS") ||
+      path.startsWith("/v1/workspaces") || /^\/v1\/runs\/[^/]+\/panel$/.test(path);
+    if (refused) return json(response, 403, { error: "read-only view" });
+    return handle(request, response);
   });
+  /** Frames a client sent up a view port's terminal, which it should not. */
+  let viewTerminalFrames = 0;
 
   // A stand-in for the agent's tmux session: it announces a size the way the
   // daemon does, then echoes what is typed so a test can prove keystrokes
   // travelled up the same socket the screen comes down.
   const terminals = new WebSocketServer({ noServer: true });
-  server.on("upgrade", (request, socket, head) => {
+  const upgrade = (view) => (request, socket, head) => {
     const url = new URL(request.url, "http://127.0.0.1");
     url.pathname = url.pathname.replace(/^\/chats\/[^/]+/, "");
     // The assistant has a route of its own: its tmux session is not named
     // like an agent's, so no agent name reaches it.
     const assistant = url.pathname === "/v1/agent/terminal";
+    const signIn = /^\/v1\/backends\/([^/]+)\/terminal$/.exec(url.pathname);
     const match = assistant
       ? ["", "the assistant"]
-      : /^\/v1\/agents\/(.+)\/terminal$/.exec(url.pathname);
+      : signIn ?? /^\/v1\/agents\/(.+)\/terminal$/.exec(url.pathname);
     // CORS never reaches a WebSocket, so the daemon refuses foreign origins at
     // the handshake and the fake has to behave the same way.
     const origin = request.headers.origin;
@@ -410,7 +540,13 @@ export async function startFakeServe({
       if (terminalReflow) client.send(Buffer.from("\x1b[?1049h"));
       draw();
       if (!terminalReflow) client.send(Buffer.from(`${agent} $ `));
+      let typed = "";
       client.on("message", (data, isBinary) => {
+        // A view port discards keystrokes and resizes alike.
+        if (view) {
+          viewTerminalFrames += 1;
+          return;
+        }
         // Text is a resize control frame, binary is keystrokes. The daemon
         // reflows the session and answers with the shape it settled on;
         // echoing a control frame back would type it at the shell instead.
@@ -420,12 +556,35 @@ export async function startFakeServe({
           draw();
           return;
         }
+        // What is typed before Enter stands for the key: "bad" signs in
+        // with one its vendor rejects, which only the test prompt finds.
+        if (signIn) {
+          typed += data.toString();
+          if (typed.includes("\r")) {
+            backendStatus[agent] = { status: "connected", via: "fake sign-in" };
+            rejectedKeys[agent] = typed.startsWith("bad");
+            typed = "";
+          }
+        }
         client.send(Buffer.from(data));
       });
     });
-  });
+  };
+  server.on("upgrade", upgrade(false));
+  viewServer?.on("upgrade", upgrade(true));
 
   let backend = "codex";
+  /** Backends signed in with a key the test prompt finds rejected. */
+  const rejectedKeys = {};
+  /** Each backend's status; a sign-in in its terminal connects it. */
+  const backendStatus = {
+    claude: { status: "connected", via: "Claude Max" },
+    codex: { status: "connected", via: "ChatGPT" },
+    cursor: { status: "signed_out" },
+    opencode: { status: "unknown", reason: "no answer" },
+    pi: { status: "not_installed" },
+    agy: { status: "not_installed" },
+  };
   function newChat() {
     return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map() };
   }
@@ -515,6 +674,19 @@ export async function startFakeServe({
       Math.max(10, stepMs / 3),
     );
     setTimeout(() => {
+      // Asked while the chat's run is live, it changes that run's program,
+      // as the envelope tells the real EA to: same main, edited in place.
+      const live = latest(chat);
+      if (live && ["running", "paused"].includes(live.record.status)) {
+        const preview = structuredClone(golden);
+        preview.status = "ready";
+        publish("assistant", "Tightened the reviewer's prompt in the running workflow.", {
+          program: `${live.program ?? PROPOSED_PROGRAM}\n// tightened by OMAR\n`,
+          inputs: {},
+          preview,
+        });
+        return;
+      }
       if (!asked) {
         publish(
           "assistant",
@@ -537,6 +709,10 @@ export async function startFakeServe({
           program: PROPOSED_PROGRAM,
           inputs: { "flow.request": chat.messages[0]?.text ?? "" },
           preview,
+          // Asked for safety, the real EA proves properties of what it proposes.
+          ...(chat.messages.some((m) => m.role === "operator" && /\bsafe|\bprove/i.test(m.text))
+            ? { lemmas: "", properties: structuredClone(PROPERTY_VERDICTS) }
+            : {}),
         },
       );
       // Real assistants comment straight after proposing. That must not look
@@ -699,6 +875,9 @@ export async function startFakeServe({
         finished_at: null,
         error: null,
       },
+      // What the run executes, so a mutation can tell an edit from none.
+      program: request.program,
+      filename: request.filename,
       // What the operator chose at the confirmation, so a test can read it back.
       options: {
         keep_workspaces: request.keep_workspaces === true,
@@ -764,6 +943,26 @@ export async function startFakeServe({
     return entry.checkpoints;
   }
 
+  /** A mutation lands as a checkpoint of its own, the new resume point. */
+  function applyMutation(entry) {
+    const checkpoints = checkpointsOf(entry);
+    const parent = entry.resumePoint;
+    const sequence = checkpoints.length + 1;
+    const id = `cp-${sequence}`;
+    checkpoints.push({
+      id,
+      sequence,
+      parent,
+      trigger: "mutation",
+      completed_tag: [0, 1],
+      next_tag: [0, 2],
+      created_at: sequence,
+      mutation: entry.record.mutation.changes,
+    });
+    entry.resumePoint = id;
+    entry.record.mutation = { ...entry.record.mutation, status: "applied", checkpoint: id };
+  }
+
   function publish(entry, kind, payload, tag = null) {
     entry.sequence += 1;
     entry.snapshot.sequence = entry.sequence;
@@ -804,6 +1003,12 @@ export async function startFakeServe({
       entry.snapshot.status = "paused";
       publish(entry, "run_checkpointed", { checkpoint: "cp-2", trigger: "pause" }, { timestamp: 0, microstep: 1 });
       publish(entry, "run_paused", { checkpoint: "cp-2" });
+      // A pause a mutation asked for: apply it, then resume on our own.
+      if (entry.record.mutation?.status === "pending") {
+        applyMutation(entry);
+        entry.record.status = "running";
+        entry.record.finished_at = null;
+      }
       while (entry.record.status === "paused") await wait();
       entry.snapshot.status = "running";
       publish(entry, "run_started", {});
@@ -865,8 +1070,13 @@ export async function startFakeServe({
   }
 
   await new Promise((resolve) => server.listen(port, host, resolve));
+  if (viewServer) await new Promise((resolve) => viewServer.listen(viewPort, host, resolve));
   return {
     url: `http://${host}:${server.address().port}`,
+    viewUrl: viewServer ? `http://${host}:${viewServer.address().port}` : null,
+    get viewTerminalFrames() {
+      return viewTerminalFrames;
+    },
     agentToken,
     async close() {
       for (const client of terminals.clients) client.terminate();
@@ -881,6 +1091,10 @@ export async function startFakeServe({
       // idle out, adding seconds to every test.
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
+      if (viewServer) {
+        viewServer.closeAllConnections();
+        await new Promise((resolve) => viewServer.close(resolve));
+      }
     },
   };
 }

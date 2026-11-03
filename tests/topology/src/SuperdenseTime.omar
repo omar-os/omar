@@ -32,6 +32,32 @@ team SuperdenseTime[producer : Codex,
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input fixed_result : int
+    input connected_result : int
+    state got_fixed_result : bool = false
+    state got_connected_result : bool = false
+    timer deadline(10min, 0)
+
+    reaction(fixed_result, connected_result) -> {=
+        if fixed_result.is_some() { self.got_fixed_result = true; }
+        if connected_result.is_some() { self.got_connected_result = true; }
+        if self.got_fixed_result && self.got_connected_result { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_fixed_result, "no time.fixed_result by the deadline");
+        assert!(self.got_connected_result, "no time.connected_result by the deadline");
+    =}
+}
+
 main {
     time = SuperdenseTime()
+
+    smoke = Smoke()
+    time.fixed_result -> smoke.fixed_result
+    time.connected_result -> smoke.connected_result
 }

@@ -174,9 +174,30 @@ team Audit[judge : ClaudeCode]
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input ruling : string
+    state got_ruling : bool = false
+    timer deadline(40min, 0)
+
+    reaction(ruling) -> {=
+        if ruling.is_some() { self.got_ruling = true; }
+        if self.got_ruling { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_ruling, "no audit.ruling by the deadline");
+    =}
+}
+
 main Bureau {
     bureau = Bureau()
     audit = Audit()
 
     bureau.dossier -> audit.dossier
+
+    smoke = Smoke()
+    audit.ruling -> smoke.ruling
 }

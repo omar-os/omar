@@ -49,6 +49,27 @@ team HR[manager   : ClaudeCode,
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input hired : bool
+    state got_hired : bool = false
+    timer deadline(10min, 0)
+
+    reaction(hired) -> {=
+        if hired.is_some() { self.got_hired = true; }
+        if self.got_hired { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_hired, "no hr.hired by the deadline");
+    =}
+}
+
 main {
     hr = HR()
+
+    smoke = Smoke()
+    hr.hired -> smoke.hired
 }
