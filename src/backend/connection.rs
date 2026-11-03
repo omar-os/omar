@@ -70,8 +70,13 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<O
 
 /// Run a status command with no terminal, giving up at `deadline`.
 pub(crate) fn run_until(program: &str, args: &[&str], deadline: Instant) -> Option<Output> {
-    let mut child = Command::new(program)
-        .args(args)
+    let mut command = Command::new(program);
+    command.args(args);
+    run_command(command, deadline)
+}
+
+fn run_command(mut command: Command, deadline: Instant) -> Option<Output> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -125,6 +130,66 @@ pub(crate) fn run_until(program: &str, args: &[&str], deadline: Instant) -> Opti
         stdout,
         text,
     })
+}
+
+/// What a sign-in check asks the CLI to answer.
+pub const CHECK_PROMPT: &str = "Reply with OK";
+/// One short model turn; well past the few seconds each CLI takes.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Whether `backend`'s sign-in actually works: its CLI answers one tiny
+/// prompt headlessly, in an empty directory. A status command reads only
+/// what is stored, so a key its vendor rejects still reads as signed in.
+/// OMAR never sees the credential; the CLI uses its own. `Err` carries the
+/// CLI's last words, which say why.
+pub fn check_sign_in(backend: &dyn Backend) -> Result<(), String> {
+    let command = backend.default_command();
+    let program = command.split_whitespace().next().unwrap_or(command);
+    let Some(args) = backend.sign_in_check(program) else {
+        return Ok(());
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "omar-check-{}-{}",
+        backend.kind().name(),
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot make {}: {error}", dir.display()))?;
+    let mut run = Command::new(program);
+    run.args(&args).current_dir(&dir);
+    let output = run_command(run, Instant::now() + CHECK_TIMEOUT);
+    let _ = std::fs::remove_dir_all(&dir);
+    match output {
+        Some(output) if output.success => Ok(()),
+        Some(output) => Err(last_words(&output.text)),
+        None => Err(format!("no answer within {}s", CHECK_TIMEOUT.as_secs())),
+    }
+}
+
+/// The last few lines a failed CLI printed, where its error is, without
+/// its colors.
+fn last_words(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // CSI: ESC [ … final byte in @..~
+            chars.find(|c| ('@'..='~').contains(c) && *c != '[');
+        } else {
+            plain.push(c);
+        }
+    }
+    let lines: Vec<&str> = plain
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let said = lines[lines.len().saturating_sub(3)..].join(" ");
+    match said.char_indices().nth(400) {
+        Some((cut, _)) => format!("{}…", &said[..cut]),
+        None if said.is_empty() => "it exited without saying why".into(),
+        None => said,
+    }
 }
 
 /// Ask one backend, through the executable its default command runs.
@@ -238,6 +303,44 @@ mod tests {
         let start = Instant::now();
         assert!(run_with_timeout("sleep", &["5"], Duration::from_millis(100)).is_none());
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_failed_check_says_what_the_cli_said_last() {
+        assert_eq!(
+            last_words("\nworking…\n\n  401: Invalid API Key  \n"),
+            "working… 401: Invalid API Key"
+        );
+        assert_eq!(last_words("a\nb\nc\nd\n"), "b c d");
+        assert_eq!(
+            last_words("\x1b[33m⚠ Warning: The provided API key is invalid.\x1b[0m"),
+            "⚠ Warning: The provided API key is invalid."
+        );
+        assert_eq!(last_words("\n \n"), "it exited without saying why");
+        let long = "é".repeat(500);
+        assert_eq!(last_words(&long).chars().count(), 401);
+    }
+
+    #[test]
+    fn every_assistant_has_a_test_prompt_its_cli_runs_headless() {
+        for kind in crate::backend::ASSISTANT {
+            let backend = crate::backend::of(kind);
+            let name = kind.name();
+            let program = backend.executables()[0];
+            let args = backend
+                .sign_in_check(program)
+                .unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(args.last(), Some(&CHECK_PROMPT), "{name}");
+        }
+        let cursor = crate::backend::by_name("cursor").unwrap();
+        assert_eq!(
+            cursor.sign_in_check("cursor").unwrap(),
+            ["agent", "-p", "--trust", CHECK_PROMPT]
+        );
+        assert_eq!(
+            cursor.sign_in_check("cursor-agent").unwrap(),
+            ["-p", "--trust", CHECK_PROMPT]
+        );
     }
 
     #[cfg(unix)]

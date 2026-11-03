@@ -101,6 +101,9 @@ impl Backend for Claude {
             note: None,
         })
     }
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
+        Some(vec!["-p", connection::CHECK_PROMPT])
+    }
     fn conversation_id(&self, target: &Target<'_>) -> Option<String> {
         let directory = claude_sessions_dir()?;
         std::iter::once(target.pane_pid)

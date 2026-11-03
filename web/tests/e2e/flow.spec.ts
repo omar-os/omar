@@ -1584,6 +1584,59 @@ test("a backend is connected from the Backends page, in a terminal that closes o
   await expect(page.getByRole("menuitem", { name: /Cursor/ })).toBeEnabled();
 });
 
+test("a sign-in whose test prompt fails keeps its terminal open until one works", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+
+  // Signed in with a key its vendor rejects: status says connected, the
+  // test prompt says otherwise, and the terminal stays for another try.
+  await page.keyboard.type("bad");
+  await page.keyboard.press("Enter");
+  const alert = terminal.getByRole("alert");
+  await expect(alert).toContainText(
+    "cursor is signed in, but its test prompt failed: 401 Invalid API Key",
+    { timeout: 10_000 },
+  );
+  await expect(terminal).toBeVisible();
+
+  // Signed in again, with a key that works.
+  await page.keyboard.type("good");
+  await page.keyboard.press("Enter");
+  await alert.getByRole("button", { name: "Check again" }).click();
+  await expect(terminal).toBeHidden();
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorConnected · fake sign-in/,
+  );
+  await expect(backends).toContainText("3 of 6 connected.");
+});
+
+test("a backend whose test prompt failed can be connected again", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+  await page.keyboard.type("bad");
+  await page.keyboard.press("Enter");
+  await expect(terminal.getByRole("alert")).toBeVisible({ timeout: 10_000 });
+  await terminal.getByRole("button", { name: "Close" }).click();
+
+  // It reads as connected, but is not counted, and offers Connect again.
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorSigned in, but its test prompt failed.*Connect/,
+  );
+  await expect(backends).toContainText("2 of 6 connected.");
+});
+
 test("with no backend connected, the Backends page comes first", async ({ page }) => {
   await page.route("**/v1/agent/backends", (route) =>
     route.fulfill({

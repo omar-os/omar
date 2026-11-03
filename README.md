@@ -177,8 +177,12 @@ Codex over SSH); `d` signs one out. `omar connect <backend>` does one
 directly. Credentials stay where each CLI keeps them; OMAR never
 stores or sends one. Each CLI reports its own sign-in, except pi, which has
 no status command: OMAR reads only the provider names in pi's `auth.json`.
+A stored key can still be rejected, so after a sign-in the CLI answers one
+short test prompt, and a failure says why. Mission Control's Backends page
+does the same, with each sign-in in a terminal on the page.
 `omar backends` shows where each stands (`--json` for
-scripts); so does Mission Control's backend menu.
+scripts, `--check` to run the test prompts); so does Mission Control's
+backend menu.
 
 ```
 BACKEND   STATUS                      NEXT

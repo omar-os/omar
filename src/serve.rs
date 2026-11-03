@@ -1778,6 +1778,13 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
                 .trim_end_matches("/connect");
             start_connect(&context, name)
         }
+        ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/check") => {
+            let _ = read_body(content_length)?;
+            let name = rest
+                .trim_start_matches(CONNECT_PREFIX)
+                .trim_end_matches("/check");
+            check_backend(name)
+        }
         // EA-only, authenticated with the token handed to its MCP sidecar.
         ("POST", "/v1/agent/reply") => agent_reply(&context, &read_body(content_length)?),
         ("POST", "/v1/agent/proposals") => {
@@ -2283,6 +2290,25 @@ fn start_connect(context: &Context_, name: &str) -> (u16, Value) {
             json!({"session": session, "terminal": format!("{CONNECT_PREFIX}{name}{TERMINAL_SUFFIX}")}),
         ),
         Err(error) => (502, json!({"error": format!("{error:#}")})),
+    }
+}
+
+/// Whether `name`'s sign-in works, by its CLI answering a test prompt: what
+/// Mission Control asks before calling a sign-in done. 422 carries the CLI's
+/// own reason.
+fn check_backend(name: &str) -> (u16, Value) {
+    let Some(backend) = connectable(name) else {
+        return (
+            404,
+            json!({"error": format!("'{name}' is not an assistant backend")}),
+        );
+    };
+    match crate::backend::connection::check_sign_in(backend) {
+        Ok(()) => (200, json!({"ok": true})),
+        Err(error) => (
+            422,
+            json!({"error": format!("{} is signed in, but its test prompt failed: {error}", backend.kind().name())}),
+        ),
     }
 }
 
@@ -6425,6 +6451,13 @@ while True:
             );
             assert!(refused.starts_with("HTTP/1.1 404"), "{name}: {refused}");
             assert!(refused.contains("not an assistant backend"), "{refused}");
+            let unchecked = request(
+                server.address(),
+                "POST",
+                &format!("/v1/backends/{name}/check"),
+                Some("{}"),
+            );
+            assert!(unchecked.starts_with("HTTP/1.1 404"), "{name}: {unchecked}");
         }
         assert!(connectable("codex").is_some());
         assert!(connectable("pi").is_some());

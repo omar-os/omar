@@ -398,6 +398,17 @@ export async function startFakeServe({
           : json(response, 404, { error: `'${connect[1]}' is not an assistant backend` }),
       );
     }
+    // The test prompt: fails for a key typed as "bad".
+    const check = /^\/v1\/backends\/([^/]+)\/check$/.exec(url.pathname);
+    if (request.method === "POST" && check) {
+      return readBody(request).then(() =>
+        !(check[1] in backendStatus)
+          ? json(response, 404, { error: `'${check[1]}' is not an assistant backend` })
+          : rejectedKeys[check[1]]
+            ? json(response, 422, { error: `${check[1]} is signed in, but its test prompt failed: 401 Invalid API Key` })
+            : json(response, 200, { ok: true }),
+      );
+    }
     if (request.method === "POST" && url.pathname === "/v1/agent/backend") {
       return readBody(request).then((body) => {
         let chosen;
@@ -529,6 +540,7 @@ export async function startFakeServe({
       if (terminalReflow) client.send(Buffer.from("\x1b[?1049h"));
       draw();
       if (!terminalReflow) client.send(Buffer.from(`${agent} $ `));
+      let typed = "";
       client.on("message", (data, isBinary) => {
         // A view port discards keystrokes and resizes alike.
         if (view) {
@@ -544,10 +556,15 @@ export async function startFakeServe({
           draw();
           return;
         }
-        if (signIn && data.toString().includes("\r")) {
-          backendStatus[agent] = { status: "connected", via: "fake sign-in" };
-          client.close();
-          return;
+        // What is typed before Enter stands for the key: "bad" signs in
+        // with one its vendor rejects, which only the test prompt finds.
+        if (signIn) {
+          typed += data.toString();
+          if (typed.includes("\r")) {
+            backendStatus[agent] = { status: "connected", via: "fake sign-in" };
+            rejectedKeys[agent] = typed.startsWith("bad");
+            typed = "";
+          }
         }
         client.send(Buffer.from(data));
       });
@@ -557,6 +574,8 @@ export async function startFakeServe({
   viewServer?.on("upgrade", upgrade(true));
 
   let backend = "codex";
+  /** Backends signed in with a key the test prompt finds rejected. */
+  const rejectedKeys = {};
   /** Each backend's status; a sign-in in its terminal connects it. */
   const backendStatus = {
     claude: { status: "connected", via: "Claude Max" },

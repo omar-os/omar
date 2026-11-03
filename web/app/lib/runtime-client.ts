@@ -62,6 +62,23 @@ export async function startConnect(
   if (!response.ok) throw new Error(await readError(response));
 }
 
+/**
+ * Has the backend's CLI answer a test prompt, which proves its sign-in works:
+ * a stored key its vendor rejects still reads as connected. Throws with the
+ * CLI's reason when it fails.
+ */
+export async function checkSignIn(
+  serveUrl: string,
+  backend: string,
+): Promise<void> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/backends/${encodeURIComponent(backend)}/check`,
+    { method: "POST", body: "{}" },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+}
+
 /** Stands for the assistant wherever an agent name is expected. */
 export const ASSISTANT = "\u0000assistant";
 

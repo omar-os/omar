@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -32,7 +32,7 @@ export function AgentTerminal({
   /** Its heading, when `url` is given. */
   title?: string;
   /** What the footer says in place of the agent's, when `url` is given. */
-  note?: string;
+  note?: ReactNode;
   /** A view port drops keystrokes and resizes, so neither is sent. */
   readOnly?: boolean;
   onClose: () => void;
@@ -208,7 +208,7 @@ export function AgentTerminal({
           <div className="terminal-screen" ref={screenRef} />
         </div>
         <p className="terminal-note">
-          {note ? `${note} ` : readOnly ? "" : "Escape goes to the agent. "}Close with Ctrl+Shift+Escape or the Close button.{" "}
+          {note ? <>{note} </> : readOnly ? "" : "Escape goes to the agent. "}Close with Ctrl+Shift+Escape or the Close button.{" "}
           {note ? null : readOnly
             ? "View only: typing here is not sent. Closing detaches."
             : agent === ASSISTANT

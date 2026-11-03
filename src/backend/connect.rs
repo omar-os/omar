@@ -234,7 +234,16 @@ fn connect(backend: &dyn Backend) -> Result<()> {
     // Resolved after installing: an installer can change which one runs.
     let program = program(backend);
     let mut failed = String::new();
-    if !matches!(status, Connection::Connected { .. }) {
+    // Stored is not working: a rejected key still reads as connected, and
+    // signing in again is how it is replaced.
+    let mut checked = false;
+    if matches!(status, Connection::Connected { .. }) {
+        match check(backend) {
+            Ok(()) => checked = true,
+            Err(error) => println!("{error}\nSigning {name} in again."),
+        }
+    }
+    if !checked {
         let login = backend
             .login(headless())
             .with_context(|| format!("{name} has no sign-in OMAR can start"))?;
@@ -253,6 +262,11 @@ fn connect(backend: &dyn Backend) -> Result<()> {
     }
     match status {
         Connection::Connected { via } => {
+            if !checked {
+                check(backend).map_err(|error| {
+                    anyhow::anyhow!("{error}; run `omar connect {name}` to sign in again")
+                })?;
+            }
             println!(
                 "✓ {name} connected{}",
                 via.map(|v| format!(" ({v})")).unwrap_or_default()
@@ -269,6 +283,19 @@ fn connect(backend: &dyn Backend) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `connection::check_sign_in`, said as it happens; the error names the
+/// environment variable the CLI signs in with, if one is set.
+fn check(backend: &dyn Backend) -> Result<(), String> {
+    let name = backend.kind().name();
+    println!("Checking {name} with a test prompt…");
+    connection::check_sign_in(backend).map_err(|error| {
+        let with = connection::env_credential(backend.credential_vars())
+            .map(|var| format!(" with ${var}"))
+            .unwrap_or_default();
+        format!("{name} is signed in{with}, but its test prompt failed: {error}")
+    })
 }
 
 /// Have `backend`'s CLI sign itself out, then check that it took.

@@ -262,6 +262,11 @@ pub trait Backend: Send + Sync {
     fn logout(&self) -> Option<Login> {
         None
     }
+    /// The CLI's own headless run of `connection::CHECK_PROMPT` as `program`,
+    /// which proves a sign-in works (`connection::check_sign_in`).
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
+        None
+    }
 
     fn kind(&self) -> Kind;
     /// Names an operator may type. The first is canonical.

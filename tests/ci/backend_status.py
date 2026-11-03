@@ -91,6 +91,35 @@ class BackendStatus(unittest.TestCase):
         self.assertEqual(status["pi"]["status"], "connected")
         self.assertEqual(status["pi"]["via"], "anthropic")
 
+    def test_check_has_each_signed_in_backend_answer_a_test_prompt(self):
+        # pi is signed in to a key its vendor rejects; only a prompt finds out.
+        store = Path(self.env["HOME"]) / ".pi/agent"
+        store.mkdir(parents=True)
+        (store / "auth.json").write_text('{"groq": {"type": "api_key"}}')
+        pi = Path(self.env["PATH"]) / "pi"
+        pi.write_text('#!/bin/sh\n[ "$1" = --version ] && exit 0\n'
+            '[ "$1" = -p ] && { echo \'401: {"message":"Invalid API Key"}\' >&2; exit 1; }\nexit 0\n')
+        pi.chmod(0o755)
+        check = lambda *args: subprocess.run([str(OMAR), "backends", "--check", *args],
+            env=self.env, capture_output=True, text=True, timeout=60)
+
+        result = check()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("✓ claude answered its test prompt", result.stdout)
+        self.assertIn('✗ pi is signed in, but its test prompt failed: 401: {"message":"Invalid API Key"}',
+            result.stdout)
+        # Signed out and not named: nothing to check.
+        self.assertNotIn("codex", result.stdout.split("\n\n")[1])
+
+        result = check("--json", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)[0]["check"], {"ok": True})
+
+        # Named, so it must work.
+        result = check("codex")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("✗ codex is not signed in; run `omar connect codex`", result.stdout)
+
     def test_the_table_says_how_to_sign_in_what_is_signed_out(self):
         rows = {line.split()[0]: line for line in self.omar().splitlines()[1:]}
         self.assertIn("✓ Claude Max", rows["claude"])
@@ -159,10 +188,44 @@ mkdir -p {pi.parent} && cp {package} {pi}""")
         out = self.omar("connect", "codex").stdout
         self.assertIn("Device code sign-in must be allowed", out)
         self.assertIn("✓ codex connected (ChatGPT)", out)
-        # Connected already: nothing is run again.
-        signed_in.unlink()
-        signed_in.write_text("")
-        self.assertEqual(self.omar("connect", "codex").stdout, "✓ codex connected (ChatGPT)\n")
+        # Connected already: only the test prompt runs.
+        self.assertEqual(self.omar("connect", "codex").stdout,
+            "Checking codex with a test prompt…\n✓ codex connected (ChatGPT)\n")
+
+    def test_a_sign_in_whose_test_prompt_fails_is_not_called_connected(self):
+        # Its status reads the stored sign-in; its vendor rejects the key.
+        signed_in = self.root / "codex-signed-in"
+        self.stand_in("codex", f"""
+[ "$1 $2" = "login status" ] && {{ [ -f {signed_in} ] && echo 'Logged in using an API key - sk-***' >&2 && exit 0; echo 'Not logged in' >&2; exit 1; }}
+[ "$*" = "login --device-auth" ] && touch {signed_in}
+[ "$1" = exec ] && {{ echo 'ERROR: 401 Unauthorized: Incorrect API key provided' >&2; exit 1; }}""")
+        result = self.omar("connect", "codex", ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("codex is signed in, but its test prompt failed: "
+            "ERROR: 401 Unauthorized: Incorrect API key provided; "
+            "run `omar connect codex` to sign in again", result.stderr)
+        self.assertNotIn("connected", result.stdout)
+
+    def test_a_stored_sign_in_that_fails_its_test_prompt_is_signed_in_again(self):
+        signed_in, fixed, ran = (self.root / name for name in ("codex-signed-in", "fixed", "ran"))
+        signed_in.touch()
+        self.stand_in("codex", f"""
+[ "$1 $2" = "login status" ] && {{ echo 'Logged in using ChatGPT' >&2; exit 0; }}
+[ "$*" = "login --device-auth" ] && touch {fixed}
+[ "$1" = exec ] && {{ echo "$PWD $*" >> {ran}; [ -f {fixed} ] || {{ echo 'model_not_found' >&2; exit 1; }}; }}""")
+        out = self.omar("connect", "codex").stdout
+        self.assertIn("codex is signed in, but its test prompt failed: model_not_found\n"
+            "Signing codex in again.", out)
+        self.assertTrue(out.endswith("✓ codex connected (ChatGPT)\n"), out)
+        # Twice, before and after the sign-in, each in an empty directory
+        # that is gone afterwards.
+        runs = ran.read_text().splitlines()
+        self.assertEqual(len(runs), 2, runs)
+        for run in runs:
+            directory, args = run.split(" ", 1)
+            self.assertEqual(args, "exec --skip-git-repo-check Reply with OK")
+            self.assertIn("omar-check-codex-", directory)
+            self.assertFalse(Path(directory).exists())
 
     def test_a_sign_in_that_does_not_take_fails(self):
         self.stand_in("codex", """[ "$1 $2" = "login status" ] && { echo 'Not logged in' >&2; exit 1; }""")

@@ -83,6 +83,14 @@ impl Backend for Codex {
             note: None,
         })
     }
+    /// The check runs in an empty directory, which is no git repository.
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
+        Some(vec![
+            "exec",
+            "--skip-git-repo-check",
+            connection::CHECK_PROMPT,
+        ])
+    }
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         let socket = from_stamp(target.stamp?)?;
         CodexSession::open(&socket).ok()?.only_thread().ok()

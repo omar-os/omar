@@ -64,6 +64,15 @@ impl Backend for Cursor {
             note: None,
         })
     }
+    /// `--trust`: the check's empty directory would otherwise ask first.
+    fn sign_in_check(&self, program: &str) -> Option<Vec<&'static str>> {
+        let check = vec!["-p", "--trust", connection::CHECK_PROMPT];
+        Some(if program == "cursor" {
+            [vec!["agent"], check].concat()
+        } else {
+            check
+        })
+    }
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["Cursor Agent"]
     }

@@ -239,6 +239,13 @@ enum Commands {
         /// Print JSON instead of a table
         #[arg(long)]
         json: bool,
+        /// Also have each signed-in backend answer a short test prompt, which
+        /// proves its sign-in works (a rejected key still reads as signed in);
+        /// exits 1 if one fails. Each check spends one prompt.
+        #[arg(long)]
+        check: bool,
+        /// Only these backends; with --check, each must be signed in
+        backends: Vec<String>,
     },
 
     /// Install an agent backend and sign it in
@@ -635,10 +642,11 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             status_deployment(&omar_dir, target.id, &deployment)
         }
         Some(Commands::SetupTmux) => setup_tmux(),
-        Some(Commands::Backends { json }) => {
-            print!("{}", backends_report(json));
-            Ok(())
-        }
+        Some(Commands::Backends {
+            json,
+            check,
+            backends,
+        }) => check_backends(json, check, &backends),
         Some(Commands::Connect { backend: None }) => {
             use std::io::IsTerminal;
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
@@ -1496,17 +1504,121 @@ fn sync_tmux_setup_warning(app: &mut app::App) {
 /// Interactive tmux configuration setup.
 /// Every assistant backend's sign-in, as a table or as JSON.
 fn backends_report(json: bool) -> String {
+    report_backends(&crate::backend::connection::assistants(), &[], json)
+}
+
+/// `omar backends`: the report for the named backends (all when none), and
+/// with `check`, each signed-in one's test prompt, run in parallel.
+fn check_backends(json: bool, check: bool, names: &[String]) -> Result<()> {
     use crate::backend::{connection, Connection};
-    let statuses = connection::assistants();
+    let mut statuses = connection::assistants();
+    if !names.is_empty() {
+        let named = |backend: &&dyn crate::backend::Backend, name: &String| {
+            backend
+                .aliases()
+                .contains(&name.to_ascii_lowercase().as_str())
+        };
+        for name in names {
+            anyhow::ensure!(
+                statuses.iter().any(|(backend, _)| named(backend, name)),
+                "'{name}' is not an assistant backend; see omar backends"
+            );
+        }
+        statuses.retain(|(backend, _)| names.iter().any(|name| named(backend, name)));
+    }
+    let checks: Vec<Option<Result<(), String>>> = if check {
+        std::thread::scope(|scope| {
+            // None: not signed in and not named, so nothing to check.
+            // Some(None): named but not signed in, which fails.
+            let runs: Vec<_> = statuses
+                .iter()
+                .map(|(backend, status)| {
+                    let backend = *backend;
+                    let name = backend.kind().name();
+                    let connected = matches!(status, Connection::Connected { .. });
+                    (connected || !names.is_empty()).then(|| {
+                        connected.then(|| {
+                            scope.spawn(move || {
+                                connection::check_sign_in(backend).map_err(|error| {
+                                    format!(
+                                        "{name} is signed in, but its test prompt failed: {error}"
+                                    )
+                                })
+                            })
+                        })
+                    })
+                })
+                .collect();
+            runs.into_iter()
+                .zip(&statuses)
+                .map(|(run, (backend, status))| match run {
+                    Some(Some(run)) => Some(
+                        run.join()
+                            .unwrap_or_else(|_| Err("the check panicked".into())),
+                    ),
+                    Some(None) => Some(Err(format!(
+                        "{} is {}; run `omar connect {}`",
+                        backend.kind().name(),
+                        connection::label(status),
+                        backend.kind().name()
+                    ))),
+                    None => None,
+                })
+                .collect()
+        })
+    } else {
+        Vec::new()
+    };
+    print!("{}", report_backends(&statuses, &checks, json));
+    let failed = checks
+        .iter()
+        .flatten()
+        .filter(|check| check.is_err())
+        .count();
+    anyhow::ensure!(failed == 0, "{failed} backend(s) failed their check");
+    Ok(())
+}
+
+fn report_backends(
+    statuses: &[(
+        &'static dyn crate::backend::Backend,
+        crate::backend::Connection,
+    )],
+    checks: &[Option<Result<(), String>>],
+    json: bool,
+) -> String {
+    use crate::backend::{connection, Connection};
+    let check_of = |index: usize| checks.get(index).and_then(Option::as_ref);
     if json {
         let rows: Vec<_> = statuses
             .iter()
-            .map(|(backend, status)| connection::describe(*backend, status))
+            .enumerate()
+            .map(|(index, (backend, status))| {
+                let mut row = connection::describe(*backend, status);
+                match check_of(index) {
+                    Some(Ok(())) => row["check"] = serde_json::json!({"ok": true}),
+                    Some(Err(error)) => {
+                        row["check"] = serde_json::json!({"ok": false, "error": error})
+                    }
+                    None => {}
+                }
+                row
+            })
             .collect();
         return format!("{}\n", serde_json::Value::Array(rows));
     }
+    let mut lines = String::new();
+    for (index, (backend, _)) in statuses.iter().enumerate() {
+        match check_of(index) {
+            Some(Ok(())) => {
+                lines += &format!("✓ {} answered its test prompt\n", backend.kind().name())
+            }
+            Some(Err(error)) => lines += &format!("✗ {error}\n"),
+            None => {}
+        }
+    }
     let mut out = format!("{:<10}{:<28}NEXT\n", "BACKEND", "STATUS");
-    for (backend, status) in &statuses {
+    for (backend, status) in statuses {
         let name = backend.kind().name();
         let next = match status {
             Connection::Connected { .. } => String::new(),
@@ -1516,7 +1628,10 @@ fn backends_report(json: bool) -> String {
         out += row.trim_end();
         out.push('\n');
     }
-    out
+    if !lines.is_empty() {
+        out.push('\n');
+    }
+    out + &lines
 }
 
 fn setup_tmux() -> Result<()> {

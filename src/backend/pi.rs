@@ -58,6 +58,16 @@ impl Backend for Pi {
             note: Some("In pi, type /logout and pick the provider, then /quit."),
         })
     }
+    /// Its default model, through whichever provider that needs: a stored
+    /// key can be rejected, or not reach that model.
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
+        Some(vec![
+            "-p",
+            "--no-session",
+            "--no-tools",
+            connection::CHECK_PROMPT,
+        ])
+    }
     fn readiness(&self, _command: &str) -> Readiness {
         Readiness::Channel
     }

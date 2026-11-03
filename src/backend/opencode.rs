@@ -63,6 +63,9 @@ impl Backend for Opencode {
             note: None,
         })
     }
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
+        Some(vec!["run", connection::CHECK_PROMPT])
+    }
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         from_stamp(target.stamp?).map(|(_, session)| session)
     }
