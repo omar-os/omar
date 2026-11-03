@@ -1,6 +1,6 @@
 # Contributing
 
-Rules for every contributor, human or agent. Agents also follow [AGENT.md](AGENT.md).
+Rules for every contributor, human or agent. Agents also follow [AGENTS.md](AGENTS.md).
 
 ## Design principles
 

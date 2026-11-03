@@ -1,5 +1,5 @@
 <!-- High-level principles from https://github.com/multica-ai/andrej-karpathy-skills/blob/main/CLAUDE.md -->
-# AGENT.md
+# AGENTS.md
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
