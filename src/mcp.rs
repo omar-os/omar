@@ -928,10 +928,12 @@ impl OmarMcpServer {
 
     fn list_backends(&self) -> Result<Value> {
         use crate::backend::{connection, Connection};
-        let infos: Vec<Value> = connection::assistants()
+        let (statuses, sandboxes) = connection::assistants_and_sandboxes();
+        let infos: Vec<Value> = statuses
             .into_iter()
-            .map(|(backend, status)| {
-                let mut info = connection::describe(backend, &status);
+            .zip(&sandboxes)
+            .map(|((backend, status), sandbox)| {
+                let mut info = connection::describe_with_sandbox(backend, &status, sandbox);
                 info["available"] = (status != Connection::NotInstalled).into();
                 info["command"] = backend.default_command().into();
                 info

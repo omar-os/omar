@@ -381,22 +381,31 @@ export async function startFakeServe({
       return json(response, 200, {
         backend,
         available: ["claude", "codex", "cursor", "opencode", "agy"],
+        sandbox: { default: sandboxDefault },
       });
     }
     if (request.method === "GET" && url.pathname === "/v1/agent/backends") {
       return json(response, 200, {
-        backends: Object.entries(backendStatus).map(([name, status]) => ({ name, ...status, login: `omar connect ${name}` })),
+        backends: Object.entries(backendStatus).map(([name, status]) => ({
+          name,
+          ...status,
+          login: `omar connect ${name}`,
+          sandbox: { ...sandboxStatus[name], login: `omar connect ${name} --sandbox` },
+        })),
       });
     }
     // The daemon starts `omar connect <name>` in a session; here, pressing
     // Enter in its terminal stands for finishing the sign-in.
     const connect = /^\/v1\/backends\/([^/]+)\/connect$/.exec(url.pathname);
     if (request.method === "POST" && connect) {
-      return readBody(request).then(() =>
-        connect[1] in backendStatus
-          ? json(response, 200, { terminal: `/v1/backends/${connect[1]}/terminal` })
-          : json(response, 404, { error: `'${connect[1]}' is not an assistant backend` }),
-      );
+      return readBody(request).then((body) => {
+        if (!(connect[1] in backendStatus)) {
+          return json(response, 404, { error: `'${connect[1]}' is not an assistant backend` });
+        }
+        // `--sandbox`: Enter in the terminal stores a key for sandboxes instead.
+        sandboxSignIns[connect[1]] = JSON.parse(body || "{}").sandbox === true;
+        return json(response, 200, { terminal: `/v1/backends/${connect[1]}/terminal` });
+      });
     }
     // The test prompt: fails for a key typed as "bad".
     const check = /^\/v1\/backends\/([^/]+)\/check$/.exec(url.pathname);
@@ -561,8 +570,12 @@ export async function startFakeServe({
         if (signIn) {
           typed += data.toString();
           if (typed.includes("\r")) {
-            backendStatus[agent] = { status: "connected", via: "fake sign-in" };
-            rejectedKeys[agent] = typed.startsWith("bad");
+            if (sandboxSignIns[agent]) {
+              sandboxStatus[agent] = { status: "connected", via: "fake key" };
+            } else {
+              backendStatus[agent] = { status: "connected", via: "fake sign-in" };
+              rejectedKeys[agent] = typed.startsWith("bad");
+            }
             typed = "";
           }
         }
@@ -574,6 +587,18 @@ export async function startFakeServe({
   viewServer?.on("upgrade", upgrade(true));
 
   let backend = "codex";
+  /** Whether a run that says nothing runs in sandboxes (`[sandbox] enabled`). */
+  const sandboxDefault = process.env.FAKE_SANDBOX_DEFAULT === "1";
+  /** Each backend's key for sandboxes, and which sign-in each terminal runs. */
+  const sandboxStatus = {
+    claude: { status: "signed_out" },
+    codex: { status: "connected", via: "ChatGPT" },
+    cursor: { status: "signed_out" },
+    opencode: { status: "signed_out" },
+    pi: { status: "signed_out" },
+    agy: { status: "signed_out" },
+  };
+  const sandboxSignIns = {};
   /** Backends signed in with a key the test prompt finds rejected. */
   const rejectedKeys = {};
   /** Each backend's status; a sign-in in its terminal connects it. */
@@ -882,6 +907,8 @@ export async function startFakeServe({
       options: {
         keep_workspaces: request.keep_workspaces === true,
         checkpoint_period: typeof request.checkpoint_period === "string" ? request.checkpoint_period : null,
+        sandbox: request.sandbox === true,
+        no_sandbox: request.no_sandbox === true,
       },
       // One workspace per instance, named after the run: the file viewer
       // shows a run's own, never another run's.

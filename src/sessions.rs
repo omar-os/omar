@@ -105,13 +105,19 @@ pub struct StartOptions {
     /// go with the run; a paused run keeps them either way.
     #[arg(long)]
     pub keep_workspaces: bool,
-    /// Docker Sandbox kit pinned by digest, or a local kit directory (one
-    /// sandbox per team instance); defaults to `[sandbox].template`, or OMAR's
-    /// published kit under `[sandbox] enabled = true`.
+    /// Run each team instance in its own Docker Sandbox (a microVM that sees
+    /// only its workspace), from `[sandbox].template` or OMAR's published kit.
+    /// Each team backend must be connected for sandboxes first:
+    /// `omar connect <backend> --sandbox`. On by default under
+    /// `[sandbox] enabled = true`.
+    #[arg(long)]
+    pub sandbox: bool,
+    /// Like --sandbox, from this kit: an image pinned by digest, or a local
+    /// kit directory.
     #[arg(long)]
     pub sandbox_template: Option<String>,
     /// Run the teams on the host even where the config enables sandboxes.
-    #[arg(long, conflicts_with = "sandbox_template")]
+    #[arg(long, conflicts_with_all = ["sandbox", "sandbox_template"])]
     pub no_sandbox: bool,
 }
 #[derive(Subcommand, Debug)]
@@ -1686,7 +1692,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
                 true => fs::canonicalize(t).map(|p| p.to_string_lossy().into_owned()),
                 false => Ok(t.clone()),
             }).transpose()?;
-            let body=json!({"program":program,"filename":filename,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces,"sandbox_template":template,"no_sandbox":options.no_sandbox});
+            let body=json!({"program":program,"filename":filename,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces,"sandbox":options.sandbox,"sandbox_template":template,"no_sandbox":options.no_sandbox});
             let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
             if owned { run["session"] = json!(s.name); }
             // One structured result: the admission record, or with --fg the terminal record.

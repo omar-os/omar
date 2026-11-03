@@ -157,9 +157,15 @@ pub fn check_sign_in(backend: &dyn Backend) -> Result<(), String> {
         .map_err(|error| format!("cannot make {}: {error}", dir.display()))?;
     let mut run = Command::new(program);
     run.args(&args).current_dir(&dir);
-    let output = run_command(run, Instant::now() + CHECK_TIMEOUT);
+    let result = run_checked(run);
     let _ = std::fs::remove_dir_all(&dir);
-    match output {
+    result
+}
+
+/// Run a sign-in check's command, capped at [`CHECK_TIMEOUT`]; `Err` holds
+/// what it said last.
+pub(crate) fn run_checked(command: Command) -> Result<(), String> {
+    match run_command(command, Instant::now() + CHECK_TIMEOUT) {
         Some(output) if output.success => Ok(()),
         Some(output) => Err(last_words(&output.text)),
         None => Err(format!("no answer within {}s", CHECK_TIMEOUT.as_secs())),
@@ -221,6 +227,25 @@ pub fn assistants() -> Vec<(&'static dyn Backend, Connection)> {
     })
 }
 
+/// [`assistants`], and beside each, whether its agents can run in sandboxes
+/// (`crate::sandbox::connections`), asked at the same time.
+pub fn assistants_and_sandboxes() -> (Vec<(&'static dyn Backend, Connection)>, Vec<Connection>) {
+    std::thread::scope(|scope| {
+        let sandboxes = scope.spawn(|| {
+            let backends: Vec<_> = super::ASSISTANT
+                .iter()
+                .map(|kind| super::of(*kind))
+                .collect();
+            crate::sandbox::connections(&backends)
+        });
+        let statuses = assistants();
+        let sandboxes = sandboxes.join().unwrap_or_else(|_| {
+            vec![Connection::unknown("sandbox status check panicked"); statuses.len()]
+        });
+        (statuses, sandboxes)
+    })
+}
+
 /// How the CLI shows a connection.
 pub fn label(connection: &Connection) -> String {
     match connection {
@@ -238,6 +263,19 @@ pub fn describe(backend: &dyn Backend, connection: &Connection) -> serde_json::V
     let name = backend.kind().name();
     value["name"] = name.into();
     value["login"] = format!("omar connect {name}").into();
+    value
+}
+
+/// [`describe`], with how the backend stands for sandboxes under `sandbox`.
+pub fn describe_with_sandbox(
+    backend: &dyn Backend,
+    connection: &Connection,
+    sandbox: &Connection,
+) -> serde_json::Value {
+    let mut value = describe(backend, connection);
+    let mut sandbox = serde_json::to_value(sandbox).expect("a connection serializes");
+    sandbox["login"] = format!("omar connect {} --sandbox", backend.kind().name()).into();
+    value["sandbox"] = sandbox;
     value
 }
 

@@ -16,6 +16,33 @@ const POLL_MS = 3000;
 
 const NOTE =
   "This is the backend's own install and sign-in; it closes once the backend answers a test prompt.";
+const SANDBOX_NOTE =
+  "This gives Docker Sandboxes a key for this backend's sandboxed agents; it closes once the backend answers a test prompt inside a sandbox.";
+
+/** A sign-in in progress: the backend's own, or its key for sandboxes. */
+type Connecting = { name: string; sandbox: boolean };
+
+/** How the backend stands for sandboxed teams, or null without sbx. */
+function describeSandbox(
+  status: BackendStatus,
+  rejected?: string,
+): string | null {
+  const sandbox = status.sandbox;
+  if (!sandbox || sandbox.status === "not_installed") return null;
+  if (rejected) return "Sandboxes: key stored, but its test prompt failed";
+  switch (sandbox.status) {
+    case "connected":
+      return sandbox.via
+        ? `Sandboxes · ${sandbox.via}`
+        : "Sandboxes · connected";
+    case "signed_out":
+      return "Sandboxes · not connected";
+    default:
+      return sandbox.reason
+        ? `Sandboxes · ${sandbox.reason}`
+        : "Sandboxes · unknown";
+  }
+}
 
 function describe(status: BackendStatus, rejected?: string): string {
   if (rejected) return "Signed in, but its test prompt failed";
@@ -36,7 +63,9 @@ function describe(status: BackendStatus, rejected?: string): string {
  * that runs `omar connect <backend>` in a terminal here, the same install and
  * sign-in as on the command line. Once the backend reports connected, its CLI
  * answers a test prompt, since a stored key can still be rejected; the
- * terminal closes only when that works.
+ * terminal closes only when that works. Where Docker Sandboxes is installed,
+ * each backend also shows whether sandboxed teams can use it, with a Sandbox
+ * button that runs `omar connect <backend> --sandbox` the same way.
  */
 export function BackendsPage({
   serveUrl,
@@ -47,13 +76,16 @@ export function BackendsPage({
 }) {
   const [statuses, setStatuses] = useState<BackendStatus[] | null>(null);
   const [error, setError] = useState("");
-  const [connecting, setConnecting] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState<Connecting | null>(null);
   // "waiting" for the sign-in, "checking" its test prompt, or "rejected".
   const [phase, setPhase] = useState<"waiting" | "checking" | "rejected">(
     "waiting",
   );
-  // Backends whose test prompt failed, and the CLI's reason.
+  // Backends whose test prompt failed, and the CLI's reason; keyed by name,
+  // or by `sandbox:<name>` for a sandbox key.
   const [rejected, setRejected] = useState<Record<string, string>>({});
+  const keyOf = ({ name, sandbox }: Connecting) =>
+    sandbox ? `sandbox:${name}` : name;
 
   const refresh = useCallback(async () => {
     try {
@@ -84,24 +116,26 @@ export function BackendsPage({
   }, [serveUrl]);
 
   const check = useCallback(
-    async (backend: string) => {
+    async (target: Connecting) => {
       setPhase("checking");
+      const key = target.sandbox ? `sandbox:${target.name}` : target.name;
       try {
-        await checkSignIn(serveUrl, backend);
+        await checkSignIn(serveUrl, target.name, target.sandbox);
         setRejected((all) => {
           const rest = { ...all };
-          delete rest[backend];
+          delete rest[key];
           return rest;
         });
         setConnecting(null);
         setPhase("waiting");
+        void refresh();
       } catch (cause) {
         const reason = cause instanceof Error ? cause.message : String(cause);
-        setRejected((all) => ({ ...all, [backend]: reason }));
+        setRejected((all) => ({ ...all, [key]: reason }));
         setPhase("rejected");
       }
     },
-    [serveUrl],
+    [serveUrl, refresh],
   );
 
   // A sign-in is done when its backend says so and then answers a prompt.
@@ -109,19 +143,20 @@ export function BackendsPage({
     if (!connecting || phase !== "waiting") return;
     const timer = setInterval(() => {
       void refresh().then((list) => {
-        const now = list?.find((status) => status.name === connecting);
-        if (now?.status === "connected") void check(connecting);
+        const now = list?.find((status) => status.name === connecting.name);
+        const state = connecting.sandbox ? now?.sandbox?.status : now?.status;
+        if (state === "connected") void check(connecting);
       });
     }, POLL_MS);
     return () => clearInterval(timer);
   }, [connecting, phase, refresh, check]);
 
-  async function connect(backend: string) {
+  async function connect(target: Connecting) {
     setError("");
     try {
-      await startConnect(serveUrl, backend);
+      await startConnect(serveUrl, target.name, target.sandbox);
       setPhase("waiting");
-      setConnecting(backend);
+      setConnecting(target);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -160,47 +195,82 @@ export function BackendsPage({
           </p>
         ) : null}
         <ul>
-          {(statuses ?? []).map((status) => (
-            <li key={status.name} data-status={status.status}>
-              <span className="backend-name">
-                {backendLabel(status.name)}
-                <small title={rejected[status.name]}>
-                  {describe(status, rejected[status.name])}
-                </small>
-              </span>
-              {working(status) ? (
-                <span aria-hidden="true">✓</span>
-              ) : (
-                <button
-                  type="button"
-                  aria-label={`Connect ${backendLabel(status.name)}`}
-                  onClick={() => void connect(status.name)}
-                >
-                  Connect
-                </button>
-              )}
-            </li>
-          ))}
+          {(statuses ?? []).map((status) => {
+            const sandboxRejected = rejected[`sandbox:${status.name}`];
+            const sandbox = describeSandbox(status, sandboxRejected);
+            const sandboxReady =
+              status.sandbox?.status === "connected" && !sandboxRejected;
+            return (
+              <li key={status.name} data-status={status.status}>
+                <span className="backend-name">
+                  {backendLabel(status.name)}
+                  <small title={rejected[status.name]}>
+                    {describe(status, rejected[status.name])}
+                  </small>
+                  {sandbox ? (
+                    <small className="backend-sandbox" title={sandboxRejected}>
+                      {sandbox}
+                    </small>
+                  ) : null}
+                </span>
+                <span className="backend-actions">
+                  {sandbox && !sandboxReady ? (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      aria-label={`Set up ${backendLabel(status.name)} for sandboxes`}
+                      onClick={() =>
+                        void connect({ name: status.name, sandbox: true })
+                      }
+                    >
+                      Sandbox
+                    </button>
+                  ) : null}
+                  {working(status) ? (
+                    <span aria-hidden="true">✓</span>
+                  ) : (
+                    <button
+                      type="button"
+                      aria-label={`Connect ${backendLabel(status.name)}`}
+                      onClick={() =>
+                        void connect({ name: status.name, sandbox: false })
+                      }
+                    >
+                      Connect
+                    </button>
+                  )}
+                </span>
+              </li>
+            );
+          })}
         </ul>
       </section>
       {connecting ? (
         <AgentTerminal
           serveUrl={serveUrl}
-          agent={connecting}
-          url={connectTerminalUrl(serveUrl, connecting)}
-          title={`Connect ${backendLabel(connecting)}`}
+          agent={connecting.name}
+          url={connectTerminalUrl(serveUrl, connecting.name)}
+          title={
+            connecting.sandbox
+              ? `Set up ${backendLabel(connecting.name)} for sandboxes`
+              : `Connect ${backendLabel(connecting.name)}`
+          }
           note={
             phase === "checking" ? (
               <span role="status">
-                Signed in. Checking it with a test prompt…
+                {connecting.sandbox
+                  ? "Key stored. Checking it with a test prompt in a sandbox…"
+                  : "Signed in. Checking it with a test prompt…"}
               </span>
             ) : phase === "rejected" ? (
               <span className="backends-rejected" role="alert">
-                {rejected[connecting]}. Sign in again here, then{" "}
+                {rejected[keyOf(connecting)]}. Sign in again here, then{" "}
                 <button type="button" onClick={() => void check(connecting)}>
                   Check again
                 </button>
               </span>
+            ) : connecting.sandbox ? (
+              SANDBOX_NOTE
             ) : (
               NOTE
             )

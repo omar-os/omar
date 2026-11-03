@@ -2753,6 +2753,19 @@ p.connection-error { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; 
   color: white;
 }
 
+.backends-panel li .backend-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The sandbox key is secondary to the sign-in itself. */
+.backends-panel li button.secondary-button {
+  border-color: var(--line-2);
+  background: transparent;
+  color: var(--text-2);
+}
+
 .backend-status-failed {
   display: flex;
   align-items: center;

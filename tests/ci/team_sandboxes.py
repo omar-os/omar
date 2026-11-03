@@ -71,7 +71,10 @@ elif args[:2] == ["diagnose", "--json"]:
     print(json.dumps({"checks": [{"name": "Authentication", "status": status,
                                   "message": "not signed in", "hint": "Run sbx login"}]}))
 elif args[:2] == ["secret", "ls"]:
-    print(json.dumps({"secrets": []}))
+    print(json.dumps({"secrets": [{"scope": "global", "type": "service", "name": n, "secret": "sk-****"}
+                                  for n in faults.get("SECRETS", [])]}))
+elif args == ["version"]:
+    print("sbx version fake")
 else: sys.exit(2)
 """)
         sbx.chmod(0o700)
@@ -135,7 +138,13 @@ total = Some(self.count);
              "triggers": ["w.go"], "effects": ["w.greeting"], "contract": "w.greeting", "prompt": "Say hello."},
             {"op": "commit_plan"},
         ]
-        for name, team, plan in [("program", "SandboxTeams", instructions), ("ticker", "SandboxTicker", ticker)]:
+        # One Claude agent: what a sandbox needs a key for.
+        claude = [{"op": "begin_plan", "team": "SandboxClaude"},
+                  {"op": "declare_instance", "name": "c", "team": "Writer", "parent": ""},
+                  {"op": "spawn_agent", "instance": "c", "name": "c.agent", "backend": "claude"},
+                  {"op": "commit_plan"}]
+        for name, team, plan in [("program", "SandboxTeams", instructions), ("ticker", "SandboxTicker", ticker),
+                                 ("claude", "SandboxClaude", claude)]:
             (root / (name + ".json")).write_text(json.dumps(dict(version=1, team=team, instructions=plan)))
             (source / (name + ".omar")).write_text("// Compiler-fixture input\n")
         program, ticker_program = source / "program.omar", source / "ticker.omar"
@@ -149,7 +158,7 @@ total = Some(self.count);
                    FAKE_BOXES=str(boxes), FAKE_CALLS=str(calls), FAKE_TOGGLES=str(toggles),
                    CARGO_HOME=os.environ.get("CARGO_HOME", str(Path.home()/".cargo")),
                    RUSTUP_HOME=os.environ.get("RUSTUP_HOME", str(Path.home()/".rustup")))
-        for key in ("TMUX", "TMUX_PANE", "OMAR_TMUX_SERVER", "OMAR_SESSION_ID", "OMAR_STATE_DIR", "OMAR_HOME", "OMAR_EA_ID"):
+        for key in ("TMUX", "TMUX_PANE", "OMAR_TMUX_SERVER", "OMAR_SESSION_ID", "OMAR_STATE_DIR", "OMAR_HOME", "OMAR_EA_ID", "XDG_CONFIG_HOME"):
             env.pop(key, None)
         runtime = json.loads(subprocess.run([str(BIN), "up", "--no-ea", "--name", "sandboxes", "--json"], cwd=source,
                                             env=env, text=True, capture_output=True, timeout=90, check=True).stdout)
@@ -307,6 +316,35 @@ total = Some(self.count);
             result = omar(*plain)
             assert result.returncode == 0 and "warning" not in result.stderr, result
             assert not creates_since(before) and record().get("sandbox_template") is None
+            # `--sandbox` opts one run in, from OMAR's published kit.
+            before = len(entries())
+            result = omar(*plain, "--sandbox")
+            assert result.returncode == 0, result
+            creates = creates_since(before)
+            assert len(creates) == 3 and all(c[-3].startswith(DEFAULT) for c in creates), creates
+            # A backend not connected for sandboxes is refused with how to
+            # connect it, and Claude's says a subscription will not do.
+            before = len(entries())
+            refused = omar("run", str(source / "claude.omar"), "--sandbox", "--fg")
+            said = refused.stdout + refused.stderr
+            assert refused.returncode != 0 and "omar connect claude --sandbox" in said, refused
+            assert "Claude subscription cannot be used in sandboxes" in said, refused
+            assert not creates_since(before)
+            # `omar backends` reads the same: a key counts once sbx holds it
+            # and has approved OMAR's kit to use it.
+            def sandbox_status(name):
+                listed = json.loads(subprocess.run([str(BIN), "backends", "--json", name], env=env, text=True,
+                                                   capture_output=True, timeout=60, check=True).stdout)
+                return listed[0]["sandbox"]
+            assert sandbox_status("claude")["status"] == "signed_out"
+            fault(SECRETS=["anthropic"])
+            assert sandbox_status("claude")["status"] == "signed_out", "stored but not approved"
+            (home / ".config" / "sbx").mkdir(parents=True, exist_ok=True)
+            (home / ".config" / "sbx" / "credentials.yaml").write_text(
+                "bindings:\n  anthropic:\n    apiKey:\n      domains: [api.anthropic.com]\n")
+            assert sandbox_status("claude") == {"status": "connected", "via": "anthropic key",
+                                                "login": "omar connect claude --sandbox"}
+            fault()
             # A named template is required, never silently replaced by the host.
             fault(SIGNED_OUT=1)
             refused = omar(*plain, "--sandbox-template", TEMPLATE)
@@ -329,7 +367,7 @@ total = Some(self.count);
             result = omar(*plain, "--no-sandbox", session=enabled["name"])
             assert result.returncode == 0, result
             assert not creates_since(before)
-            print("PASS: per-team workers, shared file order, native backend delivery, exact mounts, protected history, cleanup, pause/resume, opt-in, required template, enabled default kit, opt-out")
+            print("PASS: per-team workers, shared file order, native backend delivery, exact mounts, protected history, cleanup, pause/resume, opt-in (--sandbox), backend keys and status, required template, enabled default kit, opt-out")
         except BaseException:
             log = state_root / "logs" / "runtime.log"
             if log.exists():

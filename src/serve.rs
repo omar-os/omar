@@ -198,6 +198,9 @@ struct StartRunRequest {
     /// Keep the instances' workspaces when the run ends; off, they go with it.
     #[serde(default)]
     keep_workspaces: bool,
+    /// Run the teams in Docker Sandboxes, as `omar run --sandbox`.
+    #[serde(default)]
+    sandbox: bool,
     /// Docker Sandbox template for this run; the runtime's configured one
     /// otherwise.
     #[serde(default)]
@@ -1783,18 +1786,34 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         ("GET", "/v1/agent/backends") => (200, backend_connections()),
         ("POST", "/v1/agent/backend") => switch_backend(&context, &read_body(content_length)?),
         ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/connect") => {
-            let _ = read_body(content_length)?;
+            #[derive(Deserialize, Default)]
+            struct Request {
+                #[serde(default)]
+                sandbox: bool,
+            }
+            let request: Request =
+                serde_json::from_slice(&read_body(content_length)?).unwrap_or_default();
             let name = rest
                 .trim_start_matches(CONNECT_PREFIX)
                 .trim_end_matches("/connect");
-            start_connect(&context, name)
+            start_connect(&context, name, request.sandbox)
         }
         ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/check") => {
-            let _ = read_body(content_length)?;
+            #[derive(Deserialize, Default)]
+            struct Request {
+                #[serde(default)]
+                sandbox: bool,
+            }
+            let request: Request =
+                serde_json::from_slice(&read_body(content_length)?).unwrap_or_default();
             let name = rest
                 .trim_start_matches(CONNECT_PREFIX)
                 .trim_end_matches("/check");
-            check_backend(name)
+            if request.sandbox {
+                check_sandbox(&context, name)
+            } else {
+                check_backend(name)
+            }
         }
         // EA-only, authenticated with the token handed to its MCP sidecar.
         ("POST", "/v1/agent/reply") => agent_reply(&context, &read_body(content_length)?),
@@ -2189,6 +2208,9 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
             .find(|kind| crate::backend::of(*kind).default_command() == command)
             .map(crate::backend::Kind::name),
         "available": crate::backend::assistant_names(),
+        // What a run that says nothing does, so Mission Control's deploy
+        // dialog starts from it.
+        "sandbox": {"default": context.sandbox.on_by_default()},
     })
 }
 
@@ -2196,9 +2218,13 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
 /// answer comes from each CLI and takes up to a few seconds.
 fn backend_connections() -> Value {
     use crate::backend::connection;
-    let backends: Vec<Value> = connection::assistants()
+    let (statuses, sandboxes) = connection::assistants_and_sandboxes();
+    let backends: Vec<Value> = statuses
         .into_iter()
-        .map(|(backend, status)| connection::describe(backend, &status))
+        .zip(&sandboxes)
+        .map(|((backend, status), sandbox)| {
+            connection::describe_with_sandbox(backend, &status, sandbox)
+        })
         .collect();
     json!({ "backends": backends })
 }
@@ -2269,10 +2295,11 @@ fn connect_session(context: &Context_, backend: &dyn crate::backend::Backend) ->
     )
 }
 
-/// Run `omar connect <backend>` (install, then the CLI's own sign-in) in a
-/// session Mission Control attaches a terminal to. One already running is
-/// reused, so a second click shows the same sign-in.
-fn start_connect(context: &Context_, name: &str) -> (u16, Value) {
+/// Run `omar connect <backend>` (install, then the CLI's own sign-in), or
+/// with `sandbox` `omar connect <backend> --sandbox`, in a session Mission
+/// Control attaches a terminal to. One already running is reused, so a
+/// second click shows the same sign-in.
+fn start_connect(context: &Context_, name: &str, sandbox: bool) -> (u16, Value) {
     let Some(backend) = connectable(name) else {
         return (
             404,
@@ -2288,8 +2315,9 @@ fn start_connect(context: &Context_, name: &str) -> (u16, Value) {
     // A failed connect leaves its message on screen until a key is pressed;
     // a successful one ends the session, and the page sees it connected.
     let command = format!(
-        "{} connect {name} || {{ printf '\\nPress Enter to close.'; read _; }}",
-        crate::manager::shell_single_quote(&omar.display().to_string())
+        "{} connect {name}{} || {{ printf '\\nPress Enter to close.'; read _; }}",
+        crate::manager::shell_single_quote(&omar.display().to_string()),
+        if sandbox { " --sandbox" } else { "" }
     );
     let started = match client.has_session(&session) {
         Ok(true) => Ok(()),
@@ -2320,6 +2348,21 @@ fn check_backend(name: &str) -> (u16, Value) {
             422,
             json!({"error": format!("{} is signed in, but its test prompt failed: {error}", backend.kind().name())}),
         ),
+    }
+}
+
+/// Whether `name`'s agents reach their model from a sandbox: its CLI answers
+/// the test prompt in a throwaway one. 422 carries why not.
+fn check_sandbox(context: &Context_, name: &str) -> (u16, Value) {
+    let Some(backend) = connectable(name) else {
+        return (
+            404,
+            json!({"error": format!("'{name}' is not an assistant backend")}),
+        );
+    };
+    match crate::sandbox::check_connected(backend, &context.sandbox) {
+        Ok(()) => (200, json!({"ok": true})),
+        Err(error) => (422, json!({"error": error})),
     }
 }
 
@@ -3165,6 +3208,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     }
     let backends: Vec<&str> = state.agents.values().map(|a| a.backend.as_str()).collect();
     request.sandbox_template = match crate::sandbox::select(
+        request.sandbox,
         request.sandbox_template.as_deref(),
         request.no_sandbox,
         &context.sandbox,
