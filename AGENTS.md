@@ -70,3 +70,6 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 @CONTRIBUTING.md
 
 Follow [CONTRIBUTING.md](CONTRIBUTING.md). It holds the project's rules for humans and agents alike.
+
+Agents only:
+- Never edit the top-level `README.md`. It is public facing, and every change to it needs a human's approval. Propose the wording in the PR description or to the operator instead.

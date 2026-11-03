@@ -10,6 +10,7 @@ import { defaultRunTimeout, describeRunFailure } from "./lib/run-feedback";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
+import { BackendsPage } from "./backends-page";
 import { SettingsMenu } from "./settings-menu";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
@@ -64,6 +65,7 @@ import {
   stopRun,
   subscribeToDiagram,
   fetchConversations,
+  fetchBackendStatus,
   checkProperties,
   openProofEditor,
   describeError,
@@ -247,6 +249,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
+  const [backendsOpen, setBackendsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [historyRevision, setHistoryRevision] = useState(0);
@@ -1147,6 +1150,20 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   // messages, which told an operator nothing they wanted to know.
   const lag = typeof snapshot?.lag === "number" ? formatDuration(snapshot.lag) : "—";
   const canRun = daemon.state === "live";
+  // With no backend signed in there is nothing for the assistant to run on,
+  // so the Backends page comes first. Asked once per runtime.
+  useEffect(() => {
+    if (!canRun || readOnly || isDemo) return;
+    let cancelled = false;
+    fetchBackendStatus(serveUrl)
+      .then((list) => {
+        if (!cancelled && list && !list.some((status) => status.status === "connected")) setBackendsOpen(true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [canRun, readOnly, isDemo, serveUrl]);
   const retrying = run !== null && isRunFinished(run.status);
   const canConfirm = !readOnly && design !== null && ["review", "finished", "failed"].includes(phase);
   const failedRun = run?.status === "failed";
@@ -1479,7 +1496,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
             <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
-            <div className="conversation-actions"><SettingsMenu />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+            <div className="conversation-actions"><SettingsMenu onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
           </header>
           {daemon.state === "offline" ? (
             // The one place the outage is reported: the sidebar and composer
@@ -1582,6 +1599,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                     key={conversationId}
                     serveUrl={hydratedUrl ?? serveUrl}
                     live={daemon.state === "live"}
+                    onConnectMore={readOnly ? undefined : () => setBackendsOpen(true)}
                   />
                 )}
                 {!isDemo ? assistantTerminal : null}
@@ -1898,6 +1916,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       ) : null}
 
       {filesOpen && !readOnly ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); }} onClose={() => setFilesOpen(false)} /> : null}
+      {backendsOpen && !readOnly ? (
+        <BackendsPage serveUrl={hydratedUrl ?? serveUrl} onClose={() => setBackendsOpen(false)} />
+      ) : null}
       {terminalAgent ? (
         <AgentTerminal
           serveUrl={serveUrl}

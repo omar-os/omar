@@ -383,6 +383,32 @@ export async function startFakeServe({
         available: ["claude", "codex", "cursor", "opencode", "agy"],
       });
     }
+    if (request.method === "GET" && url.pathname === "/v1/agent/backends") {
+      return json(response, 200, {
+        backends: Object.entries(backendStatus).map(([name, status]) => ({ name, ...status, login: `omar connect ${name}` })),
+      });
+    }
+    // The daemon starts `omar connect <name>` in a session; here, pressing
+    // Enter in its terminal stands for finishing the sign-in.
+    const connect = /^\/v1\/backends\/([^/]+)\/connect$/.exec(url.pathname);
+    if (request.method === "POST" && connect) {
+      return readBody(request).then(() =>
+        connect[1] in backendStatus
+          ? json(response, 200, { terminal: `/v1/backends/${connect[1]}/terminal` })
+          : json(response, 404, { error: `'${connect[1]}' is not an assistant backend` }),
+      );
+    }
+    // The test prompt: fails for a key typed as "bad".
+    const check = /^\/v1\/backends\/([^/]+)\/check$/.exec(url.pathname);
+    if (request.method === "POST" && check) {
+      return readBody(request).then(() =>
+        !(check[1] in backendStatus)
+          ? json(response, 404, { error: `'${check[1]}' is not an assistant backend` })
+          : rejectedKeys[check[1]]
+            ? json(response, 422, { error: `${check[1]} is signed in, but its test prompt failed: 401 Invalid API Key` })
+            : json(response, 200, { ok: true }),
+      );
+    }
     if (request.method === "POST" && url.pathname === "/v1/agent/backend") {
       return readBody(request).then((body) => {
         let chosen;
@@ -483,9 +509,10 @@ export async function startFakeServe({
     // The assistant has a route of its own: its tmux session is not named
     // like an agent's, so no agent name reaches it.
     const assistant = url.pathname === "/v1/agent/terminal";
+    const signIn = /^\/v1\/backends\/([^/]+)\/terminal$/.exec(url.pathname);
     const match = assistant
       ? ["", "the assistant"]
-      : /^\/v1\/agents\/(.+)\/terminal$/.exec(url.pathname);
+      : signIn ?? /^\/v1\/agents\/(.+)\/terminal$/.exec(url.pathname);
     // CORS never reaches a WebSocket, so the daemon refuses foreign origins at
     // the handshake and the fake has to behave the same way.
     const origin = request.headers.origin;
@@ -513,6 +540,7 @@ export async function startFakeServe({
       if (terminalReflow) client.send(Buffer.from("\x1b[?1049h"));
       draw();
       if (!terminalReflow) client.send(Buffer.from(`${agent} $ `));
+      let typed = "";
       client.on("message", (data, isBinary) => {
         // A view port discards keystrokes and resizes alike.
         if (view) {
@@ -528,6 +556,16 @@ export async function startFakeServe({
           draw();
           return;
         }
+        // What is typed before Enter stands for the key: "bad" signs in
+        // with one its vendor rejects, which only the test prompt finds.
+        if (signIn) {
+          typed += data.toString();
+          if (typed.includes("\r")) {
+            backendStatus[agent] = { status: "connected", via: "fake sign-in" };
+            rejectedKeys[agent] = typed.startsWith("bad");
+            typed = "";
+          }
+        }
         client.send(Buffer.from(data));
       });
     });
@@ -536,6 +574,17 @@ export async function startFakeServe({
   viewServer?.on("upgrade", upgrade(true));
 
   let backend = "codex";
+  /** Backends signed in with a key the test prompt finds rejected. */
+  const rejectedKeys = {};
+  /** Each backend's status; a sign-in in its terminal connects it. */
+  const backendStatus = {
+    claude: { status: "connected", via: "Claude Max" },
+    codex: { status: "connected", via: "ChatGPT" },
+    cursor: { status: "signed_out" },
+    opencode: { status: "unknown", reason: "no answer" },
+    pi: { status: "not_installed" },
+    agy: { status: "not_installed" },
+  };
   function newChat() {
     return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map() };
   }

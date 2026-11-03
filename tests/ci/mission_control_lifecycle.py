@@ -49,6 +49,15 @@ print("Claude Code ready", flush=True)
 while True: time.sleep(1)
 ''')
     fake.chmod(0o700)
+    # Installed and signed out: pi reads its own store, which this HOME lacks.
+    stand_ins = root / "bin"
+    stand_ins.mkdir()
+    (stand_ins / "pi").write_text("#!/bin/sh\nexit 0\n")
+    (stand_ins / "pi").chmod(0o700)
+    env["PATH"] = f"{stand_ins}:{env['PATH']}"
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "OPENAI_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY",
+                "XAI_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "DEEPSEEK_API_KEY", "COPILOT_GITHUB_TOKEN", "PI_CODING_AGENT_DIR"):
+        env.pop(key, None)
     config = root / "config.toml"
     config.write_text('[agent]\ndefault_command = ' + json.dumps(str(fake)) + '\n')
     with socket.socket() as listener:
@@ -108,6 +117,16 @@ while True: time.sleep(1)
 
     try:
         first = launch()
+        # A backend that cannot start is refused, with how to sign it in,
+        # before the working assistant is touched.
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        connection.request("POST", "/v1/agent/backend", body=json.dumps({"backend": "pi"}))
+        refused = connection.getresponse()
+        reason = json.loads(refused.read())["error"]
+        connection.close()
+        assert refused.status == 409, (refused.status, reason)
+        assert reason == "pi is not signed in; run `omar connect pi`", reason
+        assert len(launches()) == 1 and not dead(launches()[0]["pid"]), "a refused switch touched the assistant"
         token = json.loads((Path(sessions[0]["directory"]) / "mcp/ea-0/context.json").read_text())["serve"]["token"]
         api("POST", "/v1/agent/reply", {"token": token, "text": "Saved before closing"})
         before = api("GET", "/v1/chat")
