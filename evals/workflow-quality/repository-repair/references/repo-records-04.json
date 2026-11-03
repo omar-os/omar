@@ -1,0 +1,252 @@
+{
+  "id": "repo-records-04",
+  "protected_tests": [
+    {
+      "id": "versions-1",
+      "request": {
+        "operation": "versions",
+        "payload": [
+          "1.10",
+          "1.2"
+        ]
+      },
+      "expected": [
+        "1.2",
+        "1.10"
+      ]
+    },
+    {
+      "id": "versions-2",
+      "request": {
+        "operation": "versions",
+        "payload": []
+      },
+      "expected": []
+    },
+    {
+      "id": "versions-3",
+      "request": {
+        "operation": "versions",
+        "payload": [
+          "2.0",
+          "1.9",
+          "1.9"
+        ]
+      },
+      "expected": [
+        "1.9",
+        "1.9",
+        "2.0"
+      ]
+    },
+    {
+      "id": "csv_row-1",
+      "request": {
+        "operation": "csv_row",
+        "payload": [
+          "a,b",
+          "c"
+        ]
+      },
+      "expected": "\"a,b\",c"
+    },
+    {
+      "id": "csv_row-2",
+      "request": {
+        "operation": "csv_row",
+        "payload": [
+          "say \"yes\"",
+          "x"
+        ]
+      },
+      "expected": "\"say \"\"yes\"\"\",x"
+    },
+    {
+      "id": "csv_row-3",
+      "request": {
+        "operation": "csv_row",
+        "payload": [
+          "a",
+          "b"
+        ]
+      },
+      "expected": "a,b"
+    },
+    {
+      "id": "merge-1",
+      "request": {
+        "operation": "merge",
+        "payload": {
+          "defaults": {
+            "x": 1
+          },
+          "overrides": {
+            "x": null
+          }
+        }
+      },
+      "expected": {
+        "x": null
+      }
+    },
+    {
+      "id": "merge-2",
+      "request": {
+        "operation": "merge",
+        "payload": {
+          "defaults": {
+            "x": 1
+          },
+          "overrides": {}
+        }
+      },
+      "expected": {
+        "x": 1
+      }
+    },
+    {
+      "id": "merge-3",
+      "request": {
+        "operation": "merge",
+        "payload": {
+          "defaults": {},
+          "overrides": {
+            "y": 2
+          }
+        }
+      },
+      "expected": {
+        "y": 2
+      }
+    },
+    {
+      "id": "page-1",
+      "request": {
+        "operation": "page",
+        "payload": {
+          "page": 1,
+          "size": 2,
+          "items": [
+            1,
+            2,
+            3
+          ]
+        }
+      },
+      "expected": [
+        1,
+        2
+      ]
+    },
+    {
+      "id": "page-2",
+      "request": {
+        "operation": "page",
+        "payload": {
+          "page": 2,
+          "size": 2,
+          "items": [
+            1,
+            2,
+            3
+          ]
+        }
+      },
+      "expected": [
+        3
+      ]
+    },
+    {
+      "id": "page-3",
+      "request": {
+        "operation": "page",
+        "payload": {
+          "page": 4,
+          "size": 2,
+          "items": [
+            1
+          ]
+        }
+      },
+      "expected": []
+    },
+    {
+      "id": "latest-1",
+      "request": {
+        "operation": "latest",
+        "payload": [
+          {
+            "id": "a",
+            "revision": 3
+          },
+          {
+            "id": "a",
+            "revision": 1
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": "a",
+          "revision": 3
+        }
+      ]
+    },
+    {
+      "id": "latest-2",
+      "request": {
+        "operation": "latest",
+        "payload": []
+      },
+      "expected": []
+    },
+    {
+      "id": "latest-3",
+      "request": {
+        "operation": "latest",
+        "payload": [
+          {
+            "id": "b",
+            "revision": 1
+          },
+          {
+            "id": "a",
+            "revision": 1
+          }
+        ]
+      },
+      "expected": [
+        {
+          "id": "a",
+          "revision": 1
+        },
+        {
+          "id": "b",
+          "revision": 1
+        }
+      ]
+    }
+  ],
+  "oracle_patch": {
+    "changes": [
+      {
+        "path": "candidate_app/core.py",
+        "content": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef page(p):\n    start=(p['page']-1)*p['size']\n    return p['items'][start:start+p['size']]\n\ndef latest(p):\n    best={}\n    for r in p:\n        if r['id'] not in best or r['revision']>best[r['id']]['revision']: best[r['id']]=r\n    return [best[k] for k in sorted(best)]\n"
+      }
+    ],
+    "explanation": "Authored fixture repair; independent review pending."
+  },
+  "label_author": "owned repository fixture generator",
+  "review_status": "provisional",
+  "critical_errors": [
+    "protected regression failure",
+    "input mutation",
+    "prohibited patch path",
+    "unexpected output or execution failure"
+  ],
+  "human_review_required": [
+    "patch meets complete specification beyond examples",
+    "patch is reasonable and does not hard-code protected cases"
+  ],
+  "independent_unit": "repository-records"
+}

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "id": "repo-inventory-05",
+  "family": "repository_repair",
+  "split": "development",
+  "group": "repository-inventory",
+  "instruction": "Repair the inventory package so its public API meets every README requirement. Reported defect: Available stock is max(on_hand-reserved,0), per SKU; preserve all on-hand keys. Preserve unrelated behavior and inputs. Return JSON with changes [{path, content}] containing complete UTF-8 text for each modified allowed source file, and explanation. Do not modify tests, metadata or other paths.",
+  "files": {
+    "candidate_app/policy.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef reserve(p):\n    stock=dict(p['stock'])\n    if any(stock.get(k,0)<v for k,v in p['request'].items()): return {'accepted':False,'stock':stock}\n    for k,v in p['request'].items(): stock[k]=stock.get(k,0)-v\n    return {'accepted':True,'stock':stock}\n\ndef replay(p):\n    seen=set(); total=0\n    for e in p:\n        if e['id'] not in seen: total+=e['delta']; seen.add(e['id'])\n    return total\n\ndef reorder(p):\n    return sorted(k for k,v in p['points'].items() if p['stock'].get(k,0)<=v)\n",
+    "candidate_app/core.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef allocate(p):\n    need=p['quantity']; allocations=[]\n    for batch in p['batches']:\n        take=min(need,batch['count'])\n        if take: allocations.append({'id':batch['id'],'count':take})\n        need-=take\n    return {'allocations':allocations,'unmet':need}\n\ndef available(p):\n    return {k:v-p['reserved'].get(k,0) for k,v in p['on_hand'].items()}\n",
+    "candidate_app/__init__.py": "from .api import handle\n",
+    "candidate_app/api.py": "from . import policy, core\n\nOPERATIONS = {\n    'reserve': policy.reserve,\n    'replay': policy.replay,\n    'reorder': policy.reorder,\n    'allocate': core.allocate,\n    'available': core.available,\n}\n\ndef handle(request):\n    return OPERATIONS[request['operation']](request['payload'])\n",
+    "pyproject.toml": "[project]\nname = 'owned-inventory-fixture'\nversion = '0.1.0'\nrequires-python = '>=3.11'\n",
+    "README.md": "# Owned diagnostic repository: inventory\n\nPublic API: candidate_app.handle({operation, payload}). Inputs must remain unchanged.\n\n- reserve: Reserve every requested quantity atomically. If any stock is insufficient return accepted=false and the unchanged stock. Never mutate input.\n- replay: Sum event quantity deltas, applying only the first occurrence of each event ID.\n- reorder: Return sorted SKUs whose stock is at or below the reorder point; use zero for missing stock.\n- allocate: Allocate requested quantity FIFO from positive batch counts. Return allocations and unmet quantity; do not mutate batches.\n- available: Available stock is max(on_hand-reserved,0), per SKU; preserve all on-hand keys.\n\nRun public checks with: python3 -m unittest discover -s tests\n",
+    "tests/test_public.py": "import unittest\nfrom candidate_app import handle\n\nclass PublicReproduction(unittest.TestCase):\n    def test_reported_issue(self):\n        self.assertEqual(handle({'operation': 'available', 'payload': {'on_hand': {'a': 2}, 'reserved': {'a': 4}}}), {'a': 0})\n"
+  },
+  "allowed_patch_paths": [
+    "candidate_app/api.py",
+    "candidate_app/core.py",
+    "candidate_app/policy.py"
+  ],
+  "entrypoint": "candidate_app:handle",
+  "visible_test": {
+    "id": "available-1",
+    "request": {
+      "operation": "available",
+      "payload": {
+        "on_hand": {
+          "a": 2
+        },
+        "reserved": {
+          "a": 4
+        }
+      }
+    },
+    "expected": {
+      "a": 0
+    }
+  },
+  "repository_digest": "fd431f93a3e8ac03812be6f23ae7c066e1e4f3a458d8694109d29dcf6538f6eb"
+}

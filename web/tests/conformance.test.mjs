@@ -95,6 +95,7 @@ const UNRESOLVABLE = `team Conformance[worker : NotARealBackend]
     output done : string
 
     prompt worker(go) -> done
+    task("Echo the request", "Return the request as the completed result.")
     "
         Echo $(go) into done.
     "
@@ -108,15 +109,25 @@ async function startRealServe() {
   const home = await mkdtemp(join(tmpdir(), "omar-conformance-"));
   // Agents run in tmux sessions named from this prefix. Without a unique one
   // the test would spawn into — and later kill — the developer's own sessions.
-  const sessionPrefix = `omar-conformance-${process.pid}-`;
+  const sessionPrefix = `omar-conformance-${process.pid}-${home.slice(-6)}-`;
+  const tmuxServer = sessionPrefix.slice(0, -1);
   await mkdir(join(home, ".omar"), { recursive: true });
   await writeFile(
     join(home, ".omar/config.toml"),
     `[dashboard]\nsession_prefix = "${sessionPrefix}"\n`,
   );
-  const child = spawn(OMAR_BIN, ["serve", "--address", "127.0.0.1:0", "--no-ea"], {
-    env: { ...process.env, HOME: home, OMARC_BIN },
+  const child = spawn(OMAR_BIN, ["--config", join(home, ".omar/config.toml"), "serve", "--address", "127.0.0.1:0", "--no-ea"], {
+    env: { ...process.env, OMAR_STATE_DIR: join(home, ".omar"), OMAR_TMUX_SERVER: tmuxServer, OMAR_SERVE_DIAGNOSTICS: "1", OMARC_BIN },
     stdio: ["ignore", "pipe", "pipe"],
+  });
+  let closing = false;
+  let diagnostics = "";
+  child.stderr.on("data", chunk => {
+    diagnostics = (diagnostics + chunk).slice(-16_384);
+    if (process.env.OMAR_CONFORMANCE_DIAGNOSTICS === "1") process.stderr.write(chunk);
+  });
+  child.on("exit", (code, signal) => {
+    if (!closing) process.stderr.write(`Local conformance daemon exited (${code ?? signal}): ${diagnostics}\n`);
   });
 
   const url = await new Promise((resolveUrl, rejectUrl) => {
@@ -143,18 +154,19 @@ async function startRealServe() {
     url,
     home,
     sessionPrefix,
+    diagnostics: () => diagnostics,
     async close() {
-      child.kill();
-      // A failed or finished run leaves its agent sessions behind, so the
-      // harness clears its own namespace rather than accumulating panes.
-      await new Promise((done) => {
-        const list = spawn("sh", [
-          "-c",
-          `tmux ls -F '#{session_name}' 2>/dev/null | grep '^${sessionPrefix}' | xargs -r -n1 tmux kill-session -t`,
-        ]);
-        list.on("exit", done);
-        list.on("error", done);
-      });
+      closing = true;
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise((done) => {
+          const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
+          child.once("exit", () => { clearTimeout(timer); done(); });
+          child.kill();
+        });
+      }
+      // Every daemon has its own server, including multiple daemons created
+      // by one Node process. Cleanup cannot reach another test or user pane.
+      spawnSync("tmux", ["-L", tmuxServer, "kill-server"], { stdio: "ignore" });
       await rm(home, { recursive: true, force: true });
     },
   };
@@ -356,6 +368,17 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     const token = context.serve?.token;
     assert.equal(typeof token, "string", "serve wrote its token into the context");
 
+    const legacy = UNRESOLVABLE.replace('    task("Echo the request", "Return the request as the completed result.")\n', '');
+    const rejected = await fetch(`${real.url}/v1/agent/proposals`, {
+      ...post({token, program:legacy, summary:"missing task copy", inputs:{}}),
+    });
+    assert.equal(rejected.status, 400);
+    assert.match((await rejected.json()).error, /only\.reaction\.0/);
+    const legacyCheck = await fetch(`${real.url}/v1/programs/check`, {
+      ...post({program:legacy}),
+    });
+    assert.equal((await legacyCheck.json()).ok, true, "older source still compiles");
+
     const response = await fetch(`${real.url}/v1/agent/proposals`, {
       ...post({ token, program: UNRESOLVABLE, summary: "conformance", inputs: {} }),
     });
@@ -369,6 +392,9 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     const preview = proposal.design.preview;
     assert.equal(preview.protocol_version, 1);
     assert.equal(preview.team, "Conformance");
+    assert.equal(preview.reactions[0].title, "Echo the request");
+    assert.equal(preview.reactions[0].description, "Return the request as the completed result.");
+    assert.equal(preview.reactions[0].name, "only.reaction.0");
     const ids = new Set([
       ...preview.ports.map((port) => port.id),
       ...preview.reactions.map((reaction) => reaction.id),
@@ -503,9 +529,17 @@ async function collectEvents(url, timeoutMs) {
 
 test("two chats run the same topology independently and retain their live panels", { skip: WIRE_SKIP, timeout: 60_000 }, async () => {
   const real = await startRealServe();
+  const checkedFetch = async (...args) => {
+    try { return await fetch(...args); }
+    catch (error) {
+      // Drain the diagnostic pipe before finally tears the child down.
+      await new Promise(resolve => setTimeout(resolve, 25));
+      throw new Error(`${error.message}: ${JSON.stringify(error.cause)}; daemon: ${real.diagnostics()}`, { cause: error });
+    }
+  };
   const post = (body) => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   const request = async (path, init) => {
-    const response = await fetch(`${real.url}${path}`, init);
+    const response = await checkedFetch(`${real.url}${path}`, init);
     const body = await response.json();
     assert.ok(response.ok, JSON.stringify(body));
     return body;
@@ -529,7 +563,7 @@ test("two chats run the same topology independently and retain their live panels
     assert.notEqual(a.diagram_address, b.diagram_address);
     const waitPanel = async (base, run) => {
       for (let attempt = 0; attempt < 100; attempt++) {
-        const response = await fetch(`${real.url}${base}/v1/runs/${run.run_id}/panel`);
+        const response = await checkedFetch(`${real.url}${base}/v1/runs/${run.run_id}/panel`);
         const panel = await response.json();
         // Admission can return before the run publishes its Web panel.
         assert.ok(response.ok || (response.status === 404 && panel.error === "run has no panel"), JSON.stringify(panel));

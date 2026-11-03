@@ -1,0 +1,28 @@
+name: Workflow quality tooling
+
+on:
+  pull_request:
+    paths:
+      - 'evals/workflow-quality/**'
+      - '.github/workflows/workflow-quality.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'evals/workflow-quality/**'
+      - '.github/workflows/workflow-quality.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  offline-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Test fixtures, frozen protocols, independent review and designer bounds
+        # Native requests are stubbed. Opt-in Docker qualification is separate.
+        run: python3 -m unittest discover -s evals/workflow-quality -p 'test_*.py'

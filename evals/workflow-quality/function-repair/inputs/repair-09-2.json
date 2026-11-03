@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "repair-09-2",
+  "family": "function_repair",
+  "split": "development",
+  "group": "repair-function-9",
+  "instruction": "Repair candidate.py. Return each number clamped to the inclusive range 0 to 10. Return JSON with patched_source and explanation. Define only repair(values), use no imports, attributes, filesystem, network, classes, while loops or recursion. Allowed builtins: sum, min, max, len, sorted, set, list, abs, range, enumerate. Do not mutate the input.",
+  "files": {
+    "candidate.py": "def repair(values):\n    return values\n"
+  },
+  "visible_test": {
+    "input": [],
+    "expected": []
+  }
+}

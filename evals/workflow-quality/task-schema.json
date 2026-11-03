@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Omar workflow diagnostic input",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "family",
+    "split",
+    "group",
+    "instruction"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "type": "string"
+    },
+    "family": {
+      "enum": [
+        "document_synthesis",
+        "repository_repair",
+        "function_repair"
+      ]
+    },
+    "split": {
+      "enum": [
+        "development",
+        "reserved"
+      ]
+    },
+    "group": {
+      "type": "string"
+    },
+    "instruction": {
+      "type": "string"
+    },
+    "sources": {
+      "type": "array"
+    },
+    "files": {
+      "type": "object"
+    },
+    "visible_test": {
+      "type": "object"
+    },
+    "allowed_patch_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "repository_digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "entrypoint": {
+      "const": "candidate_app:handle"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "family": {
+            "const": "repository_repair"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "files",
+          "allowed_patch_paths",
+          "repository_digest",
+          "entrypoint",
+          "visible_test"
+        ]
+      }
+    }
+  ]
+}

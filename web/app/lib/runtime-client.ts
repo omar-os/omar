@@ -94,12 +94,13 @@ export async function sendChat(
   selection: string[] = [],
   signal?: AbortSignal,
   conversationId?: string,
+  workflowPlan?: import("./protocol-generated").PlanRef,
 ): Promise<void> {
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(`${base}/v1/chat`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text, selection, conversation_id: conversationId }),
+    body: JSON.stringify({ text, selection, conversation_id: conversationId, workflow_plan: workflowPlan }),
     signal,
   });
   if (!response.ok) {

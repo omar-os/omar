@@ -10,7 +10,7 @@ import { sendChat, subscribeToChat } from "./runtime-client";
  * come. So messages arrive on a subscription rather than resolving a promise.
  */
 export type DesignAgent = {
-  send(text: string, selection?: string[]): Promise<void>;
+  send(text: string, selection?: string[], plan?: import("./protocol-generated").PlanRef): Promise<void>;
   subscribe(
     onMessage: (message: ChatMessage) => void,
     onConnectionChange: (connected: boolean) => void,
@@ -23,7 +23,7 @@ export type DesignAgent = {
 export function eaDesignAgent(serveUrl: string): DesignAgent {
   let conversationId: string | undefined;
   return {
-    send: (text, selection) => sendChat(serveUrl, text, selection ?? [], undefined, conversationId),
+    send: (text, selection, plan) => sendChat(serveUrl, text, selection ?? [], undefined, conversationId, plan),
     subscribe: (onMessage, onConnectionChange, onConversation, onState) =>
       subscribeToChat(serveUrl, onMessage, onConnectionChange, (conversation) => {
         conversationId = conversation.id;

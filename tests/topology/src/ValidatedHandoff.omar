@@ -1,0 +1,18 @@
+team ValidatedHandoff[writer : Web, checker : Web, repairer : Web] {
+    input request : string
+    action raw : string
+    action retry : string
+    action repaired : string
+    output result : string
+    output blocked : string
+
+    prompt writer(request) -> raw task("Draft the result", "Produce a draft from the supplied request.")
+        "Draft a JSON object with a supported value from $(request)."
+    prompt checker(raw) -> (result | retry) task("Check the draft", "Accept the supported draft or explain the failure.")
+        "Check $(raw). Write accepted JSON to result or a failure diagnosis to retry."
+    prompt repairer(retry) -> repaired task("Repair once", "Make one correction from the failure report.")
+        "Correct the draft using this failure report: $(retry)."
+    prompt checker(repaired) -> (result | blocked) task("Check the repair", "Accept the correction or report the unresolved failure.")
+        "Recheck $(repaired). Write accepted JSON to result or the unresolved failure to blocked."
+}
+main ValidatedHandoff { flow = ValidatedHandoff() }

@@ -1,0 +1,62 @@
+{
+  "id": "synthetic-extraction-v1",
+  "profile_id": "codex-quality",
+  "profile_version": 1,
+  "operation": "structured_extraction",
+  "source_kind": "public_benchmark",
+  "author": "Synthetic test fixture",
+  "source": "test://synthetic-benchmark",
+  "finding": "Synthetic result to exercise source-row import, not a quality claim.",
+  "limitations": "Invented test data; cannot nominate a real model or support qualification.",
+  "reviewed_at": 0,
+  "expires_at": 1796083200,
+  "locally_qualified": false,
+  "qualification": null,
+  "benchmark_result": {
+    "benchmark": "Synthetic source-row test",
+    "benchmark_version": "fixture-v1",
+    "published_at": 1793491200,
+    "retrieved_at": 1793577600,
+    "task_slice": "Synthetic extraction rows",
+    "target_scope": {
+      "task_family": "grounded-documents",
+      "task_slice": "supplied-fact-extraction",
+      "contract_version": "v1",
+      "complexity": "routine",
+      "consequence": "low",
+      "input_modalities": [
+        "text"
+      ],
+      "output_modalities": [
+        "structured_data"
+      ]
+    },
+    "profile_digest": "",
+    "measured_model": "gpt-6.1-sol",
+    "measured_backend": null,
+    "measured_harness": "Synthetic harness fixture-v1",
+    "measured_effort": null,
+    "measured_tools": null,
+    "sample_size": 10,
+    "score": 42.0,
+    "unit": "percent",
+    "direction": "higher_is_better",
+    "uncertainty": null,
+    "cost_usd": null,
+    "latency_ms": null,
+    "measurement_conditions": "Synthetic fixture; no calls, costs or latency measured.",
+    "applicability": "Test metadata only; no applicability to actual task performance.",
+    "dataset_overlap": "Unknown; test data only.",
+    "contamination": "Unknown; test data only.",
+    "source_row": {
+      "snapshot": "",
+      "snapshot_digest": "",
+      "locator": "Synthetic result row 1",
+      "row_pointer": "/results/0",
+      "score_pointer": "/results/0/score",
+      "model_pointer": "/results/0/model",
+      "unit_pointer": "/results/0/unit"
+    },
+    "review": null
+  }
+}

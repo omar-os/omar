@@ -47,7 +47,24 @@ pub struct TopologyMcpContext {
 pub struct ServeMcpContext {
     pub endpoint: String,
     pub token: String,
+    #[serde(default)]
+    pub design_only: bool,
 }
+
+impl McpLaunchContext {
+    pub fn design_only(&self) -> bool {
+        self.serve.as_ref().is_some_and(|serve| serve.design_only)
+    }
+}
+
+pub(crate) const DESIGN_TOOLS: &[&str] = &[
+    "omar_reply",
+    "omar_propose_design",
+    "omar_get_execution_profiles",
+    "omar_get_capability_evidence",
+    "omar_research_workflow",
+    "omar_get_workflow_plan",
+];
 
 #[derive(Debug, Clone)]
 pub struct ManagerRuntimeOptions {
@@ -492,7 +509,11 @@ pub fn build_ea_command(
     let combined_path = state_dir.join("ea_prompt_combined.md");
     std::fs::create_dir_all(&state_dir).ok();
 
-    let combined = match (mem.is_empty(), notes.is_empty()) {
+    let combined = if mcp_context.design_only() {
+        format!("You are the workflow designer in an explicitly scoped design-only session. Use only the six OMAR design tools. Research this operator's request, propose a useful provisional workflow, ask focused questions, and revise from actual saved answers. You cannot run workflows, spawn agents, manage sessions or message third parties. Workflow execution belongs to the operator. Reply through omar_reply; submit designs through omar_propose_design. Native tools may be separately disabled by the launcher.\n\n{}\n\nLanguage specification (embedded with this binary):\n{}",
+            include_str!("../../prompts/workflow-design.md"), include_str!("../../lang/spec.md"))
+    } else {
+        match (mem.is_empty(), notes.is_empty()) {
         (true, true) => prompt_content,
         (false, true) => format!(
             "{}\n\n---\n\n## Current OMAR State (from previous session)\n\n{}",
@@ -506,6 +527,7 @@ pub fn build_ea_command(
             "{}\n\n---\n\n## Current OMAR State (from previous session)\n\n{}\n\n## Manager Notes (from previous session)\n\n{}",
             prompt_content, mem, notes
         ),
+    }
     };
     // For claude (file flag) we resolve `{{EA_ID}}` / `{{EA_NAME}}` on
     // disk. The other backends still go through `build_agent_command`,
@@ -1037,6 +1059,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ea = test_mcp_context(dir.path());
         ea.serve = Some(ServeMcpContext {
+            design_only: false,
             endpoint: "127.0.0.1:1".into(),
             token: "test".into(),
         });
@@ -1062,6 +1085,43 @@ pub(crate) mod tests {
         assert_eq!(read(a_path).agent_name.as_deref(), Some("worker/a"));
         assert_eq!(read(b_path).agent_name.as_deref(), Some("worker-b"));
         assert!(read(shared_path).serve.is_none());
+    }
+
+    #[test]
+    fn design_scope_survives_context_storage_and_uses_the_embedded_language_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_mcp_context(dir.path());
+        context.serve = Some(ServeMcpContext {
+            endpoint: "127.0.0.1:1".into(),
+            token: "test".into(),
+            design_only: true,
+        });
+        let path = materialize_mcp_context_file(&context).unwrap();
+        let decoded: McpLaunchContext =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(decoded.design_only());
+        let old: ServeMcpContext =
+            serde_json::from_value(serde_json::json!({"endpoint":"localhost:1","token":"test"}))
+                .unwrap();
+        assert!(!old.design_only);
+        let _ = build_ea_command(
+            "codex --sandbox read-only",
+            0,
+            "diagnostic",
+            dir.path(),
+            &decoded,
+        );
+        let prompt =
+            std::fs::read_to_string(ea::ea_state_dir(0, dir.path()).join("ea_prompt_combined.md"))
+                .unwrap();
+        assert!(prompt.contains("design-only session"));
+        assert!(prompt.contains(include_str!("../../lang/spec.md")));
+        assert!(prompt.contains(include_str!("../../prompts/workflow-design.md")));
+        let flags = crate::backend::codex::codex_mcp_overrides(&decoded).unwrap();
+        for name in DESIGN_TOOLS {
+            assert!(flags.contains(&format!("tools.{name}.approval_mode")));
+        }
+        assert!(!flags.contains("tools.spawn_agent.approval_mode"));
     }
 
     // Exercise the real manager lifecycle: worktree/backend launchers can keep
@@ -1228,6 +1288,7 @@ pub(crate) mod tests {
             std::env::temp_dir().join(format!("omar-serve-ctx-{}", uuid::Uuid::new_v4()));
         let context = McpLaunchContext {
             serve: Some(ServeMcpContext {
+                design_only: false,
                 endpoint: "127.0.0.1:7340".to_string(),
                 token: "secret-token".to_string(),
             }),
@@ -1411,6 +1472,7 @@ pub(crate) mod tests {
         std::fs::write(&prompt, "be helpful").unwrap();
 
         for base in [
+            "codex --dangerously-bypass-approvals-and-sandbox --model gpt-5.6-sol",
             "codex -c arbitrary_config=true",
             "codex --profile work",
             "codex -p work",
@@ -1429,11 +1491,9 @@ pub(crate) mod tests {
             assert!(!cmd.contains("CODEX_HOME="));
         }
 
-        // The flags OMAR always adds are not on that list.
-        for base in [
-            "codex",
-            "codex --dangerously-bypass-approvals-and-sandbox --model gpt-5.6-sol",
-        ] {
+        // Explicit models must reach the native engine; default sandbox flags
+        // can still use the attached app-server path.
+        for base in ["codex", "codex --dangerously-bypass-approvals-and-sandbox"] {
             let cmd = build_agent_command(base, &prompt, &[], &test_mcp_context(dir.path()));
             assert!(
                 crate::backend::codex::codex_launch_socket(&cmd).is_some(),

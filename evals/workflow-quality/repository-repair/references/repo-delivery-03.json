@@ -1,0 +1,212 @@
+{
+  "id": "repo-delivery-03",
+  "protected_tests": [
+    {
+      "id": "parcels-1",
+      "request": {
+        "operation": "parcels",
+        "payload": {
+          "count": 6,
+          "capacity": 3
+        }
+      },
+      "expected": [
+        3,
+        3
+      ]
+    },
+    {
+      "id": "parcels-2",
+      "request": {
+        "operation": "parcels",
+        "payload": {
+          "count": 0,
+          "capacity": 4
+        }
+      },
+      "expected": []
+    },
+    {
+      "id": "parcels-3",
+      "request": {
+        "operation": "parcels",
+        "payload": {
+          "count": 7,
+          "capacity": 3
+        }
+      },
+      "expected": [
+        3,
+        3,
+        1
+      ]
+    },
+    {
+      "id": "zones-1",
+      "request": {
+        "operation": "zones",
+        "payload": {
+          "postal": "12345",
+          "zones": {
+            "1": "broad",
+            "123": "local"
+          }
+        }
+      },
+      "expected": "local"
+    },
+    {
+      "id": "zones-2",
+      "request": {
+        "operation": "zones",
+        "payload": {
+          "postal": "999",
+          "zones": {
+            "1": "x"
+          }
+        }
+      },
+      "expected": null
+    },
+    {
+      "id": "zones-3",
+      "request": {
+        "operation": "zones",
+        "payload": {
+          "postal": "123",
+          "zones": {
+            "12": "x"
+          }
+        }
+      },
+      "expected": "x"
+    },
+    {
+      "id": "billable-1",
+      "request": {
+        "operation": "billable",
+        "payload": {
+          "actual": 1001,
+          "dimensional": 0
+        }
+      },
+      "expected": 2
+    },
+    {
+      "id": "billable-2",
+      "request": {
+        "operation": "billable",
+        "payload": {
+          "actual": 0,
+          "dimensional": 0
+        }
+      },
+      "expected": 0
+    },
+    {
+      "id": "billable-3",
+      "request": {
+        "operation": "billable",
+        "payload": {
+          "actual": 500,
+          "dimensional": 2000
+        }
+      },
+      "expected": 2
+    },
+    {
+      "id": "events-1",
+      "request": {
+        "operation": "events",
+        "payload": [
+          "b",
+          "a",
+          "b"
+        ]
+      },
+      "expected": [
+        "b",
+        "a"
+      ]
+    },
+    {
+      "id": "events-2",
+      "request": {
+        "operation": "events",
+        "payload": []
+      },
+      "expected": []
+    },
+    {
+      "id": "events-3",
+      "request": {
+        "operation": "events",
+        "payload": [
+          "x",
+          "x"
+        ]
+      },
+      "expected": [
+        "x"
+      ]
+    },
+    {
+      "id": "charge-1",
+      "request": {
+        "operation": "charge",
+        "payload": {
+          "base": "1",
+          "rate": "0.335",
+          "kg": 1
+        }
+      },
+      "expected": "1.34"
+    },
+    {
+      "id": "charge-2",
+      "request": {
+        "operation": "charge",
+        "payload": {
+          "base": "0",
+          "rate": "0",
+          "kg": 0
+        }
+      },
+      "expected": "0.00"
+    },
+    {
+      "id": "charge-3",
+      "request": {
+        "operation": "charge",
+        "payload": {
+          "base": "2.00",
+          "rate": "1.20",
+          "kg": 2
+        }
+      },
+      "expected": "4.40"
+    }
+  ],
+  "oracle_patch": {
+    "changes": [
+      {
+        "path": "candidate_app/policy.py",
+        "content": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef parcels(p):\n    full,rest=divmod(p['count'],p['capacity'])\n    return [p['capacity']]*full+([rest] if rest else [])\n\ndef zones(p):\n    matches=[k for k in p['zones'] if p['postal'].startswith(k)]\n    return p['zones'][max(matches,key=len)] if matches else None\n\ndef billable(p):\n    return (max(p['actual'],p['dimensional'])+999)//1000\n"
+      }
+    ],
+    "explanation": "Authored fixture repair; independent review pending."
+  },
+  "label_author": "owned repository fixture generator",
+  "review_status": "provisional",
+  "critical_errors": [
+    "protected regression failure",
+    "input mutation",
+    "prohibited patch path",
+    "unexpected output or execution failure"
+  ],
+  "human_review_required": [
+    "patch meets complete specification beyond examples",
+    "patch is reasonable and does not hard-code protected cases"
+  ],
+  "independent_unit": "repository-delivery"
+}

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "repair-12-2",
+  "family": "function_repair",
+  "split": "reserved",
+  "group": "repair-function-12",
+  "instruction": "Repair candidate.py. Return the number of distinct elements. Return JSON with patched_source and explanation. Define only repair(values), use no imports, attributes, filesystem, network, classes, while loops or recursion. Allowed builtins: sum, min, max, len, sorted, set, list, abs, range, enumerate. Do not mutate the input.",
+  "files": {
+    "candidate.py": "def repair(values):\n    return len(values)\n"
+  },
+  "visible_test": {
+    "input": [],
+    "expected": 0
+  }
+}

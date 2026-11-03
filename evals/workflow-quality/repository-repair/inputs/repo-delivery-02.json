@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "repo-delivery-02",
+  "family": "repository_repair",
+  "split": "development",
+  "group": "repository-delivery",
+  "instruction": "Repair the delivery package so its public API meets every README requirement. Reported defect: Choose the longest matching postal prefix; return its zone or null when no prefix matches. Preserve unrelated behavior and inputs. Return JSON with changes [{path, content}] containing complete UTF-8 text for each modified allowed source file, and explanation. Do not modify tests, metadata or other paths.",
+  "files": {
+    "candidate_app/policy.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef parcels(p):\n    full,rest=divmod(p['count'],p['capacity'])\n    return [p['capacity']]*full+([rest] if rest else [])\n\ndef zones(p):\n    return next((v for k,v in p['zones'].items() if p['postal'].startswith(k)),None)\n\ndef billable(p):\n    return (max(p['actual'],p['dimensional'])+999)//1000\n",
+    "candidate_app/core.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef events(p):\n    return list(dict.fromkeys(p))\n\ndef charge(p):\n    amount=Decimal(p['base'])+Decimal(p['rate'])*p['kg']\n    return str(amount.quantize(Decimal('0.01'),rounding=ROUND_HALF_UP))\n",
+    "candidate_app/__init__.py": "from .api import handle\n",
+    "candidate_app/api.py": "from . import policy, core\n\nOPERATIONS = {\n    'parcels': policy.parcels,\n    'zones': policy.zones,\n    'billable': policy.billable,\n    'events': core.events,\n    'charge': core.charge,\n}\n\ndef handle(request):\n    return OPERATIONS[request['operation']](request['payload'])\n",
+    "pyproject.toml": "[project]\nname = 'owned-delivery-fixture'\nversion = '0.1.0'\nrequires-python = '>=3.11'\n",
+    "README.md": "# Owned diagnostic repository: delivery\n\nPublic API: candidate_app.handle({operation, payload}). Inputs must remain unchanged.\n\n- parcels: Split a nonnegative integer item count into full capacity parcels then one remainder; omit zero-size parcels.\n- zones: Choose the longest matching postal prefix; return its zone or null when no prefix matches.\n- billable: Billable kilograms are ceiling(max(actual grams, dimensional grams)/1000), with zero weight billed zero.\n- events: Return unique tracking event IDs in first-seen order.\n- charge: Compute decimal base plus per-kg rate times weight, rounding half up to exactly two decimal places as text.\n\nRun public checks with: python3 -m unittest discover -s tests\n",
+    "tests/test_public.py": "import unittest\nfrom candidate_app import handle\n\nclass PublicReproduction(unittest.TestCase):\n    def test_reported_issue(self):\n        self.assertEqual(handle({'operation': 'zones', 'payload': {'postal': '12345', 'zones': {'1': 'broad', '123': 'local'}}}), 'local')\n"
+  },
+  "allowed_patch_paths": [
+    "candidate_app/api.py",
+    "candidate_app/core.py",
+    "candidate_app/policy.py"
+  ],
+  "entrypoint": "candidate_app:handle",
+  "visible_test": {
+    "id": "zones-1",
+    "request": {
+      "operation": "zones",
+      "payload": {
+        "postal": "12345",
+        "zones": {
+          "1": "broad",
+          "123": "local"
+        }
+      }
+    },
+    "expected": "local"
+  },
+  "repository_digest": "a72c8a833e5e91735453774164eef37df80b16d2ed0eca14d2123b8ba59917ef"
+}

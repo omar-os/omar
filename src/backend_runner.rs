@@ -203,12 +203,45 @@ async fn accept_messages(listener: tokio::net::UnixListener, queue: Arc<Queue>) 
     }
 }
 
+fn append_native_usage(path: &Path, request_id: &str, event: &Value) -> Result<()> {
+    let mut turns: Vec<Value> = if path.exists() {
+        serde_json::from_slice(&std::fs::read(path)?)?
+    } else {
+        Vec::new()
+    };
+    turns.push(json!({"native_request_id":request_id,"native_event":"turn.completed","process_success":null,
+        "native_finished_at":null,"recorded_at":crate::workflow_design::now(),"usage":event.get("usage"),
+        "model":event.get("model"),"effort":event.get("reasoning_effort")}));
+    crate::topology::write_json_atomic(path, &turns)
+}
+
+fn finish_native_usage(path: &Path, request_id: &str, success: bool) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut turns: Vec<Value> = serde_json::from_slice(&std::fs::read(path)?)?;
+    let mut changed = false;
+    for turn in &mut turns {
+        if turn["native_request_id"] == request_id {
+            turn["process_success"] = json!(success);
+            turn["native_finished_at"] = json!(crate::workflow_design::now());
+            changed = true;
+        }
+    }
+    if changed {
+        crate::topology::write_json_atomic(path, &turns)?;
+    }
+    Ok(())
+}
+
 async fn codex_turn(
     config: &Config,
     context: &crate::manager::McpLaunchContext,
     queue: &Queue,
     prompt: &str,
+    usage_path: Option<PathBuf>,
 ) -> Result<()> {
+    let native_request_id = uuid::Uuid::new_v4().to_string();
     let previous = queue.state.lock().await.session.clone();
     let resume = previous
         .map(|session| format!(" resume {}", crate::manager::shell_single_quote(&session)))
@@ -250,15 +283,29 @@ async fn codex_turn(
                     println!("{text}");
                 }
             }
-            Some("turn.completed") => completed = true,
+            Some("turn.completed") => {
+                completed = true;
+                // Native usage belongs to the engine event, not terminal
+                // scraping or an estimate based on the requested model.
+                if let Some(path) = &usage_path {
+                    if let Err(error) = append_native_usage(path, &native_request_id, &event) {
+                        eprintln!("Native usage evidence is unavailable: {error:#}");
+                    }
+                }
+            }
             Some("turn.failed" | "error") => bail!("Codex exec turn failed: {event}"),
             _ => {}
         }
     }
-    anyhow::ensure!(
-        child.wait().await?.success() && completed,
-        "Codex exec exited without completing its turn"
-    );
+    let success = child.wait().await?.success() && completed;
+    if let Some(path) = &usage_path {
+        if let Err(error) = finish_native_usage(path, &native_request_id, success) {
+            // An evidence write must not leave a successfully executed request
+            // pending for replay. Incomplete evidence stays unknown instead.
+            eprintln!("Native access evidence could not be finalized: {error:#}");
+        }
+    }
+    anyhow::ensure!(success, "Codex exec exited without completing its turn");
     Ok(())
 }
 
@@ -396,7 +443,7 @@ pub async fn run(path: &Path) -> Result<()> {
                 }
                 continue;
             };
-            let live = if context.topology.is_none() {
+            let live = if context.topology.is_none() && !context.design_only() {
                 crate::supervision::context_message(&crate::supervision::context(&context.omar_dir, context.ea_id, context.agent_name.as_deref().unwrap_or("ea"))?)
             } else { String::new() };
             let origin = if message.operator { "Operator message" } else { "OMAR coordination event (not operator input)" };
@@ -404,7 +451,7 @@ pub async fn run(path: &Path) -> Result<()> {
             // the state read immediately before this native turn.
             let prompt = format!("{instructions}\n\n[{origin}; message {}]\n{}\n\n{live}", message.id, message.text);
             if config.backend == "codex" {
-                codex_turn(&config, &context, &queue, &prompt).await?;
+                codex_turn(&config, &context, &queue, &prompt, std::env::var_os("OMAR_USAGE_FILE").map(PathBuf::from)).await?;
             } else if config.backend == "cursor" {
                 let engine = engine.as_mut().unwrap();
                 let session = queue.state.lock().await.session.clone().context("missing ACP session")?;
@@ -443,6 +490,76 @@ pub async fn run(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn codex_access_evidence_checks_actual_child_exit_after_completion_event() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let context: crate::manager::McpLaunchContext = serde_json::from_value(json!({
+            "omar_dir":dir.path(),"ea_id":1,"session_prefix":"test","default_command":"unused",
+            "default_workdir":dir.path(),"health_idle_warning":0,"agent_name":"fixture-worker"
+        }))
+        .unwrap();
+        let queue = Queue {
+            path: dir.path().join("queue.json"),
+            state: Mutex::new(Inbox::default()),
+            changed: Notify::new(),
+        };
+        for exit_code in [0, 1] {
+            let script = dir.path().join(format!("native-fixture-{exit_code}"));
+            std::fs::write(&script,format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\nexit {exit_code}\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let config = Config {
+                backend: "codex".into(),
+                command: crate::manager::shell_single_quote(&script.to_string_lossy()),
+                context_file: dir.path().join("context.json"),
+                prompt_file: dir.path().join("prompt"),
+                socket: dir.path().join("socket"),
+                initial_session: None,
+            };
+            let usage = dir.path().join(format!("usage-{exit_code}.json"));
+            let result = codex_turn(
+                &config,
+                &context,
+                &queue,
+                "Synthetic test input",
+                Some(usage.clone()),
+            )
+            .await;
+            assert_eq!(result.is_ok(), exit_code == 0);
+            let turns: Vec<Value> =
+                serde_json::from_slice(&std::fs::read(&usage).unwrap()).unwrap();
+            assert_eq!(turns[0]["process_success"], exit_code == 0);
+            assert_eq!(turns[0]["native_event"], "turn.completed");
+            assert!(turns[0]["model"].is_null());
+            if exit_code == 0 {
+                let unavailable = dir.path().join("unwritable-ledger");
+                std::fs::create_dir(&unavailable).unwrap();
+                assert!(codex_turn(&config,&context,&queue,"Synthetic test input",Some(unavailable)).await.is_ok(),
+                    "an evidence write failure must not turn a completed native request into a replayable failure");
+            }
+        }
+    }
+
+    #[test]
+    fn native_completion_ledger_requires_successful_exit_and_preserves_prior_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let event = json!({"usage":{"input_tokens":3,"output_tokens":2},"model":null});
+        append_native_usage(&path, "first", &event).unwrap();
+        let read = || serde_json::from_slice::<Vec<Value>>(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(read()[0]["process_success"].is_null());
+        finish_native_usage(&path, "first", true).unwrap();
+        assert_eq!(read()[0]["process_success"], true);
+        append_native_usage(&path, "second", &event).unwrap();
+        finish_native_usage(&path, "second", false).unwrap();
+        let records = read();
+        assert_eq!(records[0]["process_success"], true);
+        assert_eq!(records[1]["process_success"], false);
+        assert_eq!(records[0]["native_event"], "turn.completed");
+        assert!(records[0]["model"].is_null());
+        assert!(records[0]["native_finished_at"].as_u64().is_some());
+    }
 
     #[test]
     fn cursor_spinner_prefix_does_not_discard_initialize_reply() {

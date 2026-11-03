@@ -30,6 +30,7 @@ mod tmux;
 mod topology;
 mod ui;
 mod web_assets;
+mod workflow_design;
 mod workspace;
 
 use std::io;
@@ -100,6 +101,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Prepare and review published benchmark records offline
+    WorkflowEvidence {
+        #[command(subcommand)]
+        action: workflow_design::benchmark_import::Action,
+    },
     /// Inspect and version team-instance files (not runtime checkpoints)
     Workspace {
         #[command(subcommand)]
@@ -393,7 +399,13 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::parse() {
+        Cli {
+            command: Some(Commands::WorkflowEvidence { action }),
+            ..
+        } => return workflow_design::benchmark_import::run(action),
+        cli => cli,
+    };
     let mut config = Config::load(cli.config.as_deref())?;
     if let Some(ref agent) = cli.agent {
         config.agent.default_command = crate::backend::resolve(agent)
@@ -422,6 +434,9 @@ async fn async_main() -> Result<()> {
     }
 
     match cli.command {
+        Some(Commands::WorkflowEvidence { action }) => {
+            workflow_design::benchmark_import::run(action)
+        }
         Some(Commands::Spawn {
             name,
             command,
@@ -597,6 +612,10 @@ async fn async_main() -> Result<()> {
             topology::run_topology(
                 &bytecode,
                 topology::TopologyRunConfig {
+                    step_policies: &std::collections::BTreeMap::new(),
+                    output_checks: &std::collections::BTreeMap::new(),
+                    receipt_directory: None,
+                    execution_profiles: &std::collections::BTreeMap::new(),
                     ea_id: target.id,
                     omar_dir: &omar_dir,
                     generated: &generated,
@@ -770,6 +789,9 @@ async fn async_main() -> Result<()> {
 }
 
 fn omar_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("OMAR_STATE_DIR").filter(|p| !p.is_empty()) {
+        return PathBuf::from(path);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".omar")

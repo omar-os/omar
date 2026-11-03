@@ -136,6 +136,7 @@ mod tests {
         context.serve = Some(crate::manager::ServeMcpContext {
             endpoint: "localhost:1".into(),
             token: "test".into(),
+            design_only: false,
         });
         let session = dir.path().join("saved chat.jsonl");
         std::fs::write(&session, "{}").unwrap();

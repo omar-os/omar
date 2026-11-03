@@ -14,6 +14,7 @@ import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { catalog, sourceDigest, workflowFixture, fixtureProfileFacts, fixtureBenchmarkEvidence } from "./workflow-fixture.mjs";
 
 /** Mirrors the daemon's cap; the names reach the assistant's pane. */
 const MAX_SELECTION = 64;
@@ -40,13 +41,26 @@ export async function startFakeServe({
   port = 0,
   /** Which captured topology to replay; see tests/fixtures. */
   snapshot: snapshotFile = "diagram-snapshot.v1.json",
+  /** Optional task copy over the captured execution topology. */
+  taskMetadata = {},
   /** The geometry a terminal announces, as the daemon reports the agent's. */
   terminal: terminalSize = { cols: 96, rows: 28 },
   terminalReflow = false,
+  workflowDesign = false,
+  workflowRepositoryChecks = false,
+  workflowIssues = /** @type {import("../app/lib/protocol-generated").ResearchIssue[]} */ ([]),
+  workflowToolBlocked = false,
+  workflowFacts = /** @type {"current" | "expired" | null} */ (null),
+  workflowFactsLifetimeSeconds = 3600,
+  workflowBenchmark = false,
 } = {}) {
   const golden = JSON.parse(
     await readFile(new URL(`./fixtures/${snapshotFile}`, import.meta.url), "utf8"),
   );
+  for (const reaction of golden.reactions) {
+    const copy = taskMetadata[reaction.id];
+    if (copy) Object.assign(reaction, { title: copy.title, description: copy.description });
+  }
 
   /** @type {Map<string, {record: object, snapshot: object, subscribers: Set<import("node:http").ServerResponse>, sequence: number}>} */
   const runs = new Map();
@@ -61,6 +75,62 @@ export async function startFakeServe({
     if (request.method === "OPTIONS") {
       response.writeHead(204, CORS).end();
       return;
+    }
+    if (url.pathname === "/v1/workflow/profiles") return json(response, 200, catalog);
+    if (url.pathname === "/v1/workflow/evidence") return json(response, 200, {revision:"test-fixture",evidence:workflowBenchmark ? [...catalog.evidence,fixtureBenchmarkEvidence()] : catalog.evidence});
+    if (request.method === "POST" && url.pathname.startsWith("/v1/workflow/")) {
+      const body = JSON.parse(await readBody(request));
+      if (url.pathname.endsWith("/import")) {
+        const bundle=body.bundle;
+        if(bundle.schema_version!==1 || sourceDigest(bundle.program)!==bundle.source_digest) return json(response,400,{error:"workflow bundle source digest mismatch"});
+        const next=workflowFixture(bundle.program,bundle.inputs,golden,chat.id);
+        next.draft=structuredClone(bundle.draft);next.draft.revises=null;next.draft.intent.message_sequences=[];next.draft.research.session_id=null;next.draft.research.usage=null;
+        for(const a of next.draft.intent.assumptions){a.accepted=false;a.confirmation=null;}
+        for(const q of next.draft.questions){q.answer=null;q.answer_record=null;}
+        next.profiles=structuredClone(bundle.profiles);
+        for(const [agent,p] of Object.entries(next.profiles)) {
+          if(!catalog.profiles.some(current=>current.id===p.id && current.model===p.model && current.version===p.version)) return json(response,400,{error:"imported profile differs from destination"});
+          next.draft.preferences.overrides[agent]=p.id;
+          const decision=next.selections.find(s=>s.agent===agent);if(decision)decision.profile_id=p.id;
+        }
+        chat.plans.set(next.id,next);
+        const preview=structuredClone(golden);preview.status="ready";
+        publishChat("assistant","Imported workflow. Review its assumptions and model choices before running.", {plan:{id:next.id,revision:1},program:next.program,inputs:next.inputs,preview}, false, [], chat);
+        return json(response,200,next);
+      }
+      if (url.pathname.endsWith("/receipts")) {
+        const entry=chat.runs.get(body.run_id);
+        if (!entry) return json(response,404,{error:"run not found"});
+        return json(response,200,{schema_version:1,run_id:body.run_id,plan:entry.plan,source_digest:entry.source_digest,profiles:entry.profiles,started_at:entry.record.started_at,finished_at:entry.record.finished_at,status:entry.record.status,error:entry.record.error,verification:[],repository_checks:workflowRepositoryChecks ? [{invocation_id:"fixture-check",reaction:"flow.checker",verifier_id:"fixture-suite",verifier_digest:"a".repeat(64),image:"sha256:"+"b".repeat(64),candidate_digest:"c".repeat(64),status:"passed",test_count:15,elapsed_ms:120,artifact:"fixture"}] : [],observed_models:{},observed_efforts:{},backend_versions:{},input_tokens:null,output_tokens:null,cost_usd:null});
+      }
+      if (url.pathname.endsWith("/access-evidence")) {
+        const entry=chat.runs.get(body.run_id);
+        if(!entry || !entry.profiles?.[body.agent]) return json(response,400,{error:"agent has no saved native profile in this run"});
+        return json(response,200,{run_id:body.run_id,agent:body.agent,profile_id:entry.profiles[body.agent].id,profile_digest:"fixture",connection_scope:null,backend_version:null,runtime_contract:"native-profiles-v5",status:"insufficient_evidence",observed_at:null,observed_model:null,observed_effort:null,invocation_ids:[],native_request_ids:[],artifact_digests:{},report_digest:sourceDigest("fixture"),limitations:["Synthetic fixture has no complete native model request evidence. Operator review is required."],new_model_requests:0,adapter_cost_usd:0,recorded_run_cost_usd:null});
+      }
+      const plan=chat.plans.get(body.id);
+      if (!plan) return json(response,404,{error:"plan not found in this chat"});
+      if (url.pathname.endsWith("/export")) {
+        const draft=structuredClone(plan.draft);draft.revises=null;draft.intent.message_sequences=[];draft.research.session_id=null;draft.research.usage=null;
+        return json(response,200,{schema_version:1,program:plan.program,source_digest:plan.source_digest,inputs:plan.inputs,draft,profiles:plan.profiles,evidence_revision:plan.evidence_revision,routing_policy_revision:plan.routing_policy_revision});
+      }
+      if (url.pathname.endsWith("/plan")) return json(response,200,plan);
+      if (url.pathname.endsWith("/plans")) {
+        if (plan.revision!==body.expected_revision) return json(response,409,{error:"revision conflict"});
+        const next=structuredClone(plan);next.revision++;next.program=body.program;next.inputs=body.inputs;next.source_digest=sourceDigest(body.program);
+        for(const q of next.draft.questions) if(body.answers[q.id]) {
+          if(q.answer!==body.answers[q.id] || !q.answer_record) q.answer_record={id:next.id,revision:next.revision};
+          q.answer=body.answers[q.id];
+        }
+        for(const a of next.draft.intent.assumptions) {
+          a.accepted=body.accepted_assumptions.includes(a.id);
+          a.confirmation=a.accepted ? (a.confirmation ?? {kind:"assumption",plan:{id:next.id,revision:next.revision},assumption_id:a.id,text_digest:sourceDigest(a.text)}) : null;
+        }
+        next.draft.preferences.overrides=body.overrides;
+        for(const [agent,id] of Object.entries(body.overrides)) {const p=catalog.profiles.find(p=>p.id===id);if(!p)return json(response,400,{error:"unknown profile"});next.profiles[agent]=p;Object.assign(next.selections.find(s=>s.agent===agent), {profile_id:p.id,reason:`Operator selected ${p.label}. Task qualification remains provisional.`});}
+        if(workflowFacts) fixtureProfileFacts(next,workflowFacts,workflowFactsLifetimeSeconds);
+        chat.plans.set(next.id,next);return json(response,200,next);
+      }
     }
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, { status: "ok", protocol_version: 1 });
@@ -292,7 +362,7 @@ export async function startFakeServe({
 
   let backend = "codex";
   function newChat() {
-    return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map() };
+    return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map(), plans: new Map() };
   }
   let activeChat = newChat();
   const chats = new Map([[activeChat.id, activeChat]]);
@@ -391,6 +461,21 @@ export async function startFakeServe({
       // the operator sees what they are approving before any run exists.
       const preview = structuredClone(golden);
       preview.status = "ready";
+      const plan = workflowDesign ? workflowFixture(PROPOSED_PROGRAM, {"flow.request":chat.messages[0]?.text ?? ""}, preview, chat.id, !!request.workflow_plan) : null;
+      if(plan) plan.draft.research.issues=structuredClone(workflowIssues);
+      if(plan && workflowBenchmark) for(const selection of plan.selections) { selection.evidence_ids=["synthetic-extraction-v1"]; selection.evidence_assessments={"synthetic-extraction-v1":{status:"candidate",reasons:["Synthetic display fixture only"]}}; }
+      if(plan && workflowFacts) fixtureProfileFacts(plan,workflowFacts,workflowFactsLifetimeSeconds);
+      if(plan && workflowToolBlocked) {
+        plan.draft.steps[0].required_tools=["web"];
+        const decision=plan.selections.find(s=>s.agent===plan.draft.steps[0].agent);
+        decision.tool_access=[{tool:"web",status:"unknown",reason:"Declared support only; no reviewed connection attempt."}];
+        decision.capability_blockers=["Required tool 'web': Declared support only; no reviewed connection attempt."];
+      }
+      if(plan && request.workflow_plan) {
+        const previous=chat.plans.get(request.workflow_plan.id);
+        if(previous) {plan.id=previous.id;plan.revision=previous.revision+1;}
+      }
+      if(plan) chat.plans.set(plan.id,plan);
       // Markdown, because that is what the EA actually writes.
       publish(
         "assistant",
@@ -400,6 +485,7 @@ export async function startFakeServe({
           "```\nrequest -> planner -> reviewer -> result\n```",
         {
           program: PROPOSED_PROGRAM,
+          ...(plan ? {plan:{id:plan.id,revision:plan.revision}} : {}),
           inputs: { "flow.request": chat.messages[0]?.text ?? "" },
           preview,
         },
@@ -544,6 +630,9 @@ export async function startFakeServe({
     }
 
     const runId = randomUUID();
+    const plan=request.plan ? chat.plans.get(request.plan.id) : null;
+    if(request.plan && (!plan || plan.revision!==request.plan.revision || plan.program!==request.program || JSON.stringify(plan.inputs)!==JSON.stringify(request.inputs))) return json(response,409,{error:"revision conflict"});
+    if(plan && (plan.draft.intent.assumptions.some(a=>!a.accepted) || plan.draft.questions.some(q=>q.required || q.answer))) return json(response,409,{error:"review incomplete"});
     const address = `${host}:${server.address().port}`;
     const snapshot = structuredClone(golden);
     snapshot.status = "running";
@@ -554,6 +643,7 @@ export async function startFakeServe({
       }
     }
     const entry = {
+      plan:request.plan??null,profiles:plan?.profiles??{},source_digest:sourceDigest(request.program),
       record: {
         run_id: runId,
         team: snapshot.team,

@@ -8,6 +8,51 @@ pub(crate) fn backend_version_probe_succeeds(binary: &str) -> bool {
     command_succeeds_with_timeout(binary, &["--version"], BACKEND_VERSION_PROBE_TIMEOUT)
 }
 
+/// Capture only the local CLI version, with the same bounded probe used by
+/// backend discovery. This says nothing about authentication or model access.
+pub(crate) fn backend_version(binary: &str) -> Option<String> {
+    use std::io::Read;
+    let path = std::env::temp_dir().join(format!("omar-version-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .ok()?;
+        let mut child = Command::new(binary)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(file)
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break,
+                Ok(None) if start.elapsed() < BACKEND_VERSION_PROBE_TIMEOUT => {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        let mut output = String::new();
+        std::fs::File::open(&path)
+            .ok()?
+            .take(512)
+            .read_to_string(&mut output)
+            .ok()?;
+        let version = output.lines().next()?.trim();
+        (!version.is_empty()).then(|| version.to_owned())
+    })();
+    let _ = std::fs::remove_file(path);
+    result
+}
+
 pub(crate) fn command_succeeds_with_timeout(
     program: &str,
     args: &[&str],
@@ -95,5 +140,17 @@ mod tests {
             &["--version"],
             Duration::from_secs(2),
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_capture_records_output_and_keeps_unavailability_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let fast = executable_script(temp.path(), "version", "echo test-cli-1.0");
+        assert_eq!(
+            backend_version(fast.to_str().unwrap()).as_deref(),
+            Some("test-cli-1.0")
+        );
+        assert_eq!(backend_version("/nonexistent/omar-test-backend"), None);
     }
 }

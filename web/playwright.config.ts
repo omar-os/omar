@@ -18,6 +18,7 @@ export default defineConfig({
   reporter: process.env.CI ? "line" : "list",
   timeout: 60_000,
   use: {
+    launchOptions: { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH },
     baseURL: "http://127.0.0.1:3100",
     trace: "retain-on-failure",
   },

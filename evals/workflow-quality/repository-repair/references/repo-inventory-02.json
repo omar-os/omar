@@ -1,0 +1,297 @@
+{
+  "id": "repo-inventory-02",
+  "protected_tests": [
+    {
+      "id": "reserve-1",
+      "request": {
+        "operation": "reserve",
+        "payload": {
+          "stock": {
+            "a": 2
+          },
+          "request": {
+            "a": 3
+          }
+        }
+      },
+      "expected": {
+        "accepted": false,
+        "stock": {
+          "a": 2
+        }
+      }
+    },
+    {
+      "id": "reserve-2",
+      "request": {
+        "operation": "reserve",
+        "payload": {
+          "stock": {
+            "a": 2,
+            "b": 1
+          },
+          "request": {
+            "a": 1,
+            "b": 2
+          }
+        }
+      },
+      "expected": {
+        "accepted": false,
+        "stock": {
+          "a": 2,
+          "b": 1
+        }
+      }
+    },
+    {
+      "id": "reserve-3",
+      "request": {
+        "operation": "reserve",
+        "payload": {
+          "stock": {
+            "a": 2
+          },
+          "request": {
+            "a": 2
+          }
+        }
+      },
+      "expected": {
+        "accepted": true,
+        "stock": {
+          "a": 0
+        }
+      }
+    },
+    {
+      "id": "replay-1",
+      "request": {
+        "operation": "replay",
+        "payload": [
+          {
+            "id": "x",
+            "delta": 3
+          },
+          {
+            "id": "x",
+            "delta": 3
+          }
+        ]
+      },
+      "expected": 3
+    },
+    {
+      "id": "replay-2",
+      "request": {
+        "operation": "replay",
+        "payload": []
+      },
+      "expected": 0
+    },
+    {
+      "id": "replay-3",
+      "request": {
+        "operation": "replay",
+        "payload": [
+          {
+            "id": "a",
+            "delta": 4
+          },
+          {
+            "id": "b",
+            "delta": -2
+          },
+          {
+            "id": "a",
+            "delta": 9
+          }
+        ]
+      },
+      "expected": 2
+    },
+    {
+      "id": "reorder-1",
+      "request": {
+        "operation": "reorder",
+        "payload": {
+          "points": {
+            "a": 2
+          },
+          "stock": {
+            "a": 2
+          }
+        }
+      },
+      "expected": [
+        "a"
+      ]
+    },
+    {
+      "id": "reorder-2",
+      "request": {
+        "operation": "reorder",
+        "payload": {
+          "points": {
+            "b": 0,
+            "a": 1
+          },
+          "stock": {}
+        }
+      },
+      "expected": [
+        "a",
+        "b"
+      ]
+    },
+    {
+      "id": "reorder-3",
+      "request": {
+        "operation": "reorder",
+        "payload": {
+          "points": {
+            "a": 2
+          },
+          "stock": {
+            "a": 3
+          }
+        }
+      },
+      "expected": []
+    },
+    {
+      "id": "allocate-1",
+      "request": {
+        "operation": "allocate",
+        "payload": {
+          "quantity": 3,
+          "batches": [
+            {
+              "id": "a",
+              "count": 2
+            },
+            {
+              "id": "b",
+              "count": 4
+            }
+          ]
+        }
+      },
+      "expected": {
+        "allocations": [
+          {
+            "id": "a",
+            "count": 2
+          },
+          {
+            "id": "b",
+            "count": 1
+          }
+        ],
+        "unmet": 0
+      }
+    },
+    {
+      "id": "allocate-2",
+      "request": {
+        "operation": "allocate",
+        "payload": {
+          "quantity": 3,
+          "batches": []
+        }
+      },
+      "expected": {
+        "allocations": [],
+        "unmet": 3
+      }
+    },
+    {
+      "id": "allocate-3",
+      "request": {
+        "operation": "allocate",
+        "payload": {
+          "quantity": 0,
+          "batches": [
+            {
+              "id": "a",
+              "count": 2
+            }
+          ]
+        }
+      },
+      "expected": {
+        "allocations": [],
+        "unmet": 0
+      }
+    },
+    {
+      "id": "available-1",
+      "request": {
+        "operation": "available",
+        "payload": {
+          "on_hand": {
+            "a": 2
+          },
+          "reserved": {
+            "a": 4
+          }
+        }
+      },
+      "expected": {
+        "a": 0
+      }
+    },
+    {
+      "id": "available-2",
+      "request": {
+        "operation": "available",
+        "payload": {
+          "on_hand": {
+            "a": 2,
+            "b": 3
+          },
+          "reserved": {
+            "a": 1
+          }
+        }
+      },
+      "expected": {
+        "a": 1,
+        "b": 3
+      }
+    },
+    {
+      "id": "available-3",
+      "request": {
+        "operation": "available",
+        "payload": {
+          "on_hand": {},
+          "reserved": {}
+        }
+      },
+      "expected": {}
+    }
+  ],
+  "oracle_patch": {
+    "changes": [
+      {
+        "path": "candidate_app/policy.py",
+        "content": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef reserve(p):\n    stock=dict(p['stock'])\n    if any(stock.get(k,0)<v for k,v in p['request'].items()): return {'accepted':False,'stock':stock}\n    for k,v in p['request'].items(): stock[k]=stock.get(k,0)-v\n    return {'accepted':True,'stock':stock}\n\ndef replay(p):\n    seen=set(); total=0\n    for e in p:\n        if e['id'] not in seen: total+=e['delta']; seen.add(e['id'])\n    return total\n\ndef reorder(p):\n    return sorted(k for k,v in p['points'].items() if p['stock'].get(k,0)<=v)\n"
+      }
+    ],
+    "explanation": "Authored fixture repair; independent review pending."
+  },
+  "label_author": "owned repository fixture generator",
+  "review_status": "provisional",
+  "critical_errors": [
+    "protected regression failure",
+    "input mutation",
+    "prohibited patch path",
+    "unexpected output or execution failure"
+  ],
+  "human_review_required": [
+    "patch meets complete specification beyond examples",
+    "patch is reasonable and does not hard-code protected cases"
+  ],
+  "independent_unit": "repository-inventory"
+}

@@ -157,10 +157,12 @@ pub(crate) fn ensure_codex_runtime_flags(base_command: &str) -> String {
     }
     let mut command = base_command.to_string();
 
-    if !base_command
-        .split_whitespace()
-        .any(|token| token == "--dangerously-bypass-approvals-and-sandbox")
-    {
+    if !base_command.split_whitespace().any(|token| {
+        token == "--dangerously-bypass-approvals-and-sandbox"
+            || token == "--sandbox"
+            || token == "-s"
+            || token.starts_with("--sandbox=")
+    }) {
         command.push_str(" --dangerously-bypass-approvals-and-sandbox");
     }
 
@@ -179,10 +181,32 @@ pub(crate) fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> 
     .ok()?;
     let command_arg = format!("mcp_servers.omar.command={}", command);
     let args_arg = format!("mcp_servers.omar.args={}", args);
+    // Workflow tools only read or satisfy this run's invocation contracts.
+    // A design-only session gets its six host-scoped research/proposal tools.
+    // Ordinary EA and external integration tools receive no blanket approval.
+    let approved_tools: &[&str] = if context.topology.is_some() {
+        &["omar_pending", "omar_set_port", "omar_complete"]
+    } else if context.design_only() {
+        crate::manager::DESIGN_TOOLS
+    } else {
+        &[]
+    };
+    let port_permissions = approved_tools
+        .iter()
+        .map(|tool| {
+            format!(
+                " -c {}",
+                shell_single_quote(&format!(
+                    "mcp_servers.omar.tools.{tool}.approval_mode=\"approve\""
+                ))
+            )
+        })
+        .collect::<String>();
     Some(format!(
-        "-c features.scheduled_tasks=false -c {} -c {}",
+        "-c features.scheduled_tasks=false -c {} -c {}{}",
         shell_single_quote(&command_arg),
-        shell_single_quote(&args_arg)
+        shell_single_quote(&args_arg),
+        port_permissions
     ))
 }
 
@@ -203,6 +227,10 @@ pub(crate) const SUN_PATH_MAX: usize = 96;
 /// for ninety seconds — all to arrive where it started. Better to see the flag
 /// and not build the home at all.
 pub(crate) const CODEX_NO_ATTACH_FLAGS: &[&str] = &[
+    // A model belongs to the engine. Passing it only to an attached TUI
+    // would leave the dedicated app-server running its configured default.
+    "--model",
+    "-m",
     "-c",
     "--config",
     "--profile",

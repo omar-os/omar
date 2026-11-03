@@ -1,0 +1,33 @@
+{
+  "id": "repair-06-1",
+  "protected_tests": [
+    [
+      [
+        -2,
+        3
+      ],
+      5
+    ],
+    [
+      [],
+      0
+    ],
+    [
+      [
+        -4,
+        -1
+      ],
+      5
+    ]
+  ],
+  "label_author": "synthetic fixture generator",
+  "review_status": "provisional",
+  "critical_errors": [
+    "protected regression failure",
+    "input mutation",
+    "unsupported side effects"
+  ],
+  "human_review_required": [
+    "patch meets the complete specification, beyond examples"
+  ]
+}

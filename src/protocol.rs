@@ -33,6 +33,7 @@ use crate::diagram::{
 };
 use crate::serve::{ChatMessage, ChatRole, ProposedDesign, RunRecord, RunStatus};
 use crate::topology::PortKind;
+use crate::workflow_design::*;
 
 /// Where the generated file lives, relative to the repository root.
 pub const GENERATED_PATH: &str = "web/app/lib/protocol-generated.ts";
@@ -175,6 +176,93 @@ pub fn generate() -> String {
 
     // Declared after the vocabularies, because the structs refer to them.
     let mut decls = vec![
+        IntentRevision::decl(&config),
+        Assumption::decl(&config),
+        ResearchBrief::decl(&config),
+        ResearchSource::decl(&config),
+        StatementOrigin::decl(&config),
+        ConfirmationRef::decl(&config),
+        DesignRequirement::decl(&config),
+        ResearchIssue::decl(&config),
+        ResearchIssueKind::decl(&config),
+        ResearchResolution::decl(&config),
+        ResearchCaptureRef::decl(&config),
+        ResearchLimits::decl(&config),
+        ResearchStop::decl(&config),
+        ResearchCaptureSummary::decl(&config),
+        ResearchUsage::decl(&config),
+        Operation::decl(&config),
+        StepSpec::decl(&config),
+        StepOwner::decl(&config),
+        StepInput::decl(&config),
+        StepOutput::decl(&config),
+        StepInterface::decl(&config),
+        StepValueBinding::decl(&config),
+        StepResources::decl(&config),
+        StepResourceUsage::decl(&config),
+        StepExecution::decl(&config),
+        StepEffect::decl(&config),
+        RecoveryPolicy::decl(&config),
+        HumanRecovery::decl(&config),
+        VerificationStage::decl(&config),
+        VerificationDecision::decl(&config),
+        VerificationEvent::decl(&config),
+        QualificationScope::decl(&config),
+        TaskComplexity::decl(&config),
+        TaskConsequence::decl(&config),
+        Modality::decl(&config),
+        OutputCheck::decl(&config),
+        ReviewQuestion::decl(&config),
+        ExecutionProfile::decl(&config),
+        ProfileIdentity::decl(&config),
+        ModelReferenceKind::decl(&config),
+        ReviewedProfileSource::decl(&config),
+        AdvertisedModelLimits::decl(&config),
+        ProfileEconomics::decl(&config),
+        BillingModel::decl(&config),
+        ProfilePrice::decl(&config),
+        PriceUnit::decl(&config),
+        ProfileQuota::decl(&config),
+        ProfileFactStatus::decl(&config),
+        ProfileFactAssessment::decl(&config),
+        ProfileFallbackPolicy::decl(&config),
+        FallbackTrigger::decl(&config),
+        ProfileRepairRoute::decl(&config),
+        ExecutionIsolation::decl(&config),
+        ProfileTier::decl(&config),
+        ProfileAccess::decl(&config),
+        ModelAccessObservation::decl(&config),
+        ModelAccessOutcome::decl(&config),
+        ModelAccessStatus::decl(&config),
+        ModelAccessAssessment::decl(&config),
+        NativeAccessCandidate::decl(&config),
+        AccessCandidateStatus::decl(&config),
+        ToolCapability::decl(&config),
+        ToolTransport::decl(&config),
+        ToolAuthentication::decl(&config),
+        ToolEffect::decl(&config),
+        ToolConnectivityObservation::decl(&config),
+        ToolConnectionOutcome::decl(&config),
+        ToolAccessStatus::decl(&config),
+        ToolAccessDecision::decl(&config),
+        CapabilityEvidence::decl(&config),
+        PublishedBenchmarkResult::decl(&config),
+        BenchmarkSourceRow::decl(&config),
+        ScoreDirection::decl(&config),
+        BenchmarkUncertainty::decl(&config),
+        BenchmarkReview::decl(&config),
+        CapabilityEvidenceStatus::decl(&config),
+        CapabilityEvidenceAssessment::decl(&config),
+        EvidenceSourceKind::decl(&config),
+        LocalQualification::decl(&config),
+        SelectionDecision::decl(&config),
+        RoutingPreferences::decl(&config),
+        PlanDraft::decl(&config),
+        PlanRef::decl(&config),
+        WorkflowPlanRevision::decl(&config),
+        WorkflowBundle::decl(&config),
+        RepositoryCheckReceipt::decl(&config),
+        ExecutionReceipt::decl(&config),
         DiagramTag::decl(&config),
         DiagramInstance::decl(&config),
         DiagramAgent::decl(&config),
@@ -195,7 +283,12 @@ pub fn generate() -> String {
         out.push_str(decl);
         out.push_str("\n\n");
     }
-    out
+    // Field documentation can make ts-rs leave spaces before line breaks.
+    out.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 #[cfg(test)]

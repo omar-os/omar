@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "repair-04-2",
+  "family": "function_repair",
+  "split": "development",
+  "group": "repair-function-4",
+  "instruction": "Repair candidate.py. Return the minimum number, or None for an empty list. Return JSON with patched_source and explanation. Define only repair(values), use no imports, attributes, filesystem, network, classes, while loops or recursion. Allowed builtins: sum, min, max, len, sorted, set, list, abs, range, enumerate. Do not mutate the input.",
+  "files": {
+    "candidate.py": "def repair(values):\n    return max(values) if values else 0\n"
+  },
+  "visible_test": {
+    "input": [],
+    "expected": null
+  }
+}

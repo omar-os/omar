@@ -613,12 +613,16 @@ impl OmarMcpServer {
                         "name": "omar",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "instructions": SERVER_INSTRUCTIONS,
+                    "instructions": if self.context.design_only() {
+                        "This session only supports workflow research, saved-plan lookup, proposals and operator replies. Use the listed tool contracts; workflow execution and management tools are unavailable."
+                    } else { SERVER_INSTRUCTIONS },
                 }),
             ),
             "tools/list" => {
                 let tools = if self.context.topology.is_some() {
                     topology_tool_definitions()
+                } else if self.context.design_only() {
+                    ea_tool_definitions()
                 } else {
                     let mut tools = tool_definitions();
                     // Only the EA converses with the operator, and only when
@@ -661,11 +665,23 @@ impl OmarMcpServer {
                     topology.agent
                 )),
             }
+        } else if self.context.design_only()
+            && !crate::manager::DESIGN_TOOLS.contains(&call.name.as_str())
+        {
+            Err(anyhow!(
+                "Tool '{}' is unavailable in a design-only session",
+                call.name
+            ))
         } else {
             match call.name.as_str() {
                 // Refused rather than merely unlisted, so an agent that learned
                 // the names elsewhere still cannot reach the operator.
-                "omar_reply" | "omar_propose_design" => match &self.context.serve {
+                "omar_reply"
+                | "omar_propose_design"
+                | "omar_get_execution_profiles"
+                | "omar_get_capability_evidence"
+                | "omar_research_workflow"
+                | "omar_get_workflow_plan" => match &self.context.serve {
                     Some(serve) => serve_tool_call(serve, &call.name, call.arguments),
                     None => Err(anyhow!(
                         "Tool '{}' is only available to the executive assistant",
@@ -733,7 +749,7 @@ impl OmarMcpServer {
                 tool_error(err)
             }
         };
-        if self.context.topology.is_none() {
+        if self.context.topology.is_none() && !self.context.design_only() {
             let _ = crate::supervision::touch(&self.context.omar_dir, self.ea_id(), self.actor());
             if let Ok(state) =
                 crate::supervision::context(&self.context.omar_dir, self.ea_id(), self.actor())
@@ -2545,6 +2561,20 @@ fn tool_definitions() -> Vec<Value> {
 /// Control, which then admits the run itself, so nothing here can start work.
 fn ea_tool_definitions() -> Vec<Value> {
     vec![
+        tool("omar_get_execution_profiles", "Read configured execution profiles and explicit native model/effort settings within the current operator request's host research budget. Response has data, capture and research usage; a retry returns the captured catalog. Access unknown is not verified authentication. This lookup does not call a model.", json!({"type":"object","properties":{},"additionalProperties":false})),
+        tool("omar_get_capability_evidence", "Read dated operation-specific evidence within the current operator request's host research budget. Response has data, capture and research usage; a retry returns the captured catalog. Provider claims shortlist candidates; only current reviewed local qualification supports automatic economical routing.", json!({"type":"object","properties":{},"additionalProperties":false})),
+        tool("omar_research_workflow", "Read a bounded source from this chat's operator messages or an immutable saved plan input, or finish research. Use the research session from the operator envelope/catalog response. Reuse a request_id only for an identical retry. External retrieval is explicitly unsupported and performs no network request. Returned capture proves a dated host read, not truth or authorship. Native tools/tokens are outside this budget. Stop on a closed budget and present explicit gaps.", json!({
+            "type":"object","properties":{
+                "session_id":{"type":"string"},"request_id":{"type":"string"},
+                "lookup":{"oneOf":[
+                    {"type":"object","properties":{"kind":{"const":"operator_message"},"message_sequence":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0}},"required":["kind","message_sequence"],"additionalProperties":false},
+                    {"type":"object","properties":{"kind":{"const":"plan_input"},"plan":{"type":"object","properties":{"id":{"type":"string"},"revision":{"type":"integer","minimum":1}},"required":["id","revision"],"additionalProperties":false},"input_port":{"type":"string"},"json_pointer":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["kind","plan","input_port"],"additionalProperties":false},
+                    {"type":"object","properties":{"kind":{"const":"external"},"location":{"type":"string"}},"required":["kind","location"],"additionalProperties":false}
+                ]},
+                "stop":{"type":"string","enum":["sufficient_evidence","needs_user_input","missing_capability"]}
+            },"required":["session_id","request_id"],"additionalProperties":false
+        })),
+        tool("omar_get_workflow_plan", "Read a durable workflow plan in this chat, including review answers. Omit revision to read the latest.", json!({"type":"object","properties":{"id":{"type":"string"},"revision":{"type":"integer","minimum":1}},"required":["id"],"additionalProperties":false})),
         tool(
             "omar_reply",
             "Send a message to the operator in Mission Control. This is the only way they see what you say. Set progress=true for a running commentary while you work — what you are doing and what you have found — so the operator is not left watching a spinner. Leave it unset for anything you want an answer to, or that concludes a turn.",
@@ -2563,12 +2593,13 @@ fn ea_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "omar_propose_design",
-            "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares.",
+            "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares. Every prompt or code reaction must include task(\"Short action title\", \"What this step does and produces.\") after its output contract and optional within(...) deadline, before its prompt string or code body. Use a specific 3–6 word action title (maximum 80 characters) and 1–3 sentences (maximum 1200 characters), including any manual handoff. Task copy is display metadata; it does not replace the execution prompt.",
             json!({
                 "type":"object",
                 "properties":{
                     "program":{"type":"string","description":"Complete .omar source"},
                     "summary":{"type":"string","description":"One or two sentences on what it does"},
+                    "plan":{"type":"object","description":"Structured PlanDraft: revises (optional {id,revision} for an existing plan); intent {outcome,message_sequences,constraints,requirements:[{id,text,origin}],assumptions:[{id,text,provenance,origin,accepted:false}],acceptance_criteria}; research {summary,sources:[{id,location,finding,provenance,origin}],gaps,capability_evidence_ids,issues:[{id,kind,description,source_ids,blocking,resolution}]}; steps:[{logical_id,reaction,agent,operation,purpose,decomposition_reason,resources,acceptance_criteria,required_tools,evidence_ids,verification_reaction,output_checks,execution:{effect,max_invocations,deadline_ms},recovery,qualification_scope:{task_family,task_slice,contract_version,complexity,consequence,input_modalities,output_modalities}}]; questions:[{id,question,reason,target_reactions,options,proposed_default,required,answer}]; preferences:{allowed_backends,overrides}. Use fully qualified compiled reaction/agent IDs. Operations include exact_validation/exact_transformation (code only), structured_extraction, classification_routing, document_retrieval, evidence_synthesis, planning, writing, claim_verification, code_implementation, code_review, code_repair, code_verification, script_storyboard, render_code_generation, media_generation, audiovisual_verification. Use exact enum names from the workflow contract. Preserve logical IDs across redesign; explain each added handoff. Interface schemas are host-derived. Native token/spend caps are unsupported; resources may bound invocation payload bytes. Origin is typed: system_proposed, user_stated (exact operator quote), source_observed (input port/JSON pointer/quote), or user_confirmed (actual saved review reference). Follow the workflow design contract for origin fields. Never invent user acceptance or unsupported benchmark rankings."},
                     "inputs":{"type":"object","description":"Values for the program's declared input ports"}
                 },
                 "required":["program","summary"],
@@ -2581,7 +2612,7 @@ fn ea_tool_definitions() -> Vec<Value> {
 /// Minimal HTTP POST. `omar serve` is loopback-only and the payloads are tiny,
 /// so this avoids pulling in an HTTP client, matching how topology agents reach
 /// the invocation server over a raw socket.
-fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<()> {
+fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<Value> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
@@ -2602,9 +2633,6 @@ fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<()> {
     let mut reader = BufReader::new(&mut stream);
     let mut status = String::new();
     reader.read_line(&mut status)?;
-    if status.contains(" 200") || status.contains(" 201") || status.contains(" 202") {
-        return Ok(());
-    }
 
     // The body is the whole point of a rejection. `omar serve` compiles a
     // proposed program before publishing it and answers with the compiler's
@@ -2621,6 +2649,9 @@ fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<()> {
     let mut payload = String::new();
     // `Connection: close`, so the body runs to the end of the stream.
     let _ = reader.read_to_string(&mut payload);
+    if status.contains(" 200 ") || status.contains(" 201 ") || status.contains(" 202 ") {
+        return serde_json::from_str(&payload).context("invalid response from omar serve");
+    }
 
     let detail = serde_json::from_str::<Value>(&payload)
         .ok()
@@ -2646,6 +2677,10 @@ fn serve_tool_call(
     let path = match name {
         "omar_reply" => "/v1/agent/reply",
         "omar_propose_design" => "/v1/agent/proposals",
+        "omar_get_execution_profiles" => "/v1/agent/profiles",
+        "omar_get_capability_evidence" => "/v1/agent/evidence",
+        "omar_research_workflow" => "/v1/agent/research",
+        "omar_get_workflow_plan" => "/v1/agent/plan",
         other => bail!("unknown serve tool '{other}'"),
     };
     // Arguments come from a model, so the shape is not guaranteed. Indexing a
@@ -2657,8 +2692,7 @@ fn serve_tool_call(
         other => bail!("{name} expects an object of arguments, got {other}"),
     };
     body.insert("token".to_string(), json!(serve.token));
-    post_json(&serve.endpoint, path, &Value::Object(body))?;
-    Ok(json!({"status":"delivered"}))
+    post_json(&serve.endpoint, path, &Value::Object(body))
 }
 
 fn topology_tool_definitions() -> Vec<Value> {
@@ -2814,6 +2848,7 @@ mod tests {
     fn ea_context() -> McpLaunchContext {
         McpLaunchContext {
             serve: Some(crate::manager::ServeMcpContext {
+                design_only: false,
                 endpoint: "127.0.0.1:1".to_string(),
                 token: "test-token".to_string(),
             }),
@@ -2869,11 +2904,13 @@ mod tests {
         let ea = listed_tools(ea_context());
         assert!(ea.contains(&"omar_reply".to_string()));
         assert!(ea.contains(&"omar_propose_design".to_string()));
+        assert!(ea.contains(&"omar_research_workflow".to_string()));
 
         // A plain spawned agent has no serve context, so it must not see them.
         let agent = listed_tools(test_context());
         assert!(!agent.contains(&"omar_reply".to_string()));
         assert!(!agent.contains(&"omar_propose_design".to_string()));
+        assert!(!agent.contains(&"omar_research_workflow".to_string()));
 
         // Workflow agents are restricted to the port protocol.
         let workflow = listed_tools(McpLaunchContext {
@@ -2895,6 +2932,7 @@ mod tests {
         // malformed call would take the EA's whole tool channel down.
         let server = OmarMcpServer::new(McpLaunchContext {
             serve: Some(crate::manager::ServeMcpContext {
+                design_only: false,
                 // Unroutable: reaching the post at all would be the bug.
                 endpoint: "127.0.0.1:1".to_string(),
                 token: "t".to_string(),
@@ -2915,6 +2953,42 @@ mod tests {
     }
 
     #[test]
+    fn design_only_scope_rejects_unlisted_tools_even_when_called_directly() {
+        let mut context = ea_context();
+        context.serve.as_mut().unwrap().design_only = true;
+        let mut names = listed_tools(context.clone());
+        names.sort();
+        let mut expected = crate::manager::DESIGN_TOOLS.to_vec();
+        expected.sort();
+        assert_eq!(names, expected);
+        let server = OmarMcpServer::new(context);
+        for name in [
+            "spawn_agent",
+            "send_input",
+            "slack_reply",
+            "switch_ea",
+            "schedule_omar_event",
+            "computer_keyboard",
+            "omar_set_port",
+            "coordination_state",
+            "unknown",
+        ] {
+            let result = server.call_tool(ToolCallRequest {
+                name: name.into(),
+                arguments: json!({}),
+            });
+            assert_eq!(result["isError"], true, "{name}: {result}");
+            assert!(result.to_string().contains("design-only session"));
+        }
+        // An allowed malformed call reaches the design tool's validation.
+        let result = server.call_tool(ToolCallRequest {
+            name: "omar_reply".into(),
+            arguments: json!(7),
+        });
+        assert!(result.to_string().contains("expects an object"));
+    }
+
+    #[test]
     fn operator_tools_are_refused_not_merely_unlisted() {
         // Knowing the tool name must not be enough for a non-EA agent.
         for context in [
@@ -2930,7 +3004,11 @@ mod tests {
             },
         ] {
             let server = OmarMcpServer::new(context);
-            for name in ["omar_reply", "omar_propose_design"] {
+            for name in [
+                "omar_reply",
+                "omar_propose_design",
+                "omar_research_workflow",
+            ] {
                 let result = server.call_tool(ToolCallRequest {
                     name: name.to_string(),
                     arguments: json!({"text": "hello", "program": "team T() {}", "summary": "s"}),

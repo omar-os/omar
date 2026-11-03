@@ -100,6 +100,10 @@ pub enum Instruction {
         effects: Vec<String>,
         contract: String,
         prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         /// A Rust body, when the reaction is code rather than a prompt.
         #[serde(default)]
         body: Option<String>,
@@ -204,6 +208,10 @@ pub struct ReactionState {
     pub effects: Vec<String>,
     pub contract: String,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// A Rust body, when the reaction is code rather than a prompt.
     #[serde(default)]
     pub body: Option<String>,
@@ -680,6 +688,8 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 effects,
                 contract,
                 prompt,
+                title,
+                description,
                 body,
                 instance,
                 within,
@@ -732,6 +742,8 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                             effects: effects.clone(),
                             contract: contract.clone(),
                             prompt: prompt.clone(),
+                            title: title.clone(),
+                            description: description.clone(),
                             body: body.clone(),
                             within: *within,
                         },
@@ -1059,9 +1071,18 @@ struct InvocationEntry {
 #[derive(Clone, Default)]
 struct InvocationRegistry {
     entries: Arc<Mutex<BTreeMap<String, InvocationEntry>>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl InvocationRegistry {
+    /// Revoke all pending invocations when a bounded workflow is cancelled.
+    /// Dropping senders wakes waiters; later port writes cannot resurrect them.
+    fn cancel_all(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.clear();
+        }
+    }
     fn register(
         &self,
         record: InvocationRecord,
@@ -1072,6 +1093,10 @@ impl InvocationRegistry {
             .entries
             .lock()
             .map_err(|_| anyhow::anyhow!("invocation registry lock poisoned"))?;
+        anyhow::ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "invocation service cancelled"
+        );
         if entries.contains_key(&id) {
             bail!("duplicate invocation '{id}'");
         }
@@ -1113,6 +1138,10 @@ impl InvocationRegistry {
             .entries
             .lock()
             .map_err(|_| anyhow::anyhow!("invocation registry lock poisoned"))?;
+        anyhow::ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "invocation service cancelled"
+        );
         match command {
             InvocationCommand::SetPort(args) => {
                 let invocation = entries
@@ -1520,6 +1549,30 @@ fn parse_literal(value: &str) -> Result<Value> {
     }
 }
 
+pub(crate) fn require_exclusive_effects(contract: &str, ports: &[&str]) -> Result<()> {
+    let groups = parse_contract(contract)?;
+    let expected: BTreeSet<_> = ports.iter().copied().collect();
+    let valid = groups.len() == 1
+        && !groups[0].optional
+        && groups[0].alternatives.len() == ports.len()
+        && groups[0]
+            .alternatives
+            .iter()
+            .all(|(_, constant)| constant.is_none())
+        && groups[0]
+            .alternatives
+            .iter()
+            .map(|(port, _)| port.as_str())
+            .collect::<BTreeSet<_>>()
+            == expected
+        && expected.len() == ports.len();
+    anyhow::ensure!(
+        valid,
+        "recovery checker requires one exclusive accepted/rejected effect contract"
+    );
+    Ok(())
+}
+
 fn validate_contract(contract: &str, writes: &BTreeMap<String, Value>) -> Result<()> {
     let groups = parse_contract(contract)?;
     let contract_ports: BTreeSet<_> = groups
@@ -1573,6 +1626,178 @@ struct InvocationSpec {
 
 trait ReactionExecutor: Sync {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>>;
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+struct ReceiptExecutor<'a, E> {
+    inner: E,
+    directory: Option<&'a Path>,
+    checks: &'a BTreeMap<String, Vec<crate::workflow_design::OutputCheck>>,
+    policies: &'a crate::workflow_design::recovery::RuntimePolicies,
+    attempts: Mutex<BTreeMap<String, u32>>,
+    stop_dir: Option<&'a Path>,
+    timeout: Duration,
+}
+
+impl<E: ReactionExecutor> ReactionExecutor for ReceiptExecutor<'_, E> {
+    fn cancelled(&self) -> bool {
+        self.stop_dir.is_some_and(deploy::stop_requested)
+    }
+
+    fn invoke(&self, mut invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+        let started = std::time::Instant::now();
+        let started_at = crate::workflow_design::now();
+        let copy = invocation.clone();
+        let policy = self.policies.get(&copy.reaction_id);
+        let mut invoked = false;
+        let mut attempt = None;
+        let mut verification = None;
+        let mut repository_checks = Vec::new();
+        let mut resource_usage = None;
+        let mut result: Result<BTreeMap<String, Value>> = (|| {
+            anyhow::ensure!(
+                !self.cancelled(),
+                "workflow invocation cancelled before execution"
+            );
+            if let Some(policy) = policy {
+                let mut counts = self
+                    .attempts
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("invocation budget lock poisoned"))?;
+                let used = counts.entry(copy.reaction_id.clone()).or_default();
+                attempt = Some(used.saturating_add(1));
+                anyhow::ensure!(
+                    *used < policy.execution.max_invocations,
+                    "invocation limit exhausted for '{}'; no further attempt was started",
+                    copy.reaction_id
+                );
+                *used += 1;
+                invocation.within =
+                    Some(invocation.within.unwrap_or(self.timeout).min(self.timeout));
+                if let Some(ms) = policy.execution.deadline_ms {
+                    let limit = Duration::from_millis(ms);
+                    invocation.within = Some(
+                        invocation
+                            .within
+                            .map_or(limit, |existing| existing.min(limit)),
+                    );
+                }
+                let input_bytes = serde_json::to_vec(&copy.trigger_values)?.len()
+                    + if policy.owner == crate::workflow_design::StepOwner::Code {
+                        serde_json::to_vec(&copy.state_values)?.len() + policy.parameter_bytes
+                    } else {
+                        0
+                    };
+                let prompt_bytes = match policy.owner {
+                    crate::workflow_design::StepOwner::Code => 0,
+                    crate::workflow_design::StepOwner::Human => {
+                        rendered_prompt_bytes(&copy.prompt, &copy.trigger_values)?
+                    }
+                    crate::workflow_design::StepOwner::Model => {
+                        invocation_message_content(&copy, "")?
+                            .len()
+                            .checked_add(rendered_prompt_bytes(&copy.prompt, &copy.trigger_values)?)
+                            .context("prompt size overflow")?
+                    }
+                };
+                resource_usage = Some(crate::workflow_design::StepResourceUsage {
+                    invocation_id: copy.id.clone(),
+                    logical_step_id: policy.logical_id.clone(),
+                    reaction: copy.reaction_id.clone(),
+                    owner: policy.owner,
+                    invoked: false,
+                    input_bytes,
+                    prompt_bytes,
+                    raw_output_bytes: None,
+                    returned_output_bytes: None,
+                    limits: policy.resources.clone(),
+                    context_coverage: crate::workflow_design::contracts::CONTEXT_COVERAGE.into(),
+                });
+                anyhow::ensure!(input_bytes <= policy.resources.max_input_bytes,
+                    "step input byte limit exceeded ({input_bytes} > {}); invocation was not started",policy.resources.max_input_bytes);
+                anyhow::ensure!(prompt_bytes <= policy.resources.max_prompt_bytes,
+                    "step prompt byte limit exceeded ({prompt_bytes} > {}); invocation was not started",policy.resources.max_prompt_bytes);
+            }
+            invoked = true;
+            if let Some(usage) = &mut resource_usage {
+                usage.invoked = true;
+            }
+            let check_deadline = started + invocation.within.unwrap_or(self.timeout);
+            let result = self.inner.invoke(invocation);
+            anyhow::ensure!(
+                !self.cancelled(),
+                "workflow invocation cancelled; late output discarded"
+            );
+            let writes = result?;
+            if let Some(usage) = &mut resource_usage {
+                let bytes = serde_json::to_vec(&writes)?.len();
+                usage.raw_output_bytes = Some(bytes);
+                anyhow::ensure!(
+                    bytes <= usage.limits.max_output_bytes,
+                    "step output byte limit exceeded ({bytes} > {}); output was not delivered",
+                    usage.limits.max_output_bytes
+                );
+            }
+            let (writes, event) = crate::workflow_design::repository::check_and_route(
+                crate::workflow_design::repository::RuntimeContext {
+                    directory: self.directory,
+                    invocation_id: &copy.id,
+                    reaction: &copy.reaction_id,
+                    stop_dir: self.stop_dir,
+                    deadline: check_deadline,
+                },
+                self.checks
+                    .get(&copy.reaction_id)
+                    .map_or(&[], Vec::as_slice),
+                policy.and_then(|p| p.gate.as_ref()),
+                writes,
+                &mut repository_checks,
+            )?;
+            if policy.is_some_and(|p| p.gate.is_some()) {
+                validate_contract(&copy.contract, &writes)?;
+            }
+            verification = event;
+            if let Some(usage) = &mut resource_usage {
+                let bytes = serde_json::to_vec(&writes)?.len();
+                anyhow::ensure!(
+                    bytes <= usage.limits.max_output_bytes,
+                    "routed output byte limit exceeded; output was not delivered"
+                );
+                usage.returned_output_bytes = Some(bytes);
+            }
+            Ok(writes)
+        })();
+        let cancelled = self.cancelled();
+        if cancelled {
+            result = Err(anyhow::anyhow!(
+                "workflow invocation cancelled; late output discarded"
+            ));
+            verification = None;
+            if let Some(usage) = &mut resource_usage {
+                usage.returned_output_bytes = None;
+            }
+        }
+        if let Some(directory) = self.directory {
+            write_json_atomic(
+                &directory.join(format!("{}.json", copy.id)),
+                &json!({
+                    "schema_version":1, "invocation_id":copy.id, "reaction":copy.reaction_id,
+                    "agent":copy.agent, "started_at":started_at, "elapsed_ms":started.elapsed().as_millis(),
+                    "input_digest":crate::workflow_design::digest(&serde_json::to_vec(&copy.trigger_values)?),
+                    "status":if cancelled {"cancelled"} else if result.is_ok() {"contract_satisfied"} else {"failed"},
+                    "invoked":invoked, "attempt":attempt, "max_invocations":policy.map(|p| p.execution.max_invocations),
+                    "verification":verification,
+                    "repository_checks":repository_checks,
+                    "resources":resource_usage,
+                    "outputs":result.as_ref().ok(), "error":result.as_ref().err().map(|e| format!("{e:#}")),
+                    "input_tokens":null, "output_tokens":null, "cost_usd":null,
+                }),
+            )?;
+        }
+        result
+    }
 }
 
 /// What an expired deadline means, which the effect contract decides.
@@ -1608,6 +1833,21 @@ struct AgentReactionExecutor {
     web: BTreeSet<String>,
 }
 
+/// Shared by native delivery and the byte-budget check so interpolation and
+/// the duplicated trigger context cannot escape accounting.
+fn invocation_message(invocation: &InvocationSpec) -> Result<String> {
+    let rendered = render_prompt(&invocation.prompt, &invocation.trigger_values)?;
+    invocation_message_content(invocation, &rendered)
+}
+
+fn invocation_message_content(invocation: &InvocationSpec, rendered: &str) -> Result<String> {
+    Ok(format!(
+        "OMAR INVOCATION\ninvocation_id: {}\ntriggers: {}\neffects: {}\ncontract: {}\n\n{}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. For a signal effect, set its value to null. Do not address another agent directly.",
+        invocation.id, serde_json::to_string(&invocation.trigger_values)?,
+        serde_json::to_string(&invocation.allowed_effects)?, invocation.contract, rendered
+    ))
+}
+
 impl ReactionExecutor for AgentReactionExecutor {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
         let invocation_id = invocation.id.clone();
@@ -1631,14 +1871,7 @@ impl ReactionExecutor for AgentReactionExecutor {
         // follows is the same either way — a client answering is a slow agent,
         // and the registry does not care which kind it is waiting on.
         if !self.web.contains(&invocation.agent) {
-            let message = format!(
-                "OMAR INVOCATION\ninvocation_id: {}\ntriggers: {}\neffects: {}\ncontract: {}\n\n{}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. For a signal effect, set its value to null. Do not address another agent directly.",
-                invocation.id,
-                serde_json::to_string(&invocation.trigger_values)?,
-                serde_json::to_string(&invocation.allowed_effects)?,
-                invocation.contract,
-                rendered
-            );
+            let message = invocation_message(&invocation)?;
             let session = self.client.session_for(&invocation.agent);
             if let Err(error) = self
                 .client
@@ -1732,6 +1965,11 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
 }
 
 pub struct TopologyRunConfig<'a> {
+    pub step_policies: &'a crate::workflow_design::recovery::RuntimePolicies,
+    pub output_checks: &'a BTreeMap<String, Vec<crate::workflow_design::OutputCheck>>,
+    pub receipt_directory: Option<&'a Path>,
+    /// Immutable, admission-validated native settings, keyed by runtime agent.
+    pub execution_profiles: &'a BTreeMap<String, crate::workflow_design::ExecutionProfile>,
     pub ea_id: crate::ea::EaId,
     pub omar_dir: &'a Path,
     /// Where this program's generated artifacts go, from `generated_dir`.
@@ -2000,25 +2238,33 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             });
         }
     }
-    let executor = DispatchExecutor {
-        workspace_dirs: workspaces
-            .iter()
-            .map(|(name, ws)| {
-                (
-                    name.clone(),
-                    (ws.worktree(config.omar_dir), ws.temp(config.omar_dir)),
-                )
-            })
-            .collect(),
-        state: &state,
-        code: reactions,
+    let executor = ReceiptExecutor {
+        policies: config.step_policies,
+        attempts: Mutex::new(BTreeMap::new()),
+        stop_dir: (!config.step_policies.is_empty()).then_some(runtime_dir.as_path()),
         timeout: config.timeout,
-        agents: AgentReactionExecutor {
-            client,
-            team: state.team.clone(),
-            registry: invocation_server.registry.clone(),
+        checks: config.output_checks,
+        directory: config.receipt_directory,
+        inner: DispatchExecutor {
+            workspace_dirs: workspaces
+                .iter()
+                .map(|(name, ws)| {
+                    (
+                        name.clone(),
+                        (ws.worktree(config.omar_dir), ws.temp(config.omar_dir)),
+                    )
+                })
+                .collect(),
+            state: &state,
+            code: reactions,
             timeout: config.timeout,
-            web,
+            agents: AgentReactionExecutor {
+                client,
+                team: state.team.clone(),
+                registry: invocation_server.registry.clone(),
+                timeout: config.timeout,
+                web,
+            },
         },
     };
     advance_record(&record, &runtime_dir, DeploymentState::Running, None)?;
@@ -2029,9 +2275,14 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
         let record = record.clone();
         let dir = runtime_dir.clone();
         let shutdown = watcher_shutdown.clone();
+        let invocations = invocation_server.registry.clone();
+        let bounded = !config.step_policies.is_empty();
         thread::spawn(move || {
             while !shutdown.load(Ordering::Acquire) {
                 if deploy::stop_requested(&dir) {
+                    if bounded {
+                        invocations.cancel_all();
+                    }
                     if let Ok(mut guard) = record.lock() {
                         if guard.state == DeploymentState::Running {
                             let _ = guard.advance(
@@ -2189,9 +2440,13 @@ fn spawn_topology_agents(
         let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
         fs::write(&prompt_file, format!("{protocol}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.\n", temp.display()))?;
         let backend = canonical_backend(&agent.backend);
-        let base_command = crate::backend::resolve(backend)
-            .map(|backend| backend.default_command().to_string())
-            .map_err(anyhow::Error::msg)?;
+        let base_command = if let Some(profile) = config.execution_profiles.get(name) {
+            profile.command(backend)?
+        } else {
+            crate::backend::resolve(backend)
+                .map(|backend| backend.default_command().to_string())
+                .map_err(anyhow::Error::msg)?
+        };
         let context = McpLaunchContext {
             omar_dir: config.omar_dir.to_path_buf(),
             ea_id: config.ea_id,
@@ -2212,16 +2467,27 @@ fn spawn_topology_agents(
             }),
         };
         let command = manager::build_agent_command(&base_command, &prompt_file, &[], &context);
+        let mut environment = vec![
+            ("OMAR_WORKTREE".into(), workdir.into()),
+            ("OMAR_TEMP".into(), temp.to_string_lossy().into_owned()),
+            ("TMPDIR".into(), temp.to_string_lossy().into_owned()),
+        ];
+        if let Some(directory) = config.receipt_directory {
+            environment.push((
+                "OMAR_USAGE_FILE".into(),
+                directory
+                    .join("usage")
+                    .join(format!("{name}.json"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
         client.new_session_with_backend_env(
             &session,
             &command,
             Some(workdir),
             Some(backend),
-            &[
-                ("OMAR_WORKTREE".into(), workdir.into()),
-                ("OMAR_TEMP".into(), temp.to_string_lossy().into_owned()),
-                ("TMPDIR".into(), temp.to_string_lossy().into_owned()),
-            ],
+            &environment,
         )?;
         spawned.insert(name.clone(), session);
         launched.insert(name.clone(), command);
@@ -2844,6 +3110,12 @@ fn run_event_loop_observed<E: ReactionExecutor>(
         // so running them together is safe, and by the time a layer is reached
         // every reaction that could feed it has already had its turn.
         for layer in &layers {
+            if executor.cancelled() {
+                return Ok(LoopEnd::Stopped(Settled {
+                    outputs,
+                    state_vars: store,
+                }));
+            }
             let mut enabled: Vec<_> = layer
                 .iter()
                 .filter_map(|id| state.reactions.get_key_value(id))
@@ -2885,7 +3157,16 @@ fn run_event_loop_observed<E: ReactionExecutor>(
                             .map_err(|_| anyhow::anyhow!("reaction executor panicked"))?
                     })
                     .collect::<Result<Vec<_>>>()
-            })?;
+            });
+            // No result from this layer is committed after cancellation,
+            // including an answer produced before a slower peer returned.
+            if executor.cancelled() {
+                return Ok(LoopEnd::Stopped(Settled {
+                    outputs,
+                    state_vars: store,
+                }));
+            }
+            let results = results?;
 
             // Declaration order decides who wins a port two reactions in this
             // layer both write, which is the rule the language states.
@@ -2993,21 +3274,51 @@ fn invocation_spec(
 
 fn render_prompt(template: &str, values: &BTreeMap<String, Value>) -> Result<String> {
     let mut rendered = String::new();
+    visit_prompt(template, values, |part| {
+        rendered.push_str(part);
+        Ok(())
+    })?;
+    Ok(rendered)
+}
+
+fn rendered_prompt_bytes(template: &str, values: &BTreeMap<String, Value>) -> Result<usize> {
+    let mut bytes = 0usize;
+    visit_prompt(template, values, |part| {
+        bytes = bytes
+            .checked_add(part.len())
+            .context("prompt size overflow")?;
+        Ok(())
+    })?;
+    Ok(bytes)
+}
+
+/// Count and render using exactly the same interpolation parser. Counting
+/// does not allocate the expanded prompt; repeated non-string values are
+/// encoded once so a rejected oversized expansion stays cheap to inspect.
+fn visit_prompt(
+    template: &str,
+    values: &BTreeMap<String, Value>,
+    mut emit: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let mut encoded = BTreeMap::new();
     let mut remaining = template;
     while let Some(start) = remaining.find("$(") {
-        rendered.push_str(&remaining[..start]);
+        emit(&remaining[..start])?;
         let expression = &remaining[start + 2..];
         let end = interpolation_end(expression).context("unterminated prompt interpolation")?;
         let identifier = interpolation_identifier(&expression[..end])?;
         match values.get(&identifier) {
-            Some(Value::String(text)) => rendered.push_str(text),
-            Some(other) => rendered.push_str(&other.to_string()),
-            None => rendered.push_str("<absent>"),
+            Some(Value::String(text)) => emit(text)?,
+            Some(other) => emit(
+                encoded
+                    .entry(identifier)
+                    .or_insert_with(|| other.to_string()),
+            )?,
+            None => emit("<absent>")?,
         }
         remaining = &expression[end + 1..];
     }
-    rendered.push_str(remaining);
-    Ok(rendered)
+    emit(remaining)
 }
 
 fn interpolation_end(expression: &str) -> Option<usize> {
@@ -3117,11 +3428,11 @@ fn require_identifier(kind: &str, value: &str) -> Result<()> {
 /// command to resolve — the difference has to be known before any of that is
 /// attempted. It names what answers the reaction, not how the bytes get there:
 /// the transport is the panel's business, not the program's.
-fn is_web_backend(backend: &str) -> bool {
+pub(crate) fn is_web_backend(backend: &str) -> bool {
     canonical_backend(backend) == "web"
 }
 
-fn canonical_backend(backend: &str) -> &str {
+pub(crate) fn canonical_backend(backend: &str) -> &str {
     if backend.eq_ignore_ascii_case("web") {
         return "web";
     }
@@ -3131,7 +3442,59 @@ fn canonical_backend(backend: &str) -> &str {
 }
 
 #[cfg(test)]
+#[path = "topology_recovery_tests.rs"]
+mod recovery_tests;
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn output_gate_rejects_malformed_result_before_returning_scheduler_writes() {
+        struct Malformed;
+        impl super::ReactionExecutor for Malformed {
+            fn invoke(
+                &self,
+                _: super::InvocationSpec,
+            ) -> anyhow::Result<std::collections::BTreeMap<String, serde_json::Value>> {
+                Ok(std::collections::BTreeMap::from([(
+                    "memo".into(),
+                    serde_json::json!("{\"wrong\":true}"),
+                )]))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut invocation = deadline_spec("memo", None);
+        invocation.id = "checked-invocation".into();
+        let checks = std::collections::BTreeMap::from([(
+            invocation.reaction_id.clone(),
+            vec![crate::workflow_design::OutputCheck::JsonObject {
+                port: "memo".into(),
+                required_fields: vec!["recommendation".into()],
+            }],
+        )]);
+        let executor = super::ReceiptExecutor {
+            inner: Malformed,
+            directory: Some(directory.path()),
+            checks: &checks,
+            policies: &BTreeMap::new(),
+            attempts: Mutex::new(BTreeMap::new()),
+            stop_dir: None,
+            timeout: Duration::from_secs(10),
+        };
+        assert!(super::ReactionExecutor::invoke(&executor, invocation)
+            .unwrap_err()
+            .to_string()
+            .contains("recommendation"));
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("checked-invocation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["status"], "failed");
+        assert!(
+            receipt["outputs"].is_null(),
+            "rejected writes cannot be delivered as accepted outputs"
+        );
+    }
+
     #[test]
     fn cleanup_refuses_unknown_recorded_tmux_identity() {
         let mut record = crate::deploy::DeploymentRecord::create("test", Default::default(), 10);
@@ -3170,6 +3533,41 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn task_metadata_survives_verification_without_changing_execution() {
+        let old = program();
+        let mut named = old.clone();
+        for instruction in &mut named.instructions {
+            if let Instruction::InstallReaction {
+                title, description, ..
+            } = instruction
+            {
+                *title = Some("Complete the request".into());
+                *description = Some("Process the request and return the result.".into());
+            }
+        }
+        let before = verify(&old).unwrap();
+        let after = verify(&named).unwrap();
+        let reaction = &after.reactions["reaction.0"];
+        assert_eq!(reaction.title.as_deref(), Some("Complete the request"));
+        assert_eq!(reaction.prompt, before.reactions["reaction.0"].prompt);
+        let mut restored = after.clone();
+        for reaction in restored.reactions.values_mut() {
+            reaction.title = None;
+            reaction.description = None;
+        }
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(restored).unwrap()
+        );
+        let roundtrip: VmState =
+            serde_json::from_value(serde_json::to_value(after).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.reactions["reaction.0"].title.as_deref(),
+            Some("Complete the request")
+        );
     }
 
     #[test]
@@ -3422,6 +3820,8 @@ mod tests {
                     effects: effects.into_iter().map(str::to_string).collect(),
                     contract: contract.into(),
                     prompt: "prompt".into(),
+                    title: None,
+                    description: None,
                     body: None,
                     within: None,
                 },

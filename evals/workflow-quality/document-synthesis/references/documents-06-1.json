@@ -1,0 +1,22 @@
+{
+  "id": "documents-06-1",
+  "decision": "insufficient_evidence",
+  "required_source_ids": [
+    "policy",
+    "measurement",
+    "review"
+  ],
+  "caveat": "The measurement conflicts and final approval is missing.",
+  "label_author": "synthetic fixture generator",
+  "review_status": "provisional",
+  "critical_errors": [
+    "wrong decision",
+    "invented citation",
+    "unsupported factual claim"
+  ],
+  "human_review_required": [
+    "claims are supported by cited passages",
+    "material caveat is expressed",
+    "no substantive reviewer edits"
+  ]
+}

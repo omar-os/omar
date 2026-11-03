@@ -1,0 +1,280 @@
+{
+  "id": "repo-schedule-04",
+  "protected_tests": [
+    {
+      "id": "merge-1",
+      "request": {
+        "operation": "merge",
+        "payload": [
+          [
+            4,
+            6
+          ],
+          [
+            1,
+            4
+          ]
+        ]
+      },
+      "expected": [
+        [
+          1,
+          6
+        ]
+      ]
+    },
+    {
+      "id": "merge-2",
+      "request": {
+        "operation": "merge",
+        "payload": []
+      },
+      "expected": []
+    },
+    {
+      "id": "merge-3",
+      "request": {
+        "operation": "merge",
+        "payload": [
+          [
+            1,
+            9
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            12,
+            14
+          ]
+        ]
+      },
+      "expected": [
+        [
+          1,
+          9
+        ],
+        [
+          12,
+          14
+        ]
+      ]
+    },
+    {
+      "id": "overlap-1",
+      "request": {
+        "operation": "overlap",
+        "payload": [
+          [
+            0,
+            2
+          ],
+          [
+            4,
+            6
+          ]
+        ]
+      },
+      "expected": 0
+    },
+    {
+      "id": "overlap-2",
+      "request": {
+        "operation": "overlap",
+        "payload": [
+          [
+            0,
+            5
+          ],
+          [
+            2,
+            4
+          ]
+        ]
+      },
+      "expected": 2
+    },
+    {
+      "id": "overlap-3",
+      "request": {
+        "operation": "overlap",
+        "payload": [
+          [
+            0,
+            2
+          ],
+          [
+            2,
+            4
+          ]
+        ]
+      },
+      "expected": 0
+    },
+    {
+      "id": "due-1",
+      "request": {
+        "operation": "due",
+        "payload": {
+          "today": "2024-02-29",
+          "tasks": [
+            {
+              "id": "a",
+              "due": "2024-02-29"
+            }
+          ]
+        }
+      },
+      "expected": [
+        "a"
+      ]
+    },
+    {
+      "id": "due-2",
+      "request": {
+        "operation": "due",
+        "payload": {
+          "today": "2024-03-01",
+          "tasks": [
+            {
+              "id": "b",
+              "due": "2024-02-29"
+            },
+            {
+              "id": "c",
+              "due": "2024-03-02"
+            }
+          ]
+        }
+      },
+      "expected": [
+        "b"
+      ]
+    },
+    {
+      "id": "due-3",
+      "request": {
+        "operation": "due",
+        "payload": {
+          "today": "2024-01-01",
+          "tasks": []
+        }
+      },
+      "expected": []
+    },
+    {
+      "id": "slots-1",
+      "request": {
+        "operation": "slots",
+        "payload": {
+          "start": 0,
+          "end": 6,
+          "length": 3
+        }
+      },
+      "expected": [
+        [
+          0,
+          3
+        ],
+        [
+          3,
+          6
+        ]
+      ]
+    },
+    {
+      "id": "slots-2",
+      "request": {
+        "operation": "slots",
+        "payload": {
+          "start": 5,
+          "end": 6,
+          "length": 3
+        }
+      },
+      "expected": []
+    },
+    {
+      "id": "slots-3",
+      "request": {
+        "operation": "slots",
+        "payload": {
+          "start": 3,
+          "end": 9,
+          "length": 2
+        }
+      },
+      "expected": [
+        [
+          3,
+          5
+        ],
+        [
+          5,
+          7
+        ],
+        [
+          7,
+          9
+        ]
+      ]
+    },
+    {
+      "id": "elapsed-1",
+      "request": {
+        "operation": "elapsed",
+        "payload": {
+          "start": "2024-01-01T10:00:00+02:00",
+          "end": "2024-01-01T09:30:00+00:00"
+        }
+      },
+      "expected": 90
+    },
+    {
+      "id": "elapsed-2",
+      "request": {
+        "operation": "elapsed",
+        "payload": {
+          "start": "2024-01-01T23:30:00+00:00",
+          "end": "2024-01-02T00:00:00+00:00"
+        }
+      },
+      "expected": 30
+    },
+    {
+      "id": "elapsed-3",
+      "request": {
+        "operation": "elapsed",
+        "payload": {
+          "start": "2024-01-01T10:00:00+00:00",
+          "end": "2024-01-01T10:00:00+00:00"
+        }
+      },
+      "expected": 0
+    }
+  ],
+  "oracle_patch": {
+    "changes": [
+      {
+        "path": "candidate_app/core.py",
+        "content": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef slots(p):\n    return [[s,s+p['length']] for s in range(p['start'],p['end']-p['length']+1,p['length'])]\n\ndef elapsed(p):\n    return int((datetime.fromisoformat(p['end'])-datetime.fromisoformat(p['start'])).total_seconds()//60)\n"
+      }
+    ],
+    "explanation": "Authored fixture repair; independent review pending."
+  },
+  "label_author": "owned repository fixture generator",
+  "review_status": "provisional",
+  "critical_errors": [
+    "protected regression failure",
+    "input mutation",
+    "prohibited patch path",
+    "unexpected output or execution failure"
+  ],
+  "human_review_required": [
+    "patch meets complete specification beyond examples",
+    "patch is reasonable and does not hard-code protected cases"
+  ],
+  "independent_unit": "repository-schedule"
+}

@@ -202,6 +202,7 @@ export function assertChatMessage(value: unknown): ChatMessage {
 }
 
 export type RunRequest = {
+  plan?: import("./protocol-generated").PlanRef;
   program: string;
   inputs: Record<string, unknown>;
   conversation_id?: string;

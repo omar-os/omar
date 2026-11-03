@@ -19,6 +19,8 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ts_rs::TS;
+
+mod workflow;
 use uuid::Uuid;
 
 use crate::chat_history::{ConversationSummary, History};
@@ -98,6 +100,8 @@ pub struct RunRecord {
 
 #[derive(Debug, Deserialize)]
 struct StartRunRequest {
+    #[serde(default)]
+    plan: Option<crate::workflow_design::PlanRef>,
     program: String,
     #[serde(default)]
     conversation_id: Option<String>,
@@ -186,6 +190,9 @@ pub struct ChatMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct ProposedDesign {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub plan: Option<crate::workflow_design::PlanRef>,
     pub program: String,
     #[serde(default)]
     #[ts(type = "Record<string, unknown>")]
@@ -205,6 +212,8 @@ struct AgentReply {
 
 #[derive(Debug, Deserialize)]
 struct AgentProposal {
+    #[serde(default)]
+    plan: Option<crate::workflow_design::PlanDraft>,
     token: String,
     program: String,
     summary: String,
@@ -214,6 +223,8 @@ struct AgentProposal {
 
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
+    #[serde(default)]
+    workflow_plan: Option<crate::workflow_design::PlanRef>,
     #[serde(default)]
     conversation_id: Option<String>,
     text: String,
@@ -249,6 +260,7 @@ struct Context_ {
     session_prefix: String,
     default_workdir: String,
     health_idle_warning: i64,
+    design_only: bool,
     runs: Runs,
     /// Where each run's web-backed invocations are answered. Absent for a run
     /// whose program has no `Web` agent, which is what makes the panel routes
@@ -384,6 +396,7 @@ impl Serve {
             session_prefix: config.dashboard.session_prefix.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
+            design_only: config.agent.design_only,
             runs: Runs::default(),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
@@ -425,7 +438,11 @@ impl Serve {
                     Ok((stream, _)) => {
                         let workspaces = workspaces.clone();
                         thread::spawn(move || {
-                            let _ = handle_client(stream, workspaces);
+                            if let Err(error) = handle_client(stream, workspaces) {
+                                if std::env::var_os("OMAR_SERVE_DIAGNOSTICS").is_some() {
+                                    eprintln!("Serve connection failed: {error:#}");
+                                }
+                            }
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -479,6 +496,7 @@ impl Serve {
             tmux_server: None,
             topology: None,
             serve: Some(crate::manager::ServeMcpContext {
+                design_only: config.agent.design_only,
                 endpoint: self.address.to_string(),
                 token: self.agent_token.clone(),
             }),
@@ -525,7 +543,10 @@ impl Serve {
 
         let existing = crate::ea::ea_manager_session(ea_id, &config.dashboard.session_prefix);
         if client.has_session(&existing)? {
-            if !restart && !context.chat.lock().expect("chat poisoned").needs_context {
+            if !restart
+                && !config.agent.design_only
+                && !context.chat.lock().expect("chat poisoned").needs_context
+            {
                 return Ok(AttachEa::AlreadyRunningWithoutServe(existing));
             }
             // Not `ensure_session_not_attached`: that resolves through the
@@ -546,6 +567,7 @@ impl Serve {
                 default_workdir: config.agent.default_workdir.clone(),
                 health_idle_warning: config.health.idle_warning,
                 serve: Some(crate::manager::ServeMcpContext {
+                    design_only: config.agent.design_only,
                     endpoint: self.address.to_string(),
                     token: self.agent_token.clone(),
                 }),
@@ -574,6 +596,12 @@ impl Serve {
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("no MCP context at {}", path.display()))?;
         let context: Value = serde_json::from_str(&raw).context("MCP context is not valid JSON")?;
+        anyhow::ensure!(
+            context["serve"]["design_only"].as_bool().unwrap_or(false)
+                == self.workspaces.root.design_only,
+            "{} carries a different assistant tool scope",
+            path.display()
+        );
         match context.get("serve").and_then(|serve| serve.get("token")) {
             Some(Value::String(token)) if *token == self.agent_token => Ok(()),
             Some(_) => anyhow::bail!("{} carries a different server's token", path.display()),
@@ -671,6 +699,10 @@ pub fn run(
 }
 
 fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<()> {
+    // The listener polls nonblocking for shutdown. Accepted sockets can
+    // inherit that mode (notably on macOS), but this handler uses blocking
+    // reads with deadlines. Partial request delivery must not become EAGAIN.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -729,7 +761,15 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
     } else {
         None
     };
-    let context = if path == "/v1/agent/reply" || path == "/v1/agent/proposals" {
+    let context = if matches!(
+        path.as_str(),
+        "/v1/agent/reply"
+            | "/v1/agent/proposals"
+            | "/v1/agent/profiles"
+            | "/v1/agent/evidence"
+            | "/v1/agent/research"
+            | "/v1/agent/plan"
+    ) {
         let body: Value = match serde_json::from_slice(&raw_body) {
             Ok(body) => body,
             Err(error) => {
@@ -942,6 +982,29 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>) -> Result<(
             } else {
                 agent_proposal(&context, &read_body(content_length)?)
             }
+        }
+        ("GET", "/v1/workflow/profiles") => workflow::profiles(&context),
+        ("GET", "/v1/workflow/evidence") => workflow::evidence(&context),
+        ("POST", "/v1/agent/profiles") => {
+            workflow::research::catalog(&context, &read_body(content_length)?, false)
+        }
+        ("POST", "/v1/agent/evidence") => {
+            workflow::research::catalog(&context, &read_body(content_length)?, true)
+        }
+        ("POST", "/v1/agent/research") => {
+            workflow::research::lookup(&context, &read_body(content_length)?)
+        }
+        ("POST", "/v1/workflow/plans") => workflow::save(&context, &read_body(content_length)?),
+        ("POST", "/v1/workflow/export") => workflow::export(&context, &read_body(content_length)?),
+        ("POST", "/v1/workflow/import") => workflow::import(&context, &read_body(content_length)?),
+        ("POST", "/v1/workflow/plan") | ("POST", "/v1/agent/plan") => {
+            workflow::read(&context, &read_body(content_length)?)
+        }
+        ("POST", "/v1/workflow/receipts") => {
+            workflow::receipt(&context, &read_body(content_length)?)
+        }
+        ("POST", "/v1/workflow/access-evidence") => {
+            workflow::access_evidence::inspect(&context, &read_body(content_length)?)
         }
         ("POST", "/v1/programs/check") => {
             if content_length > MAX_BODY_BYTES {
@@ -1309,6 +1372,7 @@ fn relaunch_ea(context: &Arc<Context_>, command: &str) -> Result<String> {
             health_idle_warning: context.health_idle_warning,
             // Without this the new process has no way to answer the operator.
             serve: Some(crate::manager::ServeMcpContext {
+                design_only: context.design_only,
                 endpoint: context.address.to_string(),
                 token: context
                     .agent_token
@@ -1401,6 +1465,7 @@ impl Workspaces {
             session_prefix: self.root.session_prefix.clone(),
             default_workdir: self.root.default_workdir.clone(),
             health_idle_warning: self.root.health_idle_warning,
+            design_only: self.root.design_only,
             runs: Runs::default(),
             panels: Panels::default(),
             chat: Arc::new(Mutex::new(Chat {
@@ -1500,6 +1565,14 @@ fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     if request.text.trim().is_empty() {
         return (400, json!({"error": "message is empty"}));
     }
+    let design_context = if let Some(reference) = &request.workflow_plan {
+        match workflow::review_context(context, reference) {
+            Ok(context) => context,
+            Err(error) => return (409, json!({"error":format!("{error:#}")})),
+        }
+    } else {
+        String::new()
+    };
     // The selection is echoed into the EA's pane, so it is untrusted input of
     // unbounded size unless bounded here.
     if request.selection.len() > MAX_SELECTION {
@@ -1577,10 +1650,19 @@ fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(message) => message,
         Err(error) => return (500, json!({"error": format!("{error:#}")})),
     };
+    let research = match workflow::research::begin_for_message(context, &message) {
+        Ok(usage) => usage,
+        Err(error) => {
+            return (
+                500,
+                json!({"error": format!("could not initialize research scope: {error:#}")}),
+            )
+        }
+    };
     context.chat.lock().expect("serve chat poisoned").busy = true;
     match deliver_to_ea(
         context,
-        &format!("{resume}{}", request.text),
+        &format!("{resume}Operator message reference: sequence {} in chat {}. Use this stored message for user_stated provenance. Research session: {}. Use omar_research_workflow for bounded source reads.\n\n{}{design_context}", message.sequence, context.conversation_id, research.session_id, request.text),
         &request.selection,
     ) {
         Ok(()) => {
@@ -1626,8 +1708,21 @@ fn mission_control_envelope(text: &str, selection: &[String]) -> String {
          print here reaches nobody. Every question, status update, and answer must go \
          through `omar_reply`.\n\
          To offer a workflow, call the MCP tool `omar_propose_design` with a complete \
-         OMAR program. The operator approves and runs it; you do not.\n\n\
-         {selected}{text}"
+         OMAR program. The operator approves and runs it; you do not.\n\
+         Every step must include task(\"Short action title\", \"What it does and produces.\") \
+         after its output contract and optional within(...) deadline, before its prompt \
+         string or code body. Use a specific 3–6 word action title and 1–3 plain-language \
+         sentences explaining the work, result, and any manual handoff. Keep technical \
+         IDs and backend names out of titles; preserve the actual execution behavior.\n\
+         When asked how to get started, invite the operator to describe a workflow \
+         they want to automate, from development to marketing and beyond. Lead with \
+         concrete developer examples: a GitHub issue into a tested pull request, \
+         fixing failing CI builds; then a product release into launch emails and \
+         social posts. Explain that you will work out the steps and agents and \
+         propose an implementation to review and run. Ask focused questions only \
+         where needed; do not require a full workflow checklist up front.\n\n\
+         {design_rules}\n\n{selected}{text}",
+        design_rules = include_str!("../prompts/workflow-design.md")
     )
 }
 
@@ -1685,11 +1780,40 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
+    if let Err(error) = validate_task_metadata(&state) {
+        return (400, json!({"error": error}));
+    }
+    let plan = match proposal.plan {
+        Some(mut draft) => {
+            // A generated proposal cannot assert that the user approved an assumption.
+            for assumption in &mut draft.intent.assumptions {
+                assumption.accepted = false;
+            }
+            match workflow::create(context, &proposal.program, &proposal.inputs, draft, &state) {
+                Ok(plan) => Some(crate::workflow_design::PlanRef {
+                    id: plan.id,
+                    revision: plan.revision,
+                }),
+                Err(error) => {
+                    return (
+                        if error.to_string().contains("conflict") {
+                            409
+                        } else {
+                            400
+                        },
+                        json!({"error": format!("{error:#}")}),
+                    )
+                }
+            }
+        }
+        None => None,
+    };
     if let Err(error) = context.publish(
         ChatRole::Assistant,
         proposal.summary,
         false,
         Some(ProposedDesign {
+            plan,
             program: proposal.program,
             inputs: proposal.inputs,
             preview: crate::diagram::DiagramSnapshot::from_vm_state(&state),
@@ -1698,6 +1822,33 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         return (500, json!({"error": format!("{error:#}")}));
     }
     (202, json!({"status": "proposed"}))
+}
+
+/// Only assistant proposals require task copy. Older source and saved runs
+/// remain loadable, and display metadata never changes execution identity.
+fn validate_task_metadata(state: &VmState) -> std::result::Result<(), String> {
+    let invalid: Vec<_> = state
+        .reactions
+        .iter()
+        .filter_map(|(id, reaction)| {
+            let valid = |value: &Option<String>, max: usize| {
+                value.as_deref().is_some_and(|s| {
+                    let s = s.trim();
+                    !s.is_empty() && s.chars().count() <= max
+                })
+            };
+            (!valid(&reaction.title, 80) || !valid(&reaction.description, 1200))
+                .then_some(id.as_str())
+        })
+        .collect();
+    if invalid.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Every proposed step needs a task title (1–80 characters) and description (1–1200 characters). Add task(\"Short action title\", \"What this step does and produces, including any manual handoff.\") after the output contract and optional within(...) deadline, before the prompt string or code body. Missing or invalid task metadata: {}. Preserve existing IDs, prompts, agents and connections.",
+            invalid.join(", ")
+        ))
+    }
 }
 
 fn compile_preview(context: &Arc<Context_>, program: &str) -> Result<VmState> {
@@ -1868,6 +2019,12 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         }
     }
 
+    let (execution_profiles, output_checks, step_policies) =
+        match workflow::admit(context, &request, &state, &run_id, &run_dir) {
+            Ok(profiles) => profiles,
+            Err(error) => return (409, json!({"error": format!("{error:#}")})),
+        };
+
     let record = RunRecord {
         run_id: run_id.clone(),
         team: state.team.clone(),
@@ -1892,6 +2049,9 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         topology::generated_dir(&program_path),
         inputs,
         &request,
+        execution_profiles,
+        output_checks,
+        step_policies,
         ready_sender,
     );
 
@@ -2149,6 +2309,9 @@ fn spawn_run_thread(
     generated: std::path::PathBuf,
     inputs: Vec<String>,
     request: &StartRunRequest,
+    execution_profiles: BTreeMap<String, crate::workflow_design::ExecutionProfile>,
+    output_checks: BTreeMap<String, Vec<crate::workflow_design::OutputCheck>>,
+    step_policies: crate::workflow_design::recovery::RuntimePolicies,
     ready_sender: mpsc::Sender<SocketAddr>,
 ) {
     // The panel's credentials arrive on their own channel, and only for a run
@@ -2181,6 +2344,15 @@ fn spawn_run_thread(
         let outcome = topology::run_topology(
             &bytecode,
             TopologyRunConfig {
+                step_policies: &step_policies,
+                output_checks: &output_checks,
+                receipt_directory: Some(
+                    &crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+                        .join("serve")
+                        .join(&run_id)
+                        .join("invocations"),
+                ),
+                execution_profiles: &execution_profiles,
                 ea_id: context.ea_id,
                 omar_dir: &context.omar_dir,
                 generated: &generated,
@@ -2213,6 +2385,12 @@ fn spawn_run_thread(
                     record.status = RunStatus::Failed;
                     record.error = Some(format!("{error:#}"));
                 }
+            }
+            if let Err(error) = workflow::finish(&context, record) {
+                record.error = Some(format!(
+                    "Execution receipt could not be persisted: {error:#}"
+                ));
+                record.status = RunStatus::Failed;
             }
         }
     });
@@ -2357,6 +2535,24 @@ mod tests {
     use super::*;
     use crate::topology::{AgentState, PortState};
 
+    #[test]
+    fn a_fragmented_http_request_waits_for_its_remaining_bytes() {
+        let server = test_server();
+        let mut stream = TcpStream::connect(server.address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(b"GET /heal").unwrap();
+        // Give the polling listener time to accept and begin reading.
+        thread::sleep(Duration::from_millis(250));
+        stream
+            .write_all(b"th HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+
     fn sample_state() -> VmState {
         VmState {
             version: 1,
@@ -2418,7 +2614,7 @@ mod tests {
         }
     }
 
-    fn test_server() -> Serve {
+    pub(super) fn test_server() -> Serve {
         let omar_dir = std::env::temp_dir().join(format!("omar-serve-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&omar_dir).expect("temp omar dir");
         Serve::start(
@@ -2748,6 +2944,7 @@ while True:
             )
             .unwrap();
         let proposal = ProposedDesign {
+            plan: None,
             program: include_str!("../web/tests/fixtures/review-flow.omar").into(),
             inputs: BTreeMap::from([("flow.request".into(), json!("release evidence"))]),
             preview: serde_json::from_str(include_str!(
@@ -3047,6 +3244,45 @@ while True:
     }
 
     #[test]
+    fn proposed_tasks_require_titles_and_descriptions_for_every_step() {
+        let mut state = sample_state();
+        let reaction: topology::ReactionState = serde_json::from_value(json!({
+            "order": 0, "agent": "worker", "triggers": ["request"],
+            "effects": ["answer"], "contract": "answer", "prompt": "Answer the request"
+        }))
+        .unwrap();
+        state
+            .reactions
+            .insert("reaction.0".into(), reaction.clone());
+        state.reactions.insert("nested.reaction.0".into(), reaction);
+        let error = validate_task_metadata(&state).unwrap_err();
+        assert!(error.contains("reaction.0") && error.contains("nested.reaction.0"));
+        for reaction in state.reactions.values_mut() {
+            reaction.title = Some("Answer the request".into());
+            reaction.description = Some("Read the request and return an answer.".into());
+        }
+        assert!(validate_task_metadata(&state).is_ok());
+        let reaction = state.reactions.get_mut("nested.reaction.0").unwrap();
+        reaction.description = Some("  \n ".into());
+        assert!(validate_task_metadata(&state)
+            .unwrap_err()
+            .ends_with("Preserve existing IDs, prompts, agents and connections."));
+        state
+            .reactions
+            .get_mut("nested.reaction.0")
+            .unwrap()
+            .description = Some("x".repeat(1201));
+        assert!(validate_task_metadata(&state).is_err());
+        state
+            .reactions
+            .get_mut("nested.reaction.0")
+            .unwrap()
+            .description = Some("Valid description".into());
+        state.reactions.get_mut("nested.reaction.0").unwrap().title = Some("x".repeat(81));
+        assert!(validate_task_metadata(&state).is_err());
+    }
+
+    #[test]
     fn an_unbuildable_proposal_never_reaches_the_operator() {
         // The EA gets the compiler diagnostic back as its tool result, so it
         // can correct the program rather than the operator seeing a broken one.
@@ -3169,7 +3405,8 @@ while True:
             mission_control_envelope("plain question", &[]),
             mission_control_envelope("plain question", &[]),
         );
-        assert!(!mission_control_envelope("plain question", &[]).contains("selected"));
+        assert!(!mission_control_envelope("plain question", &[])
+            .contains("The operator has selected these components in the diagram:"));
     }
 
     #[test]
@@ -3213,6 +3450,28 @@ while True:
             context["serve"]["endpoint"].as_str(),
             Some(server.address().to_string().as_str())
         );
+    }
+
+    #[test]
+    fn design_only_scope_is_written_before_launch_and_inherited_by_new_chats() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.agent.design_only = true;
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let context: crate::manager::McpLaunchContext = serde_json::from_slice(
+            &std::fs::read(crate::manager::ea_mcp_context_path(
+                dir.path(),
+                server.ea_id,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(context.design_only());
+        let reply = request(server.address(), "POST", "/v1/chats", Some("{}"));
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        let contexts = server.workspaces.contexts.lock().unwrap();
+        assert!(contexts.len() >= 2);
+        assert!(contexts.values().all(|context| context.design_only));
     }
 
     #[test]
@@ -3496,7 +3755,12 @@ while True:
         assert!(plain.contains("WebSocket"), "{plain}");
     }
 
-    fn request(address: SocketAddr, method: &str, path: &str, body: Option<&str>) -> String {
+    pub(super) fn request(
+        address: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> String {
         let mut stream = TcpStream::connect(address).expect("connect");
         let body = body.unwrap_or("");
         write!(

@@ -410,6 +410,52 @@ def testNamedMain : IO Unit :=
   | .ok program => assertEqual "named main" program.team "Payroll"
   | .error message => throw (IO.userError s!"named main: {message}")
 
+def testTaskMetadata : IO Unit := do
+  let source := "team Tasks[writer : Codex] {
+    input request : string
+    action draft : string
+    output result : string
+    prompt writer(request) -> draft within(30s)
+      task(\" Draft campaign script \", \" Turn the brief into a script for review. \")
+      \"Draft $(request)\"
+    reaction(draft) -> result
+      task(\"Save approved script\", \"Copy the script to the output.\")
+      {= result = draft; =}
+  }
+  team Wrapper { nested = Tasks() }
+  main NamedTasks { first = Tasks() second = Wrapper() }"
+  match lex source >>= parse "ignored" with
+  | .error message => throw (IO.userError s!"task metadata: {message}")
+  | .ok program => do
+      assertEqual "metadata reaches nested instances" program.reactions.size 4
+      for reaction in program.reactions do
+        assertEqual "task has description" reaction.description.isSome true
+        assertEqual "identity remains generated" (mentions reaction.id "reaction.") true
+        if reaction.body.isNone then
+          assertEqual "title trimmed" (reaction.title.getD "") "Draft campaign script"
+          assertEqual "prompt is not task copy" (mentions reaction.prompt "Draft $(") true
+          assertEqual "deadline preserved" (reaction.within.getD 0) 30000000000
+        else
+          assertEqual "code task title" (reaction.title.getD "") "Save approved script"
+      let bytecode := compile program
+      assertEqual "bytecode has task title" (mentions bytecode "\"title\": \"Draft campaign script\"") true
+      let legacy := source.replace
+        "task(\" Draft campaign script \", \" Turn the brief into a script for review. \")" ""
+        |>.replace "task(\"Save approved script\", \"Copy the script to the output.\")" ""
+      match lex legacy >>= parse "ignored" with
+      | .error message => throw (IO.userError message)
+      | .ok old =>
+          assertEqual "metadata leaves execution bytecode unchanged"
+            (compile { program with reactions := program.reactions.map fun r =>
+              { r with title := none, description := none } }) (compile old)
+  for annotation in ["task(\" \", \"Description\")", "task(\"Title\", \" \")",
+      "task(\"Title\")"] do
+    let invalid := "team T[a : Codex] { input x : string output y : string prompt a(x) -> y " ++
+      annotation ++ " \"Go\" } main { t = T() }"
+    match compileSource "InvalidTask" invalid with
+    | .ok _ => throw (IO.userError s!"invalid task metadata accepted: {annotation}")
+    | .error _ => pure ()
+
 def main : IO UInt32 := do
   try
     for test in topologyCases do
@@ -422,6 +468,7 @@ def main : IO UInt32 := do
     testDelayUnits
     testStateLiterals
     testCodeTerminator
+    testTaskMetadata
     IO.println "compiler rejection tests passed"
     pure 0
   catch error =>

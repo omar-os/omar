@@ -33,7 +33,7 @@ test("renders the OMAR Mission Control application shell", async () => {
   assert.doesNotMatch(html, /WORKFLOW BUILDER/);
   assert.doesNotMatch(html, /class="topbar"/);
   assert.match(html, /alt="Omar"/);
-  assert.match(html, /LIVE TOPOLOGY/);
+  assert.match(html, /WORKFLOW TOPOLOGY/);
   assert.match(html, /ReviewFlow\.omar/);
   // Mode is a launch flag, so with OMAR_SERVE_URL unset the shell renders the
   // offline demo topology rather than any connect affordance.
@@ -89,7 +89,7 @@ test("renders every team as a container holding its own ports and reactions", as
   assert.match(diagram, /snapshot\.instances/);
 });
 
-test("uses the LF-inspired visual grammar without KIELER", async () => {
+test("renders workflow task cards with the existing topology engine", async () => {
   const [diagram, styles, manifest] = await Promise.all([
     readFile(
       new URL("../app/diagram/diagram-canvas.tsx", import.meta.url),
@@ -99,8 +99,8 @@ test("uses the LF-inspired visual grammar without KIELER", async () => {
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
 
-  // Real SVG geometry, not rectangles clipped into shape by CSS.
-  assert.match(diagram, /function chevronPoints/);
+  // Task cards use SVG rectangles while ports and actions retain their semantics.
+  assert.match(diagram, /<rect className="omar-reaction-body"/);
   assert.match(diagram, /function portTriangle/);
   assert.match(diagram, /function diamondPoints/);
   assert.match(diagram, /"elk\.edgeRouting": "ORTHOGONAL"/);

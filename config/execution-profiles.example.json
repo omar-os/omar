@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "id": "codex-quality",
+      "version": 1,
+      "label": "GPT-6.1 Sol · quality candidate",
+      "backend": "codex",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
+      "tier": "quality",
+      "operations": [
+        "structured_extraction",
+        "evidence_synthesis",
+        "claim_verification",
+        "code_repair",
+        "code_verification"
+      ],
+      "tools": [
+        "files",
+        "shell",
+        "web"
+      ],
+      "access": "unknown",
+      "enabled": true,
+      "input_modalities": [
+        "text",
+        "structured_data",
+        "code"
+      ],
+      "output_modalities": [
+        "text",
+        "structured_data",
+        "code"
+      ]
+    },
+    {
+      "id": "codex-economy",
+      "version": 1,
+      "label": "GPT-6 Luna · economy candidate",
+      "backend": "codex",
+      "model": "gpt-6-luna",
+      "effort": "medium",
+      "tier": "economy",
+      "operations": [
+        "structured_extraction",
+        "claim_verification"
+      ],
+      "tools": [
+        "files",
+        "shell",
+        "web"
+      ],
+      "access": "unknown",
+      "enabled": true,
+      "input_modalities": [
+        "text",
+        "structured_data",
+        "code"
+      ],
+      "output_modalities": [
+        "text",
+        "structured_data",
+        "code"
+      ]
+    },
+    {
+      "id": "claude-quality",
+      "version": 1,
+      "label": "Claude Sonnet · quality candidate",
+      "backend": "claude",
+      "model": "claude-sonnet-5-5",
+      "effort": "high",
+      "tier": "quality",
+      "operations": [
+        "structured_extraction",
+        "evidence_synthesis",
+        "claim_verification",
+        "code_repair",
+        "code_verification"
+      ],
+      "tools": [
+        "files",
+        "shell",
+        "web"
+      ],
+      "access": "unknown",
+      "enabled": true,
+      "input_modalities": [
+        "text",
+        "structured_data",
+        "code"
+      ],
+      "output_modalities": [
+        "text",
+        "structured_data",
+        "code"
+      ]
+    },
+    {
+      "id": "claude-economy",
+      "version": 1,
+      "label": "Claude Haiku · economy candidate",
+      "backend": "claude",
+      "model": "claude-haiku-5-5",
+      "effort": null,
+      "tier": "economy",
+      "operations": [
+        "structured_extraction",
+        "claim_verification"
+      ],
+      "tools": [
+        "files",
+        "shell",
+        "web"
+      ],
+      "access": "unknown",
+      "enabled": true,
+      "input_modalities": [
+        "text",
+        "structured_data",
+        "code"
+      ],
+      "output_modalities": [
+        "text",
+        "structured_data",
+        "code"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "anthropic-20261101-extraction",
+      "profile_id": "claude-economy",
+      "profile_version": 1,
+      "operation": "structured_extraction",
+      "source_kind": "provider_claim",
+      "author": "Anthropic",
+      "source": "https://platform.claude.com/docs/en/models/overview",
+      "finding": "Provider positions Haiku for high-volume extraction. This is candidate-selection evidence only.",
+      "limitations": "No local quality or account-access measurement. Does not qualify an economical route.",
+      "reviewed_at": 1793491200,
+      "expires_at": 1796083200,
+      "locally_qualified": false,
+      "qualification": null,
+      "benchmark_result": null
+    },
+    {
+      "id": "openai-20261102-sol-coding-guidance",
+      "profile_id": "codex-quality",
+      "profile_version": 1,
+      "operation": "code_repair",
+      "source_kind": "provider_claim",
+      "author": "OpenAI",
+      "source": "https://developers.openai.com/api/docs/guides/latest-model#gpt-61-sol",
+      "finding": "OpenAI positions GPT-6.1 Sol for complex coding. This supports a provisional code-repair candidate, not a measured Omar repair success rate.",
+      "limitations": "Descriptive provider guidance, checked by Codex against the official page; no numerical benchmark, independent human review, task-matched measurement, native account verification or observed immutable model identity. Applying general coding guidance to repair is an explicit transfer hypothesis.",
+      "reviewed_at": 1793658854,
+      "expires_at": 1796250854,
+      "locally_qualified": false,
+      "qualification": null,
+      "benchmark_result": null
+    },
+    {
+      "id": "openai-20261102-luna-extraction-guidance",
+      "profile_id": "codex-economy",
+      "profile_version": 1,
+      "operation": "structured_extraction",
+      "source_kind": "provider_claim",
+      "author": "OpenAI",
+      "source": "https://developers.openai.com/api/docs/guides/deployment-checklist#set-up-reasoningeffort",
+      "finding": "OpenAI recommends low effort for routine extraction and lists GPT-6 Luna among supported reasoning models. Luna is a candidate for a local extraction trial.",
+      "limitations": "Provider guidance checked by Codex, not independent quality evidence. The configured candidate remains medium effort; this source does not measure that setting. No reliable economical route, subscription cost, native tool access or local acceptance rate is established.",
+      "reviewed_at": 1793658854,
+      "expires_at": 1796250854,
+      "locally_qualified": false,
+      "qualification": null,
+      "benchmark_result": null
+    },
+    {
+      "id": "anthropic-20261102-sonnet-bug-fix-guidance",
+      "profile_id": "claude-quality",
+      "profile_version": 1,
+      "operation": "code_repair",
+      "source_kind": "provider_claim",
+      "author": "Anthropic",
+      "source": "https://www.anthropic.com/claude-sonnet-5-5",
+      "finding": "Anthropic identifies scoped bug fixing as a Sonnet 5.5 use case. This nominates a repair candidate without ranking it against another Omar profile.",
+      "limitations": "Provider description checked by Codex, not independent human review or a task-matched result. Native account access and exact observed identity are unknown. Publication comparisons do not transfer to this profile, prompts, tools, data or subscription usage.",
+      "reviewed_at": 1793658854,
+      "expires_at": 1796250854,
+      "locally_qualified": false,
+      "qualification": null,
+      "benchmark_result": null
+    },
+    {
+      "id": "anthropic-20261102-sonnet-frontiercode-1-1-main-max",
+      "profile_id": "claude-quality",
+      "profile_version": 1,
+      "operation": "code_repair",
+      "source_kind": "provider_claim",
+      "author": "Anthropic",
+      "source": "https://www.anthropic.com/claude-sonnet-5-5",
+      "finding": "The provider Performance table reports Sonnet 5.5 at 46.2 percent on FrontierCode 1.1 Main with Max effort.",
+      "limitations": "The configured Omar candidate requests high effort. The captured table does not establish the sample size, native harness, tools, uncertainty or per-task resource totals. The linked system card could not be fetched because the retrieval tool rejected its size. Do not infer those details or a task winner.",
+      "reviewed_at": 1793658881,
+      "expires_at": 1796250854,
+      "locally_qualified": false,
+      "qualification": null,
+      "benchmark_result": {
+        "benchmark": "FrontierCode",
+        "benchmark_version": "1.1 Main",
+        "published_at": 1790553600,
+        "retrieved_at": 1793658854,
+        "task_slice": "Main-set agentic code changes",
+        "target_scope": {
+          "task_family": "repository-repair",
+          "task_slice": "multi-file-bug-fix",
+          "contract_version": "v1",
+          "complexity": "complex",
+          "consequence": "medium",
+          "input_modalities": [
+            "text",
+            "code"
+          ],
+          "output_modalities": [
+            "code"
+          ]
+        },
+        "profile_digest": "a7d6367c8cf52585a1f442e084e8194502ad2b537260d10bd99d55507df5f1f9",
+        "measured_model": "Sonnet 5.5",
+        "measured_backend": null,
+        "measured_harness": null,
+        "measured_effort": "max",
+        "measured_tools": null,
+        "sample_size": null,
+        "score": 46.2,
+        "unit": "percent",
+        "direction": "higher_is_better",
+        "uncertainty": null,
+        "cost_usd": null,
+        "latency_ms": null,
+        "measurement_conditions": "Provider-published HTML score, Main subset, Max effort. Additional methodology was not verified from the oversized system card.",
+        "applicability": "Only a hypothesis for future repository-repair evaluation. Omar requests high effort and has different prompts, protected fixtures and a ports-only runtime; do not report this percentage as Omar or high-effort accuracy.",
+        "dataset_overlap": "Unknown; no overlap audit against Omar repository groups has been performed.",
+        "contamination": "Unknown; this capture does not establish training-data exclusion or contamination controls.",
+        "source_row": {
+          "snapshot": "{\n  \"source\": \"https://www.anthropic.com/claude-sonnet-5-5\",\n  \"author\": \"Anthropic\",\n  \"published_date\": \"2026-09-28\",\n  \"retrieved_at\": 1793658854,\n  \"capture_method\": \"Codex manual transcription of the opened official HTML Performance table; not a provider API export.\",\n  \"results\": [\n    {\n      \"benchmark\": \"FrontierCode\",\n      \"version\": \"1.1\",\n      \"subset\": \"Main\",\n      \"model\": \"Sonnet 5.5\",\n      \"effort\": \"Max\",\n      \"score\": 46.2,\n      \"unit\": \"percent\"\n    }\n  ]\n}\n",
+          "snapshot_digest": "011bcf18c699f8a940d0aed84bebdb52ae4a746469aca50e3cdc7aa9fd175150",
+          "locator": "Performance table: FrontierCode 1.1 (Main), Sonnet 5.5 column, Max effort marker.",
+          "row_pointer": "/results/0",
+          "score_pointer": "/results/0/score",
+          "model_pointer": "/results/0/model",
+          "unit_pointer": "/results/0/unit"
+        },
+        "review": {
+          "accepted": true,
+          "reviewer": "Codex (automated source check; not independent human evaluation)",
+          "reviewed_at": 1793658881,
+          "rationale": "Checked the opened official Performance table against the extract: Sonnet 5.5, FrontierCode 1.1 Main, 46.2 percent, Max effort. This approves transcription only. Sample size and measured harness remain unknown, so readiness must remain insufficient; the configured high-effort profile is not the measured condition. No local quality, account access, pricing or cross-model ranking is approved.",
+          "content_digest": "1f65c5c345b20ae66d5a209f8e9a0fd7972dab0a8f0ca04bc14f269de337524b"
+        }
+      }
+    }
+  ]
+}

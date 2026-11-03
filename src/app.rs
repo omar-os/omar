@@ -1960,6 +1960,7 @@ mod tests {
             agent: AgentConfig {
                 default_command: "true".to_string(),
                 default_workdir: ".".to_string(),
+                ..AgentConfig::default()
             },
             metrics: MetricsConfig::default(),
             slack_bridge: crate::config::SlackBridgeConfig::default(),

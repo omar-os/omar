@@ -64,6 +64,10 @@ pub struct HealthConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
+    /// Restrict the serve assistant's OMAR tools to research, proposals and replies.
+    /// Native shell/network permissions remain the backend command's responsibility.
+    #[serde(default)]
+    pub design_only: bool,
     /// Default command to run for new agents
     #[serde(default = "default_command")]
     pub default_command: String,
@@ -173,6 +177,7 @@ impl Default for HealthConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            design_only: false,
             default_command: default_command(),
             default_workdir: default_workdir(),
         }

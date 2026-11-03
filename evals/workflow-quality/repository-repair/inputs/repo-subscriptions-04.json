@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "id": "repo-subscriptions-04",
+  "family": "repository_repair",
+  "split": "reserved",
+  "group": "repository-subscriptions",
+  "instruction": "Repair the subscriptions package so its public API meets every README requirement. Reported defect: Sum payments less refunds, deduplicating by event ID and keeping the first occurrence. Preserve unrelated behavior and inputs. Return JSON with changes [{path, content}] containing complete UTF-8 text for each modified allowed source file, and explanation. Do not modify tests, metadata or other paths.",
+  "files": {
+    "candidate_app/policy.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef total(p):\n    return str(sum((Decimal(v) for v in p),Decimal('0')).quantize(Decimal('0.01'),rounding=ROUND_HALF_UP))\n\ndef discount(p):\n    return max(0,p['price']-max(0,p['discount']))\n\ndef periods(p):\n    return max(0,(p['now']-p['start'])//p['interval']+1)\n",
+    "candidate_app/core.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef balance(p):\n    return sum(e['amount'] if e['kind']=='payment' else -e['amount'] for e in p)\n\ndef active(p):\n    return sorted(s['id'] for s in p['subscriptions'] if s['start']<=p['now']<s['end'])\n",
+    "candidate_app/__init__.py": "from .api import handle\n",
+    "candidate_app/api.py": "from . import policy, core\n\nOPERATIONS = {\n    'total': policy.total,\n    'discount': policy.discount,\n    'periods': policy.periods,\n    'balance': core.balance,\n    'active': core.active,\n}\n\ndef handle(request):\n    return OPERATIONS[request['operation']](request['payload'])\n",
+    "pyproject.toml": "[project]\nname = 'owned-subscriptions-fixture'\nversion = '0.1.0'\nrequires-python = '>=3.11'\n",
+    "README.md": "# Owned diagnostic repository: subscriptions\n\nPublic API: candidate_app.handle({operation, payload}). Inputs must remain unchanged.\n\n- total: Sum decimal item amounts and round half up to exactly two decimal places as text; empty total is 0.00.\n- discount: Subtract discount cents, bounded below by zero; negative discounts are treated as zero.\n- periods: Count whole periods due at or before now, starting at start, for positive integer interval; future starts return zero.\n- balance: Sum payments less refunds, deduplicating by event ID and keeping the first occurrence.\n- active: Return sorted IDs of subscriptions with start<=now<end; preserve separate records sharing an ID.\n\nRun public checks with: python3 -m unittest discover -s tests\n",
+    "tests/test_public.py": "import unittest\nfrom candidate_app import handle\n\nclass PublicReproduction(unittest.TestCase):\n    def test_reported_issue(self):\n        self.assertEqual(handle({'operation': 'balance', 'payload': [{'id': 'a', 'kind': 'payment', 'amount': 10}, {'id': 'a', 'kind': 'payment', 'amount': 10}]}), 10)\n"
+  },
+  "allowed_patch_paths": [
+    "candidate_app/api.py",
+    "candidate_app/core.py",
+    "candidate_app/policy.py"
+  ],
+  "entrypoint": "candidate_app:handle",
+  "visible_test": {
+    "id": "balance-1",
+    "request": {
+      "operation": "balance",
+      "payload": [
+        {
+          "id": "a",
+          "kind": "payment",
+          "amount": 10
+        },
+        {
+          "id": "a",
+          "kind": "payment",
+          "amount": 10
+        }
+      ]
+    },
+    "expected": 10
+  },
+  "repository_digest": "13103ed4fd2f8d90c511658b79ea122376cc6ff4fff6d4a64982e042f0773653"
+}

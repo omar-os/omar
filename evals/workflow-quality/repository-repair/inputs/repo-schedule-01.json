@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "id": "repo-schedule-01",
+  "family": "repository_repair",
+  "split": "development",
+  "group": "repository-schedule",
+  "instruction": "Repair the schedule package so its public API meets every README requirement. Reported defect: Merge sorted or unsorted integer [start,end] intervals, including touching intervals; preserve the input. Preserve unrelated behavior and inputs. Return JSON with changes [{path, content}] containing complete UTF-8 text for each modified allowed source file, and explanation. Do not modify tests, metadata or other paths.",
+  "files": {
+    "candidate_app/policy.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef merge(p):\n    return sorted(p)\n\ndef overlap(p):\n    return max(0,min(p[0][1],p[1][1])-max(p[0][0],p[1][0]))\n\ndef due(p):\n    today=date.fromisoformat(p['today'])\n    return [t['id'] for t in p['tasks'] if date.fromisoformat(t['due']) <= today]\n",
+    "candidate_app/core.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef slots(p):\n    return [[s,s+p['length']] for s in range(p['start'],p['end']-p['length']+1,p['length'])]\n\ndef elapsed(p):\n    return int((datetime.fromisoformat(p['end'])-datetime.fromisoformat(p['start'])).total_seconds()//60)\n",
+    "candidate_app/__init__.py": "from .api import handle\n",
+    "candidate_app/api.py": "from . import policy, core\n\nOPERATIONS = {\n    'merge': policy.merge,\n    'overlap': policy.overlap,\n    'due': policy.due,\n    'slots': core.slots,\n    'elapsed': core.elapsed,\n}\n\ndef handle(request):\n    return OPERATIONS[request['operation']](request['payload'])\n",
+    "pyproject.toml": "[project]\nname = 'owned-schedule-fixture'\nversion = '0.1.0'\nrequires-python = '>=3.11'\n",
+    "README.md": "# Owned diagnostic repository: schedule\n\nPublic API: candidate_app.handle({operation, payload}). Inputs must remain unchanged.\n\n- merge: Merge sorted or unsorted integer [start,end] intervals, including touching intervals; preserve the input.\n- overlap: Return the duration shared by two half-open integer intervals, never negative.\n- due: Return task IDs whose ISO dates are on or before today, retaining input order.\n- slots: Return all whole [start,end] slots of positive length within a day range; include the last exact-fit slot.\n- elapsed: Return elapsed whole minutes between timezone-aware ISO timestamps, accounting for offsets.\n\nRun public checks with: python3 -m unittest discover -s tests\n",
+    "tests/test_public.py": "import unittest\nfrom candidate_app import handle\n\nclass PublicReproduction(unittest.TestCase):\n    def test_reported_issue(self):\n        self.assertEqual(handle({'operation': 'merge', 'payload': [[4, 6], [1, 4]]}), [[1, 6]])\n"
+  },
+  "allowed_patch_paths": [
+    "candidate_app/api.py",
+    "candidate_app/core.py",
+    "candidate_app/policy.py"
+  ],
+  "entrypoint": "candidate_app:handle",
+  "visible_test": {
+    "id": "merge-1",
+    "request": {
+      "operation": "merge",
+      "payload": [
+        [
+          4,
+          6
+        ],
+        [
+          1,
+          4
+        ]
+      ]
+    },
+    "expected": [
+      [
+        1,
+        6
+      ]
+    ]
+  },
+  "repository_digest": "3347b14f7073afc76728f09ac48c1a407c0f61c142afbc429c75a24929fb561f"
+}

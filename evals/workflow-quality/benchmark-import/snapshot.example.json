@@ -1,0 +1,10 @@
+{
+  "notice": "SYNTHETIC TEST DATA. Not a measured provider result.",
+  "results": [
+    {
+      "model": "gpt-6.1-sol",
+      "score": 42.0,
+      "unit": "percent"
+    }
+  ]
+}

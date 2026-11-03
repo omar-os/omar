@@ -1,0 +1,243 @@
+{
+  "id": "repo-permissions-02",
+  "protected_tests": [
+    {
+      "id": "decision-1",
+      "request": {
+        "operation": "decision",
+        "payload": {
+          "action": "read",
+          "allow": [
+            "read"
+          ],
+          "deny": [
+            "read"
+          ]
+        }
+      },
+      "expected": false
+    },
+    {
+      "id": "decision-2",
+      "request": {
+        "operation": "decision",
+        "payload": {
+          "action": "read",
+          "allow": [
+            "read"
+          ],
+          "deny": []
+        }
+      },
+      "expected": true
+    },
+    {
+      "id": "decision-3",
+      "request": {
+        "operation": "decision",
+        "payload": {
+          "action": "write",
+          "allow": [
+            "read"
+          ],
+          "deny": []
+        }
+      },
+      "expected": false
+    },
+    {
+      "id": "within-1",
+      "request": {
+        "operation": "within",
+        "payload": {
+          "root": "/team/a",
+          "path": "/team/ab"
+        }
+      },
+      "expected": false
+    },
+    {
+      "id": "within-2",
+      "request": {
+        "operation": "within",
+        "payload": {
+          "root": "/team/a",
+          "path": "/team/a/x"
+        }
+      },
+      "expected": true
+    },
+    {
+      "id": "within-3",
+      "request": {
+        "operation": "within",
+        "payload": {
+          "root": "/team/a",
+          "path": "/team/a/../b"
+        }
+      },
+      "expected": false
+    },
+    {
+      "id": "roles-1",
+      "request": {
+        "operation": "roles",
+        "payload": {
+          "assigned": [
+            "a",
+            "b"
+          ],
+          "definitions": {
+            "a": [
+              "read"
+            ],
+            "b": [
+              "write"
+            ]
+          }
+        }
+      },
+      "expected": [
+        "read",
+        "write"
+      ]
+    },
+    {
+      "id": "roles-2",
+      "request": {
+        "operation": "roles",
+        "payload": {
+          "assigned": [],
+          "definitions": {}
+        }
+      },
+      "expected": []
+    },
+    {
+      "id": "roles-3",
+      "request": {
+        "operation": "roles",
+        "payload": {
+          "assigned": [
+            "unknown",
+            "a"
+          ],
+          "definitions": {
+            "a": [
+              "read"
+            ]
+          }
+        }
+      },
+      "expected": [
+        "read"
+      ]
+    },
+    {
+      "id": "expiry-1",
+      "request": {
+        "operation": "expiry",
+        "payload": {
+          "revoked": false,
+          "now": 10,
+          "expires_at": 10
+        }
+      },
+      "expected": false
+    },
+    {
+      "id": "expiry-2",
+      "request": {
+        "operation": "expiry",
+        "payload": {
+          "revoked": false,
+          "now": 9,
+          "expires_at": 10
+        }
+      },
+      "expected": true
+    },
+    {
+      "id": "expiry-3",
+      "request": {
+        "operation": "expiry",
+        "payload": {
+          "revoked": true,
+          "now": 9,
+          "expires_at": 10
+        }
+      },
+      "expected": false
+    },
+    {
+      "id": "filter-1",
+      "request": {
+        "operation": "filter",
+        "payload": {
+          "tenant": "A",
+          "records": [
+            {
+              "tenant": "a",
+              "id": 1
+            }
+          ]
+        }
+      },
+      "expected": []
+    },
+    {
+      "id": "filter-2",
+      "request": {
+        "operation": "filter",
+        "payload": {
+          "tenant": "A",
+          "records": [
+            {
+              "tenant": "A",
+              "id": 2
+            }
+          ]
+        }
+      },
+      "expected": [
+        {
+          "tenant": "A",
+          "id": 2
+        }
+      ]
+    },
+    {
+      "id": "filter-3",
+      "request": {
+        "operation": "filter",
+        "payload": {
+          "tenant": "A",
+          "records": []
+        }
+      },
+      "expected": []
+    }
+  ],
+  "oracle_patch": {
+    "changes": [
+      {
+        "path": "candidate_app/policy.py",
+        "content": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef decision(p):\n    return p['action'] in p['allow'] and p['action'] not in p['deny']\n\ndef within(p):\n    root=posixpath.normpath(p['root']); path=posixpath.normpath(p['path'])\n    return path==root or path.startswith(root.rstrip('/')+'/')\n\ndef roles(p):\n    return sorted({x for role in p['assigned'] for x in p['definitions'].get(role,[])})\n"
+      }
+    ],
+    "explanation": "Authored fixture repair; independent review pending."
+  },
+  "label_author": "owned repository fixture generator",
+  "review_status": "provisional",
+  "critical_errors": [
+    "protected regression failure",
+    "input mutation",
+    "prohibited patch path",
+    "unexpected output or execution failure"
+  ],
+  "human_review_required": [
+    "patch meets complete specification beyond examples",
+    "patch is reasonable and does not hard-code protected cases"
+  ],
+  "independent_unit": "repository-permissions"
+}

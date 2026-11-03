@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "id": "repo-permissions-04",
+  "family": "repository_repair",
+  "split": "reserved",
+  "group": "repository-permissions",
+  "instruction": "Repair the permissions package so its public API meets every README requirement. Reported defect: A grant is active when now is strictly before expires_at and revoked is false. Preserve unrelated behavior and inputs. Return JSON with changes [{path, content}] containing complete UTF-8 text for each modified allowed source file, and explanation. Do not modify tests, metadata or other paths.",
+  "files": {
+    "candidate_app/policy.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef decision(p):\n    return p['action'] in p['allow'] and p['action'] not in p['deny']\n\ndef within(p):\n    root=posixpath.normpath(p['root']); path=posixpath.normpath(p['path'])\n    return path==root or path.startswith(root.rstrip('/')+'/')\n\ndef roles(p):\n    return sorted({x for role in p['assigned'] for x in p['definitions'].get(role,[])})\n",
+    "candidate_app/core.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef expiry(p):\n    return not p['revoked'] and p['now']<=p['expires_at']\n\ndef filter(p):\n    return [r for r in p['records'] if r['tenant']==p['tenant']]\n",
+    "candidate_app/__init__.py": "from .api import handle\n",
+    "candidate_app/api.py": "from . import policy, core\n\nOPERATIONS = {\n    'decision': policy.decision,\n    'within': policy.within,\n    'roles': policy.roles,\n    'expiry': core.expiry,\n    'filter': core.filter,\n}\n\ndef handle(request):\n    return OPERATIONS[request['operation']](request['payload'])\n",
+    "pyproject.toml": "[project]\nname = 'owned-permissions-fixture'\nversion = '0.1.0'\nrequires-python = '>=3.11'\n",
+    "README.md": "# Owned diagnostic repository: permissions\n\nPublic API: candidate_app.handle({operation, payload}). Inputs must remain unchanged.\n\n- decision: Deny overrides allow. Return true only if requested action is allowed and not denied.\n- within: Normalize POSIX absolute paths, then check whether path equals root or is its descendant, using path components.\n- roles: Union permissions from all assigned known roles and return sorted unique strings; ignore unknown roles.\n- expiry: A grant is active when now is strictly before expires_at and revoked is false.\n- filter: Keep records whose tenant exactly matches the requested tenant; tenant names are case-sensitive.\n\nRun public checks with: python3 -m unittest discover -s tests\n",
+    "tests/test_public.py": "import unittest\nfrom candidate_app import handle\n\nclass PublicReproduction(unittest.TestCase):\n    def test_reported_issue(self):\n        self.assertEqual(handle({'operation': 'expiry', 'payload': {'revoked': False, 'now': 10, 'expires_at': 10}}), False)\n"
+  },
+  "allowed_patch_paths": [
+    "candidate_app/api.py",
+    "candidate_app/core.py",
+    "candidate_app/policy.py"
+  ],
+  "entrypoint": "candidate_app:handle",
+  "visible_test": {
+    "id": "expiry-1",
+    "request": {
+      "operation": "expiry",
+      "payload": {
+        "revoked": false,
+        "now": 10,
+        "expires_at": 10
+      }
+    },
+    "expected": false
+  },
+  "repository_digest": "34de273d36b3e9ec59f3e01e44e2852cd8ff55fa7c9fca7723c8e78af7cc70e1"
+}

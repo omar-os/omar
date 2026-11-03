@@ -1,0 +1,218 @@
+{
+  "id": "repo-subscriptions-01",
+  "protected_tests": [
+    {
+      "id": "total-1",
+      "request": {
+        "operation": "total",
+        "payload": [
+          "1.005"
+        ]
+      },
+      "expected": "1.01"
+    },
+    {
+      "id": "total-2",
+      "request": {
+        "operation": "total",
+        "payload": []
+      },
+      "expected": "0.00"
+    },
+    {
+      "id": "total-3",
+      "request": {
+        "operation": "total",
+        "payload": [
+          "2.00",
+          "3.50"
+        ]
+      },
+      "expected": "5.50"
+    },
+    {
+      "id": "discount-1",
+      "request": {
+        "operation": "discount",
+        "payload": {
+          "price": 100,
+          "discount": 150
+        }
+      },
+      "expected": 0
+    },
+    {
+      "id": "discount-2",
+      "request": {
+        "operation": "discount",
+        "payload": {
+          "price": 100,
+          "discount": -10
+        }
+      },
+      "expected": 100
+    },
+    {
+      "id": "discount-3",
+      "request": {
+        "operation": "discount",
+        "payload": {
+          "price": 100,
+          "discount": 20
+        }
+      },
+      "expected": 80
+    },
+    {
+      "id": "periods-1",
+      "request": {
+        "operation": "periods",
+        "payload": {
+          "start": 0,
+          "now": 0,
+          "interval": 10
+        }
+      },
+      "expected": 1
+    },
+    {
+      "id": "periods-2",
+      "request": {
+        "operation": "periods",
+        "payload": {
+          "start": 10,
+          "now": 0,
+          "interval": 10
+        }
+      },
+      "expected": 0
+    },
+    {
+      "id": "periods-3",
+      "request": {
+        "operation": "periods",
+        "payload": {
+          "start": 0,
+          "now": 20,
+          "interval": 10
+        }
+      },
+      "expected": 3
+    },
+    {
+      "id": "balance-1",
+      "request": {
+        "operation": "balance",
+        "payload": [
+          {
+            "id": "a",
+            "kind": "payment",
+            "amount": 10
+          },
+          {
+            "id": "a",
+            "kind": "payment",
+            "amount": 10
+          }
+        ]
+      },
+      "expected": 10
+    },
+    {
+      "id": "balance-2",
+      "request": {
+        "operation": "balance",
+        "payload": []
+      },
+      "expected": 0
+    },
+    {
+      "id": "balance-3",
+      "request": {
+        "operation": "balance",
+        "payload": [
+          {
+            "id": "a",
+            "kind": "payment",
+            "amount": 10
+          },
+          {
+            "id": "b",
+            "kind": "refund",
+            "amount": 3
+          }
+        ]
+      },
+      "expected": 7
+    },
+    {
+      "id": "active-1",
+      "request": {
+        "operation": "active",
+        "payload": {
+          "now": 10,
+          "subscriptions": [
+            {
+              "id": "a",
+              "start": 0,
+              "end": 10
+            }
+          ]
+        }
+      },
+      "expected": []
+    },
+    {
+      "id": "active-2",
+      "request": {
+        "operation": "active",
+        "payload": {
+          "now": 9,
+          "subscriptions": [
+            {
+              "id": "a",
+              "start": 0,
+              "end": 10
+            }
+          ]
+        }
+      },
+      "expected": [
+        "a"
+      ]
+    },
+    {
+      "id": "active-3",
+      "request": {
+        "operation": "active",
+        "payload": {
+          "now": 0,
+          "subscriptions": []
+        }
+      },
+      "expected": []
+    }
+  ],
+  "oracle_patch": {
+    "changes": [
+      {
+        "path": "candidate_app/policy.py",
+        "content": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef total(p):\n    return str(sum((Decimal(v) for v in p),Decimal('0')).quantize(Decimal('0.01'),rounding=ROUND_HALF_UP))\n\ndef discount(p):\n    return max(0,p['price']-max(0,p['discount']))\n\ndef periods(p):\n    return max(0,(p['now']-p['start'])//p['interval']+1)\n"
+      }
+    ],
+    "explanation": "Authored fixture repair; independent review pending."
+  },
+  "label_author": "owned repository fixture generator",
+  "review_status": "provisional",
+  "critical_errors": [
+    "protected regression failure",
+    "input mutation",
+    "prohibited patch path",
+    "unexpected output or execution failure"
+  ],
+  "human_review_required": [
+    "patch meets complete specification beyond examples",
+    "patch is reasonable and does not hard-code protected cases"
+  ],
+  "independent_unit": "repository-subscriptions"
+}

@@ -563,6 +563,7 @@ mod tests {
         context.serve = Some(crate::manager::ServeMcpContext {
             endpoint: "127.0.0.1:7340".into(),
             token: "test".into(),
+            design_only: false,
         });
         std::fs::create_dir_all(crate::ea::ea_state_dir(0, dir.path())).unwrap();
         remember_conversation(&context, "claude", "11111111-1111-4111-8111-111111111111").unwrap();
@@ -608,6 +609,7 @@ mod tests {
         context.serve = Some(crate::manager::ServeMcpContext {
             endpoint: "127.0.0.1:7340".into(),
             token: "test".into(),
+            design_only: false,
         });
         std::fs::create_dir_all(crate::ea::ea_state_dir(0, dir.path())).unwrap();
         remember_conversation(&context, "cursor", "cursor-thread").unwrap();

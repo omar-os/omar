@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 
 import "../app/globals.css";
+import "../app/workflow-design.css";
 import { Studio } from "../app/studio";
 
 /**

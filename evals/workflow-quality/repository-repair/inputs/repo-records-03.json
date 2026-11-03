@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "id": "repo-records-03",
+  "family": "repository_repair",
+  "split": "development",
+  "group": "repository-records",
+  "instruction": "Repair the records package so its public API meets every README requirement. Reported defect: Merge override fields into defaults. An explicit null overrides a default; absent fields preserve it. Never mutate inputs. Preserve unrelated behavior and inputs. Return JSON with changes [{path, content}] containing complete UTF-8 text for each modified allowed source file, and explanation. Do not modify tests, metadata or other paths.",
+  "files": {
+    "candidate_app/policy.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef versions(p):\n    return sorted(p,key=lambda v:tuple(int(n) for n in v.split('.')))\n\ndef csv_row(p):\n    out=io.StringIO(); csv.writer(out,lineterminator='\\n').writerow(p)\n    return out.getvalue()[:-1]\n\ndef merge(p):\n    return {**p['defaults'],**{k:v for k,v in p['overrides'].items() if v is not None}}\n",
+    "candidate_app/core.py": "import csv\nimport io\nimport posixpath\nfrom datetime import date, datetime\nfrom decimal import Decimal, ROUND_HALF_UP\n\ndef page(p):\n    start=(p['page']-1)*p['size']\n    return p['items'][start:start+p['size']]\n\ndef latest(p):\n    best={}\n    for r in p:\n        if r['id'] not in best or r['revision']>best[r['id']]['revision']: best[r['id']]=r\n    return [best[k] for k in sorted(best)]\n",
+    "candidate_app/__init__.py": "from .api import handle\n",
+    "candidate_app/api.py": "from . import policy, core\n\nOPERATIONS = {\n    'versions': policy.versions,\n    'csv_row': policy.csv_row,\n    'merge': policy.merge,\n    'page': core.page,\n    'latest': core.latest,\n}\n\ndef handle(request):\n    return OPERATIONS[request['operation']](request['payload'])\n",
+    "pyproject.toml": "[project]\nname = 'owned-records-fixture'\nversion = '0.1.0'\nrequires-python = '>=3.11'\n",
+    "README.md": "# Owned diagnostic repository: records\n\nPublic API: candidate_app.handle({operation, payload}). Inputs must remain unchanged.\n\n- versions: Sort dot-separated numeric version strings by numeric components, preserving duplicates.\n- csv_row: Encode one CSV row using standard CSV quoting and no trailing line terminator.\n- merge: Merge override fields into defaults. An explicit null overrides a default; absent fields preserve it. Never mutate inputs.\n- page: Return a one-based page of records of positive size; an out-of-range page returns empty.\n- latest: Keep the record with greatest numeric revision for each ID; on ties keep the first. Return records sorted by ID.\n\nRun public checks with: python3 -m unittest discover -s tests\n",
+    "tests/test_public.py": "import unittest\nfrom candidate_app import handle\n\nclass PublicReproduction(unittest.TestCase):\n    def test_reported_issue(self):\n        self.assertEqual(handle({'operation': 'merge', 'payload': {'defaults': {'x': 1}, 'overrides': {'x': None}}}), {'x': None})\n"
+  },
+  "allowed_patch_paths": [
+    "candidate_app/api.py",
+    "candidate_app/core.py",
+    "candidate_app/policy.py"
+  ],
+  "entrypoint": "candidate_app:handle",
+  "visible_test": {
+    "id": "merge-1",
+    "request": {
+      "operation": "merge",
+      "payload": {
+        "defaults": {
+          "x": 1
+        },
+        "overrides": {
+          "x": null
+        }
+      }
+    },
+    "expected": {
+      "x": null
+    }
+  },
+  "repository_digest": "47f17687d4234eb2de999722773d26e0150be1f01e7634f8b44873f59df5726d"
+}
