@@ -254,9 +254,9 @@ test("a manual task is answered inside its workflow step and retains rejected dr
   await expect(page.locator("dialog[open]")).toHaveCount(0);
   await panel.getByText("Technical details", { exact: true }).click();
   await expect(panel).toContainText("flow.reviewer");
-  // Scoped to this component's wiring: what it reads, and what it may set.
+  // Technical details retain the input and the declared output contract.
   await expect(panel.locator(".step-response")).toContainText("flow.plan");
-  await expect(panel).toContainText("flow.critique");
+  await expect(panel.locator(".port-waiting-contract")).toHaveText("critique");
 
   // Only what this invocation is allowed to write, with its declared type.
   const waiting = panel.locator(".port-waiting");
@@ -277,7 +277,11 @@ test("a manual task is answered inside its workflow step and retains rejected dr
   await expect(waiting.getByRole("alert")).toContainText("Test rejection");
   await expect(waiting.getByRole("textbox")).toHaveValue("looks fine");
   await page.unroute("**/v1/runs/*/panel");
+  const response = page.waitForRequest(request =>
+    request.method() === "POST" && /\/v1\/runs\/[^/]+\/panel$/.test(new URL(request.url()).pathname));
   await waiting.getByRole("button", { name: "Submit result and continue" }).click();
+  // Friendly labels still submit to the exact qualified runtime output.
+  expect((await response).postDataJSON().values).toEqual({ "flow.critique": "looks fine" });
 
   // Answered, so it leaves the queue; the panel stays open on the component.
   await expect(panel.locator(".port-waiting")).toHaveCount(0);
