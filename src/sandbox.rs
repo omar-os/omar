@@ -153,8 +153,11 @@ fn ready(backends: &[&str]) -> Result<()> {
 }
 
 /// Why a backend's agents cannot start in a sandbox, and what fixes it.
+/// Named as `omar connect` takes it, however the program spells the backend.
 fn not_connected(backend: &str) -> String {
-    let why = match crate::backend::by_name(backend).map(|b| b.kind()) {
+    let kind = crate::backend::by_name(backend).map(|b| b.kind());
+    let backend = kind.map_or(backend, |kind| kind.name());
+    let why = match kind {
         // The one refusal an operator would not expect: `omar connect claude`
         // with a subscription works on the host.
         Some(crate::backend::Kind::Claude) => {
@@ -931,6 +934,9 @@ mod tests {
         // A subscription sign-in on the host is no help; the error says so.
         assert!(not_connected("claude").contains("Claude subscription cannot be used"));
         assert!(not_connected("codex").ends_with("run `omar connect codex --sandbox`"));
+        // Programs spell it ClaudeCode; `omar connect` takes claude.
+        assert!(not_connected("ClaudeCode").starts_with("claude is not connected"));
+        assert!(not_connected("ClaudeCode").ends_with("`omar connect claude --sandbox`"));
     }
 
     #[test]
