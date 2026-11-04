@@ -326,6 +326,10 @@ pub fn paused_source(runtime_dir: &Path) -> Result<PathBuf> {
 pub fn apply(omar_dir: &Path, ea_id: u32, to: &Bytecode, source: &Path) -> Result<Option<Applied>> {
     let to_state = topology::verify(to)?;
     let runtime_dir = crate::deploy::dir_for(omar_dir, ea_id, &to.team);
+    anyhow::ensure!(
+        !runtime_dir.join("template-run.json").exists(),
+        "Templates keep fixed acceptance gates; prepare a new workflow to change their source."
+    );
     let record = crate::deploy::DeploymentRecord::load(&runtime_dir)?
         .with_context(|| format!("no deployment '{}'", to.team))?;
     anyhow::ensure!(

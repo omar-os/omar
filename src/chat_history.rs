@@ -16,6 +16,9 @@ pub struct Conversation {
     pub id: String,
     pub title: String,
     #[serde(default)]
+    #[ts(skip)]
+    pub defer_assistant_start: bool,
+    #[serde(default)]
     pub ea_id: Option<crate::ea::EaId>,
     pub created_at: u64,
     pub updated_at: u64,
@@ -55,6 +58,7 @@ impl Conversation {
         Self {
             id: Uuid::new_v4().to_string(),
             title: "New chat".into(),
+            defer_assistant_start: false,
             ea_id: None,
             created_at: now(),
             updated_at: now(),
@@ -196,6 +200,54 @@ impl History {
         Ok(id)
     }
 
+    pub fn reserve_template(&mut self, id: &str, title: &str) -> Result<()> {
+        Uuid::parse_str(id)?;
+        if let Some(chat) = self.conversations.iter().find(|c| c.id == id) {
+            anyhow::ensure!(
+                chat.defer_assistant_start && chat.messages.is_empty(),
+                "template request conflicts with an existing conversation"
+            );
+            return Ok(());
+        }
+        let mut next = self.clone();
+        let mut chat = Conversation::new();
+        chat.id = id.into();
+        chat.title = title.chars().take(80).collect();
+        chat.defer_assistant_start = true;
+        next.conversations.push(chat);
+        next.save()?;
+        *self = next;
+        Ok(())
+    }
+
+    pub fn complete_template(
+        &mut self,
+        id: &str,
+        title: &str,
+        text: &str,
+        design: crate::serve::ProposedDesign,
+    ) -> Result<()> {
+        let mut next = self.clone();
+        let chat = next
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == id)
+            .context("unknown template chat")?;
+        anyhow::ensure!(
+            chat.messages.is_empty(),
+            "template request conflicts with an existing conversation"
+        );
+        chat.title = title.chars().take(80).collect();
+        chat.messages = vec![
+            ChatMessage {sequence:1,role:ChatRole::Operator,text:text.into(),progress:false,design:None,selection:vec![]},
+            ChatMessage {sequence:2,role:ChatRole::Assistant,text:"Your workflow is prepared. Review the inputs and model choices, then confirm execution. No agents have been started.".into(),progress:false,design:Some(design),selection:vec![]},
+        ];
+        chat.updated_at = now();
+        next.save()?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn select(&mut self, id: Option<&str>) -> Result<()> {
         let mut next = self.clone();
         match id {
@@ -248,6 +300,9 @@ impl History {
             .iter_mut()
             .find(|chat| chat.id == id)
             .expect("active chat exists");
+        if message.role == ChatRole::Operator {
+            chat.defer_assistant_start = false;
+        }
         message.sequence = chat.messages.last().map_or(1, |last| last.sequence + 1);
         if message.role == ChatRole::Operator
             && !chat.messages.iter().any(|m| m.role == ChatRole::Operator)

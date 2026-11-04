@@ -32,6 +32,7 @@ mod serve;
 mod sessions;
 mod stub_agent;
 mod supervision;
+mod template_library;
 mod terminal;
 mod tmux;
 mod topology;

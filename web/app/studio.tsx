@@ -3,6 +3,9 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
 import { QuoteSelection, withQuote } from "./quote-selection";
+import { TemplateLibrary } from "./template-library";
+import { TemplateResults } from "./template-results";
+import { TemplatePlan } from "./template-plan";
 import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
 import { Artifacts } from "./artifacts";
 import { DeployConfirmation, type DeployOptions } from "./deploy-confirmation";
@@ -251,6 +254,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
   const [backendsOpen, setBackendsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(true);
+  const [templatesOpen,setTemplatesOpen] = useState(false);
+  const [lastTemplateRun,setLastTemplateRun] = useState<RunRecord|null>(null);
+  const [showDeliverables,setShowDeliverables] = useState(true);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [historyRevision, setHistoryRevision] = useState(0);
   const [filesOpen, setFilesOpen] = useState(false);
@@ -466,6 +472,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     runRef.current = null;
     setMessages([]);
     setRun(null);
+    setLastTemplateRun(null);
+    setShowDeliverables(true);
     setAnswering(false);
     setChecking(false);
     setEvents([]);
@@ -816,6 +824,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           restoreConversation(conversation);
           runRef.current = conversation.run ?? null;
           setRun(conversation.run ?? null);
+          setLastTemplateRun(conversation.run ?? null);
           replaying = true;
           replayedProposal = false;
           for (const message of replay) applyMessage(message);
@@ -1431,6 +1440,11 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     requestAnimationFrame(() => composerRef.current?.focus());
   }
 
+  const isTemplate = source.startsWith("// OMAR_TEMPLATE ");
+  const templateRun = isTemplate ? (run ?? lastTemplateRun) : null;
+  const deliverableReady = templateRun && isRunFinished(templateRun.status);
+  const showingDeliverables = !!deliverableReady && showDeliverables;
+  const templateDesign = [...messages].reverse().find(message=>message.design?.program === source)?.design;
   return (
     <main className="studio-shell">
       <div className="visually-hidden" aria-live="polite">
@@ -1440,12 +1454,14 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         <span className="connection" data-phase={phase}>{phase}</span>
       </div>
 
+      {templatesOpen && <TemplateLibrary url={historyUrl} onClose={()=>setTemplatesOpen(false)} onSelect={chat=>{onSelect(chat);setDrawerOpen(false);setTemplatesOpen(false);}} />}
       <div className="studio-content">
         {isDemo ? <aside className="chat-history demo-history" aria-label="Workflow navigation"><header><div className="brand-lockup"><OmarLogo /><strong>OMAR</strong></div></header><div className="sidebar-heading"><div><span className="eyebrow">WORKSPACE</span><h2>Workflows</h2></div><span className="workflow-count">1</span></div><div className="history-label">DEMO WORKFLOW</div><ul><li><button type="button" aria-current="true" onClick={() => composerRef.current?.focus()}><span className="workflow-name">Review workflow <WorkflowIcon name="chevron" size={14} /></span><span className="workflow-description">Plan, review, and refine a release</span><span className="workflow-meta"><small className="workflow-status status-draft"><i />Demo</small></span></button></li></ul></aside> : null}
         {!isDemo && (!historyDrawer || drawerOpen) ? (
           <ChatHistory
             serveUrl={historyUrl}
             activeId={selectedId ?? conversationId}
+            onTemplates={()=>setTemplatesOpen(true)}
             onSwitchingChange={setSelectingChat}
             readOnly={readOnly}
             offline={daemon.state === "offline"}
@@ -1492,6 +1508,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             .filter(Boolean)
             .join(" ")}
         >
+          {!readOnly && !isDemo && !historyOpen && !historyDrawer ? <button type="button" className="secondary-button" onClick={()=>setTemplatesOpen(true)}>Browse templates</button> : null}
           <h1 className="visually-hidden">{workflowNames[conversationId]?.name ?? conversationTitle}</h1>
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
@@ -1709,7 +1726,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               <button type="button" className="primary-button" onClick={() => setPanelAgent(manualStep.agent)}>Open response panel</button>
             </div>
           ) : null}
-          <div className="topology-body">
+          {isTemplate && templateDesign && !showingDeliverables ? <TemplatePlan url={serveUrl} program={source} inputs={templateDesign.inputs} /> : null}
+          {deliverableReady ? <div className="template-result-navigation"><strong>{conversationTitle}</strong><button type="button" className="secondary-button" onClick={()=>setShowDeliverables(value=>!value)}>{showingDeliverables?"View workflow":"View deliverables"}</button></div> : null}
+          {showingDeliverables && templateRun ? <TemplateResults key={templateRun.run_id} url={serveUrl} runId={templateRun.run_id} status={templateRun.status} primary /> : null}
+          <div className="topology-body" style={showingDeliverables?{display:"none"}:undefined}>
           <DiagramCanvas
             snapshot={snapshot}
             selection={selection}

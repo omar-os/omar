@@ -123,17 +123,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Build compiler for independent-session integration
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lang
+          test: false
+
       - name: Run all tests
         run: cargo test -- --test-threads=1
 
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Build compiler for independent-session integration
-        uses: leanprover/lean-action@v1
-        with:
-          lake-package-directory: lang
-          test: false
 
       - name: Verify legacy supervision through MCP and tmux
         run: |
@@ -150,6 +151,12 @@ jobs:
           python3 tests/ci/protocol_runner.py
           python3 tests/ci/mission_control_lifecycle.py
           python3 tests/ci/backend_status.py
+
+      - name: Prepare the local repository verifier image
+        run: |
+          docker pull python:3.12-slim
+          echo "OMAR_TEMPLATE_TEST_IMAGE=$(docker image inspect python:3.12-slim --format '{{.Id}}')" >> "$GITHUB_ENV"
+          python3 -m unittest templates/test_repository_patch_export.py
 
       - name: Run tests that shell out to cargo
         run: cargo test --bin omar -- --ignored --test-threads=1
