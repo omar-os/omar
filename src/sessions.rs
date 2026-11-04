@@ -929,6 +929,14 @@ fn relaunch(
         .args(["-L", &session.tmux_server, "kill-server"])
         .output();
     let _ = fs::remove_file(&session.socket);
+    // Resolve today's private directory instead of recreating a vanished login
+    // directory from a saved path. The HTTP address and chat history stay put.
+    session.socket = crate::paths::private_temp_dir()?.join(
+        session
+            .socket
+            .file_name()
+            .context("Missing runtime socket filename")?,
+    );
     launch.session = session.clone();
     launch.address = match address {
         Some(address) => address,
@@ -1257,14 +1265,6 @@ async fn daemon(directory: &Path) -> Result<()> {
         crate::scheduler::TickerBuffer::new(),
         config.dashboard.session_prefix.clone(),
     ));
-    // Runtime directories can disappear on logout/WSL shutdown; the saved
-    // control path remains valid after recreating its private parent.
-    private_dir(
-        session
-            .socket
-            .parent()
-            .context("Missing runtime socket directory")?,
-    )?;
     let listener = UnixListener::bind(&session.socket)?;
     listener.set_nonblocking(true)?;
     session.url = format!("http://{}", server.address());
