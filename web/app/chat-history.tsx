@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore, type RefObject } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { saveWorkflowName, useWorkflowNames } from "./lib/workflow-names";
 import { WorkflowIcon } from "./workflow-icon";
 import { WorkflowSortMenu, type WorkflowSort } from "./workflow-sort-menu";
 import type { ConversationSummary } from "./lib/protocol";
-import { fetchConversations, selectConversation } from "./lib/runtime-client";
+import { describeError, fetchConversations, selectConversation } from "./lib/runtime-client";
 
 const mobileQuery = "(max-width: 900px)";
 function subscribeViewport(onChange: () => void) {
@@ -33,17 +33,20 @@ export function SidebarIcon({ direction }: { direction: "open" | "close" }) {
   );
 }
 
-export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, onClose, onOpen, onSelect, onSwitchingChange, railButtonRef }: {
+export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, readOnly = false, offline = false, onClose, onSelect, onSwitchingChange }: {
   serveUrl: string;
   activeId: string;
   mobile: boolean;
   revision: string;
   collapsed: boolean;
+  /** A view port refuses `activate`: selecting stays in this tab. */
+  readOnly?: boolean;
+  /** The runtime is down, which the studio already says: keep the last list,
+      dimmed, rather than a second error. It reloads once the runtime is back. */
+  offline?: boolean;
   onClose: () => void;
-  onOpen: () => void;
   onSelect: (conversation: ConversationSummary) => void;
   onSwitchingChange: (switching: boolean) => void;
-  railButtonRef: RefObject<HTMLButtonElement | null>;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [chats, setChats] = useState<ConversationSummary[]>([]);
@@ -90,7 +93,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
         setLoading(false);
       }).catch((cause) => {
         if (abort.signal.aborted) return;
-        setError(cause instanceof Error ? cause.message : String(cause));
+        setError(describeError(cause));
         setLoading(false);
       });
     };
@@ -104,6 +107,11 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
       if (mobile) onClose();
       return;
     }
+    if (readOnly) {
+      const conversation = chats.find((chat) => chat.id === id);
+      if (conversation) onSelect(conversation);
+      return;
+    }
     setSwitching(true);
     onSwitchingChange(true);
     setError("");
@@ -113,7 +121,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
       setChats((current) => [conversation, ...current.filter((chat) => chat.id !== conversation.id)]);
       onSelect(conversation);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(describeError(cause));
     } finally {
       setSwitching(false);
       onSwitchingChange(false);
@@ -129,40 +137,23 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
     }
     return updatedAt(b) - updatedAt(a) || byName();
   });
-  if (collapsed) {
-    return (
-      <nav className="history-rail" aria-label="Chat navigation">
-        <OmarLogo />
-        <button
-          ref={railButtonRef}
-          type="button"
-          onClick={onOpen}
-          aria-label="Open chat history"
-          title="Open sidebar"
-        >
-          <SidebarIcon direction="open" />
-        </button>
-      </nav>
-    );
-  }
+  // Folded: the divider's handle beside the conversation is the way back.
+  if (collapsed) return null;
   const content = <>
     <header>
       <div className="brand-lockup"><OmarLogo /><strong>OMAR</strong></div>
-      <button type="button" className="history-fold" onClick={onClose} aria-label="Fold chat history" title="Fold sidebar">
-        <SidebarIcon direction="close" />
-      </button>
     </header>
     <div className="sidebar-heading">
       <div><span className="eyebrow">WORKSPACE</span><h2 id="chat-history-title">Workflows</h2></div>
       <span className="workflow-count">{chats.length}</span>
     </div>
     <div className="history-actions">
-      <button className="new-workflow" type="button" disabled={loading || switching} onClick={() => void select()}><span className="new-icon"><WorkflowIcon name="plus" size={15} /></span>New workflow</button>
+      {readOnly ? null : <button className="new-workflow" type="button" disabled={loading || switching} onClick={() => void select()}><span className="new-icon"><WorkflowIcon name="plus" size={15} /></span>New workflow</button>}
       <label className="workflow-search"><WorkflowIcon name="search" size={15} /><input aria-label="Search workflows" placeholder="Search workflows…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
     </div>
     <div className="history-label"><span>{sort === "recent" ? "RECENT" : sort === "name" ? "NAME" : "STATUS"}</span><WorkflowSortMenu value={sort} onChange={setSort} /></div>
-    {error ? <div className="history-error"><p role="alert">{error}</p><button type="button" onClick={() => setRetry((current) => current + 1)}>Retry</button></div> : null}
-    <ul aria-label="Saved chats" aria-busy={loading || switching}>
+    {error && !offline ? <div className="history-error" role="alert"><span>{error.startsWith("Can't reach") ? "Couldn't load workflows." : error}</span><button type="button" className="link-button" onClick={() => setRetry((current) => current + 1)}>Retry</button></div> : null}
+    <ul aria-label="Saved chats" aria-busy={loading || switching} className={offline ? "stale" : undefined}>
       {visible.map((chat) => (
         <li key={chat.id} className="workflow-row">
           <button type="button" disabled={switching} aria-current={chat.id === activeId ? "true" : undefined} aria-keyshortcuts="F2" onKeyDown={(event) => { if (event.key === "F2") { event.preventDefault(); cancelRename.current = false; setEditedName(displayName(chat)); setEditing(chat.id); } }} onClick={() => void select(chat.id)}>

@@ -50,11 +50,12 @@ Control pointed at it, and opens a browser. Ctrl-C stops both.
 make dev
 ```
 
-`OMAR_SERVE_ADDRESS`, `OMAR_WEB_PORT` and `OMAR_DEV_OPEN=0` adjust it. The two
+`OMAR_SERVE_PORT`, `OMAR_WEB_PORT` and `OMAR_DEV_OPEN=0` adjust it.
+`OMAR_DEV_NO_EA=1` starts without an assistant for frontend-only development. The two
 halves separately, if you want them in separate terminals:
 
 ```bash
-cargo run --bin omar -- serve --address 127.0.0.1:7340   # from the repository root
+cargo run --bin omar -- serve --port 7340                 # from the repository root
 OMAR_SERVE_URL=http://127.0.0.1:7340 npm run dev         # from web/
 ```
 
@@ -105,16 +106,6 @@ context when native history is unavailable. Restarting the runtime does not
 recover topology execution; running topologies prevent automatic shutdown.
 Unsent drafts, manual source edits and terminal scrollback are not archived.
 Reopened proposals still require deployment confirmation.
-
-In task details, **Add connection** configures an HTTP API, outbound webhook,
-or an MCP server already installed in the execution agent. HTTP connections
-support no authentication, bearer tokens, and API key headers; credentials are
-referenced by environment variable name. Connection settings travel in the
-task's execution prompt. The agent makes requests with its own tools; adding a
-connection does not test the endpoint or install an MCP server. **Workflow
-inputs** separately control what data triggers the task. **Apply configuration**
-validates the source and saves the edited draft in this browser, scoped to the
-chat and proposal, so it survives reloads. A new proposal starts a new draft.
 
 The catalog routes remain `/v1/chats` and `/v1/chats/<id>/activate`. Activation
 only remembers a default selection. Clients pin a workspace by prefixing its

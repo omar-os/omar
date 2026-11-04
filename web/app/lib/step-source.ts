@@ -68,7 +68,7 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
     if (open < 0) return null;
     const end = all.findIndex((token, i) => i > open && !token.string && token.text === "}");
     if (end < 0) return null;
-    const prompts = all.slice(open + 1, end).filter((token) => !token.string && token.text === "prompt");
+    const prompts = all.slice(open + 1, end).filter((token) => !token.string && token.text === "task");
     const declaration = prompts[index];
     if (!declaration) return null;
     const position = all.indexOf(declaration);

@@ -188,31 +188,6 @@ pub fn resolve_or_create_ea_selector(
     Ok((resolve_ea_selector(base_dir, selector)?, false))
 }
 
-/// A backend launch always allocates a new EA. Its optional name is not a
-/// selector; in particular, it must never replace the active EA's manager.
-pub fn create_launch_ea(base_dir: &Path, name: Option<&str>) -> anyhow::Result<EaInfo> {
-    let _lock = registry_lock(base_dir)?;
-    let eas = load_registry(base_dir);
-    let next = eas
-        .iter()
-        .map(|ea| ea.id)
-        .max()
-        .unwrap_or(0)
-        .max(load_next_id_counter(base_dir))
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("EA ID space exhausted"))?;
-    let default_name = next.to_string();
-    let name = name.unwrap_or(&default_name);
-    if eas.iter().any(|ea| ea.name == name) {
-        anyhow::bail!("EA name '{name}' already exists; choose a new name for the new EA");
-    }
-    let id = register_ea_unlocked(base_dir, name, None)?;
-    load_registry(base_dir)
-        .into_iter()
-        .find(|ea| ea.id == id)
-        .ok_or_else(|| anyhow::anyhow!("Created EA {id} missing from registry"))
-}
-
 /// Ensure at least one default EA exists on disk.
 pub fn ensure_default_ea(base_dir: &Path) -> anyhow::Result<Vec<EaInfo>> {
     let _lock = registry_lock(base_dir)?;
@@ -358,39 +333,6 @@ fn save_registry(base_dir: &Path, eas: &[EaInfo]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn backend_launch_allocates_numbers_and_never_replaces_an_ea() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = create_launch_ea(dir.path(), None).unwrap();
-        save_active_ea(dir.path(), first.id).unwrap();
-        let second = create_launch_ea(dir.path(), None).unwrap();
-        assert_eq!(first.name, first.id.to_string());
-        assert_eq!(second.name, second.id.to_string());
-        assert!(second.id > first.id);
-        let named = create_launch_ea(dir.path(), Some("Research")).unwrap();
-        assert!(named.id > second.id);
-        assert!(create_launch_ea(dir.path(), Some("Research")).is_err());
-        assert_eq!(load_registry(dir.path()).len(), 3);
-        assert_eq!(load_active_ea(dir.path()), Some(first.id));
-    }
-
-    #[test]
-    fn simultaneous_launches_get_distinct_ids_and_default_names() {
-        let dir = tempfile::tempdir().unwrap();
-        std::thread::scope(|scope| {
-            for _ in 0..8 {
-                let path = dir.path();
-                scope.spawn(move || create_launch_ea(path, None).unwrap());
-            }
-        });
-        let eas = load_registry(dir.path());
-        assert_eq!(eas.len(), 8);
-        for (index, ea) in eas.iter().enumerate() {
-            assert_eq!(ea.id, index as EaId + 1);
-            assert_eq!(ea.name, ea.id.to_string());
-        }
-    }
 
     #[test]
     fn test_ea_prefix() {

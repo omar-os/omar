@@ -9,7 +9,13 @@ import {
   useRef,
   useState,
 } from "react";
-import { formatDuration, webAgents, type DiagramSnapshot } from "../lib/protocol";
+import {
+  formatCountdown,
+  formatDuration,
+  runClockAt,
+  webAgents,
+  type DiagramSnapshot,
+} from "../lib/protocol";
 
 /**
  * Runtime instances stay grouped with their boundary ports and reactions.
@@ -35,6 +41,8 @@ type ElkSection = {
 
 type ElkEdge = {
   id: string;
+  sources?: string[];
+  targets?: string[];
   sections?: ElkSection[];
 };
 
@@ -72,6 +80,13 @@ const ACTION_SIZE = { width: 26, height: 26 };
 const CLOCK_SIZE = { width: 34, height: 34 };
 const PORT_SIZE = { width: 12, height: 12 };
 const TEAM_PADDING = { top: 30, right: 78, bottom: 30, left: 78 };
+/**
+ * Room under a clock for its captions, which hang below the box ELK sees:
+ * name, schedule and, on a live run, the countdown. Reserved whenever the
+ * container holds a timer rather than only while counting, so starting the
+ * run does not move the boxes.
+ */
+const CLOCK_CAPTIONS = 14;
 const CANVAS_MARGIN = 28;
 /** Feedback edges leave and re-enter horizontally before dropping to a lane. */
 /**
@@ -124,15 +139,30 @@ type TimerView = {
   phase: number;
   /** True on the tag it fired at, which is when the face pulses. */
   firing: boolean;
+  /**
+   * The tag it last fired at, as a string: the hand is keyed on it, so each
+   * firing is a fresh hand and its sweep plays again, even when the timer
+   * fires on consecutive tags and the face never stops reading as firing.
+   */
+  firedKey: string;
+  /**
+   * When it fires next, in the run's own time, or null for a one-shot that
+   * has fired and has nothing left to wait for.
+   */
+  next: number | null;
   center: Point;
 };
 
 type ReactionView = {
   id: string;
   order: number;
+  /** Its number among its own team instance's tasks, which is how the source reads. */
+  localOrder: number;
   name: string;
   meta: string;
   contract: string;
+  /** One line of what the task asks, from its prompt; the contract for a code reaction. */
+  summary: string;
   backend: string;
   status: string;
   box: Box;
@@ -409,7 +439,8 @@ function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> 
   return new Map(
     snapshot.reactions.map((reaction) => {
       const owner = agents.get(reaction.agent);
-      const agent = owner?.name ?? reaction.agent;
+      // The agent's own name: the instance it belongs to is the box around it.
+      const agent = localName(owner?.name ?? reaction.agent, reaction.instance);
       // Which model is behind an agent changes how you read what it did, and
       // the program picked it deliberately, so it belongs on the task card.
       const detail = [owner?.backend, reaction.status]
@@ -435,10 +466,113 @@ function textWidth(text: string, perChar: number): number {
   return text.length * perChar;
 }
 
+/**
+ * One line of what a task asks: its prompt's first sentence, with each
+ * `$(port)` read as the port's name. The card's width is set by the name and
+ * the model line, never by this; whatever does not fit ends in an ellipsis.
+ */
+export function summarisePrompt(prompt: string): string {
+  const flat = prompt
+    .replace(/\$\(([^)]*)\)/g, (_, port: string) => port.split(".").pop() ?? port)
+    .replace(/\s+/g, " ")
+    .trim();
+  const sentence = flat.match(/^(.*?[.!?])(?:\s|$)/)?.[1] ?? flat;
+  return sentence.replace(/[.!?:;,]+$/, "");
+}
+
+/** Cut to what a width holds at a per-character advance, ending in an ellipsis. */
+export function fitText(text: string, width: number, perChar: number): string {
+  const room = Math.max(1, Math.floor(width / perChar));
+  return text.length <= room ? text : `${text.slice(0, Math.max(0, room - 1)).trimEnd()}…`;
+}
+
+/**
+ * The model behind a task, as a mark on its card: a monochrome glyph for
+ * the backends OMAR knows, drawn in a 24-unit box, and an initial for one
+ * it does not. Not the vendors' artwork; a shape that reads as theirs.
+ */
+function BackendMark({ backend }: { backend: string }) {
+  const kind = backend.toLowerCase();
+  const stroke = { fill: "none", stroke: "currentColor", strokeWidth: 2.2, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
+  if (kind === "codex") {
+    // Six arcs about the centre: the interlocking ring.
+    return (
+      <g {...stroke} strokeWidth={2}>
+        {[0, 60, 120, 180, 240, 300].map((angle) => (
+          <path key={angle} d="M12 3.2 A8.8 8.8 0 0 1 19.6 7.6 L12 12 Z" transform={`rotate(${angle} 12 12)`} />
+        ))}
+      </g>
+    );
+  }
+  if (kind === "claude" || kind === "claudecode") {
+    // Rays from the centre: the sunburst.
+    return (
+      <g {...stroke} strokeWidth={2.4}>
+        {[0, 45, 90, 135, 180, 225, 270, 315].map((angle, i) => (
+          <path key={angle} d={`M12 12 L12 ${i % 2 === 0 ? 2.6 : 4.2}`} transform={`rotate(${angle} 12 12)`} />
+        ))}
+      </g>
+    );
+  }
+  if (kind === "cursor") {
+    // A cube seen from above.
+    return (
+      <g {...stroke}>
+        <path d="M12 2.5 L20.5 7.25 V16.75 L12 21.5 L3.5 16.75 V7.25 Z" />
+        <path d="M12 12 L20.5 7.25 M12 12 V21.5 M12 12 L3.5 7.25" />
+      </g>
+    );
+  }
+  if (kind === "opencode") {
+    return (
+      <g {...stroke}>
+        <path d="M4 6 L10 12 L4 18" />
+        <path d="M12 19 H20" />
+      </g>
+    );
+  }
+  if (kind === "pi") {
+    return (
+      <g {...stroke}>
+        <path d="M4 7 H20 M8 7 V19 M15.5 7 V17 Q15.5 19.5 18.5 19" />
+      </g>
+    );
+  }
+  if (kind === "antigravity" || kind === "agy") {
+    return (
+      <g {...stroke}>
+        <ellipse cx="12" cy="12" rx="9" ry="4.2" transform="rotate(-30 12 12)" />
+        <path d="M12 17 V5 M8.5 8.5 L12 5 L15.5 8.5" />
+      </g>
+    );
+  }
+  if (kind === "web") {
+    return (
+      <g {...stroke} strokeWidth={1.9}>
+        <circle cx="12" cy="12" r="9" />
+        <ellipse cx="12" cy="12" rx="4" ry="9" />
+        <path d="M3 12 H21" />
+      </g>
+    );
+  }
+  if (kind === "stub") {
+    return (
+      <g {...stroke} strokeWidth={2} strokeDasharray="3 2.6">
+        <circle cx="12" cy="12" r="8.5" />
+      </g>
+    );
+  }
+  return (
+    <text x="12" y="17" textAnchor="middle" fill="currentColor" fontSize="14" fontWeight="700">
+      {backend.slice(0, 1).toUpperCase()}
+    </text>
+  );
+}
+
 function reactionWidth(labels: ReactionLabels, within: number | null): number {
   const widest = Math.max(
-    textWidth(labels.name, 6.9),
-    textWidth(labels.meta, 5.2) + 22,
+    textWidth(labels.name, 8.1),
+    textWidth(labels.meta, 6.4) + 22,
   );
   // A deadline is drawn between the text and the point, so the node has to be
   // wider for it rather than the stopwatch sitting on top of the name.
@@ -515,6 +649,7 @@ async function runElk(
   snapshot: DiagramSnapshot,
   containers: ContainerView[],
   aspectRatio: number | null,
+  unwrapped: ReadonlySet<string> = new Set(),
 ): Promise<ElkNode> {
   const labels = reactionLabels(snapshot);
   const wrapping: Record<string, string> =
@@ -531,7 +666,7 @@ async function runElk(
   const labelRoom = (names: string[]) =>
     names.length === 0
       ? 0
-      : Math.ceil(Math.max(...names.map((name) => textWidth(name, 6.4))));
+      : Math.ceil(Math.max(...names.map((name) => textWidth(name, 7.5))));
 
   // ELK expresses an edge's route relative to the deepest node containing both
   // of its ends, whatever node the edge was declared on. Declaring each edge
@@ -642,7 +777,7 @@ async function runElk(
           "elk.spacing.portPort": `${PORT_GAP}`,
           "elk.padding": `[top=${TEAM_PADDING.top},left=${
             TEAM_PADDING.left + room("input")
-          },bottom=${TEAM_PADDING.bottom},right=${
+          },bottom=${TEAM_PADDING.bottom + (timers.length > 0 ? CLOCK_CAPTIONS : 0)},right=${
             TEAM_PADDING.right + room("output")
           }]`,
           // In-layer (vertical) spacing only. Kept generous because an action's
@@ -652,7 +787,7 @@ async function runElk(
           "elk.spacing.edgeNode": "22",
           "elk.layered.spacing.edgeNodeBetweenLayers": "22",
           "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
-          ...wrapping,
+          ...(unwrapped.has(container.id) ? {} : wrapping),
         },
         ports: ports.map((port) => ({
           id: port.id,
@@ -765,6 +900,9 @@ function buildLayout(
       // or spent, so the hand sits at the top rather than creeping round.
       phase: timer.period > 0 ? (since % timer.period) / timer.period : 0,
       firing: fired !== null && fired === now,
+      firedKey: timer.last_tag ? `${timer.last_tag.timestamp}:${timer.last_tag.microstep}` : "",
+      next:
+        fired === null ? timer.offset : timer.period > 0 ? fired + timer.period : null,
       center: {
         x: (box?.x ?? 0) + (box?.width ?? CLOCK_SIZE.width) / 2,
         y: (box?.y ?? 0) + (box?.height ?? CLOCK_SIZE.height) / 2,
@@ -774,14 +912,25 @@ function buildLayout(
 
   const labels = reactionLabels(snapshot);
   const web = webAgents(snapshot);
+  // Numbered within each team instance, in declaration order: the card says
+  // "01" for an instance's first task however many other instances precede it.
+  const localOrders = new Map<string, number>();
+  const perInstance = new Map<string, number>();
+  for (const reaction of [...snapshot.reactions].sort((a, b) => a.order - b.order)) {
+    const seen = perInstance.get(reaction.instance) ?? 0;
+    localOrders.set(reaction.id, seen);
+    perInstance.set(reaction.instance, seen + 1);
+  }
   const reactions: ReactionView[] = snapshot.reactions.map((reaction) => {
     const label = labels.get(reaction.id) ?? { name: reaction.name, meta: "" };
     return {
       id: reaction.id,
       order: reaction.order,
+      localOrder: localOrders.get(reaction.id) ?? reaction.order,
       name: label.name,
       meta: label.meta,
       contract: reaction.contract,
+      summary: reaction.prompt ? summarisePrompt(reaction.prompt) : reaction.contract,
       backend: snapshot.agents.find((agent) => agent.id === reaction.agent)?.backend ?? "Agent",
       status: reaction.status,
       box: nodeBoxes.get(reaction.id) ?? { x: 0, y: 0, ...REACTION_SIZE },
@@ -890,7 +1039,20 @@ function buildLayout(
 
     const from = anchorBox(edge.source);
     const to = anchorBox(edge.target);
-    if (from && to && to.x + to.width <= from.x + from.width) {
+    // Two kinds of edge have their target left of their source. One ELK had
+    // to reverse to break a cycle, and draws backwards: out of the source's
+    // left, into the target's right. The other joins one wrapped row to the
+    // next, and ELK already draws it forwards: out of the right, down the gap
+    // between the rows, in from the left. Only the first needs the lane; the
+    // second would be dragged under the whole team by it.
+    const first = routed[0];
+    const last = routed[routed.length - 1];
+    const backwards =
+      from &&
+      to &&
+      (first.x < from.x + from.width - AXIS_EPSILON ||
+        last.x > to.x + AXIS_EPSILON);
+    if (from && to && to.x + to.width <= from.x + from.width && backwards) {
       // Stagger lanes so several feedback edges do not sit on top of each other.
       const span = {
         left: to.x - WRAP_STUB,
@@ -930,7 +1092,7 @@ function buildLayout(
         : edge.delay === 0
           ? "\u03bcstep"
           : formatDuration(edge.delay);
-    const split = text ? breakForLabel(drawn, textWidth(text, 5.6) + 8) : null;
+    const split = text ? breakForLabel(drawn, textWidth(text, 6.7) + 8) : null;
     return [
       {
         id: edge.id,
@@ -1013,6 +1175,11 @@ function fitScale(layout: Layout, size: Size): number {
  * actually renders larger in the panel we have, biased towards the single row.
  */
 const WRAP_CANDIDATES = [3.0, 2.2, 1.6];
+// Tried only when none of those made a cut worth keeping: a chain of four
+// of the redesign's cards is tall enough that the looser ratios make no cut
+// at all and 1.6 cuts in front of the output port, while this wraps it
+// cleanly. Graphs that already wrap never pay for the extra run.
+const WRAP_FALLBACK = 1.2;
 const WRAP_GAIN = 1.08;
 
 /**
@@ -1043,23 +1210,71 @@ async function computeGeometry(
 
   let best = plain;
   let bestScale = fitScale(buildLayout(snapshot, declared, plain), size) * WRAP_GAIN;
-  for (const aspectRatio of WRAP_CANDIDATES) {
+  const attempt = async (aspectRatio: number) => {
     let candidate: ElkNode;
     let scale: number;
     try {
       candidate = await runElk(factory, snapshot, declared, aspectRatio);
+      const stranded = strandedPorts(candidate);
+      if (stranded.size > 0) {
+        candidate = await runElk(
+          factory,
+          snapshot,
+          declared,
+          aspectRatio,
+          stranded,
+        );
+      }
       scale = fitScale(buildLayout(snapshot, declared, candidate), size);
     } catch {
       // Wrapping is an optimisation, and ELK throws on some graphs — cyclic
       // ones especially. Losing a candidate is fine; losing the diagram is not.
-      continue;
+      return;
     }
     if (scale > bestScale) {
       best = candidate;
       bestScale = scale;
     }
+  };
+  for (const aspectRatio of WRAP_CANDIDATES) {
+    await attempt(aspectRatio);
+  }
+  if (best === plain) {
+    await attempt(WRAP_FALLBACK);
   }
   return { declared, elk: best };
+}
+
+/**
+ * Containers whose wrap left one of their own ports in a row by itself.
+ *
+ * ELK wraps a container by cutting its layering into rows, and its ports are
+ * layered like anything else: inputs first, outputs last. A cut right before
+ * the outputs puts them in a row of their own, and the edge into one leaves
+ * its reaction, drops a row, runs back across the box and comes forward
+ * again to a port that is drawn on the border anyway. That row buys nothing,
+ * so such a container is laid out unwrapped instead. The tell is an edge
+ * between a container and its own port with a leftward run in it: with the
+ * ports on the outer layers nothing else can send one backwards.
+ */
+function strandedPorts(node: ElkNode, into = new Set<string>()): Set<string> {
+  const own = new Set((node.ports ?? []).map((port) => port.id));
+  const backwards = (section: ElkSection) =>
+    [section.startPoint, ...(section.bendPoints ?? []), section.endPoint].some(
+      (point, index, points) =>
+        index > 0 && point.x < points[index - 1].x - AXIS_EPSILON,
+    );
+  for (const edge of node.edges ?? []) {
+    const touchesOwn = [...(edge.sources ?? []), ...(edge.targets ?? [])].some(
+      (end) => own.has(end),
+    );
+    if (touchesOwn && (edge.sections ?? []).some(backwards)) {
+      into.add(node.id);
+      break;
+    }
+  }
+  for (const child of node.children ?? []) strandedPorts(child, into);
+  return into;
 }
 
 /**
@@ -1101,6 +1316,12 @@ export function componentName(id: string): string {
   return separator === -1 ? id : id.slice(separator + 2);
 }
 
+/** `in 1 m 30 s` until the firing, then `due` until the run gets to it. */
+function countdownLabel(remaining: number): string {
+  const left = formatCountdown(remaining);
+  return left === "due" ? left : `in ${left}`;
+}
+
 export function DiagramCanvas({
   snapshot,
   selection = [],
@@ -1109,6 +1330,7 @@ export function DiagramCanvas({
   onOpenTerminal,
   onOpenPanel,
   highlight,
+  focus,
 }: {
   snapshot: DiagramSnapshot;
   selection?: string[];
@@ -1124,11 +1346,28 @@ export function DiagramCanvas({
    * has picked out to talk about.
    */
   highlight?: ReadonlySet<string>;
+  /**
+   * Ids a formal property is about: its ports, reactions and timers, and the
+   * teams they sit in. Everything else, connections included, is dimmed.
+   */
+  focus?: ReadonlySet<string>;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const edgeEnds = useMemo(
+    () => new Map(snapshot.edges.map((edge) => [edge.id, edge] as const)),
+    [snapshot.edges],
+  );
+  /** The class that dims what a property is not about, if one is focused. */
+  const focusClass = (id: string) => (focus ? (focus.has(id) ? " in-focus" : " off-focus") : "");
+  const edgeFocusClass = (id: string) => {
+    if (!focus) return "";
+    const edge = edgeEnds.get(id);
+    return edge && focus.has(edge.source) && focus.has(edge.target) ? " in-focus" : " off-focus";
+  };
   const [layout, setLayout] = useState<Layout | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [size, setSize] = useState<Size>({ width: 0, height: 0 });
+  const sized = size.width > 0 && size.height > 0;
   const [userView, setUserView] = useState<Viewport | null>(null);
   const dragRef = useRef<{ x: number; y: number; view: Viewport } | null>(null);
   // The glide reads the live view without re-creating itself on every frame.
@@ -1143,6 +1382,32 @@ export function DiagramCanvas({
   useEffect(() => () => { if (inspectTimerRef.current !== null) clearTimeout(inspectTimerRef.current); }, [snapshot.team]);
   const selected = useMemo(() => new Set(selection), [selection]);
 
+  // A countdown is the one reading on the canvas that moves between tags,
+  // which is exactly when nothing else does: the hand steps with logical time,
+  // but a timer fires on the physical clock, and that is what an operator
+  // waiting for it wants to see. The run's clock is wall time since the
+  // origin the runtime announced (see `runClockAt`). Only a live run has a
+  // clock to read.
+  const counting =
+    snapshot.status === "running" &&
+    snapshot.timers.some((timer) => timer.last_tag === null || timer.period > 0);
+  const tag = snapshot.current_tag;
+  // When this client first saw the current tag: the fallback origin for a
+  // runtime that has not announced its clock. Keyed on the tag alone, so the
+  // events published within it do not restart the reading.
+  const tagKey = `${tag?.timestamp ?? ""}|${tag?.microstep ?? ""}`;
+  const [seen, setSeen] = useState(() => ({ tagKey, at: Date.now() }));
+  const [wall, setWall] = useState(() => Date.now());
+  useEffect(() => {
+    if (!counting) return;
+    const tick = setInterval(() => setWall(Date.now()), 250);
+    return () => clearInterval(tick);
+  }, [counting]);
+  const firstSeen = seen.tagKey === tagKey ? seen.at : wall;
+  if (seen.tagKey !== tagKey) setSeen({ tagKey, at: wall });
+  /** The run's physical clock as this render sees it, in nanoseconds. */
+  const runClock = runClockAt(snapshot, wall, firstSeen);
+
   // Reads the drag flag when the click happens, never during render.
   function handleNodeClick(component: string) {
     if (draggedRef.current) return;
@@ -1156,7 +1421,7 @@ export function DiagramCanvas({
   function selectable(id: string, base: string) {
     // Dimming is a property of the drawing, not of selection, so it applies
     // whether or not anything is selectable.
-    const lit = highlight ? (highlight.has(id) ? " at-tag" : " off-tag") : "";
+    const lit = highlight ? (highlight.has(id) ? " at-tag" : " off-tag") : focusClass(id);
     if (!onToggleComponent) return { className: `${base}${lit}` };
     const component = componentName(id);
     return {
@@ -1199,8 +1464,12 @@ export function DiagramCanvas({
 
     // Same shape as what is already drawn: the values moved and nothing else,
     // so redraw from the geometry in hand rather than asking ELK for it again.
+    // A layout worked out before the host had a size could not wrap, since
+    // wrapping fits the panel; it is keyed as such so the first measurement
+    // asks ELK again rather than keeping a single row for good.
+    const key = sized ? shape : `${shape}|unsized`;
     const drawn = geometryRef.current;
-    if (drawn?.key === shape) {
+    if (drawn?.key === key) {
       try {
         setLayout(buildLayout(snapshot, drawn.geometry.declared, drawn.geometry.elk));
         setError(null);
@@ -1213,7 +1482,7 @@ export function DiagramCanvas({
     computeGeometry(snapshot, sizeRef.current)
       .then((geometry) => {
         if (cancelled) return;
-        geometryRef.current = { key: shape, geometry };
+        geometryRef.current = { key, geometry };
         setLayout(buildLayout(snapshot, geometry.declared, geometry.elk));
         const structure = structureKey(snapshot);
         if (structureRef.current !== structure) {
@@ -1229,7 +1498,7 @@ export function DiagramCanvas({
     return () => {
       cancelled = true;
     };
-  }, [snapshot, shape]);
+  }, [snapshot, shape, sized]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -1391,7 +1660,7 @@ export function DiagramCanvas({
             {layout.containers.map((container) => (
               <g
                 key={container.id}
-                className={`omar-team ${layout.status}`}
+                className={`omar-team ${layout.status}${focusClass(container.id)}`}
                 // Which box this one sits in. Nesting is structure, so it is
                 // readable from the drawing rather than only inferable from
                 // the geometry.
@@ -1438,7 +1707,7 @@ export function DiagramCanvas({
 
             <g className="omar-edges">
               {layout.edges.map((edge) => (
-                <g key={edge.id}>
+                <g key={edge.id} className={edgeFocusClass(edge.id).trim() || undefined}>
                   <path
                     data-id={edge.id}
                     className={`omar-edge ${edge.kind}`}
@@ -1484,8 +1753,8 @@ export function DiagramCanvas({
             <g className="omar-timers">
               {layout.timers.map((timer) => {
                 const radius = CLOCK_SIZE.width / 2;
-                // The long hand sweeps the period; the short one is a fixed
-                // dial mark, so a face still reads as a clock when stopped.
+                // One hand, at how far through its period the timer is; it
+                // points straight up on the tag it fires at.
                 const angle = timer.phase * Math.PI * 2 - Math.PI / 2;
                 const hand = {
                   x: Math.cos(angle) * (radius - 8),
@@ -1501,22 +1770,22 @@ export function DiagramCanvas({
                     transform={`translate(${timer.center.x},${timer.center.y})`}
                   >
                     <circle className="omar-timer-face" r={radius} />
-                    {/* Grouped so the fire animation turns both hands about
-                        the pin rather than each about its own end. */}
-                    <g className="omar-timer-hands">
+                    {/* Keyed on the firing so the sweep replays each time.
+                        The invisible circle gives the group a bounding box
+                        centred on the pin, which is what the sweep turns
+                        about; a lone hand's box would be centred on itself. */}
+                    <g
+                      key={timer.firedKey}
+                      className="omar-timer-hands"
+                      data-fired={timer.firedKey || undefined}
+                    >
+                      <circle r={radius - 8} fill="none" stroke="none" />
                       <line
                         className="omar-timer-hand"
                         x1={0}
                         y1={0}
                         x2={hand.x}
                         y2={hand.y}
-                      />
-                      <line
-                        className="omar-timer-hand short"
-                        x1={0}
-                        y1={0}
-                        x2={0}
-                        y2={-(radius - 12)}
                       />
                     </g>
                     <circle className="omar-timer-pin" r={1.8} />
@@ -1528,6 +1797,18 @@ export function DiagramCanvas({
                         ? `${formatDuration(timer.offset)}, every ${formatDuration(timer.period)}`
                         : `once at ${formatDuration(timer.offset)}`}
                     </text>
+                    {/* Physical time to its next firing, counting down while
+                        the run is live. A spent one-shot has nothing to wait
+                        for and shows none. */}
+                    {counting && timer.next !== null ? (
+                      <text
+                        className="omar-timer-countdown"
+                        y={radius + 32}
+                        textAnchor="middle"
+                      >
+                        {countdownLabel(timer.next - runClock)}
+                      </text>
+                    ) : null}
                   </g>
                 );
               })}
@@ -1572,7 +1853,7 @@ export function DiagramCanvas({
                     y={36}
                     textAnchor="middle"
                   >
-                    {String(reaction.order + 1).padStart(2, "0")}
+                    {String(reaction.localOrder + 1).padStart(2, "0")}
                   </text>
                   <text
                     className="omar-reaction-name"
@@ -1582,10 +1863,12 @@ export function DiagramCanvas({
                     {reaction.name}
                   </text>
                   <text className="omar-reaction-description" x={REACTION_TEXT_X} y={46}>
-                    {reaction.contract.length > 24 ? `${reaction.contract.slice(0, 23)}…` : reaction.contract}
+                    {fitText(reaction.summary, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING, 6.7)}
                   </text>
                   <rect className="omar-model-badge" x={REACTION_TEXT_X} y={57} width={16} height={16} rx={5} />
-                  <text className="omar-model-mark" x={REACTION_TEXT_X + 8} y={68} textAnchor="middle">{reaction.backend.slice(0, 1)}</text>
+                  <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 59) scale(0.5)`}>
+                    <BackendMark backend={reaction.backend} />
+                  </g>
                   <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={68}>{reaction.meta}</text>
                   {/* A deadline the program set for itself. A stopwatch rather
                       than a clock: a timer fires on its own, this counts down
@@ -1678,7 +1961,6 @@ export function DiagramCanvas({
           <svg viewBox="0 0 12 12" aria-hidden="true">
             <circle className="omar-timer-face" cx="6" cy="6" r="5" />
             <line className="omar-timer-hand" x1="6" y1="6" x2="6" y2="2.5" />
-            <line className="omar-timer-hand short" x1="6" y1="6" x2="8.5" y2="6" />
           </svg>
           timer
         </span>

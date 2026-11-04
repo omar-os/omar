@@ -10,13 +10,17 @@
     "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
     "build:spa": "vite build --config vite.spa.config.ts && node build/compress-spa.mjs",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
-    "test": "npm run build && node --test --experimental-strip-types --disable-warning=ExperimentalWarning tests/rendered-html.test.mjs tests/protocol-contract.test.mjs tests/step-source.test.mjs",
+    "test": "npm run build && node --test --experimental-strip-types --disable-warning=ExperimentalWarning tests/rendered-html.test.mjs tests/protocol-contract.test.mjs tests/countdown.test.mjs tests/step-source.test.mjs tests/view-access.test.mjs tests/describe-error.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "test:e2e": "playwright test",
     "test:conformance": "node --test tests/conformance.test.mjs",
     "test:serve-ui": "node --test tests/serve-ui.test.mjs"
   },
   "dependencies": {
+    "@codemirror/commands": "6.11.1",
+    "@codemirror/merge": "6.12.3",
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.15",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "elkjs": "^0.12.0",

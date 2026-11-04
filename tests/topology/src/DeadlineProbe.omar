@@ -18,14 +18,14 @@ team DeadlineProbe[punctual : ClaudeCode, tardy : ClaudeCode, reporter : ClaudeC
     action missed : string
     output report : string
 
-    prompt punctual(start) -> met within(10min)
+    task punctual(start) -> met within(10min)
     "
         The timer fired at logical time $(start).
         Your deadline is 10 minutes, far more than you need.
         Set `met` to exactly: punctual
     "
 
-    prompt tardy(start) -> missed? within(1ms)
+    task tardy(start) -> missed? within(1ms)
     "
         The timer fired at logical time $(start).
         This invocation has a deadline of 1ms, which has almost certainly
@@ -34,7 +34,7 @@ team DeadlineProbe[punctual : ClaudeCode, tardy : ClaudeCode, reporter : ClaudeC
         is written, which is the expected outcome.
     "
 
-    prompt reporter(met, missed) -> report
+    task reporter(met, missed) -> report
     "
         Two reactions ran under `within` deadlines at the same tag.
         The generous one reported: $(met)
@@ -49,6 +49,27 @@ team DeadlineProbe[punctual : ClaudeCode, tardy : ClaudeCode, reporter : ClaudeC
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input report : string
+    state got_report : bool = false
+    timer deadline(10min, 0)
+
+    reaction(report) -> {=
+        if report.is_some() { self.got_report = true; }
+        if self.got_report { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_report, "no probe.report by the deadline");
+    =}
+}
+
 main WithinTest {
     probe = DeadlineProbe()
+
+    smoke = Smoke()
+    probe.report -> smoke.report
 }

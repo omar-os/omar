@@ -9,9 +9,11 @@ import { WorkflowIcon } from "./workflow-icon";
 import { TaskConnections } from "./task-connections";
 
 /** Details come from the compiled topology, never from prototype sample data. */
-export function StepInspector({ component, snapshot, source, editable, onApply, onClose, onEdit, onAsk }: {
+export function StepInspector({ component, snapshot, source, editable, readOnly = false, onApply, onClose, onEdit, onAsk }: {
   source: string;
   editable: boolean;
+  /** Details only: nothing here may lead to a change. */
+  readOnly?: boolean;
   onApply: (source: string) => Promise<void>;
   component: string;
   snapshot: DiagramSnapshot;
@@ -38,13 +40,15 @@ export function StepInspector({ component, snapshot, source, editable, onApply, 
         <div className="inspector-field"><span>Execution backend</span><div className="step-model"><i>{(agent?.backend ?? "?").slice(0, 1)}</i>{agent?.backend ?? "Not specified"}<span className={`step-status ${reaction.status}`}>{reaction.status}</span></div></div>
         <div className="inspector-field"><span>Output contract</span><div className="step-contract">{reaction.contract || "No contract declared"}</div></div>
         {reaction.within != null ? <div className="inspector-field"><span>Deadline</span><strong>{formatDuration(reaction.within)}</strong></div> : null}
-        <div className="connections-heading"><span>Connections</span><button type="button" onClick={() => onAsk(`Update the connections for ${component}: `)}><WorkflowIcon name="plus" size={12} /> Edit</button></div>
+        <div className="connections-heading"><span>Connections</span>{readOnly ? null : <button type="button" onClick={() => onAsk(`Update the connections for ${component}: `)}><WorkflowIcon name="plus" size={12} /> Edit</button>}</div>
         <div className="inspector-field"><span>Receives</span>{connectionNames(reaction.triggers)}</div>
         <div className="inspector-field"><span>Produces</span>{connectionNames(reaction.effects)}</div>
         </> : null}
-        {configuration ? <StepEditor key={`${component}:${source}`} source={source} step={configuration} enabled={editable} onApply={onApply} ports={snapshot.ports.filter((item) => item.instance === reaction.instance && item.kind !== "output").map((item) => item.name.startsWith(`${reaction.instance}.`) ? item.name.slice(reaction.instance.length + 1) : item.name)} /> : <p className="step-empty">Use the source editor for this step’s configuration.</p>}
+        {configuration ? <StepEditor key={`${component}:${source}`} source={source} step={configuration} enabled={editable} readOnly={readOnly} onApply={onApply} ports={snapshot.ports.filter((item) => item.instance === reaction.instance && item.kind !== "output").map((item) => item.name.startsWith(`${reaction.instance}.`) ? item.name.slice(reaction.instance.length + 1) : item.name)} /> : <p className="step-empty">Use the source editor for this step’s configuration.</p>}
+        {readOnly ? null : <>
         <button type="button" className="step-edit" onClick={onEdit}>Edit prompt & backend in source <WorkflowIcon name="arrow" size={14} /></button>
         <button type="button" className="step-ask" onClick={() => onAsk(`Update the prompt or execution backend for ${component}: `)}>Edit with OMAR</button>
+        </>}
       </> : null}
       {port ? <>
         <div className="inspector-field"><span>Value type</span><strong>{port.type}</strong></div>
@@ -56,8 +60,8 @@ export function StepInspector({ component, snapshot, source, editable, onApply, 
   );
 }
 
-function StepEditor({ source, step, ports, enabled, onApply }: {
-  source: string; step: StepSource; ports: string[]; enabled: boolean; onApply: (source: string) => Promise<void>;
+function StepEditor({ source, step, ports, enabled, readOnly, onApply }: {
+  source: string; step: StepSource; ports: string[]; enabled: boolean; readOnly: boolean; onApply: (source: string) => Promise<void>;
 }) {
   const [backend, setBackend] = useState(step.backend);
   const [prompt, setPrompt] = useState(step.prompt);
@@ -77,15 +81,15 @@ function StepEditor({ source, step, ports, enabled, onApply }: {
   }
   return <div className="step-editor">
     <h4>Configuration</h4>
-    <p className="step-edit-note">Apply to save changes to {step.team} and all its instances in this browser. The workflow still requires confirmation before running.</p>
-    {!enabled ? <p role="status">Configuration is read-only while the workflow is running or the runtime is unavailable.</p> : null}
+    {readOnly ? null : <p className="step-edit-note">Apply to save changes to {step.team} and all its instances in this browser. The workflow still requires confirmation before running.</p>}
+    {!enabled && !readOnly ? <p role="status">Configuration is read-only while the workflow is running or the runtime is unavailable.</p> : null}
     <fieldset disabled={!enabled || busy}>
-      <TaskConnections connections={connections} triggers={triggers} ports={ports} onConnectionsChange={setConnections} onTriggersChange={setTriggers} />
+      <TaskConnections connections={connections} triggers={triggers} ports={ports} readOnly={readOnly} onConnectionsChange={setConnections} onTriggersChange={setTriggers} />
       <label className="inspector-field"><span>Execution agent</span><select aria-label="Step execution agent" value={backend} onChange={(event) => setBackend(event.target.value)}>{backends.map((value) => <option key={value} value={value}>{value === "ClaudeCode" ? "Claude Code" : value === "OpenCode" ? "opencode" : value === "Pi" ? "pi" : value === "Agy" ? "agy" : value}</option>)}</select></label>
       <p className="step-edit-note">Uses the model configured for this agent.</p>
       <label className="inspector-field"><span>Prompt</span><textarea aria-label="Step prompt" rows={7} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
       <label className="inspector-field"><span>Task outputs / contract</span><input aria-label="Step output contract" value={contract} onChange={(event) => setContract(event.target.value)} /></label>
-      <button type="button" className="step-save" disabled={!changed || busy} onClick={() => void apply()}>{busy ? "Validating…" : "Apply configuration"}</button>
+      {readOnly ? null : <button type="button" className="step-save" disabled={!changed || busy} onClick={() => void apply()}>{busy ? "Validating…" : "Apply configuration"}</button>}
     </fieldset>
     {error ? <p className="step-config-error" role="alert">{error}</p> : null}
     {saved ? <p role="status">Configuration applied to the draft.</p> : null}

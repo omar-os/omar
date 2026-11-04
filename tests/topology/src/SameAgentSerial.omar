@@ -9,18 +9,18 @@ team SameAgentSerial[worker : Codex,
     action left : string
     action right : string
 
-    prompt worker(request) -> left
+    task worker(request) -> left
     "
         Set `left` to `left: $(request)`.
     "
 
-    prompt worker(request) -> right
+    task worker(request) -> right
     "
         Set `right` to `right: $(request)`. This invocation must run after the
         preceding invocation because both reactions use the same agent.
     "
 
-    prompt collector(left, right) -> result
+    task collector(left, right) -> result
     "
         Both serialized effects commit at the same tag boundary.
         left=$(left)
@@ -29,6 +29,27 @@ team SameAgentSerial[worker : Codex,
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input result : string
+    state got_result : bool = false
+    timer deadline(10min, 0)
+
+    reaction(result) -> {=
+        if result.is_some() { self.got_result = true; }
+        if self.got_result { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_result, "no serial.result by the deadline");
+    =}
+}
+
 main {
     serial = SameAgentSerial()
+
+    smoke = Smoke()
+    serial.result -> smoke.result
 }

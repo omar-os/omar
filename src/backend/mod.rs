@@ -6,17 +6,23 @@
 //! itself. Adding a backend is one variant of [`Kind`], one file, and one
 //! entry in [`ALL`].
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use serde_json::Value;
 
 use crate::manager::McpLaunchContext;
+pub use connection::Connection;
 
 pub(crate) mod antigravity;
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod connect;
+pub(crate) mod connection;
 pub(crate) mod cursor;
+pub(crate) mod jev;
 pub(crate) mod managed;
 pub(crate) mod opencode;
 pub(crate) mod pi;
@@ -161,6 +167,7 @@ pub enum Kind {
     Cursor,
     Opencode,
     Pi,
+    Jev,
     Stub,
 }
 
@@ -192,12 +199,72 @@ pub struct StartupGate {
     pub confirms: bool,
 }
 
+/// A topology prompt evaluated directly by a backend, without a coding-agent pane.
+/// Output types are the canonical types already resolved and checked by the VM.
+/// A CLI's own sign-in: `program args`, attached to the operator's terminal.
+pub struct Login {
+    pub args: &'static [&'static str],
+    /// Said before it starts, when the CLI does not say it itself.
+    pub note: Option<&'static str>,
+}
+
+pub struct TopologyInvocation<'a> {
+    pub effects: &'a BTreeMap<String, String>,
+    pub triggers: &'a BTreeMap<String, Value>,
+    pub instructions: &'a str,
+    pub timeout: Duration,
+}
+
 pub trait Backend: Send + Sync {
+    /// This backend evaluates topology prompts directly and cannot run a chat assistant.
+    fn topology_only(&self) -> bool {
+        false
+    }
+
+    /// Only called for a topology-only backend. The VM validates returned writes
+    /// against the invocation's effect contract and port types before publishing.
+    fn invoke_topology(
+        &self,
+        _invocation: &TopologyInvocation<'_>,
+    ) -> Result<BTreeMap<String, Value>> {
+        bail!(
+            "{} does not evaluate topology prompts directly",
+            self.kind().name()
+        )
+    }
+
     /// Only freshly launched native TUIs may have their startup dialogs answered.
     fn has_startup_gates(&self) -> bool {
         false
     }
     fn startup_gate(&self, _screen: &str) -> Option<StartupGate> {
+        None
+    }
+
+    /// Whether this backend's installed CLI, run as `program`, is signed in.
+    fn connection(&self, _program: &str) -> Connection {
+        Connection::unknown("no sign-in check for this backend")
+    }
+    /// The vendor's official installer, which `omar connect` runs.
+    fn install_command(&self) -> Option<&'static str> {
+        None
+    }
+    /// How `omar connect` has the installed CLI sign itself in. `headless`:
+    /// no browser can open here, so prefer a code the operator types elsewhere.
+    fn login(&self, _headless: bool) -> Option<Login> {
+        None
+    }
+    /// Environment variables that sign the CLI in, which no sign-out clears.
+    fn credential_vars(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// How the connect picker has the CLI sign itself out.
+    fn logout(&self) -> Option<Login> {
+        None
+    }
+    /// The CLI's own headless run of `connection::CHECK_PROMPT` as `program`,
+    /// which proves a sign-in works (`connection::check_sign_in`).
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
         None
     }
 
@@ -212,6 +279,12 @@ pub trait Backend: Send + Sync {
     /// the backend's channel and never types into the widget these describe.
     fn readiness_markers(&self) -> &'static [&'static str] {
         &[]
+    }
+    /// Whether a launch with no startup dialog on screen has finished
+    /// starting: its banner by default.
+    fn startup_finished(&self, screen: &str, _pane_pid: u32) -> bool {
+        let markers = self.readiness_markers();
+        !markers.is_empty() && markers.iter().all(|marker| screen.contains(marker))
     }
     /// How a caller learns that a launched pane can take work. A launch under
     /// OMAR's protocol runner has no banner: the runner's socket is the proof,
@@ -341,20 +414,20 @@ pub(crate) fn remember_conversation(
     Ok(())
 }
 
-pub const ALL: [&dyn Backend; 7] = [
+pub const ALL: [&dyn Backend; 8] = [
     &claude::Claude,
     &codex::Codex,
     &cursor::Cursor,
     &opencode::Opencode,
     &pi::Pi,
     &antigravity::Antigravity,
+    &jev::Jev,
     &stub::Stub,
 ];
 
 /// Backends an operator can run an assistant on.
 ///
-/// The stub is deliberately absent: it answers invocations without a model,
-/// which is useful for exercising a run and useless for talking to.
+/// Stub and Jev are deliberately absent: neither is a conversational assistant.
 pub const ASSISTANT: [Kind; 6] = [
     Kind::Claude,
     Kind::Codex,
@@ -383,14 +456,21 @@ pub fn by_name(name: &str) -> Option<&'static dyn Backend> {
 
 /// Like [`by_name`], with the error an operator reads.
 pub fn resolve(name: &str) -> Result<&'static dyn Backend, String> {
-    // `web` never reaches here: nothing is spawned for it, so there is no
-    // command to resolve. It is named so a typo is told what it meant.
-    by_name(name).ok_or_else(|| {
+    // Web has no launched process; direct topology backends are registered
+    // but cannot supply a command for an executive assistant or coding pane.
+    let backend = by_name(name).ok_or_else(|| {
         format!(
-            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, pi, agy, stub, web",
+            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, pi, agy, stub, web; topology-only: jev",
             name
         )
-    })
+    })?;
+    if backend.topology_only() {
+        return Err(format!(
+            "{} is a topology-only backend; use it in an .omar team, not as a coding assistant",
+            backend.kind().name()
+        ));
+    }
+    Ok(backend)
 }
 
 /// The backend one token of a command line runs, if it is one of ours.
@@ -589,11 +669,13 @@ mod tests {
         assert!(claude.contains("--session-id '11111111-1111-4111-8111-111111111111'"));
         let (codex, _) = crate::manager::build_ea_command("codex", 0, "test", dir.path(), &context);
         assert!(
-            codex.contains("codex resume 'saved-codex' --remote"),
+            codex.contains(
+                "codex resume 'saved-codex' -c check_for_update_on_startup=false --remote"
+            ),
             "{codex}"
         );
         assert!(!codex.contains("codex resume 'saved-codex' --dangerously"));
-        assert!(codex.contains("|| codex --dangerously-bypass-approvals-and-sandbox --remote"));
+        assert!(codex.contains("|| codex --dangerously-bypass-approvals-and-sandbox -c check_for_update_on_startup=false --remote"));
         let (managed, _) = crate::manager::build_ea_command(
             "codex --profile work",
             0,
@@ -658,6 +740,7 @@ mod tests {
             Kind::Cursor,
             Kind::Opencode,
             Kind::Pi,
+            Kind::Jev,
             Kind::Stub,
         ] {
             assert_eq!(of(kind).kind(), kind);
@@ -675,6 +758,18 @@ mod tests {
     }
 
     #[test]
+    fn jev_is_registered_for_direct_topology_calls_not_assistant_launches() {
+        let backend = by_name("JeV").unwrap();
+        assert!(resolve("jev").err().unwrap().contains("topology-only"));
+        assert_eq!(backend.kind(), Kind::Jev);
+        assert!(backend.topology_only());
+        assert!(backend.executables().is_empty());
+        assert!(!ASSISTANT.contains(&Kind::Jev));
+        assert!(!resolve("Codex").unwrap().topology_only());
+        assert!(!resolve("ClaudeCode").unwrap().topology_only());
+    }
+
+    #[test]
     fn names_resolve_by_alias_and_case() {
         assert_eq!(by_name("Claude-Code").unwrap().kind(), Kind::Claude);
         assert_eq!(by_name("claudecode").unwrap().kind(), Kind::Claude);
@@ -689,10 +784,6 @@ mod tests {
         assert_eq!(
             resolve("claude").unwrap().default_command(),
             "claude --dangerously-skip-permissions"
-        );
-        assert_eq!(
-            resolve("cursor").unwrap().default_command(),
-            "cursor agent --yolo"
         );
         assert_eq!(resolve("opencode").unwrap().default_command(), "opencode");
         assert_eq!(

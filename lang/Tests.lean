@@ -1,4 +1,8 @@
 import Omar.Compiler
+import Omar.Mutation
+import Omar.Prove
+-- Not used here, but every property file imports it, so it must be built.
+import Omar.Verify
 
 open Lean
 open Omar
@@ -22,46 +26,49 @@ structure TopologyCase where
   codexOnly : Bool := true
 
 def topologyCases : Array TopologyCase := #[
-  { file := "AllTypes.omar", team := "AllTypes", agents := 1, ports := 18,
-    reactions := 1, instructions := 23 },
+  { file := "AllTypes.omar", team := "AllTypes", agents := 1, ports := 24,
+    connections := 6, reactions := 4, states := 6, instructions := 47 },
   { file := "BusinessLoop.omar", team := "BusinessLoop", agents := 8,
-    ports := 20, reactions := 11, instructions := 42 },
+    ports := 21, connections := 1, reactions := 14, states := 1, instructions := 51 },
   -- `main WithinTest` names the program, so the team is not the file stem.
-  { file := "DeadlineProbe.omar", team := "WithinTest", agents := 3, ports := 3,
-    reactions := 3, instructions := 13, codexOnly := false },
+  { file := "DeadlineProbe.omar", team := "WithinTest", agents := 3, ports := 4,
+    connections := 1, reactions := 6, states := 1, instructions := 22, codexOnly := false },
   -- Every agent is a Stub, so the shared-backend assertion does not apply.
-  { file := "Depths.omar", team := "Depths", agents := 4, ports := 9,
-    connections := 4, reactions := 4, instructions := 27, codexOnly := false },
-  { file := "EffectContracts.omar", team := "EffectContracts", agents := 1, ports := 6,
-    reactions := 3, instructions := 13 },
-  { file := "FanOutFanIn.omar", team := "FanOutFanIn", agents := 4, ports := 5,
-    reactions := 4, instructions := 16 },
-  { file := "HR.omar", team := "HR", agents := 3, ports := 6,
-    reactions := 4, instructions := 16, codexOnly := false },
-  { file := "HRCodex.omar", team := "HRCodex", agents := 3, ports := 6,
-    reactions := 4, instructions := 16 },
-  { file := "OrTriggers.omar", team := "OrTriggers", agents := 3, ports := 5,
-    reactions := 3, instructions := 14 },
-  { file := "OrderedWrites.omar", team := "OrderedWrites", agents := 4, ports := 3,
-    reactions := 4, instructions := 14 },
+  { file := "Depths.omar", team := "Depths", agents := 4, ports := 11,
+    connections := 5, reactions := 8, states := 1, instructions := 38, codexOnly := false },
+  { file := "EffectContracts.omar", team := "EffectContracts", agents := 1, ports := 7,
+    connections := 1, reactions := 6, states := 1, instructions := 22 },
+  { file := "FanOutFanIn.omar", team := "FanOutFanIn", agents := 4, ports := 6,
+    connections := 1, reactions := 7, states := 1, instructions := 25 },
+  { file := "HR.omar", team := "HR", agents := 3, ports := 7,
+    connections := 1, reactions := 7, states := 1, instructions := 25, codexOnly := false },
+  { file := "HRCodex.omar", team := "HRCodex", agents := 3, ports := 7,
+    connections := 1, reactions := 7, states := 1, instructions := 25 },
+  { file := "OrTriggers.omar", team := "OrTriggers", agents := 3, ports := 6,
+    connections := 1, reactions := 6, states := 1, instructions := 23 },
+  { file := "OrderedWrites.omar", team := "OrderedWrites", agents := 4, ports := 4,
+    connections := 1, reactions := 7, states := 1, instructions := 23 },
   -- A `ClaudeCode` and a `Web`, so the shared backend assertion does not apply.
   { file := "PortManager.omar", team := "WebPanel", agents := 2, ports := 4,
     connections := 2, reactions := 2, instructions := 15, codexOnly := false },
-  { file := "Recurrence.omar", team := "Recurrence", agents := 1, ports := 3,
-    reactions := 1, instructions := 8 },
+  { file := "Recurrence.omar", team := "Recurrence", agents := 1, ports := 4,
+    connections := 1, reactions := 4, states := 1, instructions := 17 },
   -- Three instances of one team, so every count is the team's times three.
-  { file := "Ring.omar", team := "Ring", agents := 3, ports := 9,
-    connections := 3, reactions := 3, instructions := 26 },
+  { file := "Ring.omar", team := "Ring", agents := 3, ports := 10,
+    connections := 4, reactions := 6, states := 1, instructions := 35 },
   -- Same shape as Ring with the reaction written as code, so no agent at all.
   { file := "RingCode.omar", team := "RingCode", agents := 0, ports := 9,
     connections := 3, reactions := 3, instructions := 23 },
   -- The issue's sketch: a counter kept in state rather than carried in the token.
   { file := "RingLeader.omar", team := "RingLeader", agents := 0, ports := 3,
     connections := 1, reactions := 2, states := 1, instructions := 11 },
-  { file := "SameAgentSerial.omar", team := "SameAgentSerial", agents := 2, ports := 4,
-    reactions := 3, instructions := 12 },
-  { file := "SuperdenseTime.omar", team := "SuperdenseTime", agents := 3, ports := 6,
-    connections := 1, reactions := 3, instructions := 16 }
+  { file := "SameAgentSerial.omar", team := "SameAgentSerial", agents := 2, ports := 5,
+    connections := 1, reactions := 6, states := 1, instructions := 21 },
+  { file := "SuperdenseTime.omar", team := "SuperdenseTime", agents := 3, ports := 8,
+    connections := 3, reactions := 6, states := 2, instructions := 28 },
+  -- `main WorldNewsEveryTwoMinutes` names the program; a 2min periodic timer.
+  { file := "WorldNews.omar", team := "WorldNewsEveryTwoMinutes", agents := 2, ports := 4,
+    connections := 2, reactions := 5, states := 1, instructions := 22 }
 ]
 
 def testTopology (test : TopologyCase) : IO Unit := do
@@ -105,6 +112,10 @@ def testTopology (test : TopologyCase) : IO Unit := do
         (mentions (reaction.body.getD "") "$(idx)") false
     assertEqual "body keeps its braces"
       (program.reactions.all (fun r => mentions (r.body.getD "") "out = Some(token + 1)")) true
+  if test.file == "WorldNews.omar" then
+    -- `2min` is two minutes of logical time, in nanoseconds, every tick.
+    assertEqual "timer period"
+      (mentions bytecode "\"name\": \"fetch.tick\", \"offset\": 0, \"period\": 120000000000") true
   if test.file == "RingLeader.omar" then
     -- State is qualified like a port, typed as OMAR's int, and starts at 0.
     let var ← match program.states[0]? with
@@ -128,9 +139,10 @@ def testTopology (test : TopologyCase) : IO Unit := do
     -- Instances are structure, not a naming convention: the bytecode says which
     -- container each name belongs to rather than leaving it to be guessed from
     -- the dot.
-    assertEqual "one instance per instantiation" program.instances.size 3
+    -- Three nodes, and the Smoke team that checks the ring.
+    assertEqual "one instance per instantiation" program.instances.size 4
     assertEqual "instances name their team"
-      (program.instances.all (·.team == "Node")) true
+      ((program.instances.filter (·.name != "smoke")).all (·.team == "Node")) true
     assertEqual "every port belongs to an instance"
       (program.ports.all (fun port => port.instance_ != "")) true
     assertEqual "members are grouped by instance"
@@ -157,7 +169,7 @@ def testTopology (test : TopologyCase) : IO Unit := do
       (program.reactions.all (fun reaction => !mentions reaction.prompt "$(idx)")) true
     assertEqual "ring is wired head to tail"
       (program.connections.map fun connection => s!"{connection.source}->{connection.target}")
-      #["n1.out->n2.token", "n2.out->n3.token", "n3.out->n1.token"]
+      #["n1.out->n2.token", "n2.out->n3.token", "n3.out->n1.token", "n1.done->smoke.done"]
   if test.file == "PortManager.omar" then
     -- The backend is the whole point of the sample, and `codexOnly` is off, so
     -- nothing else would check it.
@@ -222,7 +234,7 @@ def nodeTeam : String :=
   "team Node(idx : int)[agent : Codex] {
      input token : int
      output out : int
-     prompt agent(token) -> out \"node $(idx) got $(token)\"
+     task agent(token) -> out \"node $(idx) got $(token)\"
    }"
 
 /-- One reaction carrying whatever deadline the caller writes. -/
@@ -230,7 +242,7 @@ def deadlineTeam (deadline : String) : String :=
   "team Desk[a : Codex] {
      input req : string
      output res : string
-     prompt a(req) -> res? within(" ++ deadline ++ ") \"do it\"
+     task a(req) -> res? within(" ++ deadline ++ ") \"do it\"
    }
    main { d = Desk() }"
 
@@ -248,7 +260,7 @@ def testWithin : IO Unit := do
     | .error message => throw (IO.userError s!"within {written}: {message}")
   -- No deadline is not a zero deadline: the run-wide timeout still applies.
   let plain := "team Desk[a : Codex] { input req : string output res : string
-                prompt a(req) -> res \"go\" } main { d = Desk() }"
+                task a(req) -> res \"go\" } main { d = Desk() }"
   match lex plain >>= parse "Desk" with
   | .ok program =>
       assertEqual "no deadline" (program.reactions.all (·.within == none)) true
@@ -343,6 +355,11 @@ def rejectionCases : Array (String × String × String) := #[
   ("a parameter named like a port",
     "team Wire(src : int) { input src : int output dst : int }
      main { w = Wire(1) }", "is also a port"),
+  -- `shutdown` is the runtime's trigger, and no team may declare its own.
+  ("a timer named shutdown",
+    wireTeam "timer shutdown(1s, 0)", "the trigger the run's last tag fires"),
+  ("a port named shutdown",
+    wireTeam "input shutdown : int", "the trigger the run's last tag fires"),
   ("a parameter named like a state variable",
     "team Wire(n : int) { input src : int output dst : int state n : int = 0 }
      main { w = Wire(1) }", "is also a port, timer or state")
@@ -359,6 +376,24 @@ def testStateLiterals : IO Unit :=
       assertEqual "string state"
         (program.states.any (fun v => v.name == "w.name" && v.initial == .str "x")) true
   | .error message => throw (IO.userError s!"state literals: {message}")
+
+/-- Reacting to `shutdown` declares it, once per instance, as a timer the
+    clock never fires; a team that does not react to it has none. -/
+def testShutdown : IO Unit := do
+  let source := "team T { input a : int state seen : bool = false
+     reaction(a) -> {= self.seen = true; request_stop(); =}
+     reaction(shutdown) -> {= assert!(self.seen); =} }
+     main { x = T() y = T() }"
+  match compileSource "Smoke" source with
+  | .ok bytecode =>
+      assertEqual "one shutdown trigger per instance"
+        ((bytecode.splitOn "\"shutdown\": true").length - 1) 2
+  | .error message => throw (IO.userError s!"shutdown: {message}")
+  match lex (wireTeam "src -> dst") >>= parse "Wire" with
+  | .ok program =>
+      assertEqual "no shutdown without a reaction to it"
+        (program.timers.any (·.shutdown)) false
+  | .error message => throw (IO.userError s!"no shutdown: {message}")
 
 /-- `{= ... =}` promises raw Rust, so a `=}` that Rust is holding — in a
     string, a raw string, a character literal or a comment — closes nothing. -/
@@ -410,6 +445,298 @@ def testNamedMain : IO Unit :=
   | .ok program => assertEqual "named main" program.team "Payroll"
   | .error message => throw (IO.userError s!"named main: {message}")
 
+
+def testExternalSchemas : IO Unit := do
+  let schema := "{\"type\":\"string\",\"enum\":[\"approved\",\"needs_revision\"]}"
+  let source := "type Decision from \"schemas/decision.json\"\n" ++
+    "team Review[Decision : Codex] { input Decision : Decision " ++
+    "output out : list<option<Decision>> task Decision(Decision) -> out \"Review $(Decision)\" } " ++
+    "main { review = Review() }"
+  let bytecode ← match compileSourceWithSchemas "Review" source #[ ("schemas/decision.json", schema) ] with
+    | .ok bytecode => pure bytecode
+    | .error error => throw (IO.userError s!"external schema: {error}")
+  let json ← match Json.parse bytecode with
+    | .ok json => pure json
+    | .error error => throw (IO.userError error)
+  let instructions ← match json.getObjVal? "instructions" >>= Json.getArr? with
+    | .ok instructions => pure instructions
+    | .error error => throw (IO.userError error)
+  for expected in ["string in [\"approved\",\"needs_revision\"]",
+      "list<option<string in [\"approved\",\"needs_revision\"]>>"] do
+    assertEqual "schema type emitted"
+      (instructions.any (fun item => (item.getObjValAs? String "type").toOption == some expected)) true
+  -- The spelling travels beside the expanded type, and only where a name was used.
+  for expected in ["Decision", "list<option<Decision>>"] do
+    assertEqual s!"declared spelling {expected}"
+      (instructions.any (fun item => (item.getObjValAs? String "declared").toOption == some expected)) true
+  assertEqual "a built-in type has no declared spelling"
+    (instructions.any (fun item => (item.getObjValAs? String "type").toOption == some "string" &&
+      (item.getObjValAs? String "declared").toOption.isSome)) false
+  assertEqual "schema name does not rewrite agent"
+    (instructions.any (fun item => (item.getObjValAs? String "name").toOption == some "review.Decision")) true
+  for invalid in [
+      "{}", "[]", "{\"type\":\"object\",\"enum\":[\"a\"]}",
+      "{\"type\":\"string\",\"enum\":[]}",
+      "{\"type\":\"string\",\"enum\":[1]}",
+      "{\"type\":\"string\",\"enum\":[\"a\",\"a\"]}",
+      "{\"type\":\"string\",\"enum\":[\"a\"],\"minLength\":2}",
+      "{\"type\":\"string\",\"enum\":[\"a\"],\"$ref\":\"remote.json\"}",
+      "{\"type\":\"string\",\"enum\":[\"a\"],\"title\":1}", "not json"] do
+    match compileSourceWithSchemas "Review" source #[ ("schemas/decision.json", invalid) ] with
+    | .error error => assertEqual "schema diagnostic has type context" (error.startsWith "schema type 'Decision' from 'schemas/decision.json':") true
+    | .ok _ => throw (IO.userError s!"accepted unsupported schema: {invalid}")
+  match compileSource "Review" source with
+  | .error _ => pure ()
+  | .ok _ => throw (IO.userError "accepted missing schema contents")
+  for invalidSource in [
+      "type string from \"a.json\" team T {} main { t = T() }",
+      "type D from \"a.json\" type D from \"a.json\" team T {} main { t = T() }",
+      "type D from \"\" team T {} main { t = T() }"] do
+    match schemaImports invalidSource with
+    | .error _ => pure ()
+    | .ok _ => throw (IO.userError "accepted invalid schema declaration")
+  let escaped := "{\"type\":\"string\",\"enum\":[\"quote\\\"\",\"line\\nend\",\"雪\",\"\"]}"
+  match compileSourceWithSchemas "Escaped"
+      "type E from \"e.json\" team T { input token : E } main { t = T() }"
+      #[ ("e.json", escaped) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"escaped schema values: {error}")
+  -- A body may read an enum port: what arrives was checked when it was
+  -- written. It may not write one: its Rust String admits anything.
+  let readsEnum := "input token : Decision output out : string reaction(token) -> out {= out = token; =}"
+  match compileSourceWithSchemas "CodeEnum"
+      ("type Decision from \"schemas/decision.json\" team T { " ++ readsEnum ++ " } main { t = T() }")
+      #[ ("schemas/decision.json", schema) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"enum trigger blocked code reaction: {error}")
+  let writesEnum := "input token : string output out : Decision reaction(token) -> out {= out = token; =}"
+  match compileSourceWithSchemas "CodeEnum"
+      ("type Decision from \"schemas/decision.json\" team T { " ++ writesEnum ++ " } main { t = T() }")
+      #[ ("schemas/decision.json", schema) ] with
+  | .error error =>
+    assertEqual "code enum effect rejected during compilation" (decide ((error.splitOn "cannot write enum port").length > 1)) true
+  | .ok _ => throw (IO.userError "accepted enum port as code reaction effect")
+  -- A body carries scalars only, so a wrapped port is out of its reach whether
+  -- or not it is an enum -- and the compiler says so, not the verifier.
+  for declarations in [
+      "input token : list<Decision> output out : string reaction(token) -> out {= out = None; =}",
+      "input token : string output out : option<Decision> reaction(token) -> out {= out = None; =}",
+      "input token : list<string> output out : string reaction(token) -> out {= out = None; =}"] do
+    let coded := "type Decision from \"schemas/decision.json\" team T { " ++ declarations ++ " } main { t = T() }"
+    match compileSourceWithSchemas "CodeEnum" coded #[ ("schemas/decision.json", schema) ] with
+    | .error error =>
+      assertEqual "wrapped port rejected for code reaction" (decide ((error.splitOn "cannot use port").length > 1)) true
+    | .ok _ => throw (IO.userError s!"accepted wrapped port in code reaction: {declarations}")
+  -- The runtime holds state and parameters in built-in types only.
+  for (source, what) in [
+      ("type Decision from \"s.json\" team T { state last : Decision = \"approved\" } main { t = T() }", "state"),
+      ("type Decision from \"s.json\" team T(default : Decision) { input token : string } main { t = T(\"approved\") }", "parameter")] do
+    match compileSourceWithSchemas "Scalar" source #[ ("s.json", schema) ] with
+    | .error error =>
+      assertEqual s!"schema type rejected for {what}" (decide ((error.splitOn s!"{what} ").length > 1 && (error.splitOn "cannot have schema type").length > 1)) true
+    | .ok _ => throw (IO.userError s!"accepted schema type for {what}")
+  -- The name and what the schema said about it reach the bytecode, so the
+  -- agent can be told `Decision` rather than the refinement spelled out.
+  let described := "{\"type\":\"string\",\"enum\":[\"approved\",\"needs_revision\"]," ++
+    "\"title\":\"Review decision\",\"description\":\"A canonical review decision\"}"
+  let bytecode ← match compileSourceWithSchemas "Review" source #[ ("schemas/decision.json", described) ] with
+    | .ok bytecode => pure bytecode
+    | .error error => throw (IO.userError s!"described schema: {error}")
+  let instructions ← match Json.parse bytecode >>= (·.getObjVal? "instructions") >>= Json.getArr? with
+    | .ok instructions => pure instructions
+    | .error error => throw (IO.userError error)
+  let declared := instructions.filter fun item => (item.getObjValAs? String "op").toOption == some "define_type"
+  assertEqual "one define_type per import" declared.size 1
+  for (field, expected) in [("name", "Decision"), ("type", "string in [\"approved\",\"needs_revision\"]"),
+      ("title", "Review decision"), ("description", "A canonical review decision")] do
+    assertEqual s!"define_type {field}" ((declared[0]!.getObjValAs? String field).toOption) (some expected)
+  assertEqual "define_type precedes the ports" ((instructions.toList.map fun item =>
+    (item.getObjValAs? String "op").toOption.getD "").take 2) ["begin_plan", "define_type"]
+  -- Absent metadata is absent, not an empty string.
+  match compileSourceWithSchemas "Review" source #[ ("schemas/decision.json", schema) ] with
+  | .ok bytecode =>
+      assertEqual "no title without one" (decide ((bytecode.splitOn "\"title\"").length > 1)) false
+  | .error error => throw (IO.userError s!"external schema: {error}")
+  -- An enum elsewhere in the same topology does not disable ordinary Rust bodies.
+  let mixed := "type Decision from \"schemas/decision.json\" team T { " ++
+    "input decision : Decision input token : string output out : string " ++
+    "reaction(token) -> out {= out = token; =} } main { t = T() }"
+  match compileSourceWithSchemas "Mixed" mixed #[ ("schemas/decision.json", schema) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"unrelated enum blocked code reaction: {error}")
+  IO.println "external JSON Schema tests passed"
+
+
+
+def testSchemaTypeResolution : IO Unit := do
+  let contents := "{\"type\":\"string\",\"enum\":[\"continue\",\"stop\"]}"
+  -- A schema and a backend occupy distinct namespaces.
+  let collision := "type Codex from \"s.json\"; team T[worker : Codex] { " ++
+    "input token : Codex output out : Codex task worker(token) -> out \"Forward\" } main { t = T() }"
+  match compileSourceWithSchemas "Names" collision #[ ("s.json", contents) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"schema/backend collision: {error}")
+  let connected := "type Decision from \"s.json\" " ++
+    "team A { output out : Decision } team B { input token : Decision } " ++
+    "main { a = A() b = B() a.out -> b.token }"
+  match compileSourceWithSchemas "Connected" connected #[ ("s.json", contents) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"shared schema connection: {error}")
+  for source in [
+      "type Decision from \"s.json\" team T { input token : Unknown } main { t = T() }",
+      "type Decision from \"s.json\" team A { output out : Decision } " ++
+        "team B { input token : string } main { a = A() b = B() a.out -> b.token }",
+      "team T { input token : string in [\"continue\",\"stop\"] } main { t = T() }"] do
+    match compileSourceWithSchemas "Invalid" source #[ ("s.json", contents) ] with
+    | .error _ => pure ()
+    | .ok _ => throw (IO.userError "accepted unknown, incompatible, or inline schema type")
+  IO.println "schema type resolution tests passed"
+
+/-- The plan `omarc --diff` writes, as one string per instruction. -/
+def mutationPlan (old new : String) (newName : String := "Relay") : Except String (Array String) := do
+  let plan ← compileDiffSourcesWithSchemas "Relay" old #[] newName new #[]
+  let instructions ← Json.parse plan >>= (·.getObjValAs? (Array Json) "instructions")
+  pure (instructions.map (·.compress))
+
+def planOf (old new : String) : IO (Array String) :=
+  match mutationPlan old new with
+  | .ok plan => pure plan
+  | .error error => throw (IO.userError s!"plan: {error}")
+
+def relaySource (second : String) (prompt : String) (extra : String := "") : String :=
+  "team Node(idx : int)[agent : Stub] { input token : int output out : int state seen : int = 0 " ++
+  extra ++ " task agent(token) -> out \"" ++ prompt ++ " $(idx)\" } " ++
+  "main Relay { n1 = Node(1) n2 = Node(" ++ second ++ ") n1.out -> n2.token }"
+
+def testMutation : IO Unit := do
+  let v1 := relaySource "2" "go"
+  -- Unchanged: the frame and nothing else.
+  let same ← planOf v1 v1
+  assertEqual "unchanged plan" same.size 2
+  -- A prompt edited: both reactions updated in place, nothing else.
+  let edited ← planOf v1 (relaySource "2" "go faster")
+  assertEqual "edited prompt" (edited.filter (mentions · "update_reaction")).size 2
+  assertEqual "edited prompt only" edited.size 4
+  -- An argument changed: that instance replaced whole, the other untouched.
+  let replaced ← planOf v1 (relaySource "5" "go")
+  for expected in ["kill_agent", "remove_instance", "remove_state", "declare_instance",
+      "\"name\":\"n2.seen\""] do
+    unless replaced.any (mentions · expected) do
+      throw (IO.userError s!"replaced instance: {expected} missing from {replaced}")
+  if replaced.any (mentions · "n1.") then
+    throw (IO.userError s!"replacing n2 touched n1: {replaced}")
+  -- Removals come before declarations.
+  let firstDeclare := (replaced.findIdx? (mentions · "declare_instance")).getD 0
+  let lastRemoval := (replaced.toList.reverse.findIdx? (mentions · "remove_")).map
+    (replaced.size - 1 - ·) |>.getD replaced.size
+  unless lastRemoval < firstDeclare do
+    throw (IO.userError s!"a removal follows a declaration: {replaced}")
+  -- A connection taken out and a port added.
+  let rewired ← planOf v1
+    ("team Node(idx : int)[agent : Stub] { input token : int output out : int state seen : int = 0 " ++
+     "output echo : int task agent(token) -> out \"go $(idx)\" } " ++
+     "main Relay { n1 = Node(1) n2 = Node(2) }")
+  for expected in ["disconnect_ports", "\"name\":\"n1.echo\"", "\"name\":\"n2.echo\""] do
+    unless rewired.any (mentions · expected) do
+      throw (IO.userError s!"rewired: {expected} missing from {rewired}")
+  -- A renamed main is another program.
+  match mutationPlan v1 (v1.replace "main Relay" "main Other") "Other" with
+  | .error error => unless mentions error "keeps the program's main" do
+      throw (IO.userError s!"renamed main: {error}")
+  | .ok _ => throw (IO.userError "a renamed main was planned as a mutation")
+  -- The theorems hold of what is shipped: these are what `plan_sound`,
+  -- `plan_minimal` and `compiled_plan_sound` are about.
+  let _ := @Omar.Mutation.plan_sound
+  let _ := @Omar.Mutation.plan_minimal
+  let _ := @Omar.Mutation.compiled_plan_sound
+  IO.println "mutation tests passed"
+
+
+/-- Contracts are read the way the runtime reads them (`parse_contract`). -/
+def testContracts : IO Unit := do
+  let show_ (text : String) : String :=
+    reprStr (Omar.Model.contract text)
+  assertEqual "single" (show_ "a.x")
+    (reprStr [({ alternatives := [{ port := "a.x" }] } : Omar.Reactor.Clause)])
+  assertEqual "alternatives, optional" (show_ "( a.x | a.y ) ?")
+    (reprStr [({ alternatives := [{ port := "a.x" }, { port := "a.y" }], optional := true }
+      : Omar.Reactor.Clause)])
+  assertEqual "groups and a constant" (show_ "a.x , ( a.ok = false | a.why ) ?")
+    (reprStr [({ alternatives := [{ port := "a.x" }] } : Omar.Reactor.Clause),
+      { alternatives := [{ port := "a.ok", constant := some "false" }, { port := "a.why" }],
+        optional := true }])
+  assertEqual "no effects" (show_ "") "[]"
+
+/-- What is checked is Lean's to decide; this runs Lean, as `omarc` does. -/
+def runLean (file : System.FilePath) (source : String) : IO (UInt32 × String) := do
+  IO.FS.writeFile file source
+  let (lean, args, library) ← Omar.Prove.leanCommand
+  let output ← IO.Process.output {
+    cmd := lean, args := args ++ #[file.toString], env := #[("LEAN_PATH", some library)] }
+  pure (output.exitCode, output.stdout ++ output.stderr)
+
+/-- Every program in the topology suite has a model Lean accepts, and runs. -/
+def testModels : IO Unit := do
+  let mut source := "import Omar.Reactor\nopen Omar.Reactor\n\n"
+  for (test, index) in topologyCases.zipIdx do
+    let text ← IO.FS.readFile s!"../tests/topology/src/{test.file}"
+    let program ← match elaborateSourceWithSchemas test.team text #[] with
+      | .ok program => pure program
+      | .error message => throw (IO.userError s!"{test.file}: {message}")
+    source := source ++ s!"namespace Case{index}\n" ++
+      Omar.Model.render (Omar.Model.ofProgram program) ++
+      s!"\nexample : ∃ e, Valid topology e := valid_exists _\nend Case{index}\n\n"
+  let (code, output) ← runLean ".lake/models-test.lean" source
+  if code != 0 then throw (IO.userError s!"models do not check:\n{output}")
+
+/-- The trading desk's properties are proved, and a proof that assumes
+    rather than proves, or a statement about something other than the
+    program's runs, is not accepted. -/
+def testProve : IO Unit := do
+  let source ← IO.FS.readFile "../tests/verification/Desk.omar"
+  let program ← match elaborateSourceWithSchemas "Desk" source #[] with
+    | .ok program => pure program
+    | .error message => throw (IO.userError message)
+  let request ← match Json.parse (← IO.FS.readFile "../tests/verification/desk-properties.json")
+      >>= fromJson? (α := Omar.Prove.Request) with
+    | .ok request => pure request
+    | .error message => throw (IO.userError message)
+  -- Lemmas are optional in a request.
+  match Json.parse "{\"properties\": []}" >>= fromJson? (α := Omar.Prove.Request) with
+  | .ok bare => assertEqual "no lemmas" bare.lemmas ""
+  | .error message => throw (IO.userError s!"a request without lemmas: {message}")
+  let extra : Array Omar.Prove.Property := #[
+    { name := "cheat", statement := "False", proof := "sorry" },
+    { name := "runs", statement := "True", proof := "by\n  trivial\n#eval IO.println \"ran\"" },
+    { name := "elsewhere", statement := "True", proof := "trivial" },
+    { name := "misspelled", statement := "∀ g, e.present g \"x.ordr\" = none → True",
+      proof := "by\n  intro _ _\n  trivial" },
+    { name := "wrong", statement := "∀ g, ¬ e.invoked g \"x.reaction.0\"",
+      proof := "by\n  intro g h\n  simp at h" }]
+  let model := Omar.Model.render (Omar.Model.ofProgram program)
+  let verdicts ← Omar.Prove.check model
+    { request with properties := request.properties ++ extra } ".lake/prove-test"
+  let verdict (name : String) := verdicts.find? (·.name == name)
+  for name in ["orders_are_approved", "rejected_not_executed"] do
+    let some v := verdict name | throw (IO.userError s!"no verdict for {name}")
+    if !v.proved then throw (IO.userError s!"{name} not proved: {reprStr (v.problems.map (·.message))}")
+  assertEqual "mentions" (verdict "orders_are_approved" |>.map (·.mentions)) (some #["x.order", "r.approved"])
+  for name in ["cheat", "wrong", "runs"] do
+    if (verdict name).any (·.proved) then throw (IO.userError s!"{name} was accepted")
+  assertEqual "sorry is refused unread" ((verdict "cheat").map (·.problems.map (·.line))) (some #[0])
+  -- Checking a proof must not run code it carries.
+  assertEqual "#eval is refused unread" ((verdict "runs").map (·.problems.map (·.line))) (some #[0])
+  -- `True` is proved, but it is not a property of the program.
+  let some elsewhere := verdict "elsewhere" | throw (IO.userError "no verdict for elsewhere")
+  if elsewhere.proved || !elsewhere.problems.any (mentions ·.message "nothing about the run") then
+    throw (IO.userError "a statement about nothing in particular was accepted")
+  -- Nor is one about a port the program does not have.
+  let some misspelled := verdict "misspelled" | throw (IO.userError "no verdict for misspelled")
+  if misspelled.proved || !misspelled.problems.any (mentions ·.message "has no [x.ordr]") then
+    throw (IO.userError s!"a statement about a missing port was accepted: {reprStr (misspelled.problems.map (·.message))}")
+  -- The mistake is reported where it is, counting from the theorem.
+  assertEqual "wrong proof's line" ((verdict "wrong").map (·.problems.map (·.line) |>.contains 4)) (some true)
+
 def main : IO UInt32 := do
   try
     for test in topologyCases do
@@ -421,7 +748,14 @@ def main : IO UInt32 := do
     testWithin
     testDelayUnits
     testStateLiterals
+    testShutdown
     testCodeTerminator
+    testExternalSchemas
+    testSchemaTypeResolution
+    testMutation
+    testContracts
+    testModels
+    testProve
     IO.println "compiler rejection tests passed"
     pure 0
   catch error =>

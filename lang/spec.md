@@ -7,9 +7,9 @@ Source extension: `.omar`
 ## 1. Purpose
 
 OMAR is a declarative language for agent systems. A program defines agents,
-typed ports, and prompt reactions. The language controls topology startup,
+typed ports, and tasks. The language controls topology startup,
 teardown, and mutation. A deterministic runtime coordinates the running system.
-AI is used only inside prompt reactions, never for orchestration.
+AI is used only inside tasks, never for orchestration.
 
 ## 2. Syntax
 
@@ -29,7 +29,7 @@ main        = "main", [ identifier ], "{", { instance | wiring }, "}" ;
 wiring      = qualified, "->", qualified, [ "after", delay ] ;
 
 declaration = input | output | action | timer | state | instance
-            | connection | prompt | reaction | ";" ;
+            | connection | task | reaction | ";" ;
 input       = "input", identifier, ":", type ;
 output      = "output", identifier, ":", type ;
 action      = "action", identifier, [ "(", "delay", "=", delay, ")" ],
@@ -44,7 +44,7 @@ connection  = endpoint, "->", endpoint, [ "after", delay ] ;
 endpoint    = identifier | qualified ;
 qualified   = identifier, ".", identifier ;
 
-prompt      = "prompt", identifier, "(", [ triggers ], ")",
+task        = "task", identifier, "(", [ triggers ], ")",
               "->", effects, [ deadline ], string ;
 reaction    = "reaction", "(", [ triggers ], ")", "->", effects,
               [ deadline ], code-body ;
@@ -83,7 +83,7 @@ team Node(idx : int)[agent : Codex]
     input token : int
     output out : int
 
-    prompt agent(token) -> out "You are node $(idx). Token: $(token)"
+    task agent(token) -> out "You are node $(idx). Token: $(token)"
 }
 
 main Relay {
@@ -118,7 +118,7 @@ team Stage(role : string)[worker : Codex]
     input inp : string
     output out : string
 
-    prompt worker(inp) -> out "You are the $(role) stage. Got $(inp)."
+    task worker(inp) -> out "You are the $(role) stage. Got $(inp)."
 }
 
 team Pipeline[reporter : Codex]
@@ -132,7 +132,7 @@ team Pipeline[reporter : Codex]
     brief -> draft.inp
     draft.out -> refine.inp
 
-    prompt reporter(refine.out) -> summary "Report $(refine.out)."
+    task reporter(refine.out) -> summary "Report $(refine.out)."
 }
 
 main Nest {
@@ -166,12 +166,12 @@ not accepted in `main`.
 - `a -> b after 3s` copies it three seconds later.
 - `timer t(1s, 500ms)` fires at one second and every five hundred milliseconds
   after that. A period of `0` fires once, at the offset.
-- `prompt agent(a, b)` declares a reaction on `agent` triggered when port `a`
-  or port `b` is present. If both are present at the same tag, the reaction is
+- `task agent(a, b)` declares a task for `agent`, triggered when port `a`
+  or port `b` is present. If both are present at the same tag, the task is
   invoked once with both values.
 
-The prompt body is delivered to the agent. `$(name)` interpolates a trigger
-value and may only reference that prompt's triggers. If a declared trigger is
+The task's prompt is delivered to the agent. `$(name)` interpolates a trigger
+value and may only reference that task's triggers. If a declared trigger is
 not present in an invocation, its interpolation expands to `<absent>`.
 
 - `reaction(a, b) -> effects {= ... =}` declares a reaction that runs Rust
@@ -186,6 +186,27 @@ not present in an invocation, its interpolation expands to `<absent>`.
   crate and the bytecode are written to `src-gen/<program>/` beside the
   program — next to `src/` when the program is in one — and an unchanged
   program is not rebuilt.
+- `shutdown` is a trigger every team has without declaring it, and no team
+  may declare a name of its own by it. It fires once, at the run's last tag,
+  carrying that tag's timestamp. A body calls `request_stop()` to end the run:
+  the tag finishes, anything queued after it is dropped, and `shutdown` fires
+  one microstep later. A run that runs out of events fires it too. A body that
+  panics fails the run, so `assert!` in a `shutdown` reaction is a verdict:
+
+  ```omar
+  team Smoke {
+      input result : string
+      state seen : bool = false
+      timer deadline(10min, 0)
+      reaction(result) -> {= self.seen = true; request_stop(); =}
+      reaction(deadline) -> {= request_stop(); =}
+      reaction(shutdown) -> {= assert!(self.seen, "no result by the deadline"); =}
+  }
+
+  main { smoke = Smoke() }
+  ```
+
+  An operator's `omar stop` ends a run without `shutdown`.
 - `state round : int = 0` declares a value a reaction reads and writes as
   `self.round`. It starts at the literal and keeps its last value from one
   invocation to the next. Types are `int`, `bool`, `string`, so the value a
@@ -210,7 +231,7 @@ The expression after `->` declares the ports a reaction may set:
 - A bare typed effect requires the agent to set a value.
 - A bare untyped action emits a signal.
 
-Every trigger must be an input or action. Every effect must be an output or
+Every trigger must be an input, action, timer or `shutdown`. Every effect must be an output or
 action. A connection target must be an output or action, and its source and
 target types must match. Values must match their port types.
 
@@ -265,7 +286,7 @@ team
 agents
 typed ports
 port connections
-prompt reactions in declaration order
+tasks in declaration order
 ```
 
 The runtime derives a port-to-reaction subscription index from reaction
@@ -385,12 +406,21 @@ such a causality loop; use a delayed connection or action to cross a tag boundar
 ### 4.2 Agent protocol
 
 Topology agents do not address other agents. Each active invocation receives
-two scoped MCP tools:
+scoped MCP tools:
 
 ```text
-omar_set_port(invocation_id, port, value)
-omar_complete(invocation_id)
+omar_set_port(task_id, port, value)
+omar_complete(task_id)
 omar_pending()
+```
+
+`task_id` is a positive JSON integer identifying one execution, supplied in the
+task prompt or by `omar_pending`. Calls match it exactly and are checked against
+the calling agent; it is an identifier, not an authentication credential. IDs
+increase without reuse during a runtime process. For example:
+
+```json
+{"task_id": 7, "port": "answer", "value": "hello"}
 ```
 
 The invocation's trigger map contains only the declared triggers present at
@@ -455,19 +485,42 @@ with a person in it can be replayed by supplying the recorded writes.
 
 ## 5. Topology lifecycle
 
-Components have stable IDs derived from their qualified names. A compatible
-agent retains its process, context, memory, and active work across topology
-updates.
+Components have stable IDs: their qualified names (`n1.agent`, `n1.out`,
+`n1.out -> n2.token`). Reactions are named by position in their instance, so
+inserting one updates those after it.
 
-Mutation uses create-before-destroy:
+### 5.1 Mutation
 
-1. verify the installed revision;
-2. spawn new agents and install the new topology;
-3. atomically activate the new revision;
-4. drain obsolete reactions; and
-5. kill obsolete agents.
+`omar mutate RUN NEW.omar` (`POST /v1/runs/{id}/mutate`) changes a running or
+paused run's program. `NEW.omar` keeps `main`'s name; a renamed `main` is a
+different program and is refused.
 
-An active invocation finishes against the topology revision on which it began.
+1. pause: checkpoint at the next tag boundary, agents stopped (a paused run
+   skips this);
+2. the compiler diffs the old program's source, kept in the resume point
+   checkpoint, against the new one into a mutation plan (§6):
+   `omarc --diff OLD.omar NEW.omar PLAN.json`;
+3. the runtime checks the plan: applied to the old program it must yield
+   exactly the new one, or nothing happens;
+4. execute it on the checkpoint and publish the result as a `mutation`
+   checkpoint, the new resume point;
+5. resume (a run that was already paused stays paused).
+
+Executing a plan on a checkpoint:
+
+- matched by name, unchanged components keep their state, files and queued
+  events;
+- an instance whose team, parent or arguments changed is replaced whole, with
+  everything it contains: state from its initial values, a new empty
+  workspace;
+- a removed port or timer drops its queued events (reported); a removed
+  instance's workspace stays reachable from earlier checkpoints;
+- a new timer is armed from the last completed tag: `timer t(1s, …)` first
+  fires 1s after it;
+- every agent restarts with a fresh conversation, as on any resume.
+
+The checkpoint before a mutation holds the old program, so rolling back to it
+undoes the mutation. `--dry-run` prints the plan and changes nothing.
 
 ## 6. Bytecode
 
@@ -482,28 +535,54 @@ not accepted by the CLI.
 ```text
 BEGIN_PLAN team
 
+DEFINE_TYPE name type [title] [description]
+DECLARE_INSTANCE name team parent
 SPAWN_AGENT name backend
-KILL_AGENT name
-
 DEFINE_PORT kind name type [delay]
-REMOVE_PORT name
-
+DECLARE_TIMER name offset period
 DECLARE_STATE name type initial
-
+DECLARE_PARAM name type value
 CONNECT_PORTS source target [delay]
-
 INSTALL_REACTION id agent triggers effects contract prompt [body] [within]
-UPDATE_REACTION id triggers effects contract prompt within
-REMOVE_REACTION id
 
-ACTIVATE_TOPOLOGY revision
 COMMIT_PLAN
-ABORT_PLAN reason
 ```
 
-The initial construction subset consists of `BEGIN_PLAN`, `SPAWN_AGENT`,
-`DEFINE_PORT`, `CONNECT_PORTS`, `INSTALL_REACTION`, and `COMMIT_PLAN`. Mutation
-instructions are reserved for the next implementation stage.
+A program is `BEGIN_PLAN`, declarations, `COMMIT_PLAN`. A mutation plan is
+`BEGIN_MUTATION`, removals, then the declarations that are new or changed, then
+`COMMIT_PLAN`:
+
+```text
+BEGIN_MUTATION team
+
+REMOVE_REACTION id
+DISCONNECT_PORTS source target
+REMOVE_PARAM name
+REMOVE_STATE name
+REMOVE_TIMER name
+REMOVE_PORT name
+KILL_AGENT name
+REMOVE_INSTANCE name
+REMOVE_TYPE name
+
+UPDATE_REACTION id agent triggers effects contract prompt [body] [within]
+```
+
+Removals run in the reverse of declaration order. A changed declaration other
+than a reaction is removed and declared again; a changed reaction is updated.
+A mutation instruction in a program, or a plan whose result is not the new
+program, is rejected.
+
+Proved in `lang/Omar/Mutation.lean`, for any choice of what is replaced whole:
+
+- `plan_sound`: executing the plan on the old program's declarations yields
+  exactly the new program's;
+- `plan_minimal`: a declaration unchanged and not replaced is never touched;
+- `emit_sound` / `compiled_plan_sound`: the emitted instructions, run by the
+  bytecode semantics (`vm`), do what the plan does.
+
+Trusted, not proved: parsing each program's own instruction JSON back and
+printing the plan, and the Rust VM implementing `vm` (it re-checks each plan).
 
 JSON instruction fields are emitted in deterministic order with `op` first.
 Port and connection fields are ordered:
@@ -520,8 +599,8 @@ Reaction fields are ordered:
 op, id, agent, triggers, effects, contract, prompt, body, within
 ```
 
-`body` is a reaction's Rust and is omitted for a prompt; `agent` is empty
-for a reaction. `within` is nanoseconds, and is omitted when the reaction
+`body` is a code reaction's Rust and is omitted for a task; `agent` is empty
+for a code reaction. `within` is nanoseconds, and is omitted when the reaction
 declares no deadline.
 
 The VM verifies the complete plan before performing effects. Unknown
@@ -536,6 +615,7 @@ The compiler core is pure:
 parse          : String -> Except ParseError Syntax
 elaborate      : Syntax -> Except TypeError Topology
 compile        : Topology -> Except CompileError Bytecode
+compileDiff    : Topology -> Topology -> Except CompileError Bytecode
 verifyBytecode : Bytecode -> Except VerifyError VerifiedBytecode
 ```
 
@@ -549,3 +629,107 @@ Important verification targets are:
 - bytecode never references an undefined component;
 - compatible retained agents are never unnecessarily restarted; and
 - equal compiler inputs produce equal bytecode.
+
+## 8. Safety properties
+
+A property is a Lean theorem about every run of a program. `Omar/Reactor.lean`
+states, as axioms, what every run satisfies: §4's tags and delays, triggers,
+timers and `shutdown`, and effect contracts, which the runtime enforces before
+an invocation completes. Prompts, agents' answers and code bodies are opaque: a
+reaction may write anything its contract allows. Axioms that something *must*
+happen hold only at tags a run completes; a failure or an operator's stop cuts
+the tag it happens at. `valid_exists` proves the axioms consistent.
+
+`omarc --lean prog.omar model.lean` prints the program's model, `topology`.
+`omarc --prove prog.omar request.json verdicts.json` checks properties, each as
+
+```lean
+theorem name (e : Execution) (hv : Valid topology e) : statement := proof
+```
+
+in its own file after the generated model and any shared `lemmas`.
+`#omar_verify` (`Omar/Verify.lean`) accepts one only if it is about every run
+of `topology`, depends on `e`, names only the program's own ports, reactions
+and timers, and uses no axiom beyond `propext`, `Classical.choice` and
+`Quot.sound`. `sorry`, `axiom`, `native_decide` and `set_option` are refused
+before Lean runs.
+
+## External JSON Schema types
+
+Declare schema imports before teams:
+
+```omar
+type Decision from "./schemas/decision.json"
+team Review[reviewer : Codex] {
+    input request : string
+    output decision : Decision
+    task reviewer(request) -> decision "Review $(request)"
+}
+main { review = Review() }
+```
+
+The schema file contains `{"type":"string","enum":["approved","needs_revision"]}`.
+Paths resolve relative to the input `.omar` file, independent of the compiler's
+working directory. Imported schemas are read and validated at compile time and
+embedded as canonical string refinements in bytecode; deployment needs no schema
+file. `list<Decision>` and `option<Decision>` are supported too. Imports cannot
+shadow built-in types or repeat a name. A schema type is for ports: `state` and
+team parameters take built-in types only, because the runtime holds them in
+nothing else, and the compiler rejects a schema type in either position.
+
+A runtime compiles a program from the text it was sent and stages it on its
+own, so the files the program imports have to come with it: `/v1/programs/check`
+and `/v1/runs` take a `files` object mapping each import path to its contents,
+such as `{"schemas/decision.json": "{\"type\":\"string\",\"enum\":[...]}"}`, and
+stage each beside the program. `omar run` fills the map itself, reading each
+`type … from "…"` file from beside the program it was given. A path must be
+relative and stay inside the program's directory, and may not be the program
+file itself. A staged program's own imports are held to the same rule: the
+runtime compiles with `omarc --local-imports`, which refuses an absolute path or
+one that climbs out of the program's directory, so a program sent over the wire
+reads only what came with it, never the host's files. A program whose import is
+not supplied fails the check with an error naming the missing file. Mission
+Control's editor edits one file and sends no `files` yet, so a program typed
+there cannot import; the client API carries the map for callers that have the
+files.
+
+This version supports only a nonempty enum of unique strings. Optional
+`$schema`, `title`, and `description` string metadata is accepted. Other keywords
+are rejected, including `$ref` and object constraints, rather than ignored.
+Object schemas and general Pydantic-generated models are not yet supported.
+
+Named types are aliases: connections compare their expanded type strings, as
+existing OMAR types do. Identical enums with the same value order are compatible;
+different enum orderings are not normalized. The compiler emits internal string
+refinements; schemas are declared externally, not with inline `string in [...]`
+syntax in an OMAR source file. Runtime writes remain ordinary
+strings, not JSON-encoded string documents. The agent is told each enum port's
+type by name, the values it admits, and the schema's title and description, as
+described below. Illegal writes return the allowed values and do not satisfy
+the output contract. This validates vocabulary, not the correctness of a
+decision or its routing.
+
+A Rust code reaction may read an enum port: the value it receives was checked
+against the enum when it was written, and the body sees it as a `String`. It
+cannot write one, because the generated Rust `String` does not enforce enum
+membership; the compiler and the bytecode verifier both reject it. Write such a
+port from a task. A code reaction carries scalars only, so a `list` or
+`option` port, enum or not, cannot be its trigger or effect; the compiler says
+so rather than leaving it to the verifier.
+
+Each import is also emitted as a `define_type` instruction, before the ports,
+carrying the name, the expanded type, and the schema's `title` and
+`description` when present. A port whose type was written with an imported name
+carries that spelling in a `declared` field beside its expanded `type`, such as
+`"declared": "list<Decision>"`; the verifier checks that the spelling expands to
+the type. The VM checks values against `type` alone. The agent reads the
+spelling: an invocation lists its effects as the program declared them, such as
+`{"review.out":"Decision"}`, adds a `types` header line mapping each name used
+to the type the runtime checks, and describes each named type in prose before
+the prompt: the values it admits, then the title and description the schema
+gave it. Two imports with identical values are distinct names, and the agent is
+told the one the port was declared with.
+
+Pure compiler integrations can use `schemaImports` and
+`compileSourceWithSchemas`, supplying `(import path, JSON contents)` entries.
+`compileSource` remains filesystem-free and reports missing schema contents.

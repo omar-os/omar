@@ -54,6 +54,8 @@ const SESSION_BACKEND_VAR: &str = "OMAR_BACKEND";
 /// Session-environment key describing the backend's side channel, if it has one.
 const SESSION_DELIVERY_VAR: &str = "OMAR_DELIVERY";
 const SESSION_STARTUP_VAR: &str = "@omar_startup_pending";
+/// How long a startup navigation key may go unanswered before it is resent.
+const STARTUP_KEY_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
@@ -473,6 +475,7 @@ impl TmuxClient {
             .context("missing startup backend")?;
         let backend = crate::backend::by_name(&name).context("unknown startup backend")?;
         let target = exact_pane_target(session);
+        let pane_pid = self.get_pane_pid(session)?;
         let start = Instant::now();
         // Scheduler deliveries have a zero wait budget. Persist observations
         // so their next poll can advance the handshake without blocking.
@@ -483,6 +486,11 @@ impl TmuxClient {
             .startup_state(session, "@omar_startup_action")
             .unwrap_or_default();
         let mut answered_gate = self.startup_state(session, "@omar_startup_answered");
+        // A TUI can paint its dialog before it reads keys, and a key sent then
+        // is lost with the screen unchanged. Navigation is recomputed from the
+        // screen, so resending it to a screen that still shows the same
+        // selection is safe; a confirmation is never resent.
+        let mut acted_at = Instant::now();
         loop {
             // Current viewport only: scrollback may contain old dialogs.
             let screen = self.run(&["capture-pane", "-p", "-t", &target])?;
@@ -491,8 +499,9 @@ impl TmuxClient {
             screen.hash(&mut hash);
             let observation = format!("{:x}", hash.finish());
             if let Some(gate) = backend.startup_gate(&screen) {
+                let unheard = !gate.confirms && acted_at.elapsed() >= STARTUP_KEY_RETRY;
                 if observation == previous
-                    && observation != acted_on
+                    && (observation != acted_on || unheard)
                     && !gate.keys.is_empty()
                     && answered_gate.as_deref() != Some(gate.id)
                 {
@@ -500,14 +509,10 @@ impl TmuxClient {
                     acted_on = self
                         .startup_state(session, "@omar_startup_action")
                         .unwrap_or_default();
+                    acted_at = Instant::now();
                     answered_gate = self.startup_state(session, "@omar_startup_answered");
                 }
-            } else if !backend.readiness_markers().is_empty()
-                && backend
-                    .readiness_markers()
-                    .iter()
-                    .all(|marker| screen.contains(marker))
-            {
+            } else if backend.startup_finished(&screen, pane_pid) {
                 self.run(&[
                     "set-option",
                     "-u",
@@ -646,13 +651,23 @@ impl TmuxClient {
         if self.finish_backend_startup(session, timeout).is_err() {
             return false;
         }
+        // A resumed conversation may never paint the banner; its backend can
+        // still know it has started.
+        let backend = self
+            .session_backend(session)
+            .and_then(|name| crate::backend::by_name(&name));
+        let pane_pid = self.get_pane_pid(session).ok();
         while start.elapsed() < timeout {
             // Use plain capture (no ANSI escapes) so multi-word markers like
             // "Claude Code" match even when the TUI styles each word
             // independently (Claude Code inserts a reset between them).
             if let Ok(content) = self.capture_pane_plain(session, 120) {
                 let hay = content.to_ascii_lowercase();
-                if needles.iter().all(|needle| hay.contains(needle)) {
+                if needles.iter().all(|needle| hay.contains(needle))
+                    || backend
+                        .zip(pane_pid)
+                        .is_some_and(|(backend, pid)| backend.startup_finished(&content, pid))
+                {
                     return true;
                 }
             }
@@ -858,6 +873,28 @@ impl TmuxClient {
         teardown
     }
 
+    /// Capture every pane in every window, including descendant processes.
+    pub(crate) fn session_process_tree(&self, name: &str) -> Result<Vec<(u32, String)>> {
+        let target = exact_session_target(name);
+        let panes = self.run(&[
+            "list-panes",
+            "-s",
+            "-t",
+            &target,
+            "-F",
+            "#{pane_pid}|#{pane_dead}",
+        ])?;
+        let mut tree = Vec::new();
+        for pane in panes.lines() {
+            let (pid, dead) = pane.split_once('|').context("invalid tmux pane identity")?;
+            if dead == "1" {
+                continue;
+            }
+            tree.extend(crate::process::process_tree(pid.parse()?));
+        }
+        Ok(tree)
+    }
+
     /// Check if a session exists
     pub fn has_session(&self, name: &str) -> Result<bool> {
         self.check_session(name, false)
@@ -883,6 +920,8 @@ impl TmuxClient {
             && (error.contains("can't find session")
                 || error.contains("no server running")
                 || error.contains("no sessions")
+                // Asked while it shut down after its last session: none left.
+                || error.contains("server exited unexpectedly")
                 || (error.contains("error connecting to")
                     && (error.contains("No such file or directory")
                         || error.contains("Connection refused"))))
@@ -950,16 +989,6 @@ impl TmuxClient {
         Ok(session)
     }
 
-    /// Attach to a session (blocks until detached)
-    pub fn attach_session(&self, session: &str) -> Result<()> {
-        let target = exact_session_target(session);
-        self.command()
-            .args(["attach-session", "-t", &target])
-            .status()
-            .context("Failed to attach to tmux session")?;
-        Ok(())
-    }
-
     /// Open a popup attached to a session
     pub fn attach_popup(&self, session: &str, width: &str, height: &str) -> Result<()> {
         let target = exact_session_target(session);
@@ -997,6 +1026,7 @@ mod tests {
         for (message, ordinary_missing, cleanup_missing) in [
             ("can't find session: example", true, false),
             ("no server running on /tmp/test", true, false),
+            ("server exited unexpectedly", true, false),
             (
                 "error connecting to /tmp/test (No such file or directory)",
                 true,
@@ -1161,6 +1191,143 @@ with Path(sys.argv[1]).open('ab', buffering=0) as log:
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(std::fs::read(&log).unwrap(), b"xy");
+    }
+
+    /// A key sent before the TUI reads keys is lost and leaves the dialog as
+    /// it was. Readiness must not wait out its timeout on that dialog.
+    #[test]
+    fn a_startup_key_the_tui_did_not_hear_is_sent_again() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("startup.py");
+        let log = dir.path().join("keys");
+        std::fs::write(
+            &script,
+            include_str!("../../tests/fixtures/delivery/startup_gate.py"),
+        )
+        .unwrap();
+        let session = format!("omar-test-startup-deaf-{}", std::process::id());
+        let _guard = SessionGuard(session.clone());
+        let client = TmuxClient::new("");
+        let command = format!(
+            "python3 {} claude-deaf {}",
+            crate::manager::shell_single_quote(&script.display().to_string()),
+            crate::manager::shell_single_quote(&log.display().to_string())
+        );
+        client
+            .new_session_with_backend(&session, &command, None, Some("claude"))
+            .unwrap();
+        assert!(client.wait_for_markers(
+            &session,
+            &["Claude Code", "❯"],
+            Duration::from_secs(10),
+            Duration::from_millis(50)
+        ));
+        // One Down heard after the deaf window, then one Enter.
+        assert_eq!(std::fs::read(&log).unwrap(), b"\x1b[B\r");
+    }
+
+    #[test]
+    fn the_bypass_permissions_warning_is_accepted_before_ready() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("startup.py");
+        let log = dir.path().join("keys");
+        std::fs::write(
+            &script,
+            include_str!("../../tests/fixtures/delivery/startup_gate.py"),
+        )
+        .unwrap();
+        let session = format!("omar-test-startup-bypass-{}", std::process::id());
+        let _guard = SessionGuard(session.clone());
+        let client = TmuxClient::new("");
+        let command = format!(
+            "python3 {} claude-bypass {}",
+            crate::manager::shell_single_quote(&script.display().to_string()),
+            crate::manager::shell_single_quote(&log.display().to_string())
+        );
+        client
+            .new_session_with_backend(&session, &command, None, Some("claude"))
+            .unwrap();
+        // The warning shows both readiness markers; it must not pass for ready.
+        assert!(client.wait_for_markers(
+            &session,
+            &["Claude Code", "❯"],
+            Duration::from_secs(10),
+            Duration::from_millis(50)
+        ));
+        // Trust: Down, Enter. Then the warning: Down, Enter.
+        assert_eq!(std::fs::read(&log).unwrap(), b"\x1b[B\r\x1b[B\r");
+    }
+
+    #[test]
+    fn a_resumed_claude_without_its_banner_finishes_starting_on_its_peer_socket() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let _env = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home.path());
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"crossSessionInbound":"accept"}"#,
+        )
+        .unwrap();
+        let script = home.path().join("resumed.py");
+        let log = home.path().join("keys");
+        let spool = home.path().join("events");
+        std::fs::write(
+            &script,
+            include_str!("../../tests/fixtures/delivery/claude_resumed.py"),
+        )
+        .unwrap();
+        let session = format!("omar-test-resumed-claude-{}", std::process::id());
+        let _guard = SessionGuard(session.clone());
+        let client = TmuxClient::new("");
+        let command = format!(
+            "python3 {} {} {}",
+            crate::manager::shell_single_quote(&script.display().to_string()),
+            crate::manager::shell_single_quote(&home.path().display().to_string()),
+            crate::manager::shell_single_quote(&log.display().to_string())
+        );
+        client
+            .new_session_with_backend(&session, &command, None, Some("claude"))
+            .unwrap();
+        client
+            .set_session_delivery(&session, &format!("spool:{}", spool.display()))
+            .unwrap();
+        let options = DeliveryOptions {
+            startup_timeout: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(50),
+        };
+        let delivered = client.deliver_prompt(&session, "after the resume", &options);
+        let ready = client.wait_for_markers(
+            &session,
+            &["Claude Code", "❯"],
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        );
+        match previous {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        delivered.unwrap();
+        assert!(ready, "a resumed agent never became ready");
+        assert_eq!(
+            crate::backend::spool::drain_spool(&spool),
+            ["after the resume"]
+        );
+        assert_eq!(client.startup_state(&session, SESSION_STARTUP_VAR), None);
+        assert!(std::fs::read(&log).unwrap_or_default().is_empty());
     }
 
     #[test]

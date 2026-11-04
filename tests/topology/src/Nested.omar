@@ -9,7 +9,7 @@ team Stage(role : string)[worker : Codex]
     input inp : string
     output out : string
 
-    prompt worker(inp) -> out
+    task worker(inp) -> out
     "
         You are the $(role) stage. The text you received is: $(inp)
         Set `out` to that text with the word $(role) appended.
@@ -27,13 +27,34 @@ team Pipeline[reporter : Codex]
     brief -> draft.inp
     draft.out -> refine.inp
 
-    prompt reporter(refine.out) -> summary
+    task reporter(refine.out) -> summary
     "
         The pipeline produced: $(refine.out)
         Set `summary` to exactly that text.
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input summary : string
+    state got_summary : bool = false
+    timer deadline(10min, 0)
+
+    reaction(summary) -> {=
+        if summary.is_some() { self.got_summary = true; }
+        if self.got_summary { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_summary, "no run.summary by the deadline");
+    =}
+}
+
 main Nested {
     run = Pipeline()
+
+    smoke = Smoke()
+    run.summary -> smoke.summary
 }

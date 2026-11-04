@@ -20,6 +20,8 @@ export function Resizer({
   onDragStart,
   onDelta,
   onStep,
+  fixed = false,
+  handleRef,
 }: {
   label: string;
   collapsed: boolean;
@@ -30,12 +32,17 @@ export function Resizer({
   onDragStart: () => void;
   onDelta: (deltaX: number) => void;
   onStep: (deltaX: number) => void;
+  /** A column of fixed width: the divider folds it and nothing else. */
+  fixed?: boolean;
+  /** The handle left behind when the column is folded. */
+  handleRef?: React.RefObject<HTMLButtonElement | null>;
 }) {
   const originRef = useRef<number | null>(null);
 
   if (collapsed) {
     return (
       <button
+        ref={handleRef}
         type="button"
         className={`resizer-handle ${toward}`}
         onClick={onExpand}
@@ -77,17 +84,17 @@ export function Resizer({
 
   return (
     <div
-      className="resizer"
+      className={fixed ? "resizer fixed" : "resizer"}
       role="separator"
       aria-orientation="vertical"
-      aria-label={`Resize ${label}`}
-      tabIndex={0}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={endDrag}
-      onPointerCancel={endDrag}
-      onKeyDown={handleKeyDown}
-      onDoubleClick={onExpand}
+      aria-label={fixed ? label : `Resize ${label}`}
+      tabIndex={fixed ? undefined : 0}
+      onPointerDown={fixed ? undefined : handlePointerDown}
+      onPointerMove={fixed ? undefined : handlePointerMove}
+      onPointerUp={fixed ? undefined : endDrag}
+      onPointerCancel={fixed ? undefined : endDrag}
+      onKeyDown={fixed ? undefined : handleKeyDown}
+      onDoubleClick={fixed ? undefined : onExpand}
     >
       <i aria-hidden="true" />
       {onCollapse ? <button type="button" className="resizer-collapse" aria-label={`Hide ${label}`} title={`Hide ${label}`} onPointerDown={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); onCollapse(); }}><span aria-hidden="true">{toward === "right" ? "‹" : "›"}</span></button> : null}

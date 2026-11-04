@@ -10,10 +10,10 @@ const program = `team ReviewFlow[planner:Codex, reviewer:Codex] {
  output result:string
  action plan:string
  action critique:string
- /* prompt fake() -> result "fake" /* nested */ */
- prompt planner(request) -> plan "Use $(request). A \\"quoted\\" word and prompt text."
- prompt reviewer(plan) -> critique within(30s) "Inspect $(plan)."
- prompt planner(critique) -> result "Return $(critique)."
+ /* task fake() -> result "fake" /* nested */ */
+ task planner(request) -> plan "Use $(request). A \\"quoted\\" word and prompt text."
+ task reviewer(plan) -> critique within(30s) "Inspect $(plan)."
+ task planner(critique) -> result "Return $(critique)."
 }
 main ReviewFlow { flow = ReviewFlow() }`;
 
@@ -35,7 +35,7 @@ test('step spans distinguish repeated agents, deadlines, comments and escaped qu
 
 test('qualified reaction names select the correct team definition', () => {
  const reaction = {...snapshot.reactions[0], name:'flow.reaction.0'};
- const source = 'team Unrelated[a:Web] { input x:string output y:string prompt a(x) -> y "Unrelated" }\n'+program;
+ const source = 'team Unrelated[a:Web] { input x:string output y:string task a(x) -> y "Unrelated" }\n'+program;
  assert.equal(locateStep(source, snapshot, reaction).prompt, 'Use $(request). A "quoted" word and prompt text.');
 });
 

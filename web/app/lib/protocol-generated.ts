@@ -5,11 +5,15 @@
 // generator exists to make impossible.
 
 /** Every status `omar serve` can report a run in. */
-export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "failed"] as const;
+export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "pausing", "paused", "failed"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
+/** How a mutation asked of a run went. `pending` waits for the run to pause. */
+export const MUTATION_STATUSES = ["pending", "applied", "failed"] as const;
+export type MutationStatus = (typeof MUTATION_STATUSES)[number];
+
 /** Where a drawing stands. `ready` is compiled but never run, which is what a proposal's preview is. */
-export const DIAGRAM_STATUSES = ["ready", "running", "completed", "failed"] as const;
+export const DIAGRAM_STATUSES = ["ready", "running", "completed", "failed", "paused"] as const;
 export type DiagramStatus = (typeof DIAGRAM_STATUSES)[number];
 
 /** Where one reaction stands. */
@@ -25,7 +29,7 @@ export const PORT_KINDS = ["input", "output", "action"] as const;
 export type PortKind = (typeof PORT_KINDS)[number];
 
 /** What happened, as the event stream names it. */
-export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed"] as const;
+export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started"] as const;
 export type DiagramEventKind = (typeof DIAGRAM_EVENT_KINDS)[number];
 
 /** Who spoke. */
@@ -34,11 +38,11 @@ export type ChatRole = (typeof CHAT_ROLES)[number];
 
 export type DiagramTag = { timestamp: number, microstep: number, };
 
-export type DiagramInstance = { id: string, name: string, 
+export type DiagramInstance = { id: string, name: string,
 /**
  * The team it was instantiated from.
  */
-team: string, 
+team: string,
 /**
  * The container this one is drawn inside, or empty for a top-level one.
  *
@@ -48,7 +52,7 @@ team: string,
  */
 parent: string, };
 
-export type DiagramAgent = { id: string, name: string, backend: string, 
+export type DiagramAgent = { id: string, name: string, backend: string,
 /**
  * The container it is drawn inside.
  */
@@ -56,21 +60,26 @@ instance: string, };
 
 export type DiagramPort = { id: string, name: string, kind: PortKind, type: string, delay: number | null, value: unknown | null, last_tag: DiagramTag | null, instance: string, };
 
-export type DiagramTimer = { id: string, name: string, offset: number, 
+export type DiagramTimer = { id: string, name: string, offset: number,
 /**
  * `0` fires once; anything else re-arms forever.
  */
 period: number, last_tag: DiagramTag | null, instance: string, };
 
-export type DiagramReaction = { id: string, name: string, agent: string, order: number, triggers: Array<string>, effects: Array<string>, contract: string, status: ReactionStatus, invocation_id: string | null, instance: string, 
+export type DiagramReaction = { id: string, name: string, agent: string, order: number, triggers: Array<string>, effects: Array<string>, contract: string, status: ReactionStatus, invocation_id: string | null, instance: string,
 /**
  * Nanoseconds this reaction gave itself, or `None` for one bounded only by
  * the run. Carried so a client can draw the bound rather than leaving the
  * operator to read it out of the source.
  */
-within: number | null, };
+within: number | null,
+/**
+ * The task's prompt, for a one-line summary on its card. `None` for a
+ * code reaction.
+ */
+prompt?: string, };
 
-export type DiagramEdge = { id: string, kind: EdgeKind, source: string, target: string, 
+export type DiagramEdge = { id: string, kind: EdgeKind, source: string, target: string,
 /**
  * Null when the hop costs nothing. `0` is `after 0`, which costs a
  * microstep; larger values are nanoseconds. Trigger and effect edges
@@ -78,18 +87,26 @@ export type DiagramEdge = { id: string, kind: EdgeKind, source: string, target: 
  */
 delay: number | null, };
 
-export type DiagramSnapshot = { protocol_version: number, team: string, sequence: number, status: DiagramStatus, current_tag: DiagramTag | null, 
+export type DiagramSnapshot = { protocol_version: number, team: string, sequence: number, status: DiagramStatus, current_tag: DiagramTag | null,
 /**
  * Nanoseconds physical time had run past `current_tag` when it executed.
  * `None` before the first tag. A sequence number says how much has been
  * published; this says whether the run is keeping its promises.
  */
-lag: number | null, 
+lag: number | null,
+/**
+ * The unix millisecond the run's logical time zero stands at, so a
+ * client can read the run's physical clock off its own wall clock,
+ * before the first tag and whenever it connected. A resume moves it
+ * back by the time the run had already spent. `None` until the loop
+ * starts its clock, which is after the agents are up.
+ */
+clock_origin?: number,
 /**
  * The containers to draw. Empty for a program compiled before instances
  * were carried through, which is how a client tells the difference.
  */
-instances: Array<DiagramInstance>, agents: Array<DiagramAgent>, ports: Array<DiagramPort>, 
+instances: Array<DiagramInstance>, agents: Array<DiagramAgent>, ports: Array<DiagramPort>,
 /**
  * Empty for a program with no timer, and for bytecode that predates them.
  */
@@ -97,18 +114,55 @@ timers: Array<DiagramTimer>, reactions: Array<DiagramReaction>, edges: Array<Dia
 
 export type DiagramEvent = { protocol_version: number, sequence: number, team: string, tag: DiagramTag | null, kind: DiagramEventKind, payload: Record<string, unknown>, };
 
-export type ProposedDesign = { program: string, inputs: Record<string, unknown>, 
+export type ProofProblem = {
+/**
+ * Counted from the theorem's first line; 0 when it is about the whole.
+ */
+line: number, column: number, message: string, };
+
+export type PropertyVerdict = { name: string, description: string, proved: boolean,
+/**
+ * The statement and proof as written, so the property can be checked
+ * again against an edited program.
+ */
+statement: string, proof: string,
+/**
+ * The theorem as it was checked.
+ */
+theorem: string,
+/**
+ * The whole Lean file: the model, the shared lemmas and the theorem.
+ */
+source: string,
+/**
+ * The ports, reactions and timers its statement names.
+ */
+mentions: Array<string>, problems: Array<ProofProblem>, };
+
+export type ProposedDesign = { program: string,
+/**
+ * Companion files relative to program.omar.
+ */
+files?: Record<string, string>, inputs: Record<string, unknown>,
 /**
  * The compiled topology, so the operator sees what they are approving
  * before any run exists.
  */
-preview: DiagramSnapshot, };
+preview: DiagramSnapshot,
+/**
+ * Lean declarations the properties share.
+ */
+lemmas?: string,
+/**
+ * What the assistant claims of the program, as Lean judged it.
+ */
+properties?: Array<PropertyVerdict>, };
 
-export type ChatMessage = { sequence: number, role: ChatRole, text: string, 
+export type ChatMessage = { sequence: number, role: ChatRole, text: string,
 /**
  * Commentary while working, rather than something awaiting an answer.
  */
-progress: boolean, design: ProposedDesign | null, 
+progress: boolean, design: ProposedDesign | null,
 /**
  * Diagram components the operator had selected when they sent this.
  * "this one" is unresolvable in text; a selection says which.
@@ -119,5 +173,35 @@ export type Conversation = { id: string, title: string, ea_id: number | null, cr
 
 export type ConversationSummary = { id: string, title: string, created_at: number, updated_at: number, message_count: number, ea_id: number | null, busy: boolean, run: RunRecord | null, };
 
-export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number, finished_at: number | null, error: string | null, };
+export type MutationRecord = { status: MutationStatus,
+/**
+ * One line per instruction of the plan.
+ */
+changes: Array<string>,
+/**
+ * Queued events the new program had no port or timer for.
+ */
+dropped?: Array<string>,
+/**
+ * The `mutation` checkpoint the run continues from.
+ */
+checkpoint?: string, error?: string, };
 
+export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number, finished_at: number | null, error: string | null,
+/**
+ * Input ports the run was admitted with, so its timeline can be
+ * projected again later from the same starting point.
+ */
+present?: Array<string>,
+/**
+ * Output ports a finished run ended with.
+ */
+outputs?: Record<string, unknown>,
+/**
+ * State variables a finished run ended with.
+ */
+state?: Record<string, unknown>,
+/**
+ * The last mutation asked of the run, and how it went.
+ */
+mutation?: MutationRecord, };

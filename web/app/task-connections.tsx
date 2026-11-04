@@ -6,10 +6,11 @@ import { WorkflowIcon } from "./workflow-icon";
 
 type ConnectionType = TaskConnection["type"] | "workflow";
 
-export function TaskConnections({ connections, triggers, ports, onConnectionsChange, onTriggersChange }: {
+export function TaskConnections({ connections, triggers, ports, readOnly = false, onConnectionsChange, onTriggersChange }: {
   connections: TaskConnection[];
   triggers: string[];
   ports: string[];
+  readOnly?: boolean;
   onConnectionsChange: (connections: TaskConnection[]) => void;
   onTriggersChange: (triggers: string[]) => void;
 }) {
@@ -33,11 +34,11 @@ export function TaskConnections({ connections, triggers, ports, onConnectionsCha
       return <li className="task-connection-card" key={connection.id}>
         <div className="task-connection-icon"><WorkflowIcon name={kind.icon} size={17} /></div>
         <div className="task-connection-info"><strong>{connection.name}</strong><small>{kind.title} · Configured</small><span title={connectionDetail(connection)}>{connectionDetail(connection)}</span></div>
-        <div className="task-connection-actions"><button type="button" aria-label={`Edit connection ${connection.name}`} onClick={() => { setEditing(connection); setType(connection.type); setAdding(true); }}>Edit</button><button type="button" aria-label={`Remove connection ${connection.name}`} onClick={() => { onConnectionsChange(connections.filter((item) => item.id !== connection.id)); if (editing?.id === connection.id) close(); }}><WorkflowIcon name="close" size={13} /></button></div>
+        {readOnly ? null : <div className="task-connection-actions"><button type="button" aria-label={`Edit connection ${connection.name}`} onClick={() => { setEditing(connection); setType(connection.type); setAdding(true); }}>Edit</button><button type="button" aria-label={`Remove connection ${connection.name}`} onClick={() => { onConnectionsChange(connections.filter((item) => item.id !== connection.id)); if (editing?.id === connection.id) close(); }}><WorkflowIcon name="close" size={13} /></button></div>}
       </li>;
     })}</ul> : <div className="task-connections-empty"><WorkflowIcon name="api" size={22} /><strong>No external connections yet</strong><span>Add an API or tool this task can use.</span></div>}
-    <button className="step-ask connection-add-button" type="button" aria-expanded={adding} onClick={() => adding ? close() : setAdding(true)}><WorkflowIcon name="plus" size={14} />Add connection</button>
-    {adding ? <div className="connection-setup">
+    {readOnly ? null : <button className="step-ask connection-add-button" type="button" aria-expanded={adding} onClick={() => adding ? close() : setAdding(true)}><WorkflowIcon name="plus" size={14} />Add connection</button>}
+    {adding && !readOnly ? <div className="connection-setup">
       <div className="connection-setup-heading"><strong>{editing ? "Edit connection" : type ? "Set up connection" : "Choose a connection type"}</strong><button type="button" aria-label="Cancel connection setup" onClick={close}><WorkflowIcon name="close" size={14} /></button></div>
       {!type ? <div className="connection-type-list">
         {connectionTypes.map((item) => <button className="connection-type-option" type="button" key={item.type} onClick={() => setType(item.type)}><i><WorkflowIcon name={item.icon} size={18} /></i><span><strong>{item.title}</strong><small>{item.description}</small></span><WorkflowIcon name="chevron" size={14} /></button>)}
@@ -52,7 +53,7 @@ export function TaskConnections({ connections, triggers, ports, onConnectionsCha
     </div> : null}
     <div className="workflow-input-heading"><strong>Workflow inputs</strong><small>{triggers.length}</small></div>
     <p className="step-edit-note">Data that triggers this task.</p>
-    {triggers.length ? <div className="workflow-input-list">{triggers.map((name) => <div className="step-input-row" key={name}><WorkflowIcon name="workflow" size={14} /><span>{name}</span><button type="button" aria-label={`Remove input ${name}`} onClick={() => onTriggersChange(triggers.filter((item) => item !== name))}><WorkflowIcon name="close" size={13} /></button></div>)}</div> : <p className="step-empty">No workflow inputs selected.</p>}
+    {triggers.length ? <div className="workflow-input-list">{triggers.map((name) => <div className="step-input-row" key={name}><WorkflowIcon name="workflow" size={14} /><span>{name}</span>{readOnly ? null : <button type="button" aria-label={`Remove input ${name}`} onClick={() => onTriggersChange(triggers.filter((item) => item !== name))}><WorkflowIcon name="close" size={13} /></button>}</div>)}</div> : <p className="step-empty">No workflow inputs selected.</p>}
   </section>;
 }
 
