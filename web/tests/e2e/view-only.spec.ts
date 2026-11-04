@@ -1,8 +1,11 @@
 import { expect, test } from "@playwright/test";
 import { FAKE_SERVE_PORT, FAKE_SERVE_URL } from "../../playwright.config";
 import { startFakeServe } from "../fake-serve.mjs";
+import { readFileSync } from "node:fs";
+import { locateStep, replaceStep } from "../../app/lib/step-source";
+import type { DiagramSnapshot } from "../../app/lib/protocol";
 
-type FakeServe = { url: string; viewUrl: string; viewTerminalFrames: number; close(): Promise<void> };
+type FakeServe = { url: string; viewUrl: string; agentToken: string; viewTerminalFrames: number; close(): Promise<void> };
 
 let fake: FakeServe;
 
@@ -25,6 +28,27 @@ async function post(path: string, body: object) {
   expect(response.ok).toBe(true);
   return response.json();
 }
+
+test("view-only step details display connections without configuration controls", async ({ page }) => {
+  const source = readFileSync(new URL("../fixtures/review-flow.omar", import.meta.url), "utf8");
+  const snapshot = JSON.parse(readFileSync(new URL("../fixtures/diagram-snapshot.v1.json", import.meta.url), "utf8")) as DiagramSnapshot;
+  const step = locateStep(source, snapshot, snapshot.reactions[0]);
+  expect(step).not.toBeNull();
+  const program = replaceStep(source, step!, { ...step!, connections: [{ id: "project-tools", name: "Project tools", type: "mcp", server: "github" }] });
+  await post("/v1/agent/proposals", { token: fake.agentToken, program, summary: "Configured workflow" });
+  const writes: string[] = [];
+  page.on("request", request => { if (request.method() !== "GET" && request.url().startsWith(FAKE_SERVE_URL)) writes.push(request.url()); });
+  await page.goto("/");
+  await expect(page.getByRole("status").filter({ hasText: "View only" })).toBeVisible();
+  await page.locator(".omar-reaction").first().press("Enter");
+  const inspector = page.getByRole("complementary", { name: "Step details" });
+  await expect(inspector.getByRole("region", { name: "Task connections" })).toContainText("Project tools");
+  for (const name of ["Add connection", "Edit connection Project tools", "Remove connection Project tools", "Remove input request", "Apply configuration"]) {
+    await expect(inspector.getByRole("button", { name, exact: true })).toHaveCount(0);
+  }
+  await expect(inspector.getByLabel("Step prompt")).toBeDisabled();
+  expect(writes).toEqual([]);
+});
 
 test("a view port watches conversations and runs without offering a write", async ({ page }) => {
   // One chat with a live run, then a second that becomes the daemon's active one.

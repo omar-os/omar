@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
 type IconName =
+  | "api"
   | "arrow"
   | "bolt"
   | "chevron"
@@ -17,6 +18,7 @@ type IconName =
 
 export function WorkflowIcon({ name, size = 18 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, ReactNode> = {
+    api: <><path d="m8 7-5 5 5 5m8-10 5 5-5 5M14 4l-4 16" /></>,
     arrow: <><path d="m5 12 14 0M14 7l5 5-5 5" /></>,
     bolt: <path d="m13 2-8 11h7l-1 9 8-12h-7l1-8Z" />,
     chevron: <path d="m9 18 6-6-6-6" />,

@@ -6,6 +6,7 @@ import type { DiagramSnapshot } from "./lib/protocol";
 import { formatDuration } from "./lib/protocol";
 import { componentName } from "./diagram/diagram-canvas";
 import { WorkflowIcon } from "./workflow-icon";
+import { TaskConnections } from "./task-connections";
 
 /** Details come from the compiled topology, never from prototype sample data. */
 export function StepInspector({ component, snapshot, source, editable, readOnly = false, onApply, onClose, onEdit, onAsk }: {
@@ -66,31 +67,28 @@ function StepEditor({ source, step, ports, enabled, readOnly, onApply }: {
   const [prompt, setPrompt] = useState(step.prompt);
   const [contract, setContract] = useState(step.contract);
   const [triggers, setTriggers] = useState(step.triggers);
-  const [adding, setAdding] = useState(false);
-  const [connection, setConnection] = useState("");
+  const [connections, setConnections] = useState(step.connections);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
-  const changed = backend !== step.backend || prompt !== step.prompt || contract !== step.contract || triggers.join(",") !== step.triggers.join(",");
+  const changed = backend !== step.backend || prompt !== step.prompt || contract !== step.contract || triggers.join(",") !== step.triggers.join(",") || JSON.stringify(connections) !== JSON.stringify(step.connections);
   const backends = Array.from(new Set([step.backend, "ClaudeCode", "Codex", "Cursor", "OpenCode", "Pi", "Agy", "Web"]));
   async function apply() {
     setBusy(true); setError(""); setSaved(false);
-    try { await onApply(replaceStep(source, step, { backend, prompt, triggers, contract })); setSaved(true); }
+    try { await onApply(replaceStep(source, step, { backend, prompt, triggers, contract, connections })); setSaved(true); }
     catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setBusy(false); }
   }
   return <div className="step-editor">
     <h4>Configuration</h4>
-    {readOnly ? null : <p className="step-edit-note">Changes update the {step.team} definition and all its instances. The workflow still requires confirmation before running.</p>}
+    {readOnly ? null : <p className="step-edit-note">Apply to save changes to {step.team} and all its instances in this browser. The workflow still requires confirmation before running.</p>}
     {!enabled && !readOnly ? <p role="status">Configuration is read-only while the workflow is running or the runtime is unavailable.</p> : null}
     <fieldset disabled={!enabled || busy}>
+      <TaskConnections connections={connections} triggers={triggers} ports={ports} readOnly={readOnly} onConnectionsChange={setConnections} onTriggersChange={setTriggers} />
       <label className="inspector-field"><span>Execution agent</span><select aria-label="Step execution agent" value={backend} onChange={(event) => setBackend(event.target.value)}>{backends.map((value) => <option key={value} value={value}>{value === "ClaudeCode" ? "Claude Code" : value === "OpenCode" ? "opencode" : value === "Pi" ? "pi" : value === "Agy" ? "agy" : value}</option>)}</select></label>
       <p className="step-edit-note">Uses the model configured for this agent.</p>
       <label className="inspector-field"><span>Prompt</span><textarea aria-label="Step prompt" rows={7} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
-      <label className="inspector-field"><span>Output connection / contract</span><input aria-label="Step output contract" value={contract} onChange={(event) => setContract(event.target.value)} /></label>
-      <div className="inspector-field"><span>Input connections</span>{triggers.length ? triggers.map((name) => <div className="step-input-row" key={name}><span>{name}</span><button type="button" aria-label={`Remove input ${name}`} onClick={() => setTriggers((current) => current.filter((item) => item !== name))}>×</button></div>) : <small>No inputs selected</small>}</div>
-      {readOnly ? null : <button className="step-ask" type="button" aria-expanded={adding} onClick={() => setAdding((current) => !current)}>Add connection</button>}
-      {adding ? <div className="step-add-connection"><label className="inspector-field"><span>Existing input or task output</span><select aria-label="Input connection" value={connection} onChange={(event) => setConnection(event.target.value)}><option value="">Choose a connection…</option>{ports.filter((port) => !triggers.includes(port)).map((port) => <option key={port}>{port}</option>)}</select></label><button type="button" className="step-ask" disabled={!connection} onClick={() => { setTriggers((current) => [...current, connection]); setConnection(""); setAdding(false); }}>Add selected connection</button></div> : null}
+      <label className="inspector-field"><span>Task outputs / contract</span><input aria-label="Step output contract" value={contract} onChange={(event) => setContract(event.target.value)} /></label>
       {readOnly ? null : <button type="button" className="step-save" disabled={!changed || busy} onClick={() => void apply()}>{busy ? "Validating…" : "Apply configuration"}</button>}
     </fieldset>
     {error ? <p className="step-config-error" role="alert">{error}</p> : null}
