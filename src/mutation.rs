@@ -356,6 +356,15 @@ pub fn apply(omar_dir: &Path, ea_id: u32, to: &Bytecode, source: &Path) -> Resul
     let (workspaces, created) = carry_workspaces(omar_dir, ea_id, &manifest, &plan, &to_state)?;
     let result = (|| -> Result<String> {
         let (existing, _) = store.list()?;
+        for (name, agent) in &to_state.agents {
+            if let Some(profile) = manifest
+                .agents
+                .get(name)
+                .and_then(|a| a.execution_profile.as_ref())
+            {
+                profile.command(&agent.backend)?;
+            }
+        }
         let new = checkpoint::Manifest {
             version: checkpoint::FORMAT,
             id: uuid::Uuid::new_v4().to_string(),
@@ -382,6 +391,10 @@ pub fn apply(omar_dir: &Path, ea_id: u32, to: &Bytecode, source: &Path) -> Resul
                     (
                         name.clone(),
                         checkpoint::AgentContext {
+                            execution_profile: manifest
+                                .agents
+                                .get(name)
+                                .and_then(|a| a.execution_profile.clone()),
                             backend: agent.backend.clone(),
                             restoration: checkpoint::FRESH_CONVERSATION.to_string(),
                         },

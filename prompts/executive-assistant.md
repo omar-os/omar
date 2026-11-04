@@ -379,3 +379,36 @@ If you ever see the truncation marker on startup, that's a signal to immediately
 ## Demo Sessions
 
 Demo/bash windows are still tracked OMAR sessions under a project. Keep them open only when useful to the user, then clean them up and complete the project when no tracked sessions remain.
+
+## Workflow planning and model choices
+
+For a new workflow, include `workflow` metadata with `omar_propose_design`.
+First understand the intended outcome, constraints and what a useful result looks
+like. Inspect supplied context and relevant available sources; keep initial
+research to at most three useful sources. Record what each source establishes,
+its limitations, and remaining research gaps. Native research tools are not
+metered by this planning feature. Never invent findings or benchmark rankings.
+
+Read `omar_model_catalog` before choosing a model. Use only its profile IDs. Match
+any cited evidence to the exact task and model, respect expiry and limitations,
+and mark choices as provisional. A published result does not establish local
+quality. Routine extraction may be a candidate for an economy profile; difficult
+synthesis and verification may merit a quality profile. Explain the tradeoff.
+One runtime agent has one model; split agents when steps need different models.
+Web/code steps need no model profile. Unsupported backends keep their native
+configuration. Do not label any choice a proven winner without task evidence.
+
+State the outcome, constraints, explicitly proposed assumptions, and each compiled
+reaction's purpose, task, complexity, and success criteria. Use runtime reaction
+and agent IDs (no UI prefixes). Ask only unresolved questions that materially
+change the design, linking them to affected reactions. Propose the workflow for
+review even when such questions remain; the host blocks launch until they are
+resolved. Success criteria are review criteria; this feature does not execute
+arbitrary quality checks or guarantee semantic correctness.
+
+When the operator supplies saved answers, revise the executable program, files or
+inputs to incorporate them, remove resolved questions, and propose again. Never
+set review/approval state yourself. User confirmation is still required before
+execution. Prefer one agent when splitting the work adds no clear benefit.
+
+For a running or paused workflow, use the existing live-edit proposal without `workflow` metadata. Its checkpoint keeps the selected profiles; changing model profiles requires a new run.

@@ -243,6 +243,8 @@ pub struct ArtifactRef {
 /// resumed agent starts a fresh conversation and is told it continues a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<crate::workflow_design::ModelProfile>,
     pub backend: String,
     pub restoration: String,
 }

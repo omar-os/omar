@@ -2155,6 +2155,7 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
 }
 
 pub struct TopologyRunConfig<'a> {
+    pub execution_profiles: BTreeMap<String, crate::workflow_design::ModelProfile>,
     pub ea_id: crate::ea::EaId,
     pub omar_dir: &'a Path,
     /// Where this program's generated artifacts go, from `generated_dir`.
@@ -2417,6 +2418,7 @@ impl<'a> RunCheckpointer<'a> {
                     (
                         name.clone(),
                         checkpoint::AgentContext {
+                            execution_profile: config.execution_profiles.get(name).cloned(),
                             backend: agent.backend.clone(),
                             restoration: checkpoint::FRESH_CONVERSATION.to_string(),
                         },
@@ -2651,6 +2653,11 @@ pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunO
     // The paused run's choice carries over: a resume is the same run.
     let mut config = config;
     config.keep_workspaces = record.keep_workspaces;
+    config.execution_profiles = manifest
+        .agents
+        .iter()
+        .filter_map(|(id, a)| a.execution_profile.clone().map(|p| (id.clone(), p)))
+        .collect();
     launch(
         &state,
         &bytecode,
@@ -3166,9 +3173,12 @@ fn spawn_topology_agents(
         let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
         fs::write(&prompt_file, format!("{protocol}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.{resumed}\n", temp.display()))?;
         let backend = canonical_backend(&agent.backend);
-        let base_command = crate::backend::resolve(backend)
-            .map(|backend| backend.default_command().to_string())
-            .map_err(anyhow::Error::msg)?;
+        let base_command = match config.execution_profiles.get(name) {
+            Some(profile) => profile.command(backend)?,
+            None => crate::backend::resolve(backend)
+                .map(|b| b.default_command().to_string())
+                .map_err(anyhow::Error::msg)?,
+        };
         let context = McpLaunchContext {
             omar_dir: config.omar_dir.to_path_buf(),
             ea_id: config.ea_id,

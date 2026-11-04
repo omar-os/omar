@@ -20,6 +20,7 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:3100",
     trace: "retain-on-failure",
+    launchOptions: { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH },
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: {

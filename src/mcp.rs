@@ -719,15 +719,16 @@ impl OmarMcpServer {
             match call.name.as_str() {
                 // Refused rather than merely unlisted, so an agent that learned
                 // the names elsewhere still cannot reach the operator.
-                "omar_reply" | "omar_propose_design" | "omar_check_properties" => {
-                    match &self.context.serve {
-                        Some(serve) => serve_tool_call(serve, &call.name, call.arguments),
-                        None => Err(anyhow!(
-                            "Tool '{}' is only available to the executive assistant",
-                            call.name
-                        )),
-                    }
-                }
+                "omar_reply"
+                | "omar_propose_design"
+                | "omar_check_properties"
+                | "omar_model_catalog" => match &self.context.serve {
+                    Some(serve) => serve_tool_call(serve, &call.name, call.arguments),
+                    None => Err(anyhow!(
+                        "Tool '{}' is only available to the executive assistant",
+                        call.name
+                    )),
+                },
                 "coordination_state" => crate::supervision::context_page(
                     &self.context.omar_dir,
                     self.ea_id(),
@@ -2566,6 +2567,11 @@ fn ea_tool_definitions() -> Vec<Value> {
             }),
         ),
         tool(
+            "omar_model_catalog",
+            "Read configured Codex/Claude model profiles and dated task evidence. Evidence is candidate guidance, not local qualification or proof that a workflow beats one agent.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+        ),
+        tool(
             "omar_propose_design",
             "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares. While a workflow is running or paused, a program that keeps its `main` name is a change to that run, which the operator applies live.",
             json!({
@@ -2576,7 +2582,8 @@ fn ea_tool_definitions() -> Vec<Value> {
                     "summary":{"type":"string","description":"One or two sentences on what it does"},
                     "inputs":{"type":"object","description":"Values for the program's declared input ports"},
                     "lemmas":{"type":"string","description":"Lean declarations the properties share"},
-                    "properties":property_schema()
+                    "properties":property_schema(),
+                    "workflow":workflow_plan_schema()
                 },
                 "required":["program","summary"],
                 "additionalProperties":false
@@ -2689,6 +2696,20 @@ fn post_json_within(
     bail!("omar serve rejected {path}: {detail}");
 }
 
+fn workflow_plan_schema() -> Value {
+    let strings = json!({"type":"array","items":{"type":"string"}});
+    json!({"type":"object","additionalProperties":false,
+    "required":["outcome","steps","choices"],"properties":{
+        "outcome":{"type":"string"},"constraints":strings,
+        "assumptions":{"type":"array","items":{"type":"object","required":["id","text"],"properties":{"id":{"type":"string"},"text":{"type":"string"}},"additionalProperties":false}},
+        "questions":{"type":"array","items":{"type":"object","required":["id","text","reactions"],"properties":{"id":{"type":"string"},"text":{"type":"string"},"reactions":strings},"additionalProperties":false}},
+        "steps":{"type":"array","items":{"type":"object","required":["reaction","purpose","task","complexity","success_criteria"],"properties":{"reaction":{"type":"string"},"purpose":{"type":"string"},"task":{"type":"string"},"complexity":{"type":"string"},"success_criteria":strings},"additionalProperties":false}},
+        "sources":{"type":"array","items":{"type":"object","required":["location","finding","limitation"],"properties":{"location":{"type":"string"},"finding":{"type":"string"},"limitation":{"type":"string"}},"additionalProperties":false}},
+        "research_gaps":strings,
+        "choices":{"type":"object","additionalProperties":{"type":"object","required":["profile_id","reason"],"properties":{"profile_id":{"type":"string"},"reason":{"type":"string"},"evidence_ids":strings},"additionalProperties":false}}
+    }})
+}
+
 /// Forward an EA tool call to `omar serve` over its loopback admin endpoint.
 fn serve_tool_call(
     serve: &crate::manager::ServeMcpContext,
@@ -2699,6 +2720,7 @@ fn serve_tool_call(
         "omar_reply" => "/v1/agent/reply",
         "omar_propose_design" => "/v1/agent/proposals",
         "omar_check_properties" => "/v1/agent/properties",
+        "omar_model_catalog" => "/v1/agent/model-catalog",
         other => bail!("unknown serve tool '{other}'"),
     };
     // Arguments come from a model, so the shape is not guaranteed. Indexing a
@@ -2722,11 +2744,13 @@ fn serve_tool_call(
         &Value::Object(body),
         std::time::Duration::from_secs(330),
     )?;
-    Ok(if name == "omar_check_properties" {
-        answer
-    } else {
-        json!({"status":"delivered"})
-    })
+    Ok(
+        if matches!(name, "omar_check_properties" | "omar_model_catalog") {
+            answer
+        } else {
+            json!({"status":"delivered"})
+        },
+    )
 }
 
 fn topology_tool_definitions() -> Vec<Value> {

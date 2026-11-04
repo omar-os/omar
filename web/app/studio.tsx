@@ -19,6 +19,7 @@ import { PropertiesPanel } from "./properties";
 import { Resizer } from "./resizer";
 import { useWorkflowNames } from "./lib/workflow-names";
 import { WorkflowIcon } from "./workflow-icon";
+import { WorkflowReview, workflowReady } from "./workflow-review";
 import { StepInspector } from "./step-inspector";
 import { Waiting } from "./waiting";
 import {
@@ -221,6 +222,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [selectingChat, setSelectingChat] = useState(false);
   const [hydratedUrl, setHydratedUrl] = useState(isDemo ? serveUrl : null);
   const switchingChat = selectingChat || hydratedUrl !== serveUrl;
+  const [workflowDirty, setWorkflowDirty] = useState(false);
   const [design, setDesign] = useState<ProposedDesign | null>(null);
   /** The property whose components the diagram singles out, in the design it
       belongs to: a new design starts with none. */
@@ -500,7 +502,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
 
   async function submitPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const request = prompt.trim();
+    await sendWorkflowMessage(prompt.trim());
+  }
+
+  async function sendWorkflowMessage(request: string) {
     if (readOnly || !request || (switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning") return;
     const selected = selection;
     const quoted = withQuote(quote, request);
@@ -718,7 +723,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     let restoring = false;
     let buffered: ChatMessage[] = [];
     const applyMessage = (message: ChatMessage) => {
-      if (message.role === "operator") {
+      if (message.role === "operator" && !message.design) {
         setAssistantBusy(true);
         setConversationTitle((title) => title === "What should the team do?" ? message.text.replace(/\s+/g, " ").slice(0, 80) : title);
       }
@@ -881,6 +886,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         program: source,
         files: design.files,
         inputs: design.inputs,
+        design_sequence: design.workflow ? [...messages].reverse().find(m => m.design)?.sequence : undefined,
         timeout_seconds: options.timeoutSeconds,
         conversation_id: conversationIdRef.current ?? undefined,
         keep_workspaces: options.keepWorkspaces,
@@ -1682,7 +1688,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                     // runs on a debounce after every proposal, and a button
                     // that blinks off for it drops the click that was already
                     // on its way. The confirmation's own button still waits.
-                    disabled={!canRun || applyingConfiguration || switchingChat || sourceErrors.length > 0}
+                    disabled={!canRun || applyingConfiguration || switchingChat || sourceErrors.length > 0 || workflowDirty || !!(design?.workflow && (!workflowReady(design.workflow) || source !== design.program))}
                     aria-haspopup="dialog"
                     aria-label={retrying ? "Run again" : "Deploy"}
                     title={daemon.state === "offline" ? "Runtime offline" : undefined}
@@ -1726,6 +1732,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           />
           {inspected ? <StepInspector key={`${serveUrl}:${inspected}`} component={inspected} snapshot={snapshot} source={source} readOnly={readOnly} editable={canRun && !readOnly && !switchingChat && (!run || isRunFinished(run.status))} onApply={applyStepConfiguration} onClose={() => setInspected(null)} onEdit={editSource} onAsk={askAboutStep} /> : null}
           </div>
+          {design?.workflow && phase === "review" ? <WorkflowReview
+            key={`${serveUrl}:${[...messages].reverse().find(m => m.design)?.sequence}`}
+            design={design} sequence={[...messages].reverse().find(m => m.design)?.sequence ?? 0} source={source} url={serveUrl}
+            disabled={readOnly || !canRun || assistantBusy || switchingChat || applyingConfiguration}
+            onDirty={setWorkflowDirty} onAsk={text => void sendWorkflowMessage(text)} onStep={setInspected}
+            onSaved={message => { setDesign(message.design); if (message.design) { setSource(message.design.program); setSnapshot(message.design.preview); } setMessages(current => current.some(m => m.sequence === message.sequence) ? current : [...current, message]); }}
+          /> : null}
           {timelineOpen ? (
             <Timeline
               steps={steps}
