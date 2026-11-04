@@ -189,10 +189,18 @@ mod tests {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
+            // Read the whole request, body too: closing a socket with
+            // unread data resets it, and the client would see that instead.
+            let mut length = 0;
             let mut header = String::new();
             while reader.read_line(&mut header).unwrap() > 2 {
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
                 header.clear();
             }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
             (&stream).write_all(answer.as_bytes()).unwrap();
             line
         });
