@@ -2761,7 +2761,7 @@ fn topology_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "omar_pending",
-            "List the OMAR invocations addressed to this agent and not yet completed, with the prompt, the trigger values, the effect ports each one may set, and the team state it may read and set. Ask when an invocation message was missed rather than guessing what is owed.",
+            "List the OMAR invocations addressed to this agent and not yet completed, with the prompt, the trigger values, the effect ports each one may set, the team state it may read and set, and the shared contexts it should keep updated. Ask when an invocation message was missed rather than guessing what is owed.",
             json!({
                 "type":"object",
                 "properties":{},

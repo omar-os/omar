@@ -28,7 +28,7 @@ backend     = identifier ;
 main        = "main", [ identifier ], "{", { instance | wiring }, "}" ;
 wiring      = qualified, "->", qualified, [ "after", delay ] ;
 
-declaration = input | output | action | timer | state | instance
+declaration = input | output | action | timer | state | context | instance
             | connection | task | reaction | ";" ;
 input       = "input", identifier, ":", type ;
 output      = "output", identifier, ":", type ;
@@ -36,6 +36,8 @@ action      = "action", identifier, [ "(", "delay", "=", delay, ")" ],
               [ ":", type ] ;
 timer       = "timer", identifier, "(", delay, ",", delay, ")" ;
 state       = "state", identifier, ":", type, "=", literal ;
+context     = "context", identifier, "(", identifier, { ",", identifier }, ")",
+              [ string ] ;
 instance    = identifier, "=", identifier, "(", [ args ], ")" ;
 args        = literal, { ",", literal } ;
 literal     = natural | string | boolean ;
@@ -68,6 +70,13 @@ natural     = digit, { digit } ;
 
 Identifiers are case-sensitive. `//` starts a line comment and `/* ... */`
 delimits a block comment.
+
+A string is `"…"`, where `\"` and `\\` are the only escapes, or `"""…"""`,
+which has none and ends at the next `"""`. A `"""` string is written indented
+with the code around it, and means the text without that indentation: a line
+break straight after the opening quotes and a blank last line before the
+closing ones are dropped, and so is the leading whitespace every non-blank
+line shares. It goes wherever a string does, a prompt included.
 
 ### 2.1 Teams, agents and main
 
@@ -221,6 +230,25 @@ invocation, its interpolation expands to `<absent>`.
   `omar_set_port` sets it (§4.2). Since the instance's reactions run one at a
   time, no two hold its state at once. State is the instance's own: a nested
   team's is out of reach, and data crosses instances only through ports.
+- `context notes(planner, coder) """Keep decisions; drop what is resolved."""`
+  declares state the listed agents keep together without their prompts saying
+  so: a `string`, starting empty. Before each task of a listed agent, the
+  runtime hands the agent the context — its name, the directive if the program
+  gave one, what it holds now — ahead of the prompt, and asks it to set the
+  full updated text with `omar_set_port` before completing. Without a
+  directive the name is the only hint, so name it for what it holds.
+
+  The write commits with the task, like any state write (§4.2): the next task
+  that shares it starts from it, at the same tag if declared later, and a task
+  that expires leaves it as it was. Not writing leaves it unchanged; it is not
+  an effect, so no contract requires it. A write over 16 KiB is refused, with
+  the agent told to condense it: it is handed whole to every task that shares
+  it.
+
+  The listed names must be agents of the team, each once. Otherwise a context
+  is the team's state like any other: a task of an unlisted agent may read
+  `$(notes)` and set it, and a body reads `self.notes`. Changing its
+  declaration in a mutation (§5.1) declares it again, empty.
 
 ### 2.3 Effect contracts
 
@@ -450,6 +478,8 @@ rejected.
 
 The invocation message lists the instance's state as it stands, under
 `state:`, so an agent knows what it may read and set without its prompt saying.
+A context the agent shares (§2.2) is set out ahead of the prompt instead, with
+its directive and the request to update it, and left out of `state:`.
 
 The topology runner owns invocation records in memory. Topology-scoped MCP
 processes send authenticated commands to the runner over a loopback connection.
@@ -463,7 +493,8 @@ the earlier value; an optional effect replaces it only when present.
 
 `omar_pending` lists the invocations addressed to the asking agent that are not
 yet complete, each with its prompt, trigger values, permitted effects, and its
-instance's state with each variable's type. It is
+instance's state with each variable's type, and the contexts its agent shares
+with their directives. It is
 scoped to that agent, so it discloses nothing the agent's own reactions were not
 already wired to see.
 
@@ -555,7 +586,7 @@ DECLARE_INSTANCE name team parent
 SPAWN_AGENT name backend
 DEFINE_PORT kind name type [delay]
 DECLARE_TIMER name offset period
-DECLARE_STATE name type initial
+DECLARE_STATE name type initial [agents] [directive]
 DECLARE_PARAM name type value
 CONNECT_PORTS source target [delay]
 INSTALL_REACTION id agent triggers effects contract prompt [body] [within]
