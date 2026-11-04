@@ -242,11 +242,21 @@ async fn health(base: &str) -> Result<()> {
 
 async fn ensure_runtime() -> Result<()> {
     match tokio::net::TcpStream::connect("127.0.0.1:45073").await {
-        Ok(_) => {
-            return health(RUNTIME_URL)
-                .await
-                .context("Port 45073 is occupied; no service was stopped or replaced")
-        }
+        Ok(_) => match health(RUNTIME_URL).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // `down` may acknowledge before its HTTP listener closes. Only
+                // proceed if the port actually becomes free; never replace a service.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                match tokio::net::TcpStream::connect("127.0.0.1:45073").await {
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
+                    _ => {
+                        return Err(error)
+                            .context("Port 45073 is occupied; no service was stopped or replaced")
+                    }
+                }
+            }
+        },
         Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
         Err(error) => return Err(error).context("Cannot check runtime port 45073"),
     }
