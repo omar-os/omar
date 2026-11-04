@@ -452,15 +452,15 @@ button:focus-visible, select:focus-visible { outline-offset: 3px; }
   .prompt-box > div { flex-wrap: wrap; gap: 8px; }
 }
 
-.workflow-review { flex-shrink: 0; max-height: 390px; overflow: auto; padding: 16px 20px; border-top: 1px solid #e4e2e9; background: #faf9fc; color: #252330; font-size: 13px; }
+.workflow-review { flex-shrink: 0; max-height: 390px; overflow: auto; padding: 16px 20px; border-top: 1px solid var(--line); background: var(--panel); color: var(--text); font-size: 13px; }
 .workflow-review header { display: flex; justify-content: space-between; gap: 12px; }
-.workflow-review header span, .workflow-review small { color: #6c6878; }
+.workflow-review header span, .workflow-review small { color: var(--muted); }
 .workflow-review p, .workflow-review details { margin: 10px 0; }
 .workflow-review summary { cursor: pointer; font-weight: 600; }
 .workflow-review fieldset { border: 0; padding: 0; min-width: 0; }
 .workflow-review label { display: block; margin: 12px 0; }
 .workflow-review small { display: block; margin-top: 5px; overflow-wrap: anywhere; }
-.workflow-review input:not([type=checkbox]), .workflow-review select { display: block; width: 100%; padding: 8px; margin-top: 6px; color: inherit; background: white; border: 1px solid #d4d0df; border-radius: 6px; }
+.workflow-review input:not([type=checkbox]), .workflow-review select { display: block; width: 100%; padding: 8px; margin-top: 6px; color: inherit; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 6px; }
 .workflow-review input[type=checkbox] { margin-right: 7px; }
 .workflow-review-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.workflow-review [role=alert] { color: #a02c35; }
+.workflow-review [role=alert] { color: var(--danger); }
