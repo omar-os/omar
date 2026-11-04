@@ -1,0 +1,17 @@
+{
+  "runtimeUrl": "http://127.0.0.1:PORT/chats/CHAT-ID",
+  "workspaceId": "T_WORKSPACE",
+  "allowedUsers": [
+    "U_YOUR_USER"
+  ],
+  "allowedChannels": [
+    "C_DEMO_CHANNEL"
+  ],
+  "command": "demo",
+  "programPath": "demo.omar",
+  "outputPort": "run.result",
+  "timeoutSeconds": 60,
+  "rawInputs": [
+    "run.request=Slack → OMAR → Slack: demo completed."
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "type": "string",
+  "enum": [
+    "complete",
+    "partial",
+    "unavailable"
+  ]
+}

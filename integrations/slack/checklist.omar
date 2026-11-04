@@ -1,0 +1,9 @@
+// Registry demonstration: no model calls or application side effects.
+team WorkflowChecklist {
+    input text : string
+    output report : string
+    text -> report after 0
+}
+main SlackChecklist {
+    checklist = WorkflowChecklist()
+}

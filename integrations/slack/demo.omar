@@ -1,0 +1,9 @@
+// No models, tools, network requests, or application side effects.
+team MessagingDemo {
+    input request : string
+    output result : string
+    request -> result after 0
+}
+main SlackDemo {
+    run = MessagingDemo()
+}
