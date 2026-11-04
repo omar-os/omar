@@ -316,6 +316,12 @@ def notesTeam (task : String) : String :=
      state notes : string = \"\" " ++ task ++ " }
    main { t = T() }"
 
+/-- `T` with agents `a` and `b`, and `decl` among its declarations. -/
+def contextTeam (decl : String) : String :=
+  "team T[a : Codex, b : Codex] { input go : int output out : string " ++ decl ++ "
+     task a(go) -> out \"Do $(go)\" }
+   main { t = T() }"
+
 def rejectionCases : Array (String × String × String) := #[
   -- Only zero may be unitless; every other delay says what it means.
   ("connection delay without a unit",
@@ -381,7 +387,20 @@ def rejectionCases : Array (String × String × String) := #[
     notesTeam "task a(go) -> out \"Use $(go\"", "unterminated"),
   ("a parameter named like a state variable",
     "team Wire(n : int) { input src : int output dst : int state n : int = 0 }
-     main { w = Wire(1) }", "is also a port, timer or state")
+     main { w = Wire(1) }", "is also a port, timer or state"),
+  -- A context names the agents of its own team that share it.
+  ("a context listing an unknown agent",
+    contextTeam "context ops(a, ghost)", "lists 'ghost', which is not an agent of team 'T'"),
+  ("a context listing no agents",
+    contextTeam "context ops()", "lists no agents"),
+  ("a context listing an agent twice",
+    contextTeam "context ops(a, a)", "lists an agent twice"),
+  ("a context named like a port",
+    contextTeam "context go(a)", "context 't.go' is also a port"),
+  ("a context named like a state variable",
+    contextTeam "context ops(a) state ops : int = 0", "duplicate state"),
+  ("an unterminated block string",
+    contextTeam "context ops(a) \"\"\"never closed", "unterminated")
 ]
 
 /-- A task reads its team's state as `$(notes)`, which the runtime looks up
@@ -396,6 +415,43 @@ def testPromptReads : IO Unit := do
       | none => throw (IO.userError "prompt reads: no reaction")
   | .error message => throw (IO.userError s!"prompt reads: {message}")
   IO.println "prompt read tests passed"
+
+/-- A context is a string state that names the agents sharing it, and its
+    directive if given. A block string's indentation is the code's, not the
+    text's: the common part is dropped, a deeper line keeps the rest, and a
+    lone `"` needs no escape. -/
+def testContexts : IO Unit := do
+  let decl := "context ops(a, b) \"\"\"
+        Keep decisions.
+          - one \"quoted\" item
+
+        Drop what is resolved.
+      \"\"\"
+     context style(b)"
+  match lex (contextTeam decl) >>= parse "T" with
+  | .ok program =>
+      match program.states.find? (·.name == "t.ops"), program.states.find? (·.name == "t.style") with
+      | some ops, some style =>
+          assertEqual "context type" ops.type "string"
+          assertEqual "context starts empty" (ops.initial == .str "") true
+          assertEqual "sharing agents qualified" ops.sharedBy #["t.a", "t.b"]
+          assertEqual "block string dedented" ops.directive
+            (some "Keep decisions.\n  - one \"quoted\" item\n\nDrop what is resolved.")
+          assertEqual "no directive" style.directive none
+          assertEqual "one sharer" style.sharedBy #["t.b"]
+      | _, _ => throw (IO.userError "contexts: missing")
+  | .error message => throw (IO.userError s!"contexts: {message}")
+  match compileSource "T" (contextTeam "context ops(a) \"Keep it short.\"") with
+  | .ok bytecode =>
+      assertEqual "context bytecode"
+        (bytecode.splitOn "\"agents\": [\"t.a\"], \"directive\": \"Keep it short.\"").length 2
+  | .error message => throw (IO.userError s!"context bytecode: {message}")
+  -- A port may still be called `context`, and connect.
+  match lex "team W { input context : int output dst : int context -> dst } main { w = W() }"
+      >>= parse "W" with
+  | .ok _ => pure ()
+  | .error message => throw (IO.userError s!"port named context: {message}")
+  IO.println "context tests passed"
 
 /-- Every type state may have has a literal to start from. -/
 def testStateLiterals : IO Unit :=
@@ -781,6 +837,7 @@ def main : IO UInt32 := do
     testDelayUnits
     testStateLiterals
     testPromptReads
+    testContexts
     testShutdown
     testCodeTerminator
     testExternalSchemas

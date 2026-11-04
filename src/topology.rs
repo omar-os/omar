@@ -85,6 +85,13 @@ pub enum Instruction {
         initial: Value,
         #[serde(default)]
         instance: String,
+        /// For a `context`: the agents whose tasks are handed it before they
+        /// run and asked to update it after. Empty for plain state.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        agents: Vec<String>,
+        /// How the program says a context should be kept, if it does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directive: Option<String>,
     },
     /// A team parameter and the argument its instantiation bound to it.
     DeclareParam {
@@ -263,6 +270,11 @@ pub struct StateVarState {
     pub initial: Value,
     #[serde(default)]
     pub instance: String,
+    /// A context's sharing agents and directive; see `Instruction::DeclareState`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directive: Option<String>,
 }
 
 /// A team parameter with the argument bound to it, which is constant for the
@@ -805,6 +817,8 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 ty,
                 initial,
                 instance,
+                agents,
+                directive,
             } => {
                 require_identifier("state", name)?;
                 check_instance(&state, "state", name, instance)?;
@@ -820,10 +834,28 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 if !starts_well {
                     bail!("state '{name}' is {ty} but starts as {initial}");
                 }
+                // A context is a note its agents read and rewrite: text, and
+                // shared only by agents of its own instance.
+                if !agents.is_empty() || directive.is_some() {
+                    if ty != "string" {
+                        bail!("context '{name}' is {ty}; a context is a string");
+                    }
+                    if agents.is_empty() {
+                        bail!("context '{name}' lists no agents");
+                    }
+                }
+                for agent in agents {
+                    match state.agents.get(agent) {
+                        Some(spec) if spec.instance == *instance => {}
+                        _ => bail!("context '{name}' lists '{agent}', which is not an agent of its instance"),
+                    }
+                }
                 let var = StateVarState {
                     ty: ty.clone(),
                     initial: initial.clone(),
                     instance: instance.clone(),
+                    agents: agents.clone(),
+                    directive: directive.clone(),
                 };
                 if state.state_vars.insert(name.clone(), var).is_some() {
                     bail!("duplicate state '{name}'");
@@ -1275,6 +1307,10 @@ struct InvocationRecord {
     /// two of them hold it at once.
     state_values: BTreeMap<String, Value>,
     state_types: BTreeMap<String, String>,
+    /// The contexts its agent shares, with their directives, and every
+    /// context of the instance; see `InvocationSpec`.
+    contexts: BTreeMap<String, Option<String>>,
+    context_names: BTreeSet<String>,
     prompt: String,
     writes: BTreeMap<String, Value>,
     completed: bool,
@@ -1298,6 +1334,9 @@ struct PendingInvocation {
     state: BTreeMap<String, Value>,
     #[serde(default)]
     state_types: BTreeMap<String, String>,
+    /// The contexts its agent shares, and how each should be kept.
+    #[serde(default)]
+    contexts: BTreeMap<String, Option<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1449,6 +1488,9 @@ impl InvocationRegistry {
                 let (port, ty) = (port.clone(), ty.clone());
                 validate_value(&ty, &args.value)
                     .with_context(|| format!("invalid value for port '{}'", port))?;
+                if invocation.record.context_names.contains(&port) {
+                    check_context_size(&port, &args.value)?;
+                }
                 invocation.record.writes.insert(port.clone(), args.value);
                 Ok(json!({"status":"buffered","port":port}))
             }
@@ -1469,6 +1511,7 @@ impl InvocationRegistry {
                         allowed_effects: entry.record.allowed_effects.clone(),
                         state: entry.record.state_values.clone(),
                         state_types: entry.record.state_types.clone(),
+                        contexts: entry.record.contexts.clone(),
                     })
                     .collect();
                 Ok(json!({ "pending": pending }))
@@ -1978,7 +2021,7 @@ fn validate_contract(contract: &str, writes: &BTreeMap<String, Value>) -> Result
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct InvocationSpec {
     id: u64,
     reaction_id: String,
@@ -1997,6 +2040,12 @@ struct InvocationSpec {
     state_values: BTreeMap<String, Value>,
     /// Their types, which is what a task's write of one is checked against.
     state_types: BTreeMap<String, String>,
+    /// The contexts this invocation's agent shares, each with the directive
+    /// the program gave it: handed to the agent ahead of its prompt.
+    contexts: BTreeMap<String, Option<String>>,
+    /// Every context of the instance, shared with this agent or not: a write
+    /// to one is held to `CONTEXT_LIMIT`.
+    context_names: BTreeSet<String>,
     contract: String,
     prompt: String,
     /// What the program allows this invocation, overriding the run-wide
@@ -2042,6 +2091,59 @@ fn prompt_values(invocation: &InvocationSpec) -> BTreeMap<String, Value> {
         .collect()
 }
 
+/// The most a context may hold, in bytes. It is handed whole to every task
+/// that shares it, so it is a note to keep short, not a transcript.
+const CONTEXT_LIMIT: usize = 16 * 1024;
+
+fn check_context_size(name: &str, value: &Value) -> Result<()> {
+    let size = value.as_str().map_or(0, str::len);
+    if size > CONTEXT_LIMIT {
+        bail!(
+            "context '{}' would be {size} bytes, over its {CONTEXT_LIMIT}-byte limit; condense it and set it again",
+            unqualified(name)
+        );
+    }
+    Ok(())
+}
+
+/// A name as the team wrote it, without the instance path before it.
+fn unqualified(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// What a task is handed before its prompt: each context its agent shares,
+/// how to keep it, what it holds now, and that it should leave it updated.
+/// That is the whole of a context — the reading and writing a prompt would
+/// otherwise have to ask for.
+fn context_preamble(invocation: &InvocationSpec) -> String {
+    let mut preamble = String::new();
+    for (name, directive) in &invocation.contexts {
+        let short = unqualified(name);
+        let value = invocation
+            .state_values
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        preamble.push_str(&format!(
+            "Shared context `{short}`, kept by your team between its tasks.\n"
+        ));
+        if let Some(directive) = directive {
+            preamble.push_str(&format!("How to keep it: {directive}\n"));
+        }
+        if value.is_empty() {
+            preamble.push_str("It is empty so far.\n");
+        } else {
+            preamble.push_str(&format!(
+                "It holds:\n<context name=\"{short}\">\n{value}\n</context>\n"
+            ));
+        }
+        preamble.push_str(&format!(
+            "Before omar_complete, set `{short}` to its full updated text with omar_set_port, so the next task starts from what this one learned. Leave it alone if nothing changed.\n\n"
+        ));
+    }
+    preamble
+}
+
 /// The registry's record of an agent invocation, its prompt rendered.
 fn invocation_record(team: &str, invocation: &InvocationSpec) -> Result<InvocationRecord> {
     Ok(InvocationRecord {
@@ -2054,7 +2156,13 @@ fn invocation_record(team: &str, invocation: &InvocationSpec) -> Result<Invocati
         trigger_values: invocation.trigger_values.clone(),
         state_values: invocation.state_values.clone(),
         state_types: invocation.state_types.clone(),
-        prompt: render_prompt(&invocation.prompt, &prompt_values(invocation))?,
+        contexts: invocation.contexts.clone(),
+        context_names: invocation.context_names.clone(),
+        prompt: format!(
+            "{}{}",
+            context_preamble(invocation),
+            render_prompt(&invocation.prompt, &prompt_values(invocation))?
+        ),
         writes: BTreeMap::new(),
         completed: false,
     })
@@ -4323,6 +4431,17 @@ fn invocation_spec(
         .filter(|(_, var)| var.instance == reaction.instance)
         .filter_map(|(name, _)| store.get(name).map(|value| (name.clone(), value.clone())))
         .collect();
+    let instance_contexts = || {
+        state
+            .state_vars
+            .iter()
+            .filter(|(_, var)| var.instance == reaction.instance && !var.agents.is_empty())
+    };
+    let contexts = instance_contexts()
+        .filter(|(_, var)| var.agents.contains(&reaction.agent))
+        .map(|(name, var)| (name.clone(), var.directive.clone()))
+        .collect();
+    let context_names = instance_contexts().map(|(name, _)| name.clone()).collect();
     Ok(InvocationSpec {
         id: next_task_id()?,
         reaction_id: reaction_id.clone(),
@@ -4333,6 +4452,8 @@ fn invocation_spec(
         types,
         state_values,
         state_types,
+        contexts,
+        context_names,
         contract: reaction.contract.clone(),
         prompt: reaction.prompt.clone(),
         within: reaction.within.map(Duration::from_nanos),
@@ -4386,11 +4507,14 @@ fn invocation_message(invocation: &InvocationSpec, rendered: &str) -> Result<Str
     }
     header.push_str(&format!("contract: {}\n", invocation.contract));
     let mut state_note = String::new();
-    if !invocation.state_values.is_empty() {
-        header.push_str(&format!(
-            "state: {}\n",
-            serde_json::to_string(&invocation.state_values)?
-        ));
+    // A context this agent shares is already set out ahead of the prompt.
+    let state: BTreeMap<_, _> = invocation
+        .state_values
+        .iter()
+        .filter(|(name, _)| !invocation.contexts.contains_key(*name))
+        .collect();
+    if !state.is_empty() {
+        header.push_str(&format!("state: {}\n", serde_json::to_string(&state)?));
         state_note = " The state above is your team's, kept between its tasks: change any of it with omar_set_port the same way, if the next task should see something else.".to_string();
     }
     Ok(format!(
@@ -5048,6 +5172,8 @@ mod tests {
             types: BTreeMap::from([("Decision".to_string(), decision.clone())]),
             state_values: BTreeMap::new(),
             state_types: BTreeMap::new(),
+            contexts: BTreeMap::new(),
+            context_names: BTreeSet::new(),
             contract: "out".into(),
             prompt: "Decide.".into(),
             within: None,
@@ -7315,6 +7441,8 @@ mod tests {
             types: BTreeMap::new(),
             state_values: BTreeMap::from([("t.notes".into(), json!("old"))]),
             state_types: BTreeMap::from([("t.notes".into(), "string".into())]),
+            contexts: BTreeMap::new(),
+            context_names: BTreeSet::new(),
             contract: String::new(),
             prompt: "Notes: $(t.notes)".into(),
             within: None,
@@ -7330,6 +7458,207 @@ mod tests {
             message.contains("change any of it with omar_set_port"),
             "{message}"
         );
+    }
+
+    /// Three agents of one instance; `a` and `b` share the context `ops`,
+    /// `c` does not. All run at the one tag `go` arrives, in that order.
+    fn shared_context_bytecode() -> Bytecode {
+        serde_json::from_str(
+            r#"{
+              "version": 1,
+              "team": "Ctx",
+              "instructions": [
+                {"op":"begin_plan","team":"Ctx"},
+                {"op":"declare_instance","name":"t","parent":"","team":"T"},
+                {"op":"spawn_agent","instance":"t","name":"t.a","backend":"stub"},
+                {"op":"spawn_agent","instance":"t","name":"t.b","backend":"stub"},
+                {"op":"spawn_agent","instance":"t","name":"t.c","backend":"stub"},
+                {"op":"define_port","instance":"t","kind":"input","name":"t.go","type":"int"},
+                {"op":"declare_state","instance":"t","name":"t.ops","type":"string","initial":"",
+                  "agents":["t.a","t.b"],"directive":"List decisions, newest last."},
+                {"op":"install_reaction","instance":"t","id":"t.reaction.0","agent":"t.a",
+                  "triggers":["t.go"],"effects":[],"contract":"","prompt":"Plan."},
+                {"op":"install_reaction","instance":"t","id":"t.reaction.1","agent":"t.b",
+                  "triggers":["t.go"],"effects":[],"contract":"","prompt":"Build."},
+                {"op":"install_reaction","instance":"t","id":"t.reaction.2","agent":"t.c",
+                  "triggers":["t.go"],"effects":[],"contract":"","prompt":"Review."},
+                {"op":"commit_plan"}
+              ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// Answers through the registry as an agent does over MCP. `a` records a
+    /// decision in the context without its prompt asking; the others only
+    /// read. Each one's pending entry and message are kept.
+    struct ContextKeepers {
+        registry: InvocationRegistry,
+        seen: Mutex<Vec<(String, Value, String)>>,
+    }
+    impl ReactionExecutor for ContextKeepers {
+        fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+            let record = invocation_record("Ctx", &invocation)?;
+            let message = invocation_message(&invocation, &record.prompt)?;
+            let completion = self.registry.register(record)?;
+            let agent = invocation.agent.clone();
+            let pending = self
+                .registry
+                .execute("Ctx", &agent, InvocationCommand::Pending)?;
+            self.seen
+                .lock()
+                .unwrap()
+                .push((agent.clone(), pending["pending"][0].clone(), message));
+            if agent == "t.a" {
+                self.registry.execute(
+                    "Ctx",
+                    &agent,
+                    InvocationCommand::SetPort(SetPortArgs {
+                        task_id: invocation.id,
+                        port: "ops".into(),
+                        value: json!("Use SQLite."),
+                    }),
+                )?;
+            }
+            self.registry.execute(
+                "Ctx",
+                &agent,
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: invocation.id,
+                }),
+            )?;
+            let writes = completion.try_recv()?;
+            self.registry.remove(&invocation.id);
+            Ok(writes)
+        }
+    }
+
+    /// A context is handed to the tasks of the agents that share it, ahead of
+    /// a prompt that never mentions it, with its directive and the ask to
+    /// update it; what one writes reaches the next. An agent that does not
+    /// share it sees it only as the team's state.
+    #[test]
+    fn a_context_is_handed_to_its_agents_and_kept_by_them() {
+        let state = verify(&shared_context_bytecode()).unwrap();
+        let keepers = ContextKeepers {
+            registry: InvocationRegistry::default(),
+            seen: Mutex::new(Vec::new()),
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::from([("t.go".to_string(), json!(1))])),
+            &keepers,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            None,
+            Some(&Recorder::new()),
+        )
+        .unwrap();
+        let LoopEnd::Completed(settled) = end else {
+            panic!("the run should finish");
+        };
+        assert_eq!(settled.state_vars["t.ops"], json!("Use SQLite."));
+        let seen = keepers.seen.lock().unwrap();
+        let [(_, a, a_message), (_, b, b_message), (_, c, c_message)] = &seen[..] else {
+            panic!("expected three invocations, got {}", seen.len());
+        };
+        let a_prompt = a["prompt"].as_str().unwrap();
+        assert!(a_prompt.starts_with("Shared context `ops`"), "{a_prompt}");
+        assert!(a_prompt.contains("How to keep it: List decisions, newest last.\n"));
+        assert!(a_prompt.contains("It is empty so far.\n"), "{a_prompt}");
+        assert!(a_prompt.contains("set `ops` to its full updated text with omar_set_port"));
+        assert!(a_prompt.ends_with("\n\nPlan."), "{a_prompt}");
+        assert_eq!(
+            a["contexts"]["t.ops"],
+            json!("List decisions, newest last.")
+        );
+        // `b` runs after `a` at the same tag, so it starts from `a`'s note.
+        let b_prompt = b["prompt"].as_str().unwrap();
+        assert!(
+            b_prompt.contains("<context name=\"ops\">\nUse SQLite.\n</context>\n"),
+            "{b_prompt}"
+        );
+        assert!(b_prompt.ends_with("Build."), "{b_prompt}");
+        // Set out ahead of the prompt, so not repeated in the state line.
+        for message in [a_message, b_message] {
+            assert!(!message.contains("state: "), "{message}");
+        }
+        // `c` shares no context: its prompt is its own, and `ops` is just the
+        // team's state, which every task may read.
+        assert_eq!(c["prompt"], json!("Review."));
+        assert_eq!(c["contexts"], json!({}));
+        assert!(
+            c_message.contains("state: {\"t.ops\":\"Use SQLite.\"}\n"),
+            "{c_message}"
+        );
+    }
+
+    /// A context write over the limit is refused with what to do about it,
+    /// whoever writes it; one at the limit is taken.
+    #[test]
+    fn a_context_write_over_its_limit_is_refused() {
+        let registry = InvocationRegistry::default();
+        let completion = registry
+            .register(InvocationRecord {
+                id: 12,
+                team: "Ctx".into(),
+                agent: "t.c".into(),
+                reaction: "t.reaction.2".into(),
+                state_types: BTreeMap::from([("t.ops".into(), "string".into())]),
+                context_names: BTreeSet::from(["t.ops".to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+        let set = |value: String| {
+            registry.execute(
+                "Ctx",
+                "t.c",
+                InvocationCommand::SetPort(SetPortArgs {
+                    task_id: 12,
+                    port: "ops".into(),
+                    value: json!(value),
+                }),
+            )
+        };
+        let refused = set("x".repeat(CONTEXT_LIMIT + 1)).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("over its 16384-byte limit; condense it"),
+            "{refused:#}"
+        );
+        set("x".repeat(CONTEXT_LIMIT)).unwrap();
+        registry
+            .execute(
+                "Ctx",
+                "t.c",
+                InvocationCommand::Complete(CompleteArgs { task_id: 12 }),
+            )
+            .unwrap();
+        assert_eq!(
+            completion.try_recv().unwrap()["t.ops"]
+                .as_str()
+                .unwrap()
+                .len(),
+            CONTEXT_LIMIT
+        );
+    }
+
+    /// A context is text, shared by agents of its own instance.
+    #[test]
+    fn a_context_must_be_text_shared_by_its_own_agents() {
+        let with = |declaration: &str| {
+            let mut bytecode = shared_context_bytecode();
+            let at = bytecode
+                .instructions
+                .iter()
+                .position(|i| matches!(i, Instruction::DeclareState { .. }))
+                .unwrap();
+            bytecode.instructions[at] = serde_json::from_str(declaration).unwrap();
+            verify(&bytecode).map(|_| ()).unwrap_err().to_string()
+        };
+        assert!(with(r#"{"op":"declare_state","instance":"t","name":"t.ops","type":"int","initial":0,"agents":["t.a"]}"#)
+            .contains("a context is a string"));
+        assert!(with(r#"{"op":"declare_state","instance":"t","name":"t.ops","type":"string","initial":"","agents":["t.z"]}"#)
+            .contains("not an agent of its instance"));
     }
 
     #[test]
