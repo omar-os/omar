@@ -138,7 +138,7 @@ launch_handoff() {
   rm -f "$handoff_file"
   (
     cd "$work_dir"
-    HOME="$home_dir" "$OMAR_BIN" attach -s "$session_id" --tui "$@" </dev/null >"$home_dir/launch.log" 2>&1
+    HOME="$home_dir" "$OMAR_BIN" attach -s "$session_id" --tui --agents "$@" </dev/null >"$home_dir/launch.log" 2>&1
   ) || true
 }
 

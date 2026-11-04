@@ -68,7 +68,7 @@ session_json="$(cd "$REPO_ROOT" && HOME="$home_dir" "$OMAR_BIN" up -s harness --
 session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$session_json")"
 server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
 tmux_cmd new-session -d -s omar-dashboard \
-  "cd '$REPO_ROOT' && HOME='$home_dir' '$OMAR_BIN' attach -s '$session_id' --tui"
+  "cd '$REPO_ROOT' && HOME='$home_dir' '$OMAR_BIN' attach -s '$session_id' --tui --agents"
 
 wait_for_session omar-dashboard
 wait_for_session omar-agent-ea-0

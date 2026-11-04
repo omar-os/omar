@@ -127,7 +127,7 @@ trust_level="trusted"
                                                     capture_output=True, text=True, timeout=120, check=True).stdout)
                 server = session['tmux_server']
                 state = Path(session['directory'])
-                command = shlex.join(['env', '-u', 'TMUX', OMAR, 'attach', '-s', session['name'], '--tui'])
+                command = shlex.join(['env', '-u', 'TMUX', OMAR, 'attach', '-s', session['name'], '--tui', '--agents'])
                 tmux('new-session', '-d', '-s', 'cold-launch', '-x', '110', '-y', '35', '-c', str(work), command)
                 until(lambda: 'omar-dashboard' in tmux('list-sessions'), 'cold dashboard')
             else:
