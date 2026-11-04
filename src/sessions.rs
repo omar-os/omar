@@ -1635,6 +1635,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             Ok(())
         }),
         Some(Commands::Attach { tui: true, .. }) => target(cli).and_then(|s| {
+            anyhow::ensure!(s.state == "ready", "session '{}' is {}; attach needs a ready runtime", s.name, s.state);
             rpc(&s,json!({"op":"hello"}),Duration::from_secs(5))?;
             crate::console::run(&s)
         }),
