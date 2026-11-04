@@ -269,6 +269,7 @@ export function assertChatMessage(value: unknown): ChatMessage {
 }
 
 export type RunRequest = {
+  design_sequence?: number;
   program: string;
   inputs: Record<string, unknown>;
   conversation_id?: string;

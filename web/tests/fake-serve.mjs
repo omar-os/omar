@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 
 /** Mirrors the daemon's cap; the names reach the assistant's pane. */
 const MAX_SELECTION = 64;
+const MODEL_CATALOG = JSON.parse(await readFile(new URL("../../config/workflow-models.example.json", import.meta.url), "utf8"));
 
 const CORS = {
   "access-control-allow-origin": "*",
@@ -43,6 +44,7 @@ const PROPOSED_PROGRAM = await readFile(
 );
 
 export async function startFakeServe({
+  workflowPlanning = false,
   stepMs = 120,
   liveChatReplayDelayMs = 0,
   host = "127.0.0.1",
@@ -87,6 +89,28 @@ export async function startFakeServe({
     }
     if (request.method === "POST" && url.pathname === "/v1/programs/check") {
       return readBody(request).then((body) => checkProgram(body, response));
+    }
+    if (workflowPlanning && request.method === "GET" && url.pathname === "/v1/workflow/catalog") return json(response, 200, MODEL_CATALOG);
+    if (workflowPlanning && request.method === "POST" && url.pathname === "/v1/workflow/review") {
+      const body = JSON.parse(await readBody(request));
+      const previous = chat.messages.findLast(m => m.design);
+      if (previous?.sequence !== body.sequence) return json(response, 409, { error: "revision conflict" });
+      const design = structuredClone(previous.design);
+      design.program = body.program; design.inputs = body.inputs; design.files = body.files;
+      const plan = design.workflow;
+      for (const [id, answer] of Object.entries(body.answers)) {
+        if ((plan.review.answers[id] ?? "") !== answer) plan.review.needs_redesign = true;
+        plan.review.answers[id] = answer;
+      }
+      plan.review.accepted_assumptions = body.accepted_assumptions;
+      plan.review.confirmed = body.confirmed;
+      for (const [agent, id] of Object.entries(body.choices)) {
+        plan.choices[agent].profile_id = id;
+        plan.profiles[agent] = MODEL_CATALOG.profiles.find(p => p.id === id);
+      }
+      const message = publishChat("operator", "Saved workflow review.", design, false, [], chat);
+      chat.busy = false;
+      return json(response, 200, message);
     }
     if (request.method === "POST" && url.pathname === "/v1/runs") {
       return readBody(request).then((body) => admit(body, response, chat));
@@ -706,7 +730,9 @@ export async function startFakeServe({
           "- `reviewer` critiques it\n\n" +
           "```\nrequest -> planner -> reviewer -> result\n```",
         {
-          program: PROPOSED_PROGRAM,
+          program: workflowPlanning && request.text.includes("saved answers")
+            ? PROPOSED_PROGRAM.replace("Draft a concrete plan", "Draft a concrete plan for the product team") : PROPOSED_PROGRAM,
+          ...(workflowPlanning ? { workflow: planningFixture(preview, chat) } : {}),
           inputs: { "flow.request": chat.messages[0]?.text ?? "" },
           preview,
           // Asked for safety, the real EA proves properties of what it proposes.
@@ -722,6 +748,21 @@ export async function startFakeServe({
         stepMs,
       );
     }, stepMs);
+  }
+
+  function planningFixture(preview, chat) {
+    const previous = chat.messages.findLast(m => m.design)?.design.workflow;
+    const id = value => value.replace(/^(agent|reaction)::/, "");
+    const profiles = Object.fromEntries(preview.agents.filter(a => /codex|claude/i.test(a.backend)).map(a => [id(a.id), MODEL_CATALOG.profiles.find(p => p.id === "codex-quality")]));
+    return {
+      outcome: "A grounded release recommendation", constraints: ["Use supplied release evidence"],
+      assumptions: [{ id: "internal", text: "This brief is for an internal audience" }],
+      questions: previous?.review.needs_redesign ? [] : [{ id: "audience", text: "Who will use this brief?", reactions: [id(preview.reactions[0].id)] }],
+      steps: preview.reactions.map(r => ({ reaction: id(r.id), purpose: "Review release evidence", task: "synthesis", complexity: "complex", success_criteria: ["Claims cite supplied evidence"] })),
+      sources: [{ location: "Supplied release notes", finding: "A review is needed before shipping", limitation: "Fixture for UI testing" }], research_gaps: [],
+      choices: Object.fromEntries(Object.entries(profiles).map(([agent, p]) => [agent, { profile_id: p.id, reason: "Complex synthesis; provisional profile", evidence_ids: [] }])),
+      profiles, review: { answers: previous?.review.answers ?? {}, accepted_assumptions: [], confirmed: false, needs_redesign: false },
+    };
   }
 
   function latest(chat = activeChat) {

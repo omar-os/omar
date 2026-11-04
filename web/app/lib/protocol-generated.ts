@@ -139,7 +139,39 @@ source: string,
  */
 mentions: Array<string>, problems: Array<ProofProblem>, };
 
-export type ProposedDesign = { program: string,
+export type ModelProfile = { id: string, backend: string, model: string, effort: string | null,
+/**
+ * A routing hint, not a measured price or quality guarantee.
+ */
+tier: string, };
+
+export type ModelEvidence = { id: string, profile_id: string, task: string, finding: string, source: string, observed_at: number, expires_at: number, limitations: string, };
+
+export type ModelCatalog = { profiles: Array<ModelProfile>, evidence: Array<ModelEvidence>, };
+
+export type DesignAssumption = { id: string, text: string, };
+
+export type DesignQuestion = { id: string, text: string, reactions: Array<string>, };
+
+export type DesignStep = { reaction: string, purpose: string, task: string, complexity: string, success_criteria: Array<string>, };
+
+export type DesignSource = { location: string, finding: string, limitation: string, };
+
+export type ModelChoice = { profile_id: string, reason: string, evidence_ids: Array<string>, };
+
+export type DesignReview = { answers: Record<string, string>, accepted_assumptions: Array<string>, confirmed: boolean, needs_redesign: boolean, };
+
+export type WorkflowPlan = { outcome: string, constraints: Array<string>, assumptions: Array<DesignAssumption>, questions: Array<DesignQuestion>, steps: Array<DesignStep>, sources: Array<DesignSource>, research_gaps: Array<string>, choices: Record<string, ModelChoice>,
+/**
+ * Host-owned: assistant proposals cannot confirm a plan or manufacture answers.
+ */
+review: DesignReview,
+/**
+ * Host-owned exact profile snapshots, so a later catalog edit cannot silently change a run.
+ */
+profiles: Record<string, ModelProfile>, };
+
+export type ProposedDesign = { workflow?: WorkflowPlan, program: string,
 /**
  * Companion files relative to program.omar.
  */
