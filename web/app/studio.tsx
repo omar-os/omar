@@ -1173,7 +1173,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       cancelled = true;
     };
   }, [canRun, readOnly, isDemo, serveUrl]);
-  const retrying = run !== null && isRunFinished(run.status);
+  const retrying = (run !== null && isRunFinished(run.status)) || (source.startsWith("// OMAR_TEMPLATE ") && lastTemplateRun !== null && isRunFinished(lastTemplateRun.status));
   const canConfirm = !readOnly && design !== null && ["review", "finished", "failed"].includes(phase);
   const failedRun = run?.status === "failed";
   const failureDetails = failedRun ? (run.error || error || "The run failed.") : "";
@@ -1675,12 +1675,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               {/* The panel draws a proposal before a run and the run after it,
                   so it has to say which one is on screen. */}
               <span className="eyebrow">
-                {snapshot.status === "ready" ? "PROPOSED TOPOLOGY" : "WORKFLOW TOPOLOGY"}
+                {showingDeliverables ? "SAVED DELIVERABLES" : snapshot.status === "ready" ? "PROPOSED TOPOLOGY" : "WORKFLOW TOPOLOGY"}
               </span>
               <h2>{snapshot?.team}</h2>
             </div>
             <div className="run-stats">
-              <span><small>{phase === "review" && failedRun ? "LAST RUN" : "STATUS"}</small>{run?.status ?? snapshot?.status}</span>
+              <span><small>{phase === "review" && (failedRun || templateRun) ? "LAST RUN" : "STATUS"}</small>{run?.status ?? templateRun?.status ?? snapshot?.status}</span>
               <span><small>TAG</small>{tag}</span>
               <span><small>LAG</small>{lag}</span>
             </div>
