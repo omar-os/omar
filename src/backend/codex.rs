@@ -225,10 +225,12 @@ pub(crate) fn ensure_codex_runtime_flags(base_command: &str) -> String {
     }
     let mut command = base_command.to_string();
 
-    if !base_command
-        .split_whitespace()
-        .any(|token| token == "--dangerously-bypass-approvals-and-sandbox")
-    {
+    if !base_command.split_whitespace().any(|token| {
+        matches!(
+            token,
+            "--dangerously-bypass-approvals-and-sandbox" | "--sandbox" | "-s"
+        ) || token.starts_with("--sandbox=")
+    }) {
         command.push_str(" --dangerously-bypass-approvals-and-sandbox");
     }
 
@@ -714,6 +716,13 @@ mod tests {
         let explicit = "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox";
         assert_eq!(ensure_codex_runtime_flags(explicit), explicit);
         assert_eq!(ensure_codex_runtime_flags("bash"), "bash");
+        for command in [
+            "codex --sandbox read-only",
+            "codex --sandbox=read-only",
+            "codex -s read-only",
+        ] {
+            assert_eq!(ensure_codex_runtime_flags(command), command);
+        }
     }
 
     #[test]

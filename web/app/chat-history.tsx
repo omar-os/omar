@@ -33,7 +33,7 @@ export function SidebarIcon({ direction }: { direction: "open" | "close" }) {
   );
 }
 
-export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, readOnly = false, offline = false, onClose, onSelect, onSwitchingChange }: {
+export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, readOnly = false, offline = false, onClose, onSelect, onSwitchingChange, onTemplates }: {
   serveUrl: string;
   activeId: string;
   mobile: boolean;
@@ -46,6 +46,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
   offline?: boolean;
   onClose: () => void;
   onSelect: (conversation: ConversationSummary) => void;
+  onTemplates?: () => void;
   onSwitchingChange: (switching: boolean) => void;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -149,6 +150,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
     </div>
     <div className="history-actions">
       {readOnly ? null : <button className="new-workflow" type="button" disabled={loading || switching} onClick={() => void select()}><span className="new-icon"><WorkflowIcon name="plus" size={15} /></span>New workflow</button>}
+      {!readOnly && onTemplates ? <button className="template-entry" type="button" disabled={offline || switching} onClick={onTemplates}>Browse templates</button> : null}
       <label className="workflow-search"><WorkflowIcon name="search" size={15} /><input aria-label="Search workflows" placeholder="Search workflows…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
     </div>
     <div className="history-label"><span>{sort === "recent" ? "RECENT" : sort === "name" ? "NAME" : "STATUS"}</span><WorkflowSortMenu value={sort} onChange={setSort} /></div>
