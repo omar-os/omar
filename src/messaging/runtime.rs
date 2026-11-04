@@ -112,3 +112,28 @@ impl Runtime for OmarRuntime {
         Ok(run)
     }
 }
+
+/// Resolve only at connector startup; never rebind or retry an ambiguous run admission.
+pub(super) async fn bind_chat(config: &mut super::config::Config) -> Result<()> {
+    if !config.auto_chat {
+        return Ok(());
+    }
+    let mut url = reqwest::Url::parse(&config.runtime_url)?;
+    url.set_path("");
+    let base = url.as_str().trim_end_matches('/').to_string();
+    let runtime = OmarRuntime::new(base.clone())?;
+    let chat = runtime.call("/v1/chats/messaging", Some(&serde_json::json!({"platform":config.platform,"accountId":config.account_id}))).await
+        .map_err(|error| {
+            if error.downcast_ref::<RuntimeError>().is_some_and(|e|e.status==404) {
+                anyhow::anyhow!("Runtime needs the automatic-chat API; restart the same named runtime using this OMAR build, then reconnect")
+            } else { error }
+        })?;
+    let id = chat["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing dedicated chat ID"))?;
+    uuid::Uuid::parse_str(id).map_err(|_| anyhow::anyhow!("Invalid dedicated chat ID"))?;
+    config.runtime_url = format!("{base}/chats/{id}");
+    config.auto_chat = false;
+    eprintln!("Using dedicated {} chat {id} at {base}.", config.platform);
+    Ok(())
+}

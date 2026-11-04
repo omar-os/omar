@@ -369,6 +369,10 @@ fn legacy_config_resolves_bundle_relative_to_config_without_changing_inputs() {
 async fn real_runtime() {
     let path = std::env::var("OMAR_MESSAGING_TEST_CONFIG").unwrap();
     let mut c = Config::load(std::path::Path::new(&path)).unwrap();
+    if c.auto_chat {
+        runtime::bind_chat(&mut c).await.unwrap();
+        println!("AUTO_CHAT_URL={}", c.runtime_url);
+    }
     if c.platform == "discord" {
         c.allowed_conversations = vec!["456".into()];
     }
@@ -452,7 +456,7 @@ fn research_launcher_forwards_arguments_without_global_configuration_changes() {
 fn cli_preserves_config_argument_and_supports_login_logout() {
     use clap::Parser;
     for platform in ["slack", "discord"] {
-        for action in ["config.json", "login", "logout"] {
+        for action in ["config.json", "login", "logout", "connect"] {
             assert!(crate::Cli::try_parse_from(["omar", "messaging", platform, action]).is_ok());
         }
         assert!(crate::Cli::try_parse_from(["omar", "messaging", platform]).is_err());

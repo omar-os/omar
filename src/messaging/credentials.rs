@@ -319,3 +319,25 @@ mod discord_tests {
         }
     }
 }
+
+pub(super) fn ensure(platform: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    let result = if platform == "slack" {
+        load().map(|_| ())
+    } else {
+        discord_load().map(|_| ())
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if !std::io::stdin().is_terminal() => Err(error),
+        Err(_) => {
+            if platform == "slack" {
+                login()?;
+                load().map(|_| ())
+            } else {
+                discord_login()?;
+                discord_load().map(|_| ())
+            }
+        }
+    }
+}

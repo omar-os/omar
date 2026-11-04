@@ -15,6 +15,9 @@ use crate::serve::{ChatMessage, ChatRole};
 pub struct Conversation {
     pub id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(skip)]
+    pub messaging_key: Option<String>,
     #[serde(default)]
     pub ea_id: Option<crate::ea::EaId>,
     pub created_at: u64,
@@ -55,6 +58,7 @@ impl Conversation {
         Self {
             id: Uuid::new_v4().to_string(),
             title: "New chat".into(),
+            messaging_key: None,
             ea_id: None,
             created_at: now(),
             updated_at: now(),
@@ -196,6 +200,26 @@ impl History {
         Ok(id)
     }
 
+    /// Stable platform/account ownership, independent of display title or UI selection.
+    pub fn messaging_chat(&mut self, key: &str, title: &str) -> Result<String> {
+        if let Some(chat) = self
+            .conversations
+            .iter()
+            .find(|c| c.messaging_key.as_deref() == Some(key))
+        {
+            return Ok(chat.id.clone());
+        }
+        let mut next = self.clone();
+        let mut chat = Conversation::new();
+        chat.messaging_key = Some(key.into());
+        chat.title = title.into();
+        let id = chat.id.clone();
+        next.conversations.push(chat);
+        next.save()?;
+        *self = next;
+        Ok(id)
+    }
+
     pub fn select(&mut self, id: Option<&str>) -> Result<()> {
         let mut next = self.clone();
         match id {
@@ -291,6 +315,36 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messaging_identity_survives_rename_restart_and_failed_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chats.json");
+        let mut history = History::load(path.clone()).unwrap();
+        let active = history.active_id.clone();
+        let slack = history.messaging_chat("slack:T1", "Slack").unwrap();
+        history
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == slack)
+            .unwrap()
+            .title = "Renamed by user".into();
+        history.save().unwrap();
+        let mut history = History::load(path.clone()).unwrap();
+        assert_eq!(history.messaging_chat("slack:T1", "Slack").unwrap(), slack);
+        assert_eq!(history.conversation(&slack).title, "Renamed by user");
+        assert_eq!(history.active_id, active);
+        assert_ne!(
+            history.messaging_chat("discord:T1", "Discord").unwrap(),
+            slack
+        );
+        assert_ne!(history.messaging_chat("slack:T2", "Slack").unwrap(), slack);
+        let before = history.conversations.len();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(history.messaging_chat("slack:T3", "Slack").is_err());
+        assert_eq!(history.conversations.len(), before);
+    }
 
     fn message(text: &str) -> ChatMessage {
         ChatMessage {

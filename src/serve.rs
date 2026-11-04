@@ -1647,6 +1647,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             }
         }
         ("GET", "/v1/chats") => (200, workspaces.list()),
+        ("POST", "/v1/chats/messaging") => messaging_chat(&workspaces, &read_body(content_length)?),
         ("POST", "/v1/chats") => {
             let _ = read_body(content_length)?;
             select_chat(&workspaces, None)
@@ -2360,6 +2361,50 @@ impl Context_ {
 }
 
 /// Selection remembers where to open next, without touching another EA.
+fn messaging_chat(workspaces: &Arc<Workspaces>, body: &[u8]) -> (u16, Value) {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Request {
+        platform: String,
+        account_id: String,
+    }
+    let request: Request = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return (400, json!({"error":"Expected platform and accountId"})),
+    };
+    if !matches!(request.platform.as_str(), "slack" | "discord")
+        || request.account_id.is_empty()
+        || request.account_id.len() > 128
+        || !request
+            .account_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return (400, json!({"error":"Invalid messaging identity"}));
+    }
+    // Serialize find/create with browser chat creation and EA allocation.
+    let _selection = workspaces.selection.lock().expect("selection poisoned");
+    let key = format!("{}:{}", request.platform, request.account_id);
+    let title = if request.platform == "slack" {
+        "Slack"
+    } else {
+        "Discord"
+    };
+    let id = match workspaces
+        .history
+        .lock()
+        .expect("history poisoned")
+        .messaging_chat(&key, title)
+    {
+        Ok(id) => id,
+        Err(error) => return (500, json!({"error":error.to_string()})),
+    };
+    if let Err(error) = workspaces.get(&id) {
+        return (500, json!({"error":error.to_string()}));
+    }
+    (200, json!({"id":id}))
+}
+
 fn select_chat(workspaces: &Arc<Workspaces>, id: Option<&str>) -> (u16, Value) {
     let _selection = workspaces.selection.lock().expect("selection poisoned");
     let selected = {
@@ -4444,6 +4489,44 @@ fn write_asset(stream: &mut TcpStream, asset: &crate::web_assets::Asset) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_messaging_chat_requests_create_one_background_chat() {
+        let server = test_server();
+        let active = server.workspaces.history.lock().unwrap().active_id.clone();
+        let address = server.address();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let response = request(
+                        address,
+                        "POST",
+                        "/v1/chats/messaging",
+                        Some(r#"{"platform":"slack","accountId":"T1"}"#),
+                    );
+                    assert!(response.contains(" 200 "), "{response}");
+                    let value: Value =
+                        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    value["id"].as_str().unwrap().to_string()
+                })
+            })
+            .collect();
+        let ids: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(ids.iter().all(|id| id == &ids[0]));
+        let history = server.workspaces.history.lock().unwrap();
+        assert_eq!(history.active_id, active);
+        assert_eq!(history.conversations.len(), 2);
+        assert_eq!(history.conversation(&ids[0]).title, "Slack");
+        drop(history);
+        for body in [
+            r#"{"platform":"other","accountId":"T1"}"#,
+            r#"{"platform":"slack","accountId":""}"#,
+            r#"{"platform":"slack","accountId":"../bad"}"#,
+            r#"{"platform":"slack","accountId":"T1","title":"spoof"}"#,
+        ] {
+            assert!(request(address, "POST", "/v1/chats/messaging", Some(body)).contains(" 400 "));
+        }
+    }
 
     #[test]
     fn a_checked_program_brings_the_schemas_it_imports() {

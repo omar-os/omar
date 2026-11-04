@@ -1,4 +1,5 @@
 pub mod config;
+mod connect;
 mod credential_store;
 mod credentials;
 pub mod discord;
@@ -235,6 +236,14 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
 
 pub async fn run(command: &Command) -> Result<()> {
     match command {
+        Command::Slack {
+            action: Some(CredentialAction::Connect),
+            ..
+        } => connect::run("slack").await,
+        Command::Discord {
+            action: Some(CredentialAction::Connect),
+            ..
+        } => connect::run("discord").await,
         Command::Discord {
             action: Some(CredentialAction::Login),
             ..
@@ -285,6 +294,8 @@ pub enum Command {
 
 #[derive(clap::Subcommand)]
 pub enum CredentialAction {
+    /// Set up once, start/reuse local runtime :45073 and resolve a dedicated chat
+    Connect,
     /// Save tokens once using hidden input and a private local file
     Login,
     /// Remove saved tokens (does not revoke tokens or unset environment variables)

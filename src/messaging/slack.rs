@@ -175,7 +175,19 @@ async fn socket_loop<R: super::runtime::Runtime + 'static, M: Messenger + 'stati
     }
 }
 
-pub async fn run(config: Config) -> Result<()> {
+pub(super) async fn account_id() -> Result<String> {
+    let (bot, app) = super::credentials::load()?.into_tokens();
+    let identity = SlackApi::new(bot, app)?
+        .call("auth.test", json!({}), false)
+        .await?;
+    Ok(identity["team_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .context("Missing Slack workspace ID")?
+        .into())
+}
+
+pub async fn run(mut config: Config) -> Result<()> {
     ensure!(
         config.platform == "slack",
         "Slack command requires a Slack configuration"
@@ -192,6 +204,7 @@ pub async fn run(config: Config) -> Result<()> {
         .filter(|s| !s.is_empty())
         .context("Missing Slack bot identity")?
         .to_string();
+    super::runtime::bind_chat(&mut config).await?;
     let runtime = OmarRuntime::new(config.runtime_url.clone())?;
     runtime.call("/v1/chat", None).await?;
     let gateway = Arc::new(Gateway::new(config, runtime, api));

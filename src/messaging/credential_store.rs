@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     path::Path,
 };
-fn private_directory(path: &Path, create: bool) -> Result<()> {
+pub(super) fn private_directory(path: &Path, create: bool) -> Result<()> {
     if create {
         fs::create_dir_all(path.parent().context("Invalid credential path")?)?;
         #[cfg(unix)]

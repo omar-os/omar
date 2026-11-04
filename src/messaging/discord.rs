@@ -375,6 +375,15 @@ where
     }
 }
 
+pub(super) async fn account_id() -> Result<String> {
+    let api = DiscordApi::new(super::credentials::discord_load()?)?;
+    let identity = api.call(reqwest::Method::GET, "/users/@me", None).await?;
+    ensure!(identity["bot"] == true, "Expected a Discord bot token");
+    Ok(id(&identity["id"])
+        .context("Missing Discord bot ID")?
+        .into())
+}
+
 pub async fn run(mut config: Config) -> Result<()> {
     ensure!(
         config.platform == "discord",
@@ -403,6 +412,7 @@ pub async fn run(mut config: Config) -> Result<()> {
             .as_str()
             .context("Missing Discord Gateway URL")?,
     )?;
+    super::runtime::bind_chat(&mut config).await?;
     let runtime = OmarRuntime::new(config.runtime_url.clone())?;
     runtime.call("/v1/chat", None).await?;
     let mut channels = HashMap::new();

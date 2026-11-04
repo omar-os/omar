@@ -7,6 +7,8 @@ use std::{collections::BTreeMap, path::Path};
 #[serde(rename_all = "camelCase")]
 pub struct Config {
     pub runtime_url: String,
+    #[serde(default)]
+    pub auto_chat: bool,
     #[serde(default = "slack")]
     pub platform: String,
     #[serde(alias = "workspaceId")]
@@ -115,11 +117,11 @@ impl Config {
                 && url.password().is_none()
                 && url.query().is_none()
                 && url.fragment().is_none()
-                && !chat.is_empty()
-                && chat.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                && (url.path() == format!("/chats/{chat}")
-                    || url.path() == format!("/chats/{chat}/")),
-            "runtimeUrl must be loopback HTTP scoped to /chats/<id>"
+                && ((self.auto_chat && matches!(url.path(), "" | "/"))
+                    || (!chat.is_empty()
+                        && chat.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                        && (url.path() == format!("/chats/{chat}") || url.path() == format!("/chats/{chat}/")))),
+            "runtimeUrl must be loopback HTTP scoped to /chats/<id>, or a runtime root with autoChat enabled"
         );
         ensure!(
             !self.platform.is_empty() && !self.account_id.is_empty(),
