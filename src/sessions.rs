@@ -704,6 +704,7 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
     };
     if let Ok(compiler) = executable_on_path(compiler) {
         pin_executable(&compiler, &directory.join("bin/omarc"))?;
+        crate::properties::pin_library(&compiler, &directory.join("bin/omarc"))?;
     }
     let config_path = cli
         .config
@@ -731,6 +732,9 @@ fn launch(cli: &Cli, options: UpOptions, foreground: bool) -> Result<(Session, O
     // like-named sessions apart.
     let tag = home_tag();
     let socket = crate::paths::private_temp_dir()?.join(format!("{name}-{tag}.sock"));
+    // The name is free in this home, so a socket here is dead: left by a crash,
+    // or by a deleted home at the same path (CI reuses one).
+    let _ = fs::remove_file(&socket);
     let mut session = Session {
         name: name.clone(),
         protocol: PROTOCOL,
@@ -897,6 +901,7 @@ fn relaunch(
     };
     if let Some(compiler) = compiler {
         repin_executable(compiler, &directory.join("bin/omarc"))?;
+        crate::properties::pin_library(compiler, &directory.join("bin/omarc"))?;
     }
     let version = Command::new(directory.join("bin/omar"))
         .arg("--version")

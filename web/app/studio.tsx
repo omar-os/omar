@@ -10,10 +10,12 @@ import { defaultRunTimeout, describeRunFailure } from "./lib/run-feedback";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
+import { BackendsPage } from "./backends-page";
 import { SettingsMenu } from "./settings-menu";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
 import { PortPanel } from "./port-panel";
+import { PropertiesPanel } from "./properties";
 import { Resizer } from "./resizer";
 import { useWorkflowNames } from "./lib/workflow-names";
 import { WorkflowIcon } from "./workflow-icon";
@@ -63,6 +65,9 @@ import {
   stopRun,
   subscribeToDiagram,
   fetchConversations,
+  fetchBackendStatus,
+  checkProperties,
+  openProofEditor,
   describeError,
 } from "./lib/runtime-client";
 
@@ -190,7 +195,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [following, setFollowing] = useState(true);
   /** Ports the operator has set on the live run. */
   // can flip back and forth once there is.
-  const [tab, setTab] = useState<"source" | "events">("source");
+  const [tab, setTab] = useState<"source" | "events" | "properties">("source");
   /** What the run's web agents are waiting to be given. */
   const [pending, setPending] = useState<PendingInvocation[]>([]);
   const [answering, setAnswering] = useState(false);
@@ -217,6 +222,14 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [hydratedUrl, setHydratedUrl] = useState(isDemo ? serveUrl : null);
   const switchingChat = selectingChat || hydratedUrl !== serveUrl;
   const [design, setDesign] = useState<ProposedDesign | null>(null);
+  /** The property whose components the diagram singles out, in the design it
+      belongs to: a new design starts with none. */
+  const [propertyPick, setPropertyPick] = useState<{ design: ProposedDesign; name: string } | null>(null);
+  /** The program a design's verdicts were last checked against, if not its own. */
+  const [recheckedProgram, setRecheckedProgram] = useState<{ design: ProposedDesign; program: string } | null>(null);
+  const [checkingProperties, setCheckingProperties] = useState(false);
+  const [openingProofs, setOpeningProofs] = useState(false);
+  const [propertyError, setPropertyError] = useState("");
   const [run, setRun] = useState<RunRecord | null>(null);
   const [error, setError] = useState("");
   // The run's checkpoints, drawn on the timeline; the one a resume would
@@ -236,6 +249,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
+  const [backendsOpen, setBackendsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [historyRevision, setHistoryRevision] = useState(0);
@@ -331,6 +345,83 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     mark(snapshot.reactions, step.reactions);
     return lit;
   }, [steps, stepIndex, snapshot]);
+  const properties = useMemo(() => design?.properties ?? [], [design]);
+  const property = propertyPick && propertyPick.design === design ? propertyPick.name : null;
+  const setProperty = (name: string | null) =>
+    setPropertyPick(name && design ? { design, name } : null);
+  // A new design brings its own verdicts, checked against its own program.
+  const checkedProgram =
+    recheckedProgram && recheckedProgram.design === design ? recheckedProgram.program : design?.program ?? null;
+  // A design without properties has no tab to show them in.
+  const shownTab = tab === "properties" && properties.length === 0 ? "source" : tab;
+  /**
+   * What the selected property is about: the components its statement names,
+   * the teams they sit in, and every team those sit in. The diagram dims the
+   * rest, so the operator sees which part of the system a guarantee covers.
+   */
+  const propertyFocus = useMemo(() => {
+    const verdict = properties.find((candidate) => candidate.name === property);
+    if (!verdict || !snapshot) return undefined;
+    const ids = new Set<string>();
+    const owners = new Set<string>();
+    for (const name of verdict.mentions) {
+      for (const entity of [
+        ...snapshot.ports.filter((port) => port.name === name),
+        ...snapshot.timers.filter((timer) => timer.name === name),
+        ...snapshot.reactions.filter((reaction) => reaction.id === `reaction::${name}`),
+      ]) {
+        ids.add(entity.id);
+        owners.add(entity.instance);
+      }
+    }
+    for (let owner of owners) {
+      // Instances are named by their full path, so each prefix is a parent.
+      while (owner) {
+        ids.add(`instance::${owner}`);
+        owner = owner.includes(".") ? owner.slice(0, owner.lastIndexOf(".")) : "";
+      }
+    }
+    return ids;
+  }, [properties, property, snapshot]);
+  const propertiesStale = properties.length > 0 && checkedProgram !== null && source !== checkedProgram;
+  async function recheckProperties() {
+    if (!design) return;
+    setCheckingProperties(true);
+    setPropertyError("");
+    const program = source;
+    try {
+      const verdicts = await checkProperties(serveUrl, {
+        program,
+        files: design.files,
+        lemmas: design.lemmas,
+        properties: properties.map(({ name, description, statement, proof }) => ({ name, description, statement, proof })),
+      });
+      const next = { ...design, properties: verdicts };
+      setDesign((current) => (current === design ? next : current));
+      setRecheckedProgram({ design: next, program });
+    } catch (cause) {
+      setPropertyError(describeError(cause));
+    } finally {
+      setCheckingProperties(false);
+    }
+  }
+  async function openProofs() {
+    // Opened synchronously from the click, so a popup blocker allows it.
+    const tab = window.open("about:blank", "_blank");
+    if (tab) tab.opener = null;
+    setOpeningProofs(true);
+    setPropertyError("");
+    try {
+      const url = await openProofEditor(serveUrl, properties.map(({ name, source }) => ({ name, source })));
+      if (tab) tab.location.replace(url);
+      else window.open(url, "_blank", "noopener");
+    } catch (cause) {
+      tab?.close();
+      setPropertyError(describeError(cause));
+    } finally {
+      setOpeningProofs(false);
+    }
+  }
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [events, setEvents] = useState<DiagramEvent[]>([]);
   const disconnectRef = useRef<null | (() => void)>(null);
@@ -1059,6 +1150,20 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   // messages, which told an operator nothing they wanted to know.
   const lag = typeof snapshot?.lag === "number" ? formatDuration(snapshot.lag) : "—";
   const canRun = daemon.state === "live";
+  // With no backend signed in there is nothing for the assistant to run on,
+  // so the Backends page comes first. Asked once per runtime.
+  useEffect(() => {
+    if (!canRun || readOnly || isDemo) return;
+    let cancelled = false;
+    fetchBackendStatus(serveUrl)
+      .then((list) => {
+        if (!cancelled && list && !list.some((status) => status.status === "connected")) setBackendsOpen(true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [canRun, readOnly, isDemo, serveUrl]);
   const retrying = run !== null && isRunFinished(run.status);
   const canConfirm = !readOnly && design !== null && ["review", "finished", "failed"].includes(phase);
   const failedRun = run?.status === "failed";
@@ -1391,7 +1496,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
             <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
-            <div className="conversation-actions"><SettingsMenu />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+            <div className="conversation-actions"><SettingsMenu onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
           </header>
           {daemon.state === "offline" ? (
             // The one place the outage is reported: the sidebar and composer
@@ -1494,6 +1599,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                     key={conversationId}
                     serveUrl={hydratedUrl ?? serveUrl}
                     live={daemon.state === "live"}
+                    onConnectMore={readOnly ? undefined : () => setBackendsOpen(true)}
                   />
                 )}
                 {!isDemo ? assistantTerminal : null}
@@ -1612,6 +1718,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             // Agents outlive the run that spawned them, so a finished run can
             // still be opened; before a run there is nothing behind the node.
             highlight={timelineOpen ? highlighted : undefined}
+            focus={shownTab === "properties" ? propertyFocus : undefined}
             onOpenTerminal={canRun && run ? setTerminalAgent : undefined}
             // A web agent has no pane; double-clicking it opens the panel it is
             // answered through instead, which is the only thing there is.
@@ -1683,12 +1790,22 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <div className="tabs" role="tablist">
             <button
               role="tab"
-              aria-selected={tab === "source"}
-              className={tab === "source" ? "active" : ""}
+              aria-selected={shownTab === "source"}
+              className={shownTab === "source" ? "active" : ""}
               onClick={() => setTab("source")}
             >
               Source
             </button>
+            {properties.length ? (
+              <button
+                role="tab"
+                aria-selected={shownTab === "properties"}
+                className={shownTab === "properties" ? "active" : ""}
+                onClick={() => setTab("properties")}
+              >
+                Properties <small className="tab-count">{properties.filter((verdict) => verdict.proved).length}/{properties.length}</small>
+              </button>
+            ) : null}
             {/* Events only exist once something has been deployed. */}
             {isDeployed ? (
               <button
@@ -1702,7 +1819,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             ) : null}
           </div>
 
-          {tab === "source" ? (
+          {shownTab === "source" ? (
             <>
             {!readOnly && Object.keys(design?.files ?? {}).length > 0 ? <button className="secondary-button" onClick={() => setFilesOpen(true)}>View companion files ({Object.keys(design?.files ?? {}).length})</button> : null}
             {mutationPlan && !readOnly ? (
@@ -1742,6 +1859,18 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               onFilenameChange={setFilename}
             />
             </>
+          ) : shownTab === "properties" ? (
+            <PropertiesPanel
+              verdicts={properties}
+              selected={property}
+              onSelect={setProperty}
+              stale={propertiesStale}
+              checking={checkingProperties}
+              onRecheck={readOnly ? undefined : () => void recheckProperties()}
+              onOpenEditor={readOnly ? undefined : () => void openProofs()}
+              opening={openingProofs}
+              error={propertyError}
+            />
           ) : (
             <div className="event-strip" role="tabpanel">
               {events.length ? (
@@ -1787,6 +1916,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       ) : null}
 
       {filesOpen && !readOnly ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); }} onClose={() => setFilesOpen(false)} /> : null}
+      {backendsOpen && !readOnly ? (
+        <BackendsPage serveUrl={hydratedUrl ?? serveUrl} onClose={() => setBackendsOpen(false)} />
+      ) : null}
       {terminalAgent ? (
         <AgentTerminal
           serveUrl={serveUrl}
