@@ -2952,7 +2952,7 @@ fn topology_tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "omar_set_port",
-            "Set one effect port for the active OMAR invocation. Calls are buffered until omar_complete; repeated writes to the same port use last-writer-wins semantics.",
+            "Set one effect port, or one of the team's state variables, for the active OMAR invocation. Calls are buffered until omar_complete; repeated writes to the same port use last-writer-wins semantics.",
             json!({
                 "type":"object",
                 "properties":{
@@ -2980,7 +2980,7 @@ fn topology_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "omar_pending",
-            "List the OMAR invocations addressed to this agent and not yet completed, with the prompt, the trigger values, and the effect ports each one may set. Ask when an invocation message was missed rather than guessing what is owed.",
+            "List the OMAR invocations addressed to this agent and not yet completed, with the prompt, the trigger values, the effect ports each one may set, and the team state it may read and set. Ask when an invocation message was missed rather than guessing what is owed.",
             json!({
                 "type":"object",
                 "properties":{},

@@ -171,8 +171,9 @@ not accepted in `main`.
   invoked once with both values.
 
 The task's prompt is delivered to the agent. `$(name)` interpolates a trigger
-value and may only reference that task's triggers. If a declared trigger is
-not present in an invocation, its interpolation expands to `<absent>`.
+value or a state of the task's own team, and may reference nothing else: the
+compiler rejects any other name. If a declared trigger is not present in an
+invocation, its interpolation expands to `<absent>`.
 
 - `reaction(a, b) -> effects {= ... =}` declares a reaction that runs Rust
   instead of asking an agent, so it names none. Inside the body each trigger
@@ -213,6 +214,13 @@ not present in an invocation, its interpolation expands to `<absent>`.
   run ends with can be kept in the deployment record and shown. Reactions of
   the same instance run in declaration order at a tag, whether or not it
   declares state.
+
+  Every task of the instance reads and writes its state too, with nothing to
+  declare: `$(round)` in a prompt is the value when the invocation starts —
+  including what a reaction declared before it wrote at the same tag — and
+  `omar_set_port` sets it (§4.2). Since the instance's reactions run one at a
+  time, no two hold its state at once. State is the instance's own: a nested
+  team's is out of reach, and data crosses instances only through ports.
 
 ### 2.3 Effect contracts
 
@@ -429,13 +437,19 @@ value `null`; this preserves the distinction between absence and a signal.
 
 `omar_set_port`:
 
-- only accepts ports listed in the invocation's effect contract;
+- only accepts ports listed in the invocation's effect contract, and the
+  state of the invocation's own instance, which no contract lists;
 - validates the value immediately;
 - may be called many times; and
 - uses last-writer-wins for repeated writes to the same port by that invocation.
 
 Writes remain private until `omar_complete`. Completion validates the final
-port snapshot against the contract. Calls after completion are rejected.
+port snapshot against the contract, and commits state writes with the effects;
+an invocation that expires or fails commits neither. Calls after completion are
+rejected.
+
+The invocation message lists the instance's state as it stands, under
+`state:`, so an agent knows what it may read and set without its prompt saying.
 
 The topology runner owns invocation records in memory. Topology-scoped MCP
 processes send authenticated commands to the runner over a loopback connection.
@@ -448,7 +462,8 @@ when it actually writes that port. A mandatory effect is guaranteed to replace
 the earlier value; an optional effect replaces it only when present.
 
 `omar_pending` lists the invocations addressed to the asking agent that are not
-yet complete, each with its prompt, trigger values and permitted effects. It is
+yet complete, each with its prompt, trigger values, permitted effects, and its
+instance's state with each variable's type. It is
 scoped to that agent, so it discloses nothing the agent's own reactions were not
 already wired to see.
 
