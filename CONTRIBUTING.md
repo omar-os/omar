@@ -1,6 +1,6 @@
 # Contributing
 
-Rules for every contributor, human or agent. Agents also follow [AGENT.md](AGENT.md).
+Rules for every contributor, human or agent. Agents also follow [AGENTS.md](AGENTS.md).
 
 ## Design principles
 
@@ -23,11 +23,11 @@ CI's `Repository Rules` job enforces 1 and 2 on files a change adds.
 6. For a major feature, push a branch and open a PR so CI runs.
 7. Stacked PR: target the parent PR's branch and start the description with "Stacked on #N".
 8. When pushing new commits to an open PR, update its description to match.
-9. Show the change working. If a PR changes anything a person can see or run, its description has:
-   - **Evidence**: a GIF of 60 seconds or less for each distinct feature, embedded in the PR description. Show the starting state, the action, and the observable result; split unrelated features into separate GIFs. Record against the real system (real `omar serve`, `omarc`, assistant; not test fakes) at the PR's latest commit; re-record when a push changes what it shows.
+9. Show the change working. Every PR description has both sections, no exceptions:
+   - **Evidence**: a GIF of 60 seconds or less for each distinct UI or multi-step feature, embedded in the PR description; a screenshot or terminal output for a CLI. Show the starting state, action, and observable result; split unrelated features into separate GIFs. Record against the real system (real `omar serve`, `omarc`, assistant; not test fakes) at the PR's latest commit; re-record when a push changes what it shows.
    - **Try it by hand**: copy-pasteable steps from a clean checkout: build commands; input files in full (the complete `.omar` programs, not "a program with a timer"); each command with its expected output; one failure case where it matters (e.g. a rejected change).
 
-   Otherwise write "No visible change" (refactors, tests only). CI shows tests pass; this shows the feature does what the PR says, checkable in a minute. Speed up waits and label them "(sped up)"; captions never cover what they describe. Put assets on an orphan `pr-assets/<branch>` branch, linked via `raw.githubusercontent.com`. Link the implementation PR to its project issue through Development; use a closing keyword only when that PR completes the issue's scope.
+   No visible change (refactors, tests only): Evidence is the relevant test's output (failing before, passing after, for a bug fix); Try it by hand is the command that runs it. CI shows tests pass; this shows the feature does what the PR says, checkable in minutes. Recording: speed up waits in longer flows and label them "(sped up)"; captions never cover what they describe. Put assets on an orphan `pr-assets/<branch>` branch, linked via `raw.githubusercontent.com`. Link the implementation PR to its project issue through Development; use a closing keyword only when that PR completes the issue's scope.
 10. Format code before pushing.
 11. Squash commits when merging.
 12. Keep writing concise, to the point where grammar can be sacrificed: README, comments, PR descriptions. Human-readable, not essays.

@@ -42,8 +42,8 @@ def main():
             "lang/spec.md": "spec\n",
             "prompts/skills/new.md": "prompt\n",
             "CONTRIBUTING.md": "rules\n",
-            "AGENT.md": "agents\n",
-            "CLAUDE.md": "@AGENT.md\n",
+            "AGENTS.md": "agents\n",
+            "CLAUDE.md": "@AGENTS.md\n",
         }
         result = check(allowed)
         assert result.returncode == 0, result
