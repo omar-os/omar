@@ -10,6 +10,8 @@ pub struct Run {
     pub status: String,
     #[serde(default)]
     pub outputs: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -19,7 +21,19 @@ pub struct RuntimeError {
     pub run_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovedWorkflow {
+    pub name: String,
+    pub request: Value,
+    pub output_port: String,
+    pub timeout_seconds: u64,
+}
+
 pub trait Runtime: Send + Sync {
+    fn approved(&self) -> impl std::future::Future<Output = Result<Vec<ApprovedWorkflow>>> + Send {
+        async { Ok(Vec::new()) }
+    }
     fn converse(
         &self,
         _sender: &str,
@@ -86,6 +100,22 @@ impl OmarRuntime {
     }
 }
 impl Runtime for OmarRuntime {
+    async fn approved(&self) -> Result<Vec<ApprovedWorkflow>> {
+        let root = self.base.split("/chats/").next().unwrap_or(&self.base);
+        let runtime = OmarRuntime::new(root.to_owned())?;
+        match runtime.call("/v1/workflows", None).await {
+            Ok(value) => Ok(serde_json::from_value(value)?),
+            Err(error)
+                if error
+                    .downcast_ref::<RuntimeError>()
+                    .is_some_and(|e| e.status == 404) =>
+            {
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn converse(&self, sender: &str, text: &str) -> Result<String> {
         // Separate users and connector lifetimes; the runtime retains its archive,
         // but a newly opened connector never resumes yesterday's assistant.
@@ -127,11 +157,30 @@ impl Runtime for OmarRuntime {
     }
 
     async fn start(&self, request: &Value) -> Result<Run> {
-        let run: Run = serde_json::from_value(self.call("/v1/runs", Some(request)).await?)?;
+        let conversation = request["conversation_id"].as_str();
+        let target = match conversation {
+            Some(id) => {
+                uuid::Uuid::parse_str(id)?;
+                let root = self.base.split("/chats/").next().unwrap_or(&self.base);
+                OmarRuntime::new(format!("{root}/chats/{id}"))?
+            }
+            None => OmarRuntime::new(self.base.clone())?,
+        };
+        let mut run: Run = serde_json::from_value(target.call("/v1/runs", Some(request)).await?)?;
+        run.conversation_id = conversation.map(str::to_owned);
         anyhow::ensure!(!run.run_id.is_empty(), "Missing run ID");
         Ok(run)
     }
     async fn wait(&self, mut run: Run, timeout: u64) -> Result<Run> {
+        let conversation = run.conversation_id.clone();
+        let target = match &conversation {
+            Some(id) => {
+                uuid::Uuid::parse_str(id)?;
+                let root = self.base.split("/chats/").next().unwrap_or(&self.base);
+                OmarRuntime::new(format!("{root}/chats/{id}"))?
+            }
+            None => OmarRuntime::new(self.base.clone())?,
+        };
         let deadline = Instant::now() + Duration::from_secs(timeout + 15);
         while matches!(
             run.status.as_str(),
@@ -141,17 +190,18 @@ impl Runtime for OmarRuntime {
                 bail!("Monitoring deadline reached");
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let mut url = reqwest::Url::parse(&format!("{}/v1/runs/", self.base))?;
+            let mut url = reqwest::Url::parse(&format!("{}/v1/runs/", target.base))?;
             url.path_segments_mut()
                 .map_err(|_| anyhow::anyhow!("Invalid runtime URL"))?
                 .pop_if_empty()
                 .push(&run.run_id);
             let path = url
                 .path()
-                .strip_prefix(reqwest::Url::parse(&self.base)?.path())
+                .strip_prefix(reqwest::Url::parse(&target.base)?.path())
                 .unwrap_or("")
                 .to_string();
-            run = serde_json::from_value(self.call(&path, None).await?)?;
+            run = serde_json::from_value(target.call(&path, None).await?)?;
+            run.conversation_id = conversation.clone();
         }
         anyhow::ensure!(
             matches!(

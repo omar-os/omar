@@ -1,5 +1,6 @@
 //! Durable Mission Control conversations, scoped to one executive assistant.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,11 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(skip)]
     pub messaging_key: Option<String>,
+    /// Source bundles explicitly approved by running a proposed design. Drafts
+    /// stay in messages; messaging never treats a proposal as permission to run.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(skip)]
+    pub approved_workflows: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub ea_id: Option<crate::ea::EaId>,
     pub created_at: u64,
@@ -59,6 +65,7 @@ impl Conversation {
             id: Uuid::new_v4().to_string(),
             title: "New chat".into(),
             messaging_key: None,
+            approved_workflows: BTreeMap::new(),
             ea_id: None,
             created_at: now(),
             updated_at: now(),
@@ -220,6 +227,24 @@ impl History {
         Ok(id)
     }
 
+    pub fn approve_workflow(
+        &mut self,
+        id: &str,
+        team: &str,
+        request: serde_json::Value,
+    ) -> Result<()> {
+        let mut next = self.clone();
+        let chat = next
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == id)
+            .context("unknown conversation")?;
+        chat.approved_workflows.insert(team.into(), request);
+        next.save()?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn select(&mut self, id: Option<&str>) -> Result<()> {
         let mut next = self.clone();
         match id {
@@ -344,6 +369,29 @@ mod tests {
         fs::create_dir(&path).unwrap();
         assert!(history.messaging_chat("slack:T3", "Slack").is_err());
         assert_eq!(history.conversations.len(), before);
+    }
+
+    #[test]
+    fn approved_workflows_survive_restart_and_failed_updates_preserve_the_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chats.json");
+        let mut history = History::load(path.clone()).unwrap();
+        let id = history.active_id.clone();
+        let bundle = serde_json::json!({"program":"approved source", "files":{"schemas/a.json":"schema"}, "inputs":{"request":"value"}});
+        history
+            .approve_workflow(&id, "News", bundle.clone())
+            .unwrap();
+        let restarted = History::load(path.clone()).unwrap();
+        assert_eq!(
+            restarted.conversation(&id).approved_workflows["News"],
+            bundle
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(history
+            .approve_workflow(&id, "News", serde_json::json!({"program":"replacement"}))
+            .is_err());
+        assert_eq!(history.conversation(&id).approved_workflows["News"], bundle);
     }
 
     fn message(text: &str) -> ChatMessage {

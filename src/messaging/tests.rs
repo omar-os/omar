@@ -59,6 +59,7 @@ impl Runtime for FakeRuntime {
             run_id: "id".into(),
             status: "running".into(),
             outputs: Default::default(),
+            conversation_id: None,
         })
     }
     async fn wait(&self, mut run: Run, _: u64) -> Result<Run> {
@@ -503,6 +504,7 @@ impl Runtime for RegistryRuntime {
             run_id: request["program"].as_str().unwrap().into(),
             status: "running".into(),
             outputs: Default::default(),
+            conversation_id: None,
         })
     }
     async fn wait(&self, mut run: Run, timeout: u64) -> Result<Run> {
@@ -788,4 +790,73 @@ async fn discord_plain_text_uses_assistant_with_authorization_and_dedup() {
         replies[0].1.text,
         "Answer to user: Help me plan some research"
     );
+}
+
+#[derive(Default)]
+struct ApprovedRuntime {
+    entries: Mutex<Vec<runtime::ApprovedWorkflow>>,
+    workflow: RegistryRuntime,
+    discoveries: AtomicUsize,
+}
+impl Runtime for ApprovedRuntime {
+    async fn approved(&self) -> Result<Vec<runtime::ApprovedWorkflow>> {
+        self.discoveries.fetch_add(1, Ordering::SeqCst);
+        Ok(self.entries.lock().unwrap().clone())
+    }
+    async fn start(&self, request: &Value) -> Result<Run> {
+        self.workflow.start(request).await
+    }
+    async fn wait(&self, run: Run, timeout: u64) -> Result<Run> {
+        self.workflow.wait(run, timeout).await
+    }
+}
+
+#[tokio::test]
+async fn web_approval_becomes_listable_and_runnable_without_restarting_the_gateway() {
+    let g = Gateway::new(
+        fixture(),
+        ApprovedRuntime::default(),
+        FakeMessenger::default(),
+    );
+    let mut m = incoming();
+    m.command = "list".into();
+    let mut outsider = m.clone();
+    outsider.sender_id = "outsider".into();
+    g.handle(outsider).await;
+    assert_eq!(g.runtime.discoveries.load(Ordering::SeqCst), 0);
+    g.handle(m.clone()).await;
+    assert!(!g.messenger.replies.lock().unwrap()[0]
+        .1
+        .text
+        .contains("web-News"));
+    let bundle = json!({"program":"FIRST","inputs":{"run.request":"approved"},"files":{"schema.json":"allowed"},"conversation_id":"original-chat"});
+    g.runtime
+        .entries
+        .lock()
+        .unwrap()
+        .push(runtime::ApprovedWorkflow {
+            name: "web-News-1".into(),
+            request: bundle.clone(),
+            output_port: String::new(),
+            timeout_seconds: 90,
+        });
+    m.event_id = "second".into();
+    g.handle(m.clone()).await;
+    assert!(g.messenger.replies.lock().unwrap()[1]
+        .1
+        .text
+        .contains("web-News-1"));
+    m.event_id = "third".into();
+    m.command = "run web-News-1".into();
+    g.handle(m.clone()).await;
+    g.handle(m).await;
+    assert_eq!(*g.runtime.workflow.requests.lock().unwrap(), vec![bundle]);
+    assert_eq!(*g.runtime.workflow.timeouts.lock().unwrap(), vec![90]);
+    let replies = g.messenger.replies.lock().unwrap();
+    assert!(replies
+        .last()
+        .unwrap()
+        .1
+        .text
+        .contains("first.result: first output"));
 }

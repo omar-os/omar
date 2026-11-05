@@ -122,11 +122,7 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
             && message.command != "list"
             && message.command != "run"
             && !message.command.starts_with("run ");
-        let selected = message
-            .command
-            .strip_prefix("run ")
-            .and_then(|name| c.select(name));
-        let response = {
+        {
             let mut state = self.state.lock().unwrap();
             let now = Instant::now();
             state.seen.retain(|_, expires| *expires > now);
@@ -139,8 +135,48 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
                 return;
             }
             state.seen.insert(key, now + self.dedup_ttl);
+        }
+        let configured = message
+            .command
+            .strip_prefix("run ")
+            .and_then(|name| c.select(name));
+        // Fetch at command time: a web approval is visible without reconnecting.
+        let approved = if message.command == "list"
+            || (configured.is_none() && message.command.starts_with("run "))
+        {
+            match self.runtime.approved().await {
+                Ok(entries) => entries,
+                Err(_) => {
+                    self.reply(d, "Could not load approved workflows from OMAR. No run started; try again when the runtime is available.".into(), None).await;
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let selected = configured.or_else(|| {
+            approved
+                .iter()
+                .find(|w| message.command.strip_prefix("run ") == Some(w.name.as_str()))
+                .map(|w| config::Selected {
+                    request: &w.request,
+                    output_port: &w.output_port,
+                    timeout_seconds: w.timeout_seconds,
+                })
+        });
+        let response = {
+            let mut state = self.state.lock().unwrap();
             if message.command == "list" {
-                Some(c.listing())
+                let mut listing = c.listing();
+                for workflow in &approved {
+                    if c.select(&workflow.name).is_none() {
+                        listing.push_str(&format!(
+                            "\n- {} — Approved in Mission Control",
+                            workflow.name
+                        ));
+                    }
+                }
+                Some(listing)
             } else if selected.is_none() && !conversational {
                 let usage = self.messenger.usage(if c.workflows.is_empty() {
                     &c.command
@@ -225,20 +261,35 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
         };
         let mut text = format!("OMAR run {}: {}.", record.run_id, record.status);
         if record.status == "completed" {
-            match record.outputs.get(selected.output_port) {
-                Some(value) => {
-                    text.push('\n');
-                    text.push_str(
-                        &value
+            if selected.output_port.is_empty() {
+                if record.outputs.is_empty() {
+                    text.push_str("\nNo output values were produced.");
+                }
+                for (port, value) in &record.outputs {
+                    text.push_str(&format!(
+                        "\n{port}: {}",
+                        value
                             .as_str()
                             .map(str::to_owned)
-                            .unwrap_or_else(|| value.to_string()),
-                    );
+                            .unwrap_or_else(|| value.to_string())
+                    ));
                 }
-                None => text.push_str(&format!(
-                    "\nConfigured output {} is missing; check OMAR.",
-                    selected.output_port
-                )),
+            } else {
+                match record.outputs.get(selected.output_port) {
+                    Some(value) => {
+                        text.push('\n');
+                        text.push_str(
+                            &value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string()),
+                        );
+                    }
+                    None => text.push_str(&format!(
+                        "\nConfigured output {} is missing; check OMAR.",
+                        selected.output_port
+                    )),
+                }
             }
         } else {
             text.push_str(" Check OMAR for details.");

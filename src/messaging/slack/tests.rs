@@ -222,7 +222,8 @@ async fn runtime_unknown_status_and_missing_run_id_are_errors() {
             crate::messaging::runtime::Run {
                 run_id: "id".into(),
                 status: "mystery".into(),
-                outputs: Default::default()
+                outputs: Default::default(),
+                conversation_id: None,
             },
             1
         )

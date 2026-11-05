@@ -159,7 +159,7 @@ pub enum MutationStatus {
     Failed,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct StartRunRequest {
     program: String,
     /// The source's file name, which names a program without a named `main`.
@@ -1757,6 +1757,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             }
         }
         ("GET", "/v1/chats") => (200, workspaces.list()),
+        ("GET", "/v1/workflows") => (200, approved_workflows(&workspaces)),
         ("POST", "/v1/chats/messaging") => messaging_chat(&workspaces, &read_body(content_length)?),
         ("POST", "/v1/chats") => {
             let _ = read_body(content_length)?;
@@ -2036,7 +2037,7 @@ fn view_refusal(method: &str, path: &str) -> Option<&'static str> {
     let route = path.split_once('?').map_or(path, |(route, _)| route);
     let panel = route.starts_with("/v1/runs/") && route.ends_with("/panel");
     let workspaces = route == "/v1/workspaces" || route.starts_with("/v1/workspaces/");
-    (method != "GET" || panel || workspaces).then_some("read-only view")
+    (method != "GET" || panel || workspaces || route == "/v1/workflows").then_some("read-only view")
 }
 
 /// Forward one read to a run's diagram server, which binds loopback only, and
@@ -2599,6 +2600,32 @@ impl Context_ {
                     .cloned()
             });
     }
+}
+
+/// Runtime-owned source of truth for approved builder workflows, shared by
+/// messaging adapters. Names remain stable across connector/runtime restarts.
+fn approved_workflows(workspaces: &Arc<Workspaces>) -> Value {
+    let history = workspaces.history.lock().expect("history poisoned");
+    let mut entries = Vec::new();
+    for chat in &history.conversations {
+        let Some(ea) = chat.ea_id else {
+            continue;
+        };
+        if crate::ea_lifecycle::fenced(&workspaces.settings.omar_dir, ea) {
+            continue;
+        }
+        for (team, request) in &chat.approved_workflows {
+            let mut request = request.clone();
+            request["conversation_id"] = json!(chat.id);
+            entries.push(json!({
+                "name":format!("web-{team}-{ea}"),
+                "request":request,
+                "timeoutSeconds":request["timeout_seconds"],
+                "outputPort":""
+            }));
+        }
+    }
+    json!(entries)
 }
 
 /// Selection remembers where to open next, without touching another EA.
@@ -3194,6 +3221,35 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         let runs = context.runs.lock().expect("serve runs poisoned");
         if let Some(active) = find_active_run(&runs, &state.team) {
             return (409, team_held_error(active));
+        }
+    }
+
+    // Only a submitted design is published to messaging: catalog runs and
+    // unapproved drafts must not create or replace builder entries.
+    {
+        let mut history = context.history.lock().expect("history poisoned");
+        let proposed = history
+            .conversation(&context.conversation_id)
+            .messages
+            .iter()
+            .any(|m| {
+                m.design
+                    .as_ref()
+                    .is_some_and(|d| d.program == request.program && d.files == request.files)
+            });
+        if proposed {
+            let bundle = match serde_json::to_value(&request) {
+                Ok(bundle) => bundle,
+                Err(error) => return (500, json!({"error":error.to_string()})),
+            };
+            if let Err(error) =
+                history.approve_workflow(&context.conversation_id, &state.team, bundle)
+            {
+                return (
+                    500,
+                    json!({"error":format!("could not save approved workflow: {error}")}),
+                );
+            }
         }
     }
 
@@ -4786,6 +4842,129 @@ fn write_asset(stream: &mut TcpStream, asset: &crate::web_assets::Asset) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires omarc; CI runs ignored tests after building the compiler"]
+    async fn proposed_workflow_is_registered_only_after_approval_and_runs_through_messaging() {
+        use crate::messaging::runtime::{OmarRuntime, Runtime};
+        let server = test_server();
+        let source = r#"type Decision from "schemas/decision.json"
+        team Echo { input request : Decision output result : Decision request -> result after 0 }
+        main ApprovedDemo { run = Echo() }"#;
+        let files =
+            json!({"schemas/decision.json":r#"{"type":"string","enum":["approved","review"]}"#});
+        let proposal = json!({"token":server.agent_token,"program":source,"files":files,"summary":"echo","inputs":{"run.request":"approved"}});
+        let response = request(
+            server.address(),
+            "POST",
+            "/v1/agent/proposals",
+            Some(&proposal.to_string()),
+        );
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        let runtime = OmarRuntime::new(format!(
+            "http://{}/chats/{}",
+            server.address(),
+            server.context.conversation_id
+        ))
+        .unwrap();
+        assert!(runtime.approved().await.unwrap().is_empty());
+        let body = json!({"program":source,"files":files,"inputs":{"run.request":"approved"},"timeout_seconds":30});
+        let mut invalid = body.clone();
+        invalid["inputs"]["run.request"] = json!("not-allowed");
+        assert!(runtime.start(&invalid).await.is_err());
+        assert!(runtime.approved().await.unwrap().is_empty());
+        let first = runtime.start(&body).await.unwrap();
+        assert_eq!(
+            runtime.wait(first, 30).await.unwrap().outputs["run.result"],
+            "approved"
+        );
+        let entries = runtime.approved().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].name.starts_with("web-ApprovedDemo-"));
+        // A connector bound to another chat must still execute and monitor the
+        // approval in its owning chat, including that chat's active-run guard.
+        let other = server
+            .workspaces
+            .history
+            .lock()
+            .unwrap()
+            .messaging_chat("discord:test", "Discord")
+            .unwrap();
+        server.workspaces.get(&other).unwrap();
+        let connector =
+            OmarRuntime::new(format!("http://{}/chats/{other}", server.address())).unwrap();
+        let held = record("ApprovedDemo", RunStatus::Paused);
+        let held_id = held.run_id.clone();
+        server
+            .context
+            .runs
+            .lock()
+            .unwrap()
+            .insert(held_id.clone(), held);
+        let error = connector.start(&entries[0].request).await.unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::messaging::runtime::RuntimeError>()
+                .unwrap()
+                .status,
+            409
+        );
+        server.context.runs.lock().unwrap().remove(&held_id);
+        let second = connector.start(&entries[0].request).await.unwrap();
+        let finished = connector.wait(second, 30).await.unwrap();
+        assert_eq!(finished.outputs["run.result"], "approved");
+        assert!(server
+            .workspaces
+            .get(&other)
+            .unwrap()
+            .runs
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(runtime.approved().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn approved_workflow_catalog_excludes_drafts_and_preserves_chat_scope_and_inputs() {
+        let server = test_server();
+        assert_eq!(approved_workflows(&server.workspaces), json!([]));
+        let id = server.context.conversation_id.clone();
+        let mut message = ChatMessage {
+            sequence: 0,
+            role: ChatRole::Assistant,
+            text: "draft".into(),
+            progress: false,
+            design: None,
+            selection: vec![],
+        };
+        // Ordinary assistant text and unapproved designs are not registrations.
+        server
+            .context
+            .history
+            .lock()
+            .unwrap()
+            .append_to(&id, message.clone())
+            .unwrap();
+        assert_eq!(approved_workflows(&server.workspaces), json!([]));
+        message.text = "still a draft".into();
+        let bundle = json!({"program":"approved source", "files":{"schema.json":"schema"}, "inputs":{"run.request":"fixed"},"timeout_seconds":90});
+        server
+            .context
+            .history
+            .lock()
+            .unwrap()
+            .approve_workflow(&id, "News", bundle)
+            .unwrap();
+        let entries = approved_workflows(&server.workspaces);
+        assert_eq!(entries[0]["request"]["conversation_id"], id);
+        assert_eq!(entries[0]["request"]["inputs"]["run.request"], "fixed");
+        assert_eq!(entries[0]["request"]["files"]["schema.json"], "schema");
+        assert_eq!(entries[0]["timeoutSeconds"], 90);
+        let response = request(server.address(), "GET", "/v1/workflows", None);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("web-News-"));
+        assert!(view_refusal("GET", "/v1/workflows").is_some());
+    }
 
     #[test]
     fn concurrent_messaging_chat_requests_create_one_background_chat() {
