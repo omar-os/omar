@@ -72,12 +72,12 @@ const STUB_FLOW = `team StubFlow[writer : Stub,
     output blurb : string
     action draft : string
 
-    prompt writer(topic) -> draft
+    task writer(topic) -> draft
     "
         Draft something about $(topic).
     "
 
-    prompt editor(draft) -> blurb
+    task editor(draft) -> blurb
     "
         Tighten $(draft).
     "
@@ -94,7 +94,7 @@ const UNRESOLVABLE = `team Conformance[worker : NotARealBackend]
     input go : string
     output done : string
 
-    prompt worker(go) -> done
+    task worker(go) -> done
     "
         Echo $(go) into done.
     "
@@ -114,7 +114,7 @@ async function startRealServe() {
     join(home, ".omar/config.toml"),
     `[dashboard]\nsession_prefix = "${sessionPrefix}"\n`,
   );
-  const child = spawn(OMAR_BIN, ["serve", "--address", "127.0.0.1:0", "--no-ea"], {
+  const child = spawn(OMAR_BIN, ["serve", "--port", "0", "--no-ea"], {
     env: { ...process.env, HOME: home, OMARC_BIN },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -127,7 +127,7 @@ async function startRealServe() {
     );
     child.stdout.on("data", (chunk) => {
       buffer += chunk;
-      const match = /OMAR serve: (http:\/\/\S+)/.exec(buffer);
+      const match = /URL:\s+(http:\/\/\S+)/.exec(buffer);
       if (match) {
         clearTimeout(timer);
         resolveUrl(match[1]);
@@ -139,9 +139,19 @@ async function startRealServe() {
     });
   });
 
+  // The runtime's private state (its MCP context among it) lives in the
+  // session's own directory, found through the registry.
+  const listed = spawnSync(OMAR_BIN, ["ls", "--json"], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: home },
+  });
+  const stateDir = JSON.parse(listed.stdout || "[]").find((s) => s.state === "ready")?.directory;
+  assert.ok(stateDir, `no ready session listed: ${listed.stdout} ${listed.stderr}`);
+
   return {
     url,
     home,
+    stateDir,
     sessionPrefix,
     async close() {
       child.kill();
@@ -202,6 +212,25 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     assert.equal(f.status, r.status);
     assert.equal(f.body.protocol_version, r.body.protocol_version);
     assert.equal(f.body.status, r.body.status);
+    // A daemon that predates view ports does not say which port this is.
+    if ("access" in r.body) assert.equal(f.body.access, r.body.access);
+  });
+
+  test("backend sign-in status has the same shape", async () => {
+    const { real: r, fake: f } = await both("/v1/agent/backends");
+    assert.equal(r.status, 200);
+    assert.equal(f.status, r.status);
+    const statuses = ["connected", "signed_out", "not_installed", "unknown"];
+    for (const body of [r.body, f.body]) {
+      assert.deepEqual(
+        body.backends.map((b) => b.name),
+        ["claude", "codex", "cursor", "opencode", "pi", "agy"],
+      );
+      for (const backend of body.backends) {
+        assert.ok(statuses.includes(backend.status), backend.status);
+        assert.equal(typeof backend.login, "string");
+      }
+    }
   });
 
   test("an empty run listing has the same shape", async () => {
@@ -351,7 +380,7 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     // `--no-ea` still writes the context, so the harness can stand in for the
     // assistant without an agent process existing.
     const context = JSON.parse(
-      await readFile(join(real.home, ".omar/mcp/ea-0/context.json"), "utf8"),
+      await readFile(join(real.stateDir, "mcp/ea-0/context.json"), "utf8"),
     );
     const token = context.serve?.token;
     assert.equal(typeof token, "string", "serve wrote its token into the context");
@@ -513,3 +542,59 @@ async function collectEvents(url, timeoutMs) {
   await reader.cancel();
   return kinds;
 }
+
+test("two chats run the same topology independently and retain their live panels", { skip: WIRE_SKIP, timeout: 60_000 }, async () => {
+  const real = await startRealServe();
+  const post = (body) => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const request = async (path, init) => {
+    const response = await fetch(`${real.url}${path}`, init);
+    const body = await response.json();
+    assert.ok(response.ok, JSON.stringify(body));
+    return body;
+  };
+  const program = `team Concurrent[panel : Web] {
+    input question : string
+    output answer : string
+    task panel(question) -> answer within(1min) "Answer $(question)."
+  }
+  main Concurrent { flow = Concurrent() }`;
+  try {
+    const first = await request("/v1/chat");
+    const second = await request("/v1/chats", post({}));
+    assert.notEqual(first.ea_id, second.ea_id);
+    const firstBase = `/chats/${first.id}`;
+    const secondBase = `/chats/${second.id}`;
+    const [a, b] = await Promise.all([
+      request(`${firstBase}/v1/runs`, post({ conversation_id: first.id, program, inputs: { "flow.question": "First" } })),
+      request(`${secondBase}/v1/runs`, post({ conversation_id: second.id, program, inputs: { "flow.question": "Second" } })),
+    ]);
+    assert.notEqual(a.diagram_address, b.diagram_address);
+    const waitPanel = async (base, run) => {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const response = await fetch(`${real.url}${base}/v1/runs/${run.run_id}/panel`);
+        const panel = await response.json();
+        // Admission can return before the run publishes its Web panel.
+        assert.ok(response.ok || (response.status === 404 && panel.error === "run has no panel"), JSON.stringify(panel));
+        if (panel.pending?.length) return panel.pending[0];
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.fail("live panel never became ready");
+    };
+    const [pa, pb] = await Promise.all([waitPanel(firstBase, a), waitPanel(secondBase, b)]);
+    assert.notEqual(pa.task_id, pb.task_id);
+    await request(`/v1/chats/${first.id}/activate`, post({}));
+    const listing = await request("/v1/chats");
+    for (const chat of listing.conversations) assert.equal(chat.run.status, "running");
+    assert.equal((await fetch(`${real.url}${secondBase}/v1/runs/${a.run_id}`)).status, 404);
+    const answer = (base, run, panel, value) => request(`${base}/v1/runs/${run.run_id}/panel`, post({ task_id: panel.task_id, agent: panel.agent, values: { "flow.answer": value } }));
+    await answer(firstBase, a, pa, "First result");
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const status = await request(`${firstBase}/v1/runs/${a.run_id}`);
+      if (status.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal((await request(`${firstBase}/v1/runs/${a.run_id}`)).status, "completed");
+    assert.equal((await request(`${secondBase}/v1/runs/${b.run_id}`)).status, "running");
+    await answer(secondBase, b, pb, "Second result");
+  } finally { await real.close(); }
+});

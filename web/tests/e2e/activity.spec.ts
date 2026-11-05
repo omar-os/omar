@@ -29,20 +29,17 @@ test("activity fixtures: concurrent agents, long tool, settings, diff, reconnect
     let activity: ActivitySnapshot = {run_id:record.run_id, sequence:1,server_time:Date.now(),invocations:[first,second]};
     let disconnected = false;
     let roles: SavedRoleSettings[] = [];
-    await page.route(`${FAKE_SERVE_URL}/v1/runs/*/activity`, async (route) => {
+    await page.route("**/v1/runs/*/activity", async (route) => {
       if (disconnected) return route.abort();
       await route.fulfill({json:{...activity,server_time:Date.now()}});
     });
-    await page.route(`${FAKE_SERVE_URL}/v1/role-settings`, async (route) => {
+    await page.route("**/v1/role-settings", async (route) => {
       if (route.request().method() === "POST") { roles = [route.request().postDataJSON()]; await route.fulfill({json:{saved:true,applies_to:"next_invocation"}}); }
       else await route.fulfill({json:{roles,capabilities_available:true,codex_models:[{model:"fixture-model",name:"Fixture model",efforts:["medium","high"],default_effort:"medium"}]}});
     });
     // Keep fake runtime in flight; timeline events are not the fixture's source.
-    await page.route(`${FAKE_SERVE_URL}/v1/events`, (route) => route.fulfill({ contentType:"text/event-stream", body:": fixture connection\n\n" }));
-    await page.route(`${FAKE_SERVE_URL}/v1/diagram`, (route) => route.fulfill({json:diagram}));
-    await page.addInitScript(({key, value}) => sessionStorage.setItem(key, JSON.stringify(value)), {
-      key:`omar.activity.run:${FAKE_SERVE_URL}`, value:{run_id:record.run_id,snapshot:diagram,sequence:0},
-    });
+    await page.route("**/diagram/v1/events", (route) => route.fulfill({ contentType:"text/event-stream", body:": fixture connection\n\n" }));
+    await page.route("**/diagram/v1/diagram", (route) => route.fulfill({json:diagram}));
     const errors: string[] = [];
     page.on("pageerror", (error) => errors.push(error.message));
     await page.goto("/");

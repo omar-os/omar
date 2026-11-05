@@ -1,0 +1,1 @@
+'<EXE>' stub-agent --context-file '<DIR>/mcp/ea-0/context.json'

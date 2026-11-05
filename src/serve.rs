@@ -13,14 +13,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ts_rs::TS;
 use uuid::Uuid;
 
+use crate::chat_history::{ConversationSummary, History};
 use crate::config::Config;
 use crate::ea::EaId;
 use crate::tmux::{DeliveryOptions, TmuxClient};
@@ -32,8 +33,20 @@ pub const SERVE_PROTOCOL_VERSION: u32 = 1;
 /// compilation and process start-up.
 const DIAGRAM_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_BYTES: usize = 512 * 1024;
+/// Relayed diagram routes: `/v1/runs/{id}` + this + the diagram server's path.
+const DIAGRAM_RELAY: &str = "/diagram";
+
+/// Which listener a request arrived on. The view listener may be public and
+/// is unauthenticated, so it answers reads only.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Full,
+    View,
+}
 const TERMINAL_PREFIX: &str = "/v1/agents/";
 const TERMINAL_SUFFIX: &str = "/terminal";
+/// A backend's sign-in terminal: `/v1/backends/<name>/terminal`.
+const CONNECT_PREFIX: &str = "/v1/backends/";
 /// How long the relay waits on each side before checking the other.
 const TERMINAL_POLL: Duration = Duration::from_millis(25);
 /// A selection names diagram components, and a diagram the operator can click
@@ -44,7 +57,54 @@ const MAX_SELECTION_NAME: usize = 128;
 /// Messages a stalled chat subscriber may fall behind by before it is dropped.
 const CHAT_QUEUE: usize = 256;
 
-#[derive(Debug, Clone, Serialize, TS)]
+/// Only an observed Mission Control connection arms automatic shutdown.
+/// API-only daemons remain available until explicitly stopped.
+const WINDOW_GRACE: Duration = Duration::from_secs(10);
+const WINDOW_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct Presence {
+    clients: usize,
+    seen: bool,
+    idle_since: Option<Instant>,
+    stopping: bool,
+}
+
+impl Presence {
+    /// Why a new run cannot be admitted right now, if it cannot.
+    fn refusal(&self) -> Option<&'static str> {
+        self.stopping.then_some("runtime is shutting down")
+    }
+}
+
+impl Presence {
+    fn connect(&mut self) -> Result<()> {
+        anyhow::ensure!(!self.stopping, "runtime is shutting down");
+        self.clients += 1;
+        self.seen = true;
+        self.idle_since = None;
+        Ok(())
+    }
+
+    fn shutdown_due(&mut self, now: Instant, active_runs: bool) -> bool {
+        if !self.seen || self.clients > 0 || active_runs {
+            self.idle_since = None;
+            return false;
+        }
+        now.duration_since(*self.idle_since.get_or_insert(now)) >= WINDOW_GRACE
+    }
+}
+
+/// Removes presence on every exit, including a failed initial replay.
+struct WindowConnection(Arc<Workspaces>);
+impl Drop for WindowConnection {
+    fn drop(&mut self) {
+        let mut presence = self.0.presence.lock().expect("presence poisoned");
+        presence.clients -= 1;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct RunRecord {
     pub run_id: String,
     pub team: String,
@@ -53,13 +113,73 @@ pub struct RunRecord {
     pub started_at: u64,
     pub finished_at: Option<u64>,
     pub error: Option<String>,
+    /// Input ports the run was admitted with, so its timeline can be
+    /// projected again later from the same starting point.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub present: Vec<String>,
+    /// Output ports a finished run ended with.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(optional, type = "Record<string, unknown>")]
+    pub outputs: BTreeMap<String, Value>,
+    /// State variables a finished run ended with.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(optional, type = "Record<string, unknown>")]
+    pub state: BTreeMap<String, Value>,
+    /// The last mutation asked of the run, and how it went.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mutation: Option<MutationRecord>,
+}
+
+/// A mutation as a run's record reports it. A running run is paused first,
+/// so a mutation waits `pending` until the run reaches a tag boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct MutationRecord {
+    pub status: MutationStatus,
+    /// One line per instruction of the plan.
+    pub changes: Vec<String>,
+    /// Queued events the new program had no port or timer for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional, type = "Array<string>")]
+    pub dropped: Vec<String>,
+    /// The `mutation` checkpoint the run continues from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationStatus {
+    Pending,
+    Applied,
+    Failed,
 }
 
 #[derive(Debug, Deserialize)]
 struct StartRunRequest {
     program: String,
+    /// The source's file name, which names a program without a named `main`.
+    /// Must be a plain name ending in `.omar`; default `program.omar`.
+    #[serde(default)]
+    filename: Option<String>,
+    /// Files the program imports, by the relative path it imports them under:
+    /// `{"schemas/decision.json": "{...}"}` for
+    /// `type Decision from "schemas/decision.json"`. The compiler resolves an
+    /// import beside the source, and the source here is staged on its own.
+    #[serde(default)]
+    files: BTreeMap<String, String>,
+    #[serde(default)]
+    conversation_id: Option<String>,
     #[serde(default)]
     inputs: BTreeMap<String, Value>,
+    /// `NAME=VALUE` inputs exactly as a CLI received them; the runtime parses
+    /// them by port type, so a bare `hello` is the string hello.
+    #[serde(default)]
+    raw_inputs: Vec<String>,
     /// A daemon re-runs the same team repeatedly, so stale agent sessions are
     /// replaced rather than treated as a conflict.
     #[serde(default = "default_replace")]
@@ -71,6 +191,13 @@ struct StartRunRequest {
     /// a delay means for everyone else's.
     #[serde(default)]
     fast: bool,
+    /// How often to checkpoint: `off`, `tag`, `30m` (physical), or
+    /// `logical:30m`; default every physical hour.
+    #[serde(default)]
+    checkpoint_period: Option<String>,
+    /// Keep the instances' workspaces when the run ends; off, they go with it.
+    #[serde(default)]
+    keep_workspaces: bool,
 }
 
 fn default_replace() -> bool {
@@ -111,6 +238,10 @@ pub enum RunStatus {
     /// a failure -- the daemon has answered this since `RunEnd::Stopped`
     /// existed, and no client had it written down.
     Stopped,
+    /// A pause has been requested and the loop has not reached the tag
+    /// boundary where it checkpoints and parks.
+    Pausing,
+    Paused,
     Failed,
 }
 
@@ -121,13 +252,24 @@ impl RunStatus {
     /// current tag closes, so a second run of the same team would still be
     /// answered by the first one's panes.
     pub fn is_active(self) -> bool {
-        matches!(self, Self::Starting | Self::Running | Self::Stopping)
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Stopping | Self::Pausing
+        )
+    }
+
+    /// Whether the run still holds its team: its agents, or, paused, the
+    /// deployment record and checkpoints a resume needs. A fresh run of the
+    /// team would write over those, so a paused run blocks one until it is
+    /// resumed or stopped.
+    pub fn holds_team(self) -> bool {
+        self.is_active() || self == Self::Paused
     }
 }
 
 /// One entry in the operator/EA conversation. `design` is set only on
 /// proposals, and carries a program the operator has *not* yet approved.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct ChatMessage {
     pub sequence: u64,
     pub role: ChatRole,
@@ -144,12 +286,24 @@ pub struct ChatMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct ProposedDesign {
     pub program: String,
+    /// Companion files relative to program.omar.
+    #[serde(default)]
+    #[ts(optional, type = "Record<string, string>")]
+    pub files: BTreeMap<String, String>,
     #[serde(default)]
     #[ts(type = "Record<string, unknown>")]
     pub inputs: BTreeMap<String, Value>,
     /// The compiled topology, so the operator sees what they are approving
     /// before any run exists.
     pub preview: crate::diagram::DiagramSnapshot,
+    /// Lean declarations the properties share.
+    #[serde(default)]
+    #[ts(optional, type = "string")]
+    pub lemmas: String,
+    /// What the assistant claims of the program, as Lean judged it.
+    #[serde(default)]
+    #[ts(optional, type = "Array<PropertyVerdict>")]
+    pub properties: Vec<crate::properties::PropertyVerdict>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,26 +318,74 @@ struct AgentReply {
 struct AgentProposal {
     token: String,
     program: String,
+    #[serde(default)]
+    files: BTreeMap<String, String>,
     summary: String,
     #[serde(default)]
     inputs: BTreeMap<String, Value>,
+    #[serde(default)]
+    lemmas: String,
+    #[serde(default)]
+    properties: Vec<crate::properties::Property>,
+}
+
+/// Properties to check against a program, from the assistant (with its
+/// token) or the operator.
+#[derive(Debug, Deserialize)]
+struct PropertyCheck {
+    #[serde(default)]
+    token: String,
+    program: String,
+    #[serde(default)]
+    files: BTreeMap<String, String>,
+    #[serde(default)]
+    lemmas: String,
+    properties: Vec<crate::properties::Property>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
+    #[serde(default)]
+    conversation_id: Option<String>,
     text: String,
     #[serde(default)]
     selection: Vec<String>,
 }
 
-#[derive(Default)]
 struct Chat {
-    messages: Vec<ChatMessage>,
+    latest_run: Option<String>,
     subscribers: Vec<mpsc::SyncSender<ChatMessage>>,
-    sequence: u64,
+    busy: bool,
+    needs_context: bool,
+    needs_relaunch: bool,
+    owned: bool,
+}
+
+/// A chat owns one EA; only the durable archive is shared between workspaces.
+struct Workspaces {
+    history: Arc<Mutex<History>>,
+    contexts: Mutex<BTreeMap<String, Arc<Context_>>>,
+    settings: Settings,
+    selection: Mutex<()>,
+    editors: Mutex<crate::editor::Editors>,
+    presence: Mutex<Presence>,
+    launch_ea: AtomicBool,
+    shutdown: Arc<AtomicBool>,
+}
+
+/// Session configuration is independent of any EA's live context.
+struct Settings {
+    omar_dir: PathBuf,
+    session_prefix: String,
+    default_workdir: String,
+    health_idle_warning: i64,
+    command: String,
+    address: SocketAddr,
 }
 
 struct Context_ {
+    history: Arc<Mutex<History>>,
+    conversation_id: String,
     omar_dir: PathBuf,
     ea_id: EaId,
     session_prefix: String,
@@ -196,23 +398,34 @@ struct Context_ {
     panels: Panels,
     activity: Arc<Mutex<BTreeMap<String, crate::activity::ActivityRun>>>,
     role_settings: crate::activity::RoleSettings,
+    /// Mutations waiting for their run to pause: the new program, compiled,
+    /// and the directory its source is staged in.
+    mutations: Mutex<BTreeMap<String, (topology::Bytecode, PathBuf)>>,
     chat: Arc<Mutex<Chat>>,
     /// Authenticates the EA's MCP sidecar on the agent-only endpoints.
-    agent_token: String,
+    agent_token: Mutex<String>,
+    /// Serialize sends, replies and backend changes within this EA.
+    chat_operation: Mutex<()>,
     /// The command the assistant runs, and where to reach this server when it
     /// is relaunched on a different backend.
     command: Arc<Mutex<String>>,
     address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Context_ {
+    /// Hold this while serving the EA so its deletion waits for the work.
+    fn admit(&self) -> Result<crate::ea_lifecycle::Admission> {
+        crate::ea_lifecycle::Admission::acquire(&self.omar_dir, self.ea_id)
+    }
+
     fn publish(
         &self,
         role: ChatRole,
         text: String,
         progress: bool,
         design: Option<ProposedDesign>,
-    ) -> ChatMessage {
+    ) -> Result<ChatMessage> {
         self.publish_with_selection(role, text, progress, design, Vec::new())
     }
 
@@ -223,21 +436,26 @@ impl Context_ {
         progress: bool,
         design: Option<ProposedDesign>,
         selection: Vec<String>,
-    ) -> ChatMessage {
+    ) -> Result<ChatMessage> {
+        let _admission = self.admit()?;
         let mut chat = self.chat.lock().expect("serve chat poisoned");
-        chat.sequence += 1;
-        let message = ChatMessage {
-            sequence: chat.sequence,
-            role,
-            text,
-            progress,
-            design,
-            selection,
-        };
-        chat.messages.push(message.clone());
+        let message = self.history.lock().expect("history poisoned").append_to(
+            &self.conversation_id,
+            ChatMessage {
+                sequence: 0,
+                role,
+                text,
+                progress,
+                design,
+                selection,
+            },
+        )?;
+        if role == ChatRole::Assistant && !progress {
+            chat.busy = false;
+        }
         chat.subscribers
             .retain(|subscriber| subscriber.try_send(message.clone()).is_ok());
-        message
+        Ok(message)
     }
 }
 
@@ -256,6 +474,7 @@ pub enum AttachEa {
 }
 
 pub struct Serve {
+    ea_id: EaId,
     address: SocketAddr,
     agent_token: String,
     running: Arc<AtomicBool>,
@@ -265,9 +484,343 @@ pub struct Serve {
     /// starting one for real.
     #[cfg(test)]
     context: Arc<Context_>,
+    workspaces: Arc<Workspaces>,
 }
 
 impl Serve {
+    pub(crate) fn session_delete_ea(
+        &self,
+        id: EaId,
+        scheduler: &crate::scheduler::Scheduler,
+    ) -> Result<Value> {
+        let root = &self.workspaces.settings.omar_dir;
+        let result = crate::ea_lifecycle::delete(
+            root,
+            id,
+            &self.workspaces.settings.session_prefix,
+            scheduler,
+            || {
+                let contexts = self
+                    .workspaces
+                    .contexts
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|context| context.ea_id == id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for workspace in crate::workspace::list(root, id)? {
+                    self.workspaces.editors.lock().unwrap().stop(&workspace.id);
+                }
+                for context in &contexts {
+                    // Mutation continuations must not launch a replacement after a stop.
+                    context.mutations.lock().unwrap().clear();
+                    let ids = context
+                        .runs
+                        .lock()
+                        .unwrap()
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for run in ids {
+                        let (status, value) = stop_run(context, &run);
+                        anyhow::ensure!(status < 400, "cannot stop run: {}", value["error"]);
+                    }
+                }
+                crate::ea_lifecycle::wait_until(
+                    40,
+                    "EA deletion is fenced; waiting for topology termination timed out; retry deletion",
+                    || {
+                        !contexts.iter().any(|context| {
+                            context
+                                .runs
+                                .lock()
+                                .unwrap()
+                                .values()
+                                .any(|run| run.status.is_active())
+                        })
+                    },
+                )?;
+                for context in &contexts {
+                    context.agent_token.lock().unwrap().clear();
+                    context.chat.lock().unwrap().subscribers.clear();
+                    context.panels.lock().unwrap().clear();
+                }
+                Ok(())
+            },
+            |survivor| {
+                self.workspaces
+                    .history
+                    .lock()
+                    .unwrap()
+                    .remove_ea(id, survivor)
+            },
+        )?;
+        self.workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .retain(|_, context| context.ea_id != id);
+        Ok(json!(result))
+    }
+
+    pub(crate) fn session_runs(&self, ea: Option<EaId>) -> Vec<Value> {
+        self.workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|context| ea.is_none_or(|id| id == context.ea_id))
+            .flat_map(|context| {
+                context
+                    .runs
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .map(|run| {
+                        let mut value = json!(run);
+                        value["ea_id"] = json!(context.ea_id);
+                        value
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    pub(crate) fn session_start(&self, ea: EaId, body: Value) -> Result<Value> {
+        let _ea_admission =
+            crate::ea_lifecycle::Admission::acquire(&self.workspaces.settings.omar_dir, ea)?;
+        let admission = self.workspaces.presence.lock().unwrap();
+        anyhow::ensure!(
+            !self.workspaces.shutdown.load(Ordering::SeqCst),
+            "runtime is stopping"
+        );
+        if let Some(refusal) = admission.refusal() {
+            bail!("{refusal}");
+        }
+        let id = self.workspaces.history.lock().unwrap().chat_for_ea(ea)?;
+        let context = self.workspaces.get(&id)?;
+        let (status, value) = start_run(&context, &serde_json::to_vec(&body)?);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    pub(crate) fn session_create_ea(&self, name: &str, command: Option<&str>) -> Result<EaId> {
+        // Browser-created chats allocate from this same registry.
+        let _selection = self.workspaces.selection.lock().unwrap();
+        let root = &self.workspaces.settings.omar_dir;
+        let id = crate::ea::register_ea(root, name, None)?;
+        if let Some(command) = command {
+            crate::manager::write_private_file(
+                &crate::ea::ea_state_dir(id, root).join("assistant-command"),
+                command.as_bytes(),
+            )?;
+        }
+        Ok(id)
+    }
+
+    pub(crate) fn session_start_manager(&self, ea: EaId) -> Result<Value> {
+        let _ea_admission =
+            crate::ea_lifecycle::Admission::acquire(&self.workspaces.settings.omar_dir, ea)?;
+        let _admission = self.workspaces.presence.lock().unwrap();
+        anyhow::ensure!(
+            !self.workspaces.shutdown.load(Ordering::SeqCst),
+            "runtime is stopping"
+        );
+        let id = self.workspaces.history.lock().unwrap().chat_for_ea(ea)?;
+        let context = self.workspaces.get(&id)?;
+        let _operation = context.chat_operation.lock().unwrap();
+        let name = crate::ea::ea_manager_session(ea, &context.session_prefix);
+        let client = TmuxClient::new("");
+        if !client.has_session(&name)? {
+            // The EA's `assistant-command` file is its explicit override
+            // (`ea create --agent` writes it); a start honours its current content.
+            let command = {
+                let mut current = context.command.lock().unwrap();
+                let chosen = assistant_command(&context.omar_dir, ea, &current);
+                *current = chosen.clone();
+                chosen
+            };
+            relaunch_ea(&context, &command)?;
+        }
+        context.chat.lock().unwrap().needs_relaunch = false;
+        Ok(json!({"session": name, "ea_id":ea}))
+    }
+
+    pub(crate) fn session_stop(&self, ea: EaId, selector: &str) -> Result<Value> {
+        let contexts = self
+            .workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut matches = Vec::new();
+        for context in contexts {
+            if context.ea_id != ea {
+                continue;
+            }
+            for run in context.runs.lock().unwrap().values() {
+                if run.run_id == selector || (run.team == selector && run.status.holds_team()) {
+                    matches.push((context.clone(), run.run_id.clone()));
+                }
+            }
+        }
+        anyhow::ensure!(
+            matches.len() == 1,
+            "run '{selector}' is missing or ambiguous; use its run id"
+        );
+        let (context, id) = &matches[0];
+        let (status, value) = stop_run(context, id);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    pub(crate) fn session_pause(&self, ea: EaId, selector: &str) -> Result<Value> {
+        let (context, id) = self.session_find(ea, selector, |run| run.status.is_active())?;
+        let (status, value) = pause_run(&context, &id);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    pub(crate) fn session_resume(&self, ea: EaId, selector: &str) -> Result<Value> {
+        let (context, id) =
+            self.session_find(ea, selector, |run| run.status == RunStatus::Paused)?;
+        if let Some(refusal) = self.workspaces.presence.lock().unwrap().refusal() {
+            bail!("{refusal}");
+        }
+        let (status, value) = resume_run(&context, &id);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    pub(crate) fn session_mutate(
+        &self,
+        ea: EaId,
+        selector: &str,
+        request: &Value,
+    ) -> Result<Value> {
+        let (context, id) = self.session_find(ea, selector, |run| {
+            matches!(run.status, RunStatus::Running | RunStatus::Paused)
+        })?;
+        let (status, value) = mutate_run(&context, &id, &serde_json::to_vec(request)?);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    pub(crate) fn session_rollback(
+        &self,
+        ea: EaId,
+        selector: &str,
+        checkpoint: &str,
+    ) -> Result<Value> {
+        let (context, id) =
+            self.session_find(ea, selector, |run| run.status == RunStatus::Paused)?;
+        let body = serde_json::to_vec(&json!({ "checkpoint": checkpoint }))?;
+        let (status, value) = rollback_run(&context, &id, &body);
+        anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    /// The one run a selector names: its id, or a team name when exactly one
+    /// of that team's runs is in the state the operation acts on.
+    fn session_find(
+        &self,
+        ea: EaId,
+        selector: &str,
+        eligible: impl Fn(&RunRecord) -> bool,
+    ) -> Result<(Arc<Context_>, String)> {
+        let _admission =
+            crate::ea_lifecycle::Admission::acquire(&self.workspaces.settings.omar_dir, ea)?;
+        // The EA's chat context is where its parked runs are offered again
+        // after a restart; it exists once something asks for the EA.
+        let id = self.workspaces.history.lock().unwrap().chat_for_ea(ea)?;
+        self.workspaces.get(&id)?;
+        let contexts = self
+            .workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut matches = Vec::new();
+        for context in contexts {
+            if context.ea_id != ea {
+                continue;
+            }
+            for run in context.runs.lock().unwrap().values() {
+                if run.run_id == selector || (run.team == selector && eligible(run)) {
+                    matches.push((context.clone(), run.run_id.clone()));
+                }
+            }
+        }
+        anyhow::ensure!(
+            matches.len() == 1,
+            "run '{selector}' is missing or ambiguous; use its run id"
+        );
+        Ok(matches.remove(0))
+    }
+
+    /// Refuse new admissions without touching the admission mutex, which an
+    /// in-flight start may hold for tens of seconds; a forced shutdown must
+    /// never wait behind it.
+    pub(crate) fn session_shutdown_now(&self) {
+        self.workspaces.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    /// A graceful shutdown parks the session's work rather than ending it:
+    /// every active run pauses at its next tag boundary, so the session
+    /// restarts later with the runs where they were. A run that cannot pause
+    /// (it has not started executing yet) is stopped instead.
+    pub(crate) fn session_stopping(&self) -> Result<()> {
+        // Admission uses this same mutex when checking shutdown and inserting a run.
+        let mut presence = self.workspaces.presence.lock().unwrap();
+        presence.stopping = true;
+        self.workspaces.shutdown.store(true, Ordering::SeqCst);
+        let contexts = self
+            .workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for context in contexts {
+            let runs: Vec<RunRecord> = context.runs.lock().unwrap().values().cloned().collect();
+            // A pausing run is about to park on its own; asking again would
+            // be refused while its pause request waits.
+            for run in runs
+                .iter()
+                .filter(|r| r.status.is_active() && r.status != RunStatus::Pausing)
+            {
+                let (status, value) = pause_run(&context, &run.run_id);
+                if status >= 400 {
+                    eprintln!(
+                        "run {} ({}) cannot pause for shutdown ({}); stopping it",
+                        run.run_id, run.team, value["error"]
+                    );
+                    crate::deploy::request_stop(&crate::deploy::dir_for(
+                        &context.omar_dir,
+                        context.ea_id,
+                        &run.team,
+                    ))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn session_has_work(&self) -> bool {
+        self.session_runs(None).iter().any(|r| {
+            matches!(
+                r["status"].as_str(),
+                Some("starting" | "running" | "stopping" | "pausing")
+            )
+        })
+    }
+
     pub fn start(
         address: SocketAddr,
         config: &Config,
@@ -284,26 +837,87 @@ impl Serve {
             .with_context(|| format!("failed to bind serve at {address}"))?;
         let address = listener.local_addr()?;
         let agent_token = Uuid::new_v4().to_string();
+        let mut history = History::load_session(omar_dir)?;
+        let has_history = !history.active().messages.is_empty();
+        let conversation_id = history.active_id.clone();
+        let workspace_ea = match history.active().ea_id {
+            Some(id) => id,
+            None if !history
+                .conversations
+                .iter()
+                .any(|chat| chat.ea_id == Some(ea_id)) =>
+            {
+                ea_id
+            }
+            None => {
+                crate::ea::ensure_default_ea(omar_dir)?;
+                crate::ea::register_ea(
+                    omar_dir,
+                    &format!("chat-{conversation_id}"),
+                    Some("Mission Control chat"),
+                )?
+            }
+        };
+        history.assign_ea(&conversation_id, workspace_ea)?;
+        let history = Arc::new(Mutex::new(history));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let parked = paused_runs(omar_dir, workspace_ea);
+        let latest_parked = parked
+            .values()
+            .max_by_key(|run| run.started_at)
+            .map(|run| run.run_id.clone());
         let context = Arc::new(Context_ {
+            history: history.clone(),
+            conversation_id: conversation_id.clone(),
             omar_dir: omar_dir.to_path_buf(),
-            ea_id,
+            ea_id: workspace_ea,
             session_prefix: config.dashboard.session_prefix.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
-            runs: Runs::default(),
+            runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             activity: Arc::new(Mutex::new(BTreeMap::new())),
             role_settings: crate::activity::RoleSettings::load(
-                omar_dir.join(format!("role-settings-{ea_id}.json")),
+                omar_dir.join(format!("role-settings-{workspace_ea}.json")),
             ),
-            chat: Arc::new(Mutex::new(Chat::default())),
-            agent_token: agent_token.clone(),
-            command: Arc::new(Mutex::new(config.agent.default_command.clone())),
+            mutations: Mutex::default(),
+            chat: Arc::new(Mutex::new(Chat {
+                latest_run: latest_parked,
+                subscribers: Vec::new(),
+                busy: false,
+                needs_context: has_history,
+                needs_relaunch: has_history,
+                owned: false,
+            })),
+            agent_token: Mutex::new(agent_token.clone()),
+            chat_operation: Mutex::new(()),
+            command: Arc::new(Mutex::new(assistant_command(
+                omar_dir,
+                workspace_ea,
+                &config.agent.default_command,
+            ))),
             address,
+            shutdown: shutdown.clone(),
         });
-        // Blocking accept rather than a polling loop: `Drop` wakes it with a
-        // self-connection, so there is no need to spin, and no added latency on
-        // every connection from a poll interval.
+        let workspaces = Arc::new(Workspaces {
+            history,
+            contexts: Mutex::new(BTreeMap::from([(conversation_id, context.clone())])),
+            settings: Settings {
+                omar_dir: omar_dir.to_path_buf(),
+                session_prefix: config.dashboard.session_prefix.clone(),
+                default_workdir: config.agent.default_workdir.clone(),
+                health_idle_warning: config.health.idle_warning,
+                command: config.agent.default_command.clone(),
+                address,
+            },
+            selection: Mutex::new(()),
+            editors: Mutex::new(crate::editor::Editors::default()),
+            presence: Mutex::new(Presence::default()),
+            launch_ea: AtomicBool::new(false),
+            shutdown,
+        });
+        let shared_workspaces = workspaces.clone();
+        listener.set_nonblocking(true)?;
         let running = Arc::new(AtomicBool::new(true));
         let thread_running = running.clone();
         #[cfg(test)]
@@ -312,10 +926,17 @@ impl Serve {
             while thread_running.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let context = context.clone();
+                        let workspaces = workspaces.clone();
                         thread::spawn(move || {
-                            let _ = handle_client(stream, context);
+                            let _ = handle_client(stream, workspaces, Access::Full);
                         });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if workspaces.shutdown_if_idle() {
+                            thread_running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        thread::sleep(WINDOW_POLL);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
@@ -323,24 +944,60 @@ impl Serve {
             }
         });
         let server = Self {
+            ea_id: workspace_ea,
             address,
             agent_token,
             running,
             thread: Some(thread),
             #[cfg(test)]
             context: shared,
+            workspaces: shared_workspaces,
         };
         // Before this returns, so that everything downstream of "the server
         // started" can rely on the context being there. It names this server,
         // and `attach_ea` — which used to write it — runs after the address is
         // announced, so anything that took the announcement as readiness could
         // read the path before it existed.
-        server.write_mcp_context(config, omar_dir, ea_id);
+        server.write_mcp_context(config, omar_dir, workspace_ea);
         Ok(server)
     }
 
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Serve Mission Control read-only on a second address. It may be public:
+    /// it answers reads only, so nothing on it needs a credential. It stops
+    /// with this server.
+    pub fn start_viewer(&self, address: SocketAddr) -> Result<SocketAddr> {
+        let listener = TcpListener::bind(address)
+            .with_context(|| format!("failed to bind the view port at {address}"))?;
+        let address = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+        let running = self.running.clone();
+        let workspaces = self.workspaces.clone();
+        thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let workspaces = workspaces.clone();
+                        thread::spawn(move || {
+                            let _ = handle_client(stream, workspaces, Access::View);
+                        });
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        thread::sleep(WINDOW_POLL)
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(address)
     }
 
     /// Record this server in the EA's MCP context.
@@ -355,7 +1012,8 @@ impl Serve {
             default_command: config.agent.default_command.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
-            tmux_server: None,
+            agent_name: None,
+            tmux_server: std::env::var("OMAR_TMUX_SERVER").ok(),
             topology: None,
             serve: Some(crate::manager::ServeMcpContext {
                 endpoint: self.address.to_string(),
@@ -369,16 +1027,31 @@ impl Serve {
     /// with the operator and propose designs.
     ///
     /// The context is baked into the EA's MCP config at launch, so an already
-    /// running EA cannot gain these tools without being restarted. Restarting
-    /// discards its session, so that is opt-in and reported rather than silent.
+    /// running EA cannot gain these tools without being restarted. A saved
+    /// Mission Control chat resumes its native conversation with the new MCP
+    /// context. An unrelated terminal EA still requires explicit replacement.
     pub fn attach_ea(
         &self,
         config: &Config,
         omar_dir: &Path,
-        ea_id: EaId,
+        _ea_id: EaId,
         restart: bool,
         launch: bool,
     ) -> Result<AttachEa> {
+        let _admission = crate::ea_lifecycle::Admission::acquire(omar_dir, self.ea_id)?;
+        self.workspaces.launch_ea.store(launch, Ordering::Relaxed);
+        let id = self
+            .workspaces
+            .history
+            .lock()
+            .unwrap()
+            .chat_for_ea(self.ea_id)?;
+        let context = &self.workspaces.get(&id)?;
+        let _operation = context
+            .chat_operation
+            .lock()
+            .expect("chat operation poisoned");
+        let ea_id = self.ea_id;
         let name = crate::ea::load_registry(omar_dir)
             .into_iter()
             .find(|ea| ea.id == ea_id)
@@ -396,18 +1069,19 @@ impl Serve {
 
         let existing = crate::ea::ea_manager_session(ea_id, &config.dashboard.session_prefix);
         if client.has_session(&existing)? {
-            if !restart {
+            if !restart && !context.chat.lock().expect("chat poisoned").needs_context {
                 return Ok(AttachEa::AlreadyRunningWithoutServe(existing));
             }
             // Not `ensure_session_not_attached`: that resolves through the
             // prefix-filtered session list, and the manager session is named
             // `<prefix>ea-<id>`, which never matches the agent prefix. Kill it
             // directly, as `ensure_manager_session` itself does.
-            client.kill_session(&existing)?;
+            stop_assistant(context)?;
         }
+        context.chat.lock().expect("chat poisoned").owned = true;
         let (session, _) = crate::manager::ensure_manager_session(
             &client,
-            &config.agent.default_command,
+            &context.command.lock().expect("command poisoned").clone(),
             ea_id,
             &name,
             omar_dir,
@@ -421,6 +1095,10 @@ impl Serve {
                 }),
             },
         )?;
+        {
+            let mut chat = context.chat.lock().expect("chat poisoned");
+            chat.needs_relaunch = false;
+        }
         match self.verify_ea_context(omar_dir, ea_id) {
             Ok(()) => Ok(AttachEa::Attached(session)),
             Err(reason) => Ok(AttachEa::LaunchedWithoutServe {
@@ -450,18 +1128,16 @@ impl Serve {
             ),
         }
     }
-
-    /// Block until the accept loop stops, which for the CLI means forever.
-    pub fn wait(mut self) -> Result<()> {
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        Ok(())
-    }
 }
 
 impl Drop for Serve {
     fn drop(&mut self) {
+        self.workspaces.shutdown.store(true, Ordering::SeqCst);
+        self.workspaces
+            .editors
+            .lock()
+            .expect("editors poisoned")
+            .stop_all();
         self.running.store(false, Ordering::Relaxed);
         let _ = TcpStream::connect(self.address);
         if let Some(thread) = self.thread.take() {
@@ -470,36 +1146,251 @@ impl Drop for Serve {
     }
 }
 
-pub fn run(
-    address: SocketAddr,
-    config: &Config,
-    omar_dir: &Path,
-    ea_id: EaId,
-    restart_ea: bool,
-    launch_ea: bool,
-) -> Result<()> {
-    let server = Serve::start(address, config, omar_dir, ea_id)?;
-    println!("OMAR serve: http://{}", server.address());
-    match server.attach_ea(config, omar_dir, ea_id, restart_ea, launch_ea) {
-        Ok(AttachEa::Attached(session)) => println!("Executive assistant: {session}"),
-        Ok(AttachEa::AlreadyRunningWithoutServe(session)) => eprintln!(
-            "Executive assistant '{session}' is already running and was launched without this \
-             server, so it cannot reply or propose designs. Restart it with \
-             `omar serve --restart-ea` to enable them."
-        ),
-        Ok(AttachEa::LaunchedWithoutServe { session, reason }) => eprintln!(
-            "Executive assistant '{session}' started, but will NOT see omar_reply or \
-             omar_propose_design: {reason}.\nIt answers in its terminal instead, where the \
-             operator cannot see it. Reinstall the runtime (`cargo install --path . --force`) \
-             so every entry point launches agents with this build, then restart with \
-             `omar serve --restart-ea`."
-        ),
-        Err(error) => eprintln!("Executive assistant unavailable: {error:#}"),
+/// Reopening the launcher should reuse a live runtime, not replace its runs.
+#[cfg(test)]
+pub fn is_running(address: SocketAddr) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+    if write!(
+        stream,
+        "GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )
+    .is_err()
+    {
+        return false;
     }
-    server.wait()
+    let mut response = String::new();
+    if stream.take(8192).read_to_string(&mut response).is_err() {
+        return false;
+    }
+    response
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str::<Value>(body).ok())
+        .is_some_and(|body| {
+            body["status"] == "ok" && body["protocol_version"] == SERVE_PROTOCOL_VERSION
+        })
 }
 
-fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
+fn workspace_request(
+    workspaces: &Workspaces,
+    context: &Context_,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<Value> {
+    let root = &context.omar_dir;
+    if method == "GET" && path == "/v1/workspaces" {
+        return Ok(json!({"workspaces": crate::workspace::list(root, context.ea_id)?}));
+    }
+    if method == "POST" && path == "/v1/workspaces/workflow" {
+        let _operation = context
+            .chat_operation
+            .lock()
+            .expect("chat operation poisoned");
+        let request: CheckRequest = serde_json::from_slice(body)?;
+        let key = format!(
+            "workflow:{}",
+            crate::checkpoint::sha256(&serde_json::to_vec(
+                &json!({"program": request.program, "files": request.files})
+            )?)
+        );
+        if let Some(ws) = crate::workspace::list(root, context.ea_id)?
+            .into_iter()
+            .find(|ws| ws.deployment_id == key)
+        {
+            return Ok(json!({"workspace": ws}));
+        }
+        let staged = stage_program(&request.program, None, &request.files)
+            .map_err(|(_, error)| anyhow::anyhow!("{error}"))?;
+        let ws = crate::workspace::Workspace::create(root, context.ea_id, &key, "Workflow", None)?;
+        let result = (|| -> Result<()> {
+            fs::write(ws.worktree(root).join("program.omar"), &request.program)?;
+            stage_files(&ws.worktree(root), "program.omar", &request.files)
+                .map_err(anyhow::Error::msg)?;
+            ws.snapshot(root, "Workflow files")?;
+            Ok(())
+        })();
+        let _ = staged.finish(Ok(()));
+        if let Err(error) = result {
+            let _ = ws.remove(root);
+            return Err(error);
+        }
+        return Ok(json!({"workspace": ws}));
+    }
+    // A program's proved properties as Lean files, to open in the editor and
+    // work on interactively. Only Lean's own files go in; nothing here runs.
+    if method == "POST" && path == "/v1/workspaces/properties" {
+        #[derive(Deserialize)]
+        struct ProofFile {
+            name: String,
+            source: String,
+        }
+        #[derive(Deserialize)]
+        struct ProofWorkspace {
+            properties: Vec<ProofFile>,
+        }
+        let request: ProofWorkspace = serde_json::from_slice(body)?;
+        anyhow::ensure!(!request.properties.is_empty(), "no properties to open");
+        for file in &request.properties {
+            anyhow::ensure!(
+                !file.name.is_empty()
+                    && file
+                        .name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "'{}' is not a property name",
+                file.name
+            );
+        }
+        let key = format!("properties:{}", crate::checkpoint::sha256(body));
+        if let Some(ws) = crate::workspace::list(root, context.ea_id)?
+            .into_iter()
+            .find(|ws| ws.deployment_id == key)
+        {
+            return Ok(json!({"workspace": ws}));
+        }
+        let ws =
+            crate::workspace::Workspace::create(root, context.ea_id, &key, "Properties", None)?;
+        let result = (|| -> Result<()> {
+            let tree = ws.worktree(root);
+            fs::write(
+                tree.join("lean-toolchain"),
+                crate::properties::LEAN_TOOLCHAIN,
+            )?;
+            for file in &request.properties {
+                fs::write(tree.join(format!("{}.lean", file.name)), &file.source)?;
+            }
+            ws.snapshot(root, "Properties as proved")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = ws.remove(root);
+            return Err(error);
+        }
+        return Ok(json!({"workspace": ws}));
+    }
+    let rest = path
+        .strip_prefix("/v1/workspaces/")
+        .context("unknown workspace route")?;
+    let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
+    let ws = crate::workspace::Workspace::load(root, id)?;
+    anyhow::ensure!(
+        ws.ea_id == context.ea_id,
+        "workspace belongs to another chat"
+    );
+    if method == "GET" && action == "workflow" {
+        anyhow::ensure!(
+            ws.deployment_id.starts_with("workflow:"),
+            "not a workflow workspace"
+        );
+        let mut files = BTreeMap::new();
+        let mut pending = vec![String::new()];
+        let mut bytes = 0usize;
+        let mut entries_seen = 0usize;
+        while let Some(path) = pending.pop() {
+            let listing = crate::artifacts::browse(
+                &ws,
+                root,
+                &crate::artifacts::Selection {
+                    path: path.clone(),
+                    snapshot: None,
+                },
+            )?;
+            anyhow::ensure!(listing["truncated"] != true, "too many workflow files");
+            for entry in listing["entries"].as_array().context("invalid listing")? {
+                let name = entry["name"].as_str().context("invalid file name")?;
+                let file = if path.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{path}/{name}")
+                };
+                entries_seen += 1;
+                anyhow::ensure!(entries_seen <= 2000, "too many workflow files");
+                match entry["kind"].as_str() {
+                    Some("directory") => pending.push(file),
+                    Some("file") => {
+                        let preview = crate::artifacts::preview(
+                            &ws,
+                            root,
+                            &crate::artifacts::Selection {
+                                path: file.clone(),
+                                snapshot: None,
+                            },
+                        )?;
+                        anyhow::ensure!(
+                            preview["kind"] == "text",
+                            "workflow file {file} must be text under 512 KiB"
+                        );
+                        let text = preview["text"]
+                            .as_str()
+                            .context("invalid file contents")?
+                            .to_string();
+                        bytes += text.len();
+                        anyhow::ensure!(bytes <= 4 * 1024 * 1024, "workflow exceeds 4 MiB");
+                        files.insert(file, text);
+                    }
+                    _ => bail!("workflow contains unsupported file {file}"),
+                }
+            }
+        }
+        let program = files
+            .remove("program.omar")
+            .context("program.omar is missing")?;
+        return Ok(json!({"program": program, "files": files}));
+    }
+    if method == "GET" && action.is_empty() {
+        return Ok(
+            json!({"workspace":ws, "worktree":ws.worktree(root), "snapshots":ws.snapshots(root)?}),
+        );
+    }
+    anyhow::ensure!(method == "POST", "unsupported workspace operation");
+    match action {
+        "browse" | "preview" => {
+            let selection = serde_json::from_slice::<crate::artifacts::Selection>(body)?;
+            if action == "browse" {
+                crate::artifacts::browse(&ws, root, &selection)
+            } else {
+                crate::artifacts::preview(&ws, root, &selection)
+            }
+        }
+        "restore" => {
+            let selection = serde_json::from_slice::<crate::artifacts::Selection>(body)?;
+            let restored = ws.restore(
+                root,
+                selection
+                    .snapshot
+                    .as_deref()
+                    .context("select a snapshot to restore")?,
+            )?;
+            Ok(json!({"workspace":restored}))
+        }
+        "editor" => {
+            let presence = workspaces.presence.lock().expect("presence poisoned");
+            anyhow::ensure!(!presence.stopping, "runtime is shutting down");
+            let url = workspaces
+                .editors
+                .lock()
+                .expect("editors poisoned")
+                .open(root, &ws)?;
+            Ok(json!({"url":url}))
+        }
+        "editor/stop" => {
+            workspaces
+                .editors
+                .lock()
+                .expect("editors poisoned")
+                .stop(id);
+            Ok(json!({"stopped":true}))
+        }
+        _ => bail!("unknown workspace operation"),
+    }
+}
+
+fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Access) -> Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -507,9 +1398,10 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
     reader.read_line(&mut request_line)?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
+    let mut path = parts.next().unwrap_or("").to_string();
 
     let mut content_length = 0usize;
+    let mut host = None;
     let mut origin = None;
     let mut origin_header = None;
     let mut websocket_key = None;
@@ -519,6 +1411,9 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
             break;
         }
         let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("host:") {
+            host = Some(value.trim().to_owned());
+        }
         if let Some(value) = lower.strip_prefix("content-length:") {
             content_length = value.trim().parse().unwrap_or(0);
         }
@@ -538,11 +1433,137 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
     }
     let origin = origin.as_deref();
 
+    if content_length > MAX_BODY_BYTES {
+        return write_json(
+            &mut stream,
+            413,
+            &json!({"error": "request too large"}),
+            origin,
+        );
+    }
+    let mut raw_body = vec![0; content_length];
+    reader.read_exact(&mut raw_body)?;
+    let scoped_id = if let Some(rest) = path.strip_prefix("/chats/") {
+        let Some((id, route)) = rest.split_once('/') else {
+            return write_json(&mut stream, 404, &json!({"error": "not found"}), origin);
+        };
+        let id = id.to_string();
+        path = format!("/{route}");
+        Some(id)
+    } else {
+        None
+    };
+    if access == Access::View {
+        if let Some(reason) = view_refusal(&method, &path) {
+            return write_json(&mut stream, 403, &json!({"error": reason}), None);
+        }
+    }
+    let context = if path == "/v1/agent/reply"
+        || path == "/v1/agent/proposals"
+        || path == "/v1/agent/properties"
+    {
+        let body: Value = match serde_json::from_slice(&raw_body) {
+            Ok(body) => body,
+            Err(error) => {
+                return write_json(
+                    &mut stream,
+                    400,
+                    &json!({"error": error.to_string()}),
+                    origin,
+                )
+            }
+        };
+        let contexts = workspaces.contexts.lock().expect("workspaces poisoned");
+        let found = contexts
+            .values()
+            .find(|context| {
+                body.get("token").and_then(Value::as_str)
+                    == Some(context.agent_token.lock().expect("token poisoned").as_str())
+            })
+            .cloned();
+        match found {
+            Some(context)
+                if scoped_id
+                    .as_ref()
+                    .is_none_or(|id| id == &context.conversation_id) =>
+            {
+                context
+            }
+            _ => return write_json(&mut stream, 403, &json!({"error": "forbidden"}), origin),
+        }
+    } else {
+        let id = scoped_id.unwrap_or_else(|| {
+            workspaces
+                .history
+                .lock()
+                .expect("history poisoned")
+                .active_id
+                .clone()
+        });
+        let context = match access {
+            Access::Full => workspaces.get(&id),
+            Access::View => workspaces.get_for_view(&id),
+        };
+        match context {
+            Ok(context) => context,
+            Err(error) => {
+                return write_json(
+                    &mut stream,
+                    404,
+                    &json!({"error": error.to_string()}),
+                    origin,
+                )
+            }
+        }
+    };
+
+    let admission = match context.admit() {
+        Ok(admission) => admission,
+        Err(error) => {
+            return write_json(
+                &mut stream,
+                410,
+                &json!({"error":error.to_string()}),
+                origin,
+            )
+        }
+    };
+
+    if path == "/v1/workspaces" || path.starts_with("/v1/workspaces/") {
+        // Workspace reads expose host files; editor launch grants shell access.
+        // Reject cross-site requests, including simple POSTs, rather than only
+        // withholding CORS headers after executing the operation.
+        let local_hosts = [
+            context.address.to_string(),
+            format!("localhost:{}", context.address.port()),
+        ];
+        if !host.as_ref().is_some_and(|h| local_hosts.contains(h))
+            || (origin_header.is_some() && origin.is_none())
+        {
+            return write_json(&mut stream, 403, &json!({"error":"origin rejected"}), None);
+        }
+        if method == "OPTIONS" {
+            return write_json(&mut stream, 204, &Value::Null, origin);
+        }
+        let response = workspace_request(&workspaces, &context, &method, &path, &raw_body);
+        let (status, body) = match response {
+            Ok(body) => (200, body),
+            Err(error) => (400, json!({"error":format!("{error:#}")})),
+        };
+        return write_json(&mut stream, status, &body, origin);
+    }
+
+    // Geometry is only a terminal handshake parameter; leave other API paths
+    // and their routing unchanged.
+    let (terminal_path, terminal_query) = path.split_once('?').unwrap_or((&path, ""));
     // A terminal is the one endpoint where a wrong answer hands an attacker a
     // shell, and CORS does not apply to WebSockets: the browser opens the
     // socket regardless and only the server can refuse it.
-    if method == "GET" && path.starts_with(TERMINAL_PREFIX) && path.ends_with(TERMINAL_SUFFIX) {
-        let agent = path
+    if method == "GET"
+        && terminal_path.starts_with(TERMINAL_PREFIX)
+        && terminal_path.ends_with(TERMINAL_SUFFIX)
+    {
+        let agent = terminal_path
             .trim_start_matches(TERMINAL_PREFIX)
             .trim_end_matches(TERMINAL_SUFFIX)
             .to_string();
@@ -551,23 +1572,69 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
             crate::ea::ea_prefix(context.ea_id, &context.session_prefix),
             crate::tmux::flatten_agent_name(&agent)
         );
+        drop(admission);
         return attach_terminal(
             stream,
             &session,
             websocket_key.as_deref(),
             origin_header.as_deref(),
+            terminal_query,
+            access,
+        );
+    }
+    // A backend's sign-in, started by `POST /v1/backends/<name>/connect`.
+    if method == "GET"
+        && terminal_path.starts_with(CONNECT_PREFIX)
+        && terminal_path.ends_with(TERMINAL_SUFFIX)
+    {
+        let name = terminal_path
+            .trim_start_matches(CONNECT_PREFIX)
+            .trim_end_matches(TERMINAL_SUFFIX);
+        let Some(backend) = connectable(name) else {
+            return write_json(
+                &mut stream,
+                404,
+                &json!({"error": format!("'{name}' is not an assistant backend")}),
+                origin_header.as_deref(),
+            );
+        };
+        let session = connect_session(&context, backend);
+        drop(admission);
+        return attach_terminal(
+            stream,
+            &session,
+            websocket_key.as_deref(),
+            origin_header.as_deref(),
+            terminal_query,
+            access,
         );
     }
     // The assistant is not one of the agents: its session is named
     // `<base>ea-<id>` rather than `<base><id>-<name>`, so no agent name
     // reaches it and it needs a route of its own.
-    if method == "GET" && path == "/v1/agent/terminal" {
+    if method == "GET" && terminal_path == "/v1/agent/terminal" {
+        if context
+            .chat
+            .lock()
+            .expect("serve chat poisoned")
+            .needs_relaunch
+        {
+            return write_json(
+                &mut stream,
+                409,
+                &json!({"error": "Send a message to resume this chat's assistant terminal."}),
+                origin_header.as_deref(),
+            );
+        }
         let session = crate::ea::ea_manager_session(context.ea_id, &context.session_prefix);
+        drop(admission);
         return attach_terminal(
             stream,
             &session,
             websocket_key.as_deref(),
             origin_header.as_deref(),
+            terminal_query,
+            access,
         );
     }
 
@@ -584,34 +1651,129 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
         }
     }
 
+    // A viewer watches without counting as an operator window, and without
+    // waking the assistant the way an operator's arrival does.
+    if access == Access::View && method == "GET" && path == "/v1/chat/events" {
+        return stream_chat(stream, &context, None, admission);
+    }
     // Streams for as long as the operator keeps Mission Control open.
     if method == "GET" && path == "/v1/chat/events" {
-        return stream_chat(stream, &context, origin);
+        {
+            workspaces
+                .presence
+                .lock()
+                .expect("presence poisoned")
+                .connect()?;
+        }
+        let _connection = WindowConnection(workspaces.clone());
+        if workspaces.launch_ea.load(Ordering::Relaxed) {
+            let context = context.clone();
+            thread::spawn(move || {
+                let _operation = context
+                    .chat_operation
+                    .lock()
+                    .expect("chat operation poisoned");
+                let Ok(_admission) = context.admit() else {
+                    return;
+                };
+                if context.chat.lock().expect("chat poisoned").needs_relaunch {
+                    let command = context.command.lock().expect("command poisoned").clone();
+                    match relaunch_ea(&context, &command) {
+                        Ok(_) => context.chat.lock().expect("chat poisoned").needs_relaunch = false,
+                        Err(error) => eprintln!("Could not resume assistant: {error:#}"),
+                    }
+                }
+            });
+        }
+        return stream_chat(stream, &context, origin, admission);
     }
 
-    let mut read_body = |length: usize| -> Result<Vec<u8>> {
-        let mut raw = vec![0u8; length];
-        reader.read_exact(&mut raw)?;
-        Ok(raw)
-    };
+    if method == "GET" {
+        if let Some((run_id, upstream)) = path
+            .strip_prefix("/v1/runs/")
+            .and_then(|rest| rest.split_once(DIAGRAM_RELAY))
+            .filter(|(_, upstream)| matches!(*upstream, "/v1/diagram" | "/v1/events"))
+        {
+            let address = context
+                .runs
+                .lock()
+                .expect("serve runs poisoned")
+                .get(run_id)
+                .and_then(|record| record.diagram_address.clone());
+            return match address {
+                Some(address) => relay_diagram(stream, &address, upstream),
+                None => write_json(
+                    &mut stream,
+                    404,
+                    &json!({"error": "no live diagram"}),
+                    origin,
+                ),
+            };
+        }
+    }
+
+    let read_body = |_length: usize| -> Result<Vec<u8>> { Ok(raw_body.clone()) };
+
+    if content_length > MAX_BODY_BYTES
+        && (path.starts_with("/v1/chats") || path == "/v1/agent/reply")
+    {
+        return write_json(
+            &mut stream,
+            413,
+            &json!({"error": "request too large"}),
+            origin,
+        );
+    }
 
     let (status, body) = match (method.as_str(), path.as_str()) {
         ("GET", "/health") => (
             200,
-            json!({"status": "ok", "protocol_version": SERVE_PROTOCOL_VERSION}),
+            json!({
+                "status": "ok",
+                "protocol_version": SERVE_PROTOCOL_VERSION,
+                "access": match access {
+                    Access::Full => "full",
+                    Access::View => "view",
+                },
+            }),
         ),
         ("POST", "/v1/runs") => {
             if content_length > MAX_BODY_BYTES {
                 (413, json!({"error": "program too large"}))
             } else {
-                start_run(&context, &read_body(content_length)?)
+                // The idle check and run admission must be indivisible: a
+                // closing window cannot stop a deployment being admitted.
+                let presence = workspaces.presence.lock().expect("presence poisoned");
+                if let Some(refusal) = presence.refusal() {
+                    (503, json!({"error": refusal}))
+                } else {
+                    start_run(&context, &read_body(content_length)?)
+                }
             }
         }
         ("GET", "/v1/chat") => {
-            let chat = context.chat.lock().expect("serve chat poisoned");
-            (200, json!({"messages": chat.messages}))
+            let history = context.history.lock().expect("history poisoned");
+            (200, json!(history.conversation(&context.conversation_id)))
         }
-        ("POST", "/v1/chat") => send_to_ea(&context, &read_body(content_length)?),
+        ("POST", "/v1/chat") => {
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "message too large"}))
+            } else {
+                send_to_ea(&context, &read_body(content_length)?)
+            }
+        }
+        ("GET", "/v1/chats") => (200, workspaces.list()),
+        ("POST", "/v1/chats") => {
+            let _ = read_body(content_length)?;
+            select_chat(&workspaces, None)
+        }
+        ("POST", rest) if rest.starts_with("/v1/chats/") && rest.ends_with("/activate") => {
+            let _ = read_body(content_length)?;
+            let id = rest
+                .trim_start_matches("/v1/chats/")
+                .trim_end_matches("/activate");
+            select_chat(&workspaces, Some(id))
+        }
         ("GET", "/v1/agent") => (200, describe_agent(&context)),
         ("GET", "/v1/role-settings") => {
             let models = activity_models(&context);
@@ -652,7 +1814,22 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
                 None => (404, json!({"error":"activity unavailable for this run"})),
             }
         }
+        ("GET", "/v1/agent/backends") => (200, backend_connections()),
         ("POST", "/v1/agent/backend") => switch_backend(&context, &read_body(content_length)?),
+        ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/connect") => {
+            let _ = read_body(content_length)?;
+            let name = rest
+                .trim_start_matches(CONNECT_PREFIX)
+                .trim_end_matches("/connect");
+            start_connect(&context, name)
+        }
+        ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/check") => {
+            let _ = read_body(content_length)?;
+            let name = rest
+                .trim_start_matches(CONNECT_PREFIX)
+                .trim_end_matches("/check");
+            check_backend(name)
+        }
         // EA-only, authenticated with the token handed to its MCP sidecar.
         ("POST", "/v1/agent/reply") => agent_reply(&context, &read_body(content_length)?),
         ("POST", "/v1/agent/proposals") => {
@@ -660,6 +1837,17 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
                 (413, json!({"error": "program too large"}))
             } else {
                 agent_proposal(&context, &read_body(content_length)?)
+            }
+        }
+        ("POST", "/v1/agent/properties") | ("POST", "/v1/properties/check") => {
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "program too large"}))
+            } else {
+                check_properties(
+                    &context,
+                    &read_body(content_length)?,
+                    path == "/v1/agent/properties",
+                )
             }
         }
         ("POST", "/v1/programs/check") => {
@@ -683,6 +1871,94 @@ fn handle_client(mut stream: TcpStream, context: Arc<Context_>) -> Result<()> {
         }
         // Before the run-record route, which would otherwise take the suffix
         // for part of the id.
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/snapshot") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/snapshot");
+            run_snapshot(&context, id)
+        }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/program") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/program");
+            run_program(&context, id)
+        }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/workspaces") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/workspaces");
+            run_workspaces(&context, id)
+        }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/timeline") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/timeline")
+                .to_string();
+            run_timeline(&context, &id)
+        }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.contains("/checkpoints/") => {
+            let rest = rest.trim_start_matches("/v1/runs/");
+            let (id, checkpoint) = rest.split_once("/checkpoints/").unwrap_or((rest, ""));
+            show_checkpoint(&context, id, checkpoint)
+        }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/checkpoints") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/checkpoints")
+                .to_string();
+            list_checkpoints(&context, &id)
+        }
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/rollback") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/rollback")
+                .to_string();
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "body too large"}))
+            } else {
+                rollback_run(&context, &id, &read_body(content_length)?)
+            }
+        }
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/mutate") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/mutate")
+                .to_string();
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "body too large"}))
+            } else {
+                mutate_run(&context, &id, &read_body(content_length)?)
+            }
+        }
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/pause") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/pause")
+                .to_string();
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "body too large"}))
+            } else {
+                let _ = read_body(content_length)?;
+                pause_run(&context, &id)
+            }
+        }
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/resume") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/resume")
+                .to_string();
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "body too large"}))
+            } else {
+                let _ = read_body(content_length)?;
+                let presence = workspaces.presence.lock().expect("presence poisoned");
+                if let Some(refusal) = presence.refusal() {
+                    (503, json!({"error": refusal}))
+                } else {
+                    resume_run(&context, &id)
+                }
+            }
+        }
         ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/stop") => {
             let id = rest
                 .trim_start_matches("/v1/runs/")
@@ -735,12 +2011,15 @@ fn attach_terminal(
     session: &str,
     websocket_key: Option<&str>,
     origin: Option<&str>,
+    query: &str,
+    access: Access,
 ) -> Result<()> {
     // Same-origin policy does not cover WebSockets. Without this check any page
     // the operator happens to visit could open a terminal into their agents and
     // type into it, loopback binding notwithstanding. A missing Origin is not a
-    // browser, which cannot suppress it.
-    if let Some(origin) = origin {
+    // browser, which cannot suppress it. A view terminal takes no input and
+    // shows what the view port already shows anyone, so any origin may watch.
+    if let Some(origin) = origin.filter(|_| access == Access::Full) {
         if crate::diagram::allowed_origin(Some(origin)).is_none() {
             return write_json(&mut stream, 403, &json!({"error": "origin refused"}), None);
         }
@@ -754,7 +2033,21 @@ fn attach_terminal(
         );
     };
 
-    let attachment = match crate::terminal::Attachment::open_session(session) {
+    let dimensions = match terminal_dimensions(query) {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            return write_json(&mut stream, 400, &json!({"error": error.to_string()}), None)
+        }
+    };
+    // A viewer's geometry is ignored: it must not reshape the operator's window.
+    let attachment = match (access, dimensions) {
+        (Access::View, _) => crate::terminal::Attachment::open_session_read_only(session),
+        (Access::Full, Some(size)) => {
+            crate::terminal::Attachment::open_session_sized(session, Some(size))
+        }
+        (Access::Full, None) => crate::terminal::Attachment::open_session(session),
+    };
+    let attachment = match attachment {
         Ok(attachment) => attachment,
         // The socket has not been upgraded yet, so this can still be an
         // ordinary HTTP error the client can read.
@@ -777,7 +2070,70 @@ fn attach_terminal(
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
 
-    relay_terminal(stream, attachment)
+    relay_terminal(stream, attachment, access)
+}
+
+/// Why the view port refuses a request, if it does. Anything that is not a
+/// read, plus reads that hand out more than the view shows: host files and
+/// editors under `/v1/workspaces`, and a run's web-agent panel credentials.
+fn view_refusal(method: &str, path: &str) -> Option<&'static str> {
+    let route = path.split_once('?').map_or(path, |(route, _)| route);
+    let panel = route.starts_with("/v1/runs/") && route.ends_with("/panel");
+    let workspaces = route == "/v1/workspaces" || route.starts_with("/v1/workspaces/");
+    (method != "GET" || panel || workspaces).then_some("read-only view")
+}
+
+/// Forward one read to a run's diagram server, which binds loopback only, and
+/// copy its response back, an event stream included, until either side ends.
+fn relay_diagram(mut client: TcpStream, address: &str, path: &str) -> Result<()> {
+    let mut upstream = match TcpStream::connect(address) {
+        Ok(upstream) => upstream,
+        Err(_) => {
+            return write_json(
+                &mut client,
+                502,
+                &json!({"error": "diagram unavailable"}),
+                None,
+            )
+        }
+    };
+    write!(
+        upstream,
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )?;
+    upstream.flush()?;
+    std::io::copy(&mut upstream, &mut client)?;
+    Ok(())
+}
+
+/// Optional initial geometry, in client cells including tmux's status lines.
+/// Reject partial/duplicate/out-of-range dimensions before creating a PTY.
+fn terminal_dimensions(query: &str) -> Result<Option<(u16, u16)>> {
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let mut cols = None;
+    let mut rows = None;
+    for field in query.split('&') {
+        let (key, value) = field.split_once('=').context("invalid terminal geometry")?;
+        let slot = match key {
+            "cols" => &mut cols,
+            "rows" => &mut rows,
+            _ => bail!("unknown terminal geometry parameter"),
+        };
+        if slot.is_some() {
+            bail!("duplicate terminal geometry parameter");
+        }
+        let value: u16 = value.parse().context("invalid terminal dimension")?;
+        if !(2..=1000).contains(&value) {
+            bail!("implausible terminal dimension");
+        }
+        *slot = Some(value);
+    }
+    match (cols, rows) {
+        (Some(cols), Some(rows)) => Ok(Some((cols, rows))),
+        _ => bail!("both cols and rows are required"),
+    }
 }
 
 /// What the viewer can fit, in characters.
@@ -788,7 +2144,11 @@ struct Resize {
 }
 
 /// Pump bytes between the socket and the pseudo-terminal until either ends.
-fn relay_terminal(stream: TcpStream, mut attachment: crate::terminal::Attachment) -> Result<()> {
+fn relay_terminal(
+    stream: TcpStream,
+    mut attachment: crate::terminal::Attachment,
+    access: Access,
+) -> Result<()> {
     use tungstenite::{Message, WebSocket};
 
     // Reads have to give up regularly so the other direction gets a turn; this
@@ -797,16 +2157,18 @@ fn relay_terminal(stream: TcpStream, mut attachment: crate::terminal::Attachment
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut socket = WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
 
-    // The viewer must render at the agent's size rather than resize it, so it
-    // is told what that size is before any output arrives.
+    // Report PTY client dimensions, including status rows, before output.
+    // With multiple viewers this is not necessarily the shared window size.
     let size = attachment.size;
     let _ = socket.send(Message::Text(
-        json!({"cols": size.cols, "rows": size.rows}).to_string(),
+        json!({"cols": size.cols, "rows": size.client_rows()}).to_string(),
     ));
 
     loop {
         // Keystrokes travelling to the agent.
         match socket.read() {
+            // A viewer's keystrokes and resizes go nowhere.
+            Ok(Message::Binary(_) | Message::Text(_)) if access == Access::View => {}
             Ok(Message::Binary(bytes)) => attachment.write(&bytes)?,
             // Text is the control channel: the viewer says what shape it is and
             // the session reflows to match, the way a terminal does when its
@@ -816,7 +2178,7 @@ fn relay_terminal(stream: TcpStream, mut attachment: crate::terminal::Attachment
                     attachment.resize(resize.cols, resize.rows)?;
                     let size = attachment.size;
                     let _ = socket.send(Message::Text(
-                        json!({"cols": size.cols, "rows": size.rows}).to_string(),
+                        json!({"cols": size.cols, "rows": size.client_rows()}).to_string(),
                     ));
                 }
                 Err(_) => attachment.write(text.as_bytes())?,
@@ -855,17 +2217,31 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
         .expect("serve command poisoned")
         .clone();
     json!({
-        "backend": crate::config::backend_of_command(&command),
-        "available": crate::config::ASSISTANT_BACKENDS,
+        "backend": crate::backend::ASSISTANT
+            .iter()
+            .copied()
+            .find(|kind| crate::backend::of(*kind).default_command() == command)
+            .map(crate::backend::Kind::name),
+        "available": crate::backend::assistant_names(),
     })
+}
+
+/// Whether each backend is installed and signed in. Asked on demand: the
+/// answer comes from each CLI and takes up to a few seconds.
+fn backend_connections() -> Value {
+    use crate::backend::connection;
+    let backends: Vec<Value> = connection::assistants()
+        .into_iter()
+        .map(|(backend, status)| connection::describe(backend, &status))
+        .collect();
+    json!({ "backends": backends })
 }
 
 /// Relaunch the assistant on a different backend.
 ///
 /// A backend is chosen when the process starts, so changing it means a new
-/// process: the assistant's current session does not survive. That is the
-/// operator's call to make, which is why this is an explicit request rather
-/// than something inferred.
+/// process. Each backend resumes its own saved conversation when available;
+/// the durable OMAR transcript supplies context across backend changes.
 fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     #[derive(Deserialize)]
     struct Request {
@@ -875,37 +2251,197 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
-    let command = match crate::config::resolve_backend(&request.backend) {
-        Ok(command) => command,
+    let backend = match crate::backend::resolve(&request.backend) {
+        Ok(backend) => backend,
         Err(reason) => return (400, json!({"error": reason})),
     };
-    if !crate::config::ASSISTANT_BACKENDS.contains(&request.backend.as_str()) {
+    if !crate::backend::ASSISTANT.contains(&backend.kind()) {
         return (
             400,
             json!({"error": format!("'{}' is not an assistant backend", request.backend)}),
         );
     }
+    // Asked before the running assistant is touched, and before the chat
+    // lock: a status check can take seconds.
+    let status = crate::backend::connection::connection(backend);
+    if let Some(reason) = unusable(backend, &status) {
+        return (409, json!({"error": reason, "status": status}));
+    }
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
+    let command = backend.default_command().to_string();
 
     match relaunch_ea(context, &command) {
         Ok(session) => {
             *context.command.lock().expect("serve command poisoned") = command;
+            let mut chat = context.chat.lock().expect("serve chat poisoned");
+            chat.needs_context = true;
+            chat.needs_relaunch = false;
+            chat.busy = false;
             (200, json!({"backend": request.backend, "session": session}))
         }
         Err(error) => (502, json!({"error": format!("{error:#}")})),
     }
 }
 
+/// An assistant backend by name; anything else has no sign-in to run here.
+fn connectable(name: &str) -> Option<&'static dyn crate::backend::Backend> {
+    crate::backend::by_name(name)
+        .filter(|backend| crate::backend::ASSISTANT.contains(&backend.kind()))
+}
+
+/// The tmux session a backend's sign-in runs in. Named apart from agents
+/// (`<base><ea>-<agent>`) and the assistant (`<base>ea-<ea>`).
+fn connect_session(context: &Context_, backend: &dyn crate::backend::Backend) -> String {
+    format!(
+        "{}connect-{}-{}",
+        context.session_prefix,
+        context.ea_id,
+        backend.kind().name()
+    )
+}
+
+/// Run `omar connect <backend>` (install, then the CLI's own sign-in) in a
+/// session Mission Control attaches a terminal to. One already running is
+/// reused, so a second click shows the same sign-in.
+fn start_connect(context: &Context_, name: &str) -> (u16, Value) {
+    let Some(backend) = connectable(name) else {
+        return (
+            404,
+            json!({"error": format!("'{name}' is not an assistant backend")}),
+        );
+    };
+    let Some(omar) = crate::manager::omar_server_exe() else {
+        return (500, json!({"error": "cannot find the omar executable"}));
+    };
+    let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
+    let session = connect_session(context, backend);
+    let name = backend.kind().name();
+    // A failed connect leaves its message on screen until a key is pressed;
+    // a successful one ends the session, and the page sees it connected.
+    let command = format!(
+        "{} connect {name} || {{ printf '\\nPress Enter to close.'; read _; }}",
+        crate::manager::shell_single_quote(&omar.display().to_string())
+    );
+    let started = match client.has_session(&session) {
+        Ok(true) => Ok(()),
+        _ => client.new_session(&session, &command, None),
+    };
+    match started {
+        Ok(()) => (
+            200,
+            json!({"session": session, "terminal": format!("{CONNECT_PREFIX}{name}{TERMINAL_SUFFIX}")}),
+        ),
+        Err(error) => (502, json!({"error": format!("{error:#}")})),
+    }
+}
+
+/// Whether `name`'s sign-in works, by its CLI answering a test prompt: what
+/// Mission Control asks before calling a sign-in done. 422 carries the CLI's
+/// own reason.
+fn check_backend(name: &str) -> (u16, Value) {
+    let Some(backend) = connectable(name) else {
+        return (
+            404,
+            json!({"error": format!("'{name}' is not an assistant backend")}),
+        );
+    };
+    match crate::backend::connection::check_sign_in(backend) {
+        Ok(()) => (200, json!({"ok": true})),
+        Err(error) => (
+            422,
+            json!({"error": format!("{} is signed in, but its test prompt failed: {error}", backend.kind().name())}),
+        ),
+    }
+}
+
+/// Why the assistant cannot move to `backend`, if it cannot: launching one that
+/// is missing or signed out would stop the working assistant for one that hangs.
+/// An unreadable status is let through, as Mission Control does.
+fn unusable(
+    backend: &dyn crate::backend::Backend,
+    status: &crate::backend::connection::Connection,
+) -> Option<String> {
+    use crate::backend::connection::Connection;
+    let name = backend.kind().name();
+    let state = match status {
+        Connection::NotInstalled => "not installed",
+        Connection::SignedOut => "not signed in",
+        Connection::Connected { .. } | Connection::Unknown { .. } => return None,
+    };
+    Some(format!("{name} is {state}; run `omar connect {name}`"))
+}
+
+fn assistant_command(root: &Path, ea_id: EaId, fallback: &str) -> String {
+    fs::read_to_string(crate::ea::ea_state_dir(ea_id, root).join("assistant-command"))
+        .ok()
+        .filter(|command| !command.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn remember_assistant(context: &Context_) -> Result<()> {
+    let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
+    let session = crate::ea::ea_manager_session(context.ea_id, &context.session_prefix);
+    let command = context.command.lock().expect("command poisoned").clone();
+    crate::manager::write_private_file(
+        &crate::ea::ea_state_dir(context.ea_id, &context.omar_dir).join("assistant-command"),
+        command.as_bytes(),
+    )?;
+    if client.has_session(&session)? {
+        let backend_name = client.session_backend(&session);
+        if let Some(backend) = backend_name
+            .as_deref()
+            .and_then(crate::backend::by_name)
+            .or_else(|| crate::backend::detect(&command))
+        {
+            let stamp = client.session_delivery(&session);
+            let target = crate::backend::Target {
+                name: &session,
+                pane_pid: client.get_pane_pid(&session)?,
+                stamp: stamp.as_deref(),
+            };
+            if let Some(id) = backend.conversation_id(&target) {
+                crate::manager::write_private_file(
+                    &crate::backend::conversation_path(
+                        &context.omar_dir,
+                        context.ea_id,
+                        backend.kind().name(),
+                    ),
+                    id.as_bytes(),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stop_assistant(context: &Context_) -> Result<()> {
+    remember_assistant(context)?;
+    let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
+    client.kill_session_tree(&crate::ea::ea_manager_session(
+        context.ea_id,
+        &context.session_prefix,
+    ))
+}
+
 fn relaunch_ea(context: &Arc<Context_>, command: &str) -> Result<String> {
+    anyhow::ensure!(
+        !context.shutdown.load(Ordering::SeqCst),
+        "runtime is shutting down"
+    );
     let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
     let existing = crate::ea::ea_manager_session(context.ea_id, &context.session_prefix);
     if client.has_session(&existing)? {
-        client.kill_session(&existing)?;
+        stop_assistant(context)?;
     }
     let name = crate::ea::load_registry(&context.omar_dir)
         .into_iter()
         .find(|ea| ea.id == context.ea_id)
         .map(|ea| ea.name)
         .unwrap_or_else(|| format!("ea-{}", context.ea_id));
+    context.chat.lock().expect("chat poisoned").owned = true;
     let (session, _) = crate::manager::ensure_manager_session(
         &client,
         command,
@@ -919,14 +2455,246 @@ fn relaunch_ea(context: &Arc<Context_>, command: &str) -> Result<String> {
             // Without this the new process has no way to answer the operator.
             serve: Some(crate::manager::ServeMcpContext {
                 endpoint: context.address.to_string(),
-                token: context.agent_token.clone(),
+                token: context
+                    .agent_token
+                    .lock()
+                    .expect("agent token poisoned")
+                    .clone(),
             }),
         },
     )?;
     Ok(session)
 }
 
+impl Workspaces {
+    fn shutdown_if_idle(&self) -> bool {
+        if crate::sessions::is_managed() {
+            return false;
+        }
+        let mut presence = self.presence.lock().expect("presence poisoned");
+        let contexts: Vec<_> = self
+            .contexts
+            .lock()
+            .expect("workspaces poisoned")
+            .values()
+            .cloned()
+            .collect();
+        let active = contexts.iter().any(|context| {
+            context
+                .runs
+                .lock()
+                .expect("runs poisoned")
+                .values()
+                .any(|run| run.status.is_active())
+        });
+        if !presence.shutdown_due(
+            Instant::now(),
+            active || self.editors.lock().expect("editors poisoned").connected(),
+        ) {
+            return false;
+        }
+        presence.stopping = true;
+        self.shutdown.store(true, Ordering::SeqCst);
+        for context in contexts {
+            let _operation = context
+                .chat_operation
+                .lock()
+                .expect("chat operation poisoned");
+            if !context.chat.lock().expect("chat poisoned").owned {
+                continue;
+            }
+            if let Err(error) = stop_assistant(&context) {
+                eprintln!("Could not stop assistant: {error:#}");
+                presence.stopping = false;
+                self.shutdown.store(false, Ordering::SeqCst);
+                return false;
+            }
+            let mut chat = context.chat.lock().expect("chat poisoned");
+            chat.busy = false;
+            chat.needs_context = true;
+            chat.needs_relaunch = true;
+            chat.owned = false;
+        }
+        self.editors.lock().expect("editors poisoned").stop_all();
+        eprintln!("Mission Control closed; no active topologies. Runtime stopped.");
+        true
+    }
+
+    fn get(&self, id: &str) -> Result<Arc<Context_>> {
+        let mut contexts = self.contexts.lock().expect("workspaces poisoned");
+        if let Some(context) = contexts.get(id) {
+            let _admission = context.admit()?;
+            return Ok(context.clone());
+        }
+        let mut history = self.history.lock().expect("history poisoned");
+        let saved = history
+            .conversations
+            .iter()
+            .find(|chat| chat.id == id)
+            .context("unknown chat")?;
+        let has_history = !saved.messages.is_empty();
+        let ea_id = match saved.ea_id {
+            Some(ea_id) => ea_id,
+            None => {
+                crate::ea::ensure_default_ea(&self.settings.omar_dir)?;
+                let ea_id = crate::ea::register_ea(
+                    &self.settings.omar_dir,
+                    &format!("chat-{id}"),
+                    Some("Mission Control chat"),
+                )?;
+                history.assign_ea(id, ea_id)?;
+                ea_id
+            }
+        };
+        let _admission = crate::ea_lifecycle::Admission::acquire(&self.settings.omar_dir, ea_id)?;
+        // The EA's parked runs, unless a chat already offers them.
+        let mut parked = paused_runs(&self.settings.omar_dir, ea_id);
+        for other in contexts.values() {
+            let held = other.runs.lock().expect("runs poisoned");
+            parked.retain(|run_id, _| !held.contains_key(run_id));
+        }
+        let latest_parked = parked
+            .values()
+            .max_by_key(|run| run.started_at)
+            .map(|run| run.run_id.clone());
+        let context = Arc::new(Context_ {
+            history: self.history.clone(),
+            conversation_id: id.to_string(),
+            omar_dir: self.settings.omar_dir.clone(),
+            ea_id,
+            session_prefix: self.settings.session_prefix.clone(),
+            default_workdir: self.settings.default_workdir.clone(),
+            health_idle_warning: self.settings.health_idle_warning,
+            runs: Arc::new(Mutex::new(parked)),
+            panels: Panels::default(),
+            activity: Arc::new(Mutex::new(BTreeMap::new())),
+            role_settings: crate::activity::RoleSettings::load(
+                self.settings
+                    .omar_dir
+                    .join(format!("role-settings-{ea_id}.json")),
+            ),
+            mutations: Mutex::default(),
+            chat: Arc::new(Mutex::new(Chat {
+                latest_run: latest_parked,
+                subscribers: Vec::new(),
+                busy: false,
+                needs_context: has_history,
+                needs_relaunch: true,
+                owned: false,
+            })),
+            agent_token: Mutex::new(Uuid::new_v4().to_string()),
+            chat_operation: Mutex::new(()),
+            command: Arc::new(Mutex::new(assistant_command(
+                &self.settings.omar_dir,
+                ea_id,
+                &self.settings.command,
+            ))),
+            address: self.settings.address,
+            shutdown: self.shutdown.clone(),
+        });
+        contexts.insert(id.to_string(), context.clone());
+        Ok(context)
+    }
+
+    /// `get` for the view port, which must not change what it shows: a chat
+    /// that has never had an assistant would be given one, so it is refused.
+    fn get_for_view(&self, id: &str) -> Result<Arc<Context_>> {
+        let started = self
+            .history
+            .lock()
+            .expect("history poisoned")
+            .conversations
+            .iter()
+            .any(|chat| chat.id == id && chat.ea_id.is_some());
+        anyhow::ensure!(
+            started
+                || self
+                    .contexts
+                    .lock()
+                    .expect("workspaces poisoned")
+                    .contains_key(id),
+            "unknown chat"
+        );
+        self.get(id)
+    }
+
+    fn list(&self) -> Value {
+        let contexts = self.contexts.lock().expect("workspaces poisoned").clone();
+        let (active_id, mut conversations) = {
+            let history = self.history.lock().expect("history poisoned");
+            (history.active_id.clone(), history.list())
+        };
+        for conversation in &mut conversations {
+            if let Some(context) = contexts.get(&conversation.id) {
+                context.live_summary(conversation);
+            }
+        }
+        json!({"active_id": active_id, "conversations": conversations})
+    }
+}
+
+impl Context_ {
+    fn live_summary(&self, summary: &mut ConversationSummary) {
+        let chat = self.chat.lock().expect("chat poisoned");
+        summary.busy = chat.busy;
+        let runs = self.runs.lock().expect("runs poisoned");
+        summary.run = chat
+            .latest_run
+            .as_ref()
+            .and_then(|id| runs.get(id))
+            .cloned()
+            .or_else(|| {
+                runs.values()
+                    .max_by_key(|run| (run.status.is_active(), run.started_at))
+                    .cloned()
+            });
+    }
+}
+
+/// Selection remembers where to open next, without touching another EA.
+fn select_chat(workspaces: &Arc<Workspaces>, id: Option<&str>) -> (u16, Value) {
+    let _selection = workspaces.selection.lock().expect("selection poisoned");
+    let selected = {
+        let mut history = workspaces.history.lock().expect("history poisoned");
+        if let Some(id) = id {
+            let Some(chat) = history.conversations.iter().find(|chat| chat.id == id) else {
+                return (404, json!({"error": "unknown chat"}));
+            };
+            let omar_dir = &workspaces.settings.omar_dir;
+            if chat
+                .ea_id
+                .is_some_and(|ea| crate::ea_lifecycle::fenced(omar_dir, ea))
+            {
+                return (410, json!({"error":"EA is deleting or deleted"}));
+            }
+        }
+        if let Err(error) = history.select(id) {
+            return (500, json!({"error": error.to_string()}));
+        }
+        history.active_id.clone()
+    };
+    let context = match workspaces.get(&selected) {
+        Ok(context) => context,
+        Err(error) => return (500, json!({"error": error.to_string()})),
+    };
+    let mut summary = workspaces
+        .history
+        .lock()
+        .expect("history poisoned")
+        .conversation(&selected)
+        .summary();
+    context.live_summary(&mut summary);
+    (200, json!(summary))
+}
+
 fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
+    if context.shutdown.load(Ordering::SeqCst) {
+        return (503, json!({"error": "runtime is shutting down"}));
+    }
     let request: ChatRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
@@ -952,16 +2720,83 @@ fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": format!("selected component name is empty or too long: '{name}'")}),
         );
     }
-    let message = context.publish_with_selection(
+    let (resume, relaunch) = {
+        let chat = context.chat.lock().expect("serve chat poisoned");
+        if request
+            .conversation_id
+            .as_ref()
+            .is_some_and(|id| id != &context.conversation_id)
+        {
+            return (
+                409,
+                json!({"error": "The active chat changed. Reopen it before sending."}),
+            );
+        }
+        if chat.busy {
+            return (409, json!({"error": "The assistant is still replying."}));
+        }
+        let resume = if chat.needs_context {
+            match context
+                .history
+                .lock()
+                .expect("history poisoned")
+                .conversation(&context.conversation_id)
+                .resume_context()
+            {
+                Ok(context) => context,
+                Err(error) => return (500, json!({"error": error.to_string()})),
+            }
+        } else {
+            String::new()
+        };
+        (resume, chat.needs_relaunch)
+    };
+    if relaunch {
+        let command = context
+            .command
+            .lock()
+            .expect("serve command poisoned")
+            .clone();
+        if let Err(error) = relaunch_ea(context, &command) {
+            return (
+                502,
+                json!({"error": format!("could not resume assistant: {error:#}")}),
+            );
+        }
+        context
+            .chat
+            .lock()
+            .expect("serve chat poisoned")
+            .needs_relaunch = false;
+    }
+    let message = match context.publish_with_selection(
         ChatRole::Operator,
         request.text.clone(),
         false,
         None,
         request.selection.clone(),
-    );
-    match deliver_to_ea(context, &request.text, &request.selection) {
-        Ok(()) => (202, json!(message)),
-        Err(error) => (502, json!({"error": format!("{error:#}")})),
+    ) {
+        Ok(message) => message,
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    context.chat.lock().expect("serve chat poisoned").busy = true;
+    match deliver_to_ea(
+        context,
+        &format!("{resume}{}", request.text),
+        &request.selection,
+    ) {
+        Ok(()) => {
+            context
+                .chat
+                .lock()
+                .expect("serve chat poisoned")
+                .needs_context = false;
+            (202, json!(message))
+        }
+        Err(error) => {
+            context.chat.lock().expect("serve chat poisoned").busy = false;
+            (502, json!({"error": format!("{error:#}")}))
+        }
     }
 }
 
@@ -971,7 +2806,7 @@ fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
 /// message is indistinguishable from any other, and the EA answers in the
 /// terminal where nobody is looking. Topology agents get an `OMAR INVOCATION`
 /// envelope for the same reason.
-fn mission_control_envelope(text: &str, selection: &[String]) -> String {
+fn mission_control_envelope(text: &str, selection: &[String], live: Option<&LiveRun>) -> String {
     // Named on their own line so the EA can tell the operator's words from the
     // components they had highlighted while writing them.
     let selected = if selection.is_empty() {
@@ -993,9 +2828,65 @@ fn mission_control_envelope(text: &str, selection: &[String]) -> String {
          print here reaches nobody. Every question, status update, and answer must go \
          through `omar_reply`.\n\
          To offer a workflow, call the MCP tool `omar_propose_design` with a complete \
-         OMAR program. The operator approves and runs it; you do not.\n\n\
-         {selected}{text}"
+         OMAR program. Include companion files in `files`, keyed by their relative paths \
+         (for example schemas/decision.json), so imported types compile. The entry \
+         source is program.omar. The operator approves and runs it; you do not.\n\n\
+         {live}{selected}{text}",
+        live = live.map(ToString::to_string).unwrap_or_default(),
     )
+}
+
+/// The run an operator's message may be about, while it still has a program
+/// to change.
+struct LiveRun {
+    team: String,
+    status: String,
+    program: PathBuf,
+}
+
+impl std::fmt::Display for LiveRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "The workflow `{team}` is {status}; the program it runs is {program}. \
+             To change it, edit that program and propose the complete result with \
+             `omar_propose_design`, keeping `main {team}`. The operator applies it to \
+             the live run, which keeps its state and files.\n\n",
+            team = self.team,
+            status = self.status,
+            program = self.program.display(),
+        )
+    }
+}
+
+/// This chat's run, if it is running or paused.
+fn live_run(context: &Context_) -> Option<LiveRun> {
+    let id = context
+        .chat
+        .lock()
+        .expect("serve chat poisoned")
+        .latest_run
+        .clone()?;
+    let record = context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .get(&id)?
+        .clone();
+    if !matches!(
+        record.status,
+        RunStatus::Starting | RunStatus::Running | RunStatus::Pausing | RunStatus::Paused
+    ) {
+        return None;
+    }
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(&id);
+    Some(LiveRun {
+        team: record.team,
+        status: crate::diagram::wire_name(&record.status).unwrap_or_default(),
+        program: staged_program(&run_dir)?,
+    })
 }
 
 fn deliver_to_ea(context: &Arc<Context_>, text: &str, selection: &[String]) -> Result<()> {
@@ -1007,85 +2898,184 @@ fn deliver_to_ea(context: &Arc<Context_>, text: &str, selection: &[String]) -> R
     );
     client.deliver_prompt(
         &session,
-        &mission_control_envelope(text, selection),
+        &mission_control_envelope(text, selection, live_run(context).as_ref()),
         &DeliveryOptions::default(),
     )?;
     Ok(())
 }
 
 fn agent_reply(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     let reply: AgentReply = match serde_json::from_slice(body) {
         Ok(reply) => reply,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
-    if reply.token != context.agent_token {
+    if reply.token != *context.agent_token.lock().expect("agent token poisoned") {
         return (403, json!({"error": "forbidden"}));
     }
-    context.publish(ChatRole::Assistant, reply.text, reply.progress, None);
-    (202, json!({"status": "delivered"}))
+    match context.publish(ChatRole::Assistant, reply.text, reply.progress, None) {
+        Ok(_) => (202, json!({"status": "delivered"})),
+        Err(error) => (500, json!({"error": format!("{error:#}")})),
+    }
 }
 
 /// A proposal is a program the operator has not approved. It is published to
 /// the conversation and nothing more — only the operator can start a run.
 fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     let proposal: AgentProposal = match serde_json::from_slice(body) {
         Ok(proposal) => proposal,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
-    if proposal.token != context.agent_token {
+    if proposal.token != *context.agent_token.lock().expect("agent token poisoned") {
         return (403, json!({"error": "forbidden"}));
     }
     // Compile before publishing. The operator never sees an unbuildable
     // program, and the EA gets the compiler's diagnostic back as its tool
     // result, so it can correct the program itself.
-    let state = match compile_preview(context, &proposal.program) {
+    let state = match compile_preview(&proposal.program, &proposal.files) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
-    context.publish(
+    // Proved here rather than taken on trust: the operator is shown Lean's
+    // verdict on this program, whatever the assistant believed.
+    let properties = if proposal.properties.is_empty() {
+        Vec::new()
+    } else {
+        match prove_properties(
+            &proposal.program,
+            &proposal.files,
+            &proposal.lemmas,
+            &proposal.properties,
+        ) {
+            Ok(verdicts) => verdicts,
+            Err(error) => return (400, json!({"error": error})),
+        }
+    };
+    if let Err(error) = context.publish(
         ChatRole::Assistant,
         proposal.summary,
         false,
         Some(ProposedDesign {
             program: proposal.program,
+            files: proposal.files,
             inputs: proposal.inputs,
             preview: crate::diagram::DiagramSnapshot::from_vm_state(&state),
+            lemmas: proposal.lemmas,
+            properties,
         }),
-    );
+    ) {
+        return (500, json!({"error": format!("{error:#}")}));
+    }
     (202, json!({"status": "proposed"}))
 }
 
-fn compile_preview(context: &Arc<Context_>, program: &str) -> Result<VmState> {
-    let dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir).join("proposals");
-    fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.omar", Uuid::new_v4()));
-    fs::write(&path, program)?;
-    let bytecode = topology::load_program(&path)?;
-    let state = topology::verify(&bytecode)?;
-    let _ = fs::remove_file(&path);
-    Ok(state)
+/// Lean's verdict on each property of `program`.
+fn prove_properties(
+    program: &str,
+    files: &BTreeMap<String, String>,
+    lemmas: &str,
+    properties: &[crate::properties::Property],
+) -> std::result::Result<Vec<crate::properties::PropertyVerdict>, String> {
+    let staged = stage_program(program, None, files).map_err(|(_, problem)| {
+        problem["errors"][0]
+            .as_str()
+            .or(problem["error"].as_str())
+            .unwrap_or("the program could not be staged")
+            .to_string()
+    })?;
+    let outcome = crate::properties::prove(&staged.path, lemmas, properties);
+    staged.finish(outcome)
 }
 
-fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&str>) -> Result<()> {
+/// Check properties without proposing anything: how the assistant works a
+/// proof out, and how the operator re-checks after editing the program.
+fn check_properties(context: &Arc<Context_>, body: &[u8], agent: bool) -> (u16, Value) {
+    let request: PropertyCheck = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    if agent && request.token != *context.agent_token.lock().expect("agent token poisoned") {
+        return (403, json!({"error": "forbidden"}));
+    }
+    match prove_properties(
+        &request.program,
+        &request.files,
+        &request.lemmas,
+        &request.properties,
+    ) {
+        Ok(verdicts) => (200, json!({"verdicts": verdicts})),
+        Err(error) => (400, json!({"error": error})),
+    }
+}
+
+fn compile_preview(program: &str, files: &BTreeMap<String, String>) -> Result<VmState> {
+    let staged =
+        stage_program(program, None, files).map_err(|(_, problem)| anyhow::anyhow!("{problem}"))?;
+    let outcome = topology::load_staged_program(&staged.path)
+        .and_then(|bytecode| topology::verify(&bytecode));
+    staged.finish(outcome).map_err(anyhow::Error::msg)
+}
+
+fn stream_chat(
+    mut stream: TcpStream,
+    context: &Arc<Context_>,
+    origin: Option<&str>,
+    admission: crate::ea_lifecycle::Admission,
+) -> Result<()> {
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n{}Vary: Origin\r\n\r\n",
         crate::diagram::cors_origin_header(origin)
     )?;
     let (sender, receiver) = mpsc::sync_channel(CHAT_QUEUE);
-    let backlog = {
+    let (mut conversation, backlog) = {
         let mut chat = context.chat.lock().expect("serve chat poisoned");
         chat.subscribers.push(sender);
-        chat.messages.clone()
+        let history = context.history.lock().expect("history poisoned");
+        let saved = history.conversation(&context.conversation_id);
+        (saved.summary(), saved.messages.clone())
     };
+    context.live_summary(&mut conversation);
+    drop(admission);
+    writeln!(
+        stream,
+        "event: conversation\ndata: {}\n",
+        serde_json::to_string(&conversation)?
+    )?;
     // Replay so a reload does not lose the conversation.
     stream.write_all(b": connected\n\n")?;
     for message in backlog {
         write_chat_event(&mut stream, &message)?;
     }
+    writeln!(
+        stream,
+        "event: chat_state\ndata: {}\n",
+        serde_json::to_string(&conversation)?
+    )?;
     stream.flush()?;
+    // A read-side EOF notices a browser close immediately; write-side
+    // keepalives alone can miss the FIN until a subsequent write.
+    stream.set_read_timeout(Some(Duration::from_millis(1)))?;
+    let mut heartbeat = Instant::now();
     loop {
-        match receiver.recv_timeout(Duration::from_secs(15)) {
+        match stream.peek(&mut [0; 1]) {
+            Ok(0) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+            Ok(_) => {}
+        }
+        match receiver.recv_timeout(WINDOW_POLL) {
             Ok(message) => {
                 if write_chat_event(&mut stream, &message)
                     .and_then(|_| stream.flush().map_err(Into::into))
@@ -1095,6 +3085,10 @@ fn stream_chat(mut stream: TcpStream, context: &Arc<Context_>, origin: Option<&s
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if heartbeat.elapsed() < Duration::from_secs(15) {
+                    continue;
+                }
+                heartbeat = Instant::now();
                 if stream
                     .write_all(b": keepalive\n\n")
                     .and_then(|_| stream.flush())
@@ -1126,16 +3120,41 @@ fn write_chat_event(stream: &mut TcpStream, message: &ChatMessage) -> Result<()>
 }
 
 fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    let _admission = match context.admit() {
+        Ok(admission) => admission,
+        Err(error) => return (410, json!({"error":error.to_string()})),
+    };
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     let request: StartRunRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
 
+    if request
+        .conversation_id
+        .as_ref()
+        .is_some_and(|id| id != &context.conversation_id)
+    {
+        return (
+            409,
+            json!({"error": "The request belongs to another chat."}),
+        );
+    }
     let run_id = Uuid::new_v4().to_string();
     let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
         .join("serve")
         .join(&run_id);
-    let program_path = run_dir.join("program.omar");
+    let filename = request.filename.as_deref().unwrap_or("program.omar");
+    if !filename.ends_with(".omar") || filename.contains('/') || filename.contains('\\') {
+        return (
+            400,
+            json!({"error": format!("'{filename}' is not a program file name: it must be a plain name ending in .omar")}),
+        );
+    }
+    let program_path = run_dir.join(filename);
     if let Err(error) =
         fs::create_dir_all(&run_dir).and_then(|_| fs::write(&program_path, &request.program))
     {
@@ -1144,10 +3163,13 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": format!("failed to stage program: {error}")}),
         );
     }
+    if let Err(message) = stage_files(&run_dir, filename, &request.files) {
+        return (400, json!({"error": message}));
+    }
 
     // Compile and validate synchronously so a bad program is a 400 rather than
     // a 201 followed by an asynchronous failure the caller has to poll for.
-    let bytecode = match topology::load_program(&program_path) {
+    let bytecode = match topology::load_staged_program(&program_path) {
         Ok(bytecode) => bytecode,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
@@ -1155,11 +3177,20 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
-    let inputs = match encode_inputs(&state, &request.inputs) {
+    let mut inputs = match encode_inputs(&state, &request.inputs) {
         Ok(inputs) => inputs,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
+    inputs.extend(request.raw_inputs.iter().cloned());
     if let Err(error) = topology::parse_inputs(&state, &inputs) {
+        return (400, json!({"error": format!("{error:#}")}));
+    }
+    if let Err(error) = request
+        .checkpoint_period
+        .as_deref()
+        .map(crate::checkpoint::parse_policy)
+        .transpose()
+    {
         return (400, json!({"error": format!("{error:#}")}));
     }
 
@@ -1168,16 +3199,16 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     {
         let runs = context.runs.lock().expect("serve runs poisoned");
         if let Some(active) = find_active_run(&runs, &state.team) {
-            return (
-                409,
-                json!({
-                    "error": format!("team '{}' already has an active run", state.team),
-                    "run_id": active.run_id,
-                }),
-            );
+            return (409, team_held_error(active));
         }
     }
 
+    // The verified bytecode beside the source: a later timeline projection
+    // or resume reads it back without a compiler.
+    let _ = fs::write(
+        run_dir.join("program.json"),
+        serde_json::to_vec(&bytecode).unwrap_or_default(),
+    );
     let record = RunRecord {
         run_id: run_id.clone(),
         team: state.team.clone(),
@@ -1186,19 +3217,29 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         started_at: now_unix(),
         finished_at: None,
         error: None,
+        // From the combined list: a CLI start names its inputs in `raw_inputs`.
+        present: inputs
+            .iter()
+            .filter_map(|input| input.split_once('=').map(|(name, _)| name.to_string()))
+            .collect(),
+        outputs: BTreeMap::new(),
+        state: BTreeMap::new(),
+        mutation: None,
     };
+    persist_run(context, &record);
     context
         .runs
         .lock()
         .expect("serve runs poisoned")
         .insert(run_id.clone(), record);
 
+    context.chat.lock().expect("chat poisoned").latest_run = Some(run_id.clone());
     let (ready_sender, ready_receiver) = mpsc::channel();
     spawn_run_thread(
         context,
         &run_id,
         bytecode,
-        topology::generated_dir(&program_path),
+        program_path,
         inputs,
         &request,
         ready_sender,
@@ -1217,11 +3258,23 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             (500, json!({"error": "run vanished"}))
         }
         Err(_) => {
-            let runs = context.runs.lock().expect("serve runs poisoned");
-            let message = runs
-                .get(&run_id)
-                .and_then(|record| record.error.clone())
-                .unwrap_or_else(|| "run did not start".to_string());
+            // The readiness channel closes when the runner gives up, a moment
+            // before the run thread records why; wait for that reason.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let message = loop {
+                let runs = context.runs.lock().expect("serve runs poisoned");
+                let record = runs.get(&run_id);
+                if let Some(error) = record.and_then(|record| record.error.clone()) {
+                    break error;
+                }
+                if record.is_none_or(|record| !record.status.is_active())
+                    || Instant::now() >= deadline
+                {
+                    break "run did not start".to_string();
+                }
+                drop(runs);
+                thread::sleep(Duration::from_millis(50));
+            };
             (500, json!({"error": message, "run_id": run_id}))
         }
     }
@@ -1241,6 +3294,11 @@ struct CheckRequest {
     /// Must end in `.omar`, which is the compiler's own rule.
     #[serde(default)]
     filename: Option<String>,
+    /// Files the program imports, by the relative path it imports them under.
+    /// The compiler reads an import beside the source, and the source is
+    /// staged alone, so what it imports has to come with it.
+    #[serde(default)]
+    files: BTreeMap<String, String>,
     /// Whether to work out the tags the program would pass through.
     ///
     /// Off by default: a caller that only wants to know whether a program holds
@@ -1271,12 +3329,16 @@ fn check_program(body: &[u8]) -> (u16, Value) {
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
 
-    let staged = match stage_program(&request.program, request.filename.as_deref()) {
+    let staged = match stage_program(
+        &request.program,
+        request.filename.as_deref(),
+        &request.files,
+    ) {
         Ok(staged) => staged,
         Err(problem) => return problem,
     };
-    let outcome =
-        topology::load_program(&staged.path).and_then(|bytecode| topology::verify(&bytecode));
+    let outcome = topology::load_staged_program(&staged.path)
+        .and_then(|bytecode| topology::verify(&bytecode));
 
     match staged.finish(outcome) {
         Ok(state) => {
@@ -1326,10 +3388,60 @@ impl StagedProgram {
     }
 }
 
-/// Write a program out under the name the operator gave it.
+/// Write the files a program imports beside it, under the paths it uses.
+///
+/// A path is the program's own relative reference -- `schemas/decision.json`
+/// -- so it has to stay inside the program's directory: nothing absolute,
+/// nothing climbing out of it. And it is not the program: `program_name` is
+/// what the request's text was written to, and a file under that name would
+/// replace what the request said it was compiling.
+fn stage_files(
+    directory: &Path,
+    program_name: &str,
+    files: &BTreeMap<String, String>,
+) -> std::result::Result<(), String> {
+    use std::path::Component;
+    for (relative, contents) in files {
+        let path = Path::new(relative);
+        let inside = !relative.is_empty()
+            && !relative.contains('\\')
+            && path.components().all(|part| match part {
+                Component::Normal(name) => !name.to_string_lossy().eq_ignore_ascii_case(".git"),
+                Component::CurDir => true,
+                _ => false,
+            });
+        if !inside {
+            return Err(format!(
+                "'{relative}' is not a file a program can import: \
+                 it must be a relative path inside the program's own directory"
+            ));
+        }
+        let plain: PathBuf = path
+            .components()
+            .filter(|part| !matches!(part, Component::CurDir))
+            .collect();
+        if plain == Path::new(program_name) {
+            return Err(format!(
+                "'{relative}' is the program itself, not a file it imports"
+            ));
+        }
+        let target = directory.join(path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to stage '{relative}': {error}"))?;
+        }
+        fs::write(&target, contents)
+            .map_err(|error| format!("failed to stage '{relative}': {error}"))?;
+    }
+    Ok(())
+}
+
+/// Write a program out under the name the operator gave it, with the files it
+/// imports beside it.
 fn stage_program(
     program: &str,
     filename: Option<&str>,
+    files: &BTreeMap<String, String>,
 ) -> std::result::Result<StagedProgram, (u16, Value)> {
     let name = filename.unwrap_or("program.omar");
     // The compiler rejects any other extension, and saying so here names the
@@ -1355,12 +3467,16 @@ fn stage_program(
         let _ = fs::remove_dir_all(&directory);
         return Err((500, json!({"error": format!("{error}")})));
     }
+    if let Err(message) = stage_files(&directory, name, files) {
+        let _ = fs::remove_dir_all(&directory);
+        return Err((200, json!({"ok": false, "errors": [message]})));
+    }
     Ok(StagedProgram { directory, path })
 }
 
 #[derive(Debug, Deserialize)]
 struct PanelAnswer {
-    invocation_id: String,
+    task_id: u64,
     agent: String,
     values: BTreeMap<String, Value>,
 }
@@ -1433,14 +3549,14 @@ fn panel_answer(context: &Arc<Context_>, run_id: &str, body: &[u8]) -> (u16, Val
         &access,
         &team,
         &answer.agent,
-        &answer.invocation_id,
+        &answer.task_id,
         &answer.values,
     ) {
         Ok(()) => (
             202,
             json!({
                 "run_id": run_id,
-                "invocation_id": answer.invocation_id,
+                "task_id": answer.task_id,
                 "sent": answer.values.keys().collect::<Vec<_>>()
             }),
         ),
@@ -1491,7 +3607,7 @@ fn spawn_run_thread(
     context: &Arc<Context_>,
     run_id: &str,
     bytecode: topology::Bytecode,
-    generated: std::path::PathBuf,
+    program_path: std::path::PathBuf,
     inputs: Vec<String>,
     request: &StartRunRequest,
     ready_sender: mpsc::Sender<SocketAddr>,
@@ -1543,6 +3659,12 @@ fn spawn_run_thread(
         .lock()
         .expect("activity runs poisoned")
         .insert(run_id.clone(), activity.clone());
+    // Validated at admission, so a bad cadence was already a 400.
+    let checkpoint_policy = request
+        .checkpoint_period
+        .as_deref()
+        .and_then(|period| crate::checkpoint::parse_policy(period).ok());
+    let keep_workspaces = request.keep_workspaces;
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let outcome = topology::run_topology(
@@ -1551,9 +3673,8 @@ fn spawn_run_thread(
                 activity: Some(activity),
                 ea_id: context.ea_id,
                 omar_dir: &context.omar_dir,
-                generated: &generated,
+                generated: &topology::generated_dir(&program_path),
                 base_prefix: &context.session_prefix,
-                default_workdir: &context.default_workdir,
                 health_idle_warning: context.health_idle_warning,
                 inputs: &inputs,
                 replace,
@@ -1562,27 +3683,12 @@ fn spawn_run_thread(
                 diagram_address: Some(diagram_address),
                 diagram_ready: Some(ready_sender),
                 panel_ready: Some(panel_sender),
+                checkpoint_policy,
+                keep_workspaces,
+                program_path: Some(&program_path),
             },
         );
-        // The run is over, so its invocation service is gone with it. Leaving
-        // the entry would let a panel offer work nothing can accept.
-        context
-            .panels
-            .lock()
-            .expect("serve panels poisoned")
-            .remove(&run_id);
-        let mut runs = context.runs.lock().expect("serve runs poisoned");
-        if let Some(record) = runs.get_mut(&run_id) {
-            record.finished_at = Some(now_unix());
-            match outcome {
-                Ok(topology::RunEnd::Completed) => record.status = RunStatus::Completed,
-                Ok(topology::RunEnd::Stopped) => record.status = RunStatus::Stopped,
-                Err(error) => {
-                    record.status = RunStatus::Failed;
-                    record.error = Some(format!("{error:#}"));
-                }
-            }
-        }
+        finish_run(&context, &run_id, outcome);
     });
 }
 
@@ -1601,6 +3707,10 @@ fn encode_inputs(state: &VmState, inputs: &BTreeMap<String, Value>) -> Result<Ve
         );
         let raw = match (port.ty.as_str(), value) {
             ("path", Value::String(path)) => path.clone(),
+            // An enum string is typed bare on the command line and taken as
+            // it comes, so quoting it here would make the quotes part of the
+            // value and no value the port admits.
+            (ty, Value::String(text)) if topology::string_enum(ty).is_some() => text.clone(),
             _ => serde_json::to_string(value)?,
         };
         encoded.push(format!("{name}={raw}"));
@@ -1610,7 +3720,20 @@ fn encode_inputs(state: &VmState, inputs: &BTreeMap<String, Value>) -> Result<Ve
 
 fn find_active_run<'a>(runs: &'a BTreeMap<String, RunRecord>, team: &str) -> Option<&'a RunRecord> {
     runs.values()
-        .find(|record| record.team == team && record.status.is_active())
+        .find(|record| record.team == team && record.status.holds_team())
+}
+
+/// Why a team cannot take a new run while this one holds it.
+fn team_held_error(active: &RunRecord) -> Value {
+    let error = if active.status == RunStatus::Paused {
+        format!(
+            "team '{}' has a paused run; resume it, or stop it to discard it",
+            active.team
+        )
+    } else {
+        format!("team '{}' already has an active run", active.team)
+    };
+    json!({ "error": error, "run_id": active.run_id })
 }
 
 /// Ask a run to stop at its next tag boundary.
@@ -1630,16 +3753,26 @@ fn find_active_run<'a>(runs: &'a BTreeMap<String, RunRecord>, team: &str) -> Opt
 /// finishing, and the outcome is the same either way.
 fn stop_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     let team = {
-        let runs = context.runs.lock().expect("serve runs poisoned");
-        match runs.get(id) {
+        let mut runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get_mut(id) {
             Some(record) if record.status.is_active() => record.team.clone(),
+            // Paused: no runner to ask. The run is given up, which frees the
+            // team; its checkpoints stay on disk for inspection.
+            Some(record) if record.status == RunStatus::Paused => {
+                record.status = RunStatus::Stopped;
+                record.finished_at = Some(now_unix());
+                persist_run(context, record);
+                return (200, json!(record));
+            }
             Some(record) => return (200, json!(record)),
             None => return (404, json!({"error": "unknown run"})),
         }
     };
 
     let dir = crate::deploy::dir_for(&context.omar_dir, context.ea_id, &team);
-    if let Err(error) = crate::deploy::request_stop(&dir) {
+    // Outranks a pause still waiting for its boundary: the operator asked for
+    // the run to end, and a held capture has no other way out.
+    if let Err(error) = crate::deploy::override_with_stop(&dir) {
         return (500, json!({"error": format!("{error:#}")}));
     }
 
@@ -1657,6 +3790,1007 @@ fn stop_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
         }
         Some(record) => (200, json!(record)),
         None => (404, json!({"error": "unknown run"})),
+    }
+}
+
+/// Ask a run to pause: checkpoint at its next tag boundary, then park. The
+/// same request `omar pause` makes, answered with the record marked pausing.
+fn pause_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let team = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) if record.status.is_active() => record.team.clone(),
+            Some(record) => return (200, json!(record)),
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let dir = crate::deploy::dir_for(&context.omar_dir, context.ea_id, &team);
+    if let Err(error) = crate::deploy::request(&dir, crate::deploy::ControlOp::Pause) {
+        return (409, json!({"error": format!("{error:#}")}));
+    }
+    let mut runs = context.runs.lock().expect("serve runs poisoned");
+    match runs.get_mut(id) {
+        Some(record) if record.status.is_active() => {
+            record.status = RunStatus::Pausing;
+            persist_run(context, record);
+            (202, json!(record))
+        }
+        Some(record) => (200, json!(record)),
+        None => (404, json!({"error": "unknown run"})),
+    }
+}
+
+/// One checkpoint as Mission Control lists it.
+fn checkpoint_summary(manifest: &crate::checkpoint::Manifest) -> Value {
+    let mut summary = json!({
+        "id": manifest.id,
+        "sequence": manifest.sequence,
+        "parent": manifest.parent,
+        "trigger": manifest.trigger,
+        "completed_tag": manifest.completed_tag,
+        "next_tag": manifest.next_tag,
+        "created_at": manifest.created_at,
+    });
+    if !manifest.mutation.is_empty() {
+        summary["mutation"] = json!(manifest
+            .mutation
+            .iter()
+            .map(crate::mutation::describe)
+            .collect::<Vec<_>>());
+    }
+    summary
+}
+
+/// The team whose live checkpoint directory is this run's, or why it is not:
+/// a later run of the team started a new lineage and archived this one.
+fn lineage_team(context: &Arc<Context_>, id: &str) -> Result<String, (u16, Value)> {
+    let runs = context.runs.lock().expect("serve runs poisoned");
+    let Some(record) = runs.get(id) else {
+        return Err((404, json!({"error": "unknown run"})));
+    };
+    if let Some(later) = superseded_by(&runs, id) {
+        return Err((
+            409,
+            json!({
+                "error": format!(
+                    "run {} of team '{}' started after this one; this run's checkpoints are archived beside the team's checkpoints directory",
+                    later.run_id, record.team
+                ),
+                "run_id": later.run_id,
+            }),
+        ));
+    }
+    Ok(record.team.clone())
+}
+
+/// The workspaces one run owns, for the file viewer: its instances' current
+/// ones, the ones its checkpoints keep, and copies restored from any of them.
+/// Not the whole EA's history.
+fn run_workspaces(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let team = match lineage_team(context, id) {
+        Ok(team) => team,
+        Err(response) => return response,
+    };
+    let dir = crate::deploy::dir_for(&context.omar_dir, context.ea_id, &team);
+    let record = match crate::deploy::DeploymentRecord::load(&dir) {
+        Ok(Some(record)) => record,
+        Ok(None) => return (200, json!({"workspaces": []})),
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    let manifests = crate::checkpoint::Store::new(&dir)
+        .list()
+        .map(|(manifests, _)| manifests)
+        .unwrap_or_default();
+    match crate::workspace::lineage(&context.omar_dir, context.ea_id, &record, &manifests, true) {
+        Ok(workspaces) => (200, json!({"workspaces": workspaces})),
+        Err(error) => (500, json!({"error": format!("{error:#}")})),
+    }
+}
+
+/// A run's checkpoints, oldest first, and which one a resume continues from.
+fn list_checkpoints(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let team = match lineage_team(context, id) {
+        Ok(team) => team,
+        Err(response) => return response,
+    };
+    let store = crate::checkpoint::Store::new(&crate::deploy::dir_for(
+        &context.omar_dir,
+        context.ea_id,
+        &team,
+    ));
+    let (manifests, problems) = match store.list() {
+        Ok(listed) => listed,
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    let resume_point = match store.resume_point() {
+        Ok(point) => point.map(|m| m.id),
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    (
+        200,
+        json!({
+            "checkpoints": manifests.iter().map(checkpoint_summary).collect::<Vec<_>>(),
+            "resume_point": resume_point,
+            "unreadable": problems,
+        }),
+    )
+}
+
+/// The logical timeline of a run the daemon admitted, projected from the
+/// bytecode staged with it and the inputs it started with. The same strip
+/// the editor draws for a draft, available to a client that reloaded or
+/// never saw the draft.
+fn run_timeline(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let present: std::collections::BTreeSet<String> = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) => record.present.iter().cloned().collect(),
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let staged = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id)
+        .join("program.json");
+    let bytecode = match fs::read(&staged)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| serde_json::from_slice::<topology::Bytecode>(&bytes).map_err(Into::into))
+    {
+        Ok(bytecode) => bytecode,
+        Err(error) => {
+            return (
+                409,
+                json!({"error": format!("the run's program is no longer staged: {error:#}")}),
+            )
+        }
+    };
+    match topology::verify(&bytecode) {
+        Ok(state) => {
+            let (steps, truncated) = topology::timeline(&state, &present, MAX_TIMELINE_STEPS);
+            (200, json!({"steps": steps, "truncated": truncated}))
+        }
+        Err(error) => (409, json!({"error": format!("{error:#}")})),
+    }
+}
+
+/// What a checkpoint holds, for the timeline's preview: where the run was,
+/// what it had produced, what was still queued, and which file version each
+/// instance was at.
+fn show_checkpoint(context: &Arc<Context_>, id: &str, checkpoint: &str) -> (u16, Value) {
+    let team = match lineage_team(context, id) {
+        Ok(team) => team,
+        Err(response) => return response,
+    };
+    let store = crate::checkpoint::Store::new(&crate::deploy::dir_for(
+        &context.omar_dir,
+        context.ea_id,
+        &team,
+    ));
+    let (manifest, state, _) = match store.load(checkpoint) {
+        Ok(loaded) => loaded,
+        Err(error) => return (404, json!({"error": format!("{error:#}")})),
+    };
+    let resume_point = store.resume_point().ok().flatten().map(|m| m.id);
+    let mut summary = checkpoint_summary(&manifest);
+    summary["is_resume_point"] = json!(resume_point.as_deref() == Some(manifest.id.as_str()));
+    summary["outputs"] = json!(state.outputs);
+    summary["state_vars"] = json!(state.state_vars);
+    summary["queue_len"] = json!(state.queue.len());
+    summary["queued_tags"] = json!(state
+        .queue
+        .iter()
+        .take(8)
+        .map(|tag| (tag.timestamp, tag.microstep))
+        .collect::<Vec<_>>());
+    summary["elapsed_ns"] = json!(manifest.elapsed_ns);
+    summary["workspaces"] = json!(manifest.workspaces);
+    summary["agents"] = json!(manifest.agents);
+    (200, summary)
+}
+
+#[derive(Debug, Deserialize)]
+struct RollbackRequest {
+    checkpoint: String,
+}
+
+/// Move a paused run's resume point to an older checkpoint. Nothing is
+/// deleted; the next resume continues from there with that checkpoint's
+/// files restored into new workspaces.
+fn rollback_run(context: &Arc<Context_>, id: &str, body: &[u8]) -> (u16, Value) {
+    // Serialised with admission and resume: a head change must not land
+    // after a resume has already read the old one.
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
+    let request: RollbackRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    let team = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) if record.status == RunStatus::Paused => record.team.clone(),
+            Some(record) => {
+                return (
+                    409,
+                    json!({"error": format!("run is {}; only a paused run can roll back", crate::diagram::wire_name(&record.status).unwrap_or_default())}),
+                )
+            }
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let store = crate::checkpoint::Store::new(&crate::deploy::dir_for(
+        &context.omar_dir,
+        context.ea_id,
+        &team,
+    ));
+    let manifest = match store.verify(&context.omar_dir, &request.checkpoint) {
+        Ok(manifest) => manifest,
+        Err(error) => return (409, json!({"error": format!("{error:#}")})),
+    };
+    let head = match store.set_head(&manifest.id) {
+        Ok(head) => head,
+        Err(error) => return (500, json!({"error": format!("{error:#}")})),
+    };
+    // A rollback across a mutation goes back to the program it had then:
+    // its bytecode, and its source where the checkpoint kept it.
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id);
+    let restored = store.load(&manifest.id).and_then(|(_, _, bytecode)| {
+        fs::write(run_dir.join("program.json"), serde_json::to_vec(&bytecode)?)?;
+        if let Some(program) = store.source(&manifest.id)? {
+            let source = crate::checkpoint::Source::read(&program)?;
+            if let Some(old) = staged_program(&run_dir) {
+                fs::remove_file(old)?;
+            }
+            source.write(&run_dir)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = restored {
+        return (500, json!({"error": format!("{error:#}")}));
+    }
+    (
+        200,
+        json!({
+            "resume_point": head.checkpoint_id,
+            "abandoned": head.abandoned,
+            "checkpoint": checkpoint_summary(&manifest),
+        }),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct MutateRequest {
+    program: String,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    files: BTreeMap<String, String>,
+    /// Answer with the plan and change nothing.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Change a run's program to the one sent. A paused run is changed where it
+/// stands and stays paused. A running run is asked to pause; when it parks the
+/// mutation is applied and the run resumed (see `finish_run`), so a mutation
+/// sits on the timeline between the pause checkpoint and the resumed run. A
+/// program that does not compile, renames `main`, or changes nothing is
+/// answered at once and the run is not touched.
+fn mutate_run(context: &Arc<Context_>, id: &str, body: &[u8]) -> (u16, Value) {
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
+    let request: MutateRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    let (team, status) = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) => (record.team.clone(), record.status),
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    if !matches!(status, RunStatus::Running | RunStatus::Paused) {
+        return (
+            409,
+            json!({"error": format!("run is {}; only a running or paused run can mutate", crate::diagram::wire_name(&status).unwrap_or_default())}),
+        );
+    }
+    if context
+        .mutations
+        .lock()
+        .expect("serve mutations poisoned")
+        .contains_key(id)
+    {
+        return (
+            409,
+            json!({"error": "a mutation is already waiting for this run to pause"}),
+        );
+    }
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id);
+    let filename = request.filename.as_deref().unwrap_or("program.omar");
+    if !filename.ends_with(".omar") || filename.contains('/') || filename.contains('\\') {
+        return (
+            400,
+            json!({"error": format!("'{filename}' is not a program file name: it must be a plain name ending in .omar")}),
+        );
+    }
+    let staged = run_dir.join("mutation");
+    let _ = fs::remove_dir_all(&staged);
+    if let Err(error) =
+        fs::create_dir_all(&staged).and_then(|_| fs::write(staged.join(filename), &request.program))
+    {
+        return (
+            500,
+            json!({"error": format!("failed to stage program: {error}")}),
+        );
+    }
+    if let Err(message) = stage_files(&staged, filename, &request.files) {
+        return (400, json!({"error": message}));
+    }
+    let bytecode = match topology::load_staged_program(&staged.join(filename))
+        .and_then(|bytecode| topology::verify(&bytecode).map(|_| bytecode))
+    {
+        Ok(bytecode) => bytecode,
+        Err(error) => return (400, json!({"error": format!("{error:#}")})),
+    };
+    // The program the run would continue with: a paused run's resume point
+    // holds its source, a running one is executing what was last staged.
+    // The compiler plans the change from it.
+    let plan = if status == RunStatus::Paused {
+        crate::mutation::paused_source(&crate::deploy::dir_for(
+            &context.omar_dir,
+            context.ea_id,
+            &team,
+        ))
+    } else {
+        staged_program(&run_dir).context("the run's program is no longer staged")
+    }
+    .and_then(|from| topology::compile_mutation(&from, &staged.join(filename)));
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => return (400, json!({"error": format!("{error:#}")})),
+    };
+    let changes: Vec<String> = crate::mutation::changes(&plan)
+        .iter()
+        .map(crate::mutation::describe)
+        .collect();
+    if changes.is_empty() || request.dry_run {
+        let _ = fs::remove_dir_all(&staged);
+        return (200, json!({"changes": changes}));
+    }
+    if status == RunStatus::Paused {
+        let mutation = apply_staged(context, id, &bytecode, &staged);
+        let code = if mutation.status == MutationStatus::Applied {
+            200
+        } else {
+            409
+        };
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        return (code, json!(runs.get(id)));
+    }
+    context
+        .mutations
+        .lock()
+        .expect("serve mutations poisoned")
+        .insert(id.to_string(), (bytecode, staged));
+    let (code, value) = pause_run(context, id);
+    if code >= 400 {
+        context
+            .mutations
+            .lock()
+            .expect("serve mutations poisoned")
+            .remove(id);
+        return (code, value);
+    }
+    let mut runs = context.runs.lock().expect("serve runs poisoned");
+    match runs.get_mut(id) {
+        Some(record) => {
+            record.mutation = Some(MutationRecord {
+                status: MutationStatus::Pending,
+                changes,
+                dropped: Vec::new(),
+                checkpoint: None,
+                error: None,
+            });
+            persist_run(context, record);
+            (202, json!(record))
+        }
+        None => (404, json!({"error": "unknown run"})),
+    }
+}
+
+/// Apply a staged mutation to a paused run and record how it went. On success
+/// the staged source replaces the run's, so a resume, a restart and the
+/// timeline all read the new program.
+fn apply_staged(
+    context: &Arc<Context_>,
+    id: &str,
+    bytecode: &topology::Bytecode,
+    staged: &Path,
+) -> MutationRecord {
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id);
+    let outcome = staged_program(staged)
+        .context("the mutation's program is no longer staged")
+        .and_then(|source| {
+            crate::mutation::apply(&context.omar_dir, context.ea_id, bytecode, &source)
+        })
+        .and_then(|applied| {
+            if let Some(old) = staged_program(&run_dir) {
+                fs::remove_file(old)?;
+            }
+            promote(staged, &run_dir)?;
+            fs::write(run_dir.join("program.json"), serde_json::to_vec(bytecode)?)?;
+            Ok(applied)
+        });
+    let _ = fs::remove_dir_all(staged);
+    let mutation = match outcome {
+        Ok(Some(applied)) => MutationRecord {
+            status: MutationStatus::Applied,
+            changes: applied.changes,
+            dropped: applied.dropped,
+            checkpoint: Some(applied.checkpoint),
+            error: None,
+        },
+        Ok(None) => MutationRecord {
+            status: MutationStatus::Applied,
+            changes: Vec::new(),
+            dropped: Vec::new(),
+            checkpoint: None,
+            error: None,
+        },
+        Err(error) => MutationRecord {
+            status: MutationStatus::Failed,
+            changes: Vec::new(),
+            dropped: Vec::new(),
+            checkpoint: None,
+            error: Some(format!("{error:#}")),
+        },
+    };
+    let mut runs = context.runs.lock().expect("serve runs poisoned");
+    if let Some(record) = runs.get_mut(id) {
+        record.mutation = Some(mutation.clone());
+        persist_run(context, record);
+    }
+    mutation
+}
+
+/// Move everything staged in `from` into `to`, replacing what is there.
+fn promote(from: &Path, to: &Path) -> Result<()> {
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            fs::create_dir_all(&target)?;
+            promote(&entry.path(), &target)?;
+        } else {
+            fs::rename(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// A run that parked with a mutation waiting: apply it, then resume. Resumed
+/// even when the mutation failed, as the program it had, since the pause was
+/// the mutation's and not the operator's; not resumed while the runtime is
+/// shutting down, which wanted the run paused anyway.
+fn complete_mutation(context: &Arc<Context_>, run_id: &str) {
+    let Ok(_admission) = context.admit() else {
+        return;
+    };
+    let Some((bytecode, staged)) = context
+        .mutations
+        .lock()
+        .expect("serve mutations poisoned")
+        .remove(run_id)
+    else {
+        return;
+    };
+    let paused = context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .get(run_id)
+        .is_some_and(|record| record.status == RunStatus::Paused);
+    if !paused {
+        let _ = fs::remove_dir_all(&staged);
+        let mut runs = context.runs.lock().expect("serve runs poisoned");
+        if let Some(record) = runs.get_mut(run_id) {
+            if let Some(mutation) = record.mutation.as_mut() {
+                mutation.status = MutationStatus::Failed;
+                mutation.error = Some("the run ended before it paused".to_string());
+            }
+            persist_run(context, record);
+        }
+        return;
+    }
+    let _ = apply_staged(context, run_id, &bytecode, &staged);
+    if context.shutdown.load(Ordering::SeqCst) {
+        return;
+    }
+    let (code, value) = resume_run(context, run_id);
+    if code >= 400 {
+        eprintln!(
+            "run {run_id} did not resume after its mutation: {}",
+            value["error"]
+        );
+    }
+}
+
+/// Continue a paused run from its resume point, in this daemon, under the
+/// same run id. The program it was admitted with is still staged beside the
+/// run, so generated code lands where the original run put it.
+fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    let _admission = match context.admit() {
+        Ok(admission) => admission,
+        Err(error) => return (410, json!({"error":error.to_string()})),
+    };
+    // Serialised with admission: a fresh start's team check and this run's
+    // return to `Starting` must not interleave, or both would launch.
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
+    let team = {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        match runs.get(id) {
+            Some(record) if record.status == RunStatus::Paused => record.team.clone(),
+            Some(record) => {
+                return (
+                    409,
+                    json!({"error": format!("run is {}; only a paused run can resume", crate::diagram::wire_name(&record.status).unwrap_or_default())}),
+                )
+            }
+            None => return (404, json!({"error": "unknown run"})),
+        }
+    };
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id);
+    let Some(program_path) = staged_program(&run_dir) else {
+        return (
+            409,
+            json!({"error": format!("the run's program is no longer staged in {}", run_dir.display())}),
+        );
+    };
+    {
+        let mut runs = context.runs.lock().expect("serve runs poisoned");
+        if let Some(active) = find_active_run(&runs, &team).filter(|other| other.run_id != id) {
+            return (409, team_held_error(active));
+        }
+        let Some(record) = runs.get_mut(id) else {
+            return (404, json!({"error": "unknown run"}));
+        };
+        record.status = RunStatus::Starting;
+        record.diagram_address = None;
+        record.finished_at = None;
+        record.error = None;
+        persist_run(context, record);
+    }
+    context.chat.lock().expect("chat poisoned").latest_run = Some(id.to_string());
+    let (ready_sender, ready_receiver) = mpsc::channel();
+    spawn_resume_thread(context, id, &team, program_path, ready_sender);
+    match ready_receiver.recv_timeout(DIAGRAM_READY_TIMEOUT) {
+        Ok(diagram_address) => {
+            let mut runs = context.runs.lock().expect("serve runs poisoned");
+            if let Some(record) = runs.get_mut(id) {
+                record.diagram_address = Some(diagram_address.to_string());
+                if record.status == RunStatus::Starting {
+                    record.status = RunStatus::Running;
+                }
+                return (200, json!(record));
+            }
+            (500, json!({"error": "run vanished"}))
+        }
+        Err(_) => {
+            let runs = context.runs.lock().expect("serve runs poisoned");
+            let message = runs
+                .get(id)
+                .and_then(|record| record.error.clone())
+                .unwrap_or_else(|| "the resumed run did not come up in time".to_string());
+            (502, json!({"error": message}))
+        }
+    }
+}
+
+/// A run's source, staged under the name it was started with. Imports are
+/// schemas, never `.omar`, so it is the only one there.
+fn staged_program(run_dir: &Path) -> Option<std::path::PathBuf> {
+    fs::read_dir(run_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "omar"))
+}
+
+/// A run's record on disk, beside its staged program. Written whenever the
+/// run parks or ends, so a paused run outlives the daemon that paused it.
+fn run_record_path(context: &Context_, run_id: &str) -> std::path::PathBuf {
+    crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(run_id)
+        .join("run.json")
+}
+
+fn persist_run(context: &Context_, record: &RunRecord) {
+    let path = run_record_path(context, &record.run_id);
+    // Replaced atomically: a torn record would strand the run at the next
+    // start. A failure is reported, since the run itself cannot stop for it.
+    if let Err(error) = topology::write_json_atomic(&path, record) {
+        eprintln!(
+            "warning: run {} record not saved at {}: {error:#}",
+            record.run_id,
+            path.display()
+        );
+    }
+}
+
+/// The runs a stopped session's state holds, as `omar ls` reports them
+/// without starting it: each team's latest run, read-only. A run whose
+/// runtime exited while it was executing is reported under its last recorded
+/// status; a restart settles it (see `paused_runs`).
+pub fn stored_runs(omar_dir: &Path) -> Vec<Value> {
+    let mut found = Vec::new();
+    // Every EA directory, registered or not: a session started with
+    // `--no-ea` still runs topologies under EA 0.
+    let ea_ids: Vec<EaId> = fs::read_dir(omar_dir.join("ea"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    for ea_id in ea_ids {
+        let staged = crate::ea::ea_state_dir(ea_id, omar_dir).join("serve");
+        let Ok(entries) = fs::read_dir(staged) else {
+            continue;
+        };
+        let mut latest: BTreeMap<String, RunRecord> = BTreeMap::new();
+        for record in entries
+            .flatten()
+            .filter_map(|entry| fs::read(entry.path().join("run.json")).ok())
+            .filter_map(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok())
+        {
+            let newer = latest
+                .get(&record.team)
+                .is_none_or(|held| record.started_at >= held.started_at);
+            if newer {
+                latest.insert(record.team.clone(), record);
+            }
+        }
+        for mut record in latest.into_values() {
+            let dir = crate::deploy::dir_for(omar_dir, ea_id, &record.team);
+            let state = crate::deploy::DeploymentRecord::load(&dir)
+                .ok()
+                .flatten()
+                .map(|d| d.state);
+            if record.status.is_active() && state == Some(crate::deploy::DeploymentState::Paused) {
+                record.status = RunStatus::Paused;
+            }
+            let mut value = json!(record);
+            value["ea_id"] = json!(ea_id);
+            found.push(value);
+        }
+    }
+    found
+}
+
+/// The runs an EA's staging holds that a daemon starting over must offer
+/// again under their own ids. Each team's latest run is the one that can
+/// hold it. It counts as paused when its record says so, or when the daemon
+/// died between the deployment parking and the record saying so, which the
+/// deployment record settles. A run the daemon was still executing is
+/// interrupted: with a checkpoint it is paused there, resumable at the cost
+/// of the tags since; without one it has failed.
+fn paused_runs(omar_dir: &Path, ea_id: EaId) -> BTreeMap<String, RunRecord> {
+    let staged = crate::ea::ea_state_dir(ea_id, omar_dir).join("serve");
+    let Ok(entries) = fs::read_dir(staged) else {
+        return BTreeMap::new();
+    };
+    let mut latest: BTreeMap<String, RunRecord> = BTreeMap::new();
+    for record in entries
+        .flatten()
+        .filter_map(|entry| fs::read(entry.path().join("run.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok())
+    {
+        let newer = latest
+            .get(&record.team)
+            .is_none_or(|held| record.started_at >= held.started_at);
+        if newer {
+            latest.insert(record.team.clone(), record);
+        }
+    }
+    latest
+        .into_values()
+        .filter_map(|mut record| {
+            let dir = crate::deploy::dir_for(omar_dir, ea_id, &record.team);
+            let deployment = crate::deploy::DeploymentRecord::load(&dir).ok().flatten();
+            let state = deployment.as_ref().map(|d| d.state);
+            let parked = state == Some(crate::deploy::DeploymentState::Paused);
+            let unfinished = state.is_some_and(|state| !state.is_terminal());
+            match record.status {
+                RunStatus::Paused if deployment.is_none() || parked => {}
+                RunStatus::Starting | RunStatus::Running | RunStatus::Pausing if parked => {
+                    record.status = RunStatus::Paused;
+                    record.finished_at = Some(now_unix());
+                }
+                status if status.is_active() && unfinished => {
+                    let mut deployment = deployment?;
+                    if deployment.started_at < record.started_at {
+                        // The deployment predates this run: it never got as
+                        // far as one, so there is nothing to continue.
+                        return None;
+                    }
+                    let (status, error) = recovered_status(&mut deployment, &dir);
+                    eprintln!(
+                        "Recovered run {} ({}): {}",
+                        record.run_id,
+                        record.team,
+                        crate::diagram::wire_name(&status).unwrap_or_default()
+                    );
+                    record.status = status;
+                    record.error = error;
+                    record.finished_at = deployment.finished_at;
+                    record.state = deployment.state_vars.clone();
+                    record.diagram_address = None;
+                    let path = crate::ea::ea_state_dir(ea_id, omar_dir)
+                        .join("serve")
+                        .join(&record.run_id)
+                        .join("run.json");
+                    let _ = topology::write_json_atomic(&path, &record);
+                }
+                _ => return None,
+            }
+            Some((record.run_id.clone(), record))
+        })
+        .collect()
+}
+
+/// A later run of the same team, if one has started since this one: the
+/// team's checkpoint directory then belongs to it, and this run's lineage
+/// sits archived beside it.
+fn superseded_by<'a>(runs: &'a BTreeMap<String, RunRecord>, id: &str) -> Option<&'a RunRecord> {
+    let this = runs.get(id)?;
+    runs.values()
+        .filter(|other| other.team == this.team && other.run_id != this.run_id)
+        .filter(|other| other.started_at >= this.started_at)
+        .max_by_key(|other| other.started_at)
+}
+
+/// Where a paused run's last diagram is kept: its server died with the loop,
+/// and a reload still has to show what was parked.
+fn snapshot_path(context: &Context_, run_id: &str) -> std::path::PathBuf {
+    crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(run_id)
+        .join("snapshot.json")
+}
+
+/// The diagram a paused run left behind, exactly as its server last served it.
+fn run_snapshot(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    {
+        let runs = context.runs.lock().expect("serve runs poisoned");
+        if !runs.contains_key(id) {
+            return (404, json!({"error": "unknown run"}));
+        }
+    }
+    match fs::read(snapshot_path(context, id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    {
+        Some(snapshot) => (200, snapshot),
+        None => (404, json!({"error": "no snapshot kept for this run"})),
+    }
+}
+
+/// The source a run executes now: what it was started with, or what a
+/// mutation or a rollback last made it. What an edit is compared against.
+fn run_program(context: &Arc<Context_>, id: &str) -> (u16, Value) {
+    if !context
+        .runs
+        .lock()
+        .expect("serve runs poisoned")
+        .contains_key(id)
+    {
+        return (404, json!({"error": "unknown run"}));
+    }
+    let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
+        .join("serve")
+        .join(id);
+    let Some(path) = staged_program(&run_dir) else {
+        return (
+            404,
+            json!({"error": "the run's program is no longer staged"}),
+        );
+    };
+    match fs::read_to_string(&path) {
+        Ok(program) => (
+            200,
+            json!({
+                "filename": path.file_name().map(|name| name.to_string_lossy()),
+                "program": program,
+            }),
+        ),
+        Err(error) => (500, json!({"error": format!("{error:#}")})),
+    }
+}
+
+/// What the daemon records once a run's loop returns, however it returned.
+fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::RunOutcome>) {
+    // The run is over, so its invocation service is gone with it. Leaving
+    // the entry would let a panel offer work nothing can accept.
+    context
+        .panels
+        .lock()
+        .expect("serve panels poisoned")
+        .remove(run_id);
+    let mut runs = context.runs.lock().expect("serve runs poisoned");
+    if let Some(record) = runs.get_mut(run_id) {
+        record.finished_at = Some(now_unix());
+        match outcome {
+            Ok(outcome) => {
+                record.status = match outcome.end {
+                    topology::RunEnd::Completed => RunStatus::Completed,
+                    topology::RunEnd::Stopped => RunStatus::Stopped,
+                    topology::RunEnd::Paused => RunStatus::Paused,
+                };
+                record.outputs = outcome.outputs;
+                record.state = outcome.state;
+                if let (topology::RunEnd::Paused, Some(diagram)) = (outcome.end, &outcome.diagram) {
+                    let path = snapshot_path(context, run_id);
+                    let _ = fs::create_dir_all(path.parent().expect("run dir"));
+                    let _ = fs::write(path, serde_json::to_vec(diagram).unwrap_or_default());
+                }
+            }
+            Err(error) => {
+                record.status = RunStatus::Failed;
+                record.error = Some(format!("{error:#}"));
+            }
+        }
+        persist_run(context, record);
+    }
+    drop(runs);
+    complete_mutation(context, run_id);
+}
+
+fn spawn_resume_thread(
+    context: &Arc<Context_>,
+    run_id: &str,
+    team: &str,
+    program_path: std::path::PathBuf,
+    ready_sender: mpsc::Sender<SocketAddr>,
+) {
+    // A resumed run answers web agents through the panel too: its credentials
+    // arrive on their own channel, stored as they come, as on a fresh start.
+    let (panel_sender, panel_receiver) = mpsc::channel();
+    {
+        let panels = context.panels.clone();
+        let id = run_id.to_string();
+        thread::spawn(move || {
+            if let Ok(access) = panel_receiver.recv() {
+                panels
+                    .lock()
+                    .expect("serve panels poisoned")
+                    .insert(id, access);
+            }
+        });
+    }
+    let context = context.clone();
+    let run_id = run_id.to_string();
+    let team = team.to_string();
+    thread::spawn(move || {
+        let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
+        let generated = topology::generated_dir(&program_path);
+        let outcome = topology::resume_topology(
+            TopologyRunConfig {
+                ea_id: context.ea_id,
+                omar_dir: &context.omar_dir,
+                generated: &generated,
+                base_prefix: &context.session_prefix,
+                health_idle_warning: context.health_idle_warning,
+                inputs: &[],
+                replace: true,
+                timeout: Duration::from_secs(default_timeout_seconds()),
+                pace: topology::Pace::RealTime,
+                diagram_address: Some(diagram_address),
+                diagram_ready: Some(ready_sender),
+                panel_ready: Some(panel_sender),
+                activity: context
+                    .activity
+                    .lock()
+                    .expect("activity runs poisoned")
+                    .get(&run_id)
+                    .cloned(),
+                checkpoint_policy: None,
+                keep_workspaces: false,
+                program_path: Some(&program_path),
+            },
+            &team,
+        );
+        finish_run(&context, &run_id, outcome);
+    });
+}
+
+/// The status a recovered run reports, settling an interrupted record on disk.
+fn recovered_status(
+    record: &mut crate::deploy::DeploymentRecord,
+    dir: &Path,
+) -> (RunStatus, Option<String>) {
+    use crate::deploy::DeploymentState;
+    match record.state {
+        DeploymentState::Paused => (RunStatus::Paused, None),
+        DeploymentState::Failed => (RunStatus::Failed, record.error.clone()),
+        DeploymentState::Cancelled => (RunStatus::Stopped, None),
+        DeploymentState::Terminated => {
+            let stopped = record
+                .history
+                .last()
+                .and_then(|event| event.detail.as_deref())
+                .is_some_and(|detail| detail.starts_with("stopped"));
+            (
+                if stopped {
+                    RunStatus::Stopped
+                } else {
+                    RunStatus::Completed
+                },
+                None,
+            )
+        }
+        _ if record.pid != std::process::id() && record.runner_alive() => {
+            // Another live process owns it; leave it alone and say so.
+            (
+                RunStatus::Failed,
+                Some(format!(
+                    "run is owned by another process (pid {})",
+                    record.pid
+                )),
+            )
+        }
+        _ => {
+            let now = crate::deploy::now_unix();
+            record.finished_at = Some(now);
+            // The panes belonged to the runtime that is gone, on a tmux server
+            // that was killed before this one started; nothing is left to
+            // tear down, and a resume must not go looking for it.
+            record.sessions_cleaned = true;
+            let (state, status, note) = match &record.checkpoint {
+                Some(checkpoint) => (
+                    DeploymentState::Paused,
+                    RunStatus::Paused,
+                    format!(
+                        "runtime exited mid-run; resume continues from checkpoint {checkpoint}, work after it is lost"
+                    ),
+                ),
+                None => (
+                    DeploymentState::Failed,
+                    RunStatus::Failed,
+                    "runtime exited mid-run with no checkpoint to continue from".to_string(),
+                ),
+            };
+            record.state = state;
+            record.history.push(crate::deploy::TransitionEvent {
+                state,
+                at: now,
+                detail: Some(note.clone()),
+            });
+            if status == RunStatus::Failed {
+                record.error = Some(note.clone());
+            }
+            if let Err(error) = record.save(dir) {
+                eprintln!("warning: could not settle interrupted run: {error:#}");
+            }
+            (status, Some(note))
+        }
     }
 }
 
@@ -1723,6 +4857,166 @@ fn write_asset(stream: &mut TcpStream, asset: &crate::web_assets::Asset) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checked_program_brings_the_schemas_it_imports() {
+        if !Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("lang/.lake/build/bin/omarc")
+            .exists()
+        {
+            eprintln!("skipping: omarc has not been built");
+            return;
+        }
+        let program = r#"
+            type Decision from "./schemas/decision.json"
+            team Review[reviewer : Stub] {
+                input request : string
+                output decision : Decision
+                task reviewer(request) -> decision "Review $(request)"
+            }
+            main { review = Review() }
+        "#;
+        let files = json!({
+            "schemas/decision.json": r#"{"type":"string","enum":["approved","needs_revision"]}"#
+        });
+        let companions: BTreeMap<String, String> = serde_json::from_value(files.clone()).unwrap();
+        assert!(compile_preview(program, &companions).is_ok());
+        assert!(compile_preview(program, &BTreeMap::new()).is_err());
+        let server = test_server();
+        let proposal = json!({
+            "token": server.agent_token, "program": program, "files": files,
+            "summary": "Review with a decision schema", "inputs": {"review.request": "hello"}
+        })
+        .to_string();
+        let response = request(
+            server.address(),
+            "POST",
+            "/v1/agent/proposals",
+            Some(&proposal),
+        );
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        let saved = request(server.address(), "GET", "/v1/chat", None);
+        assert!(saved.contains("schemas/decision.json"), "{saved}");
+        let body = json!({"program": program, "filename": "review.omar", "files": files});
+        let (status, answer) = check_program(body.to_string().as_bytes());
+        assert_eq!(status, 200);
+        assert_eq!(answer["ok"], json!(true), "{answer}");
+        assert_eq!(answer["team"], json!("review"));
+
+        // Without the file the check fails, naming the import rather than the
+        // scratch directory it was looked for in.
+        let body = json!({"program": program, "filename": "review.omar"});
+        let (status, answer) = check_program(body.to_string().as_bytes());
+        assert_eq!(status, 200);
+        assert_eq!(answer["ok"], json!(false), "{answer}");
+        let error = answer["errors"][0].as_str().unwrap();
+        assert!(error.contains("schemas/decision.json"), "{error}");
+        assert!(!error.contains("omar-check-"), "{error}");
+
+        // A path that is not the program's own relative reference is refused
+        // before anything is written.
+        for bad in [
+            "../decision.json",
+            "/etc/decision.json",
+            "",
+            "schemas\\decision.json",
+        ] {
+            let body = json!({
+                "program": program, "filename": "review.omar", "files": {bad: "{}"}
+            });
+            let (status, answer) = check_program(body.to_string().as_bytes());
+            assert_eq!(status, 200);
+            assert_eq!(answer["ok"], json!(false), "{bad:?}: {answer}");
+            let error = answer["errors"][0].as_str().unwrap();
+            assert!(error.contains("relative path"), "{bad:?}: {error}");
+        }
+
+        // Nor may a file replace the program the request said it was checking.
+        for name in ["review.omar", "./review.omar"] {
+            let body = json!({
+                "program": program, "filename": "review.omar",
+                "files": {name: "team Other { input x : string } main { o = Other() }"}
+            });
+            let (status, answer) = check_program(body.to_string().as_bytes());
+            assert_eq!(status, 200);
+            assert_eq!(answer["ok"], json!(false), "{name}: {answer}");
+            let error = answer["errors"][0].as_str().unwrap();
+            assert!(error.contains("the program itself"), "{name}: {error}");
+        }
+
+        // And the program's own imports are held to the same directory: a
+        // request cannot have the compiler read the host's files by naming
+        // them, however many files it brings.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = elsewhere.path().join("decision.json");
+        fs::write(
+            &outside,
+            r#"{"type":"string","enum":["approved","needs_revision"]}"#,
+        )
+        .unwrap();
+        for import in [
+            outside.display().to_string(),
+            "../decision.json".to_string(),
+        ] {
+            let program = program.replace("./schemas/decision.json", &import);
+            let companions: BTreeMap<String, String> =
+                serde_json::from_value(files.clone()).unwrap();
+            assert!(compile_preview(&program, &companions).is_err());
+            let body = json!({"program": program, "filename": "review.omar", "files": files});
+            let (status, answer) = check_program(body.to_string().as_bytes());
+            assert_eq!(status, 200);
+            assert_eq!(answer["ok"], json!(false), "{import}: {answer}");
+            let error = answer["errors"][0].as_str().unwrap();
+            assert!(
+                error.contains("inside the program's directory"),
+                "{import}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_enum_inputs_reach_the_port_unquoted() {
+        // One open input, so `parse_inputs` has nothing else to miss.
+        let bytecode: topology::Bytecode = serde_json::from_str(
+            r#"{
+              "version": 1,
+              "team": "Gate",
+              "instructions": [
+                {"op":"begin_plan","team":"Gate"},
+                {"op":"define_type","name":"Decision","type":"string in [\"continue\",\"stop\"]"},
+                {"op":"spawn_agent","name":"keeper","backend":"Codex"},
+                {"op":"define_port","kind":"input","name":"decision",
+                 "type":"string in [\"continue\",\"stop\"]","declared":"Decision"},
+                {"op":"define_port","kind":"output","name":"note","type":"string"},
+                {"op":"install_reaction","id":"reaction.0","agent":"keeper",
+                 "triggers":["decision"],"effects":["note"],"contract":"note","prompt":"p"},
+                {"op":"commit_plan"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let state = topology::verify(&bytecode).unwrap();
+        let encoded = encode_inputs(
+            &state,
+            &BTreeMap::from([("decision".to_string(), json!("stop"))]),
+        )
+        .expect("inputs encode");
+        assert_eq!(encoded, vec!["decision=stop".to_string()]);
+        // What the command line would have been handed, read back the same way.
+        let parsed = topology::parse_inputs(&state, &encoded).expect("inputs parse");
+        assert_eq!(parsed["decision"], json!("stop"));
+
+        let encoded = encode_inputs(
+            &state,
+            &BTreeMap::from([("decision".to_string(), json!("maybe"))]),
+        )
+        .expect("encoding does not judge membership");
+        let error = topology::parse_inputs(&state, &encoded)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("\"continue\""), "{error}");
+        assert!(error.contains("\"maybe\""), "{error}");
+    }
     use crate::topology::{AgentState, PortState};
 
     fn sample_state() -> VmState {
@@ -1731,6 +5025,7 @@ mod tests {
             team: "Sample".to_string(),
             state_vars: BTreeMap::new(),
             params: BTreeMap::new(),
+            types: BTreeMap::new(),
             instances: BTreeMap::new(),
             timers: BTreeMap::new(),
             agents: BTreeMap::from([(
@@ -1746,6 +5041,7 @@ mod tests {
                     PortState {
                         kind: PortKind::Input,
                         ty: "string".to_string(),
+                        declared: None,
                         delay: None,
                         instance: String::new(),
                     },
@@ -1755,6 +5051,7 @@ mod tests {
                     PortState {
                         kind: PortKind::Input,
                         ty: "path".to_string(),
+                        declared: None,
                         delay: None,
                         instance: String::new(),
                     },
@@ -1764,6 +5061,7 @@ mod tests {
                     PortState {
                         kind: PortKind::Output,
                         ty: "string".to_string(),
+                        declared: None,
                         delay: None,
                         instance: String::new(),
                     },
@@ -1783,6 +5081,10 @@ mod tests {
             started_at: 0,
             finished_at: None,
             error: None,
+            present: Vec::new(),
+            outputs: BTreeMap::new(),
+            state: BTreeMap::new(),
+            mutation: None,
         }
     }
 
@@ -1798,11 +5100,991 @@ mod tests {
         .expect("server starts")
     }
 
+    #[test]
+    fn deleting_zero_retires_live_contexts_and_preserves_survivor_history() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::ea::ensure_default_ea(dir.path()).unwrap();
+        let mut config = Config::default();
+        config.dashboard.session_prefix = format!("retire-{}-", Uuid::new_v4());
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let first_message = |server: &Serve, chat: &str| {
+            let history = server.workspaces.history.lock().unwrap();
+            history.conversation(chat).messages[0].text.clone()
+        };
+        let survivor = server.session_create_ea("survivor", None).unwrap();
+        let chat = server
+            .workspaces
+            .history
+            .lock()
+            .unwrap()
+            .chat_for_ea(survivor)
+            .unwrap();
+        let other = server.workspaces.get(&chat).unwrap();
+        other
+            .publish(ChatRole::Assistant, "Keep this".into(), false, None)
+            .unwrap();
+        let saved = record("surviving", RunStatus::Paused);
+        other
+            .runs
+            .lock()
+            .unwrap()
+            .insert(saved.run_id.clone(), saved);
+        for status in [RunStatus::Paused, RunStatus::Completed] {
+            let saved = record("target", status);
+            server
+                .context
+                .runs
+                .lock()
+                .unwrap()
+                .insert(saved.run_id.clone(), saved);
+        }
+        let scheduler = crate::scheduler::Scheduler::with_store(
+            crate::scheduler::events_store_path(dir.path()),
+        );
+        assert_eq!(
+            server.session_delete_ea(0, &scheduler).unwrap()["deleted_ea"],
+            0
+        );
+        assert!(server
+            .workspaces
+            .get(&server.context.conversation_id)
+            .is_err());
+        assert!(server.context.agent_token.lock().unwrap().is_empty());
+        assert!(server
+            .workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .values()
+            .all(|context| context.ea_id == survivor));
+        assert!(server.session_runs(Some(0)).is_empty());
+        assert_eq!(server.session_runs(Some(survivor)).len(), 1);
+        assert_eq!(first_message(&server, &chat), "Keep this");
+        assert!(!crate::ea::ea_state_dir(0, dir.path()).exists());
+        drop(server);
+        let restarted = Serve::start(
+            "127.0.0.1:0".parse().unwrap(),
+            &config,
+            dir.path(),
+            survivor,
+        )
+        .unwrap();
+        assert_eq!(first_message(&restarted, &chat), "Keep this");
+        assert!(!crate::ea::ea_state_dir(0, dir.path()).exists());
+    }
+
+    #[test]
+    #[ignore = "requires omarc"]
+    fn builder_proposals_compile_and_preserve_imported_schema_files() {
+        let server = test_server();
+        let program = "type Decision from \"./schemas/decision.json\"\nteam Review[reviewer : Jev] { input request : string output out : Decision task reviewer(request) -> out \"Choose.\" }\nmain SchemaProposal { review = Review() }";
+        let files = BTreeMap::from([(
+            "schemas/decision.json".to_string(),
+            "{\"type\":\"string\",\"enum\":[\"continue\",\"stop\",\"defer\"]}".to_string(),
+        )]);
+        let token = server.context.agent_token.lock().unwrap().clone();
+        let proposal = json!({"token": token, "program": program, "files": files, "inputs":{"review.request":"Complete input"}, "summary":"Schema flow"});
+        let (status, response) =
+            agent_proposal(&server.context, &serde_json::to_vec(&proposal).unwrap());
+        assert_eq!(status, 202, "{response}");
+        let history = server.context.history.lock().unwrap();
+        let conversation = history.conversation(&server.context.conversation_id);
+        let design = conversation
+            .messages
+            .last()
+            .unwrap()
+            .design
+            .as_ref()
+            .unwrap();
+        assert_eq!(design.files, files);
+        assert_eq!(design.preview.team, "SchemaProposal");
+        drop(history);
+        assert!(compile_preview(program, &BTreeMap::new()).is_err());
+        let escaped = BTreeMap::from([("../decision.json".into(), "{}".into())]);
+        assert!(compile_preview(program, &escaped).is_err());
+        let invalid = BTreeMap::from([(
+            "schemas/decision.json".into(),
+            "{\"type\":\"object\"}".into(),
+        )]);
+        assert!(compile_preview(program, &invalid).is_err());
+    }
+
+    #[test]
+    fn workflow_editor_workspace_preserves_edits_and_imports_saved_files() {
+        let server = test_server();
+        let body = json!({"program": "main Review {}", "files": {"schemas/decision.json": "{\"type\":\"string\"}"}});
+        let create = || {
+            workspace_request(
+                &server.workspaces,
+                &server.context,
+                "POST",
+                "/v1/workspaces/workflow",
+                &serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap()
+        };
+        let created = create();
+        let id = created["workspace"]["id"].as_str().unwrap();
+        let ws = crate::workspace::Workspace::load(&server.context.omar_dir, id).unwrap();
+        let tree = ws.worktree(&server.context.omar_dir);
+        assert_eq!(
+            fs::read_to_string(tree.join("schemas/decision.json")).unwrap(),
+            "{\"type\":\"string\"}"
+        );
+        fs::write(tree.join("program.omar"), "main Edited {}").unwrap();
+        fs::write(tree.join("extra.json"), "{}").unwrap();
+        assert_eq!(
+            create()["workspace"]["id"],
+            id,
+            "reopening must keep saved edits"
+        );
+        let route = format!("/v1/workspaces/{id}/workflow");
+        let imported =
+            workspace_request(&server.workspaces, &server.context, "GET", &route, &[]).unwrap();
+        assert_eq!(imported["program"], "main Edited {}");
+        assert_eq!(imported["files"]["extra.json"], "{}");
+        assert_eq!(
+            imported["files"]["schemas/decision.json"],
+            body["files"]["schemas/decision.json"]
+        );
+        let malicious = json!({"program": "main Review {}", "files": {"../escape": "bad"}});
+        assert!(workspace_request(
+            &server.workspaces,
+            &server.context,
+            "POST",
+            "/v1/workspaces/workflow",
+            &serde_json::to_vec(&malicious).unwrap()
+        )
+        .is_err());
+        std::os::unix::fs::symlink("/etc/passwd", tree.join("link")).unwrap();
+        assert!(
+            workspace_request(&server.workspaces, &server.context, "GET", &route, &[]).is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_routes_scope_files_to_the_chat_and_reject_cross_site_requests() {
+        let server = test_server();
+        let root = &server.context.omar_dir;
+        let ws =
+            crate::workspace::Workspace::create(root, server.context.ea_id, "run", "writer", None)
+                .unwrap();
+        fs::write(ws.worktree(root).join("report.txt"), "workspace data").unwrap();
+        let other = crate::workspace::Workspace::create(
+            root,
+            server.context.ea_id + 1,
+            "run",
+            "other",
+            None,
+        )
+        .unwrap();
+        let listing = request(server.address(), "GET", "/v1/workspaces", None);
+        assert!(listing.contains(&ws.id));
+        assert!(!listing.contains(&other.id));
+        let preview = request(
+            server.address(),
+            "POST",
+            &format!("/v1/workspaces/{}/preview", ws.id),
+            Some(r#"{"path":"report.txt"}"#),
+        );
+        assert!(preview.contains("workspace data"));
+        let denied = request(
+            server.address(),
+            "GET",
+            &format!("/v1/workspaces/{}", other.id),
+            None,
+        );
+        assert!(denied.contains("workspace belongs to another chat"));
+        let mut client = TcpStream::connect(server.address()).unwrap();
+        write!(
+            client,
+            "GET /v1/workspaces HTTP/1.1\r\nHost: {}\r\nOrigin: https://attacker.example\r\n\r\n",
+            server.address()
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.contains("403 Forbidden"));
+        assert!(!response.contains(&ws.id));
+        let snapshot = ws.snapshots(root).unwrap()[0].id.clone();
+        let restored = workspace_request(
+            &server.workspaces,
+            &server.context,
+            "POST",
+            &format!("/v1/workspaces/{}/restore", ws.id),
+            serde_json::to_string(&json!({"snapshot":snapshot}))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_ne!(restored["workspace"]["id"], ws.id);
+    }
+
+    #[test]
+    fn window_grace_requires_last_disconnect_and_resets_on_reconnect_or_run() {
+        let now = Instant::now();
+        let mut presence = Presence::default();
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE, false));
+        presence.connect().unwrap();
+        presence.connect().unwrap();
+        presence.clients -= 1;
+        assert!(!presence.shutdown_due(now, false));
+        presence.clients -= 1;
+        assert!(!presence.shutdown_due(now, false));
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE - Duration::from_millis(1), false));
+        assert!(presence.shutdown_due(now + WINDOW_GRACE, false));
+        presence.connect().unwrap();
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE, false));
+        presence.clients -= 1;
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE, true));
+        assert!(!presence.shutdown_due(now + WINDOW_GRACE * 2, false));
+        assert!(presence.shutdown_due(now + WINDOW_GRACE * 3, false));
+        presence.stopping = true;
+        assert!(presence.connect().is_err());
+    }
+
+    #[test]
+    fn runs_in_other_chats_keep_the_runtime_alive_through_teardown() {
+        let server = test_server();
+        server
+            .workspaces
+            .history
+            .lock()
+            .unwrap()
+            .select(None)
+            .unwrap();
+        let id = server.workspaces.history.lock().unwrap().active_id.clone();
+        let other = server.workspaces.get(&id).unwrap();
+        for status in [RunStatus::Starting, RunStatus::Running, RunStatus::Stopping] {
+            other
+                .runs
+                .lock()
+                .unwrap()
+                .insert("run".into(), record("background", status));
+            {
+                let mut presence = server.workspaces.presence.lock().unwrap();
+                presence.seen = true;
+                presence.idle_since = Some(Instant::now() - WINDOW_GRACE);
+            }
+            assert!(!server.workspaces.shutdown_if_idle());
+            assert!(server
+                .workspaces
+                .presence
+                .lock()
+                .unwrap()
+                .idle_since
+                .is_none());
+        }
+        other.runs.lock().unwrap().get_mut("run").unwrap().status = RunStatus::Completed;
+        assert!(!server.workspaces.shutdown_if_idle());
+        server.workspaces.presence.lock().unwrap().idle_since = Some(Instant::now() - WINDOW_GRACE);
+        assert!(server.workspaces.shutdown_if_idle());
+    }
+
+    #[test]
+    fn sse_disconnect_releases_presence_and_stops_the_listener_after_grace() {
+        let server = test_server();
+        assert!(is_running(server.address()));
+        let mut browser = TcpStream::connect(server.address()).unwrap();
+        browser
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            browser,
+            "GET /v1/chat/events HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        .unwrap();
+        let mut buffer = [0; 1024];
+        assert!(browser.read(&mut buffer).unwrap() > 0);
+        // Wait for the server to have registered the stream, not merely sent headers.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.workspaces.presence.lock().unwrap().clients == 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        browser.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(browser);
+        while server.workspaces.presence.lock().unwrap().clients != 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(server.running.load(Ordering::Relaxed));
+        server.workspaces.presence.lock().unwrap().idle_since = Some(Instant::now() - WINDOW_GRACE);
+        while server.running.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!is_running(server.address()));
+    }
+
+    #[test]
+    fn chat_history_routes_reopen_only_the_selected_conversation() {
+        let server = test_server();
+        let first = server.context.history.lock().unwrap().active_id.clone();
+        server
+            .context
+            .publish_with_selection(
+                ChatRole::Operator,
+                "Release planning".into(),
+                false,
+                None,
+                vec!["flow.planner".into()],
+            )
+            .unwrap();
+        let created = request(server.address(), "POST", "/v1/chats", Some("{}"));
+        assert!(created.contains(" 200 "), "{created}");
+        let second = server.context.history.lock().unwrap().active_id.clone();
+        assert_ne!(first, second);
+        let empty = request(server.address(), "GET", "/v1/chat", None);
+        assert!(empty.contains("\"messages\":[]"), "{empty}");
+        let list = request(server.address(), "GET", "/v1/chats", None);
+        assert!(
+            list.contains("Release planning") && list.contains(&second),
+            "{list}"
+        );
+        let reopened = request(
+            server.address(),
+            "POST",
+            &format!("/v1/chats/{first}/activate"),
+            Some("{}"),
+        );
+        assert!(reopened.contains(" 200 "), "{reopened}");
+        let chat = request(server.address(), "GET", "/v1/chat", None);
+        assert!(
+            chat.contains("Release planning") && chat.contains("flow.planner"),
+            "{chat}"
+        );
+        assert!(request(
+            server.address(),
+            "POST",
+            "/v1/chats/unknown/activate",
+            Some("{}")
+        )
+        .contains(" 404 "));
+        let stale_run =
+            json!({"conversation_id": second, "program": "must not be compiled"}).to_string();
+        assert!(request(server.address(), "POST", "/v1/runs", Some(&stale_run)).contains(" 409 "));
+        let stale =
+            json!({"conversation_id": second, "text": "This belongs elsewhere"}).to_string();
+        assert!(request(server.address(), "POST", "/v1/chat", Some(&stale)).contains(" 409 "));
+        assert!(
+            !request(server.address(), "GET", "/v1/chat", None).contains("This belongs elsewhere")
+        );
+        assert_eq!(server.context.runs.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn chats_keep_independent_replies_runs_and_ea_workspaces() {
+        let server = test_server();
+        let first = &server.context;
+        first.chat.lock().unwrap().busy = true;
+        first
+            .runs
+            .lock()
+            .unwrap()
+            .insert("live".into(), record("Team", RunStatus::Running));
+        let thinking = first.chat_operation.lock().unwrap();
+        let created = request(server.address(), "POST", "/v1/chats", Some("{}"));
+        assert!(created.contains(" 200 "), "{created}");
+        drop(thinking);
+        let id = server.workspaces.history.lock().unwrap().active_id.clone();
+        let second = server.workspaces.get(&id).unwrap();
+        assert_ne!(first.ea_id, second.ea_id);
+        assert_ne!(first.conversation_id, second.conversation_id);
+        assert!(first.chat.lock().unwrap().busy);
+        assert!(second.runs.lock().unwrap().is_empty());
+        let reply = json!({"token": server.agent_token, "text": "Background answer"}).to_string();
+        assert!(
+            request(server.address(), "POST", "/v1/agent/reply", Some(&reply)).contains(" 202 ")
+        );
+        assert!(!first.chat.lock().unwrap().busy);
+        assert!(request(
+            server.address(),
+            "GET",
+            &format!("/chats/{}/v1/chat", first.conversation_id),
+            None
+        )
+        .contains("Background answer"));
+        assert!(!request(
+            server.address(),
+            "GET",
+            &format!("/chats/{id}/v1/chat"),
+            None
+        )
+        .contains("Background answer"));
+        assert!(request(
+            server.address(),
+            "GET",
+            &format!("/chats/{id}/v1/runs/live"),
+            None
+        )
+        .contains(" 404 "));
+        assert!(request(
+            server.address(),
+            "POST",
+            &format!("/chats/{id}/v1/agent/reply"),
+            Some(&reply)
+        )
+        .contains(" 403 "));
+        assert!(request(
+            server.address(),
+            "POST",
+            &format!("/v1/chats/{}/activate", first.conversation_id),
+            Some("{}")
+        )
+        .contains(" 200 "));
+        assert_eq!(
+            first.runs.lock().unwrap()["live"].status,
+            RunStatus::Running
+        );
+        let listing = request(server.address(), "GET", "/v1/chats", None);
+        assert!(listing.contains("Team-Running"), "{listing}");
+    }
+
+    #[test]
+    fn reopening_saved_chats_keeps_their_ea_assignments() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let first = server.context.conversation_id.clone();
+        assert!(request(server.address(), "POST", "/v1/chats", Some("{}")).contains(" 200 "));
+        let second = server.workspaces.history.lock().unwrap().active_id.clone();
+        let second_ea = server.workspaces.get(&second).unwrap().ea_id;
+        drop(server);
+        let resumed = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        assert_eq!(resumed.ea_id, second_ea);
+        assert_eq!(resumed.workspaces.get(&first).unwrap().ea_id, 0);
+        assert_eq!(resumed.workspaces.get(&second).unwrap().ea_id, second_ea);
+        assert!(resumed.context.runs.lock().unwrap().is_empty());
+    }
+
+    /// A paused run is durable state: the daemon that paused it may be gone
+    /// by the time it is resumed, so the next one offers it under its own
+    /// id, to the chat and to the CLI alike. A stopped one is not offered.
+    #[test]
+    fn a_paused_run_survives_a_runtime_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        for (id, team) in [("parked", "Cadence"), ("given-up", "Other")] {
+            server.context.runs.lock().unwrap().insert(
+                id.to_string(),
+                RunRecord {
+                    run_id: id.to_string(),
+                    team: team.to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 1,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                    mutation: None,
+                },
+            );
+            finish_run(
+                &server.context,
+                id,
+                Ok(topology::RunOutcome {
+                    end: topology::RunEnd::Paused,
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                    diagram: None,
+                }),
+            );
+        }
+        assert!(request(
+            server.address(),
+            "POST",
+            "/v1/runs/given-up/stop",
+            Some("{}")
+        )
+        .contains(" 200 "));
+        // The daemon died between the deployment parking and the record
+        // saying so: the deployment record settles it.
+        let mut mid = record("Mid", RunStatus::Pausing);
+        mid.run_id = "mid-pause".to_string();
+        mid.started_at = 2;
+        persist_run(&server.context, &mid);
+        let mut deployment = crate::deploy::DeploymentRecord::create("Mid", BTreeMap::new(), 1);
+        for state in [
+            crate::deploy::DeploymentState::Deploying,
+            crate::deploy::DeploymentState::Running,
+            crate::deploy::DeploymentState::Pausing,
+            crate::deploy::DeploymentState::Paused,
+        ] {
+            deployment.advance(state, None).unwrap();
+        }
+        let mid_dir = crate::deploy::dir_for(dir.path(), 0, "Mid");
+        fs::create_dir_all(&mid_dir).unwrap();
+        deployment.save(&mid_dir).unwrap();
+        drop(server);
+        let resumed = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let response = request(resumed.address(), "GET", "/v1/runs/parked", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"status\":\"paused\""),
+            "{response}"
+        );
+        assert!(request(resumed.address(), "GET", "/v1/runs/given-up", None).contains(" 404 "));
+        // The chat shows the latest parked run; both are listed for the CLI.
+        let listing = request(resumed.address(), "GET", "/v1/chats", None);
+        assert!(listing.contains("\"run_id\":\"mid-pause\""), "{listing}");
+        let mid = request(resumed.address(), "GET", "/v1/runs/mid-pause", None);
+        assert!(mid.contains("\"status\":\"paused\""), "{mid}");
+        assert_eq!(resumed.session_runs(Some(0)).len(), 2);
+        // A second chat on the same EA does not offer the runs twice.
+        assert!(request(resumed.address(), "POST", "/v1/chats", Some("{}")).contains(" 200 "));
+        assert_eq!(resumed.session_runs(None).len(), 2);
+    }
+
+    /// The file viewer sees one run's workspaces, not every workspace the
+    /// EA ever had: the deployment's own, plus copies restored from them.
+    #[test]
+    fn a_run_lists_only_its_own_workspaces() {
+        let server = test_server();
+        let address = server.address();
+        let root = &server.context.omar_dir;
+        let mine = crate::workspace::Workspace::create(root, 0, "d1", "leader", None).unwrap();
+        let _earlier = crate::workspace::Workspace::create(root, 0, "d0", "leader", None).unwrap();
+        let snapshot = mine.snapshot(root, "v").unwrap();
+        let copy = mine.restore(root, &snapshot.id).unwrap();
+        let mut deployment = crate::deploy::DeploymentRecord::create("Cadence", BTreeMap::new(), 1);
+        deployment
+            .workspaces
+            .insert("leader".into(), mine.id.clone());
+        let dir = crate::deploy::dir_for(root, 0, "Cadence");
+        std::fs::create_dir_all(&dir).unwrap();
+        deployment.save(&dir).unwrap();
+        server
+            .context
+            .runs
+            .lock()
+            .unwrap()
+            .insert("run-1".into(), record("Cadence", RunStatus::Running));
+        let response = request(address, "GET", "/v1/runs/run-1/workspaces", None);
+        assert!(response.contains(" 200 "), "{response}");
+        let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let listed: std::collections::BTreeSet<&str> = body["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            listed,
+            [mine.id.as_str(), copy.id.as_str()].into_iter().collect()
+        );
+        assert!(request(address, "GET", "/v1/runs/nobody/workspaces", None).contains(" 404 "));
+        // Still every workspace for the EA-wide listing the CLI uses.
+        assert_eq!(crate::workspace::list(root, 0).unwrap().len(), 3);
+    }
+
+    /// A later run of the team owns its live checkpoint directory; an
+    /// earlier run's listing says so instead of showing the newer lineage.
+    #[test]
+    fn a_superseded_run_does_not_list_the_new_lineage() {
+        let server = test_server();
+        let address = server.address();
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            let mut older = record("Cadence", RunStatus::Completed);
+            older.started_at = 1;
+            let mut newer = record("Cadence", RunStatus::Running);
+            newer.started_at = 2;
+            runs.insert("old".to_string(), older);
+            runs.insert("new".to_string(), newer);
+        }
+        let dir = crate::deploy::dir_for(&server.context.omar_dir, 0, "Cadence");
+        std::fs::create_dir_all(&dir).expect("deployment dir");
+        let response = request(address, "GET", "/v1/runs/old/checkpoints", None);
+        assert!(
+            response.contains(" 409 ") && response.contains("archived"),
+            "{response}"
+        );
+        assert!(request(address, "GET", "/v1/runs/old/checkpoints/x", None).contains(" 409 "));
+        assert!(request(address, "GET", "/v1/runs/new/checkpoints", None).contains(" 200 "));
+    }
+
+    #[test]
+    fn history_save_errors_are_returned_before_a_reply_is_published() {
+        let server = test_server();
+        let path = server.context.omar_dir.join("chats.json");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let body = json!({"token": server.agent_token, "text": "Cannot persist this"}).to_string();
+        let response = request(server.address(), "POST", "/v1/agent/reply", Some(&body));
+        assert!(response.contains(" 500 "), "{response}");
+        assert!(server
+            .context
+            .history
+            .lock()
+            .unwrap()
+            .active()
+            .messages
+            .is_empty());
+    }
+
+    #[test]
+    fn restarting_restores_proposals_and_supplies_context_to_a_fresh_assistant() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let captured = dir.path().join("captured.txt");
+        let mut config = Config::default();
+        config.dashboard.session_prefix = format!("omar-history-test-{}-", Uuid::new_v4());
+        config.agent.default_workdir = dir.path().display().to_string();
+        // A recording backend drains its side-channel queue. No TTY input,
+        // real Claude installation, or model credentials are involved.
+        let recorder = dir.path().join("claude");
+        fs::write(
+            &recorder,
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys, time
+output = pathlib.Path(__file__).with_name('captured.txt')
+spool = output.with_suffix('.queue')
+subprocess.run(['tmux', 'set-environment', '-t', os.environ['TMUX_PANE'],
+                'OMAR_DELIVERY', 'spool:' + str(spool)], check=True)
+print('Claude Code\n❯ ', flush=True)
+while True:
+    claimed = spool.with_suffix('.draining')
+    try:
+        spool.rename(claimed)
+    except FileNotFoundError:
+        time.sleep(0.025)
+        continue
+    with output.open('a') as sink:
+        for line in claimed.read_text().splitlines():
+            sink.write(json.loads(line)['text'] + '\n')
+    claimed.unlink()
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o700)).unwrap();
+        config.agent.default_command = format!("'{}' '{}'", recorder.display(), captured.display());
+        let session = crate::ea::ea_manager_session(0, &config.dashboard.session_prefix);
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = crate::tmux::tmux_command()
+                    .args(["kill-session", "-t", &format!("={}", self.0)])
+                    .output();
+            }
+        }
+        let _cleanup = Cleanup(session);
+        let first = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        first
+            .context
+            .publish_with_selection(
+                ChatRole::Operator,
+                "Preserve the launch requirements".into(),
+                false,
+                None,
+                vec!["flow.planner".into()],
+            )
+            .unwrap();
+        let proposal = ProposedDesign {
+            files: BTreeMap::from([(
+                "schemas/decision.json".into(),
+                "{\"type\":\"string\"}".into(),
+            )]),
+            program: include_str!("../web/tests/fixtures/review-flow.omar").into(),
+            inputs: BTreeMap::from([("flow.request".into(), json!("release evidence"))]),
+            preview: serde_json::from_str(include_str!(
+                "../web/tests/fixtures/diagram-snapshot.v1.json"
+            ))
+            .unwrap(),
+            lemmas: String::new(),
+            properties: Vec::new(),
+        };
+        first
+            .context
+            .publish(
+                ChatRole::Assistant,
+                "Saved proposal".into(),
+                false,
+                Some(proposal),
+            )
+            .unwrap();
+        let first_id = first.context.history.lock().unwrap().active_id.clone();
+        drop(first);
+        let resumed = Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+        let body = request(resumed.address(), "GET", "/v1/chat", None);
+        assert!(
+            body.contains("Saved proposal")
+                && body.contains("release evidence")
+                && body.contains("schemas/decision.json"),
+            "{body}"
+        );
+        assert_eq!(resumed.context.history.lock().unwrap().active_id, first_id);
+        let response = request(
+            resumed.address(),
+            "POST",
+            "/v1/chat",
+            Some(r#"{"text":"Continue with a final review"}"#),
+        );
+        assert!(response.contains(" 202 "), "{response}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let text = loop {
+            let text = fs::read_to_string(&captured).unwrap_or_default();
+            if text.contains("Continue with a final review")
+                || std::time::Instant::now() >= deadline
+            {
+                break text;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        for expected in [
+            "Preserve the launch requirements",
+            "flow.planner",
+            "release evidence",
+            "Saved proposal",
+            "Continue with a final review",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing {expected} in delivered context: {text}"
+            );
+        }
+        assert!(
+            resumed.context.runs.lock().unwrap().is_empty(),
+            "restoring a proposal never deploys it"
+        );
+    }
+
     /// Stopping is a request the runner reads, not a kill.
     ///
     /// The route's whole job is to leave the same control file `omar stop`
     /// leaves, in the directory the run is actually using — so the assertion
     /// worth making is that the file lands where the runner looks.
+    /// A pause is the same kind of request as a stop: a control file where
+    /// the runner looks, and a status the record carries until the boundary.
+    #[test]
+    fn pausing_a_run_leaves_the_request_and_resuming_needs_a_paused_run() {
+        let server = test_server();
+        let address = server.address();
+        let team = "Cadence";
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: team.to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                    mutation: None,
+                },
+            );
+        }
+        let dir = crate::deploy::dir_for(&server.context.omar_dir, 0, team);
+        std::fs::create_dir_all(&dir).expect("deployment dir");
+
+        // Not paused: nothing to resume.
+        let response = request(address, "POST", "/v1/runs/run-1/resume", Some("{}"));
+        assert!(response.contains(" 409 "), "{response}");
+        assert!(
+            response.contains("only a paused run can resume"),
+            "{response}"
+        );
+
+        let response = request(address, "POST", "/v1/runs/run-1/pause", Some("{}"));
+        assert!(response.contains(" 202 "), "{response}");
+        assert_eq!(
+            crate::deploy::pending_request(&dir),
+            Some(crate::deploy::ControlOp::Pause)
+        );
+        assert!(response.contains("\"status\":\"pausing\""), "{response}");
+        assert!(RunStatus::Pausing.is_active());
+
+        // A stop outranks the pending pause: the operator wants the run to
+        // end, and a capture that is held has no other way out.
+        let response = request(address, "POST", "/v1/runs/run-1/stop", Some("{}"));
+        assert!(
+            response.contains(" 202 ") && response.contains("\"status\":\"stopping\""),
+            "{response}"
+        );
+        assert_eq!(
+            crate::deploy::pending_request(&dir),
+            Some(crate::deploy::ControlOp::Stop)
+        );
+
+        // Paused, but the program the daemon staged is gone: refused before
+        // anything is launched, with the path it looked at.
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.get_mut("run-1").expect("run").status = RunStatus::Paused;
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/resume", Some("{}"));
+        assert!(response.contains(" 409 "), "{response}");
+        assert!(response.contains("no longer staged"), "{response}");
+        assert!(request(address, "POST", "/v1/runs/nobody/resume", Some("{}")).contains(" 404 "));
+    }
+
+    /// Mission Control lists a run's checkpoints and moves a paused run's
+    /// resume point; the store underneath is the one `omar rollback` uses.
+    #[test]
+    fn checkpoints_are_listed_and_a_paused_run_rolls_back() {
+        let server = test_server();
+        let address = server.address();
+        let team = "Cadence";
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: team.to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                    mutation: None,
+                },
+            );
+        }
+        let dir = crate::deploy::dir_for(&server.context.omar_dir, 0, team);
+        std::fs::create_dir_all(&dir).expect("deployment dir");
+        let response = request(address, "GET", "/v1/runs/run-1/checkpoints", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"checkpoints\":[]"),
+            "{response}"
+        );
+
+        // Two checkpoints with no file versions to verify, published the way
+        // the runtime publishes them.
+        let store = crate::checkpoint::Store::new(&dir);
+        let program = json!({"version": 1, "team": team, "instructions": [
+            {"op": "begin_plan", "team": team},
+            {"op": "define_port", "kind": "input", "name": "tick", "type": "int"},
+            {"op": "commit_plan"}]});
+        let mut ids = Vec::new();
+        for sequence in 1..=2u64 {
+            let state = crate::checkpoint::ExecutionState {
+                version: crate::checkpoint::FORMAT,
+                completed_tag: Some((sequence, 0)),
+                queue: Vec::new(),
+                outputs: BTreeMap::new(),
+                state_vars: BTreeMap::new(),
+                elapsed_ns: sequence,
+            };
+            let manifest = crate::checkpoint::Manifest {
+                version: crate::checkpoint::FORMAT,
+                id: Uuid::new_v4().to_string(),
+                sequence,
+                parent: ids.last().cloned(),
+                deployment_id: "d".into(),
+                team: team.into(),
+                ea_id: 0,
+                created_at: sequence,
+                completed_tag: state.completed_tag,
+                next_tag: None,
+                trigger: crate::checkpoint::Trigger::Manual,
+                policy: crate::checkpoint::Policy::default(),
+                pace: "fast".into(),
+                program_sha256: crate::checkpoint::sha256(&serde_json::to_vec(&program).unwrap()),
+                program_path: None,
+                state_sha256: crate::checkpoint::sha256(
+                    &serde_json::to_vec_pretty(&state).unwrap(),
+                ),
+                elapsed_ns: state.elapsed_ns,
+                workspaces: BTreeMap::new(),
+                agents: BTreeMap::new(),
+                mutation: Vec::new(),
+            };
+            store
+                .publish(&manifest, &state, &program, None)
+                .expect("publish");
+            ids.push(manifest.id);
+        }
+        let response = request(address, "GET", "/v1/runs/run-1/checkpoints", None);
+        assert!(
+            response.contains(&format!("\"resume_point\":\"{}\"", ids[1])),
+            "{response}"
+        );
+        // The preview: what the checkpoint holds, and whether it is the resume point.
+        let response = request(
+            address,
+            "GET",
+            &format!("/v1/runs/run-1/checkpoints/{}", ids[0]),
+            None,
+        );
+        assert!(
+            response.contains(" 200 ") && response.contains("\"is_resume_point\":false"),
+            "{response}"
+        );
+        assert!(
+            response.contains("\"queue_len\":0") && response.contains("\"completed_tag\":[1,0]"),
+            "{response}"
+        );
+        assert!(request(address, "GET", "/v1/runs/run-1/checkpoints/nope", None).contains(" 404 "));
+
+        // The run's own timeline, from the bytecode staged beside its program.
+        let response = request(address, "GET", "/v1/runs/run-1/timeline", None);
+        assert!(
+            response.contains(" 409 ") && response.contains("no longer staged"),
+            "{response}"
+        );
+        let staged = crate::ea::ea_state_dir(0, &server.context.omar_dir)
+            .join("serve")
+            .join("run-1");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(
+            staged.join("program.json"),
+            serde_json::to_vec(&program).unwrap(),
+        )
+        .unwrap();
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.get_mut("run-1").expect("run").present = vec!["tick".to_string()];
+        }
+        let response = request(address, "GET", "/v1/runs/run-1/timeline", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"steps\":[{"),
+            "{response}"
+        );
+        assert!(response.contains("\"truncated\":false"), "{response}");
+
+        // Only a paused run rolls back.
+        let body = format!("{{\"checkpoint\":\"{}\"}}", ids[0]);
+        let response = request(address, "POST", "/v1/runs/run-1/rollback", Some(&body));
+        assert!(
+            response.contains(" 409 ") && response.contains("only a paused run"),
+            "{response}"
+        );
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.get_mut("run-1").expect("run").status = RunStatus::Paused;
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/rollback", Some(&body));
+        assert!(response.contains(" 200 "), "{response}");
+        assert!(
+            response.contains(&format!("\"abandoned\":\"{}\"", ids[1])),
+            "{response}"
+        );
+        assert_eq!(store.resume_point().unwrap().unwrap().id, ids[0]);
+        let response = request(
+            address,
+            "POST",
+            "/v1/runs/run-1/rollback",
+            Some("{\"checkpoint\":\"nope\"}"),
+        );
+        assert!(response.contains(" 409 "), "{response}");
+    }
+
     #[test]
     fn stopping_a_run_leaves_the_request_where_the_runner_reads_it() {
         let server = test_server();
@@ -1822,6 +6104,10 @@ mod tests {
                     started_at: 0,
                     finished_at: None,
                     error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                    mutation: None,
                 },
             );
         }
@@ -1927,6 +6213,139 @@ mod tests {
             find_active_run(&runs, "Sample").map(|record| record.status),
             Some(RunStatus::Starting)
         );
+        // A paused run holds its team too: a fresh run would overwrite the
+        // deployment record and checkpoints its resume needs.
+        runs.insert("c".to_string(), record("Sample", RunStatus::Paused));
+        let held = find_active_run(&runs, "Sample").expect("paused holds the team");
+        assert!(team_held_error(held)["error"]
+            .as_str()
+            .unwrap()
+            .contains("paused run"));
+    }
+
+    /// A paused run's diagram outlives its server: the record of the pause
+    /// keeps it, and the run's snapshot route serves it to a reload.
+    #[test]
+    fn a_paused_run_keeps_its_last_diagram() {
+        let server = test_server();
+        let address = server.address();
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: "Cadence".to_string(),
+                    status: RunStatus::Running,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                    mutation: None,
+                },
+            );
+        }
+        assert!(request(address, "GET", "/v1/runs/run-1/snapshot", None).contains(" 404 "));
+        assert!(request(address, "GET", "/v1/runs/nobody/snapshot", None).contains(" 404 "));
+        let diagram = crate::diagram::DiagramSnapshot::from_vm_state(&sample_state());
+        finish_run(
+            &server.context,
+            "run-1",
+            Ok(topology::RunOutcome {
+                end: topology::RunEnd::Paused,
+                outputs: BTreeMap::new(),
+                state: BTreeMap::new(),
+                diagram: Some(diagram),
+            }),
+        );
+        let response = request(address, "GET", "/v1/runs/run-1/snapshot", None);
+        assert!(
+            response.contains(" 200 ") && response.contains("\"team\":\"Sample\""),
+            "{response}"
+        );
+        assert!(request(address, "GET", "/v1/runs/run-1", None).contains("\"status\":\"paused\""));
+    }
+
+    /// An edit is compared against the source the run executes now, which
+    /// the run's program route serves from where the run keeps it.
+    #[test]
+    fn a_run_serves_the_source_it_executes() {
+        let server = test_server();
+        let address = server.address();
+        server.context.runs.lock().expect("runs").insert(
+            "run-1".to_string(),
+            RunRecord {
+                run_id: "run-1".to_string(),
+                team: "Morph".to_string(),
+                status: RunStatus::Running,
+                diagram_address: None,
+                started_at: 0,
+                finished_at: None,
+                error: None,
+                present: Vec::new(),
+                outputs: BTreeMap::new(),
+                state: BTreeMap::new(),
+                mutation: None,
+            },
+        );
+        assert!(request(address, "GET", "/v1/runs/run-1/program", None).contains(" 404 "));
+        assert!(request(address, "GET", "/v1/runs/nobody/program", None).contains(" 404 "));
+        let run_dir = crate::ea::ea_state_dir(server.context.ea_id, &server.context.omar_dir)
+            .join("serve")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(run_dir.join("Morph.omar"), "main Morph {}\n").unwrap();
+        let response = request(address, "GET", "/v1/runs/run-1/program", None);
+        assert!(
+            response.contains(" 200 ")
+                && response.contains("\"filename\":\"Morph.omar\"")
+                && response.contains("\"program\":\"main Morph {}\\n\""),
+            "{response}"
+        );
+    }
+
+    /// A paused run has no runner to ask, so a stop gives it up in place,
+    /// which frees its team; it cannot be resumed afterwards.
+    #[test]
+    fn stopping_a_paused_run_discards_it() {
+        let server = test_server();
+        let address = server.address();
+        {
+            let mut runs = server.context.runs.lock().expect("runs");
+            runs.insert(
+                "run-1".to_string(),
+                RunRecord {
+                    run_id: "run-1".to_string(),
+                    team: "Cadence".to_string(),
+                    status: RunStatus::Paused,
+                    diagram_address: None,
+                    started_at: 0,
+                    finished_at: None,
+                    error: None,
+                    present: Vec::new(),
+                    outputs: BTreeMap::new(),
+                    state: BTreeMap::new(),
+                    mutation: None,
+                },
+            );
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/stop", Some("{}"));
+        assert!(
+            response.contains(" 200 ") && response.contains("\"status\":\"stopped\""),
+            "{response}"
+        );
+        {
+            let runs = server.context.runs.lock().expect("runs");
+            assert!(
+                find_active_run(&runs, "Cadence").is_none(),
+                "the team is free again"
+            );
+        }
+        let response = request(address, "POST", "/v1/runs/run-1/resume", Some("{}"));
+        assert!(response.contains(" 409 "), "{response}");
     }
 
     #[test]
@@ -1967,7 +6386,7 @@ mod tests {
             server.address(),
             "POST",
             "/v1/runs/nope/panel",
-            Some(r#"{"invocation_id":"i","agent":"panel","values":{}}"#),
+            Some(r#"{"task_id":1,"agent":"panel","values":{}}"#),
         );
         assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
         assert!(response.contains("unknown run"), "{response}");
@@ -1987,6 +6406,24 @@ mod tests {
             "{response}"
         );
         assert!(response.contains("invalid request"), "{response}");
+    }
+
+    /// Resume finds the source under the name the run was started with, and
+    /// still finds a run staged before runs kept their names.
+    #[test]
+    fn a_staged_program_is_found_under_its_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(staged_program(dir.path()), None);
+        fs::create_dir(dir.path().join("schemas")).unwrap();
+        fs::write(dir.path().join("schemas/decision.json"), "{}").unwrap();
+        fs::write(dir.path().join("HR.omar"), "").unwrap();
+        assert_eq!(staged_program(dir.path()), Some(dir.path().join("HR.omar")));
+        let legacy = tempfile::tempdir().unwrap();
+        fs::write(legacy.path().join("program.omar"), "").unwrap();
+        assert_eq!(
+            staged_program(legacy.path()),
+            Some(legacy.path().join("program.omar"))
+        );
     }
 
     #[test]
@@ -2080,7 +6517,7 @@ mod tests {
         // Whatever this machine defaults to, the choices are the ones an
         // operator can actually pick.
         assert!(response.contains("\"available\""), "{response}");
-        for backend in crate::config::ASSISTANT_BACKENDS {
+        for backend in crate::backend::assistant_names() {
             assert!(
                 response.contains(backend),
                 "{backend} missing from {response}"
@@ -2119,9 +6556,49 @@ mod tests {
     }
 
     #[test]
+    fn only_an_assistant_backend_has_a_sign_in_to_start() {
+        let server = test_server();
+        for name in ["notabackend", "stub", "jev"] {
+            let refused = request(
+                server.address(),
+                "POST",
+                &format!("/v1/backends/{name}/connect"),
+                Some("{}"),
+            );
+            assert!(refused.starts_with("HTTP/1.1 404"), "{name}: {refused}");
+            assert!(refused.contains("not an assistant backend"), "{refused}");
+            let unchecked = request(
+                server.address(),
+                "POST",
+                &format!("/v1/backends/{name}/check"),
+                Some("{}"),
+            );
+            assert!(unchecked.starts_with("HTTP/1.1 404"), "{name}: {unchecked}");
+        }
+        assert!(connectable("codex").is_some());
+        assert!(connectable("pi").is_some());
+    }
+
+    #[test]
+    fn a_backend_that_cannot_start_is_refused_with_how_to_connect_it() {
+        use crate::backend::connection::Connection;
+        let cursor = crate::backend::by_name("cursor").unwrap();
+        assert_eq!(
+            unusable(cursor, &Connection::SignedOut).as_deref(),
+            Some("cursor is not signed in; run `omar connect cursor`")
+        );
+        assert_eq!(
+            unusable(cursor, &Connection::NotInstalled).as_deref(),
+            Some("cursor is not installed; run `omar connect cursor`")
+        );
+        assert_eq!(unusable(cursor, &Connection::connected("me")), None);
+        assert_eq!(unusable(cursor, &Connection::unknown("timed out")), None);
+    }
+
+    #[test]
     fn operator_messages_are_labelled_with_how_to_answer() {
         // Without this the EA answers in its pane, where nobody is looking.
-        let envelope = mission_control_envelope("review the release plan", &[]);
+        let envelope = mission_control_envelope("review the release plan", &[], None);
         assert!(envelope.starts_with("OMAR MISSION CONTROL"));
         assert!(envelope.contains("omar_reply"));
         assert!(envelope.contains("omar_propose_design"));
@@ -2140,6 +6617,7 @@ mod tests {
         let envelope = mission_control_envelope(
             "give this one a retry",
             &["n1.agent".to_string(), "n1.out".to_string()],
+            None,
         );
 
         assert!(envelope.contains("n1.agent, n1.out"), "{envelope}");
@@ -2153,13 +6631,32 @@ mod tests {
     }
 
     #[test]
+    fn a_live_run_tells_the_ea_how_to_change_it() {
+        // "Add a keeper" mid-run means this run's program, changed in place.
+        let live = LiveRun {
+            team: "Morph".into(),
+            status: "running".into(),
+            program: PathBuf::from("/state/serve/run-1/Morph.omar"),
+        };
+        let envelope = mission_control_envelope("add a keeper", &[], Some(&live));
+        assert!(envelope.contains("`Morph` is running"), "{envelope}");
+        assert!(
+            envelope.contains("/state/serve/run-1/Morph.omar"),
+            "{envelope}"
+        );
+        assert!(envelope.contains("keeping `main Morph`"), "{envelope}");
+        assert!(envelope.ends_with("add a keeper"), "{envelope}");
+        assert!(!mission_control_envelope("add a keeper", &[], None).contains("Morph"));
+    }
+
+    #[test]
     fn an_empty_selection_adds_nothing_to_the_envelope() {
         // Most messages have no selection; they should read exactly as before.
         assert_eq!(
-            mission_control_envelope("plain question", &[]),
-            mission_control_envelope("plain question", &[]),
+            mission_control_envelope("plain question", &[], None),
+            mission_control_envelope("plain question", &[], None),
         );
-        assert!(!mission_control_envelope("plain question", &[]).contains("selected"));
+        assert!(!mission_control_envelope("plain question", &[], None).contains("selected"));
     }
 
     #[test]
@@ -2285,6 +6782,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_handshake_geometry_is_validated() {
+        assert_eq!(terminal_dimensions("").unwrap(), None);
+        assert_eq!(
+            terminal_dimensions("cols=96&rows=30").unwrap(),
+            Some((96, 30))
+        );
+        for bad in [
+            "cols=80",
+            "rows=24",
+            "cols=0&rows=24",
+            "cols=80&rows=1001",
+            "cols=80&rows=24&cols=90",
+            "cols=x&rows=24",
+            "other=80&rows=24",
+        ] {
+            assert!(terminal_dimensions(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_terminal_carries_the_agent_screen_and_the_operator_keystrokes() {
         // The whole point is steering, so this drives a real tmux session
         // through a real socket: the agent's output has to arrive, and typing
@@ -2315,11 +6832,13 @@ mod tests {
         ]);
 
         let server = test_server();
-        let url = format!("ws://{}/v1/agents/wsprobe/terminal", server.address());
+        let url = format!(
+            "ws://{}/v1/agents/wsprobe/terminal?cols=93&rows=31",
+            server.address()
+        );
         let (mut socket, _) = tungstenite::connect(&url).expect("terminal connects");
 
-        // The viewer is told the agent's size before anything else, so it can
-        // render at that size instead of resizing the agent.
+        // The PTY starts at the viewer's requested size before emitting bytes.
         let size: Value = serde_json::from_str(
             &socket
                 .read()
@@ -2328,8 +6847,8 @@ mod tests {
                 .expect("text"),
         )
         .expect("json");
-        assert_eq!(size["cols"], json!(120));
-        assert_eq!(size["rows"], json!(40));
+        assert_eq!(size["cols"], json!(93));
+        assert_eq!(size["rows"], json!(31));
 
         socket
             .send(tungstenite::Message::Binary(b"echo omar-ws-ok\n".to_vec()))
@@ -2354,6 +6873,159 @@ mod tests {
         let survived = crate::terminal::window_size(&session).is_ok();
         tmux(&["kill-session", "-t", &session]);
         assert!(survived, "the agent session outlives its viewer");
+    }
+
+    #[test]
+    fn the_view_port_answers_reads_and_refuses_writes() {
+        let server = test_server();
+        let view = server
+            .start_viewer("127.0.0.1:0".parse().unwrap())
+            .expect("view port binds");
+        assert!(request(server.address(), "GET", "/health", None).contains(r#""access":"full""#));
+        assert!(request(view, "GET", "/health", None).contains(r#""access":"view""#));
+        for path in ["/v1/chats", "/v1/chat", "/v1/runs", "/v1/agent"] {
+            let response = request(view, "GET", path, None);
+            assert!(response.contains(" 200 "), "{path}: {response}");
+        }
+        // Writes, plus reads that hand out more than a view: host files,
+        // editors, and a web agent's panel credentials.
+        for (method, path) in [
+            ("POST", "/v1/chats"),
+            ("POST", "/v1/chat"),
+            ("POST", "/v1/runs"),
+            ("POST", "/v1/runs/r/stop"),
+            ("POST", "/v1/agent/backend"),
+            ("DELETE", "/v1/runs/r"),
+            ("GET", "/v1/workspaces"),
+            ("GET", "/v1/workspaces/w/preview"),
+            ("GET", "/v1/runs/r/panel"),
+        ] {
+            let response = request(view, method, path, Some("{}"));
+            assert!(
+                response.contains(" 403 ") && response.contains("read-only view"),
+                "{method} {path}: {response}"
+            );
+        }
+        // Refused before anything ran: the full port still has one chat.
+        let listing = request(server.address(), "GET", "/v1/chats", None);
+        let body: Value = serde_json::from_str(listing.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["conversations"].as_array().unwrap().len(), 1);
+        // A viewer can't conjure a chat (or the EA one would be given).
+        assert!(request(view, "GET", "/chats/nobody/v1/chat", None).contains(" 404 "));
+        assert!(request(server.address(), "POST", "/v1/chats", Some("{}")).contains(" 200 "));
+    }
+
+    #[test]
+    fn the_view_port_relays_a_runs_loopback_diagram() {
+        let diagram = TcpListener::bind("127.0.0.1:0").unwrap();
+        let diagram_address = diagram.local_addr().unwrap();
+        let upstream = std::thread::spawn(move || {
+            let (mut stream, _) = diagram.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"diagram\":1}")
+                .unwrap();
+            line
+        });
+        let server = test_server();
+        let view = server.start_viewer("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut live = record("Live", RunStatus::Running);
+        live.diagram_address = Some(diagram_address.to_string());
+        server
+            .context
+            .runs
+            .lock()
+            .unwrap()
+            .insert(live.run_id.clone(), live.clone());
+
+        let path = format!("/v1/runs/{}/diagram/v1/diagram", live.run_id);
+        let response = request(view, "GET", &path, None);
+        assert!(response.ends_with(r#"{"diagram":1}"#), "{response}");
+        assert!(upstream.join().unwrap().starts_with("GET /v1/diagram "));
+        // Only the diagram server's own reads, and only for a live diagram.
+        let other = format!("/v1/runs/{}/diagram/v1/other", live.run_id);
+        assert!(request(view, "GET", &other, None).contains(" 404 "));
+        assert!(request(view, "GET", "/v1/runs/nobody/diagram/v1/events", None).contains(" 404 "));
+    }
+
+    #[test]
+    fn a_view_terminal_shows_the_screen_but_takes_no_keystrokes_or_resizes() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let prefix = crate::ea::ea_prefix(0, &Config::default().dashboard.session_prefix);
+        let session = format!("{prefix}wsview");
+        let tmux = |args: &[&str]| {
+            crate::tmux::tmux_command()
+                .args(args)
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        tmux(&["kill-session", "-t", &session]);
+        tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            &session,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "sh",
+        ]);
+
+        let server = test_server();
+        let view = server.start_viewer("127.0.0.1:0".parse().unwrap()).unwrap();
+        // Any origin may watch: the view port is public by design.
+        let mut handshake = tungstenite::client::IntoClientRequest::into_client_request(format!(
+            "ws://{view}/v1/agents/wsview/terminal?cols=93&rows=31"
+        ))
+        .unwrap();
+        handshake
+            .headers_mut()
+            .insert("Origin", "https://display.example".parse().unwrap());
+        let (mut socket, _) = tungstenite::connect(handshake).expect("view terminal connects");
+        let size: Value =
+            serde_json::from_str(&socket.read().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(size["cols"], json!(120), "the viewer's geometry is ignored");
+
+        socket
+            .send(tungstenite::Message::Binary(
+                b"echo omar-view-typed\n".to_vec(),
+            ))
+            .unwrap();
+        socket
+            .send(tungstenite::Message::Text(
+                r#"{"cols":50,"rows":10}"#.into(),
+            ))
+            .unwrap();
+        // The operator's own typing still shows up for the viewer.
+        tmux(&["send-keys", "-t", &session, "echo omar-view-shown", "Enter"]);
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !seen.contains("omar-view-shown") && std::time::Instant::now() < deadline {
+            if let Ok(tungstenite::Message::Binary(bytes)) = socket.read() {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        let pane = tmux(&["capture-pane", "-p", "-t", &session]);
+        let window = crate::terminal::window_size(&session);
+        tmux(&["kill-session", "-t", &session]);
+        assert!(
+            seen.contains("omar-view-shown"),
+            "pane: {pane}\ngot: {seen}"
+        );
+        assert!(!pane.contains("omar-view-typed"), "a viewer typed: {pane}");
+        assert_eq!(
+            window.expect("window").cols,
+            120,
+            "a viewer resized the window"
+        );
     }
 
     /// A WebSocket handshake for the terminal, with whatever Origin is given.
@@ -2411,6 +7083,9 @@ mod tests {
         ]);
 
         let server = test_server();
+        let expected_rows = crate::terminal::window_size(&session)
+            .unwrap()
+            .client_rows();
         let url = format!("ws://{}/v1/agent/terminal", server.address());
         let (mut socket, _) = tungstenite::connect(&url).expect("assistant terminal connects");
         let size: Value = serde_json::from_str(
@@ -2424,7 +7099,7 @@ mod tests {
 
         tmux(&["kill-session", "-t", &format!("={session}")]);
         assert_eq!(size["cols"], json!(90));
-        assert_eq!(size["rows"], json!(26));
+        assert_eq!(size["rows"], json!(expected_rows));
     }
 
     #[test]

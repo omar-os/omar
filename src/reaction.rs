@@ -2,8 +2,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,10 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::topology::VmState;
+
+/// What a body's answer carries when it called `request_stop()`. Not a name a
+/// port can have, so it cannot collide with one.
+pub const STOP: &str = "!stop";
 
 /// Boilerplate the generated crate needs. The wire format is one
 /// `name<TAB>value` per line because a sealed crate has no JSON to lean on.
@@ -77,6 +82,15 @@ fn get_string(m: &In, k: &str) -> Result<Option<String>, String> {
     Ok(m.get(k).cloned())
 }
 
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// End the run once this tag is over. `shutdown` reactions fire one microstep
+/// later, and nothing queued after that runs.
+#[allow(dead_code)]
+fn request_stop() {
+    STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn need<T>(v: Option<T>, k: &str) -> Result<T, String> {
     v.ok_or_else(|| format!("state '{k}' was not supplied"))
 }
@@ -128,6 +142,9 @@ fn main() {
                 out.push_str(&v);
                 out.push('\n');
             }
+            if STOP.load(std::sync::atomic::Ordering::Relaxed) {
+                out.push_str("!stop\t\n");
+            }
             print!("{out}");
         }
         Err(error) => {
@@ -143,6 +160,67 @@ fn main() {
 pub struct Reactions {
     binary: PathBuf,
     reactions: BTreeSet<String>,
+}
+
+/// Persists uncertainty across runner crashes; snapshots refuse outstanding markers.
+struct ReactionProcess {
+    child: Child,
+    marker: Option<PathBuf>,
+    cleaned: bool,
+}
+
+impl ReactionProcess {
+    fn cleanup(&mut self) -> Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        crate::process::child_exited(&self.child).context("verify reaction child ownership")?;
+        let group = self.child.id();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // Descendants retain the group even after the direct child exits.
+            Command::new("kill")
+                .args(["-KILL", "--", &format!("-{group}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .context("signal reaction process group")?;
+            let output = Command::new("ps")
+                .args(["-axo", "pgid=,stat="])
+                .output()
+                .context("inspect reaction process group")?;
+            anyhow::ensure!(output.status.success(), "cannot verify reaction cleanup");
+            let live = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                fields.next().and_then(|s| s.parse::<u32>().ok()) == Some(group)
+                    && fields.next().is_none_or(|state| !state.starts_with('Z'))
+            });
+            if !live {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "reaction process group {group} remains alive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.child.wait().context("reap reaction process")?;
+        if let Some(marker) = &self.marker {
+            std::fs::remove_file(marker)?;
+        }
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for ReactionProcess {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            if let Err(error) = self.cleanup() {
+                eprintln!("warning: reaction cleanup unconfirmed: {error:#}");
+            }
+        }
+    }
 }
 
 /// A bound argument written as the Rust literal the generated crate declares.
@@ -309,6 +387,8 @@ const TAKEN: &[&str] = &[
     "put_string",
     "dispatch",
     "main",
+    "request_stop",
+    "STOP",
     "In",
     "Out",
     "Some",
@@ -330,6 +410,11 @@ pub fn reserved_name(qualified: &str) -> Option<&'static str> {
 }
 
 fn rust_type(ty: &str) -> Result<(&'static str, &'static str, &'static str)> {
+    // A refined string arrives as a plain String: what it admits was checked
+    // when it was written. A body may not write one — `verify` says so.
+    if crate::topology::string_enum(ty).is_some() {
+        return Ok(("String", "get_string", "put_string"));
+    }
     // (rust type, getter, putter)
     Ok(match ty {
         "int" => ("i64", "get_int", "put_int"),
@@ -516,12 +601,19 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
                 reactions,
             }));
         }
+        // JSON inspection is opt-in for bodies that name serde_json. Its sources
+        // are already cached by building OMAR, so reaction builds stay offline.
+        let dependencies = if source.contains("serde_json::") {
+            "serde_json = \"1\"\n"
+        } else {
+            ""
+        };
         // An empty [workspace] keeps the crate standalone wherever it lands.
         std::fs::write(
             dir.join("Cargo.toml"),
             format!(
                 "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
-                 [dependencies]\n\n[workspace]\n"
+                 [dependencies]\n{dependencies}\n[workspace]\n"
             ),
         )?;
         // Leaving an unchanged file untouched is what lets cargo skip the work
@@ -650,6 +742,7 @@ impl Reactions {
         self.reactions.contains(reaction_id)
     }
 
+    #[cfg(test)]
     pub fn invoke(
         &self,
         state: &VmState,
@@ -658,6 +751,18 @@ impl Reactions {
         state_values: &BTreeMap<String, Value>,
         deadline: Duration,
     ) -> Result<Option<BTreeMap<String, Value>>> {
+        self.invoke_in(state, reaction_id, triggers, state_values, deadline, None)
+    }
+
+    pub fn invoke_in(
+        &self,
+        state: &VmState,
+        reaction_id: &str,
+        triggers: &BTreeMap<String, Value>,
+        state_values: &BTreeMap<String, Value>,
+        deadline: Duration,
+        workspace: Option<&(PathBuf, PathBuf)>,
+    ) -> Result<Option<BTreeMap<String, Value>>> {
         let mut request = format!("{reaction_id}\n");
         for (name, value) in triggers.iter().chain(state_values) {
             let ty = wire_type(state, name)
@@ -665,99 +770,148 @@ impl Reactions {
             request.push_str(&format!("{name}\t{}\n", encode(value, ty)?));
         }
 
-        let mut child = Command::new(&self.binary)
+        let mut command = Command::new(self.binary.canonicalize()?);
+        if let Some((worktree, temp)) = workspace {
+            command
+                .current_dir(worktree)
+                .env("OMAR_WORKTREE", worktree)
+                .env("OMAR_TEMP", temp)
+                .env("TMPDIR", temp);
+        }
+        let marker = workspace
+            .map(|(worktree, _)| -> Result<PathBuf> {
+                let directory = worktree
+                    .parent()
+                    .context("workspace has no parent")?
+                    .join("reactions");
+                std::fs::create_dir_all(&directory)?;
+                let marker = directory.join(uuid::Uuid::new_v4().to_string());
+                std::fs::write(&marker, "Reaction cleanup has not been confirmed.\n")?;
+                Ok(marker)
+            })
+            .transpose()?;
+        let spawned = command
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("failed to run {}", self.binary.display()))?;
-        child
-            .stdin
-            .take()
-            .context("reaction subprocess has no stdin")?
-            .write_all(request.as_bytes())?;
-
-        // std has no timed wait, so the read runs in a thread and the deadline
-        // is enforced on the channel. A body that overruns is killed.
-        //
-        // Both streams are drained at once. A body that fills one while the
-        // other is unread blocks there, and would be reported as slow rather
-        // than by whatever it said before it stopped.
-        let stdout = child.stdout.take().context("reaction has no stdout")?;
-        let stderr = child.stderr.take().context("reaction has no stderr")?;
-        // Over a channel rather than a join handle: a body can leave a
-        // descendant holding the write end, so the stream may never reach its
-        // end even after the body itself is killed. Waiting on it is then a
-        // wait with no deadline, which is the one thing an invocation may not
-        // do. What it managed to say is worth having, not worth hanging for.
-        let (spoke, said) = mpsc::channel();
-        std::thread::spawn(move || {
-            // Diagnostics, so a cut one is still worth reading.
-            let (out, _) = drain(stderr, CAPTURE_LIMIT).unwrap_or_default();
-            spoke.send(String::from_utf8_lossy(&out).into_owned()).ok();
-        });
-        let said = move || said.recv_timeout(SPEAK_GRACE).unwrap_or_default();
-        let (done, finished) = mpsc::channel();
-        std::thread::spawn(move || {
-            done.send(drain(stdout, CAPTURE_LIMIT)).ok();
-        });
-
-        let started = Instant::now();
-        let out = match finished.recv_timeout(deadline) {
-            Ok(out) => {
-                // The answer is a protocol frame, so half of one is not a
-                // short answer — it is one that cannot be read. A value cut
-                // mid-way would otherwise arrive as a shorter value.
-                let (out, whole) = out?;
-                if !whole {
-                    bail!("reaction '{reaction_id}' answered with more than {CAPTURE_LIMIT} bytes");
+            .with_context(|| format!("failed to run {}", self.binary.display()));
+        let child = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(marker) = marker {
+                    std::fs::remove_file(marker)?;
                 }
-                out
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                child.kill().ok();
-                child.wait().ok();
-                said();
-                return Ok(None);
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                child.kill().ok();
-                child.wait().ok();
-                said();
-                bail!("reaction '{reaction_id}' stopped without answering");
+                return Err(error);
             }
         };
-        // Stdout reaching its end is not the body reaching its own: a body can
-        // close what it writes to and keep running. The deadline covers this
-        // wait too, or `within` would be a promise the body could opt out of.
-        let status = loop {
-            match child.try_wait()? {
-                Some(status) => break status,
-                None if started.elapsed() >= deadline => {
-                    child.kill().ok();
-                    child.wait().ok();
+        let mut process = ReactionProcess {
+            child,
+            marker,
+            cleaned: false,
+        };
+        let result = (|| {
+            if let Some(marker) = &process.marker {
+                std::fs::write(
+                    marker,
+                    format!(
+                        "Reaction process group: {}\nCleanup has not been confirmed.\n",
+                        process.child.id()
+                    ),
+                )?;
+            }
+            let child = &mut process.child;
+            child
+                .stdin
+                .take()
+                .context("reaction subprocess has no stdin")?
+                .write_all(request.as_bytes())?;
+
+            // std has no timed wait, so the read runs in a thread and the deadline
+            // is enforced on the channel. A body that overruns is killed.
+            //
+            // Both streams are drained at once. A body that fills one while the
+            // other is unread blocks there, and would be reported as slow rather
+            // than by whatever it said before it stopped.
+            let stdout = child.stdout.take().context("reaction has no stdout")?;
+            let stderr = child.stderr.take().context("reaction has no stderr")?;
+            // Over a channel rather than a join handle: a body can leave a
+            // descendant holding the write end, so the stream may never reach its
+            // end even after the body itself is killed. Waiting on it is then a
+            // wait with no deadline, which is the one thing an invocation may not
+            // do. What it managed to say is worth having, not worth hanging for.
+            let (spoke, said) = mpsc::channel();
+            std::thread::spawn(move || {
+                // Diagnostics, so a cut one is still worth reading.
+                let (out, _) = drain(stderr, CAPTURE_LIMIT).unwrap_or_default();
+                spoke.send(String::from_utf8_lossy(&out).into_owned()).ok();
+            });
+            let said = move || said.recv_timeout(SPEAK_GRACE).unwrap_or_default();
+            let (done, finished) = mpsc::channel();
+            std::thread::spawn(move || {
+                done.send(drain(stdout, CAPTURE_LIMIT)).ok();
+            });
+
+            let started = Instant::now();
+            let out = match finished.recv_timeout(deadline) {
+                Ok(out) => {
+                    // The answer is a protocol frame, so half of one is not a
+                    // short answer — it is one that cannot be read. A value cut
+                    // mid-way would otherwise arrive as a shorter value.
+                    let (out, whole) = out?;
+                    if !whole {
+                        bail!("reaction '{reaction_id}' answered with more than {CAPTURE_LIMIT} bytes");
+                    }
+                    out
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
                     said();
                     return Ok(None);
                 }
-                None => std::thread::sleep(Duration::from_millis(5)),
-            }
-        };
-        // Joined on every path, so a thread is not left per invocation.
-        let errors = said();
-        if !status.success() {
-            bail!("reaction '{reaction_id}' failed: {}", errors.trim());
-        }
-
-        let mut writes = BTreeMap::new();
-        for line in String::from_utf8_lossy(&out).lines() {
-            let Some((name, raw)) = line.split_once('\t') else {
-                continue;
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    said();
+                    bail!("reaction '{reaction_id}' stopped without answering");
+                }
             };
-            let ty = wire_type(state, name)
-                .with_context(|| format!("reaction wrote unknown name '{name}'"))?;
-            writes.insert(name.to_string(), decode(raw, ty)?);
-        }
-        Ok(Some(writes))
+            // Stdout reaching its end is not the body reaching its own: a body can
+            // close what it writes to and keep running. The deadline covers this
+            // wait too, or `within` would be a promise the body could opt out of.
+            let status = loop {
+                match crate::process::child_exited(child)? {
+                    Some(status) => break status,
+                    None if started.elapsed() >= deadline => {
+                        said();
+                        return Ok(None);
+                    }
+                    None => std::thread::sleep(Duration::from_millis(5)),
+                }
+            };
+            // Diagnostics are bounded; process-group cleanup below closes inherited streams.
+            let errors = said();
+            if !status {
+                bail!("reaction '{reaction_id}' failed: {}", errors.trim());
+            }
+
+            let mut writes = BTreeMap::new();
+            for line in String::from_utf8_lossy(&out).lines() {
+                let Some((name, raw)) = line.split_once('\t') else {
+                    continue;
+                };
+                if name == STOP {
+                    writes.insert(STOP.to_string(), Value::Bool(true));
+                    continue;
+                }
+                let ty = wire_type(state, name)
+                    .with_context(|| format!("reaction wrote unknown name '{name}'"))?;
+                writes.insert(name.to_string(), decode(raw, ty)?);
+            }
+            Ok(Some(writes))
+        })();
+        process
+            .cleanup()
+            .context("reaction writers may remain; snapshots blocked")?;
+        result
     }
 }
 
@@ -765,6 +919,64 @@ impl Reactions {
 mod tests {
     use super::*;
     use crate::topology::{verify, Bytecode};
+
+    #[test]
+    fn reaction_descendants_stop_on_return_timeout_and_error() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in ["return", "timeout", "error"] {
+            let dir = tempfile::tempdir().unwrap();
+            let worktree = dir.path().join("worktree");
+            let temp = dir.path().join("temp");
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::create_dir(&temp).unwrap();
+            let binary = dir.path().join("reaction");
+            let redirect = if mode == "timeout" {
+                ""
+            } else {
+                ">/dev/null 2>&1"
+            };
+            let ending = match mode {
+                "timeout" => "sleep 30",
+                "error" => "exit 1",
+                _ => "printf 'n1.out\\t1\\n'",
+            };
+            std::fs::write(&binary, format!(
+                "#!/bin/sh\ncat >/dev/null\nsh -c 'trap \"\" TERM HUP; while :; do echo tick >> heartbeat; sleep 0.02; done' {redirect} &\nwhile [ ! -s heartbeat ]; do sleep 0.01; done\n{ending}\n"
+            )).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let code = Reactions {
+                binary,
+                reactions: BTreeSet::new(),
+            };
+            let state = verify(&node_bytecode(RING_BODY)).unwrap();
+            let result = code.invoke_in(
+                &state,
+                "n1.reaction.0",
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                Duration::from_secs(10),
+                Some(&(worktree.clone(), temp)),
+            );
+            match mode {
+                "timeout" => assert!(result.unwrap().is_none()),
+                "error" => assert!(result.unwrap_err().to_string().contains("failed")),
+                _ => assert_eq!(result.unwrap().unwrap()["n1.out"], json!(1)),
+            }
+            let before = std::fs::read(worktree.join("heartbeat")).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            assert_eq!(
+                before,
+                std::fs::read(worktree.join("heartbeat")).unwrap(),
+                "{mode} left a writer alive"
+            );
+            assert_eq!(
+                std::fs::read_dir(dir.path().join("reactions"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
 
     /// Long enough that a body which finishes at all finishes inside it, so a
     /// test that is not about the deadline never trips over one.

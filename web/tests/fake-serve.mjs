@@ -24,6 +24,15 @@ const CORS = {
   "access-control-allow-headers": "content-type",
 };
 
+/**
+ * What `omarc --prove` made of three properties of PROPOSED_PROGRAM: two
+ * proved, and one that does not hold (a run cut short leaves a plan
+ * unreviewed). Produced by the real compiler, not written by hand.
+ */
+const PROPERTY_VERDICTS = JSON.parse(
+  await readFile(new URL("./fixtures/review-flow-properties.json", import.meta.url), "utf8"),
+);
+
 /** Marker a test can put in a program to exercise the compile-failure path. */
 const INVALID_MARKER = "!!invalid!!";
 
@@ -35,12 +44,18 @@ const PROPOSED_PROGRAM = await readFile(
 
 export async function startFakeServe({
   stepMs = 120,
+  liveChatReplayDelayMs = 0,
   host = "127.0.0.1",
   port = 0,
   /** Which captured topology to replay; see tests/fixtures. */
   snapshot: snapshotFile = "diagram-snapshot.v1.json",
   /** The geometry a terminal announces, as the daemon reports the agent's. */
   terminal: terminalSize = { cols: 96, rows: 28 },
+  terminalReflow = false,
+  /** Fail a parked Web step without making tests wait for a real deadline. */
+  webFailure = /** @type {string | null} */ (null),
+  /** Also serve a view-only port over the same state, as `omar serve` can. */
+  viewPort = /** @type {number | null} */ (null),
 } = {}) {
   const golden = JSON.parse(
     await readFile(new URL(`./fixtures/${snapshotFile}`, import.meta.url), "utf8"),
@@ -49,25 +64,36 @@ export async function startFakeServe({
   /** @type {Map<string, {record: object, snapshot: object, subscribers: Set<import("node:http").ServerResponse>, sequence: number}>} */
   const runs = new Map();
 
-  const server = createServer((request, response) => {
+  const handle = async (request, response) => {
     const url = new URL(request.url, `http://${request.headers.host}`);
+    const scoped = /^\/chats\/([^/]+)(\/.*)$/.exec(url.pathname);
+    const chat = scoped ? chats.get(scoped[1]) : activeChat;
+    if (!chat) return json(response, 404, { error: "unknown chat" });
+    if (scoped) url.pathname = scoped[2];
 
     if (request.method === "OPTIONS") {
       response.writeHead(204, CORS).end();
       return;
     }
     if (request.method === "GET" && url.pathname === "/health") {
-      return json(response, 200, { status: "ok", protocol_version: 1 });
+      return json(response, 200, { status: "ok", protocol_version: 1, access: "full" });
+    }
+    // Serve relays each run's diagram server, which only its own host can reach.
+    const relay = /^\/v1\/runs\/([^/]+)\/diagram(\/v1\/(?:diagram|events))$/.exec(url.pathname);
+    if (request.method === "GET" && relay) {
+      const entry = runs.get(decodeURIComponent(relay[1]));
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return relay[2] === "/v1/diagram" ? json(response, 200, entry.snapshot) : subscribe(response, entry);
     }
     if (request.method === "POST" && url.pathname === "/v1/programs/check") {
       return readBody(request).then((body) => checkProgram(body, response));
     }
     if (request.method === "POST" && url.pathname === "/v1/runs") {
-      return readBody(request).then((body) => admit(body, response));
+      return readBody(request).then((body) => admit(body, response, chat));
     }
     if (request.method === "GET" && url.pathname === "/v1/runs") {
       return json(response, 200, {
-        runs: [...runs.values()].map((entry) => entry.record),
+        runs: [...chat.runs.values()].map((entry) => entry.record),
       });
     }
     // Before the run-record route, which matches any suffix — the same order
@@ -75,14 +101,155 @@ export async function startFakeServe({
     if (
       request.method === "POST" &&
       url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/pause")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/pause".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      const active = ["starting", "running", "stopping", "pausing"].includes(entry.record.status);
+      if (!active) return json(response, 200, entry.record);
+      // Accepted, not done: the daemon checkpoints at the next tag boundary
+      // and only then parks. Held briefly so the waiting state is observable.
+      entry.record.status = "pausing";
+      // The walk parks at its next tag boundary, as the runtime does.
+      return json(response, 202, entry.record);
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/mutate")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/mutate".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      if (!["running", "paused"].includes(entry.record.status)) {
+        return json(response, 409, { error: `run is ${entry.record.status}; only a running or paused run can mutate` });
+      }
+      const body = JSON.parse((await readBody(request)) || "{}");
+      // The plan the daemon would diff out of the edit: one line per change.
+      const changes = body.program === entry.program ? [] : ["update_reaction review.reaction.0 on review.reviewer"];
+      if (changes.length === 0 || body.dry_run) return json(response, 200, { changes });
+      entry.program = body.program;
+      entry.record.mutation = { status: "pending", changes };
+      if (entry.record.status === "paused") {
+        applyMutation(entry);
+        return json(response, 200, entry.record);
+      }
+      // A running run pauses first; the walk applies it at the boundary.
+      entry.record.status = "pausing";
+      return json(response, 202, entry.record);
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/program")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/program".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return json(response, 200, { filename: entry.filename ?? "program.omar", program: entry.program });
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/checkpoints")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/checkpoints".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return json(response, 200, { checkpoints: checkpointsOf(entry), resume_point: entry.resumePoint, unreadable: [] });
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/timeline")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/timeline".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      // The same strip the check route projects for a draft.
+      const steps = entry.snapshot.reactions.map((reaction, index) => ({
+        timestamp: 0,
+        microstep: index,
+        events: [],
+        reactions: [reaction.id],
+      }));
+      return json(response, 200, { steps, truncated: false });
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.includes("/checkpoints/")
+    ) {
+      const [id, checkpoint] = url.pathname.slice("/v1/runs/".length).split("/checkpoints/");
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      const found = checkpointsOf(entry).find((c) => c.id === checkpoint);
+      if (!found) return json(response, 404, { error: `no checkpoint '${checkpoint}'` });
+      return json(response, 200, {
+        ...found,
+        is_resume_point: entry.resumePoint === found.id,
+        outputs: { result: `value at #${found.sequence}` },
+        state_vars: { "leader.round": found.sequence },
+        queue_len: 1,
+        queued_tags: [found.next_tag],
+        elapsed_ns: found.sequence * 1_000_000_000,
+        workspaces: { leader: { workspace_id: "0123456789abcdef", snapshot_id: `snap-${found.sequence}-0000`, commit: "0".repeat(40) } },
+        agents: { "leader.agent": { backend: "stub", restoration: "fresh_conversation" } },
+      });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/rollback")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/rollback".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      if (entry.record.status !== "paused") {
+        return json(response, 409, { error: `run is ${entry.record.status}; only a paused run can roll back` });
+      }
+      const body = JSON.parse(await readBody(request));
+      const target = checkpointsOf(entry).find((c) => c.id === body.checkpoint);
+      if (!target) return json(response, 409, { error: `no checkpoint '${body.checkpoint}'` });
+      const abandoned = entry.resumePoint;
+      entry.resumePoint = target.id;
+      return json(response, 200, { resume_point: target.id, abandoned, checkpoint: target });
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
+      url.pathname.endsWith("/resume")
+    ) {
+      const id = url.pathname.slice("/v1/runs/".length, -"/resume".length);
+      const entry = chat.runs.get(id);
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      if (entry.record.status !== "paused") {
+        return json(response, 409, { error: `run is ${entry.record.status}; only a paused run can resume` });
+      }
+      entry.record.status = "running";
+      entry.record.finished_at = null;
+      publish(entry, "run_started", {});
+      startClock(entry);
+      return json(response, 200, entry.record);
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname.startsWith("/v1/runs/") &&
       url.pathname.endsWith("/stop")
     ) {
       const id = url.pathname.slice("/v1/runs/".length, -"/stop".length);
-      const entry = runs.get(id);
+      const entry = chat.runs.get(id);
       if (!entry) return json(response, 404, { error: "unknown run" });
       // A stopping run is still active, as on the daemon: it holds its sessions
       // until the tag closes.
       const active = ["starting", "running", "stopping"].includes(entry.record.status);
+      if (entry.record.status === "paused") {
+        // No runner to ask: the paused run is given up in place.
+        entry.record.status = "stopped";
+        entry.record.finished_at = Math.floor(Date.now() / 1000);
+        return json(response, 200, entry.record);
+      }
       if (!active) return json(response, 200, entry.record);
       // Accepted, not done: the daemon answers before the run has ended, and
       // records `stopping` so a client that reloads still sees it. Held briefly
@@ -97,7 +264,7 @@ export async function startFakeServe({
     }
     if (url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/panel")) {
       const id = url.pathname.slice("/v1/runs/".length, -"/panel".length);
-      const entry = runs.get(id);
+      const entry = chat.runs.get(id);
       if (!entry) return json(response, 404, { error: "unknown run" });
       if (request.method === "GET") {
         return json(response, 200, {
@@ -110,7 +277,7 @@ export async function startFakeServe({
         return readBody(request).then((body) => {
           const answer = JSON.parse(body);
           const owed = (entry.pending ?? []).find(
-            (item) => item.invocation_id === answer.invocation_id,
+            (item) => item.task_id === answer.task_id,
           );
           if (!owed) return json(response, 400, { error: "unknown invocation" });
           // The runtime refuses a port outside the invocation's effects, so
@@ -123,32 +290,88 @@ export async function startFakeServe({
             }
           }
           entry.pending = (entry.pending ?? []).filter(
-            (item) => item.invocation_id !== answer.invocation_id,
+            (item) => item.task_id !== answer.task_id,
           );
           entry.answered = { ...answer };
           return json(response, 202, {
             run_id: id,
-            invocation_id: answer.invocation_id,
+            task_id: answer.task_id,
             sent: Object.keys(answer.values),
           });
         });
       }
     }
+    if (request.method === "GET" && url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/workspaces")) {
+      const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length, -"/workspaces".length));
+      return entry ? json(response, 200, { workspaces: entry.workspaces }) : json(response, 404, { error: "unknown run" });
+    }
+    if (request.method === "GET" && url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/options")) {
+      // Test-only: what the admission carried.
+      const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length, -"/options".length));
+      return entry ? json(response, 200, entry.options) : json(response, 404, { error: "unknown run" });
+    }
+    if (request.method === "POST" && url.pathname === "/v1/properties/check") {
+      // Lean's verdicts do not depend on anything the fake can change, so a
+      // re-check answers with them; what a test checks is that it was asked.
+      return readBody(request).then((body) => {
+        const asked = JSON.parse(body);
+        chat.propertyChecks = (chat.propertyChecks ?? 0) + 1;
+        const verdicts = asked.properties.map((property) =>
+          structuredClone(PROPERTY_VERDICTS.find((verdict) => verdict.name === property.name)) ?? {
+            ...property, proved: false, theorem: "", source: "", mentions: [],
+            problems: [{ line: 0, column: 0, message: "unknown to the fake" }],
+          });
+        return json(response, 200, { verdicts });
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/v1/workspaces/properties") {
+      return readBody(request).then((body) => {
+        chat.proofWorkspace = JSON.parse(body);
+        return json(response, 200, { workspace: { id: "proofs" } });
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/v1/workspaces/proofs/editor") {
+      return json(response, 200, { url: `http://${request.headers.host}/fake-editor/proofs` });
+    }
+    if (request.method === "GET" && url.pathname === "/v1/proofs") {
+      // Test-only: what the client asked of the proof surface.
+      return json(response, 200, { checks: chat.propertyChecks ?? 0, workspace: chat.proofWorkspace ?? null });
+    }
+    if (request.method === "GET" && url.pathname === "/fake-editor/proofs") {
+      response.writeHead(200, { "content-type": "text/html" }).end("<title>Proofs</title><h1>Proof editor</h1>");
+      return;
+    }
+    if (url.pathname.startsWith("/v1/workspaces/")) {
+      // Enough of the workspace surface for the viewer to open on a run.
+      const [id, action = ""] = url.pathname.slice("/v1/workspaces/".length).split("/");
+      const owner = [...chat.runs.values()].find((entry) => entry.workspaces.some((w) => w.id === id));
+      if (!owner) return json(response, 404, { error: "unknown workspace" });
+      if (request.method === "GET" && action === "") return json(response, 200, { workspace: owner.workspaces[0], snapshots: [] });
+      if (action === "browse") return json(response, 200, { entries: [{ name: "notes.txt", kind: "file", size: 12 }], truncated: false });
+      return json(response, 404, { error: "unsupported in the fake" });
+    }
+    if (request.method === "GET" && url.pathname.startsWith("/v1/runs/") && url.pathname.endsWith("/snapshot")) {
+      // The picture a paused run left behind, as serve keeps it.
+      const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length, -"/snapshot".length));
+      return entry && entry.record.status === "paused"
+        ? json(response, 200, entry.snapshot)
+        : json(response, 404, { error: "no snapshot kept for this run" });
+    }
     if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
-      const entry = runs.get(url.pathname.slice("/v1/runs/".length));
+      const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length));
       return entry
         ? json(response, 200, entry.record)
         : json(response, 404, { error: "unknown run" });
     }
     // Diagram surface for the single active run, mirroring the per-run server.
     if (request.method === "GET" && url.pathname === "/v1/diagram") {
-      const entry = latest();
+      const entry = latest(chat);
       return entry
         ? json(response, 200, entry.snapshot)
         : json(response, 404, { error: "no run" });
     }
     if (request.method === "GET" && url.pathname === "/v1/events") {
-      return subscribe(response);
+      return subscribe(response, latest(chat));
     }
     // Agent-only endpoints. The stand-in assistant is internal, so these exist
     // to mirror the real daemon's surface rather than to be used.
@@ -159,6 +382,32 @@ export async function startFakeServe({
         backend,
         available: ["claude", "codex", "cursor", "opencode", "agy"],
       });
+    }
+    if (request.method === "GET" && url.pathname === "/v1/agent/backends") {
+      return json(response, 200, {
+        backends: Object.entries(backendStatus).map(([name, status]) => ({ name, ...status, login: `omar connect ${name}` })),
+      });
+    }
+    // The daemon starts `omar connect <name>` in a session; here, pressing
+    // Enter in its terminal stands for finishing the sign-in.
+    const connect = /^\/v1\/backends\/([^/]+)\/connect$/.exec(url.pathname);
+    if (request.method === "POST" && connect) {
+      return readBody(request).then(() =>
+        connect[1] in backendStatus
+          ? json(response, 200, { terminal: `/v1/backends/${connect[1]}/terminal` })
+          : json(response, 404, { error: `'${connect[1]}' is not an assistant backend` }),
+      );
+    }
+    // The test prompt: fails for a key typed as "bad".
+    const check = /^\/v1\/backends\/([^/]+)\/check$/.exec(url.pathname);
+    if (request.method === "POST" && check) {
+      return readBody(request).then(() =>
+        !(check[1] in backendStatus)
+          ? json(response, 404, { error: `'${check[1]}' is not an assistant backend` })
+          : rejectedKeys[check[1]]
+            ? json(response, 422, { error: `${check[1]} is signed in, but its test prompt failed: 401 Invalid API Key` })
+            : json(response, 200, { ok: true }),
+      );
     }
     if (request.method === "POST" && url.pathname === "/v1/agent/backend") {
       return readBody(request).then((body) => {
@@ -189,15 +438,17 @@ export async function startFakeServe({
           return json(response, 403, { error: "forbidden" });
         }
         if (url.pathname === "/v1/agent/reply") {
-          publishChat("assistant", String(payload.text ?? ""), null, payload.progress === true);
+          publishChat("assistant", String(payload.text ?? ""), null, payload.progress === true, [], chat);
         } else if (url.pathname === "/v1/agent/proposals") {
           const preview = structuredClone(golden);
           preview.status = "ready";
+          preview.team = String(payload.program ?? "").match(/\bmain\s+([A-Za-z_]\w*)/)?.[1] ?? preview.team;
           publishChat("assistant", String(payload.summary ?? ""), {
             program: String(payload.program ?? ""),
+            files: payload.files ?? {},
             inputs: payload.inputs ?? {},
             preview,
-          });
+          }, false, [], chat);
         } else {
           return json(response, 404, { error: "not found" });
         }
@@ -205,30 +456,63 @@ export async function startFakeServe({
       });
     }
     // Operator/EA conversation.
+    if (request.method === "GET" && url.pathname === "/v1/chats") {
+      return json(response, 200, { active_id: activeChat.id, conversations: [...chats.values()].map(chatSummary).sort((a, b) => b.updated_at - a.updated_at) });
+    }
+    if (request.method === "POST" && (url.pathname === "/v1/chats" || /^\/v1\/chats\/[^/]+\/activate$/.test(url.pathname))) {
+      await readBody(request);
+      const id = url.pathname === "/v1/chats" ? null : url.pathname.split("/")[3];
+      const next = id ? chats.get(id) : newChat();
+      if (!next) return json(response, 404, { error: "unknown chat" });
+      activeChat = next;
+      chats.set(next.id, next);
+      return json(response, 200, chatSummary(next));
+    }
     if (request.method === "GET" && url.pathname === "/v1/chat") {
-      return json(response, 200, { messages: chat.messages });
+      return json(response, 200, { ...chatSummary(chat), messages: chat.messages });
     }
     if (request.method === "POST" && url.pathname === "/v1/chat") {
-      return readBody(request).then((body) => converse(body, response));
+      return readBody(request).then((body) => converse(body, response, chat));
     }
     if (request.method === "GET" && url.pathname === "/v1/chat/events") {
-      return subscribeChat(response);
+      return subscribeChat(response, chat);
     }
     json(response, 404, { error: "not found" });
+  };
+  const server = createServer(handle);
+
+  /**
+   * The view port: the same pages and reads, no writes. Host files and what a
+   * web agent is owed stay private, and the loopback diagram server is relayed
+   * under its run because a remote viewer cannot reach it.
+   */
+  const viewServer = viewPort === null ? null : createServer((request, response) => {
+    const path = new URL(request.url, "http://view").pathname.replace(/^\/chats\/[^/]+/, "");
+    if (request.method === "GET" && path === "/health") {
+      return json(response, 200, { status: "ok", protocol_version: 1, access: "view" });
+    }
+    const refused = (request.method !== "GET" && request.method !== "OPTIONS") ||
+      path.startsWith("/v1/workspaces") || /^\/v1\/runs\/[^/]+\/panel$/.test(path);
+    if (refused) return json(response, 403, { error: "read-only view" });
+    return handle(request, response);
   });
+  /** Frames a client sent up a view port's terminal, which it should not. */
+  let viewTerminalFrames = 0;
 
   // A stand-in for the agent's tmux session: it announces a size the way the
   // daemon does, then echoes what is typed so a test can prove keystrokes
   // travelled up the same socket the screen comes down.
   const terminals = new WebSocketServer({ noServer: true });
-  server.on("upgrade", (request, socket, head) => {
+  const upgrade = (view) => (request, socket, head) => {
     const url = new URL(request.url, "http://127.0.0.1");
+    url.pathname = url.pathname.replace(/^\/chats\/[^/]+/, "");
     // The assistant has a route of its own: its tmux session is not named
     // like an agent's, so no agent name reaches it.
     const assistant = url.pathname === "/v1/agent/terminal";
+    const signIn = /^\/v1\/backends\/([^/]+)\/terminal$/.exec(url.pathname);
     const match = assistant
       ? ["", "the assistant"]
-      : /^\/v1\/agents\/(.+)\/terminal$/.exec(url.pathname);
+      : signIn ?? /^\/v1\/agents\/(.+)\/terminal$/.exec(url.pathname);
     // CORS never reaches a WebSocket, so the daemon refuses foreign origins at
     // the handshake and the fake has to behave the same way.
     const origin = request.headers.origin;
@@ -241,28 +525,77 @@ export async function startFakeServe({
     }
     terminals.handleUpgrade(request, socket, head, (client) => {
       const agent = decodeURIComponent(match[1]);
-      let size = terminalSize;
+      let size = url.searchParams.has("cols")
+        ? { cols: Number(url.searchParams.get("cols")), rows: Number(url.searchParams.get("rows")) }
+        : terminalSize;
+      const draw = () => {
+        if (!terminalReflow) return;
+        // Full-screen fixture: right/bottom edge sentinels expose clipping,
+        // and a cleared redraw exposes duplicate output after a width change.
+        client.send(Buffer.from(`\x1b[2J\x1b[HFRAME ${size.cols}x${size.rows}` +
+          `\x1b[2;1H${"x".repeat(size.cols - 1)}R` +
+          `\x1b[${size.rows};1HBOTTOM`));
+      };
       client.send(JSON.stringify(size));
-      client.send(Buffer.from(`${agent} $ `));
+      if (terminalReflow) client.send(Buffer.from("\x1b[?1049h"));
+      draw();
+      if (!terminalReflow) client.send(Buffer.from(`${agent} $ `));
+      let typed = "";
       client.on("message", (data, isBinary) => {
+        // A view port discards keystrokes and resizes alike.
+        if (view) {
+          viewTerminalFrames += 1;
+          return;
+        }
         // Text is a resize control frame, binary is keystrokes. The daemon
         // reflows the session and answers with the shape it settled on;
         // echoing a control frame back would type it at the shell instead.
         if (!isBinary) {
           size = JSON.parse(data.toString());
           client.send(JSON.stringify(size));
+          draw();
           return;
+        }
+        // What is typed before Enter stands for the key: "bad" signs in
+        // with one its vendor rejects, which only the test prompt finds.
+        if (signIn) {
+          typed += data.toString();
+          if (typed.includes("\r")) {
+            backendStatus[agent] = { status: "connected", via: "fake sign-in" };
+            rejectedKeys[agent] = typed.startsWith("bad");
+            typed = "";
+          }
         }
         client.send(Buffer.from(data));
       });
     });
-  });
+  };
+  server.on("upgrade", upgrade(false));
+  viewServer?.on("upgrade", upgrade(true));
 
   let backend = "codex";
-  const chat = { messages: [], subscribers: new Set(), sequence: 0 };
+  /** Backends signed in with a key the test prompt finds rejected. */
+  const rejectedKeys = {};
+  /** Each backend's status; a sign-in in its terminal connects it. */
+  const backendStatus = {
+    claude: { status: "connected", via: "Claude Max" },
+    codex: { status: "connected", via: "ChatGPT" },
+    cursor: { status: "signed_out" },
+    opencode: { status: "unknown", reason: "no answer" },
+    pi: { status: "not_installed" },
+    agy: { status: "not_installed" },
+  };
+  function newChat() {
+    return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map() };
+  }
+  let activeChat = newChat();
+  const chats = new Map([[activeChat.id, activeChat]]);
+  function chatSummary(value = activeChat) {
+    return { id: value.id, title: value.title, created_at: value.created_at, updated_at: value.updated_at, message_count: value.messages.length, ea_id: [...chats.keys()].indexOf(value.id), busy: value.busy, run: value.run ?? null };
+  }
   const agentToken = randomUUID();
 
-  function publishChat(role, text, design, progress = false, selection = []) {
+  function publishChat(role, text, design, progress = false, selection = [], chat = activeChat) {
     chat.sequence += 1;
     const message = {
       sequence: chat.sequence,
@@ -272,20 +605,25 @@ export async function startFakeServe({
       design: design ?? null,
       selection,
     };
+    if (role === "operator" && !chat.messages.some((m) => m.role === "operator")) chat.title = text.slice(0, 80);
     chat.messages.push(message);
+    chat.updated_at = Date.now();
+    if (role === "operator") chat.busy = true;
+    else if (!progress) chat.busy = false;
     const kind = design ? "design_proposed" : "message";
     const frame = `id: ${message.sequence}\nevent: ${kind}\ndata: ${JSON.stringify(message)}\n\n`;
     for (const subscriber of chat.subscribers) subscriber.write(frame);
     return message;
   }
 
-  function subscribeChat(response) {
+  function subscribeChat(response, chat) {
     response.writeHead(200, {
       ...CORS,
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
       connection: "keep-alive",
     });
+    response.write(`event: conversation\ndata: ${JSON.stringify(chatSummary(chat))}\n\n`);
     response.write(": connected\n\n");
     // Replay, matching the real server, so a reload rejoins the conversation.
     for (const message of chat.messages) {
@@ -294,15 +632,19 @@ export async function startFakeServe({
         `id: ${message.sequence}\nevent: ${kind}\ndata: ${JSON.stringify(message)}\n\n`,
       );
     }
-    chat.subscribers.add(response);
-    response.on("close", () => chat.subscribers.delete(response));
+    const stateFrame = `event: chat_state\ndata: ${JSON.stringify(chatSummary(chat))}\n\n`;
+    if (chat.run && liveChatReplayDelayMs) setTimeout(() => response.write(stateFrame), liveChatReplayDelayMs);
+    else response.write(stateFrame);
+    const subscribedChat = chat;
+    subscribedChat.subscribers.add(response);
+    response.on("close", () => subscribedChat.subscribers.delete(response));
   }
 
   /**
    * Stands in for the EA. Asks one clarifying question first, so the studio's
    * multi-turn handling is exercised, then proposes on the next message.
    */
-  function converse(body, response) {
+  function converse(body, response, chat) {
     let request;
     try {
       request = JSON.parse(body);
@@ -318,7 +660,9 @@ export async function startFakeServe({
         error: `selection names more than ${MAX_SELECTION} components`,
       });
     }
-    const operator = publishChat("operator", request.text, null, false, selection);
+    if (request.conversation_id && request.conversation_id !== chat.id) return json(response, 409, { error: "The active chat changed." });
+    const publish = (role, text, design, progress = false) => publishChat(role, text, design, progress, [], chat);
+    const operator = publishChat("operator", request.text, null, false, selection, chat);
     json(response, 202, operator);
 
     const asked = chat.messages.some(
@@ -326,12 +670,25 @@ export async function startFakeServe({
     );
     // Real assistants narrate while they work; that must not end the wait.
     setTimeout(
-      () => publishChat("assistant", "Reading the ports and reactions…", null, true),
+      () => publish("assistant", "Reading the ports and reactions…", null, true),
       Math.max(10, stepMs / 3),
     );
     setTimeout(() => {
+      // Asked while the chat's run is live, it changes that run's program,
+      // as the envelope tells the real EA to: same main, edited in place.
+      const live = latest(chat);
+      if (live && ["running", "paused"].includes(live.record.status)) {
+        const preview = structuredClone(golden);
+        preview.status = "ready";
+        publish("assistant", "Tightened the reviewer's prompt in the running workflow.", {
+          program: `${live.program ?? PROPOSED_PROGRAM}\n// tightened by OMAR\n`,
+          inputs: {},
+          preview,
+        });
+        return;
+      }
       if (!asked) {
-        publishChat(
+        publish(
           "assistant",
           "Which agent should own the final write, the planner or the reviewer?",
         );
@@ -342,7 +699,7 @@ export async function startFakeServe({
       const preview = structuredClone(golden);
       preview.status = "ready";
       // Markdown, because that is what the EA actually writes.
-      publishChat(
+      publish(
         "assistant",
         "Drafted a **three-reaction** review loop.\n\n" +
           "- `planner` drafts the plan\n" +
@@ -352,19 +709,23 @@ export async function startFakeServe({
           program: PROPOSED_PROGRAM,
           inputs: { "flow.request": chat.messages[0]?.text ?? "" },
           preview,
+          // Asked for safety, the real EA proves properties of what it proposes.
+          ...(chat.messages.some((m) => m.role === "operator" && /\bsafe|\bprove/i.test(m.text))
+            ? { lemmas: "", properties: structuredClone(PROPERTY_VERDICTS) }
+            : {}),
         },
       );
       // Real assistants comment straight after proposing. That must not look
       // like a withdrawal of the proposal.
       setTimeout(
-        () => publishChat("assistant", "It is in your queue for approval."),
+        () => publish("assistant", "It is in your queue for approval."),
         stepMs,
       );
     }, stepMs);
   }
 
-  function latest() {
-    return [...runs.values()].at(-1);
+  function latest(chat = activeChat) {
+    return [...chat.runs.values()].at(-1);
   }
 
   /**
@@ -449,6 +810,7 @@ export async function startFakeServe({
   }
 
   /** One pending invocation per reaction whose agent is on the `web` backend. */
+  let nextTaskId = 1;
   function webPending(snapshot) {
     const web = new Set(
       snapshot.agents
@@ -459,7 +821,7 @@ export async function startFakeServe({
     return snapshot.reactions
       .filter((reaction) => web.has(reaction.agent))
       .map((reaction) => ({
-        invocation_id: `inv-${reaction.id}`,
+        task_id: nextTaskId++,
         // The name, not the id: that is what the daemon sends, because the
         // invocation protocol addresses an agent by the name the program
         // gave it.
@@ -476,7 +838,7 @@ export async function startFakeServe({
       }));
   }
 
-  function admit(body, response) {
+  async function admit(body, response, chat) {
     let request;
     try {
       request = JSON.parse(body);
@@ -513,6 +875,17 @@ export async function startFakeServe({
         finished_at: null,
         error: null,
       },
+      // What the run executes, so a mutation can tell an edit from none.
+      program: request.program,
+      filename: request.filename,
+      // What the operator chose at the confirmation, so a test can read it back.
+      options: {
+        keep_workspaces: request.keep_workspaces === true,
+        checkpoint_period: typeof request.checkpoint_period === "string" ? request.checkpoint_period : null,
+      },
+      // One workspace per instance, named after the run: the file viewer
+      // shows a run's own, never another run's.
+      workspaces: [{ id: runId.replaceAll("-", "").slice(0, 32), instance: "leader", deployment_id: runId, restored_from: null }],
       snapshot,
       subscribers: new Set(),
       sequence: 0,
@@ -524,12 +897,22 @@ export async function startFakeServe({
       pending: webPending(snapshot),
       answered: null,
     };
+    // Each live run has an independent diagram server, just like the runtime.
+    const diagramServer = createServer((request, response) => {
+      if (request.url === "/v1/diagram") return json(response, 200, entry.snapshot);
+      if (request.url === "/v1/events") return subscribe(response, entry);
+      return json(response, 404, { error: "not found" });
+    });
+    await new Promise((resolve) => diagramServer.listen(0, host, resolve));
+    entry.record.diagram_address = `${host}:${diagramServer.address().port}`;
+    entry.diagramServer = diagramServer;
     runs.set(runId, entry);
+    chat.runs.set(runId, entry);
+    chat.run = entry.record;
     json(response, 201, entry.record);
   }
 
-  function subscribe(response) {
-    const entry = latest();
+  function subscribe(response, entry = latest()) {
     if (!entry) return json(response, 404, { error: "no run" });
     response.writeHead(200, {
       ...CORS,
@@ -550,6 +933,36 @@ export async function startFakeServe({
     }
   }
 
+  /** Two checkpoints at the fake timeline's first two tags; the newer is the resume point. */
+  function checkpointsOf(entry) {
+    entry.checkpoints ??= [
+      { id: "cp-1", sequence: 1, parent: null, trigger: "manual", completed_tag: [0, 0], next_tag: [0, 1], created_at: 1 },
+      { id: "cp-2", sequence: 2, parent: "cp-1", trigger: "pause", completed_tag: [0, 1], next_tag: [0, 2], created_at: 2 },
+    ];
+    entry.resumePoint ??= "cp-2";
+    return entry.checkpoints;
+  }
+
+  /** A mutation lands as a checkpoint of its own, the new resume point. */
+  function applyMutation(entry) {
+    const checkpoints = checkpointsOf(entry);
+    const parent = entry.resumePoint;
+    const sequence = checkpoints.length + 1;
+    const id = `cp-${sequence}`;
+    checkpoints.push({
+      id,
+      sequence,
+      parent,
+      trigger: "mutation",
+      completed_tag: [0, 1],
+      next_tag: [0, 2],
+      created_at: sequence,
+      mutation: entry.record.mutation.changes,
+    });
+    entry.resumePoint = id;
+    entry.record.mutation = { ...entry.record.mutation, status: "applied", checkpoint: id };
+  }
+
   function publish(entry, kind, payload, tag = null) {
     entry.sequence += 1;
     entry.snapshot.sequence = entry.sequence;
@@ -565,13 +978,45 @@ export async function startFakeServe({
     for (const subscriber of entry.subscribers) subscriber.write(frame);
   }
 
+  /** The loop's clock starts once the agents are up: a beat after the run. */
+  function startClock(entry) {
+    entry.snapshot.clock_origin = Date.now();
+    publish(entry, "clock_started", { clock_origin: entry.snapshot.clock_origin });
+  }
+
   /** Walk the captured topology the way a real run would. */
   async function driveRun(entry) {
     const wait = () => new Promise((resolve) => setTimeout(resolve, stepMs));
     await wait();
     publish(entry, "run_started", {});
+    startClock(entry);
+
+    // A pause lands at a tag boundary: nothing in flight, a checkpoint
+    // announced, and the walk parked until a resume sets the run going.
+    const boundary = async () => {
+      if (entry.record.status !== "pausing") return;
+      // Held briefly, as the stop is, so the pausing state is one a test can
+      // observe before the boundary lands.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      entry.record.status = "paused";
+      entry.record.finished_at = Math.floor(Date.now() / 1000);
+      entry.snapshot.status = "paused";
+      publish(entry, "run_checkpointed", { checkpoint: "cp-2", trigger: "pause" }, { timestamp: 0, microstep: 1 });
+      publish(entry, "run_paused", { checkpoint: "cp-2" });
+      // A pause a mutation asked for: apply it, then resume on our own.
+      if (entry.record.mutation?.status === "pending") {
+        applyMutation(entry);
+        entry.record.status = "running";
+        entry.record.finished_at = null;
+      }
+      while (entry.record.status === "paused") await wait();
+      entry.snapshot.status = "running";
+      publish(entry, "run_started", {});
+      startClock(entry);
+    };
 
     for (const [index, reaction] of entry.snapshot.reactions.entries()) {
+      await boundary();
       // Nanoseconds, as the runtime sends them: a tag a second apart, each one
       // a fixed 250ms behind its logical time so the readout has something to
       // show that is neither zero nor a round second.
@@ -579,6 +1024,8 @@ export async function startFakeServe({
       const lag = 250_000_000;
       entry.snapshot.current_tag = tag;
       entry.snapshot.lag = lag;
+      // As the runtime does: a new tag makes every task idle again.
+      for (const other of entry.snapshot.reactions) { other.status = "idle"; other.invocation_id = null; }
       publish(entry, "tag_advanced", { lag }, tag);
       await wait();
 
@@ -592,6 +1039,15 @@ export async function startFakeServe({
       // finish while a panel still showed work outstanding — and would make a
       // test of "answer it and the run moves" test nothing.
       while ((entry.pending ?? []).some((item) => item.reaction === reaction.id)) {
+        if (webFailure) {
+          entry.record.status = "failed";
+          entry.record.error = webFailure;
+          entry.record.finished_at = Math.floor(Date.now() / 1000);
+          entry.snapshot.status = "failed";
+          entry.pending = [];
+          publish(entry, "run_failed", { message: webFailure });
+          return;
+        }
         await wait();
       }
 
@@ -605,6 +1061,7 @@ export async function startFakeServe({
       publish(entry, "reaction_completed", { reaction: reaction.id }, tag);
       await wait();
     }
+    await boundary();
 
     entry.snapshot.status = "completed";
     entry.record.status = "completed";
@@ -613,20 +1070,31 @@ export async function startFakeServe({
   }
 
   await new Promise((resolve) => server.listen(port, host, resolve));
+  if (viewServer) await new Promise((resolve) => viewServer.listen(viewPort, host, resolve));
   return {
     url: `http://${host}:${server.address().port}`,
+    viewUrl: viewServer ? `http://${host}:${viewServer.address().port}` : null,
+    get viewTerminalFrames() {
+      return viewTerminalFrames;
+    },
     agentToken,
     async close() {
       for (const client of terminals.clients) client.terminate();
       terminals.close();
       for (const entry of runs.values()) {
         for (const subscriber of entry.subscribers) subscriber.end();
+        entry.diagramServer.closeAllConnections();
+        await new Promise((resolve) => entry.diagramServer.close(resolve));
       }
-      for (const subscriber of chat.subscribers) subscriber.end();
+      for (const chat of chats.values()) for (const subscriber of chat.subscribers) subscriber.end();
       // Pooled keep-alive sockets would otherwise hold `close` open until they
       // idle out, adding seconds to every test.
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
+      if (viewServer) {
+        viewServer.closeAllConnections();
+        await new Promise((resolve) => viewServer.close(resolve));
+      }
     },
   };
 }

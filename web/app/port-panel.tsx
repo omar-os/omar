@@ -76,7 +76,7 @@ export function PortPanel({
         <div className="port-panel-body">
           {pending.map((invocation) => (
             <Waiting
-              key={invocation.invocation_id}
+              key={invocation.task_id}
               invocation={invocation}
               sending={sending}
               onAnswer={onAnswer}

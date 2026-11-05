@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ts_rs::TS;
 
-use crate::channel::CodexSession;
+use crate::backend::codex::CodexSession;
 use crate::tmux::TmuxClient;
 
 pub fn now_ms() -> u64 {
@@ -511,7 +511,7 @@ impl Capture {
         }
         // The delivered user item carries the runtime's opaque invocation ID.
         // Time alone cannot attribute bootstrap/manual turns in the same pane.
-        let marker = format!("invocation_id: {}", self.invocation);
+        let marker = format!("task_id: {}", self.invocation);
         if turn["items"].as_array().into_iter().flatten().any(|item| {
             item["type"] == "userMessage"
                 && item["content"]
@@ -1092,7 +1092,7 @@ mod tests {
         let mut c = capture(&run, "a");
         let bootstrap = json!({"id":"bootstrap", "startedAt": now_ms()/1000, "items": [command("completed", json!(0))]});
         assert!(!c.accept_turn(&bootstrap));
-        let matched = json!({"id":"matching", "items":[{"type":"userMessage","content":[{"type":"text","text":"OMAR INVOCATION\ninvocation_id: a\n"}]}, command("inProgress", Value::Null)]});
+        let matched = json!({"id":"matching", "items":[{"type":"userMessage","content":[{"type":"text","text":"OMAR INVOCATION\ntask_id: a\n"}]}, command("inProgress", Value::Null)]});
         c.reconcile(
             &json!({"turns":[bootstrap, matched], "model":"supported", "reasoningEffort":"high"}),
         );
@@ -1251,7 +1251,7 @@ mod tests {
             ActivityConnection::Unsupported
         );
         assert!(monitor
-            .deliver_configured("OMAR INVOCATION\ninvocation_id: a")
+            .deliver_configured("OMAR INVOCATION\ntask_id: a")
             .unwrap());
         assert!(run.snapshot().invocations[0]
             .settings_application

@@ -1,33 +1,44 @@
 mod activity;
 mod app;
+mod backend;
 mod backend_probe;
-mod channel;
+mod backend_runner;
+mod chat_history;
+mod checkpoint;
 mod computer;
 mod config;
 mod deploy;
 mod diagram;
 mod ea;
+mod ea_lifecycle;
 mod event;
 mod manager;
 mod mcp;
 mod memory;
 mod metrics;
+mod mutation;
 mod panic_hook;
 mod paths;
 mod process;
 mod projects;
 // The generator runs under `cargo test`; nothing in a release build calls it.
+mod artifacts;
+mod editor;
+mod properties;
 #[cfg(test)]
 mod protocol;
 mod reaction;
 mod scheduler;
 mod serve;
+mod sessions;
 mod stub_agent;
+mod supervision;
 mod terminal;
 mod tmux;
 mod topology;
 mod ui;
 mod web_assets;
+mod workspace;
 
 use std::io;
 use std::path::PathBuf;
@@ -35,7 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use crossterm::{
     event::{
         KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -69,23 +80,39 @@ pub const DASHBOARD_SESSION: &str = "omar-dashboard";
 const TMUX_SETUP_WARNING: &str = "⚠ tmux not configured for omar — run 'omar setup-tmux' to fix";
 
 #[derive(Parser)]
-#[command(name = "omar", about = "Agent dashboard for tmux", version)]
+#[command(
+    name = "omar",
+    about = "Independent agent runtimes and topology orchestration",
+    version,
+    subcommand_required = true,
+    arg_required_else_help = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Target a runtime session by id or name; for up and serve, the name of
+    /// the session to start, or of a stopped one to restart
+    #[arg(short = 's', long, global = true)]
+    session: Option<String>,
+
+    /// Print structured command results
+    #[arg(long, global = true)]
+    json: bool,
 
     /// Path to config file
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Agent backend to use: claude, codex, cursor, opencode, agy
+    /// Backend for the initial EA of a new session
     #[arg(short, long)]
     agent: Option<String>,
 
-    /// EA to target by id or name [default: active EA]
+    /// Target an EA within the selected runtime (default: 0)
     #[arg(long, global = true)]
     ea: Option<String>,
 
+    // Preserve the allocated EA across our own cold dashboard exec in tmux.
     /// Enable global spawn metrics logging sink
     #[arg(long, global = true)]
     spawn_metrics: bool,
@@ -93,6 +120,67 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Create a new independent background runtime, or restart a stopped one by name on this build
+    Up(sessions::UpOptions),
+    /// List independently addressable runtime sessions
+    Ls,
+    /// Inspect the selected runtime session
+    Info,
+    /// Attach to the selected runtime with the terminal dashboard or Mission Control
+    #[command(group = clap::ArgGroup::new("mode").required(true).args(["tui", "web"]))]
+    Attach {
+        /// Terminal dashboard inside the session's tmux server (z detaches; Q stops the session)
+        #[arg(long)]
+        tui: bool,
+        /// Mission Control in the browser
+        #[arg(long)]
+        web: bool,
+        /// Print the Mission Control URL instead of opening it
+        #[arg(long, requires = "web")]
+        print_url: bool,
+    },
+    /// Read a runtime's log
+    Logs {
+        #[arg(long)]
+        follow: bool,
+        #[arg(long, default_value_t = 100)]
+        tail: usize,
+    },
+    /// Remove a session and everything it kept; a running one is killed first
+    Rm,
+    /// Stop one runtime: running workflows pause at their next tag boundary, and the stopped session keeps its state until `rm`, so `up -s NAME` restarts it
+    Down {
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
+    /// Run a topology in the selected runtime, or in a new session when none is selected
+    #[command(visible_alias = "start")]
+    Run(sessions::StartOptions),
+    /// List topology runs in the selected runtime
+    Runs {
+        #[arg(long)]
+        all_eas: bool,
+    },
+    /// Manage EAs inside a runtime session
+    Ea {
+        #[command(subcommand)]
+        action: sessions::EaAction,
+    },
+    #[command(hide = true)]
+    SessionDaemon { directory: PathBuf },
+    #[command(hide = true)]
+    SessionExec {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Inspect and version team-instance files (not runtime checkpoints)
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
     /// Spawn a new agent session
     Spawn {
         /// Name for the agent session
@@ -147,62 +235,105 @@ enum Commands {
     /// Configure tmux for optimal omar experience
     SetupTmux,
 
-    /// Start or interact with the manager agent
-    Manager {
-        /// Manager action (start, orchestrate)
-        #[command(subcommand)]
-        action: Option<ManagerAction>,
+    /// Show which agent backends are installed and signed in
+    Backends {
+        /// Print JSON instead of a table
+        #[arg(long)]
+        json: bool,
+        /// Also have each signed-in backend answer a short test prompt, which
+        /// proves its sign-in works (a rejected key still reads as signed in);
+        /// exits 1 if one fails. Each check spends one prompt.
+        #[arg(long)]
+        check: bool,
+        /// Only these backends; with --check, each must be signed in
+        backends: Vec<String>,
     },
 
-    /// Manage scheduled events for the target EA
-    Event {
-        #[command(subcommand)]
-        action: EventAction,
+    /// Install an agent backend and sign it in
+    Connect {
+        /// claude, codex, cursor, opencode, pi or agy; omit to pick from a list
+        backend: Option<String>,
+    },
+
+    /// Restore authoritative coordination state to a backend lifecycle hook.
+    AgentHook {
+        #[arg(long)]
+        context_file: PathBuf,
+        #[arg(long, default_value = "claude")]
+        format: String,
+        #[arg(long)]
+        event: Option<String>,
+    },
+
+    /// Run a protocol-backed agent with a durable side-channel inbox.
+    BackendRunner {
+        #[arg(long)]
+        backend: String,
+        #[arg(long)]
+        config_file: PathBuf,
     },
 
     /// Start the OMAR MCP server over stdio
     McpServer {
         /// Path to a serialized MCP server context JSON file. When omitted,
         /// the server builds a default context from the current config and
-        /// active EA — used by peer processes (e.g. the Slack bridge) that
-        /// aren't spawned by a specific backend launch.
+        /// active EA — used by peer processes that aren't spawned by a
+        /// specific backend launch.
         #[arg(long)]
         context_file: Option<String>,
+        /// List tools without their `omar_` prefix, for clients that prefix
+        /// every tool with the server name (opencode): their `omar_` then
+        /// rebuilds the names OMAR's prompts use, instead of `omar_omar_...`.
+        #[arg(long)]
+        bare_tool_names: bool,
     },
 
-    /// Run an OMAR program to completion
-    Run {
-        /// OMAR source program
+    /// Pause a running topology: checkpoint at the next tag boundary, then
+    /// stop its agents. `omar resume` continues it.
+    Pause {
+        /// Team name or run id
+        deployment: String,
+        /// Wait until the run is paused
+        #[arg(long)]
+        wait: bool,
+    },
+
+    /// Continue a paused topology from its resume point: the checkpoint a
+    /// rollback chose, else the latest. The run keeps its id.
+    Resume {
+        /// Team name or run id
+        deployment: String,
+    },
+
+    /// Change a running or paused topology's program. A running one pauses at
+    /// its next tag boundary, takes the change, and resumes.
+    Mutate {
+        /// Team name or run id
+        deployment: String,
+        /// The new version of the program; its `main` must keep its name
         program: PathBuf,
-
-        /// External input in NAME=VALUE form; repeat for multiple inputs.
-        /// A timer-driven program takes none, and the runtime still rejects a
-        /// missing one by name, so requiring it here only blocked those.
-        #[arg(long = "input")]
-        inputs: Vec<String>,
-
-        /// Replace existing agent sessions with topology-scoped sessions
+        /// Print the changes and apply nothing
         #[arg(long)]
-        replace: bool,
-
-        /// Maximum time to wait for each prompt invocation
-        #[arg(long, default_value_t = 300)]
-        timeout_seconds: u64,
-
-        /// Run the logical clock as fast as the work allows instead of holding
-        /// it against the wall clock. A delay stays an ordering; it stops being
-        /// a wait.
+        dry_run: bool,
+        /// Wait until the change is applied
         #[arg(long)]
-        fast: bool,
+        wait: bool,
+    },
 
-        /// Expose the live topology diagram API while the run is active
+    /// Move a paused topology's resume point back to an earlier checkpoint.
+    /// Nothing is deleted; `omar resume` then continues from there.
+    Rollback {
+        /// Team name or run id
+        deployment: String,
+        /// Checkpoint id, from `omar checkpoint list`
         #[arg(long)]
-        diagram_server: bool,
+        checkpoint: String,
+    },
 
-        /// Address for the live topology diagram API. Requires
-        /// `--diagram-server`; setting it alone silently did nothing.
-        #[arg(long, default_value = "127.0.0.1:0", requires = "diagram_server")]
-        diagram_address: std::net::SocketAddr,
+    /// Request, inspect, verify, and configure runtime checkpoints
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
     },
 
     /// Answer topology invocations without a model (test backend `stub`)
@@ -215,38 +346,68 @@ enum Commands {
 
     /// Accept OMAR programs over HTTP and supervise their runs
     Serve {
-        /// Loopback address to bind the admission API
-        #[arg(long, default_value = "127.0.0.1:7340")]
-        address: std::net::SocketAddr,
-
-        /// Restart the executive assistant so it can reply and propose designs.
-        /// Its MCP context is fixed at launch, so an already running EA cannot
-        /// gain those tools without this. Discards its current session.
+        /// Deprecated: use -s NAME
+        #[arg(long, hide = true)]
+        name: Option<String>,
+        /// Port for the admission API, on 127.0.0.1
         #[arg(long)]
-        restart_ea: bool,
+        port: Option<u16>,
 
         /// Serve the API without starting an executive assistant. The agent
         /// context is still written, so a test harness can stand in for one.
         #[arg(long)]
         no_ea: bool,
 
-        /// Open Mission Control in a browser. It is served from this same
-        /// address, so the page and the API share an origin.
+        /// Insist on the bundled Mission Control, served from this same address
         #[arg(long)]
         ui: bool,
     },
 }
 
 #[derive(Subcommand)]
-enum ManagerAction {
-    /// Start the manager session
-    Start,
-    /// Run in orchestration mode (interactive)
-    Orchestrate,
+enum CheckpointAction {
+    /// Checkpoint a running topology now, at its next tag boundary
+    Create {
+        deployment: String,
+        /// Wait for the checkpoint to publish
+        #[arg(long)]
+        wait: bool,
+    },
+    /// List a topology's checkpoints, oldest first
+    List { deployment: String },
+    /// Print one checkpoint's manifest
+    Show { deployment: String, id: String },
+    /// Check that a checkpoint can be resumed from, without launching anything
+    Verify { deployment: String, id: String },
+    /// Change the automatic checkpoint period of a running topology
+    Configure {
+        deployment: String,
+        /// `off`, `tag` (every tag), `30m` (physical), or `logical:30m`
+        #[arg(long)]
+        period: String,
+    },
+    /// Retry a capture that failed and holds the run at its boundary
+    Retry { deployment: String },
 }
 
 #[derive(Subcommand)]
-enum EventAction {
+enum WorkspaceAction {
+    /// List workspaces owned by the selected EA
+    List,
+    /// Show workspace paths and immutable file snapshots
+    Show { id: String },
+    /// Snapshot all worktree files. Writers must be quiescent for a consistent version
+    Snapshot {
+        id: String,
+        #[arg(long, default_value = "Manual snapshot")]
+        label: String,
+    },
+    /// Restore files into a new workspace; does not rewind or resume a topology
+    Restore { id: String, snapshot: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum EventAction {
     /// Schedule an event for an agent or the EA
     Schedule {
         /// Receiver name ("ea" for the manager)
@@ -292,22 +453,6 @@ enum EventAction {
     },
 }
 
-/// Waits for `omar serve` to be listening, then opens Mission Control.
-///
-/// Opening before the listener exists shows the operator a connection error and
-/// makes them reload; waiting a bounded time means a daemon that fails to start
-/// does not leave a thread polling for the life of the process.
-fn open_when_listening(address: std::net::SocketAddr) {
-    for _ in 0..100 {
-        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
-            open_browser(&format!("http://{address}"));
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    eprintln!("Mission Control is at http://{address}");
-}
-
 /// Asks the desktop to open a URL, and says it plainly if there is no desktop.
 fn open_browser(url: &str) {
     let opener = if cfg!(target_os = "macos") {
@@ -328,6 +473,21 @@ fn open_browser(url: &str) {
 }
 
 fn main() -> Result<()> {
+    // Before any thread starts: installers' directories join PATH.
+    crate::backend::connect::extend_path();
+    // Only help shows backend status, and only then is it worth asking.
+    // `args_os`: a path argument need not be UTF-8.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let help = args.is_empty()
+        || matches!(args.as_slice(), [arg] if arg == "-h" || arg == "--help" || arg == "help");
+    let backends = help.then(backends_help);
+    let cli = Cli::from_arg_matches(
+        &Cli::command()
+            .help_template(help_template(backends.as_deref()))
+            .get_matches(),
+    )
+    .unwrap_or_else(|error| error.exit());
+    sessions::prepare_process(&cli)?;
     // Install the persisted-panic hook FIRST, before tokio builds its
     // runtime (and spawns worker threads). If the tmux parent dies it
     // takes the stderr pane with it (see issue #118), so panics need
@@ -343,15 +503,36 @@ fn main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(async_main())
+        .block_on(async_main(cli))
 }
 
-async fn async_main() -> Result<()> {
-    let cli = Cli::parse();
+async fn async_main(mut cli: Cli) -> Result<()> {
+    let internal = if let Some(Commands::SessionExec { args }) = &cli.command {
+        let args = args.clone();
+        cli = Cli::try_parse_from(std::iter::once("omar".to_string()).chain(args))?;
+        sessions::validate_exec(&cli)?;
+        true
+    } else {
+        false
+    };
+    if !internal {
+        if let Some(result) = sessions::dispatch(&cli).await {
+            return result;
+        }
+    }
     let mut config = Config::load(cli.config.as_deref())?;
+    if internal {
+        let target = ea::resolve_ea_selector(&omar_dir(), cli.ea.as_deref())?;
+        if let Ok(command) = std::fs::read_to_string(
+            ea::ea_state_dir(target.id, &omar_dir()).join("assistant-command"),
+        ) {
+            config.agent.default_command = command;
+        }
+    }
     if let Some(ref agent) = cli.agent {
-        config.agent.default_command =
-            config::resolve_backend(agent).map_err(|e| anyhow::anyhow!("{}", e))?;
+        config.agent.default_command = crate::backend::resolve(agent)
+            .map(|backend| backend.default_command().to_string())
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
     }
     if cli.spawn_metrics {
         config.metrics.spawn_metrics_enabled = true;
@@ -359,19 +540,25 @@ async fn async_main() -> Result<()> {
     }
     metrics::configure(config.metrics.spawn_metrics_enabled);
     let omar_dir = omar_dir();
-    let defer_active_ea_save = cli.command.is_none() && cli.agent.is_some();
-
-    if !defer_active_ea_save {
-        if let Some(ref selector) = cli.ea {
-            let (ea_info, created) = ea::resolve_or_create_ea_selector(&omar_dir, Some(selector))?;
-            if created {
-                eprintln!("Created EA '{}' (id={})", ea_info.name, ea_info.id);
-            }
-            ea::save_active_ea(&omar_dir, ea_info.id)?;
-        }
-    }
-
     match cli.command {
+        Some(
+            Commands::Up(_)
+            | Commands::Ls
+            | Commands::Info
+            | Commands::Attach { .. }
+            | Commands::Logs { .. }
+            | Commands::Down { .. }
+            | Commands::Rm
+            | Commands::Run(_)
+            | Commands::Runs { .. }
+            | Commands::Pause { .. }
+            | Commands::Resume { .. }
+            | Commands::Mutate { .. }
+            | Commands::Rollback { .. }
+            | Commands::SessionDaemon { .. }
+            | Commands::SessionExec { .. }
+            | Commands::Serve { .. },
+        ) => unreachable!(),
         Some(Commands::Spawn {
             name,
             command,
@@ -401,7 +588,7 @@ async fn async_main() -> Result<()> {
                 .map(|dir| deploy::record_path(&dir).exists())
                 .unwrap_or(false);
             if deployment {
-                kill_deployment(&omar_dir, target.id, &client, &name)
+                kill_deployment(&omar_dir, target.id, &name)
             } else {
                 kill_agent(
                     &client,
@@ -412,6 +599,41 @@ async fn async_main() -> Result<()> {
                 )
             }
         }
+        Some(Commands::Workspace { action }) => {
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            let value = match action {
+                WorkspaceAction::List => {
+                    serde_json::to_value(workspace::list(&omar_dir, target.id)?)?
+                }
+                action => {
+                    let id = match &action {
+                        WorkspaceAction::Show { id }
+                        | WorkspaceAction::Snapshot { id, .. }
+                        | WorkspaceAction::Restore { id, .. } => id,
+                        WorkspaceAction::List => unreachable!(),
+                    };
+                    let ws = workspace::Workspace::load(&omar_dir, id)?;
+                    anyhow::ensure!(ws.ea_id == target.id, "workspace belongs to another EA");
+                    match action {
+                        WorkspaceAction::Show { .. } => serde_json::json!({
+                            "workspace": ws, "worktree": ws.worktree(&omar_dir),
+                            "temp": ws.temp(&omar_dir), "snapshots": ws.snapshots(&omar_dir)?,
+                        }),
+                        WorkspaceAction::Snapshot { label, .. } => {
+                            ws.ensure_inactive(&omar_dir)?;
+                            serde_json::to_value(ws.snapshot(&omar_dir, &label)?)?
+                        }
+                        WorkspaceAction::Restore { snapshot, .. } => {
+                            let restored = ws.restore(&omar_dir, &snapshot)?;
+                            serde_json::json!({"workspace": restored, "worktree": restored.worktree(&omar_dir), "temp": restored.temp(&omar_dir)})
+                        }
+                        WorkspaceAction::List => unreachable!(),
+                    }
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
         Some(Commands::Stop { deployment }) => {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
             stop_deployment(&omar_dir, target.id, &deployment)
@@ -421,40 +643,34 @@ async fn async_main() -> Result<()> {
             status_deployment(&omar_dir, target.id, &deployment)
         }
         Some(Commands::SetupTmux) => setup_tmux(),
-        Some(Commands::Manager { action }) => {
-            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
-            let client =
-                TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
-            match action {
-                Some(ManagerAction::Start) | None => manager::start_manager(
-                    &client,
-                    &config.agent.default_command,
-                    target.id,
-                    &target.name,
-                    &omar_dir,
-                    &config.dashboard.session_prefix,
-                    &manager::ManagerRuntimeOptions {
-                        default_workdir: config.agent.default_workdir.clone(),
-                        health_idle_warning: config.health.idle_warning,
-                        serve: None,
-                    },
-                ),
-                Some(ManagerAction::Orchestrate) => manager::run_manager_orchestration(
-                    &client,
-                    &config.agent.default_command,
-                    target.id,
-                    &target.name,
-                    &omar_dir,
-                    &config.dashboard.session_prefix,
-                    &manager::ManagerRuntimeOptions {
-                        default_workdir: config.agent.default_workdir.clone(),
-                        health_idle_warning: config.health.idle_warning,
-                        serve: None,
-                    },
-                ),
+        Some(Commands::Backends {
+            json,
+            check,
+            backends,
+        }) => check_backends(json, check, &backends),
+        Some(Commands::Connect { backend: None }) => {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                crate::backend::connect::wizard()
+            } else {
+                print!("{}", backends_report(false));
+                Ok(())
             }
         }
-        Some(Commands::Event { action }) => {
+        Some(Commands::Connect {
+            backend: Some(name),
+        }) => {
+            let backend = crate::backend::resolve(&name).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                crate::backend::ASSISTANT.contains(&backend.kind()),
+                "{} is not an agent backend to connect",
+                backend.kind().name()
+            );
+            crate::backend::connect::host(backend)
+        }
+        Some(Commands::Ea {
+            action: sessions::EaAction::Event { action },
+        }) => {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
             let scheduler =
                 scheduler::Scheduler::with_store(scheduler::events_store_path(&omar_dir));
@@ -484,132 +700,185 @@ async fn async_main() -> Result<()> {
                 EventAction::Cancel { id } => cancel_cli_event(&scheduler, target.id, &id),
             }
         }
-        Some(Commands::McpServer { context_file }) => match context_file {
-            Some(path) => mcp::run_server_from_context_file(PathBuf::from(path)),
-            None => mcp::run_server_with_default_context(),
+        Some(Commands::Ea { .. }) => unreachable!("ea commands go through the runtime"),
+        Some(Commands::BackendRunner {
+            backend: _,
+            config_file,
+        }) => backend_runner::run(&config_file).await,
+        Some(Commands::AgentHook {
+            context_file,
+            format,
+            event,
+        }) => supervision::run_hook(&context_file, &format, event.as_deref()),
+        Some(Commands::McpServer {
+            context_file,
+            bare_tool_names,
+        }) => match context_file {
+            Some(path) => mcp::run_server_from_context_file(PathBuf::from(path), bare_tool_names),
+            None => mcp::run_server_with_default_context(bare_tool_names),
         },
-        Some(Commands::Run {
-            program,
-            inputs,
-            replace,
-            timeout_seconds,
-            fast,
-            diagram_server,
-            diagram_address,
-        }) => {
+        Some(Commands::Checkpoint { action }) => {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
-            let bytecode = topology::load_program(&program)?;
-            let generated = topology::generated_dir(&program);
-            topology::run_topology(
-                &bytecode,
-                topology::TopologyRunConfig {
-                    activity: None,
-                    ea_id: target.id,
-                    omar_dir: &omar_dir,
-                    generated: &generated,
-                    base_prefix: &config.dashboard.session_prefix,
-                    default_workdir: &config.agent.default_workdir,
-                    health_idle_warning: config.health.idle_warning,
-                    inputs: &inputs,
-                    replace,
-                    timeout: Duration::from_secs(timeout_seconds),
-                    pace: if fast {
-                        topology::Pace::Fast
-                    } else {
-                        topology::Pace::RealTime
-                    },
-                    diagram_address: diagram_server.then_some(diagram_address),
-                    diagram_ready: None,
-                    // `omar run` has no HTTP surface to hang a panel on, so a
-                    // web-backed reaction in a CLI run waits out its deadline.
-                    panel_ready: None,
-                },
-            )
-            .map(|_| ())
+            checkpoint_command(&omar_dir, target.id, action)
         }
         Some(Commands::HookDrain { format }) => {
             // Always print valid JSON, even on misconfiguration: a hook that
             // writes nothing reads as a failure to the backend.
             // Check the format before touching the spool: draining first
             // would destroy every queued event on a typo.
-            let reply = match channel::HookFormat::parse(&format) {
-                Some(hook) => {
-                    let events = std::env::var("OMAR_EVENT_SPOOL")
-                        .ok()
-                        .map(|spool| channel::drain_spool(std::path::Path::new(&spool)))
-                        .unwrap_or_default();
-                    hook.render(&events)
+            let reply = match crate::backend::by_name(&format) {
+                Some(backend) if backend.hook_reply(&[]).is_some() => {
+                    use std::io::Read;
+                    let mut raw = String::new();
+                    std::io::stdin().take(1_048_576).read_to_string(&mut raw)?;
+                    let input =
+                        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+                    let mut events = if backend.hook_consumes_spool(&input) {
+                        std::env::var("OMAR_EVENT_SPOOL")
+                            .ok()
+                            .map(|spool| {
+                                crate::backend::spool::drain_spool(std::path::Path::new(&spool))
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let mut state = supervision::inherited_hook_response(&input, &format)?;
+                    if input["hook_event_name"] == "stop" {
+                        state.to_string()
+                    } else if !backend.hook_takes_context(&input) {
+                        "{}".to_string()
+                    } else {
+                        if let Some(value) = state["additional_context"].as_str() {
+                            events.push(value.to_owned());
+                        }
+                        if let Some(steps) = state["injectSteps"].as_array_mut() {
+                            for step in steps {
+                                if let Some(value) = step["ephemeralMessage"].as_str() {
+                                    events.push(value.to_owned());
+                                }
+                            }
+                        }
+                        backend
+                            .hook_reply(&events)
+                            .unwrap_or_else(|| "{}".to_string())
+                    }
                 }
-                None => "{}".to_string(),
+                _ => "{}".to_string(),
             };
             println!("{}", reply);
             Ok(())
         }
         Some(Commands::StubAgent { context_file }) => stub_agent::run(&context_file),
-        Some(Commands::Serve {
-            address,
-            restart_ea,
-            no_ea,
-            ui,
-        }) => {
-            if ui && !web_assets::is_bundled() {
-                anyhow::bail!(web_assets::MISSING);
-            }
-            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
-            if ui {
-                // `serve::run` blocks, so the browser is opened from a thread
-                // that waits for the listener rather than before it exists.
-                std::thread::spawn(move || open_when_listening(address));
-            }
-            serve::run(address, &config, &omar_dir, target.id, restart_ea, !no_ea)
-        }
-        None => {
-            if cli.agent.is_some() {
-                let (target, created) =
-                    ea::resolve_or_create_ea_selector(&omar_dir, cli.ea.as_deref())?;
-                if created {
-                    eprintln!("Created EA '{}' (id={})", target.name, target.id);
-                }
-                let client =
-                    TmuxClient::new(ea::ea_prefix(target.id, &config.dashboard.session_prefix));
-                let (_, result) = manager::ensure_manager_session(
-                    &client,
-                    &config.agent.default_command,
-                    target.id,
-                    &target.name,
-                    &omar_dir,
-                    &config.dashboard.session_prefix,
-                    &manager::ManagerRuntimeOptions {
-                        default_workdir: config.agent.default_workdir.clone(),
-                        health_idle_warning: config.health.idle_warning,
-                        serve: None,
-                    },
-                )?;
-                match result {
-                    manager::ManagerEnsureResult::Started => {
-                        eprintln!("Started EA '{}' with requested backend", target.name);
-                    }
-                    manager::ManagerEnsureResult::ReplacedBackend => {
-                        eprintln!("Replaced EA '{}' with requested backend", target.name);
-                    }
-                    manager::ManagerEnsureResult::AlreadyRunning => {}
-                }
-                ea::save_active_ea(&omar_dir, target.id)?;
-            }
-            if std::env::var("TMUX").is_err() {
-                let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
-                relaunch_in_tmux(&config, &omar_dir, target.id, cli.agent.is_some())
-            } else {
-                run_dashboard(config).await
-            }
-        }
+        None => unreachable!("clap requires a command"),
     }
 }
 
+/// `omar --help` lists commands by what they are for. The last section is
+/// what OMAR launches inside agent panes and hooks; a person never types it.
+const HELP_SECTIONS: &[(&str, &[&str])] = &[
+    ("Backends", &["connect", "backends"]),
+    (
+        "Sessions",
+        &["up", "ls", "info", "attach", "logs", "down", "rm", "serve"],
+    ),
+    (
+        "Topologies",
+        &[
+            "run",
+            "runs",
+            "status",
+            "stop",
+            "pause",
+            "resume",
+            "mutate",
+            "rollback",
+            "checkpoint",
+            "workspace",
+        ],
+    ),
+    (
+        "Executive assistants and agents",
+        &["ea", "spawn", "list", "kill"],
+    ),
+    ("Setup", &["setup-tmux", "help"]),
+    (
+        "For agents (launched by OMAR, not typed)",
+        &["agent-hook", "hook-drain", "backend-runner", "mcp-server"],
+    ),
+];
+
+/// Each backend's status, under the Backends commands in help.
+fn backends_help() -> String {
+    use crate::backend::{connection, Connection};
+    let mut out = String::new();
+    for (backend, status) in connection::assistants() {
+        let name = backend.kind().name();
+        let next = match status {
+            Connection::Connected { .. } => String::new(),
+            _ => format!("omar connect {name}"),
+        };
+        let row = format!("    {name:<10}{:<26}{next}", connection::label(&status));
+        out += row.trim_end();
+        out.push('\n');
+    }
+    out
+}
+
+fn help_template(backends: Option<&str>) -> String {
+    let command = Cli::command();
+    let about: std::collections::BTreeMap<String, String> = command
+        .get_subcommands()
+        .filter(|c| !c.is_hide_set())
+        .map(|c| {
+            (
+                c.get_name().to_string(),
+                c.get_about().map(|a| a.to_string()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let width = about.keys().map(String::len).max().unwrap_or(0) + 2;
+    fn section(
+        title: &str,
+        names: &[&str],
+        about: &std::collections::BTreeMap<String, String>,
+        width: usize,
+        listed: &mut std::collections::BTreeSet<String>,
+        out: &mut String,
+    ) {
+        out.push_str(title);
+        out.push_str(":\n");
+        for name in names {
+            if let Some(text) = about.get(*name) {
+                out.push_str(&format!("  {name:<width$}{text}\n"));
+                listed.insert((*name).to_string());
+            }
+        }
+        out.push('\n');
+    }
+    let mut sections = String::new();
+    let mut listed = std::collections::BTreeSet::new();
+    for (title, names) in HELP_SECTIONS {
+        section(title, names, &about, width, &mut listed, &mut sections);
+        if let (&"Backends", Some(backends)) = (title, backends) {
+            sections.pop();
+            sections.push_str(backends);
+            sections.push('\n');
+        }
+    }
+    let rest: Vec<&str> = about
+        .keys()
+        .map(String::as_str)
+        .filter(|n| !listed.contains(*n))
+        .collect();
+    if !rest.is_empty() {
+        section("Other", &rest, &about, width, &mut listed, &mut sections);
+    }
+    format!("{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{sections}Options:\n{{options}}{{after-help}}")
+}
+
 fn omar_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omar")
+    sessions::state_root()
 }
 
 fn resolve_cli_ea(omar_dir: &std::path::Path, selector: Option<&str>) -> Result<ea::EaInfo> {
@@ -856,39 +1125,217 @@ fn status_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) ->
     for (name, value) in &record.state_vars {
         println!("  state {name} = {value}");
     }
+    if let Some(from) = &record.resumed_from {
+        println!("  resumed_from: {from}");
+    }
+    if let Some(id) = &record.checkpoint {
+        println!("  checkpoint: {id}");
+    }
+    if let Some(error) = &record.checkpoint_error {
+        println!("  checkpoint_error: {error}");
+    }
+    if let Some(policy) = deploy::read_policy(&dir)? {
+        println!("  checkpoints: {}", policy.describe());
+    }
+    if let Some(at) = record.next_checkpoint_at {
+        println!("  next_checkpoint_at: {at}");
+    }
     println!("  files: {}", dir.display());
     Ok(())
 }
 
-/// Force kill: the runner dies first, then its sessions, then the record says
-/// CANCELLED. Also sweeps sessions a crashed run left behind.
-fn kill_deployment(
+/// A live runner to send a request to, or the reason there is none.
+fn live_record(dir: &std::path::Path, team: &str) -> Result<deploy::DeploymentRecord> {
+    let record = deploy::DeploymentRecord::load(dir)?
+        .ok_or_else(|| anyhow::anyhow!("no deployment '{}'", team))?;
+    anyhow::ensure!(
+        !record.state.is_terminal(),
+        "deployment '{}' is {}; nothing is running to act on",
+        team,
+        record.state
+    );
+    anyhow::ensure!(
+        record.runner_alive(),
+        "deployment '{}' is {} but its runner (pid {}) is gone; use 'omar kill {}' to clean up",
+        team,
+        record.state,
+        record.pid,
+        team
+    );
+    Ok(record)
+}
+
+fn checkpoint_command(
     omar_dir: &std::path::Path,
     ea_id: ea::EaId,
-    client: &TmuxClient,
-    team: &str,
+    action: CheckpointAction,
 ) -> Result<()> {
+    match action {
+        CheckpointAction::Create { deployment, wait } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let before = live_record(&dir, &deployment)?;
+            if let Some(pending) = deploy::pending_request(&dir) {
+                anyhow::bail!(
+                    "deployment '{deployment}' already has a pending {pending:?} request"
+                );
+            }
+            deploy::request(&dir, deploy::ControlOp::Checkpoint)?;
+            println!("Checkpoint requested; it publishes at the next tag boundary");
+            if !wait {
+                return Ok(());
+            }
+            let deadline = std::time::Instant::now()
+                + Duration::from_secs(before.timeout_seconds.saturating_add(120));
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(500));
+                let Some(current) = deploy::DeploymentRecord::load(&dir)? else {
+                    break;
+                };
+                if current.checkpoint != before.checkpoint {
+                    println!(
+                        "Checkpoint {} published",
+                        current.checkpoint.as_deref().unwrap_or("?")
+                    );
+                    return Ok(());
+                }
+                if let Some(error) = &current.checkpoint_error {
+                    anyhow::bail!("checkpoint failed: {error}; `omar checkpoint retry {deployment}` after fixing the cause");
+                }
+                if current.state.is_terminal() || !current.runner_alive() {
+                    anyhow::bail!(
+                        "deployment '{}' is {} before the checkpoint published",
+                        deployment,
+                        current.state
+                    );
+                }
+            }
+            anyhow::bail!("checkpoint did not publish within the wait; the run may be mid-tag")
+        }
+        CheckpointAction::List { deployment } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let store = checkpoint::Store::new(&dir);
+            let (manifests, problems) = store.list()?;
+            let head = store.resume_point()?.map(|m| m.id);
+            if manifests.is_empty() {
+                println!("No checkpoints for '{deployment}'");
+            }
+            for m in &manifests {
+                let tag = m
+                    .completed_tag
+                    .map(|(t, s)| format!("({t}, {s})"))
+                    .unwrap_or_else(|| "start".to_string());
+                let mark = if head.as_deref() == Some(m.id.as_str()) {
+                    " <- resume point"
+                } else {
+                    ""
+                };
+                println!(
+                    "#{:<3} {}  {:<9} after {:<14} at {}  instances {}{}",
+                    m.sequence,
+                    m.id,
+                    format!("{:?}", m.trigger).to_lowercase(),
+                    tag,
+                    m.created_at,
+                    m.workspaces.len(),
+                    mark
+                );
+            }
+            for problem in problems {
+                println!("unreadable: {problem}");
+            }
+            Ok(())
+        }
+        CheckpointAction::Show { deployment, id } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let (manifest, state, _) = checkpoint::Store::new(&dir).load(&id)?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+            println!(
+                "queued tags: {}; outputs: {}; state variables: {}",
+                state.queue.len(),
+                state.outputs.len(),
+                state.state_vars.len()
+            );
+            Ok(())
+        }
+        CheckpointAction::Verify { deployment, id } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let manifest = checkpoint::Store::new(&dir).verify(omar_dir, &id)?;
+            println!(
+                "Checkpoint {} verified: program, state, and {} instance file versions are intact",
+                manifest.id,
+                manifest.workspaces.len()
+            );
+            for (name, agent) in &manifest.agents {
+                println!("  agent {name} ({}): {}", agent.backend, agent.restoration);
+            }
+            Ok(())
+        }
+        CheckpointAction::Configure { deployment, period } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let policy = checkpoint::parse_policy(&period)?;
+            anyhow::ensure!(
+                deploy::DeploymentRecord::load(&dir)?.is_some(),
+                "no deployment '{deployment}'"
+            );
+            deploy::write_policy(&dir, policy)?;
+            println!(
+                "Checkpoints of '{}' are now {}; a running topology picks it up at its next boundary",
+                deployment,
+                policy.describe()
+            );
+            Ok(())
+        }
+        CheckpointAction::Retry { deployment } => {
+            let dir = deployment_dir(omar_dir, ea_id, &deployment)?;
+            let record = live_record(&dir, &deployment)?;
+            anyhow::ensure!(
+                record.checkpoint_error.is_some(),
+                "deployment '{deployment}' has no failed checkpoint to retry"
+            );
+            deploy::request(&dir, deploy::ControlOp::RetryCheckpoint)?;
+            println!("Retry requested");
+            Ok(())
+        }
+    }
+}
+
+/// Force kill: the runner dies first, then its sessions, then the record says
+/// CANCELLED. Also sweeps sessions a crashed run left behind.
+fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> Result<()> {
     let dir = deployment_dir(omar_dir, ea_id, team)?;
     let mut record = deploy::DeploymentRecord::load(&dir)?
         .ok_or_else(|| anyhow::anyhow!("no deployment '{}'", team))?;
-    if record.pid != std::process::id() && record.runner_alive() {
+    let client = record.session_client()?;
+    // A finished deployment's runner is done with it; the pid it recorded may
+    // be a runtime that is still serving other work.
+    if record.is_active() && record.pid != std::process::id() && record.runner_alive() {
         deploy::kill_process(record.pid);
         let waited = std::time::Instant::now();
         while crate::process::pid_alive(record.pid) && waited.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    for failure in deploy::teardown_sessions(client, &record.sessions, &deploy::logs_dir(&dir)) {
+    let failures = if record.sessions_cleaned {
+        Vec::new()
+    } else {
+        deploy::teardown_sessions(&client, &record.sessions, &deploy::logs_dir(&dir))
+    };
+    for failure in &failures {
         eprintln!("warning: session not cleaned up: {failure}");
     }
+    record.sessions_cleaned = failures.is_empty();
     deploy::clear_stop(&dir)?;
     if record.is_active() {
         record.advance(
             deploy::DeploymentState::Cancelled,
             Some("killed by operator"),
         )?;
-        record.save(&dir)?;
     }
+    record.save(&dir)?;
+    anyhow::ensure!(
+        failures.is_empty(),
+        "deployment cleanup remains unconfirmed"
+    );
     println!("Deployment '{}' is {}", team, record.state);
     Ok(())
 }
@@ -968,61 +1415,6 @@ fn cancel_cli_event(
         Err(true) => anyhow::bail!("Event '{}' belongs to a different EA", event_id),
         Err(false) => anyhow::bail!("Event '{}' not found", event_id),
     }
-}
-
-/// Re-launch omar inside a tmux session.
-/// Called when the dashboard is started outside of tmux so that popups,
-/// attach, and other tmux-dependent features work correctly.
-///
-/// If the dashboard is already running, hands this invocation's EA/backend/cwd
-/// to it and attaches. This preserves the in-memory scheduler (cron jobs,
-/// pending events) across detach/reattach cycles. If attach fails (stale
-/// session), kills the stale session and creates a fresh one.
-fn relaunch_in_tmux(
-    config: &Config,
-    omar_dir: &std::path::Path,
-    active_ea: ea::EaId,
-    restart_manager: bool,
-) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-
-    let client = TmuxClient::new("");
-    let exe = std::env::current_exe()?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    if client.has_session(DASHBOARD_SESSION)? {
-        let handoff = ea::DashboardLaunchHandoff {
-            active_ea,
-            default_command: config.agent.default_command.clone(),
-            default_workdir: current_dir.to_string_lossy().into_owned(),
-            restart_manager,
-        };
-        ea::save_dashboard_launch_handoff(omar_dir, &handoff)?;
-        let target = format!("={}", DASHBOARD_SESSION);
-        let status = tmux_command()
-            .args(["-2", "attach-session", "-t", &target])
-            .status();
-
-        match status {
-            Ok(s) if s.success() => return Ok(()),
-            _ => {
-                let _ = client.kill_session(DASHBOARD_SESSION);
-            }
-        }
-    }
-
-    let mut cmd = tmux_command();
-    // Force 256-color mode when launching the dashboard session.
-    cmd.arg("-2");
-    cmd.args(["new-session", "-s", DASHBOARD_SESSION, "-c"]);
-    cmd.arg(&current_dir);
-    cmd.arg(&exe);
-    cmd.args(&args);
-
-    // exec() replaces the current process; only returns on error
-    let err = cmd.exec();
-    anyhow::bail!("Failed to launch tmux: {}", err)
 }
 
 /// Recommended tmux settings for omar, keyed by option name.
@@ -1111,6 +1503,138 @@ fn sync_tmux_setup_warning(app: &mut app::App) {
 }
 
 /// Interactive tmux configuration setup.
+/// Every assistant backend's sign-in, as a table or as JSON.
+fn backends_report(json: bool) -> String {
+    report_backends(&crate::backend::connection::assistants(), &[], json)
+}
+
+/// `omar backends`: the report for the named backends (all when none), and
+/// with `check`, each signed-in one's test prompt, run in parallel.
+fn check_backends(json: bool, check: bool, names: &[String]) -> Result<()> {
+    use crate::backend::{connection, Connection};
+    let mut statuses = connection::assistants();
+    if !names.is_empty() {
+        let named = |backend: &&dyn crate::backend::Backend, name: &String| {
+            backend
+                .aliases()
+                .contains(&name.to_ascii_lowercase().as_str())
+        };
+        for name in names {
+            anyhow::ensure!(
+                statuses.iter().any(|(backend, _)| named(backend, name)),
+                "'{name}' is not an assistant backend; see omar backends"
+            );
+        }
+        statuses.retain(|(backend, _)| names.iter().any(|name| named(backend, name)));
+    }
+    let checks: Vec<Option<Result<(), String>>> = if check {
+        std::thread::scope(|scope| {
+            // None: not signed in and not named, so nothing to check.
+            // Some(None): named but not signed in, which fails.
+            let runs: Vec<_> = statuses
+                .iter()
+                .map(|(backend, status)| {
+                    let backend = *backend;
+                    let name = backend.kind().name();
+                    let connected = matches!(status, Connection::Connected { .. });
+                    (connected || !names.is_empty()).then(|| {
+                        connected.then(|| {
+                            scope.spawn(move || {
+                                connection::check_sign_in(backend).map_err(|error| {
+                                    format!(
+                                        "{name} is signed in, but its test prompt failed: {error}"
+                                    )
+                                })
+                            })
+                        })
+                    })
+                })
+                .collect();
+            runs.into_iter()
+                .zip(&statuses)
+                .map(|(run, (backend, status))| match run {
+                    Some(Some(run)) => Some(
+                        run.join()
+                            .unwrap_or_else(|_| Err("the check panicked".into())),
+                    ),
+                    Some(None) => Some(Err(format!(
+                        "{} is {}; run `omar connect {}`",
+                        backend.kind().name(),
+                        connection::label(status),
+                        backend.kind().name()
+                    ))),
+                    None => None,
+                })
+                .collect()
+        })
+    } else {
+        Vec::new()
+    };
+    print!("{}", report_backends(&statuses, &checks, json));
+    let failed = checks
+        .iter()
+        .flatten()
+        .filter(|check| check.is_err())
+        .count();
+    anyhow::ensure!(failed == 0, "{failed} backend(s) failed their check");
+    Ok(())
+}
+
+fn report_backends(
+    statuses: &[(
+        &'static dyn crate::backend::Backend,
+        crate::backend::Connection,
+    )],
+    checks: &[Option<Result<(), String>>],
+    json: bool,
+) -> String {
+    use crate::backend::{connection, Connection};
+    let check_of = |index: usize| checks.get(index).and_then(Option::as_ref);
+    if json {
+        let rows: Vec<_> = statuses
+            .iter()
+            .enumerate()
+            .map(|(index, (backend, status))| {
+                let mut row = connection::describe(*backend, status);
+                match check_of(index) {
+                    Some(Ok(())) => row["check"] = serde_json::json!({"ok": true}),
+                    Some(Err(error)) => {
+                        row["check"] = serde_json::json!({"ok": false, "error": error})
+                    }
+                    None => {}
+                }
+                row
+            })
+            .collect();
+        return format!("{}\n", serde_json::Value::Array(rows));
+    }
+    let mut lines = String::new();
+    for (index, (backend, _)) in statuses.iter().enumerate() {
+        match check_of(index) {
+            Some(Ok(())) => {
+                lines += &format!("✓ {} answered its test prompt\n", backend.kind().name())
+            }
+            Some(Err(error)) => lines += &format!("✗ {error}\n"),
+            None => {}
+        }
+    }
+    let mut out = format!("{:<10}{:<28}NEXT\n", "BACKEND", "STATUS");
+    for (backend, status) in statuses {
+        let name = backend.kind().name();
+        let next = match status {
+            Connection::Connected { .. } => String::new(),
+            _ => format!("omar connect {name}"),
+        };
+        let row = format!("{name:<10}{:<28}{next}", connection::label(status));
+        out += row.trim_end();
+        out.push('\n');
+    }
+    if !lines.is_empty() {
+        out.push('\n');
+    }
+    out + &lines
+}
+
 fn setup_tmux() -> Result<()> {
     use std::io::Write;
 
@@ -1206,124 +1730,10 @@ fn setup_tmux() -> Result<()> {
     Ok(())
 }
 
-/// Locate the `omar-slack` binary. Checks next to the current executable
-/// first, then falls back to a PATH lookup.
-fn find_slack_binary() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("omar-slack");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    // Fall back to PATH lookup
-    Some(PathBuf::from("omar-slack"))
-}
-
-/// Spawn the Slack bridge binary if SLACK_BOT_TOKEN and SLACK_APP_TOKEN are set.
-fn spawn_slack_bridge() -> Option<std::process::Child> {
-    if std::env::var("SLACK_BOT_TOKEN").is_err() || std::env::var("SLACK_APP_TOKEN").is_err() {
-        return None;
-    }
-
-    let binary = find_slack_binary()?;
-    match std::process::Command::new(&binary)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => {
-            eprintln!("[omar] Slack bridge started (pid {})", child.id());
-            Some(child)
-        }
-        Err(e) => {
-            eprintln!("[omar] Failed to start Slack bridge: {}", e);
-            None
-        }
-    }
-}
-
-/// Locate the `omar-computer` binary. Checks next to the current executable
-/// first, then falls back to a PATH lookup.
-fn find_computer_binary() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("omar-computer");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    // Fall back to PATH lookup
-    Some(PathBuf::from("omar-computer"))
-}
-
-/// Spawn the computer-use bridge binary on Linux when an X11 display is
-/// available. The bridge wraps xdotool / ImageMagick `import`, which are
-/// X11-only tools, so skip it entirely on non-Linux platforms — an
-/// XQuartz `DISPLAY` on macOS would otherwise trigger a noisy spawn of a
-/// bridge that cannot do anything useful there.
-fn spawn_computer_bridge() -> Option<std::process::Child> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    // Treat both unset and empty DISPLAY as "no X11 session". A bare
-    // `export DISPLAY=` in a shell profile would otherwise satisfy
-    // `is_err() == false` and still trigger a useless bridge spawn.
-    let display_ok = std::env::var("DISPLAY")
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty());
-    if !display_ok {
-        return None;
-    }
-
-    let binary = find_computer_binary()?;
-    match std::process::Command::new(&binary)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => {
-            eprintln!("[omar] Computer bridge started (pid {})", child.id());
-            Some(child)
-        }
-        Err(e) => {
-            eprintln!("[omar] Failed to start computer bridge: {}", e);
-            None
-        }
-    }
-}
-
-/// Kill a child process gracefully: SIGTERM first, then SIGKILL after timeout.
-fn kill_child_gracefully(child: &mut std::process::Child, timeout: Duration) {
-    // Send SIGTERM
-    let _ = std::process::Command::new("kill")
-        .arg(child.id().to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    // Wait for the process to exit
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            _ => {
-                if start.elapsed() >= timeout {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
-
-    // Force kill if still running
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-async fn run_dashboard(config: Config) -> Result<()> {
+/// The dashboard is a client of one runtime: the daemon owns the event loop,
+/// assistant launches, and every workload, so nothing here starts a second
+/// scheduler or stops anything on exit.
+async fn run_dashboard(config: Config, session: sessions::Session) -> Result<()> {
     // Some shells/dev tools export NO_COLOR globally. That disables all ANSI
     // styling and makes the TUI monochrome. The dashboard is explicitly color-coded.
     if std::env::var_os("NO_COLOR").is_some() {
@@ -1336,27 +1746,10 @@ async fn run_dashboard(config: Config) -> Result<()> {
     let scheduler = Arc::new(scheduler::Scheduler::with_store(
         scheduler::events_store_path(&omar_dir),
     ));
-    let popup_receiver = scheduler::new_popup_receiver();
-    let base_prefix = config.dashboard.session_prefix.clone();
-    tokio::spawn(scheduler::run_event_loop(
-        scheduler.clone(),
-        ticker.clone(),
-        popup_receiver.clone(),
-        base_prefix,
-    ));
-
     // Create SINGLE shared App instance for the dashboard/runtime state.
-    let shared_app = Arc::new(Mutex::new(App::new(
-        &config,
-        ticker.clone(),
-        scheduler.clone(),
-    )));
-
-    // Spawn Slack bridge if configured
-    let mut slack_bridge = spawn_slack_bridge();
-
-    // Spawn computer-use bridge if X11 is available
-    let mut computer_bridge = spawn_computer_bridge();
+    let mut app = App::new(&config, ticker.clone(), scheduler.clone());
+    app.session = Some(session);
+    let shared_app = Arc::new(Mutex::new(app));
 
     // Initialize terminal
     enable_raw_mode()?;
@@ -1373,18 +1766,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Show bridge status
-    {
-        let mut app = shared_app.lock().await;
-        match (slack_bridge.is_some(), computer_bridge.is_some()) {
-            (true, true) => app.set_status("Slack & computer bridges started"),
-            (true, false) => app.set_status("Slack bridge started"),
-            (false, true) => app.set_status("Computer bridge started"),
-            _ => {}
-        }
-    }
-
-    // Warn if tmux config is missing recommended settings
     {
         let mut app = shared_app.lock().await;
         sync_tmux_setup_warning(&mut app);
@@ -1489,8 +1870,21 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                     }
                                 }
                                 app::ConfirmAction::ResetQuit => {
-                                    app.reset_on_quit = true;
-                                    app.should_quit = true;
+                                    // Quitting stops the session's runtime; the
+                                    // daemon cleans up its own workloads. `z`
+                                    // detaches instead.
+                                    let session = app.session.clone().expect("dashboard session");
+                                    match sessions::rpc(
+                                        &session,
+                                        serde_json::json!({"op": "down", "force": false}),
+                                        Duration::from_secs(10),
+                                    ) {
+                                        Ok(_) => app.should_quit = true,
+                                        Err(e) => {
+                                            app.pending_confirm = None;
+                                            app.set_status(format!("Error: {}", e));
+                                        }
+                                    }
                                 }
                                 app::ConfirmAction::DeleteEa => {
                                     let ea_id = app.active_ea;
@@ -1725,17 +2119,9 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                 continue;
                             }
 
-                            let selected_popup_receiver = app
-                                .selected_popup_receiver_name()
-                                .map(|name| (name, app.active_ea));
                             let popup_info = app
                                 .selected_agent()
                                 .map(|a| (a.session.name.clone(), app.client().clone()));
-
-                            // Tell the scheduler which agent popup is open so it
-                            // defers events for that receiver until the popup closes.
-                            // Include ea_id so suppression is scoped per-EA.
-                            *popup_receiver.lock().unwrap() = selected_popup_receiver;
 
                             // Release App lock before blocking popup call
                             drop(app);
@@ -1805,9 +2191,6 @@ async fn run_dashboard(config: Config) -> Result<()> {
                                     app.set_status(format!("Error: {}", e));
                                 }
                             }
-
-                            // Popup closed — clear so events resume delivery
-                            *popup_receiver.lock().unwrap() = None;
                         }
                         KeyCode::Char('n') => {
                             if let Err(e) = app.spawn_agent() {
@@ -1823,6 +2206,7 @@ async fn run_dashboard(config: Config) -> Result<()> {
                         }
                         KeyCode::Char('D') => {
                             // Delete the currently active EA (last EA is protected)
+                            app.registered_eas = ea::load_registry(&app.omar_dir);
                             if app.registered_eas.len() > 1 {
                                 app.pending_confirm = Some(app::ConfirmAction::DeleteEa);
                             } else {
@@ -1926,181 +2310,12 @@ async fn run_dashboard(config: Config) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    // Kill ALL OMAR EA sessions on quit (managers + workers), even if
-    // registry and tmux are temporarily out of sync.
-    {
-        let app = shared_app.lock().await;
-        let client = TmuxClient::new("");
-        let base_prefix = app.base_prefix.clone();
-
-        if let Ok(sessions) = client.list_all_sessions() {
-            for session in sessions {
-                if session.name.starts_with(&base_prefix) {
-                    let _ = client.kill_session(&session.name);
-                }
-            }
-        }
-    }
-
-    // Kill Slack bridge on exit
-    if let Some(ref mut child) = slack_bridge {
-        kill_child_gracefully(child, Duration::from_secs(3));
-    }
-
-    // Kill computer bridge on exit
-    if let Some(ref mut child) = computer_bridge {
-        kill_child_gracefully(child, Duration::from_secs(3));
-    }
-
-    let reset_on_quit = {
-        let app = shared_app.lock().await;
-        app.reset_on_quit
-    };
-    if reset_on_quit {
-        purge_persisted_runtime_state_on_quit(&omar_dir)?;
-    }
-
     Ok(())
-}
-
-fn purge_persisted_runtime_state_on_quit(omar_dir: &std::path::Path) -> Result<()> {
-    let archive_timestamp = now_ns();
-    archive_action_logs(omar_dir, archive_timestamp)?;
-    archive_manager_notes(omar_dir, archive_timestamp)?;
-
-    for file in [
-        "active_ea",
-        "ea_next_id",
-        "eas.json",
-        "eas.json.tmp",
-        "scheduled_events.json",
-        "scheduled_events.lock",
-        "scheduled_events.tmp",
-    ] {
-        remove_file_if_exists(omar_dir.join(file))?;
-    }
-
-    remove_dir_if_exists(omar_dir.join("ea"))?;
-    remove_dir_if_exists(omar_dir.join("mcp"))?;
-    manager::remove_all_omar_antigravity_mcp_configs()?;
-
-    Ok(())
-}
-
-fn archive_action_logs(omar_dir: &std::path::Path, archive_timestamp: u64) -> Result<()> {
-    let ea_dir = omar_dir.join("ea");
-    let Ok(entries) = std::fs::read_dir(&ea_dir) else {
-        return Ok(());
-    };
-
-    let archive_dir = omar_dir.join("logs").join("action_logs");
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let action_log = path.join("action_log.jsonl");
-        if !action_log.exists() {
-            continue;
-        }
-
-        std::fs::create_dir_all(&archive_dir)?;
-        let ea_id = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("unknown");
-        let archive_path = unique_archive_path(
-            &archive_dir,
-            &format!("ea-{}-{}", ea_id, archive_timestamp),
-            "jsonl",
-        );
-        std::fs::rename(action_log, archive_path)?;
-    }
-
-    Ok(())
-}
-
-fn archive_manager_notes(omar_dir: &std::path::Path, archive_timestamp: u64) -> Result<()> {
-    let Ok(entries) = std::fs::read_dir(omar_dir) else {
-        return Ok(());
-    };
-
-    let archive_dir = omar_dir.join("logs").join("manager_notes");
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !file_name.starts_with("manager_notes_ea") || !file_name.ends_with(".md") {
-            continue;
-        }
-
-        std::fs::create_dir_all(&archive_dir)?;
-        let stem = file_name.strip_suffix(".md").unwrap_or(file_name);
-        let archive_path = unique_archive_path(
-            &archive_dir,
-            &format!("{}-{}", stem, archive_timestamp),
-            "md",
-        );
-        std::fs::rename(path, archive_path)?;
-    }
-
-    Ok(())
-}
-
-fn unique_archive_path(dir: &std::path::Path, stem: &str, extension: &str) -> PathBuf {
-    let mut path = dir.join(format!("{}.{}", stem, extension));
-    let mut suffix = 1;
-    while path.exists() {
-        path = dir.join(format!("{}-{}.{}", stem, suffix, extension));
-        suffix += 1;
-    }
-    path
-}
-
-fn remove_file_if_exists(path: PathBuf) -> Result<()> {
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
-}
-
-fn remove_dir_if_exists(path: PathBuf) -> Result<()> {
-    match std::fs::remove_dir_all(&path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct HomeEnvGuard {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl HomeEnvGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let previous = std::env::var_os("HOME");
-            std::env::set_var("HOME", path);
-            Self { previous }
-        }
-    }
-
-    impl Drop for HomeEnvGuard {
-        fn drop(&mut self) {
-            match self.previous.as_ref() {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
 
     /// Regression: `extended-keys always` forces tmux to emit modify-other-keys
     /// sequences to every client, including omar's dashboard, which doesn't
@@ -2122,82 +2337,6 @@ mod tests {
             "extended-keys must be `on`, not `{}` — `always` breaks Shift+Tab \
              in the dashboard (see tests comment)",
             value
-        );
-    }
-
-    #[test]
-    fn purge_persisted_runtime_state_archives_logs_and_notes() {
-        let _env_lock = crate::test_env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let _home = HomeEnvGuard::set(dir.path());
-        let omar_dir = dir.path();
-        let agy_plugins_dir = dir.path().join(".gemini/config/plugins");
-        std::fs::create_dir_all(agy_plugins_dir.join("omar-ea-7")).unwrap();
-        std::fs::create_dir_all(agy_plugins_dir.join("user-plugin")).unwrap();
-        let agy_manifest_path = dir.path().join(".gemini/config/import_manifest.json");
-        std::fs::write(
-            &agy_manifest_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "imports": [
-                    {"name": "omar-ea-7", "source": "local-install"},
-                    {"name": "user-plugin", "source": "local-install"}
-                ]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        std::fs::create_dir_all(omar_dir.join("ea/7/status")).unwrap();
-        std::fs::create_dir_all(omar_dir.join("mcp/ea-7")).unwrap();
-        std::fs::create_dir_all(omar_dir.join("slack_outbox")).unwrap();
-        std::fs::create_dir_all(omar_dir.join("logs/panics")).unwrap();
-        std::fs::write(omar_dir.join("config.toml"), "[dashboard]\n").unwrap();
-        std::fs::write(omar_dir.join("slack_outbox/keep"), "queued").unwrap();
-        std::fs::write(omar_dir.join("logs/panics/panic.log"), "panic").unwrap();
-        std::fs::write(omar_dir.join("eas.json"), "[]").unwrap();
-        std::fs::write(omar_dir.join("active_ea"), "7").unwrap();
-        std::fs::write(omar_dir.join("ea_next_id"), "7").unwrap();
-        std::fs::write(omar_dir.join("scheduled_events.json"), "[]").unwrap();
-        std::fs::write(omar_dir.join("ea/7/tasks.md"), "- [1] stale\n").unwrap();
-        std::fs::write(omar_dir.join("ea/7/action_log.jsonl"), "action log\n").unwrap();
-        std::fs::write(omar_dir.join("manager_notes_ea7.md"), "manager notes\n").unwrap();
-
-        purge_persisted_runtime_state_on_quit(omar_dir).unwrap();
-
-        assert!(omar_dir.join("config.toml").exists());
-        assert!(omar_dir.join("slack_outbox/keep").exists());
-        assert!(omar_dir.join("logs/panics/panic.log").exists());
-        assert!(!omar_dir.join("eas.json").exists());
-        assert!(!omar_dir.join("active_ea").exists());
-        assert!(!omar_dir.join("ea_next_id").exists());
-        assert!(!omar_dir.join("scheduled_events.json").exists());
-        assert!(!omar_dir.join("ea").exists());
-        assert!(!omar_dir.join("mcp").exists());
-        assert!(!omar_dir.join("manager_notes_ea7.md").exists());
-        assert!(!agy_plugins_dir.join("omar-ea-7").exists());
-        assert!(agy_plugins_dir.join("user-plugin").exists());
-        let agy_manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(agy_manifest_path).unwrap()).unwrap();
-        assert_eq!(agy_manifest["imports"].as_array().unwrap().len(), 1);
-        assert_eq!(agy_manifest["imports"][0]["name"], "user-plugin");
-
-        let action_logs: Vec<_> = std::fs::read_dir(omar_dir.join("logs/action_logs"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(action_logs.len(), 1);
-        assert_eq!(
-            std::fs::read_to_string(&action_logs[0]).unwrap(),
-            "action log\n"
-        );
-
-        let manager_notes: Vec<_> = std::fs::read_dir(omar_dir.join("logs/manager_notes"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(manager_notes.len(), 1);
-        assert_eq!(
-            std::fs::read_to_string(&manager_notes[0]).unwrap(),
-            "manager notes\n"
         );
     }
 

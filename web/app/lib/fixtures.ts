@@ -170,21 +170,21 @@ export const reviewProgram = `team ReviewFlow[planner  : Codex,
     action plan : string
     action critique : string
 
-    prompt planner(request) -> plan
+    task planner(request) -> plan
     "
         Draft a concrete plan for this request:
         $(request)
         Set \`plan\` to the plan.
     "
 
-    prompt reviewer(plan) -> critique
+    task reviewer(plan) -> critique
     "
         Find risks and omissions in this plan:
         $(plan)
         Set \`critique\` to your findings.
     "
 
-    prompt planner(critique) -> result
+    task planner(critique) -> result
     "
         Integrate this critique into a final answer:
         $(critique)

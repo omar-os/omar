@@ -1,0 +1,1 @@
+export OMAR_AGENT_SOCKET='/tmp/omar-protocol-<HEX32>/agent.sock'; '<EXE>' backend-runner --backend agy --config-file '<DIR>/mcp/ea-0/protocol-<HEX32>.json'

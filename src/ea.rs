@@ -190,6 +190,7 @@ pub fn resolve_or_create_ea_selector(
 
 /// Ensure at least one default EA exists on disk.
 pub fn ensure_default_ea(base_dir: &Path) -> anyhow::Result<Vec<EaInfo>> {
+    let _lock = registry_lock(base_dir)?;
     let mut eas = load_registry(base_dir);
     if eas.is_empty() {
         eas.push(default_ea_info());
@@ -250,6 +251,27 @@ pub fn validate_ea_name(name: &str) -> anyhow::Result<()> {
 /// Register a new EA. Returns the assigned ID.
 /// IDs are monotonically increasing and never reused, even after deletion.
 pub fn register_ea(base_dir: &Path, name: &str, description: Option<&str>) -> anyhow::Result<EaId> {
+    let _lock = registry_lock(base_dir)?;
+    register_ea_unlocked(base_dir, name, description)
+}
+
+fn registry_lock(base_dir: &Path) -> anyhow::Result<fs::File> {
+    fs::create_dir_all(base_dir)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(base_dir.join("eas.lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn register_ea_unlocked(
+    base_dir: &Path,
+    name: &str,
+    description: Option<&str>,
+) -> anyhow::Result<EaId> {
     validate_ea_name(name)?;
     let mut eas = load_registry(base_dir);
     let max_existing = eas.iter().map(|e| e.id).max().unwrap_or(0);
@@ -281,6 +303,7 @@ pub fn register_ea(base_dir: &Path, name: &str, description: Option<&str>) -> an
 
 /// Remove an EA from the registry. Returns an error if it would remove the last EA.
 pub fn unregister_ea(base_dir: &Path, ea_id: EaId) -> anyhow::Result<()> {
+    let _lock = registry_lock(base_dir)?;
     let mut eas = load_registry(base_dir);
     if eas.len() <= 1 {
         anyhow::bail!("Cannot delete the only EA; at least one EA must remain");
@@ -288,6 +311,7 @@ pub fn unregister_ea(base_dir: &Path, ea_id: EaId) -> anyhow::Result<()> {
     if !eas.iter().any(|e| e.id == ea_id) {
         anyhow::bail!("EA {} not found in registry", ea_id);
     }
+    crate::supervision::remove_ea(base_dir, ea_id)?;
     eas.retain(|e| e.id != ea_id);
     save_registry(base_dir, &eas)
 }
@@ -438,7 +462,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let handoff = DashboardLaunchHandoff {
             active_ea: 4,
-            default_command: crate::config::resolve_backend("claude").unwrap(),
+            default_command: crate::backend::resolve("claude")
+                .unwrap()
+                .default_command()
+                .to_string(),
             default_workdir: "/tmp/omar".to_string(),
             restart_manager: true,
         };

@@ -1,0 +1,53 @@
+// OMAR topology integration source.
+// An imported enum type on an input the operator supplies. The value arrives
+// as bare text on the command line, and the run is refused at the door for one
+// the type does not list, naming the values it does. One it lists reaches a
+// prompt and a code body alike: the body reads the checked value as a plain
+// String, which is the one thing a body may do with an enum port.
+type Decision from "./schemas/decision.json"
+
+team Gate[keeper : Stub]
+{
+    input decision : Decision
+    output note : string
+    output route : string
+
+    task keeper(decision) -> note
+    "
+        The decision is $(decision). Write a short note to note.
+    "
+
+    reaction(decision) -> route {=
+        route = decision.map(|d| format!("routed {d}"));
+    =}
+}
+
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input note : string
+    input route : string
+    state got_note : bool = false
+    state got_route : bool = false
+    timer deadline(10min, 0)
+
+    reaction(note, route) -> {=
+        if note.is_some() { self.got_note = true; }
+        if route.is_some() { self.got_route = true; }
+        if self.got_note && self.got_route { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_note, "no gate.note by the deadline");
+        assert!(self.got_route, "no gate.route by the deadline");
+    =}
+}
+
+main {
+    gate = Gate()
+
+    smoke = Smoke()
+    gate.note -> smoke.note
+    gate.route -> smoke.route
+}

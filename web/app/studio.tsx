@@ -3,13 +3,24 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
 import { AgentActivity, ActivitySummary, RoleSettings, useActivity, useInactivityThreshold } from "./agent-activity";
+import { QuoteSelection, withQuote } from "./quote-selection";
+import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
+import { Artifacts } from "./artifacts";
+import { DeployConfirmation, type DeployOptions } from "./deploy-confirmation";
+import { defaultRunTimeout, describeRunFailure } from "./lib/run-feedback";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
+import { BackendsPage } from "./backends-page";
+import { SettingsMenu } from "./settings-menu";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
 import { PortPanel } from "./port-panel";
+import { PropertiesPanel } from "./properties";
 import { Resizer } from "./resizer";
+import { useWorkflowNames } from "./lib/workflow-names";
+import { WorkflowIcon } from "./workflow-icon";
+import { StepInspector } from "./step-inspector";
 import { Waiting } from "./waiting";
 import {
   eaDesignAgent,
@@ -19,11 +30,11 @@ import {
 import { reviewProgram, reviewWorkflow } from "./lib/fixtures";
 import {
   applyDiagramEvent,
-  assertDiagramSnapshot,
   formatDuration,
   isRunFinished,
   openInputs,
   type ChatMessage,
+  type ConversationSummary,
   type DiagramEvent,
   type DiagramSnapshot,
   type PendingInvocation,
@@ -37,12 +48,28 @@ import {
   checkServeHealth,
   diagramUrlFor,
   fetchDiagram,
+  fetchRunSnapshot,
   fetchPanel,
   fetchRun,
   checkProgram,
+  fetchCheckpoint,
+  fetchCheckpoints,
+  fetchRunTimeline,
+  mutateRun,
+  fetchRunProgram,
+  pauseRun,
+  resumeRun,
+  rollbackRun,
+  type CheckpointDetail,
+  type CheckpointSummary,
   startRun,
   stopRun,
   subscribeToDiagram,
+  fetchConversations,
+  fetchBackendStatus,
+  checkProperties,
+  openProofEditor,
+  describeError,
 } from "./lib/runtime-client";
 
 /**
@@ -74,7 +101,7 @@ const HEALTH_POLL_MS = 5000;
 const MIN_BUILDER = 300;
 const MIN_INSPECTOR = 260;
 const MIN_DIAGRAM = 320;
-const DEFAULT_BUILDER = 380;
+const DEFAULT_BUILDER = 520;
 const DEFAULT_INSPECTOR = 400;
 /** Drag past this fraction of a panel's minimum and it collapses. */
 const COLLAPSE_AT = 0.6;
@@ -83,18 +110,62 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-export function Studio({
-  serveUrl = "",
-  designAgent,
-}: {
-  serveUrl?: string;
-  designAgent?: DesignAgent;
+type StudioProps = { serveUrl?: string; designAgent?: DesignAgent };
+
+export function Studio({ serveUrl = "", designAgent }: StudioProps) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const [restoredUrl, setRestoredUrl] = useState<string | null>(null);
+  // Known before the workspace renders, so a view port never flashes controls.
+  const [readOnly, setReadOnly] = useState(false);
+  const select = useCallback((conversation: ConversationSummary) => {
+    setSelected(conversation.id);
+    sessionStorage.setItem(`omar-chat:${serveUrl}`, conversation.id);
+  }, [serveUrl]);
+  useEffect(() => {
+    if (!serveUrl) return;
+    const saved = sessionStorage.getItem(`omar-chat:${serveUrl}`);
+    const abort = new AbortController();
+    const health = checkServeHealth(serveUrl, abort.signal).then((health) => {
+      if (!abort.signal.aborted && health.ok) setReadOnly(health.access === "view");
+    });
+    void fetchConversations(serveUrl, abort.signal).then(async (history) => {
+      await health;
+      if (abort.signal.aborted) return;
+      if (saved && history.conversations.some((chat) => chat.id === saved)) setSelected(saved);
+      setRestoredUrl(serveUrl);
+    }).catch(async () => { await health; if (!abort.signal.aborted) setRestoredUrl(serveUrl); });
+    return () => abort.abort();
+  }, [serveUrl]);
+  // Resolve the tab's saved selection before subscribing to the daemon's
+  // default chat. Otherwise its initial replay can overwrite this tab's choice.
+  if (serveUrl && restoredUrl !== serveUrl) return <main className="studio-shell"><p className="workspace-loading" role="status">Opening your workflows…</p></main>;
+  const scopedUrl = selected ? `${serveUrl.replace(/\/$/, "")}/chats/${encodeURIComponent(selected)}` : serveUrl;
+  return <StudioWorkspace serveUrl={scopedUrl} historyUrl={serveUrl}
+    designAgent={designAgent} selectedId={selected} onSelect={select}
+    readOnly={readOnly} onReadOnly={setReadOnly} />;
+}
+
+function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, onSelect, readOnly, onReadOnly }: StudioProps & {
+  historyUrl: string;
+  selectedId: string | null;
+  onSelect: (conversation: ConversationSummary) => void;
+  /** Served from a view port: watch everything, change nothing. */
+  readOnly: boolean;
+  onReadOnly: (readOnly: boolean) => void;
 }) {
   const isDemo = serveUrl.trim().length === 0;
+  // Requests from a previous selection must not update the retained workspace.
+  const scopeRef = useRef(0);
+  useEffect(() => {
+    scopeRef.current += 1;
+    return () => { scopeRef.current += 1; };
+  }, [serveUrl]);
   const [snapshot, setSnapshot] = useState<DiagramSnapshot | null>(
     isDemo ? reviewWorkflow : null,
   );
   const [source, setSource] = useState(isDemo ? reviewProgram : "");
+  const sourceRef = useRef(source);
+  useEffect(() => { sourceRef.current = source; }, [source]);
   /** What the program is called. Named for the team it declares until the
       operator says otherwise. */
   const [filename, setFilename] = useState(
@@ -103,6 +174,19 @@ export function Studio({
   /** What the compiler said about the source as it stands. */
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [checking, setChecking] = useState(false);
+  const [applyingConfiguration, setApplyingConfiguration] = useState(false);
+  // What applying the edited source to the run would change, while the
+  // operator decides; and whether an applied change is still landing.
+  const [mutationPlan, setMutationPlan] = useState<{ fromAssistant: boolean } | null>(null);
+  /** The source the live run executes, which an edit is shown against. */
+  const [runningProgram, setRunningProgram] = useState<{ run: string; program: string } | null>(null);
+  const [mutating, setMutating] = useState(false);
+  /** What the source pane held before the assistant's change replaced it, so
+      declining the change puts the running program back. */
+  const declinedRef = useRef<{ source: string; design: ProposedDesign | null } | null>(null);
+  /** Takes a proposal that arrives while the run is live; set after render
+      so the chat subscription always reaches the current one. */
+  const proposeChangeRef = useRef<(design: ProposedDesign) => void>(() => {});
   /** Every tag the program passes through, projected or observed. */
   const [steps, setSteps] = useState<TimelineStep[]>([]);
   const [truncated, setTruncated] = useState(false);
@@ -112,12 +196,12 @@ export function Studio({
   const [following, setFollowing] = useState(true);
   /** Ports the operator has set on the live run. */
   // can flip back and forth once there is.
-  const [tab, setTab] = useState<"source" | "events">("source");
+  const [tab, setTab] = useState<"source" | "events" | "properties">("source");
   /** What the run's web agents are waiting to be given. */
   const [pending, setPending] = useState<PendingInvocation[]>([]);
   const [answering, setAnswering] = useState(false);
   const [builderWidth, setBuilderWidth] = useState(DEFAULT_BUILDER);
-  const [inspectorWidth, setInspectorWidth] = useState(DEFAULT_INSPECTOR);
+  const [inspectorWidth, setInspectorWidth] = useState(0);
   // The first design splits the window down the middle. After that the widths
   // are the operator's, so this only ever fires once.
   const arrangedRef = useRef(isDemo);
@@ -131,11 +215,37 @@ export function Studio({
   const [daemon, setDaemon] = useState<Daemon>(
     isDemo ? { state: "demo" } : { state: "checking" },
   );
+  // Bumped by "Retry now" to probe at once instead of at the next poll.
+  const [healthProbe, setHealthProbe] = useState(0);
   const [phase, setPhase] = useState<Phase>("idle");
+  const [assistantBusy, setAssistantBusy] = useState(false);
+  const [selectingChat, setSelectingChat] = useState(false);
+  const [hydratedUrl, setHydratedUrl] = useState(isDemo ? serveUrl : null);
+  const switchingChat = selectingChat || hydratedUrl !== serveUrl;
   const [design, setDesign] = useState<ProposedDesign | null>(null);
+  /** The property whose components the diagram singles out, in the design it
+      belongs to: a new design starts with none. */
+  const [propertyPick, setPropertyPick] = useState<{ design: ProposedDesign; name: string } | null>(null);
+  /** The program a design's verdicts were last checked against, if not its own. */
+  const [recheckedProgram, setRecheckedProgram] = useState<{ design: ProposedDesign; program: string } | null>(null);
+  const [checkingProperties, setCheckingProperties] = useState(false);
+  const [openingProofs, setOpeningProofs] = useState(false);
+  const [propertyError, setPropertyError] = useState("");
   const [run, setRun] = useState<RunRecord | null>(null);
   const [error, setError] = useState("");
+  // The run's checkpoints, drawn on the timeline; the one a resume would
+  // continue from; and the one whose preview is open.
+  const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>([]);
+  const [resumePoint, setResumePoint] = useState<string | null>(null);
+  // The pick is remembered with the run it was made in, so a new run starts
+  // with none without an effect having to clear it.
+  const [checkpointPick, setCheckpointPick] = useState<{ run: string; id: string } | null>(null);
+  const [checkpointDetail, setCheckpointDetail] = useState<CheckpointDetail | null>(null);
+  // Bumped whenever the run says a checkpoint landed, so the listing refetches.
+  const [checkpointEpoch, setCheckpointEpoch] = useState(0);
   const [prompt, setPrompt] = useState("");
+  /** Message text the operator chose to "Chat about this", sent as a blockquote. */
+  const [quote, setQuote] = useState("");
   /** Diagram components the operator has highlighted for the next message. */
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
@@ -143,6 +253,37 @@ export function Studio({
   const activity = useActivity(serveUrl, run?.run_id);
   const [inactivitySeconds, setInactivitySeconds] = useInactivityThreshold();
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
+  const [backendsOpen, setBackendsOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(true);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [historyRevision, setHistoryRevision] = useState(0);
+  const [filesOpen, setFilesOpen] = useState(false);
+  const [inspected, setInspected] = useState<string | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const historyButtonRef = useRef<HTMLButtonElement>(null);
+  const historyRailButtonRef = useRef<HTMLButtonElement>(null);
+  const historyDrawer = useHistoryDrawer();
+  useEffect(() => {
+    if (historyDrawer && !switchingChat && serveUrl !== historyUrl) historyButtonRef.current?.focus();
+  }, [historyDrawer, serveUrl, historyUrl, switchingChat]);
+  const historyVisible = !isDemo && (historyDrawer ? drawerOpen : historyOpen);
+  function closeHistory() {
+    if (historyDrawer) setDrawerOpen(false);
+    else setHistoryOpen(false);
+    historyButtonRef.current?.focus();
+  }
+  function openHistory() {
+    if (historyDrawer) setDrawerOpen(true);
+    else setHistoryOpen(true);
+  }
+  useEffect(() => {
+    if (!isDemo && !historyDrawer && !historyOpen) historyRailButtonRef.current?.focus();
+  }, [historyDrawer, historyOpen, isDemo]);
+
+  const conversationIdRef = useRef<string | null>(null);
+  const [conversationId, setConversationId] = useState("");
+  const workflowNames = useWorkflowNames(historyUrl);
+  const [conversationTitle, setConversationTitle] = useState("What should the team do?");
   /** The web agent whose port panel is open. A program may declare several,
       each with its own ports and prompts, so this names one rather than
       merging them into a shared view. */
@@ -179,19 +320,6 @@ export function Studio({
   const checkTokenRef = useRef(0);
   // Read by the check, which must not re-run every time a run advances.
   const runRef = useRef<RunRecord | null>(null);
-  const restoration = useRef<{ run_id: string; snapshot: DiagramSnapshot; sequence: number } | null>(null);
-  const replayedProposal = useRef(0);
-  const resumeKey = `omar.activity.run:${serveUrl}`;
-  useEffect(() => {
-    if (isDemo) return;
-    try {
-      const saved = JSON.parse(sessionStorage.getItem(resumeKey) ?? "null");
-      if (saved && typeof saved.run_id === "string") {
-        restoration.current = { ...saved, snapshot: assertDiagramSnapshot(saved.snapshot) };
-        replayedProposal.current = saved.sequence ?? 0;
-      }
-    } catch { /* Storage may be disabled or belong to an older client. */ }
-  }, [isDemo, resumeKey]);
   useEffect(() => {
     runRef.current = run;
   }, [run]);
@@ -221,6 +349,83 @@ export function Studio({
     mark(snapshot.reactions, step.reactions);
     return lit;
   }, [steps, stepIndex, snapshot]);
+  const properties = useMemo(() => design?.properties ?? [], [design]);
+  const property = propertyPick && propertyPick.design === design ? propertyPick.name : null;
+  const setProperty = (name: string | null) =>
+    setPropertyPick(name && design ? { design, name } : null);
+  // A new design brings its own verdicts, checked against its own program.
+  const checkedProgram =
+    recheckedProgram && recheckedProgram.design === design ? recheckedProgram.program : design?.program ?? null;
+  // A design without properties has no tab to show them in.
+  const shownTab = tab === "properties" && properties.length === 0 ? "source" : tab;
+  /**
+   * What the selected property is about: the components its statement names,
+   * the teams they sit in, and every team those sit in. The diagram dims the
+   * rest, so the operator sees which part of the system a guarantee covers.
+   */
+  const propertyFocus = useMemo(() => {
+    const verdict = properties.find((candidate) => candidate.name === property);
+    if (!verdict || !snapshot) return undefined;
+    const ids = new Set<string>();
+    const owners = new Set<string>();
+    for (const name of verdict.mentions) {
+      for (const entity of [
+        ...snapshot.ports.filter((port) => port.name === name),
+        ...snapshot.timers.filter((timer) => timer.name === name),
+        ...snapshot.reactions.filter((reaction) => reaction.id === `reaction::${name}`),
+      ]) {
+        ids.add(entity.id);
+        owners.add(entity.instance);
+      }
+    }
+    for (let owner of owners) {
+      // Instances are named by their full path, so each prefix is a parent.
+      while (owner) {
+        ids.add(`instance::${owner}`);
+        owner = owner.includes(".") ? owner.slice(0, owner.lastIndexOf(".")) : "";
+      }
+    }
+    return ids;
+  }, [properties, property, snapshot]);
+  const propertiesStale = properties.length > 0 && checkedProgram !== null && source !== checkedProgram;
+  async function recheckProperties() {
+    if (!design) return;
+    setCheckingProperties(true);
+    setPropertyError("");
+    const program = source;
+    try {
+      const verdicts = await checkProperties(serveUrl, {
+        program,
+        files: design.files,
+        lemmas: design.lemmas,
+        properties: properties.map(({ name, description, statement, proof }) => ({ name, description, statement, proof })),
+      });
+      const next = { ...design, properties: verdicts };
+      setDesign((current) => (current === design ? next : current));
+      setRecheckedProgram({ design: next, program });
+    } catch (cause) {
+      setPropertyError(describeError(cause));
+    } finally {
+      setCheckingProperties(false);
+    }
+  }
+  async function openProofs() {
+    // Opened synchronously from the click, so a popup blocker allows it.
+    const tab = window.open("about:blank", "_blank");
+    if (tab) tab.opener = null;
+    setOpeningProofs(true);
+    setPropertyError("");
+    try {
+      const url = await openProofEditor(serveUrl, properties.map(({ name, source }) => ({ name, source })));
+      if (tab) tab.location.replace(url);
+      else window.open(url, "_blank", "noopener");
+    } catch (cause) {
+      tab?.close();
+      setPropertyError(describeError(cause));
+    } finally {
+      setOpeningProofs(false);
+    }
+  }
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [events, setEvents] = useState<DiagramEvent[]>([]);
   const disconnectRef = useRef<null | (() => void)>(null);
@@ -237,6 +442,7 @@ export function Studio({
       const health = await checkServeHealth(serveUrl);
       if (cancelled) return;
       setDaemon(health.ok ? { state: "live" } : { state: "offline", reason: health.reason });
+      if (health.ok) onReadOnly(health.access === "view");
     };
     void probe();
     const timer = setInterval(() => void probe(), HEALTH_POLL_MS);
@@ -244,7 +450,7 @@ export function Studio({
       cancelled = true;
       clearInterval(timer);
     };
-  }, [isDemo, serveUrl]);
+  }, [isDemo, serveUrl, onReadOnly, healthProbe]);
 
   // One agent for the lifetime of a mode. Demo mode never reaches the network.
   const agent = useMemo(
@@ -252,56 +458,45 @@ export function Studio({
     [designAgent, isDemo, serveUrl],
   );
 
-  // The conversation is owned by the runtime, not this component: the stream
-  // replays history on connect, so a reload rejoins rather than starting over.
-  useEffect(() => {
-    const unsubscribe = agent.subscribe(
-      (message) => {
-        setMessages((current) =>
-          current.some((seen) => seen.sequence === message.sequence)
-            ? current
-            : [...current, message],
-        );
-        if (!message.design) {
-          // Only an assistant reply ends the wait — the operator's own message
-          // echoes back off the same stream, and commentary while it works is
-          // the opposite of finishing. And a reply must not withdraw a pending
-          // proposal: assistants routinely comment straight after proposing
-          // ("…is in your queue"), which was retracting the gate.
-          if (message.role === "assistant" && !message.progress) {
-            setPhase((current) => (current === "drafting" ? "idle" : current));
-          }
-          return;
-        }
-        if (message.sequence <= replayedProposal.current) return;
-        setConfirming(false);
-        setDesign(message.design);
-        setSource(message.design.program);
-        setSourceErrors([]);
-        setFilename(`${message.design.preview.team}.omar`);
-        // Show the proposed topology, not whatever was on screen before.
-        setSnapshot(message.design.preview);
-        if (!arrangedRef.current) {
-          arrangedRef.current = true;
-          const available = workspaceRef.current?.clientWidth ?? 0;
-          // Conversation and diagram side by side; the source pane starts
-          // collapsed behind its handle rather than crowding the first look.
-          if (available) setBuilderWidth(Math.round(available / 2));
-          setInspectorWidth(0);
-        }
-        setPhase("review");
-      },
-      () => {
-        /* daemon health is polled separately */
-      },
-    );
-    // Clear on teardown rather than on subscribe: transcripts belong to an
-    // agent, and setting state synchronously in an effect cascades renders.
-    return () => {
-      unsubscribe();
-      setMessages([]);
-    };
-  }, [agent]);
+  const restoreConversation = useCallback((conversation: ConversationSummary) => {
+    setHistoryRevision((current) => current + 1);
+    setConversationTitle(conversation.message_count ? conversation.title : "What should the team do?");
+    if (conversationIdRef.current === conversation.id) return;
+    conversationIdRef.current = conversation.id;
+    setConversationId(conversation.id);
+    disconnectRef.current?.();
+    disconnectRef.current = null;
+    checkTokenRef.current += 1;
+    runRef.current = null;
+    setMessages([]);
+    setRun(null);
+    setAnswering(false);
+    setChecking(false);
+    setEvents([]);
+    setPending([]);
+    setDesign(null);
+    setSnapshot(null);
+    setSource("");
+    setApplyingConfiguration(false);
+    setFilename("program.omar");
+    setSourceErrors([]);
+    setSelection([]);
+    setInspected(null);
+    setFilesOpen(false);
+    setConfirming(false);
+    setPhase("idle");
+    setPrompt("");
+    setQuote("");
+    setError("");
+    setTerminalAgent(null);
+    setActivityAgent(null);
+    setPanelAgent(null);
+    setSteps([]);
+    setStepIndex(0);
+    setTimelineOpen(false);
+    setTab("source");
+    // Keep the operator's split widths when replacing one topology with another.
+  }, []);
 
   useEffect(() => {
     const thread = threadRef.current;
@@ -311,33 +506,42 @@ export function Studio({
   async function submitPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const request = prompt.trim();
-    if (!request || phase === "drafting" || phase === "spawning") return;
+    if (readOnly || !request || (switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning") return;
     const selected = selection;
+    const quoted = withQuote(quote, request);
     setPrompt("");
+    setQuote("");
+    const scope = scopeRef.current;
     setError("");
     // The selection belonged to the message just sent. Keeping it would
     // silently attach it to the next one too.
     setSelection([]);
-    setPhase("drafting");
+    setAssistantBusy(true);
+    if (!run || isRunFinished(run.status)) setPhase("drafting");
     try {
-      await agent.send(request, selected);
+      await agent.send(quoted, selected);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-      setPhase("idle");
+      if (scope !== scopeRef.current) return;
+      setError(describeError(cause));
+      setAssistantBusy(false);
+      setPhase(run && !isRunFinished(run.status) ? "observing" : "idle");
     }
   }
 
   /** What the run's web agents are waiting on, as of now. */
   const loadPanel = useCallback(
     async (runId: string) => {
+      // A view port refuses the panel: what a web agent is owed is not public.
+      if (readOnly) return;
       try {
-        setPending(await fetchPanel(serveUrl, runId));
+        const next = await fetchPanel(serveUrl, runId);
+        if (runRef.current?.run_id === runId && !isRunFinished(runRef.current.status)) setPending(next);
       } catch {
         // A panel that cannot be read is not a run that has failed. The next
         // event asks again.
       }
     },
-    [serveUrl],
+    [serveUrl, readOnly],
   );
 
   /** Answer one invocation, as one completion. */
@@ -345,31 +549,36 @@ export function Studio({
     invocation: PendingInvocation,
     values: Record<string, unknown>,
   ) {
-    if (!run) return;
+    if (!run || readOnly) return;
     setAnswering(true);
+    const scope = scopeRef.current;
     setError("");
     try {
       await answerPanel(serveUrl, run.run_id, {
-        invocation_id: invocation.invocation_id,
+        task_id: invocation.task_id,
         agent: invocation.agent,
         values,
       });
+      if (scope !== scopeRef.current) return;
       await loadPanel(run.run_id);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (scope !== scopeRef.current) return;
+      setError(describeError(cause));
     } finally {
-      setAnswering(false);
+      if (scope === scopeRef.current) setAnswering(false);
     }
   }
 
   /** Watch a live run until it reaches a terminal status. */
   const observe = useCallback(
     (record: RunRecord) => {
-      const diagramUrl = diagramUrlFor(record);
+      const diagramUrl = diagramUrlFor(record, serveUrl);
       disconnectRef.current?.();
+      let connected = true;
 
       const refresh = async () => {
-        setSnapshot(await fetchDiagram(diagramUrl));
+        const next = await fetchDiagram(diagramUrl);
+        if (connected && !isRunFinished(runRef.current?.status ?? record.status)) setSnapshot(next);
       };
       void refresh().catch(() => {
         /* the SSE stream reports connection loss */
@@ -383,23 +592,27 @@ export function Studio({
       const settle = async () => {
         for (let attempt = 0; attempt < 10; attempt += 1) {
           const latest = await fetchRun(serveUrl, record.run_id).catch(() => null);
-          if (latest) {
+          if (!connected) return;
+          if (latest && isRunFinished(latest.status)) {
+            runRef.current = latest;
             setRun(latest);
-            if (isRunFinished(latest.status)) {
-              // `stopped` is the ending a stop asked for, so it reads as
-              // finished; only `failed` is a failure.
-              setPhase(latest.status === "failed" ? "failed" : "finished");
-              if (latest.error) setError(latest.error);
-              return;
-            }
+            // `stopped` is the ending a stop asked for, so it reads as
+            // finished; only `failed` is a failure. A still-running record
+            // must not undo a terminal event while persistence catches up.
+            setPhase(latest.status === "failed" ? "failed" : "finished");
+            setPending([]);
+            if (latest.status === "failed") setPanelAgent(null);
+            if (latest.error) setError(latest.error);
+            return;
           }
           await new Promise((resolve) => setTimeout(resolve, 300));
         }
       };
 
-      disconnectRef.current = subscribeToDiagram(
+      const unsubscribe = subscribeToDiagram(
         diagramUrl,
         (event) => {
+          if (!connected) return;
           setEvents((current) => [event, ...current].slice(0, 8));
           // A live run walks the same list the projection drew. Matched on the
           // tag rather than counted, so a run that reaches a tag the projection
@@ -431,14 +644,33 @@ export function Studio({
             void loadPanel(record.run_id);
           }
           if (event.kind === "run_completed") {
+            // Release ownership synchronously: the EA can propose again before
+            // the final run record is persisted or React commits this update.
+            runRef.current = { ...record, status: "completed" };
+            setRun(runRef.current);
             setPhase("finished");
             // The run's invocation service goes with it, so nothing is owed
             // any more whatever the last fetch saw.
             setPending([]);
             void settle();
           }
+          if (event.kind === "run_checkpointed" || event.kind === "run_paused") {
+            // A new mark for the timeline: refetch the listing it draws.
+            setCheckpointEpoch((n) => n + 1);
+          }
+          if (event.kind === "run_paused") {
+            // Checkpointed and parked at a tag boundary: the picture stays,
+            // labelled paused, and nothing is owed until `omar resume`.
+            setPhase("finished");
+            setPending([]);
+            void settle();
+          }
           if (event.kind === "run_failed") {
+            runRef.current = { ...record, status: "failed" };
+            setRun(runRef.current);
             setPhase("failed");
+            setPending([]);
+            setPanelAgent(null);
             const message = (event.payload as { message?: unknown }).message;
             setError(typeof message === "string" ? message : "The run failed.");
             void settle();
@@ -448,52 +680,218 @@ export function Studio({
         // expected at the end rather than an error. Ask serve what happened.
         () => void settle(),
       );
+      disconnectRef.current = () => {
+        connected = false;
+        unsubscribe();
+      };
     },
     [serveUrl, loadPanel],
   );
 
-  // A browser reload reattaches to the exact selected run. Only topology
-  // structure/status is cached; activity and outcomes are re-fetched from the
-  // daemon. This is not saved chat history.
+  // A chat can be reopened during admission, before its diagram binds.
   useEffect(() => {
-    if (isDemo) return;
-    const saved = restoration.current;
-    if (!saved) return;
-    let cancelled = false;
-    void fetchRun(serveUrl, saved.run_id).then((record) => {
-      if (cancelled || runRef.current) return;
-      runRef.current = record;
-      setRun(record);
-      setSnapshot(saved.snapshot);
-      setPhase(isRunFinished(record.status) ? record.status === "failed" ? "failed" : "finished" : "observing");
-      setInspectorWidth(0);
-      setBuilderWidth(DEFAULT_BUILDER);
-      if (!isRunFinished(record.status)) observe(record);
-    }).catch(() => { /* Daemon restart has no resumable run; no outcome inferred. */ });
-    return () => { cancelled = true; };
-  }, [isDemo, serveUrl, observe]);
-  useEffect(() => {
-    if (isDemo || !run || !snapshot || snapshot.team !== run.team) return;
-    try {
-      sessionStorage.setItem(resumeKey, JSON.stringify({ run_id: run.run_id,
-        sequence: Math.max(replayedProposal.current, ...messages.map((m) => m.sequence)),
-        snapshot: { ...snapshot, ports: snapshot.ports.map((port) => ({ ...port, value: null })) },
-      }));
-    } catch { /* Quota/disabled storage must not affect execution. */ }
-  }, [isDemo, run, snapshot, messages, resumeKey]);
+    if (switchingChat || !run || run.diagram_address || isRunFinished(run.status)) return;
+    const abort = new AbortController();
+    const poll = async () => {
+      try {
+        const latest = await fetchRun(serveUrl, run.run_id, abort.signal);
+        if (abort.signal.aborted) return;
+        runRef.current = latest;
+        setRun(latest);
+        if (isRunFinished(latest.status)) {
+          setPhase(latest.status === "failed" ? "failed" : "finished");
+          if (latest.error) setError(latest.error);
+        } else if (latest.diagram_address) {
+          observe(latest);
+          void loadPanel(latest.run_id);
+        }
+      } catch { /* daemon health reports connectivity */ }
+    };
+    const timer = setInterval(() => void poll(), 500);
+    return () => { abort.abort(); clearInterval(timer); };
+  }, [run, serveUrl, observe, loadPanel, switchingChat]);
 
-  async function confirmDesign() {
-    if (!design || phase !== "review") return;
+  // The conversation is owned by the runtime, not this component: the stream
+  // replays history on connect, so a reload rejoins rather than starting over.
+  useEffect(() => {
+    let connected = true;
+    let revision = 0;
+    const abort = new AbortController();
+    let subscribedId: string | undefined;
+    let replaying = false;
+    let replayedProposal = false;
+    let restoring = false;
+    let buffered: ChatMessage[] = [];
+    const applyMessage = (message: ChatMessage) => {
+      if (message.role === "operator") {
+        setAssistantBusy(true);
+        setConversationTitle((title) => title === "What should the team do?" ? message.text.replace(/\s+/g, " ").slice(0, 80) : title);
+      }
+      setMessages((current) =>
+        current.some((seen) => seen.sequence === message.sequence)
+          ? current
+          : [...current, message],
+      );
+      if (message.role === "assistant" && !message.progress) setAssistantBusy(false);
+      if (!message.design) {
+        // Only an assistant reply ends the wait — the operator's own message
+        // echoes back off the same stream, and commentary while it works is
+        // the opposite of finishing. And a reply must not withdraw a pending
+        // proposal: assistants routinely comment straight after proposing
+        // ("…is in your queue"), which was retracting the gate.
+        if (message.role === "assistant" && !message.progress) {
+          setPhase((current) => (current === "drafting" ? "idle" : current));
+        }
+        return;
+      }
+      if (replaying) replayedProposal = true;
+      // A fresh proposal remains in the transcript while this chat's
+      // deployed topology continues to own the live diagram and controls.
+      // A change to the live run, paused or not: shown as the plan that
+      // applies it rather than as a design to deploy.
+      if (!replaying && runRef.current && ["running", "paused"].includes(runRef.current.status)) {
+        proposeChangeRef.current(message.design);
+        return;
+      }
+      if (!replaying && runRef.current && !isRunFinished(runRef.current.status)) return;
+      if (!runRef.current || isRunFinished(runRef.current.status)) {
+        // The proposal now owns the view. Disconnecting also invalidates any
+        // in-flight refresh/settle responses belonging to the previous run.
+        disconnectRef.current?.();
+        disconnectRef.current = null;
+        runRef.current = null;
+        setRun(null);
+        setEvents([]);
+        setPending([]);
+        setPanelAgent(null);
+        setSelection([]);
+        setTab("source");
+        setError("");
+      }
+      setConfirming(false);
+      setDesign(message.design);
+      setSource(message.design.program);
+      setSourceErrors([]);
+      setFilename(`${message.design.preview.team}.omar`);
+      // Show the proposed topology, not whatever was on screen before.
+      setSnapshot(message.design.preview);
+      if (!arrangedRef.current) {
+        arrangedRef.current = true;
+        const available = workspaceRef.current?.clientWidth ?? 0;
+        // Conversation and diagram side by side; the source pane starts
+        // collapsed behind its handle rather than crowding the first look.
+        if (available) setBuilderWidth(Math.min(DEFAULT_BUILDER, Math.round(available / 2)));
+        setInspectorWidth(0);
+      }
+      setPhase(runRef.current && !isRunFinished(runRef.current.status) ? "observing" : "review");
+    };
+    const unsubscribe = agent.subscribe(
+      (message) => {
+        if (!connected) return;
+        if (restoring) buffered.push(message);
+        else if (!subscribedId || subscribedId === conversationIdRef.current) applyMessage(message);
+      },
+      () => {
+        /* daemon health is polled separately */
+      },
+      (conversation) => {
+        revision += 1;
+        subscribedId = conversation.id;
+        restoring = true;
+        buffered = [];
+      },
+      (conversation) => {
+        if (!connected || conversation.id !== subscribedId) return;
+        const currentRevision = ++revision;
+        const replay = buffered;
+        buffered = [];
+        const restore = async () => {
+          const activeRun = conversation.run && !isRunFinished(conversation.run.status);
+          // Parked, not over: a paused run keeps its controls and its timeline.
+          const parkedRun = conversation.run?.status === "paused";
+          // Keep the current chat on screen while its replacement is replayed
+          // and its live snapshot is fetched. Commit them in one React batch.
+          // A paused run's diagram server is gone; serve kept its last picture.
+          const liveSnapshot = activeRun && conversation.run?.diagram_address
+            ? await fetchDiagram(diagramUrlFor(conversation.run, serveUrl), abort.signal).catch(() => null)
+            : conversation.run?.status === "paused"
+              ? await fetchRunSnapshot(serveUrl, conversation.run.run_id, abort.signal).catch(() => null)
+              : null;
+          if (!connected || currentRevision !== revision || conversation.id !== subscribedId) return;
+          restoreConversation(conversation);
+          runRef.current = conversation.run ?? null;
+          setRun(conversation.run ?? null);
+          replaying = true;
+          replayedProposal = false;
+          for (const message of replay) applyMessage(message);
+          replaying = false;
+          if (liveSnapshot) setSnapshot(liveSnapshot);
+          setHydratedUrl(serveUrl);
+          if (serveUrl === historyUrl) onSelect(conversation);
+          if (conversation.run) {
+            const record = conversation.run;
+            runRef.current = record;
+            setRun(record);
+            setConfirming(false);
+            setPhase(isRunFinished(record.status) ? (record.status === "failed" ? "failed" : "finished") : "observing");
+            setTab("events");
+            if (!isRunFinished(record.status) && record.diagram_address) {
+              observe(record);
+              void loadPanel(record.run_id);
+            }
+          }
+          setAssistantBusy(conversation.busy);
+          // A finished run must not override the proposal restored from the
+          // transcript. Only a live topology owns the diagram and its controls.
+          if (replayedProposal && !activeRun && !parkedRun) {
+            runRef.current = null;
+            // Keep a failed record visible beside the restored proposal.
+            // The proposal owns the source; the record explains the last run.
+            setRun(conversation.run?.status === "failed" ? conversation.run : null);
+            if (conversation.run?.status === "failed") setError(conversation.run.error ?? "The run failed.");
+            setTab("source");
+            setPhase("review");
+          } else if (conversation.busy && !activeRun && !parkedRun) {
+            setPhase("drafting");
+          }
+          // Replies received during the snapshot fetch are newer than the
+          // replay's state marker; apply them last so busy/proposals stay fresh.
+          const liveMessages = buffered;
+          buffered = [];
+          restoring = false;
+          for (const message of liveMessages) applyMessage(message);
+        };
+        void restore();
+      },
+    );
+    return () => {
+      connected = false;
+      abort.abort();
+      unsubscribe();
+      disconnectRef.current?.();
+      disconnectRef.current = null;
+    };
+  }, [agent, restoreConversation, observe, loadPanel, serveUrl, historyUrl, onSelect]);
+
+  async function confirmDesign(options: DeployOptions) {
+    if (!design || !["review", "finished", "failed"].includes(phase)) return;
     setConfirming(false);
     setPhase("spawning");
+    const scope = scopeRef.current;
     setError("");
     try {
       // The source, not the design: the operator may have edited it, and what
       // they are looking at is what they are deploying.
       const record = await startRun(serveUrl, {
         program: source,
+        files: design.files,
         inputs: design.inputs,
+        timeout_seconds: options.timeoutSeconds,
+        conversation_id: conversationIdRef.current ?? undefined,
+        keep_workspaces: options.keepWorkspaces,
+        checkpoint_period: options.checkpointPeriod,
       });
+      if (scope !== scopeRef.current) return;
       setSnapshot((current) => (current ? { ...current, team: record.team } : current));
       setRun(record);
       setPhase("observing");
@@ -501,7 +899,8 @@ export function Studio({
 
       observe(record);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (scope !== scopeRef.current) return;
+      setError(describeError(cause));
       setPhase("review");
     }
   }
@@ -520,11 +919,199 @@ export function Studio({
    */
   async function requestStop() {
     if (!run || isStopping) return;
+    const scope = scopeRef.current;
     setError("");
     try {
-      setRun(await stopRun(serveUrl, run.run_id));
+      const record = await stopRun(serveUrl, run.run_id);
+      if (scope === scopeRef.current) setRun(record);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (scope !== scopeRef.current) return;
+      setError(describeError(cause));
+    }
+  }
+
+  async function applyStepConfiguration(nextSource: string) {
+    if (applyingConfiguration) throw new Error("Another configuration update is being validated.");
+    const scope = scopeRef.current;
+    const original = source;
+    if (daemon.state !== "live" || (run && !isRunFinished(run.status))) throw new Error("Wait until the workflow is idle before editing its configuration.");
+    setApplyingConfiguration(true);
+    try {
+      const checked = await checkProgram(serveUrl, nextSource, filename, { files: design?.files });
+      if (scope !== scopeRef.current || sourceRef.current !== original) throw new Error("The workflow changed during validation. Reopen this step and try again.");
+      if (runRef.current && !isRunFinished(runRef.current.status)) throw new Error("The workflow started during validation. Apply these changes after it finishes.");
+      if (!checked.ok) throw new Error((checked.errors ?? ["The configuration did not compile."]).join("\n"));
+      setSource(nextSource);
+      setSourceErrors([]);
+      if (checked.preview && !runRef.current) setSnapshot(checked.preview);
+    } finally {
+      if (scope === scopeRef.current) setApplyingConfiguration(false);
+    }
+  }
+
+  /** Ask the run to checkpoint and park at its next tag boundary. */
+  async function requestPause() {
+    if (!run || isStopping || isPausing) return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const record = await pauseRun(serveUrl, run.run_id);
+      if (scope === scopeRef.current) setRun(record);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(describeError(cause));
+    }
+  }
+
+  /**
+   * Show what changing the run to `program` would do: the operator's edited
+   * source, or a program the assistant proposed for the live run.
+   */
+  async function previewMutation(program = source, files = design?.files, fromAssistant = false) {
+    const current = runRef.current;
+    // Even the preview is a POST, which a view port refuses.
+    if (readOnly || !current || mutating) return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const { changes } = await mutateRun(serveUrl, current.run_id, {
+        program,
+        filename,
+        files,
+        dry_run: true,
+      });
+      if (scope !== scopeRef.current) return;
+      if (changes.length === 0) {
+        if (fromAssistant) restoreDeclined();
+        setError(fromAssistant
+          ? "OMAR's proposal matches what the run is executing; there is nothing to apply."
+          : "The source matches what the run is executing; there is nothing to apply.");
+        return;
+      }
+      setMutationPlan({ fromAssistant });
+      // The plan is shown above the source it came from.
+      setTab("source");
+      setInspectorWidth((width) => width || DEFAULT_INSPECTOR);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      if (fromAssistant) restoreDeclined();
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(fromAssistant ? `OMAR's proposal cannot be applied to this run: ${message}` : message);
+    }
+  }
+
+  /** Put back what the source pane held before the assistant's change. */
+  function restoreDeclined() {
+    const declined = declinedRef.current;
+    declinedRef.current = null;
+    if (!declined) return;
+    setSource(declined.source);
+    setDesign(declined.design);
+  }
+
+  function cancelMutation() {
+    if (mutationPlan?.fromAssistant) restoreDeclined();
+    declinedRef.current = null;
+    setMutationPlan(null);
+  }
+
+  useEffect(() => {
+    proposeChangeRef.current = (proposed) => {
+      if (mutating) return;
+      // The first change still pending keeps what the run really executes.
+      if (!declinedRef.current) declinedRef.current = { source, design };
+      setDesign(proposed);
+      setSource(proposed.program);
+      setSourceErrors([]);
+      void previewMutation(proposed.program, proposed.files, true);
+    };
+  });
+
+  /**
+   * Change the run to the edited source. A running run pauses at its next tag
+   * boundary, takes the change and resumes on its own, under a new diagram
+   * address; this follows it until it is back, then watches it again.
+   */
+  async function applyMutation() {
+    if (!run || mutating) return;
+    const scope = scopeRef.current;
+    setMutating(true);
+    setError("");
+    try {
+      let { record } = await mutateRun(serveUrl, run.run_id, {
+        program: source,
+        filename,
+        files: design?.files,
+      });
+      if (scope !== scopeRef.current) return;
+      setMutationPlan(null);
+      declinedRef.current = null;
+      if (!record) return;
+      runRef.current = record;
+      setRun(record);
+      const wasPaused = record.status === "paused";
+      // As long as a pause may take: the tag in progress closes first.
+      const deadline = Date.now() + 420_000;
+      while (
+        Date.now() < deadline &&
+        (record.mutation?.status === "pending" ||
+          record.status === "pausing" ||
+          record.status === "starting" ||
+          (!wasPaused && record.status === "paused"))
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        record = await fetchRun(serveUrl, record.run_id);
+        if (scope !== scopeRef.current) return;
+      }
+      runRef.current = record;
+      setRun(record);
+      setCheckpointEpoch((n) => n + 1);
+      if (record.mutation?.status === "failed") {
+        setError(`The change was not applied: ${record.mutation.error ?? "unknown error"}`);
+      }
+      if (record.status === "running" && record.diagram_address) {
+        setPhase("observing");
+        observe(record);
+      }
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(describeError(cause));
+    } finally {
+      if (scope === scopeRef.current) setMutating(false);
+    }
+  }
+
+  /** Move the resume point of a paused run back to the checkpoint picked on the timeline. */
+  async function requestRollback(checkpoint: string) {
+    if (!run || run.status !== "paused" || checkpoint === resumePoint) return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const point = await rollbackRun(serveUrl, run.run_id, checkpoint);
+      if (scope !== scopeRef.current) return;
+      setResumePoint(point);
+      setCheckpointEpoch((n) => n + 1);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(describeError(cause));
+    }
+  }
+
+  /** Continue a paused run: the daemon restores its files and agents, then the panel watches it again. */
+  async function requestResume() {
+    if (!run || run.status !== "paused") return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const record = await resumeRun(serveUrl, run.run_id);
+      if (scope !== scopeRef.current) return;
+      runRef.current = record;
+      setRun(record);
+      setPhase("observing");
+      observe(record);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(describeError(cause));
     }
   }
 
@@ -538,11 +1125,16 @@ export function Studio({
   }
 
   function discardDesign() {
+    disconnectRef.current?.();
+    disconnectRef.current = null;
     setTab("source");
     setConfirming(false);
     setDesign(null);
+    setRun(null);
+    runRef.current = null;
     // The diagram those names pointed at is going away with the design.
     setSelection([]);
+    setInspected(null);
     // Discarding puts the studio back where it was before the proposal —
     // leaving the topology on screen implies a design is still in play.
     setSnapshot(isDemo ? reviewWorkflow : null);
@@ -563,17 +1155,38 @@ export function Studio({
   // messages, which told an operator nothing they wanted to know.
   const lag = typeof snapshot?.lag === "number" ? formatDuration(snapshot.lag) : "—";
   const canRun = daemon.state === "live";
+  // With no backend signed in there is nothing for the assistant to run on,
+  // so the Backends page comes first. Asked once per runtime.
+  useEffect(() => {
+    if (!canRun || readOnly || isDemo) return;
+    let cancelled = false;
+    fetchBackendStatus(serveUrl)
+      .then((list) => {
+        if (!cancelled && list && !list.some((status) => status.status === "connected")) setBackendsOpen(true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [canRun, readOnly, isDemo, serveUrl]);
+  const retrying = run !== null && isRunFinished(run.status);
+  const canConfirm = !readOnly && design !== null && ["review", "finished", "failed"].includes(phase);
+  const failedRun = run?.status === "failed";
+  const failureDetails = failedRun ? (run.error || error || "The run failed.") : "";
+  const failure = failedRun ? describeRunFailure(failureDetails, snapshot?.agents ?? []) : null;
+  const manualStep = phase === "observing" ? pending[0] : undefined;
   // The compiler answers on every pause in typing. Debounced because a check
   // compiles a real program on disk, and aborted on the next keystroke so a
   // stale answer cannot land after a newer one.
   useEffect(() => {
     const abort = new AbortController();
     const token = ++checkTokenRef.current;
+    if (switchingChat) return;
     const current = () => checkTokenRef.current === token;
     const timer = setTimeout(() => {
       // Nothing to check against, or nothing to check: clear rather than leave
       // an error standing for text that is gone.
-      if (!canRun || source.trim() === "") {
+      if (!canRun || readOnly || source.trim() === "") {
         setSourceErrors([]);
         return;
       }
@@ -589,6 +1202,7 @@ export function Studio({
         filename,
         {
           timeline: true,
+          files: design?.files,
           present: presentKey ? presentKey.split("\u0000") : [],
         },
         abort.signal,
@@ -601,7 +1215,7 @@ export function Studio({
           // every transient error would make it flicker for the whole of an
           // edit. And only until a run exists, after which the diagram belongs
           // to what is running rather than to what has since been typed.
-          if (result.ok && result.preview && runRef.current === null) {
+          if (result.ok && result.preview && (runRef.current === null || (phase === "review" && isRunFinished(runRef.current.status)))) {
             setSnapshot(result.preview);
           }
           setSteps(result.steps ?? []);
@@ -622,12 +1236,146 @@ export function Studio({
       clearTimeout(timer);
       abort.abort();
     };
-  }, [source, filename, serveUrl, canRun, presentKey]);
+  }, [source, filename, serveUrl, canRun, readOnly, presentKey, switchingChat, phase, design?.files]);
 
   const isDeployed = run !== null;
   // The daemon's own word for it. Every terminal status replaces it, so the
   // state cannot outlive the run it was asked of.
   const isStopping = run?.status === "stopping";
+  const isPausing = run?.status === "pausing";
+  const isPaused = run?.status === "paused";
+
+  // The run's checkpoints, for the timeline. Keyed on the run's id rather
+  // than the record object, which every poll replaces; refetched when the
+  // run reports a new checkpoint, pauses, or rolls back.
+  const runId = run?.run_id;
+  const selectedCheckpoint =
+    checkpointPick && checkpointPick.run === runId ? checkpointPick.id : null;
+  useEffect(() => {
+    if (!runId) return;
+    const scope = scopeRef.current;
+    void fetchCheckpoints(serveUrl, runId)
+      .then((listing) => {
+        if (scope !== scopeRef.current) return;
+        setCheckpoints(listing.checkpoints);
+        setResumePoint(listing.resume_point);
+      })
+      .catch(() => {});
+  }, [runId, serveUrl, checkpointEpoch]);
+
+  // What the run executes, refetched when a mutation or a rollback changes it.
+  const runLive = run ? ["running", "pausing", "paused"].includes(run.status) : false;
+  useEffect(() => {
+    if (!runId || !runLive) return;
+    const scope = scopeRef.current;
+    void fetchRunProgram(serveUrl, runId)
+      .then(({ program }) => {
+        if (scope === scopeRef.current) setRunningProgram({ run: runId, program });
+      })
+      .catch(() => {});
+  }, [runId, runLive, serveUrl, checkpointEpoch]);
+  const diffBase = runLive && runningProgram && runningProgram.run === runId ? runningProgram.program : null;
+
+  // A run observed without a draft behind it (admitted over the API, or the
+  // page reloaded) still gets its timeline: the daemon projects it from the
+  // program it staged, so checkpoints have tags to sit on.
+  const stepsMissing = steps.length === 0;
+  useEffect(() => {
+    if (!runId || !stepsMissing) return;
+    const scope = scopeRef.current;
+    void fetchRunTimeline(serveUrl, runId)
+      .then((projection) => {
+        if (scope !== scopeRef.current || projection.steps.length === 0) return;
+        setSteps(projection.steps);
+        setTruncated(projection.truncated);
+      })
+      .catch(() => {});
+  }, [runId, serveUrl, stepsMissing]);
+
+  // The preview of the checkpoint picked on the timeline. Shown only while
+  // it matches the pick, so a stale detail never describes another one.
+  useEffect(() => {
+    if (!runId || !selectedCheckpoint) return;
+    const scope = scopeRef.current;
+    void fetchCheckpoint(serveUrl, runId, selectedCheckpoint)
+      .then((detail) => {
+        if (scope === scopeRef.current) setCheckpointDetail(detail);
+      })
+      .catch(() => {});
+  }, [runId, serveUrl, selectedCheckpoint, checkpointEpoch]);
+  const shownDetail =
+    selectedCheckpoint && checkpointDetail?.id === selectedCheckpoint ? checkpointDetail : null;
+
+  // Pause, Stop and Resume act on the run's timeline — a pause lands at a tag
+  // boundary, a resume continues from a checkpointed tag — so they live with
+  // the strip rather than in the heading, and stay reachable when it is folded.
+  // Each of these asks the runtime to act, so none can while it is offline.
+  const offline = daemon.state === "offline";
+  const runControls =
+    !readOnly && ((phase === "observing" && run) || (isPaused && run)) ? (
+      <span className="run-controls" role="group" aria-label="Run controls">
+        {isPaused && run ? (
+          <button
+            className="primary-button"
+            onClick={() => void requestResume()}
+            type="button"
+            disabled={offline}
+            title={offline ? "Runtime offline" : "Restores the resume point's files and agents, then continues the queue"}
+          >
+            Resume
+          </button>
+        ) : null}
+        {phase === "observing" && run ? (
+          <button
+            className="secondary-button"
+            onClick={() => void requestPause()}
+            type="button"
+            disabled={offline || isStopping || isPausing}
+            title={
+              offline
+                ? "Runtime offline"
+                : isPausing
+                ? "The current tag has to close first"
+                : "Checkpoints at the next tag boundary, then parks the run"
+            }
+          >
+            {isPausing ? "Pausing…" : "Pause"}
+          </button>
+        ) : null}
+        {((phase === "observing" && run?.status === "running") || isPaused) && run ? (
+          <button
+            className="secondary-button"
+            onClick={() => void previewMutation()}
+            type="button"
+            disabled={offline || mutating || sourceErrors.length > 0 || run.mutation?.status === "pending"}
+            title={offline ? "Runtime offline" : "Shows what changing the run to the edited source would do, then applies it"}
+          >
+            {mutating || run.mutation?.status === "pending" ? "Applying…" : "Apply edits"}
+          </button>
+        ) : null}
+        {(phase === "observing" || isPaused) && run ? (
+          <button
+            className="secondary-button"
+            onClick={() => void requestStop()}
+            type="button"
+            disabled={offline || isStopping}
+            title={
+              offline
+                ? "Runtime offline"
+                : isStopping
+                ? "The current tag has to close first"
+                : isPaused
+                  ? "Gives the paused run up, which frees its team; its checkpoints stay on disk"
+                  : isPausing
+                    ? "Outranks the pause: the run stops at the next tag boundary instead"
+                    : "Closes the current tag, then persists and tears down"
+            }
+          >
+            {isStopping ? "Stopping…" : "Stop"}
+          </button>
+        ) : null}
+      </span>
+    ) : null;
 
   // Widths are clamped against the workspace so the diagram always keeps a
   // usable column, whichever divider is being dragged. Below a panel's minimum
@@ -663,52 +1411,84 @@ export function Studio({
     ? `${builderWidth}px auto minmax(0, 1fr) auto ${inspectorWidth}px`
     : "minmax(0, 1fr)";
 
+  function editSource() {
+    setFilesOpen(false);
+    setInspected(null);
+    setTab("source");
+    setInspector(DEFAULT_INSPECTOR);
+  }
+
+  const assistantTerminal = (
+    <button
+      type="button"
+      className="terminal-button"
+      onClick={() => setTerminalAgent(ASSISTANT)}
+      disabled={daemon.state !== "live" || switchingChat || !conversationId}
+      aria-haspopup="dialog"
+    >
+      Inspect terminal
+    </button>
+  );
+
+  function askAboutStep(request: string) {
+    setPrompt(request);
+    if (builderWidth === 0) setBuilder(DEFAULT_BUILDER);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
   return (
     <main className="studio-shell">
-      <header className="topbar">
-        <div className="brand">
-          {/* Fixed-size brand mark served straight from /public: next/image
-              would only add a loader round-trip on Workers. */}
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img className="brand-mark" src="/omar-logo.png" alt="" width={40} height={40} />
-          <span>OMAR <b>Mission Control</b></span>
-        </div>
-        <div className="runtime-controls">
-          {!isDemo ? (
-            <button
-              type="button"
-              className="terminal-button"
-              onClick={() => setTerminalAgent(ASSISTANT)}
-              disabled={daemon.state !== "live"}
-              aria-haspopup="dialog"
-            >
-              Inspect on terminal
-            </button>
-          ) : null}
-          <span
-            className={`daemon ${daemon.state}`}
-            aria-label="Runtime mode"
-            title={daemon.state === "offline" ? daemon.reason : undefined}
-          >
-            <i />
-            {daemon.state === "demo" ? "demo topology" : serveUrl}
-            {daemon.state === "offline" ? " · unreachable" : null}
-          </span>
-          <span className="connection" data-phase={phase}>
-            {phase}
-          </span>
-        </div>
-      </header>
+      <div className="visually-hidden" aria-live="polite">
+        <span className={`daemon ${daemon.state}`} aria-label="Runtime mode">
+          {isDemo ? "demo topology" : historyUrl}{daemon.state === "offline" ? " · unreachable" : ""}
+        </span>
+        <span className="connection" data-phase={phase}>{phase}</span>
+      </div>
 
+      <div className="studio-content">
+        {isDemo ? <aside className="chat-history demo-history" aria-label="Workflow navigation"><header><div className="brand-lockup"><OmarLogo /><strong>OMAR</strong></div></header><div className="sidebar-heading"><div><span className="eyebrow">WORKSPACE</span><h2>Workflows</h2></div><span className="workflow-count">1</span></div><div className="history-label">DEMO WORKFLOW</div><ul><li><button type="button" aria-current="true" onClick={() => composerRef.current?.focus()}><span className="workflow-name">Review workflow <WorkflowIcon name="chevron" size={14} /></span><span className="workflow-description">Plan, review, and refine a release</span><span className="workflow-meta"><small className="workflow-status status-draft"><i />Demo</small></span></button></li></ul></aside> : null}
+        {!isDemo && (!historyDrawer || drawerOpen) ? (
+          <ChatHistory
+            serveUrl={historyUrl}
+            activeId={selectedId ?? conversationId}
+            onSwitchingChange={setSelectingChat}
+            readOnly={readOnly}
+            offline={daemon.state === "offline"}
+            mobile={historyDrawer}
+            revision={`${historyRevision}:${messages.length}`}
+            collapsed={!historyDrawer && !historyOpen}
+            onClose={closeHistory}
+            onSelect={(conversation) => {
+              onSelect(conversation);
+              if (historyDrawer) setDrawerOpen(false);
+            }}
+          />
+        ) : null}
+        {!isDemo && !historyDrawer ? (
+          <Resizer
+            label="the workflow list"
+            collapsed={!historyOpen}
+            toward="right"
+            fixed
+            handleRef={historyRailButtonRef}
+            onExpand={openHistory}
+            onCollapse={closeHistory}
+            onDragStart={() => {}}
+            onDelta={() => {}}
+            onStep={() => {}}
+          />
+        ) : null}
       <section
         ref={workspaceRef}
         className="workspace"
+        inert={switchingChat}
+        aria-busy={switchingChat}
         style={{ gridTemplateColumns: columns }}
       >
         <aside
           className={[
             "builder-panel",
-            builderWidth === 0 ? "collapsed" : "",
+            snapshot && builderWidth === 0 ? "collapsed" : "",
             // Alone in the window, so the thread is read as a column rather
             // than stretched across it.
             snapshot ? "" : "solo",
@@ -717,29 +1497,48 @@ export function Studio({
             .filter(Boolean)
             .join(" ")}
         >
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">WORKFLOW BUILDER</span>
-              <h1>What should the team do?</h1>
+          <h1 className="visually-hidden">{workflowNames[conversationId]?.name ?? conversationTitle}</h1>
+          <header className="conversation-header">
+            {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
+            <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
+            <div className="conversation-actions"><SettingsMenu onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+          </header>
+          {daemon.state === "offline" ? (
+            // The one place the outage is reported: the sidebar and composer
+            // defer to it. Amber, since it clears by itself once the runtime
+            // answers the next health probe.
+            <div className="runtime-offline" role="status" title={`${historyUrl}: ${daemon.reason}`}>
+              <i aria-hidden="true" />
+              <span><strong>Runtime offline</strong> · reconnecting…</span>
+              <span className="runtime-offline-hint">Start it with <code>omar up -s &lt;session&gt;</code></span>
+              <button type="button" className="link-button" onClick={() => setHealthProbe((n) => n + 1)}>Retry now</button>
             </div>
-          </div>
+          ) : null}
           <div className="messages" ref={threadRef}>
+            {messages.length > 0 ? <div className="date-divider">Conversation</div> : null}
             {messages.length === 0 && snapshot ? (
               <p className="builder-status">
-                Describe a workflow. The assistant drafts an OMAR program for
-                you to confirm before anything runs.
+                Describe a workflow you want to automate — from development to
+                marketing and beyond. The assistant will draft an implementation
+                for you to review and run.
               </p>
             ) : null}
             {messages.map((message) => (
               <ChatMessageView key={message.sequence} message={message} />
             ))}
-            {phase === "drafting" ? <Waiting /> : null}
+            {assistantBusy ? <Waiting /> : null}
             {phase === "spawning" ? <Waiting label="Starting the run" /> : null}
           </div>
+          {readOnly ? null : <QuoteSelection threadRef={threadRef} onQuote={(text) => { setQuote(text); composerRef.current?.focus(); }} />}
 
-          {error ? <div className="connection-error">{error}</div> : null}
+          {error ? (
+            <div className="connection-error" role="alert">
+              <span>{error}</span>
+              <button type="button" className="error-dismiss" aria-label="Dismiss error" onClick={() => setError("")}>×</button>
+            </div>
+          ) : null}
 
-          {selection.length > 0 ? (
+          {selection.length > 0 && !readOnly ? (
             <div className="selection-bar">
               <span className="selection-label">
                 [{selection.join(", ")}] selected
@@ -747,15 +1546,32 @@ export function Studio({
               <button
                 type="button"
                 className="selection-clear"
-                onClick={() => setSelection([])}
+                onClick={() => { setSelection([]); setInspected(null); }}
               >
                 Clear
               </button>
             </div>
           ) : null}
 
+          {readOnly ? (
+            // Nothing here writes, so the composer gives way to saying so.
+            <div className="prompt-box view-only">
+              <div className="composer-tools">
+                <span className="composer-status view-only-badge" role="status">View only</span>
+                {assistantTerminal}
+              </div>
+            </div>
+          ) : (
           <form className="prompt-box" onSubmit={(event) => void submitPrompt(event)}>
+            {quote ? (
+              <div className="composer-quote">
+                <blockquote>{quote}</blockquote>
+                <button type="button" aria-label="Remove quote" onClick={() => setQuote("")}>×</button>
+              </div>
+            ) : null}
             <textarea
+              ref={composerRef}
+              disabled={switchingChat || (!isDemo && !conversationId)}
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
               onKeyDown={(event) => {
@@ -766,27 +1582,44 @@ export function Studio({
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
               }}
-              placeholder="Describe a workflow…  Enter to send, Shift+Enter for a new line"
+              placeholder={snapshot ? "Ask OMAR to update this workflow…" : "Describe a workflow you want to automate…"}
+              title="Enter to send, Shift+Enter for a new line"
               aria-label="Describe a workflow"
             />
             <div>
-              {phase === "review" && !canRun ? (
-                // Why deploying is unavailable, which is about this composer's
-                // reach rather than about the workflow. The run's own state
-                // left with the buttons: the panel says STATUS beside the
-                // control that changes it, and saying it twice invited the two
-                // to disagree.
-                <span className="composer-status">
-                  {daemon.state === "demo"
-                    ? "Demo topology — relaunch with OMAR_SERVE_URL to deploy"
-                    : `Cannot reach omar serve at ${serveUrl}`}
-                </span>
-              ) : (
-                <BackendMenu
-                  serveUrl={serveUrl}
-                  live={daemon.state === "live"}
-                />
-              )}
+              <div className="composer-tools">
+                {phase === "review" && !canRun ? (
+                  // Why deploying is unavailable, which is about this composer's
+                  // reach rather than about the workflow. The run's own state
+                  // left with the buttons: the panel says STATUS beside the
+                  // control that changes it, and saying it twice invited the two
+                  // to disagree.
+                  <span className="composer-status">
+                    {daemon.state === "demo"
+                      ? "Demo topology — relaunch with OMAR_SERVE_URL to deploy"
+                      : "Runtime offline"}
+                  </span>
+                ) : (
+                  <BackendMenu
+                    key={conversationId}
+                    serveUrl={hydratedUrl ?? serveUrl}
+                    live={daemon.state === "live"}
+                    onConnectMore={readOnly ? undefined : () => setBackendsOpen(true)}
+                  />
+                )}
+                {!isDemo ? assistantTerminal : null}
+                {!isDemo ? (
+                  <button
+                    type="button"
+                    className="terminal-button"
+                    onClick={() => setFilesOpen(true)}
+                    disabled={switchingChat || daemon.state !== "live"}
+                    aria-haspopup="dialog"
+                  >
+                    Files & versions
+                  </button>
+                ) : null}
+              </div>
               {/* Deploying and stopping live on the workflow panel, beside the
                   topology they act on. What is left here acts on the message
                   being written. */}
@@ -795,13 +1628,17 @@ export function Studio({
                   className="send-button"
                   type="submit"
                   aria-label="Draft workflow"
-                  disabled={phase === "drafting" || phase === "spawning"}
+                  // The draft stays in the box; only sending waits for the runtime.
+                  disabled={(switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning" || daemon.state === "offline"}
+                  title={daemon.state === "offline" ? "Runtime offline" : undefined}
                 >
-                  ↑
+                  <WorkflowIcon name="send" size={19} />
                 </button>
               </div>
             </div>
           </form>
+          )}
+          {readOnly ? null : <p className="composer-footnote">OMAR can make mistakes. Review changes before running.</p>}
         </aside>
 
         {snapshot ? (
@@ -810,6 +1647,7 @@ export function Studio({
             collapsed={builderWidth === 0}
             toward="right"
             onExpand={() => setBuilder(DEFAULT_BUILDER)}
+            onCollapse={() => setBuilder(0)}
             onDragStart={() => {
               dragOriginRef.current.builder = builderWidth;
             }}
@@ -825,79 +1663,44 @@ export function Studio({
               {/* The panel draws a proposal before a run and the run after it,
                   so it has to say which one is on screen. */}
               <span className="eyebrow">
-                {snapshot.status === "ready" ? "PROPOSED TOPOLOGY" : "LIVE TOPOLOGY"}
+                {snapshot.status === "ready" ? "PROPOSED TOPOLOGY" : "WORKFLOW TOPOLOGY"}
               </span>
               <h2>{snapshot?.team}</h2>
             </div>
             <div className="run-stats">
-              <span><small>STATUS</small>{snapshot?.status}</span>
+              <span><small>{phase === "review" && failedRun ? "LAST RUN" : "STATUS"}</small>{run?.status ?? snapshot?.status}</span>
               <span><small>TAG</small>{tag}</span>
               <span><small>LAG</small>{lag}</span>
             </div>
-            {(phase === "review" && design) || (phase === "observing" && run) ? (
+            {canConfirm ? (
             <div className="workflow-actions">
-              {phase === "review" && design ? (
+              {canConfirm ? (
                 <span role="group" aria-label="Deploy design">
-                  {confirming ? (
-                    <>
-                      <button
-                        className="secondary-button"
-                        onClick={() => setConfirming(false)}
-                        type="button"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        className="primary-button"
-                        onClick={() => void confirmDesign()}
-                        type="button"
-                        disabled={!canRun}
-                        title="This starts real agents"
-                      >
-                        Confirm deploy
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <button
-                        className="secondary-button"
-                        onClick={discardDesign}
-                        type="button"
-                      >
-                        Discard
-                      </button>
-                      <button
-                        className="primary-button"
-                        onClick={() => setConfirming(true)}
-                        type="button"
-                        disabled={!canRun}
-                      >
-                        Deploy
-                      </button>
-                    </>
-                  )}
+                  <button className="secondary-button" onClick={discardDesign} type="button">
+                    Discard
+                  </button>
+                  <button
+                    className="primary-button"
+                    onClick={() => setConfirming(true)}
+                    type="button"
+                    // Not disabled during the background compiler check: it
+                    // runs on a debounce after every proposal, and a button
+                    // that blinks off for it drops the click that was already
+                    // on its way. The confirmation's own button still waits.
+                    disabled={!canRun || applyingConfiguration || switchingChat || sourceErrors.length > 0}
+                    aria-haspopup="dialog"
+                    aria-label={retrying ? "Run again" : "Deploy"}
+                    title={daemon.state === "offline" ? "Runtime offline" : undefined}
+                  >
+                    <WorkflowIcon name="arrow" size={14} /> {retrying ? "Run again" : "Run workflow"}
+                  </button>
                 </span>
-              ) : null}
-              {phase === "observing" && run ? (
-                <button
-                  className="secondary-button"
-                  onClick={() => void requestStop()}
-                  type="button"
-                  disabled={isStopping}
-                  title={
-                    isStopping
-                      ? "The current tag has to close first"
-                      : "Closes the current tag, then persists and tears down"
-                  }
-                >
-                  {isStopping ? "Stopping…" : "Stop"}
-                </button>
               ) : null}
             </div>
             ) : null}
           </div>
           {run ? <ActivitySummary snapshot={activity.snapshot} now={activity.now} connected={activity.connection === "connected"} seconds={inactivitySeconds} /> : null}
-          {!isDemo ? <RoleSettings serveUrl={serveUrl} snapshot={snapshot} /> : null}
+          {!isDemo && !readOnly ? <RoleSettings serveUrl={serveUrl} snapshot={snapshot} /> : null}
           <div className="activity-summary" aria-label="Inspect agents">
             <label>Inspect agent <select aria-label="Inspect agent" value={activityAgent ?? ""} onChange={(event) => setActivityAgent(event.target.value || null)}>
               <option value="">Choose an agent…</option>
@@ -909,26 +1712,61 @@ export function Studio({
               return agent ? [<button key={agent.id} className="secondary-button" type="button" onClick={() => setActivityAgent(agent.name)}>View {agent.name} activity</button>] : [];
             })}
           </div>
+          {failure ? (
+            <div className="run-feedback run-failure" role="alert">
+              <strong>Last run failed</strong>
+              <p>{failure.summary}</p>
+              <p>{failure.guidance}</p>
+              <details><summary>Error details</summary><pre>{failureDetails}</pre></details>
+            </div>
+          ) : null}
+          {manualStep ? (
+            <div className="run-feedback run-waiting" role="status">
+              <strong>Waiting for your response · {manualStep.agent}</strong>
+              <p>This Web step needs a response from you. Open the response panel to read the task and submit its result.</p>
+              <button type="button" className="primary-button" onClick={() => setPanelAgent(manualStep.agent)}>Open response panel</button>
+            </div>
+          ) : null}
+          <div className="topology-body">
           <DiagramCanvas
             activity={activity.snapshot}
             activityNow={activity.now}
             snapshot={snapshot}
             selection={selection}
             onToggleComponent={toggleComponent}
+            onInspectComponent={(component) => setInspected((current) => current === component ? null : component)}
             // Agents outlive the run that spawned them, so a finished run can
             // still be opened; before a run there is nothing behind the node.
             highlight={timelineOpen ? highlighted : undefined}
+            focus={shownTab === "properties" ? propertyFocus : undefined}
             onOpenTerminal={canRun && run ? setTerminalAgent : undefined}
             // A web agent has no pane; double-clicking it opens the panel it is
             // answered through instead, which is the only thing there is.
             onOpenPanel={run ? setPanelAgent : undefined}
           />
+          {inspected ? <StepInspector key={`${serveUrl}:${inspected}`} component={inspected} snapshot={snapshot} source={source} readOnly={readOnly} editable={canRun && !readOnly && !switchingChat && (!run || isRunFinished(run.status))} onApply={applyStepConfiguration} onClose={() => setInspected(null)} onEdit={editSource} onAsk={askAboutStep} /> : null}
+          </div>
           {timelineOpen ? (
             <Timeline
               steps={steps}
               index={stepIndex}
               live={following && phase === "observing"}
               truncated={truncated}
+              controls={runControls}
+              checkpoints={runId ? checkpoints : []}
+              resumePoint={runId ? resumePoint : null}
+              selected={selectedCheckpoint}
+              detail={shownDetail}
+              canRollBack={isPaused}
+              rollBackHint={
+                run && !isPaused
+                  ? "Pause the run first; a rollback picks the tag a paused run continues from."
+                  : undefined
+              }
+              onSelectCheckpoint={(id) =>
+                setCheckpointPick(id && runId ? { run: runId, id } : null)
+              }
+              onRollBack={readOnly ? undefined : (id) => void requestRollback(id)}
               onScrub={(next) => {
                 // Scrubbing takes the strip off the run: the operator is
                 // looking at a tag, not at where execution has reached.
@@ -938,13 +1776,16 @@ export function Studio({
               onClose={() => setTimelineOpen(false)}
             />
           ) : (
-            <button
-              type="button"
-              className="timeline-handle"
-              onClick={() => setTimelineOpen(true)}
-            >
-              ▲ Timeline
-            </button>
+            <div className="timeline-handle-bar">
+              <button
+                type="button"
+                className="timeline-handle"
+                onClick={() => setTimelineOpen(true)}
+              >
+                <span><WorkflowIcon name="chevron" size={13} /> Run timeline</span><small>{events.length ? `${events.length} events` : `${steps.length} projected steps`}</small>
+              </button>
+              {runControls}
+            </div>
           )}
         </section>
         ) : null}
@@ -955,6 +1796,7 @@ export function Studio({
             collapsed={inspectorWidth === 0}
             toward="left"
             onExpand={() => setInspector(DEFAULT_INSPECTOR)}
+            onCollapse={() => setInspector(0)}
             onDragStart={() => {
               dragOriginRef.current.inspector = inspectorWidth;
             }}
@@ -968,12 +1810,22 @@ export function Studio({
           <div className="tabs" role="tablist">
             <button
               role="tab"
-              aria-selected={tab === "source"}
-              className={tab === "source" ? "active" : ""}
+              aria-selected={shownTab === "source"}
+              className={shownTab === "source" ? "active" : ""}
               onClick={() => setTab("source")}
             >
               Source
             </button>
+            {properties.length ? (
+              <button
+                role="tab"
+                aria-selected={shownTab === "properties"}
+                className={shownTab === "properties" ? "active" : ""}
+                onClick={() => setTab("properties")}
+              >
+                Properties <small className="tab-count">{properties.filter((verdict) => verdict.proved).length}/{properties.length}</small>
+              </button>
+            ) : null}
             {/* Events only exist once something has been deployed. */}
             {isDeployed ? (
               <button
@@ -987,15 +1839,57 @@ export function Studio({
             ) : null}
           </div>
 
-          {tab === "source" ? (
+          {shownTab === "source" ? (
+            <>
+            {!readOnly && Object.keys(design?.files ?? {}).length > 0 ? <button className="secondary-button" onClick={() => setFilesOpen(true)}>View companion files ({Object.keys(design?.files ?? {}).length})</button> : null}
+            {mutationPlan && !readOnly ? (
+              <section className="mutation-plan" aria-label="Mutation plan">
+                <strong>{mutationPlan.fromAssistant ? "OMAR proposes changes to the run" : "Apply your changes to the run?"}</strong>
+                <span>
+                  Review them in the source below: green lines are added, red lines removed.{" "}
+                  {run?.status === "paused"
+                    ? "The paused run takes them and stays paused."
+                    : "It pauses at the next tag boundary, changes, and resumes."}
+                </span>
+                <div className="mutation-plan-actions">
+                  <button className="primary-button" type="button" disabled={mutating} onClick={() => void applyMutation()}>
+                    {mutating ? "Applying…" : "Apply"}
+                  </button>
+                  <button className="secondary-button" type="button" disabled={mutating} onClick={cancelMutation}>
+                    {mutationPlan.fromAssistant ? "Decline" : "Cancel"}
+                  </button>
+                </div>
+              </section>
+            ) : null}
             <OmarEditor
               source={source}
+              base={diffBase}
               filename={filename}
               status={run ? run.status : "draft"}
               errors={sourceErrors}
               checking={checking}
-              onSourceChange={setSource}
+              readOnly={readOnly}
+              onSourceChange={(next) => {
+                setSource(next);
+                // A plan describes the text it was made from; edited, the
+                // text is the operator's own.
+                setMutationPlan(null);
+                declinedRef.current = null;
+              }}
               onFilenameChange={setFilename}
+            />
+            </>
+          ) : shownTab === "properties" ? (
+            <PropertiesPanel
+              verdicts={properties}
+              selected={property}
+              onSelect={setProperty}
+              stale={propertiesStale}
+              checking={checkingProperties}
+              onRecheck={readOnly ? undefined : () => void recheckProperties()}
+              onOpenEditor={readOnly ? undefined : () => void openProofs()}
+              opening={openingProofs}
+              error={propertyError}
             />
           ) : (
             <div className="event-strip" role="tabpanel">
@@ -1014,6 +1908,21 @@ export function Studio({
         </aside>
         ) : null}
       </section>
+      </div>
+
+      {confirming && canConfirm ? (
+        <DeployConfirmation
+          team={snapshot?.team ?? "this topology"}
+          // The background check does not gate this either: the daemon
+          // compiles what it is sent and refuses a bad program itself.
+          disabled={!canRun || applyingConfiguration || switchingChat || sourceErrors.length > 0}
+          retry={retrying}
+          manual={snapshot?.agents.some((agent) => agent.backend.toLowerCase() === "web")}
+          initialTimeoutSeconds={defaultRunTimeout(snapshot?.agents ?? [])}
+          onCancel={() => setConfirming(false)}
+          onConfirm={(options) => void confirmDesign(options)}
+        />
+      ) : null}
 
       {activityAgent ? <AgentActivity key={activityAgent} agent={activityAgent} activity={activity.snapshot} connection={activity.connection}
         now={activity.now} seconds={inactivitySeconds} onThreshold={setInactivitySeconds}
@@ -1030,10 +1939,15 @@ export function Studio({
         />
       ) : null}
 
+      {filesOpen && !readOnly ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); }} onClose={() => setFilesOpen(false)} /> : null}
+      {backendsOpen && !readOnly ? (
+        <BackendsPage serveUrl={hydratedUrl ?? serveUrl} onClose={() => setBackendsOpen(false)} />
+      ) : null}
       {terminalAgent ? (
         <AgentTerminal
           serveUrl={serveUrl}
           agent={terminalAgent}
+          readOnly={readOnly}
           onClose={() => setTerminalAgent(null)}
         />
       ) : null}

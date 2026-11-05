@@ -15,9 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::app::AgentInfo;
-use crate::backend_probe;
 use crate::computer;
-use crate::config;
 use crate::ea::{self, EaId};
 use crate::manager::{self, McpLaunchContext};
 use crate::memory;
@@ -25,7 +23,7 @@ use crate::metrics;
 use crate::process::{pid_alive, pid_file_is_stale};
 use crate::projects;
 use crate::scheduler::{self, ScheduledEvent};
-use crate::tmux::{DeliveryOptions, HealthChecker, TmuxClient};
+use crate::tmux::{DeliveryOptions, HealthState, TmuxClient};
 
 const JSONRPC_VERSION: &str = "2.0";
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -33,7 +31,10 @@ const INITIAL_PROMPT_DELIVERY_STATUS_TIMEOUT: Duration = Duration::from_millis(1
 const SERVER_INSTRUCTIONS: &str = concat!(
     "OMAR provides orchestration tools for executive assistant and worker sessions. ",
     "Use these tools for agent delegation, project tracking, scheduled wake-ups, ",
-    "manager notes, action logs, Slack replies, and shared computer control. ",
+    "manager notes, action logs, and shared computer control. ",
+    "Tracked tasks have durable runtime supervision: use finish_task for results, ",
+    "get_task to read them, and acknowledge_task with result_revision to consume them. ",
+    "Call coordination_state after context loss. Do not schedule child polling timers. ",
     "Prefer tool descriptions for exact parameters, side effects, retry behavior, ",
     "and common failure modes."
 );
@@ -215,14 +216,7 @@ fn now_rfc3339() -> String {
 
 fn infer_backend_name(explicit_backend: Option<&str>, command: &str) -> String {
     fn normalize(s: &str) -> Option<&'static str> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "codex" => Some("codex"),
-            "cursor" => Some("cursor"),
-            "agy" => Some("agy"),
-            "claude" | "claude-code" | "claude_code" => Some("claude"),
-            "opencode" => Some("opencode"),
-            _ => None,
-        }
+        crate::backend::by_name(s).map(|backend| backend.kind().name())
     }
 
     if let Some(name) = explicit_backend.and_then(normalize) {
@@ -298,7 +292,10 @@ fn apply_spawn_agent_command_overrides(
 
     if let Some(reasoning_effort) = reasoning_effort {
         validate_reasoning_effort(reasoning_effort)?;
-        if command.is_some() || backend != Some("codex") {
+        if command.is_some()
+            || backend.and_then(crate::backend::by_name).map(|b| b.kind())
+                != Some(crate::backend::Kind::Codex)
+        {
             return Err(anyhow!(
                 "reasoning_effort is only supported when spawn_agent uses backend='codex'."
             ));
@@ -351,14 +348,6 @@ fn clean_human_output(output: &str) -> String {
     let output = ansi_re.replace_all(output, "");
     let output = escaped_ansi_re.replace_all(&output, "");
     control_re.replace_all(&output, "").to_string()
-}
-
-fn backend_available_from_command(command: &str, fallback_executable: &str) -> bool {
-    let executable = command
-        .split_whitespace()
-        .next()
-        .unwrap_or(fallback_executable);
-    backend_probe::backend_version_probe_succeeds(executable)
 }
 
 #[cfg(test)]
@@ -437,14 +426,37 @@ impl Drop for FileLock {
     }
 }
 
-pub fn run_server_from_context_file(path: PathBuf) -> Result<()> {
-    let context: McpLaunchContext = serde_json::from_str(
+pub fn run_server_from_context_file(path: PathBuf, bare_tool_names: bool) -> Result<()> {
+    let mut context: McpLaunchContext = serde_json::from_str(
         &fs::read_to_string(&path)
             .with_context(|| format!("Failed to read MCP context file {}", path.display()))?,
     )
     .with_context(|| format!("Failed to parse MCP context file {}", path.display()))?;
+    if context.topology.is_none() {
+        if let Some(path) = std::env::var_os("OMAR_MCP_CONTEXT_FILE") {
+            let scoped: McpLaunchContext = serde_json::from_slice(&fs::read(path)?)?;
+            if scoped.ea_id == context.ea_id
+                && scoped.omar_dir == context.omar_dir
+                && scoped.topology.is_none()
+            {
+                context = scoped;
+            }
+        }
+    }
+    if context.topology.is_none()
+        && std::env::var("OMAR_EA_ID").ok().as_deref() == Some(&context.ea_id.to_string())
+    {
+        if let Ok(actor) = std::env::var("OMAR_AGENT_NAME") {
+            context.agent_name = Some(actor);
+            if context.agent_name.as_deref() != Some("ea") {
+                context.serve = None;
+            }
+        }
+    }
     apply_context_environment(&context);
-    OmarMcpServer::new(context).run()
+    OmarMcpServer::new(context)
+        .with_bare_tool_names(bare_tool_names)
+        .run()
 }
 
 fn apply_context_environment(context: &McpLaunchContext) {
@@ -456,17 +468,13 @@ fn apply_context_environment(context: &McpLaunchContext) {
 }
 
 /// Run an MCP server without a pre-built context file. Used by peer
-/// processes (e.g. the Slack bridge) that aren't spawned by a specific
+/// processes that aren't spawned by a specific
 /// backend launch and need a default context derived from the current
 /// config + active EA.
-pub fn run_server_with_default_context() -> Result<()> {
+pub fn run_server_with_default_context(bare_tool_names: bool) -> Result<()> {
     let omar_dir = std::env::var_os("OMAR_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".omar")
-        });
+        .unwrap_or_else(crate::sessions::state_root);
     let config_path = omar_dir.join("config.toml").to_string_lossy().into_owned();
     let config = crate::config::Config::load(Some(&config_path))
         .with_context(|| format!("Failed to load omar config for {}", omar_dir.display()))?;
@@ -479,6 +487,7 @@ pub fn run_server_with_default_context() -> Result<()> {
         default_command: config.agent.default_command,
         default_workdir: config.agent.default_workdir,
         health_idle_warning: config.health.idle_warning,
+        agent_name: None,
         tmux_server: std::env::var("OMAR_TMUX_SERVER")
             .ok()
             .map(|server| server.trim().to_string())
@@ -486,11 +495,13 @@ pub fn run_server_with_default_context() -> Result<()> {
         topology: None,
         serve: None,
     };
-    OmarMcpServer::new(context).run()
+    OmarMcpServer::new(context)
+        .with_bare_tool_names(bare_tool_names)
+        .run()
 }
 
 /// Pick the EA id for a default-context server. Honors `OMAR_EA_ID` so
-/// peer processes (e.g. the Slack bridge) can pin a child to a specific
+/// a peer process can pin a child to a specific
 /// EA without mutating the global active-EA pointer the dashboard reads.
 fn resolve_default_context_ea(omar_dir: &Path, registered: &[ea::EaInfo]) -> Result<ea::EaId> {
     if let Some(raw) = std::env::var_os("OMAR_EA_ID") {
@@ -517,7 +528,16 @@ struct OmarMcpServer {
     session_prefix: String,
     manager_session: String,
     scheduler: scheduler::Scheduler,
+    /// Expose `omar_set_port` as `set_port`, and so on. For clients that
+    /// prefix every tool with the server name: opencode would otherwise show
+    /// `omar_omar_set_port` while every OMAR prompt says `omar_set_port`, and
+    /// a model that takes the prompt literally calls a tool that does not
+    /// exist. With bare names its prefix rebuilds exactly the documented one.
+    bare_tool_names: bool,
 }
+
+/// The prefix bare-name clients drop from tool names and rebuild themselves.
+const TOOL_PREFIX: &str = "omar_";
 
 impl OmarMcpServer {
     fn new(context: McpLaunchContext) -> Self {
@@ -532,10 +552,33 @@ impl OmarMcpServer {
             session_prefix,
             manager_session,
             scheduler,
+            bare_tool_names: false,
         }
     }
 
+    fn with_bare_tool_names(mut self, bare: bool) -> Self {
+        self.bare_tool_names = bare;
+        self
+    }
+
+    /// The name OMAR dispatches on, for a name the client may have sent bare.
+    fn canonical_tool_name(&self, name: &str) -> String {
+        if self.bare_tool_names && !name.starts_with(TOOL_PREFIX) {
+            let prefixed = format!("{TOOL_PREFIX}{name}");
+            let known = topology_tool_definitions()
+                .into_iter()
+                .chain(ea_tool_definitions())
+                .chain(tool_definitions())
+                .any(|tool| tool["name"].as_str() == Some(prefixed.as_str()));
+            if known {
+                return prefixed;
+            }
+        }
+        name.to_string()
+    }
+
     fn run(&self) -> Result<()> {
+        crate::supervision::start_fallback_runtime(&self.context);
         let stdin = io::stdin();
         let stdout = io::stdout();
         let mut reader = BufReader::new(stdin.lock());
@@ -608,6 +651,22 @@ impl OmarMcpServer {
                     }
                     tools
                 };
+                let tools = if self.bare_tool_names {
+                    tools
+                        .into_iter()
+                        .map(|mut tool| {
+                            if let Some(bare) = tool["name"]
+                                .as_str()
+                                .and_then(|name| name.strip_prefix(TOOL_PREFIX))
+                            {
+                                tool["name"] = json!(bare);
+                            }
+                            tool
+                        })
+                        .collect()
+                } else {
+                    tools
+                };
                 ok_response(id, json!({ "tools": tools }))
             }
             "tools/call" => match serde_json::from_value::<ToolCallRequest>(request.params) {
@@ -625,6 +684,22 @@ impl OmarMcpServer {
     }
 
     fn call_tool(&self, call: ToolCallRequest) -> Value {
+        let call = ToolCallRequest {
+            name: self.canonical_tool_name(&call.name),
+            arguments: call.arguments,
+        };
+        // Managed deletion goes through the daemon, whose exclusive lock must
+        // not wait on this process's shared admission.
+        let _admission = if call.name != "delete_ea"
+            && self.context.omar_dir.join("launch.json").exists()
+        {
+            match crate::ea_lifecycle::Admission::acquire(&self.context.omar_dir, self.ea_id()) {
+                Ok(admission) => Some(admission),
+                Err(error) => return tool_error(error),
+            }
+        } else {
+            None
+        };
         append_debug_log(
             &self.context,
             &format!("tool_call name={} args={}", call.name, call.arguments),
@@ -644,13 +719,30 @@ impl OmarMcpServer {
             match call.name.as_str() {
                 // Refused rather than merely unlisted, so an agent that learned
                 // the names elsewhere still cannot reach the operator.
-                "omar_reply" | "omar_propose_design" => match &self.context.serve {
-                    Some(serve) => serve_tool_call(serve, &call.name, call.arguments),
-                    None => Err(anyhow!(
-                        "Tool '{}' is only available to the executive assistant",
-                        call.name
-                    )),
-                },
+                "omar_reply" | "omar_propose_design" | "omar_check_properties" => {
+                    match &self.context.serve {
+                        Some(serve) => serve_tool_call(serve, &call.name, call.arguments),
+                        None => Err(anyhow!(
+                            "Tool '{}' is only available to the executive assistant",
+                            call.name
+                        )),
+                    }
+                }
+                "coordination_state" => crate::supervision::context_page(
+                    &self.context.omar_dir,
+                    self.ea_id(),
+                    self.actor(),
+                    call.arguments["offset"].as_u64().unwrap_or(0) as usize,
+                ),
+                "get_task" => crate::supervision::get_task(
+                    &self.context.omar_dir,
+                    self.ea_id(),
+                    self.actor(),
+                    &call.arguments,
+                ),
+                "finish_task" => self.finish_task(call.arguments),
+                "acknowledge_task" => self.acknowledge_task(call.arguments),
+                "resume_task" => self.resume_task(call.arguments),
                 "list_backends" => self.list_backends(),
                 "list_eas" => self.list_eas(),
                 "get_active_ea" => self.get_active_ea(),
@@ -671,7 +763,6 @@ impl OmarMcpServer {
                 "list_events" => self.list_events(),
                 "cancel_event" => self.cancel_event(call.arguments),
                 "log_justification" => self.log_justification(call.arguments),
-                "slack_reply" => self.slack_reply(call.arguments),
                 "computer_status" => self.computer_status(),
                 "computer_lock_acquire" => self.computer_lock_acquire(call.arguments),
                 "computer_lock_release" => self.computer_lock_release(call.arguments),
@@ -684,7 +775,7 @@ impl OmarMcpServer {
             }
         };
 
-        match result {
+        let mut response = match result {
             Ok(value) => {
                 append_debug_log(&self.context, &format!("tool_ok name={}", call.name));
                 tool_success_for(&call.name, value)
@@ -696,7 +787,66 @@ impl OmarMcpServer {
                 );
                 tool_error(err)
             }
+        };
+        if self.context.topology.is_none() {
+            let _ = crate::supervision::touch(&self.context.omar_dir, self.ea_id(), self.actor());
+            if let Ok(state) =
+                crate::supervision::context(&self.context.omar_dir, self.ea_id(), self.actor())
+            {
+                if let Some(content) = response["content"].as_array_mut() {
+                    content.push(
+                        json!({"type":"text","text":crate::supervision::context_message(&state)}),
+                    );
+                }
+            }
         }
+        response
+    }
+
+    fn actor(&self) -> &str {
+        self.context.agent_name.as_deref().unwrap_or("ea")
+    }
+
+    fn finish_task(&self, args: Value) -> Result<Value> {
+        #[derive(Deserialize)]
+        struct Args {
+            task_id: String,
+            status: crate::supervision::Status,
+            result: Value,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let task = crate::supervision::finish(
+            &self.context.omar_dir,
+            self.ea_id(),
+            self.actor(),
+            &args.task_id,
+            args.status,
+            args.result,
+        )?;
+        Ok(
+            json!({"task_id":task.id,"status":task.status,"result_persisted":true,"result_revision":task.result_revision}),
+        )
+    }
+
+    fn acknowledge_task(&self, args: Value) -> Result<Value> {
+        let id = args["task_id"].as_str().context("task_id is required")?;
+        let revision = args["result_revision"]
+            .as_u64()
+            .context("result_revision from the result you read is required")?;
+        crate::supervision::acknowledge(
+            &self.context.omar_dir,
+            self.ea_id(),
+            self.actor(),
+            id,
+            revision,
+        )?;
+        Ok(json!({"task_id":id,"acknowledged":true}))
+    }
+
+    fn resume_task(&self, args: Value) -> Result<Value> {
+        let id = args["task_id"].as_str().context("task_id is required")?;
+        crate::supervision::resume(&self.context.omar_dir, self.ea_id(), self.actor(), id)?;
+        Ok(json!({"status":"running","task_id":id}))
     }
 
     fn ea_id(&self) -> EaId {
@@ -744,14 +894,19 @@ impl OmarMcpServer {
         let prefix = self.session_prefix();
         let manager_session = self.manager_session();
         let client = TmuxClient::new(prefix);
-        let mut checker = HealthChecker::new(client.clone(), self.context.health_idle_warning);
         let sessions = client.list_sessions().unwrap_or_default();
         let mut manager = None;
         let mut agents = Vec::new();
         for session in sessions {
             let info = AgentInfo {
                 session: session.clone(),
-                health: checker.check(&session.name),
+                health: if health_from_activity(session.activity, self.context.health_idle_warning)
+                    == "idle"
+                {
+                    HealthState::Idle
+                } else {
+                    HealthState::Running
+                },
                 is_unresolved: false,
             };
             if session.name == manager_session {
@@ -772,17 +927,14 @@ impl OmarMcpServer {
     }
 
     fn list_backends(&self) -> Result<Value> {
-        let backends = ["claude", "codex", "cursor", "opencode", "agy"];
-        let infos: Vec<Value> = backends
-            .iter()
-            .filter_map(|name| {
-                let command = config::resolve_backend(name).ok()?;
-                let available = backend_available_from_command(&command, name);
-                Some(json!({
-                    "name": name,
-                    "available": available,
-                    "command": command,
-                }))
+        use crate::backend::{connection, Connection};
+        let infos: Vec<Value> = connection::assistants()
+            .into_iter()
+            .map(|(backend, status)| {
+                let mut info = connection::describe(backend, &status);
+                info["available"] = (status != Connection::NotInstalled).into();
+                info["command"] = backend.default_command().into();
+                info
             })
             .collect();
         Ok(json!({ "backends": infos }))
@@ -865,6 +1017,13 @@ impl OmarMcpServer {
             ea_id: u32,
         }
         let args: Args = serde_json::from_value(args)?;
+        if let Some(session) = crate::sessions::owner(&self.context.omar_dir)? {
+            return crate::sessions::rpc(
+                &session,
+                json!({"op":"delete_ea", "ea":args.ea_id.to_string()}),
+                std::time::Duration::from_secs(90),
+            );
+        }
         let registry = ea::ensure_default_ea(&self.context.omar_dir)?;
         if registry.len() <= 1 {
             return Err(anyhow!(
@@ -929,7 +1088,7 @@ impl OmarMcpServer {
             fs::remove_dir_all(&mcp_dir)
                 .map_err(|e| anyhow!("Failed to remove mcp dir {:?}: {}", mcp_dir, e))?;
         }
-        manager::remove_omar_antigravity_mcp_config(args.ea_id)?;
+        crate::backend::antigravity::remove_omar_antigravity_mcp_config(args.ea_id)?;
         let events_cancelled = self.scheduler().cancel_by_ea(args.ea_id);
         ea::unregister_ea(&self.context.omar_dir, args.ea_id)?;
         Ok(json!({
@@ -1016,6 +1175,7 @@ impl OmarMcpServer {
             "task": task,
             "status": memory::load_agent_status_in(state_dir, &session_name),
             "children": children,
+            "coordination": crate::supervision::context(&self.context.omar_dir, self.ea_id(), &short_name)?,
         }))
     }
 
@@ -1052,6 +1212,7 @@ impl OmarMcpServer {
             model: Option<String>,
             reasoning_effort: Option<String>,
             parent: Option<String>,
+            supervise: Option<bool>,
         }
         let args: Args = serde_json::from_value(args)?;
         let spawn_start = std::time::Instant::now();
@@ -1087,7 +1248,7 @@ impl OmarMcpServer {
         let parent = match args.parent.as_deref().map(str::trim) {
             Some("") => return Err(anyhow!("spawn_agent parent must not be empty")),
             Some(parent) => Some(parent.to_string()),
-            None => None,
+            None => self.context.agent_name.clone(),
         };
         self.validate_spawn_parent(project_id, parent.as_deref())?;
 
@@ -1113,7 +1274,9 @@ impl OmarMcpServer {
             return Err(anyhow!("Cannot specify both 'backend' and 'command'"));
         }
         let mut base_command = if let Some(backend) = args.backend.as_deref() {
-            config::resolve_backend(backend).map_err(|err| anyhow!(err))?
+            crate::backend::resolve(backend)
+                .map(|backend| backend.default_command().to_string())
+                .map_err(|err| anyhow!(err))?
         } else {
             args.command
                 .clone()
@@ -1133,6 +1296,11 @@ impl OmarMcpServer {
         let workdir = args
             .workdir
             .unwrap_or_else(|| self.context.default_workdir.clone());
+        let mut child_context = self.context.clone();
+        child_context.agent_name = Some(short_name.clone());
+        child_context.serve = None;
+        manager::materialize_mcp_context_file(&child_context)
+            .context("could not persist worker MCP context")?;
         let command = if supports_prompt_delivery {
             let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
             manager::build_agent_command(
@@ -1143,7 +1311,7 @@ impl OmarMcpServer {
                     ("{{TASK}}", &task),
                     ("{{EA_ID}}", &ea_id.to_string()),
                 ],
-                &self.context,
+                &child_context,
             )
         } else {
             base_command.clone()
@@ -1153,7 +1321,46 @@ impl OmarMcpServer {
             return Err(anyhow!("Agent '{}' already exists", short_name));
         }
         let tmux_spawn_start = std::time::Instant::now();
-        client.new_session(&session_name, &command, Some(&workdir))?;
+        client.new_session_with_backend(
+            &session_name,
+            &manager::scope_agent_command(&command, ea_id, &short_name, &self.context.omar_dir),
+            Some(&workdir),
+            Some(&backend_name),
+        )?;
+        let task_id = if args.supervise.unwrap_or(supports_prompt_delivery) {
+            Some(
+                match crate::supervision::register(
+                    &self.context.omar_dir,
+                    crate::supervision::Task {
+                        id: String::new(),
+                        ea_id,
+                        agent: short_name.clone(),
+                        session: session_name.clone(),
+                        parent: prompt_parent.clone(),
+                        parent_task_id: None,
+                        project_id,
+                        assignment: task.clone(),
+                        status: crate::supervision::Status::Running,
+                        result: None,
+                        result_revision: 0,
+                        acknowledged: false,
+                        retired: false,
+                        next_check_ms: 0,
+                    },
+                ) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        let _ = client.kill_session(&session_name);
+                        return Err(error);
+                    }
+                },
+            )
+        } else {
+            None
+        };
+        if !supports_prompt_delivery {
+            client.set_session_backend(&session_name, "raw")?;
+        }
         let tmux_spawn_ms = tmux_spawn_start.elapsed().as_millis() as u64;
         metrics::record_backend_bootstrap(&backend_name);
 
@@ -1167,15 +1374,16 @@ impl OmarMcpServer {
             let client2 = client.clone();
             let session2 = session_name.clone();
             let header = format!(
-                "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}",
-                short_name, prompt_parent, task
+                "YOUR NAME: {}\nYOUR PARENT: {}\nYOUR TASK: {}\nOMAR TASK ID: {}\nReturn your result using finish_task; the runtime handles parent notification and check-ins.",
+                short_name, prompt_parent, task, task_id.as_deref().unwrap_or("untracked")
             );
-            // opencode has no system-prompt flag, so build_agent_command
-            // spawns it bare. Inline the rendered agent.md content here so
-            // the worker receives instructions plus the YOUR NAME header
-            // in a single user message. Other backends already received
-            // agent.md via their respective system-prompt flags.
-            let first_message = if backend_name == "opencode" {
+            // A backend with no way to take the prompt at launch gets the
+            // rendered agent.md inlined here, so the worker receives its
+            // instructions plus the YOUR NAME header in one side-channel
+            // message. The others already received it via a launch flag.
+            let first_message = if crate::backend::by_name(&backend_name)
+                .is_some_and(|backend| backend.takes_prompt_in_first_message())
+            {
                 let prompt_file = manager::prompts_dir(&self.context.omar_dir).join("agent.md");
                 let content = std::fs::read_to_string(&prompt_file)
                     .unwrap_or_default()
@@ -1187,30 +1395,34 @@ impl OmarMcpServer {
                 header
             };
             let backend_name2 = backend_name.clone();
-            let readiness_markers = crate::tmux::backend_readiness_markers(&backend_name).to_vec();
+            let readiness = crate::backend::by_name(&backend_name)
+                .map(|backend| backend.readiness(&command))
+                .unwrap_or(crate::backend::Readiness::Settle);
             let (delivery_tx, delivery_rx) = std::sync::mpsc::channel();
             thread::spawn(move || {
                 let delivery_start = std::time::Instant::now();
-                let readiness = if !readiness_markers.is_empty() {
-                    let ready = client2.wait_for_markers(
-                        &session2,
-                        &readiness_markers,
-                        Duration::from_secs(45),
-                        Duration::from_millis(250),
-                    );
-                    if ready {
-                        Ok(())
-                    } else {
-                        Err(anyhow!("backend readiness markers timed out"))
+                let readiness = match readiness {
+                    crate::backend::Readiness::Channel => Ok(()),
+                    crate::backend::Readiness::Banner(markers) => {
+                        let ready = client2.wait_for_markers(
+                            &session2,
+                            markers,
+                            Duration::from_secs(45),
+                            Duration::from_millis(250),
+                        );
+                        if ready {
+                            Ok(())
+                        } else {
+                            Err(anyhow!("backend readiness markers timed out"))
+                        }
                     }
-                } else {
-                    client2.wait_for_stable(
+                    crate::backend::Readiness::Settle => client2.wait_for_stable(
                         &session2,
                         Duration::from_millis(500),
                         Duration::from_secs(8),
                         Duration::from_millis(120),
                         false,
-                    )
+                    ),
                 };
                 let opts = DeliveryOptions::default();
                 let delivery = client2.deliver_prompt(&session2, &first_message, &opts);
@@ -1248,13 +1460,17 @@ impl OmarMcpServer {
         });
 
         self.refresh_memory_locked()?;
-        Ok(json!({
+        let mut response = json!({
             "project_id": project_id,
             "project_name": project_name,
             "agent_name": short_name,
             "status": "running",
             "initial_prompt_delivery": initial_prompt_delivery,
-        }))
+        });
+        if let Some(task_id) = task_id {
+            response["task_id"] = json!(task_id);
+        }
+        Ok(response)
     }
 
     fn validate_spawn_parent(&self, project_id: usize, parent: Option<&str>) -> Result<()> {
@@ -1339,6 +1555,11 @@ impl OmarMcpServer {
         }
         let _session = client.ensure_session_not_attached(&session_name)?;
         client.kill_session(&session_name)?;
+        crate::supervision::cancel_agent(
+            &self.context.omar_dir,
+            self.ea_id(),
+            self.display_name(&session_name),
+        )?;
         memory::remove_agent_parent_in(state_dir, &session_name);
         memory::remove_agent_project_in(state_dir, &session_name);
         let short_name = self.display_name(&session_name).to_string();
@@ -1367,10 +1588,13 @@ impl OmarMcpServer {
         if !client.has_session(&session_name).unwrap_or(false) {
             return Err(anyhow!("Agent '{}' not found", args.name));
         }
-        client.send_keys_literal(&session_name, &args.text)?;
-        if args.enter {
-            thread::sleep(Duration::from_millis(100));
-            client.send_keys(&session_name, "Enter")?;
+        if client.session_backend(&session_name).as_deref() == Some("raw") {
+            client.send_keys_literal(&session_name, &args.text)?;
+            if args.enter {
+                client.send_keys(&session_name, "Enter")?;
+            }
+        } else {
+            client.deliver_prompt(&session_name, &args.text, &DeliveryOptions::default())?;
         }
         Ok(json!({ "status": "sent" }))
     }
@@ -1539,46 +1763,6 @@ impl OmarMcpServer {
             "project_id": project.id,
             "name": project.name,
             "status": "completed",
-        }))
-    }
-
-    /// Queue a Slack reply for the `omar-slack-bridge` peer to pick up and
-    /// post to Slack. File-based rendezvous via `{omar_dir}/slack_outbox/`
-    /// keeps the MCP surface free of loopback HTTP and survives a bridge
-    /// that's momentarily down — the bridge drains the outbox on restart.
-    fn slack_reply(&self, args: Value) -> Result<Value> {
-        #[derive(Deserialize)]
-        struct Args {
-            channel: String,
-            #[serde(default)]
-            thread_ts: Option<String>,
-            text: String,
-        }
-        let args: Args = serde_json::from_value(args)?;
-        if args.channel.trim().is_empty() {
-            return Err(anyhow!("slack_reply requires a non-empty channel"));
-        }
-        if args.text.is_empty() {
-            return Err(anyhow!("slack_reply requires a non-empty text"));
-        }
-        let dir = self.context.omar_dir.join("slack_outbox");
-        fs::create_dir_all(&dir).context("Failed to create slack outbox directory")?;
-        let id = Uuid::new_v4();
-        let tmp = dir.join(format!("{}.json.tmp", id));
-        // Prefix filename with timestamp so the bridge delivers messages in
-        // the order they were queued even under heavy fan-out.
-        let final_path = dir.join(format!("{}-{}.json", now_ns(), id));
-        let payload = serde_json::to_vec(&json!({
-            "channel": args.channel,
-            "thread_ts": args.thread_ts,
-            "text": args.text,
-            "queued_at": now_rfc3339(),
-        }))?;
-        fs::write(&tmp, &payload).context("Failed to stage slack reply")?;
-        fs::rename(&tmp, &final_path).context("Failed to commit slack reply")?;
-        Ok(json!({
-            "status": "queued",
-            "path": final_path,
         }))
     }
 
@@ -2059,9 +2243,14 @@ fn tool_definitions() -> Vec<Value> {
     static TOOLS: OnceLock<Vec<Value>> = OnceLock::new();
     TOOLS
         .get_or_init(|| vec![
+        tool("coordination_state", "Read authoritative task ownership and unconsumed child results after context loss. Use get_task for full results.", json!({"type":"object","properties":{"offset":{"type":"integer","minimum":0}}})),
+        tool("get_task", "Read a scoped durable task and a bounded page of its result; offset counts characters.", json!({"type":"object","properties":{"task_id":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["task_id"]})),
+        tool("finish_task", "Persist your completed, failed, or blocked result. Automatically notifies your parent until acknowledged. Finish or cancel children and consume their results first.", json!({"type":"object","properties":{"task_id":{"type":"string"},"status":{"type":"string","enum":["completed","failed","blocked"]},"result":{}},"required":["task_id","status","result"]})),
+        tool("acknowledge_task", "Acknowledge incorporating a child's durable result. Transport delivery alone never acknowledges it.", json!({"type":"object","properties":{"task_id":{"type":"string"},"result_revision":{"type":"integer"}},"required":["task_id","result_revision"]})),
+        tool("resume_task", "Resume a blocked child after resolving its blocker. The runtime wakes the child with its task state.", json!({"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"]})),
         tool(
             "list_backends",
-            "List installed OMAR agent backends and their commands. Use before choosing a backend/model override when availability is unclear. Read-only and safe to retry.",
+            "List OMAR agent backends: whether each is installed and signed in (status, via, login command), and its command. Use before choosing a backend/model override; a signed_out or not_installed backend needs the user to run its login command first. Read-only and safe to retry.",
             json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
         tool(
@@ -2153,9 +2342,10 @@ fn tool_definitions() -> Vec<Value> {
                 "properties":{
                     "name":{"type":"string","description":"Short agent name (session prefix is added automatically)."},
                     "project_id":{"type":"integer","description":"Existing project id from add_project or list_projects. Required — spawn_agent does not auto-create projects."},
-                    "task":{"type":"string","description":"Delivered to the agent as their initial task and shown in the dashboard. What to build or do — no [TASK COMPLETE] or parent-wakeup instructions; those are already in every agent's system prompt."},
+                    "task":{"type":"string","description":"The concrete assignment. Known agent backends receive a durable task_id and automatic supervision."},
+                    "supervise":{"type":"boolean","description":"Defaults true for supported agent backends and false for raw demo commands. Opt in custom agent commands that implement finish_task; opt out passive raw sessions."},
                     "command":{"type":"string","description":"Raw command to run instead of a backend agent (e.g. 'bash' for a demo window). Mutually exclusive with backend."},
-                    "backend":{"type":"string","enum":["claude","codex","cursor","opencode","agy"],"description":"Backend agent command to launch. Mutually exclusive with command."},
+                    "backend":{"type":"string","enum":crate::backend::assistant_names(),"description":"Backend agent command to launch. Mutually exclusive with command."},
                     "model":{"type":"string","description":"Optional backend model override. Allowed characters are alphanumeric plus '-', '_', '.', '/'."},
                     "reasoning_effort":{"type":"string","enum":["low","medium","high","xhigh"],"description":"Optional Codex reasoning effort override. Supported only with backend='codex'; appends a Codex config override such as -c model_reasoning_effort='\"high\"'."},
                     "workdir":{"type":"string","description":"Working directory for the new session. Defaults to this MCP server's launch workdir."},
@@ -2177,13 +2367,13 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "send_input",
-            "Send text to a running agent or raw demo session. Use for follow-up instructions, concrete unblocking messages, or demo commands. Side effect: injects text into the target tmux pane and optionally presses Enter. Not generally retry-safe because duplicate input may execute twice. Fails if the target agent is not running.",
+            "Send text to a running agent or raw demo session. Use for follow-up instructions, concrete unblocking messages, or demo commands. Agent messages use the backend side channel and never touch the composer. Explicit raw demo sessions receive terminal text and optionally Enter. Not generally retry-safe because duplicate input may execute twice. Fails if the target agent is not running.",
             json!({
                 "type":"object",
                 "properties":{
                     "name":{"type":"string","description":"Short target agent/session name."},
                     "text":{"type":"string","description":"Literal text to send."},
-                    "enter":{"type":"boolean","description":"Whether to press Enter after text. Defaults to false."}
+                    "enter":{"type":"boolean","description":"Raw demo sessions only: press Enter after text. Ignored for agents, whose messages are delivered directly."}
                 },
                 "required":["name","text"],
                 "additionalProperties":false
@@ -2220,7 +2410,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "schedule_omar_event",
-            "Enqueue an event in OMAR's persistent event queue to wake an agent or the EA at a chosen time. The event queue is OMAR's central coordination primitive: every timed check-in, parent completion notification, future nudge, and recurring cron-style task flows through it. Use this instead of sleep loops or any backend-native timer/reminder tool. Side effect: appends a scheduled event visible in the dashboard via list_events and durable across restarts. Not retry-safe unless duplicate delivery is acceptable; use list_events/cancel_event after uncertain results. For immediate parent notification after completion, set receiver to the parent name, payload to '[CHILD COMPLETE] {your_name}: {summary}', and delay_seconds to 0.",
+            "Enqueue an event in OMAR's persistent event queue to wake an agent or the EA at a chosen time. Tracked task check-ins and completion notifications are scheduled automatically by the runtime; do not duplicate them. Use this instead of sleep loops or any backend-native timer/reminder tool. Side effect: appends a scheduled event visible in the dashboard via list_events and durable across restarts. Not retry-safe unless duplicate delivery is acceptable; use list_events/cancel_event after uncertain results. Use finish_task for completion, and acknowledge_task with the observed result_revision after incorporating a child result.",
             json!({
                 "type":"object",
                 "properties":{
@@ -2263,20 +2453,6 @@ fn tool_definitions() -> Vec<Value> {
                     "justification":{"type":"string","description":"Why this action serves the user's goal."}
                 },
                 "required":["agent_name","action","justification"],
-                "additionalProperties":false
-            }),
-        ),
-        tool(
-            "slack_reply",
-            "Queue a reply for the omar-slack-bridge to post to Slack. Use only in response to a Slack-originated request and pass channel/thread_ts from the inbound [SLACK MESSAGE] event. Side effect: writes an outbox file that the bridge may post. Not retry-safe because duplicate files can post duplicate messages. Fails if channel or text is empty.",
-            json!({
-                "type":"object",
-                "properties":{
-                    "channel":{"type":"string","description":"From the inbound [SLACK MESSAGE] event."},
-                    "thread_ts":{"type":"string","description":"From the inbound [SLACK MESSAGE] event. Omit to start a new thread."},
-                    "text":{"type":"string"}
-                },
-                "required":["channel","text"],
                 "additionalProperties":false
             }),
         ),
@@ -2391,25 +2567,72 @@ fn ea_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "omar_propose_design",
-            "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares.",
+            "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares. While a workflow is running or paused, a program that keeps its `main` name is a change to that run, which the operator applies live.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "program":{"type":"string","description":"Complete .omar source (program.omar)"},
+                    "files":{"type":"object","additionalProperties":{"type":"string"},"description":"Companion files keyed by relative path, e.g. schemas/decision.json. Include every imported schema."},
+                    "summary":{"type":"string","description":"One or two sentences on what it does"},
+                    "inputs":{"type":"object","description":"Values for the program's declared input ports"},
+                    "lemmas":{"type":"string","description":"Lean declarations the properties share"},
+                    "properties":property_schema()
+                },
+                "required":["program","summary"],
+                "additionalProperties":false
+            }),
+        ),
+        tool(
+            "omar_check_properties",
+            "Have Lean check safety properties of an OMAR program without proposing it. Each property is a Lean theorem about every run `e` of the program's model, proved from the reactor semantics (Omar.Reactor). Returns one verdict per property: proved, or Lean's problems with lines counted from the theorem's first line, plus the model (`topology`) in `source`. Iterate until each is proved, then pass the same properties to omar_propose_design.",
             json!({
                 "type":"object",
                 "properties":{
                     "program":{"type":"string","description":"Complete .omar source"},
-                    "summary":{"type":"string","description":"One or two sentences on what it does"},
-                    "inputs":{"type":"object","description":"Values for the program's declared input ports"}
+                    "files":{"type":"object","additionalProperties":{"type":"string"}},
+                    "lemmas":{"type":"string","description":"Lean declarations the properties share"},
+                    "properties":property_schema()
                 },
-                "required":["program","summary"],
+                "required":["program","properties"],
                 "additionalProperties":false
             }),
         ),
     ]
 }
 
+/// A list of properties, as both property tools take them.
+fn property_schema() -> Value {
+    json!({
+        "type":"array",
+        "description":"Safety properties, each checked as `theorem NAME (e : Execution) (hv : Valid topology e) : STATEMENT := PROOF`.",
+        "items":{
+            "type":"object",
+            "properties":{
+                "name":{"type":"string","description":"A Lean identifier"},
+                "description":{"type":"string","description":"The guarantee in one plain sentence for the operator"},
+                "statement":{"type":"string","description":"The Lean proposition about the run `e`"},
+                "proof":{"type":"string","description":"The Lean proof, e.g. `by ...`"}
+            },
+            "required":["name","description","statement","proof"],
+            "additionalProperties":false
+        }
+    })
+}
+
 /// Minimal HTTP POST. `omar serve` is loopback-only and the payloads are tiny,
 /// so this avoids pulling in an HTTP client, matching how topology agents reach
 /// the invocation server over a raw socket.
 fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<()> {
+    post_json_within(endpoint, path, body, std::time::Duration::from_secs(5)).map(|_| ())
+}
+
+/// `post_json`, waiting up to `timeout` for the answer, which it returns.
+fn post_json_within(
+    endpoint: &str,
+    path: &str,
+    body: &Value,
+    timeout: std::time::Duration,
+) -> Result<Value> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
@@ -2417,7 +2640,7 @@ fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<()> {
     let payload = serde_json::to_vec(body)?;
     let mut stream = TcpStream::connect(endpoint)
         .with_context(|| format!("omar serve at '{endpoint}' is unavailable"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     write!(
         stream,
@@ -2430,9 +2653,7 @@ fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<()> {
     let mut reader = BufReader::new(&mut stream);
     let mut status = String::new();
     reader.read_line(&mut status)?;
-    if status.contains(" 200") || status.contains(" 201") || status.contains(" 202") {
-        return Ok(());
-    }
+    let accepted = status.contains(" 200") || status.contains(" 201") || status.contains(" 202");
 
     // The body is the whole point of a rejection. `omar serve` compiles a
     // proposed program before publishing it and answers with the compiler's
@@ -2449,6 +2670,9 @@ fn post_json(endpoint: &str, path: &str, body: &Value) -> Result<()> {
     let mut payload = String::new();
     // `Connection: close`, so the body runs to the end of the stream.
     let _ = reader.read_to_string(&mut payload);
+    if accepted {
+        return Ok(serde_json::from_str(&payload).unwrap_or(Value::Null));
+    }
 
     let detail = serde_json::from_str::<Value>(&payload)
         .ok()
@@ -2474,6 +2698,7 @@ fn serve_tool_call(
     let path = match name {
         "omar_reply" => "/v1/agent/reply",
         "omar_propose_design" => "/v1/agent/proposals",
+        "omar_check_properties" => "/v1/agent/properties",
         other => bail!("unknown serve tool '{other}'"),
     };
     // Arguments come from a model, so the shape is not guaranteed. Indexing a
@@ -2485,8 +2710,23 @@ fn serve_tool_call(
         other => bail!("{name} expects an object of arguments, got {other}"),
     };
     body.insert("token".to_string(), json!(serve.token));
-    post_json(&serve.endpoint, path, &Value::Object(body))?;
-    Ok(json!({"status":"delivered"}))
+    if name == "omar_reply" {
+        post_json(&serve.endpoint, path, &Value::Object(body))?;
+        return Ok(json!({"status":"delivered"}));
+    }
+    // Lean checks properties before serve answers, which takes longer than a
+    // message does to deliver.
+    let answer = post_json_within(
+        &serve.endpoint,
+        path,
+        &Value::Object(body),
+        std::time::Duration::from_secs(330),
+    )?;
+    Ok(if name == "omar_check_properties" {
+        answer
+    } else {
+        json!({"status":"delivered"})
+    })
 }
 
 fn topology_tool_definitions() -> Vec<Value> {
@@ -2497,11 +2737,15 @@ fn topology_tool_definitions() -> Vec<Value> {
             json!({
                 "type":"object",
                 "properties":{
-                    "invocation_id":{"type":"string"},
+                    "task_id":{"type":"integer","minimum":1,"description":"The exact task_id supplied in the task prompt or returned by omar_pending."},
                     "port":{"type":"string"},
-                    "value":{}
+                    // Any JSON type is accepted, so no `type` is declared. An
+                    // empty schema left small models guessing a shape and
+                    // wrapping strings as {"type":"string","value":…}; the
+                    // description alone stopped that.
+                    "value":{"description":"The value as a bare JSON value of the port's declared type: a JSON string for string, path and bytes ports (never an object wrapping it), a number for int and float, true or false for bool, an array for list<...>, and null for a signal or an empty option."}
                 },
-                "required":["invocation_id","port","value"],
+                "required":["task_id","port","value"],
                 "additionalProperties":false
             }),
         ),
@@ -2510,8 +2754,8 @@ fn topology_tool_definitions() -> Vec<Value> {
             "Complete the active OMAR invocation after setting its effects. The runtime validates the final effect snapshot and releases the tag barrier.",
             json!({
                 "type":"object",
-                "properties":{"invocation_id":{"type":"string"}},
-                "required":["invocation_id"],
+                "properties":{"task_id":{"type":"integer","minimum":1,"description":"The exact task_id supplied in the task prompt or returned by omar_pending."}},
+                "required":["task_id"],
                 "additionalProperties":false
             }),
         ),
@@ -2566,6 +2810,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn send_input_routes_agent_followups_away_from_composer() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().to_path_buf();
+        context.session_prefix = format!("omar-channel-test-{}-", Uuid::new_v4());
+        let server = OmarMcpServer::new(context);
+        let client = server.client();
+        let session = server.qualified_session_name("worker").unwrap();
+        client.new_session(&session, "sleep 9999", None).unwrap();
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = TmuxClient::new("").kill_session(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(session.clone());
+        let spool = dir.path().join("events.jsonl");
+        client.set_session_backend(&session, "codex").unwrap();
+        client
+            .set_session_delivery(&session, &format!("spool:{}", spool.display()))
+            .unwrap();
+        for enter in [false, true] {
+            server
+                .send_input(json!({"name": "worker", "text": "FOLLOWUP_SENTINEL", "enter": enter}))
+                .unwrap();
+            assert_eq!(
+                crate::backend::spool::drain_spool(&spool),
+                ["FOLLOWUP_SENTINEL"]
+            );
+            assert!(!client
+                .capture_pane(&session, 50)
+                .unwrap()
+                .contains("FOLLOWUP_SENTINEL"));
+        }
+    }
+
     fn test_context() -> McpLaunchContext {
         McpLaunchContext {
             omar_dir: std::env::temp_dir().join(format!("omar-mcp-test-{}", Uuid::new_v4())),
@@ -2574,6 +2858,7 @@ mod tests {
             default_command: "claude".to_string(),
             default_workdir: ".".to_string(),
             health_idle_warning: 15,
+            agent_name: None,
             tmux_server: None,
             topology: None,
             serve: None,
@@ -2609,15 +2894,60 @@ mod tests {
     }
 
     #[test]
+    fn coordination_tool_honors_task_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context();
+        context.omar_dir = dir.path().into();
+        for agent in ["a", "b"] {
+            crate::supervision::register(
+                dir.path(),
+                crate::supervision::Task {
+                    id: String::new(),
+                    ea_id: 0,
+                    agent: agent.into(),
+                    session: agent.into(),
+                    parent: "ea".into(),
+                    parent_task_id: None,
+                    project_id: 1,
+                    assignment: "task".into(),
+                    status: crate::supervision::Status::Running,
+                    result: None,
+                    result_revision: 0,
+                    acknowledged: false,
+                    retired: false,
+                    next_check_ms: 0,
+                },
+            )
+            .unwrap();
+        }
+        let server = OmarMcpServer::new(context);
+        let response = server.call_tool(ToolCallRequest {
+            name: "coordination_state".into(),
+            arguments: json!({"offset":1}),
+        });
+        assert_ne!(response["isError"], true);
+        assert_eq!(response["structuredContent"]["offset"], 1);
+        assert_eq!(
+            response["structuredContent"]["tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn only_the_executive_assistant_sees_the_operator_tools() {
         let ea = listed_tools(ea_context());
         assert!(ea.contains(&"omar_reply".to_string()));
         assert!(ea.contains(&"omar_propose_design".to_string()));
+        assert!(ea.contains(&"omar_check_properties".to_string()));
 
         // A plain spawned agent has no serve context, so it must not see them.
         let agent = listed_tools(test_context());
         assert!(!agent.contains(&"omar_reply".to_string()));
         assert!(!agent.contains(&"omar_propose_design".to_string()));
+        assert!(!agent.contains(&"omar_check_properties".to_string()));
 
         // Workflow agents are restricted to the port protocol.
         let workflow = listed_tools(McpLaunchContext {
@@ -2674,7 +3004,7 @@ mod tests {
             },
         ] {
             let server = OmarMcpServer::new(context);
-            for name in ["omar_reply", "omar_propose_design"] {
+            for name in ["omar_reply", "omar_propose_design", "omar_check_properties"] {
                 let result = server.call_tool(ToolCallRequest {
                     name: name.to_string(),
                     arguments: json!({"text": "hello", "program": "team T() {}", "summary": "s"}),
@@ -2749,12 +3079,117 @@ mod tests {
     }
 
     #[test]
+    fn bare_names_let_a_prefixing_client_rebuild_the_documented_ones() {
+        // opencode lists MCP tools as `<server>_<tool>`; with bare names its
+        // `omar_` prefix yields `omar_set_port`, the name every prompt uses.
+        let topology = McpLaunchContext {
+            topology: Some(crate::manager::TopologyMcpContext {
+                team: "T".to_string(),
+                agent: "a".to_string(),
+                endpoint: "127.0.0.1:1".to_string(),
+                token: "t".to_string(),
+            }),
+            ..test_context()
+        };
+        let bare = OmarMcpServer::new(topology.clone()).with_bare_tool_names(true);
+        assert_eq!(
+            listed_tools_of(&bare),
+            ["set_port", "complete", "pending"],
+            "bare names drop only the omar_ prefix"
+        );
+        assert_eq!(
+            listed_tools_of(&OmarMcpServer::new(topology)),
+            ["omar_set_port", "omar_complete", "omar_pending"],
+            "other clients keep the documented names"
+        );
+        let ea = OmarMcpServer::new(McpLaunchContext {
+            serve: Some(crate::manager::ServeMcpContext {
+                endpoint: "127.0.0.1:1".to_string(),
+                token: "t".to_string(),
+            }),
+            ..test_context()
+        })
+        .with_bare_tool_names(true);
+        let names = listed_tools_of(&ea);
+        assert!(names.contains(&"reply".to_string()), "{names:?}");
+        assert!(names.contains(&"propose_design".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"coordination_state".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with(TOOL_PREFIX)),
+            "{names:?}"
+        );
+        // A bare call reaches the omar_reply handler: it is validated as one.
+        let result = ea.call_tool(ToolCallRequest {
+            name: "reply".to_string(),
+            arguments: json!("not an object"),
+        });
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(
+            rendered.contains("expects an object of arguments"),
+            "{rendered}"
+        );
+        // Names that were never prefixed are passed through untouched.
+        assert_eq!(
+            ea.canonical_tool_name("coordination_state"),
+            "coordination_state"
+        );
+        assert_eq!(ea.canonical_tool_name("omar_reply"), "omar_reply");
+    }
+
+    fn listed_tools_of(server: &OmarMcpServer) -> Vec<String> {
+        let response = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(1)),
+                method: "tools/list".to_string(),
+                params: json!({}),
+            })
+            .expect("tools/list responds");
+        response.result.expect("tools result")["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
     fn topology_scope_exposes_only_port_protocol_tools() {
         let names: Vec<_> = topology_tool_definitions()
             .into_iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(names, ["omar_set_port", "omar_complete", "omar_pending"]);
+    }
+
+    #[test]
+    fn topology_tools_require_integer_task_ids() {
+        let tools = topology_tool_definitions();
+        for tool in &tools[..2] {
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["properties"]["task_id"]["type"], "integer");
+            assert_eq!(schema["properties"]["task_id"]["minimum"], 1);
+            assert!(schema["properties"].get("invocation_id").is_none());
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("task_id")));
+        }
+    }
+
+    #[test]
+    fn set_port_value_is_described_but_untyped() {
+        let tools = topology_tool_definitions();
+        let value = &tools[0]["inputSchema"]["properties"]["value"];
+        // Untyped, because a port may carry any JSON type...
+        assert!(value.get("type").is_none(), "{value}");
+        // ...but described, because an empty schema had small models wrap
+        // strings in an object the string port then rejected.
+        let description = value["description"].as_str().unwrap();
+        assert!(description.contains("never an object"), "{description}");
     }
 
     #[test]
@@ -2846,6 +3281,8 @@ mod tests {
 
         assert_eq!(agy["command"], "agy --dangerously-skip-permissions");
         assert!(agy["available"].is_boolean());
+        assert!(agy["status"].is_string());
+        assert!(agy["login"].is_string());
     }
 
     #[test]
@@ -2932,47 +3369,6 @@ mod tests {
             std::env::var("OMAR_TMUX_SERVER").as_deref(),
             Ok("isolated-test-server")
         );
-    }
-
-    #[test]
-    fn slack_reply_queues_file_in_outbox() {
-        let server = OmarMcpServer::new(test_context());
-        let outbox = server.context.omar_dir.join("slack_outbox");
-
-        let result = server
-            .slack_reply(json!({
-                "channel": "C123",
-                "thread_ts": "1700000000.001",
-                "text": "hello from test",
-            }))
-            .expect("slack_reply should succeed");
-
-        assert_eq!(result["status"], json!("queued"));
-        assert!(outbox.is_dir(), "outbox dir must exist");
-
-        let entries: Vec<_> = std::fs::read_dir(&outbox)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
-            .collect();
-        assert_eq!(entries.len(), 1, "exactly one outbox file");
-
-        let body = std::fs::read_to_string(entries[0].path()).unwrap();
-        let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["channel"], json!("C123"));
-        assert_eq!(parsed["thread_ts"], json!("1700000000.001"));
-        assert_eq!(parsed["text"], json!("hello from test"));
-    }
-
-    #[test]
-    fn slack_reply_rejects_empty_channel_or_text() {
-        let server = OmarMcpServer::new(test_context());
-        assert!(server
-            .slack_reply(json!({"channel": "", "text": "x"}))
-            .is_err());
-        assert!(server
-            .slack_reply(json!({"channel": "C1", "text": ""}))
-            .is_err());
     }
 
     #[test]
@@ -3240,30 +3636,6 @@ mod tests {
         assert!(path.exists());
         drop(lock);
         assert!(!path.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn list_backends_probe_treats_hanging_command_as_unavailable() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use std::time::Instant;
-
-        let temp = tempfile::tempdir().unwrap();
-        let slow = temp.path().join("slow-backend");
-        fs::write(&slow, "#!/bin/sh\nsleep 5\n").unwrap();
-        let mut perms = fs::metadata(&slow).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&slow, perms).unwrap();
-
-        let start = Instant::now();
-        let available = backend_available_from_command(slow.to_str().unwrap(), "slow-backend");
-
-        assert!(!available);
-        assert!(
-            start.elapsed() < Duration::from_secs(3),
-            "list_backends should not block indefinitely on backend --version"
-        );
     }
 
     #[test]

@@ -11,7 +11,9 @@ use crate::tmux::TmuxClient;
 use crate::topology::write_json_atomic;
 
 /// TERMINATED covers natural drain and graceful stop; CANCELLED is a force
-/// kill; FAILED is any error.
+/// kill; FAILED is any error. PAUSED means the run's runner has exited with
+/// a durable checkpoint behind it: no process owns the run until a resume
+/// starts a new one, so the record is terminal, and the run is not over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DeploymentState {
@@ -19,6 +21,8 @@ pub enum DeploymentState {
     Deploying,
     Running,
     Stopping,
+    Pausing,
+    Paused,
     Terminated,
     Failed,
     Cancelled,
@@ -26,7 +30,10 @@ pub enum DeploymentState {
 
 impl DeploymentState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Terminated | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Terminated | Self::Failed | Self::Cancelled | Self::Paused
+        )
     }
 
     /// Whether `next` is a legal successor. Forward-only; any non-terminal
@@ -39,8 +46,11 @@ impl DeploymentState {
         match next {
             Deploying => self == Created,
             Running => self == Deploying,
-            Stopping => self == Running,
-            Terminated => matches!(self, Running | Stopping),
+            // A stop may abort a pause whose capture is held at the boundary.
+            Stopping => matches!(self, Running | Pausing),
+            Pausing => self == Running,
+            Paused => self == Pausing,
+            Terminated => matches!(self, Running | Stopping | Pausing),
             Failed | Cancelled => true,
             Created => false,
         }
@@ -54,6 +64,8 @@ impl fmt::Display for DeploymentState {
             Self::Deploying => "DEPLOYING",
             Self::Running => "RUNNING",
             Self::Stopping => "STOPPING",
+            Self::Pausing => "PAUSING",
+            Self::Paused => "PAUSED",
             Self::Terminated => "TERMINATED",
             Self::Failed => "FAILED",
             Self::Cancelled => "CANCELLED",
@@ -85,6 +97,19 @@ pub struct DeploymentRecord {
     pub error: Option<String>,
     /// Agent name to tmux session, so teardown needs no re-verify.
     pub sessions: BTreeMap<String, String>,
+    /// Missing is unknown (legacy); explicit null is the default server.
+    #[serde(
+        default,
+        deserialize_with = "read_launch_server",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tmux_server: Option<Option<String>>,
+    /// Inherited TMUX socket when no explicit named server was selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_socket: Option<String>,
+    /// Confirmed teardown, independent of whether tmux still has a server/socket.
+    #[serde(default)]
+    pub sessions_cleaned: bool,
     /// Per-invocation timeout, which bounds a graceful stop.
     pub timeout_seconds: u64,
     pub history: Vec<TransitionEvent>,
@@ -92,11 +117,51 @@ pub struct DeploymentRecord {
     /// read back and, once there is a resume, continued.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub state_vars: BTreeMap<String, serde_json::Value>,
+    /// Instance name to stable workspace id; retained after the run ends,
+    /// whether or not the directories were.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspaces: BTreeMap<String, String>,
+    /// Keep the instances' workspaces when the run ends. Off, they go with
+    /// the run; a paused run keeps them either way, since a resume needs them.
+    #[serde(default)]
+    pub keep_workspaces: bool,
+    /// The last checkpoint this run published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    /// Why the last capture failed, while the run holds at that boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_error: Option<String>,
+    /// Unix time the next automatic capture is due, for status displays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_checkpoint_at: Option<u64>,
+    /// The checkpoint a resumed run continued from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<String>,
+}
+
+fn read_launch_server<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 impl DeploymentRecord {
     pub fn create(team: &str, sessions: BTreeMap<String, String>, timeout_seconds: u64) -> Self {
         let now = now_unix();
+        let named = std::env::var("OMAR_TMUX_SERVER")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let inherited = if named.is_none() {
+            std::env::var("TMUX").ok().filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        let socket = inherited
+            .as_ref()
+            .and_then(|value| value.rsplitn(3, ',').nth(2))
+            .filter(|path| Path::new(path).is_absolute())
+            .map(str::to_owned);
+        let identity_known = inherited.is_none() || socket.is_some();
         Self {
             deployment_id: uuid::Uuid::new_v4().to_string(),
             team: team.to_string(),
@@ -106,6 +171,9 @@ impl DeploymentRecord {
             finished_at: None,
             error: None,
             sessions,
+            tmux_server: identity_known.then_some(named),
+            tmux_socket: socket,
+            sessions_cleaned: false,
             timeout_seconds,
             history: vec![TransitionEvent {
                 state: DeploymentState::Created,
@@ -113,6 +181,12 @@ impl DeploymentRecord {
                 detail: None,
             }],
             state_vars: BTreeMap::new(),
+            workspaces: BTreeMap::new(),
+            keep_workspaces: false,
+            checkpoint: None,
+            checkpoint_error: None,
+            next_checkpoint_at: None,
+            resumed_from: None,
         }
     }
 
@@ -135,6 +209,25 @@ impl DeploymentRecord {
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
+        // Preserve ownership before replacing the latest run, including legacy
+        // records written before deployment history existed.
+        if let Some(previous) = Self::load(dir)? {
+            if previous.deployment_id != self.deployment_id {
+                anyhow::ensure!(
+                    !previous.deployment_id.is_empty()
+                        && previous
+                            .deployment_id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                    "invalid deployment id"
+                );
+                write_json_atomic(
+                    &dir.join("deployments")
+                        .join(format!("{}.json", previous.deployment_id)),
+                    &previous,
+                )?;
+            }
+        }
         write_json_atomic(&record_path(dir), self)
     }
 
@@ -148,6 +241,45 @@ impl DeploymentRecord {
         let record = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid deployment record {}", path.display()))?;
         Ok(Some(record))
+    }
+
+    /// Current and archived runs, so redeployment cannot erase workspace ownership.
+    pub fn load_all(dir: &Path) -> Result<Vec<Self>> {
+        let mut records = Vec::new();
+        let history = dir.join("deployments");
+        if history.exists() {
+            for entry in std::fs::read_dir(history)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    records.push(serde_json::from_slice(&std::fs::read(&path)?).with_context(
+                        || format!("invalid deployment record {}", path.display()),
+                    )?);
+                }
+            }
+        }
+        if let Some(current) = Self::load(dir)? {
+            records.retain(|record: &Self| record.deployment_id != current.deployment_id);
+            records.push(current);
+        }
+        Ok(records)
+    }
+
+    pub fn session_client(&self) -> Result<TmuxClient> {
+        let server = self.launch_server()?;
+        if let Some(socket) = &self.tmux_socket {
+            anyhow::ensure!(
+                Path::new(socket).is_absolute(),
+                "invalid recorded tmux socket"
+            );
+            return Ok(TmuxClient::on_socket(socket.clone()));
+        }
+        Ok(TmuxClient::on_server("", server.map(str::to_owned)))
+    }
+
+    pub fn launch_server(&self) -> Result<Option<&str>> {
+        self.tmux_server.as_ref().map(|server| server.as_deref()).context(
+            "deployment has no recorded tmux server; verify its original server and set tmux_server in its deployment record to that server name (or explicit null for the default server) before cleanup or snapshots"
+        )
     }
 
     pub fn is_active(&self) -> bool {
@@ -186,26 +318,94 @@ pub fn outputs_path(dir: &Path) -> PathBuf {
     dir.join("outputs.json")
 }
 
+/// What an operator asked the runner to do at its next tag boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlOp {
+    Stop,
+    /// Checkpoint, then end the runner with the run resumable.
+    Pause,
+    /// Checkpoint now and keep going.
+    Checkpoint,
+    /// Try again after a capture failed and the run held at its boundary.
+    RetryCheckpoint,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-struct StopRequest {
+struct ControlRequest {
+    /// Missing in records a pre-checkpoint runtime wrote, where the file's
+    /// presence meant stop.
+    #[serde(default)]
+    op: Option<ControlOp>,
     requested_at: u64,
+}
+
+/// Admit one request at a time. The file is linked into place rather than
+/// written over, so two operators racing to ask for a pause and a stop get
+/// one request and one refusal, never a silently replaced one.
+pub fn request(dir: &Path, op: ControlOp) -> Result<()> {
+    let path = control_path(dir);
+    let staged = dir.join(format!(".control-{}.json", uuid::Uuid::new_v4().simple()));
+    write_json_atomic(
+        &staged,
+        &ControlRequest {
+            op: Some(op),
+            requested_at: now_unix(),
+        },
+    )?;
+    let linked = std::fs::hard_link(&staged, &path);
+    let _ = std::fs::remove_file(&staged);
+    match linked {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let pending = pending_request(dir)
+                .map(|op| format!("{op:?}").to_lowercase())
+                .unwrap_or_else(|| "another".to_string());
+            bail!("a {pending} request is already pending; wait for the runner to answer it")
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to write {}", path.display())),
+    }
 }
 
 /// Ask the runner to stop at the next tag boundary.
 pub fn request_stop(dir: &Path) -> Result<()> {
-    write_json_atomic(
-        &control_path(dir),
-        &StopRequest {
-            requested_at: now_unix(),
-        },
-    )
+    request(dir, ControlOp::Stop)
 }
 
+/// A stop that outranks a pending pause or capture: the operator changed
+/// their mind, and stopping abandons nothing mid-tag. Deliberate, where
+/// `request_stop` refuses to replace a request silently.
+pub fn override_with_stop(dir: &Path) -> Result<()> {
+    match pending_request(dir) {
+        Some(ControlOp::Stop) => Ok(()),
+        Some(_) => {
+            clear_stop(dir)?;
+            request(dir, ControlOp::Stop)
+        }
+        None => request(dir, ControlOp::Stop),
+    }
+}
+
+/// The request waiting for the runner, if any. Unreadable requests count as
+/// a stop: an operator reached for the control file, and stopping is the
+/// one answer that abandons nothing mid-tag.
+pub fn pending_request(dir: &Path) -> Option<ControlOp> {
+    let path = control_path(dir);
+    if !path.exists() {
+        return None;
+    }
+    let request: Option<ControlRequest> = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    Some(request.and_then(|r| r.op).unwrap_or(ControlOp::Stop))
+}
+
+#[cfg(test)]
 pub fn stop_requested(dir: &Path) -> bool {
-    control_path(dir).exists()
+    pending_request(dir) == Some(ControlOp::Stop)
 }
 
-/// Remove any stop request, so a finished stop cannot end the next run.
+/// Remove any pending request, so a finished one cannot act on the next run.
 pub fn clear_stop(dir: &Path) -> Result<()> {
     let path = control_path(dir);
     if path.exists() {
@@ -213,6 +413,23 @@ pub fn clear_stop(dir: &Path) -> Result<()> {
             .with_context(|| format!("failed to remove {}", path.display()))?;
     }
     Ok(())
+}
+
+fn policy_path(dir: &Path) -> PathBuf {
+    dir.join("checkpoint-policy.json")
+}
+
+/// The run's checkpoint policy as last persisted, if an operator set one.
+pub fn read_policy(dir: &Path) -> Result<Option<crate::checkpoint::Policy>> {
+    let path = policy_path(dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&std::fs::read(&path)?)?))
+}
+
+pub fn write_policy(dir: &Path, policy: crate::checkpoint::Policy) -> Result<()> {
+    write_json_atomic(&policy_path(dir), &policy)
 }
 
 pub fn kill_process(pid: u32) {
@@ -236,7 +453,7 @@ const CAPTURE_LINES: i32 = 10_000;
 
 impl SessionHost for TmuxClient {
     fn exists(&self, session: &str) -> Result<bool> {
-        self.has_session(session)
+        self.has_session_for_cleanup(session)
     }
 
     fn capture(&self, session: &str) -> Result<String> {
@@ -244,7 +461,7 @@ impl SessionHost for TmuxClient {
     }
 
     fn kill(&self, session: &str) -> Result<()> {
-        self.kill_session(session)
+        self.kill_session_tree(session)
     }
 }
 
@@ -279,6 +496,13 @@ pub fn teardown_sessions(
     failures
 }
 
+pub fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -298,7 +522,12 @@ mod tests {
         assert!(Running.may_become(Stopping));
         assert!(Running.may_become(Terminated));
         assert!(Stopping.may_become(Terminated));
-        for state in [Created, Deploying, Running, Stopping] {
+        assert!(Running.may_become(Pausing));
+        assert!(Pausing.may_become(Paused));
+        assert!(Pausing.may_become(Stopping), "a stop aborts a held pause");
+        assert!(Pausing.may_become(Terminated));
+        assert!(!Stopping.may_become(Paused));
+        for state in [Created, Deploying, Running, Stopping, Pausing] {
             assert!(state.may_become(Failed));
             assert!(state.may_become(Cancelled));
         }
@@ -306,9 +535,10 @@ mod tests {
         assert!(!Created.may_become(Running));
         assert!(!Deploying.may_become(Terminated));
         assert!(!Stopping.may_become(Running));
-        for terminal in [Terminated, Failed, Cancelled] {
+        for terminal in [Terminated, Failed, Cancelled, Paused] {
             for next in [
-                Created, Deploying, Running, Stopping, Terminated, Failed, Cancelled,
+                Created, Deploying, Running, Stopping, Pausing, Paused, Terminated, Failed,
+                Cancelled,
             ] {
                 assert!(!terminal.may_become(next));
             }
@@ -332,6 +562,26 @@ mod tests {
     }
 
     #[test]
+    fn legacy_missing_server_is_not_an_explicit_default() {
+        let record = DeploymentRecord::create("Demo", BTreeMap::new(), 42);
+        let mut json = serde_json::to_value(record).unwrap();
+        json.as_object_mut().unwrap().remove("tmux_server");
+        let legacy: DeploymentRecord = serde_json::from_value(json.clone()).unwrap();
+        assert!(legacy.launch_server().is_err());
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("tmux_server")
+            .is_none());
+        json["tmux_server"] = serde_json::Value::Null;
+        let default: DeploymentRecord = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(default.launch_server().unwrap(), None);
+        assert!(serde_json::to_value(default).unwrap()["tmux_server"].is_null());
+        json["tmux_server"] = serde_json::json!("original-server");
+        let named: DeploymentRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(named.launch_server().unwrap(), Some("original-server"));
+    }
+
+    #[test]
     fn record_round_trips_and_stop_control_toggles() {
         let dir = tempfile::tempdir().unwrap();
         let mut record = DeploymentRecord::create("Demo", BTreeMap::new(), 42);
@@ -349,6 +599,36 @@ mod tests {
         assert!(stop_requested(dir.path()));
         clear_stop(dir.path()).unwrap();
         assert!(!stop_requested(dir.path()));
+        // A pause is not a stop, and a legacy request without an op is.
+        request(dir.path(), ControlOp::Pause).unwrap();
+        assert!(!stop_requested(dir.path()));
+        assert_eq!(pending_request(dir.path()), Some(ControlOp::Pause));
+        // One request at a time: a stop cannot silently replace the pause.
+        let refused = request_stop(dir.path()).unwrap_err().to_string();
+        assert!(
+            refused.contains("pause request is already pending"),
+            "{refused}"
+        );
+        assert_eq!(pending_request(dir.path()), Some(ControlOp::Pause));
+        // Unless the stop is meant to outrank it.
+        override_with_stop(dir.path()).unwrap();
+        assert_eq!(pending_request(dir.path()), Some(ControlOp::Stop));
+        override_with_stop(dir.path()).unwrap();
+        clear_stop(dir.path()).unwrap();
+        std::fs::write(dir.path().join("control.json"), b"{\"requested_at\":1}").unwrap();
+        assert!(stop_requested(dir.path()));
+        clear_stop(dir.path()).unwrap();
+        assert_eq!(pending_request(dir.path()), None);
+        assert!(read_policy(dir.path()).unwrap().is_none());
+        write_policy(
+            dir.path(),
+            crate::checkpoint::Policy {
+                period_secs: 90,
+                ..crate::checkpoint::Policy::OFF
+            },
+        )
+        .unwrap();
+        assert_eq!(read_policy(dir.path()).unwrap().unwrap().period_secs, 90);
     }
 
     #[test]
