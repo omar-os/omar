@@ -76,7 +76,6 @@ pub struct App {
     pub selected: usize,
     pub manager_selected: bool,
     pub should_quit: bool,
-    pub reset_on_quit: bool,
     pub show_help: bool,
     pub pending_confirm: Option<ConfirmAction>,
     pub filter: String,
@@ -123,13 +122,13 @@ pub struct App {
     default_command: String,
     default_workdir: String,
     pub scheduler: Arc<Scheduler>,
+    /// The runtime this dashboard is attached to as a client, if any.
+    pub session: Option<crate::sessions::Session>,
 }
 
 impl App {
     pub fn new(config: &Config, ticker: TickerBuffer, scheduler: Arc<Scheduler>) -> Self {
-        let omar_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".omar");
+        let omar_dir = crate::sessions::state_root();
 
         Self::new_with_omar_dir(config, ticker, scheduler, omar_dir)
     }
@@ -169,7 +168,6 @@ impl App {
             selected: 0,
             manager_selected: true,
             should_quit: false,
-            reset_on_quit: false,
             show_help: false,
             pending_confirm: None,
             filter: String::new(),
@@ -220,6 +218,7 @@ impl App {
             default_command: config.agent.default_command.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             scheduler,
+            session: None,
         }
     }
 
@@ -522,6 +521,19 @@ impl App {
             let _ = self.client.kill_session(&manager_session);
         }
 
+        // An attached dashboard asks the runtime, which launches the assistant
+        // with its serve/MCP context; it never launches one itself.
+        if let Some(session) = &self.session {
+            if crate::sessions::launched_with_assistant(session) {
+                crate::sessions::rpc(
+                    session,
+                    serde_json::json!({"op": "manager_start", "ea": self.active_ea.to_string()}),
+                    std::time::Duration::from_secs(120),
+                )?;
+            }
+            return Ok(());
+        }
+
         // Reload registry on cache miss so we have the latest EA names
         self.registered_eas = ea::load_registry(&self.omar_dir);
 
@@ -548,6 +560,7 @@ impl App {
             default_command: default_command.clone(),
             default_workdir: self.default_workdir.clone(),
             health_idle_warning: self.health_threshold,
+            agent_name: None,
             tmux_server: std::env::var("OMAR_TMUX_SERVER")
                 .ok()
                 .map(|server| server.trim().to_string())
@@ -578,7 +591,12 @@ impl App {
             .unwrap_or(workdir);
 
         self.client
-            .new_session(&manager_session, &cmd, Some(&launch_cwd))
+            .new_session_with_backend(
+                &manager_session,
+                &cmd,
+                Some(&launch_cwd),
+                crate::backend::command_name(&default_command),
+            )
             .map_err(|err| {
                 let msg = format!(
                     "tmux failed to start manager '{}' (cwd '{}') with command '{}': {}",
@@ -856,24 +874,6 @@ impl App {
                 .unwrap_or(&a.session.name)
                 .to_string()
         })
-    }
-
-    /// Receiver-side name for the selected agent, suitable for matching the
-    /// `receiver` field of a `ScheduledEvent`.
-    ///
-    /// Workers are addressed by their short name (e.g., "worker1").
-    /// The EA manager is addressed as "ea" — the session name
-    /// `omar-agent-ea-<id>` never appears in scheduled-event payloads.
-    ///
-    /// Used by the dashboard when the user opens an agent popup so the
-    /// scheduler can defer events bound for that pane while it is open.
-    pub fn selected_popup_receiver_name(&self) -> Option<String> {
-        let selected = self.selected_agent()?;
-        Some(popup_receiver_name_for(
-            &selected.session.name,
-            &self.manager_session_name(),
-            self.client.prefix(),
-        ))
     }
 
     /// Attach to the selected agent via popup
@@ -1251,7 +1251,22 @@ impl App {
 
     /// Create a new EA and add it to the registry
     pub fn create_ea(&mut self, name: String, desc: Option<String>) -> Result<EaId> {
-        match ea::register_ea(&self.omar_dir, &name, desc.as_deref()) {
+        let created = match &self.session {
+            // The runtime registers the EA and allocates its chat/workspace.
+            Some(session) => crate::sessions::rpc(
+                session,
+                serde_json::json!({"op": "create_ea", "name": name}),
+                std::time::Duration::from_secs(10),
+            )
+            .and_then(|value| {
+                value["id"]
+                    .as_u64()
+                    .map(|id| id as EaId)
+                    .ok_or_else(|| anyhow::anyhow!("runtime returned no EA id"))
+            }),
+            None => ea::register_ea(&self.omar_dir, &name, desc.as_deref()),
+        };
+        match created {
             Ok(ea_id) => {
                 self.registered_eas = ea::load_registry(&self.omar_dir);
                 self.set_status(format!("Created EA {}: {}", ea_id, name));
@@ -1267,6 +1282,34 @@ impl App {
     /// Delete the specified EA: kill all its tmux sessions, remove state, unregister.
     /// Blocked if it is the last EA. Switches to the lowest remaining EA when active.
     pub fn delete_ea(&mut self, ea_id: EaId) -> Result<()> {
+        if let Some(session) = self.session.as_ref() {
+            let session_name = session.name.clone();
+            let value = crate::sessions::rpc(
+                session,
+                serde_json::json!({"op":"delete_ea", "ea":ea_id.to_string()}),
+                std::time::Duration::from_secs(90),
+            );
+            self.pending_confirm = None;
+            self.registered_eas = ea::load_registry(&self.omar_dir);
+            if !self.registered_eas.iter().any(|ea| ea.id == self.active_ea) {
+                let survivor = self
+                    .registered_eas
+                    .iter()
+                    .map(|ea| ea.id)
+                    .min()
+                    .ok_or_else(|| anyhow::anyhow!("runtime deleted the final EA"))?;
+                self.switch_ea(survivor)?;
+            }
+            let value = value.map_err(|error| {
+                anyhow::anyhow!(
+                "EA deletion incomplete: {error:#}. Inspect omar logs -s {session_name}; retry D if this EA is still listed, or restart the session to finish cleanup.")
+            })?;
+            self.set_status(format!(
+                "Deleted EA {} ({} agents, {} events)",
+                ea_id, value["agents_killed"], value["events_cancelled"]
+            ));
+            return Ok(());
+        }
         if self.registered_eas.len() <= 1 {
             self.set_status("Cannot delete the only EA");
             self.pending_confirm = None;
@@ -1319,7 +1362,7 @@ impl App {
         if notes_path.exists() {
             std::fs::remove_file(&notes_path)?;
         }
-        crate::manager::remove_omar_antigravity_mcp_config(ea_id)?;
+        crate::backend::antigravity::remove_omar_antigravity_mcp_config(ea_id)?;
 
         let events_cancelled = self.scheduler.cancel_by_ea(ea_id);
 
@@ -1512,27 +1555,6 @@ pub fn build_tree(
     }
 
     nodes
-}
-
-/// Map a selected session name to the canonical receiver name used in
-/// scheduled events. The EA manager's session name collapses to "ea"; worker
-/// sessions drop the EA-scoped prefix.
-///
-/// Kept as a free fn so it can be unit-tested without standing up a full
-/// `App` (which needs a Config + tmux client).
-pub(crate) fn popup_receiver_name_for(
-    selected_session_name: &str,
-    manager_session_name: &str,
-    prefix: &str,
-) -> String {
-    if selected_session_name == manager_session_name {
-        "ea".to_string()
-    } else {
-        selected_session_name
-            .strip_prefix(prefix)
-            .unwrap_or(selected_session_name)
-            .to_string()
-    }
 }
 
 /// Position of the agent named `name` within `focus_child_indices`, so the
@@ -1766,9 +1788,14 @@ mod tests {
         let scheduler = Arc::new(Scheduler::new());
         let mut app = App::new(&config, TickerBuffer::new(), scheduler);
 
-        let mut commands: Vec<String> = ["claude", "codex", "cursor", "opencode", "agy"]
+        let mut commands: Vec<String> = ["claude", "codex", "cursor", "opencode", "agy", "pi"]
             .iter()
-            .map(|name| crate::config::resolve_backend(name).unwrap())
+            .map(|name| {
+                crate::backend::resolve(name)
+                    .unwrap()
+                    .default_command()
+                    .to_string()
+            })
             .collect();
         commands.push("custom --no-flags".to_string());
 
@@ -1791,7 +1818,10 @@ mod tests {
         let mut app = App::new(&config, TickerBuffer::new(), scheduler);
         let handoff = ea::DashboardLaunchHandoff {
             active_ea: 0,
-            default_command: crate::config::resolve_backend("claude").unwrap(),
+            default_command: crate::backend::resolve("claude")
+                .unwrap()
+                .default_command()
+                .to_string(),
             default_workdir: "/tmp/omar-launch".to_string(),
             restart_manager: false,
         };
@@ -1831,7 +1861,10 @@ mod tests {
         let config = test_config_with_prefix(prefix.clone());
         let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
 
-        let claude = crate::config::resolve_backend("claude").unwrap();
+        let claude = crate::backend::resolve("claude")
+            .unwrap()
+            .default_command()
+            .to_string();
         app.default_command = claude.clone();
         app.config.agent.default_command = claude.clone();
 
@@ -1898,8 +1931,14 @@ mod tests {
         let config = test_config_with_prefix(prefix.clone());
         let mut app = App::new(&config, TickerBuffer::new(), Arc::new(Scheduler::new()));
 
-        let claude = crate::config::resolve_backend("claude").unwrap();
-        let opencode = crate::config::resolve_backend("opencode").unwrap();
+        let claude = crate::backend::resolve("claude")
+            .unwrap()
+            .default_command()
+            .to_string();
+        let opencode = crate::backend::resolve("opencode")
+            .unwrap()
+            .default_command()
+            .to_string();
         assert_ne!(
             claude, opencode,
             "backends must resolve to distinct commands"
@@ -1978,7 +2017,6 @@ mod tests {
                 default_workdir: ".".to_string(),
             },
             metrics: MetricsConfig::default(),
-            slack_bridge: crate::config::SlackBridgeConfig::default(),
         }
     }
 
@@ -2981,41 +3019,5 @@ default_workdir = "."
             !state_dir.exists(),
             "EA state should be removed after successful delete"
         );
-    }
-
-    // ── popup_receiver_name_for tests ──
-    //
-    // The tmux pane the dashboard opens must be addressed by the same
-    // identifier the scheduler sees in event `receiver` fields, so that the
-    // per-pane 30s defer actually matches. Workers use their short name; the
-    // EA pane normalizes to "ea" (not the session name `omar-agent-ea-N`,
-    // which never appears in event payloads).
-
-    #[test]
-    fn popup_receiver_name_for_worker_strips_prefix() {
-        let name =
-            popup_receiver_name_for("omar-agent-0-worker1", "omar-agent-ea-0", "omar-agent-0-");
-        assert_eq!(name, "worker1");
-    }
-
-    #[test]
-    fn popup_receiver_name_for_ea_manager_normalizes_to_ea() {
-        let name = popup_receiver_name_for("omar-agent-ea-0", "omar-agent-ea-0", "omar-agent-0-");
-        assert_eq!(name, "ea");
-    }
-
-    #[test]
-    fn popup_receiver_name_for_ea_manager_ea1_also_normalizes_to_ea() {
-        // EA 1: prefix is "omar-agent-1-", manager is "omar-agent-ea-1".
-        let name = popup_receiver_name_for("omar-agent-ea-1", "omar-agent-ea-1", "omar-agent-1-");
-        assert_eq!(name, "ea");
-    }
-
-    #[test]
-    fn popup_receiver_name_for_unprefixed_falls_back_to_full_name() {
-        // Safety net: a session that doesn't carry the active EA prefix at
-        // all shouldn't silently become an empty string.
-        let name = popup_receiver_name_for("legacy-session", "omar-agent-ea-0", "omar-agent-0-");
-        assert_eq!(name, "legacy-session");
     }
 }

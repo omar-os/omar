@@ -20,8 +20,7 @@ impl CodexObserver {
         let socket = target
             .command
             .as_deref()
-            .and_then(crate::channel::codex_home)
-            .map(|home| crate::channel::codex_socket_path(&home));
+            .and_then(crate::backend::codex::codex_launch_socket);
         Box::new(Self {
             session: target.session,
             socket,

@@ -5,12 +5,151 @@
   --panel: #101013;
   --panel-2: #15151a;
   --line: #292831;
+  --line-2: #3b3844;
   --muted: #96939f;
   --text: #f5f2fa;
+  --text-2: #cbc7d2;
+  --text-3: #9d97a8;
+  --accent-text: #d8caff;
+  --link: #b49cff;
+  --code-bg: #201f26;
+  --code-text: #d9cffb;
+  --pre-bg: #131318;
+  --glass: rgba(12, 12, 15, 0.86);
+  --glow: rgba(140, 99, 242, 0.16);
+  --bubble: #242329;
+  --bubble-text: #aaa6b0;
   --purple: rgb(140, 99, 242);
   --purple-soft: rgba(140, 99, 242, 0.16);
   color-scheme: dark;
+
+  /* The diagram. Dark like the rest of the shell; light mode swaps these for
+     the paper it was first drawn on. */
+  --dia-paper: #121215;
+  --dia-grid: rgba(255, 255, 255, 0.045);
+  --dia-heading: rgba(18, 18, 21, 0.94);
+  --dia-heading-line: #292831;
+  --dia-heading-text: #f0edf5;
+  --dia-stats: #cfcbd6;
+  --dia-stats-muted: #8c8894;
+  --dia-team-shadow: rgba(0, 0, 0, 0.4);
+  --dia-team: #1b1b21;
+  --dia-team-line: #4e4c56;
+  --dia-team-name: #f0edf5;
+  --dia-team-kind: #96939f;
+  --dia-port: #e9e6ef;
+  --dia-label: #dcd8e3;
+  --dia-node: #24242b;
+  --dia-node-line: #a5a2ad;
+  --dia-node-line-soft: #7b7983;
+  --dia-edge: #9a97a2;
+  --dia-edge-delay: #b4b0bc;
+  --dia-reaction: #2b2b33;
+  --dia-reaction-line: #6f6d77;
+  --dia-badge: #1b1b21;
+  --dia-badge-line: #5a585f;
+  --dia-index: #cfcbd6;
+  --dia-name: #f0edf5;
+  --dia-meta: #a39fab;
+  --dia-done: #1c3328;
+  --dia-done-meta: #8fcaa8;
+  --dia-live: #2a2347;
+  --dia-live-meta: #b4a4f0;
+  /* A selected node's label: it keeps reading on the card it sits on. */
+  --dia-selected-text: #e9e1ff;
+  --dia-chrome: rgba(24, 24, 28, 0.94);
+  --dia-chrome-line: #3b3844;
+  --dia-chrome-text: #c4c0cb;
+  --dia-chrome-hover: #2a2a31;
+  --dia-chrome-shadow: rgba(0, 0, 0, 0.4);
+  /* Notices: amber for a state that clears by itself, red for a failure. */
+  --warn: #f5b84b;
+  --warn-text: #f3d9a6;
+  --warn-bg: rgba(245, 184, 75, 0.08);
+  --warn-line: rgba(245, 184, 75, 0.28);
+  --danger: #f87171;
+  --danger-text: #fecaca;
+  --danger-bg: rgba(127, 29, 29, 0.22);
+  --danger-line: rgba(248, 113, 113, 0.28);
 }
+
+/* Light is chosen from the settings menu and kept in local storage; the
+   layout applies the attribute before paint. */
+:root[data-theme="light"] {
+  --ink: #f6f5f9;
+  --panel: #ffffff;
+  --panel-2: #f1f0f5;
+  --line: #dcd9e3;
+  --line-2: #cfccd8;
+  --muted: #6a6675;
+  --text: #17161b;
+  --text-2: #2c2a33;
+  --text-3: #6a6675;
+  --accent-text: #5b3fd1;
+  --link: #6b4fd8;
+  --code-bg: #eeecf4;
+  --code-text: #4b3a8f;
+  --pre-bg: #f5f4f8;
+  --glass: rgba(255, 255, 255, 0.86);
+  --glow: rgba(140, 99, 242, 0.1);
+  --bubble: #e9e7ee;
+  --bubble-text: #5d5966;
+  --warn: #c27c0e;
+  --warn-text: #7a4b05;
+  --warn-bg: #fdf4e3;
+  --warn-line: #f0d39a;
+  --danger: #dc2626;
+  --danger-text: #991b1b;
+  --danger-bg: #fef2f2;
+  --danger-line: #fecaca;
+  color-scheme: light;
+
+  --dia-paper: #f6f6f4;
+  --dia-grid: rgba(54, 52, 58, 0.055);
+  --dia-heading: rgba(246, 246, 244, 0.94);
+  --dia-heading-line: #d8d7d3;
+  --dia-heading-text: #242326;
+  --dia-stats: #343237;
+  --dia-stats-muted: #807d84;
+  --dia-team-shadow: rgba(31, 30, 34, 0.07);
+  --dia-team: #ffffff;
+  --dia-team-line: #8e8c92;
+  --dia-team-name: #1b1a1e;
+  --dia-team-kind: #7d7a82;
+  --dia-port: #17161a;
+  --dia-label: #2c2b30;
+  --dia-node: #ffffff;
+  --dia-node-line: #4b4950;
+  --dia-node-line-soft: #85838b;
+  --dia-edge: #6a686f;
+  --dia-edge-delay: #5f5c66;
+  --dia-reaction: #e9e8ec;
+  --dia-reaction-line: #85838b;
+  --dia-badge: #ffffff;
+  --dia-badge-line: #b3b1b8;
+  --dia-index: #55535a;
+  --dia-name: #1b1a1e;
+  --dia-meta: #7d7a82;
+  --dia-done: #e2f1e8;
+  --dia-done-meta: #4c7a63;
+  --dia-live: #ece5ff;
+  --dia-live-meta: #6553a0;
+  --dia-selected-text: #4a2ba0;
+  --dia-chrome: rgba(255, 255, 255, 0.94);
+  --dia-chrome-line: #d5d3cf;
+  --dia-chrome-text: #55535a;
+  --dia-chrome-hover: #f0efec;
+  --dia-chrome-shadow: rgba(31, 29, 34, 0.08);
+}
+
+/* Source highlighting was tuned for a dark pane. */
+:root[data-theme="light"] .omar-tok-comment { color: #8a8794; }
+:root[data-theme="light"] .omar-tok-type { color: #1f7f8a; }
+:root[data-theme="light"] .omar-tok-agent { color: #9a6a10; }
+:root[data-theme="light"] .omar-tok-string { color: #2f7d32; }
+:root[data-theme="light"] .omar-tok-interpolation { color: #b4376b; }
+:root[data-theme="light"] .omar-tok-number { color: #8a3fb0; }
+:root[data-theme="light"] .omar-tok-punctuation { color: #6f6a7a; }
 
 * {
   box-sizing: border-box;
@@ -47,39 +186,24 @@ button {
   flex-direction: column;
   overflow: hidden;
   background:
-    radial-gradient(circle at 52% -20%, rgba(140, 99, 242, 0.16), transparent 30rem),
+    radial-gradient(circle at 52% -20%, var(--glow), transparent 30rem),
     var(--ink);
 }
 
-.topbar {
-  flex: none;
-  height: 64px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  border-bottom: 1px solid var(--line);
-  padding: 0 20px;
-  background: rgba(8, 8, 10, 0.9);
-  backdrop-filter: blur(16px);
-}
-
 .terminal-button {
-  padding: 7px 10px;
+  height: 36px;
+  padding: 0 8px;
   color: var(--text);
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
-  font-size: 12px;
+  font-size: 1rem;
   white-space: nowrap;
 }
 
 .terminal-button:hover:not(:disabled) { border-color: var(--purple); }
 .terminal-button:disabled { opacity: 0.5; cursor: default; }
 
-.brand,
-.runtime-controls,
-.runtime-controls label,
-.connection,
 .diagram-heading,
 .run-stats,
 .prompt-box > div,
@@ -88,64 +212,19 @@ button {
   align-items: center;
 }
 
-.brand {
-  gap: 10px;
-  font-size: 15px;
-  letter-spacing: 0.06em;
-}
-
-.brand b {
-  color: var(--purple);
-  font-weight: 650;
-}
-
 /* The logo artwork carries its own padding, so it is set larger than the
    optical size to make the mark itself read at ~28px. */
 .brand-mark {
   width: 40px;
   height: 40px;
-  margin: -5px;
   display: block;
   object-fit: contain;
 }
 
 .eyebrow {
-  font-size: 10px;
+  font-size: 0.75rem;
   letter-spacing: 0.14em;
   color: var(--muted);
-}
-
-.runtime-controls {
-  gap: 8px;
-}
-
-.runtime-controls label {
-  height: 34px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  overflow: hidden;
-  background: #0c0c0f;
-}
-
-.runtime-controls label span {
-  padding: 0 10px;
-  color: var(--muted);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-.runtime-controls input {
-  width: 220px;
-  height: 100%;
-  border: 0;
-  border-left: 1px solid var(--line);
-  outline: 0;
-  padding: 0 10px;
-  color: #d7d3dd;
-  background: #111115;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
 }
 
 .primary-button,
@@ -153,7 +232,7 @@ button {
   height: 34px;
   padding: 0 14px;
   border-radius: 8px;
-  font-size: 12px;
+  font-size: 0.875rem;
   font-weight: 650;
 }
 
@@ -165,92 +244,9 @@ button {
 
 .secondary-button {
   border: 1px solid var(--line);
-  background: #151519;
-  color: #bbb7c3;
+  background: var(--panel-2);
+  color: var(--text-2);
 }
-
-/* Two independent signals: where the runtime is, and where the operator is. */
-.daemon {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  height: 34px;
-  padding: 0 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #0c0c0f;
-  color: #b6b2bf;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-}
-
-.daemon i {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #6e6b74;
-}
-
-.daemon.live i {
-  background: #6ee7aa;
-  box-shadow: 0 0 8px #6ee7aa;
-}
-
-.daemon.checking i {
-  background: #e3c26b;
-}
-
-.daemon.offline {
-  border-color: rgba(248, 113, 113, 0.35);
-  color: #e5a6a6;
-}
-
-.daemon.offline i {
-  background: #f87171;
-}
-
-.daemon.demo i {
-  background: #8c63f2;
-}
-
-.connection {
-  min-width: 72px;
-  gap: 6px;
-  padding-left: 5px;
-  color: var(--muted);
-  font-size: 11px;
-  text-transform: capitalize;
-}
-
-.connection i {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #6e6b74;
-}
-
-.connection.live i {
-  background: #6ee7aa;
-  box-shadow: 0 0 8px #6ee7aa;
-}
-
-.connection.done i {
-  background: #4f9d76;
-}
-
-.connection.error i {
-  background: #f87171;
-}
-
-
-
-
-
-
-
-
-
-
 
 .primary-button:disabled {
   opacity: 0.45;
@@ -260,7 +256,7 @@ button {
 .builder-status {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 1rem;
 }
 
 .waiting {
@@ -270,7 +266,7 @@ button {
   margin: 0 0 22px;
   padding-left: 38px;
   color: var(--muted);
-  font-size: 12.5px;
+  font-size: 1rem;
 }
 
 /* The wait, and the way into the session doing the waiting. */
@@ -284,13 +280,13 @@ button {
   margin-bottom: 22px;
   border: 0;
   background: transparent;
-  color: #9d97a8;
-  font-size: 11px;
+  color: var(--text-3);
+  font-size: 0.8125rem;
   text-decoration: underline;
 }
 
 .waiting-inspect:hover {
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .waiting-verb {
@@ -300,7 +296,7 @@ button {
 .waiting-elapsed {
   color: #6f6b78;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: 0.8125rem;
   font-variant-numeric: tabular-nums;
 }
 
@@ -421,10 +417,9 @@ button {
   flex-direction: column;
   overflow: hidden;
   border-right: 1px solid var(--line);
-  background: rgba(12, 12, 15, 0.86);
+  background: var(--glass);
 }
 
-.panel-heading,
 .diagram-heading {
   min-height: 82px;
   border-bottom: 1px solid var(--line);
@@ -449,7 +444,7 @@ button {
 .workflow-actions .secondary-button {
   height: 30px;
   padding: 0 12px;
-  font-size: 11.5px;
+  font-size: 0.84375rem;
   white-space: nowrap;
 }
 
@@ -463,7 +458,7 @@ button {
 h1,
 h2 {
   margin: 6px 0 0;
-  font-size: 17px;
+  font-size: 1.1875rem;
   font-weight: 620;
   letter-spacing: -0.02em;
 }
@@ -494,30 +489,30 @@ h2 {
   place-items: center;
   border-radius: 8px;
   background: var(--purple-soft);
-  color: #c9b5ff;
-  font-size: 10px;
+  color: var(--link);
+  font-size: 0.75rem;
   font-weight: 750;
 }
 
 .message.user > span {
-  background: #242329;
-  color: #aaa6b0;
-  font-size: 8px;
+  background: var(--bubble);
+  color: var(--bubble-text);
+  font-size: 0.75rem;
 }
 
 .message p {
   margin: 2px 0 0;
-  color: #cbc7d2;
-  font-size: 13px;
-  line-height: 1.55;
+  color: var(--text-2);
+  font-size: 1.125rem;
+  line-height: 1.75;
 }
 
-/* Assistant messages are rendered markdown. */
+/* Chat messages are rendered markdown. */
 .message-body {
   min-width: 0;
-  color: #cbc7d2;
-  font-size: 13px;
-  line-height: 1.6;
+  color: var(--text-2);
+  font-size: 1.125rem;
+  line-height: 1.75;
 }
 
 .message-body > *:first-child {
@@ -532,17 +527,24 @@ h2 {
   margin: 0 0 10px;
 }
 
+/* Keep the operator's intentional line breaks within Markdown paragraphs. */
+.message.operator .message-body p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .message-body strong {
   color: var(--text);
   font-weight: 650;
 }
 
 .message-body em {
-  color: #d6d1de;
+  font-style: italic;
+  color: var(--text);
 }
 
 .message-body a {
-  color: #b49cff;
+  color: var(--link);
 }
 
 /* The Tailwind preflight strips list markers, so restore them explicitly. */
@@ -562,7 +564,7 @@ h2 {
 }
 
 .message-body li::marker {
-  color: #7d7a86;
+  color: var(--muted);
 }
 
 .message-body li {
@@ -572,40 +574,40 @@ h2 {
 .message-body code {
   padding: 1px 5px;
   border-radius: 5px;
-  background: #201f26;
-  color: #d9cffb;
-  font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--code-bg);
+  color: var(--code-text);
+  font: 14px ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .message-body pre {
   margin: 0 0 10px;
   overflow-x: auto;
   padding: 11px 13px;
-  border: 1px solid #2a2932;
+  border: 1px solid var(--line);
   border-radius: 9px;
-  background: #131318;
+  background: var(--pre-bg);
 }
 
 .message-body pre code {
   padding: 0;
   background: none;
-  color: #bfb8cd;
-  font-size: 11px;
+  color: var(--text-2);
+  font-size: 1rem;
   line-height: 1.6;
 }
 
 .message-body blockquote {
   margin: 0 0 10px;
   padding-left: 11px;
-  border-left: 2px solid #3a3844;
-  color: #a9a4b4;
+  border-left: 2px solid var(--line-2);
+  color: var(--text-3);
 }
 
 .message-body h1,
 .message-body h2,
 .message-body h3 {
   margin: 12px 0 6px;
-  font-size: 13.5px;
+  font-size: 1.25rem;
   font-weight: 650;
   letter-spacing: 0;
 }
@@ -613,27 +615,27 @@ h2 {
 .message-body table {
   margin-bottom: 10px;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: 1rem;
 }
 
 .message-body th,
 .message-body td {
   padding: 5px 9px;
-  border: 1px solid #2a2932;
+  border: 1px solid var(--line);
   text-align: left;
 }
 
 .message-body hr {
   margin: 12px 0;
   border: 0;
-  border-top: 1px solid #2a2932;
+  border-top: 1px solid var(--line);
 }
 
 .prompt-box {
   margin: 16px;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 13px;
-  background: #151519;
+  background: var(--panel-2);
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.2);
 }
 
@@ -650,25 +652,25 @@ h2 {
   padding: 14px;
   background: transparent;
   color: var(--text);
-  font-size: 13px;
-  line-height: 1.45;
+  font-size: 1.125rem;
+  line-height: 1.5;
 }
 
 .prompt-box > div {
   justify-content: space-between;
   padding: 0 10px 10px 14px;
-  color: #77737f;
-  font-size: 10px;
+  color: var(--muted);
+  font-size: 0.75rem;
 }
 
 .send-button {
-  width: 30px;
-  height: 30px;
+  width: 36px;
+  height: 36px;
   border: 0;
   border-radius: 8px;
   background: var(--purple);
   color: white;
-  font-size: 18px;
+  font-size: 1.25rem;
 }
 
 .diagram-panel {
@@ -676,17 +678,17 @@ h2 {
   flex-direction: column;
   overflow: hidden;
   background:
-    linear-gradient(rgba(54, 52, 58, 0.055) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(54, 52, 58, 0.055) 1px, transparent 1px),
-    #f6f6f4;
+    linear-gradient(var(--dia-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--dia-grid) 1px, transparent 1px),
+    var(--dia-paper);
   background-size: 24px 24px;
 }
 
 .diagram-heading {
   justify-content: space-between;
-  border-bottom-color: #d8d7d3;
-  background: rgba(246, 246, 244, 0.94);
-  color: #242326;
+  border-bottom-color: var(--dia-heading-line);
+  background: var(--dia-heading);
+  color: var(--dia-heading-text);
 }
 
 .run-stats {
@@ -701,14 +703,14 @@ h2 {
   display: grid;
   gap: 4px;
   min-width: 46px;
-  color: #343237;
+  color: var(--dia-stats);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: 0.8125rem;
 }
 
 .run-stats small {
-  color: #807d84;
-  font: 9px ui-sans-serif, system-ui, sans-serif;
+  color: var(--dia-stats-muted);
+  font: 0.75rem ui-sans-serif, system-ui, sans-serif;
   letter-spacing: 0.12em;
 }
 
@@ -785,13 +787,13 @@ h2 {
 
 /* Reactor container: white body with a soft offset plate behind it. */
 .omar-team-shadow {
-  fill: rgba(31, 30, 34, 0.07);
+  fill: var(--dia-team-shadow);
   stroke: none;
 }
 
 .omar-team-body {
-  fill: #ffffff;
-  stroke: #8e8c92;
+  fill: var(--dia-team);
+  stroke: var(--dia-team-line);
   stroke-width: 1;
 }
 
@@ -800,15 +802,15 @@ h2 {
 }
 
 .omar-team-name {
-  fill: #1b1a1e;
-  font-size: 15px;
+  fill: var(--dia-team-name);
+  font-size: 1.0625rem;
   font-weight: 650;
   letter-spacing: -0.01em;
 }
 
 .omar-team-kind {
-  fill: #7d7a82;
-  font-size: 10px;
+  fill: var(--dia-team-kind);
+  font-size: 0.75rem;
   font-weight: 500;
   letter-spacing: 0.09em;
   text-transform: uppercase;
@@ -816,22 +818,22 @@ h2 {
 
 /* Ports: small filled triangles centred on the reactor boundary. */
 .omar-port {
-  fill: #17161a;
-  stroke: #17161a;
+  fill: var(--dia-port);
+  stroke: var(--dia-port);
   stroke-width: 1;
   stroke-linejoin: round;
 }
 
 .omar-port-label {
-  fill: #2c2b30;
-  font-size: 11.5px;
+  fill: var(--dia-label);
+  font-size: 0.84375rem;
   font-weight: 600;
 }
 
 /* Actions: hollow rhombus, filled once they carry a value. */
 .omar-action {
-  fill: #ffffff;
-  stroke: #4b4950;
+  fill: var(--dia-node);
+  stroke: var(--dia-node-line);
   stroke-width: 1.4;
   stroke-linejoin: round;
 }
@@ -842,8 +844,8 @@ h2 {
 }
 
 .omar-action-label {
-  fill: #2c2b30;
-  font-size: 11px;
+  fill: var(--dia-label);
+  font-size: 0.8125rem;
   font-weight: 600;
 }
 
@@ -865,20 +867,20 @@ h2 {
 
 .omar-within-meta {
   fill: #c0392b;
-  font-size: 9px;
+  font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.02em;
 }
 
 /* Timers: a clock face, because nothing feeds one — it fires on its own. */
 .omar-timer-face {
-  fill: #ffffff;
-  stroke: #4b4950;
+  fill: var(--dia-node);
+  stroke: var(--dia-node-line);
   stroke-width: 1.4;
 }
 
 .omar-timer-hand {
-  stroke: #4b4950;
+  stroke: var(--dia-node-line);
   stroke-width: 1.6;
   stroke-linecap: round;
   /* The hand steps between logical tags rather than sweeping continuously:
@@ -887,30 +889,32 @@ h2 {
   transition: all 220ms cubic-bezier(0.34, 1.2, 0.64, 1);
 }
 
-.omar-timer-hand.short {
-  stroke: #85838b;
-  stroke-width: 1.3;
-}
-
 .omar-timer-pin {
-  fill: #4b4950;
+  fill: var(--dia-node-line);
 }
 
-/* Firing sweeps the hands a full turn.
+/* Firing sweeps the hand a full turn: it overshoots the top by a few degrees
+   and settles back upright, the way a real second hand lands.
    This is an event animation, not a claim about elapsed time: logical time
    only moves when the runtime moves it, so a hand creeping round between
-   fires would be inventing a clock the run does not have. */
+   fires would be inventing a clock the run does not have. It plays once per
+   firing because the hand is remounted for each one. */
 @keyframes omar-timer-sweep {
-  from {
+  0% {
     transform: rotate(0deg);
+    animation-timing-function: cubic-bezier(0.45, 0, 0.25, 1);
   }
-  to {
+  78% {
+    transform: rotate(365deg);
+    animation-timing-function: cubic-bezier(0.2, 0.8, 0.4, 1);
+  }
+  100% {
     transform: rotate(360deg);
   }
 }
 
 .omar-timer-group.firing .omar-timer-hands {
-  animation: omar-timer-sweep 700ms cubic-bezier(0.4, 0, 0.2, 1);
+  animation: omar-timer-sweep 950ms both;
   transform-origin: center;
   transform-box: fill-box;
 }
@@ -928,14 +932,23 @@ h2 {
 }
 
 .omar-timer-label {
-  fill: #2c2b30;
-  font-size: 11px;
+  fill: var(--dia-label);
+  font-size: 0.8125rem;
   font-weight: 600;
 }
 
 .omar-timer-meta {
-  fill: #85838b;
-  font-size: 9.5px;
+  fill: var(--dia-node-line-soft);
+  font-size: 0.75rem;
+}
+
+/* Physical time to the next firing. Purple like a firing face, so it reads as
+   something happening rather than another line of schedule; tabular digits so
+   it does not jitter as it counts. */
+.omar-timer-countdown {
+  fill: #6b56a4;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -950,8 +963,8 @@ h2 {
 
 /* Reactions: six-point chevrons, greyscale by default, coloured by run state. */
 .omar-reaction-body {
-  fill: #e9e8ec;
-  stroke: #85838b;
+  fill: var(--dia-reaction);
+  stroke: var(--dia-reaction-line);
   stroke-width: 1;
   stroke-linejoin: round;
 }
@@ -971,31 +984,31 @@ h2 {
 
 
 .omar-reaction-badge {
-  fill: #ffffff;
-  stroke: #b3b1b8;
+  fill: var(--dia-badge);
+  stroke: var(--dia-badge-line);
   stroke-width: 1;
 }
 
 .omar-reaction-index {
-  fill: #55535a;
-  font-size: 10.5px;
+  fill: var(--dia-index);
+  font-size: 0.78125rem;
   font-weight: 700;
 }
 
 .omar-reaction-name {
-  fill: #1b1a1e;
-  font-size: 12.5px;
+  fill: var(--dia-name);
+  font-size: 0.90625rem;
   font-weight: 640;
 }
 
 .omar-reaction-meta {
-  fill: #7d7a82;
-  font-size: 9.5px;
+  fill: var(--dia-meta);
+  font-size: 0.75rem;
   font-weight: 500;
 }
 
 .omar-reaction.completed .omar-reaction-body {
-  fill: #e2f1e8;
+  fill: var(--dia-done);
   stroke: #5d9c7b;
 }
 
@@ -1009,11 +1022,11 @@ h2 {
 }
 
 .omar-reaction.completed .omar-reaction-meta {
-  fill: #4c7a63;
+  fill: var(--dia-done-meta);
 }
 
 .omar-reaction.running .omar-reaction-body {
-  fill: #ece5ff;
+  fill: var(--dia-live);
   stroke: #6f55c4;
   stroke-width: 1.6;
 }
@@ -1028,7 +1041,7 @@ h2 {
 }
 
 .omar-reaction.running .omar-reaction-meta {
-  fill: #6553a0;
+  fill: var(--dia-live-meta);
 }
 
 .omar-reaction.running {
@@ -1070,7 +1083,7 @@ h2 {
 /* Connections: orthogonal, directed. */
 .omar-edge {
   fill: none;
-  stroke: #6a686f;
+  stroke: var(--dia-edge);
   stroke-width: 1.3;
   stroke-linecap: round;
 }
@@ -1080,8 +1093,8 @@ h2 {
    than encoded in the stroke, which could only ever say "some delay" and never
    which. The line breaks around the number instead of running through it. */
 .omar-edge-delay {
-  fill: #5f5c66;
-  font: 9px ui-monospace, SFMono-Regular, Menlo, monospace;
+  fill: var(--dia-edge-delay);
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
   font-weight: 600;
   letter-spacing: 0.01em;
 }
@@ -1102,10 +1115,10 @@ h2 {
   bottom: 16px;
   display: flex;
   overflow: hidden;
-  border: 1px solid #d5d3cf;
+  border: 1px solid var(--dia-chrome-line);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.94);
-  box-shadow: 0 4px 16px rgba(31, 29, 34, 0.08);
+  background: var(--dia-chrome);
+  box-shadow: 0 4px 16px var(--dia-chrome-shadow);
 }
 
 .diagram-zoom button {
@@ -1113,10 +1126,10 @@ h2 {
   height: 28px;
   padding: 0 8px;
   border: 0;
-  border-left: 1px solid #e4e2df;
+  border-left: 1px solid var(--dia-chrome-line);
   background: transparent;
-  color: #55535a;
-  font-size: 11px;
+  color: var(--dia-chrome-text);
+  font-size: 0.8125rem;
   font-weight: 600;
 }
 
@@ -1125,7 +1138,7 @@ h2 {
 }
 
 .diagram-zoom button:hover {
-  background: #f0efec;
+  background: var(--dia-chrome-hover);
 }
 
 .diagram-legend {
@@ -1135,12 +1148,12 @@ h2 {
   display: flex;
   gap: 14px;
   padding: 8px 11px;
-  border: 1px solid #d5d3cf;
+  border: 1px solid var(--dia-chrome-line);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.94);
-  color: #68656b;
-  font-size: 10px;
-  box-shadow: 0 4px 16px rgba(31, 29, 34, 0.08);
+  background: var(--dia-chrome);
+  color: var(--dia-chrome-text);
+  font-size: 0.75rem;
+  box-shadow: 0 4px 16px var(--dia-chrome-shadow);
 }
 
 .diagram-legend span {
@@ -1156,17 +1169,90 @@ h2 {
 }
 
 .diagram-legend .running {
-  fill: #ece5ff;
+  fill: var(--dia-live);
   stroke: #6f55c4;
 }
 
 .diagram-error,
 .connection-error {
-  color: #fecaca;
-  background: rgba(127, 29, 29, 0.25);
-  border: 1px solid rgba(248, 113, 113, 0.3);
-  font-size: 11px;
+  color: var(--danger-text);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-line);
+  font-size: 0.875rem;
+  line-height: 1.45;
 }
+
+/* A failed action: one compact line with a way to put it away. */
+.connection-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.connection-error::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-top: 0.45em;
+  border-radius: 50%;
+  background: var(--danger);
+}
+.connection-error > span,
+p.connection-error { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.error-dismiss {
+  flex: none;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 1.1rem;
+  line-height: 1;
+  opacity: 0.7;
+  cursor: pointer;
+}
+.error-dismiss:hover { opacity: 1; }
+
+/* Text-weight button for actions inside a notice. */
+.link-button {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--link);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.link-button:hover { text-decoration: underline; }
+
+/* The runtime is unreachable. Pinned under the conversation header so it is
+   read before the thread, and gone once a health probe succeeds. */
+.runtime-offline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 0 16px;
+  padding: 8px 12px;
+  border: 1px solid var(--warn-line);
+  border-radius: 8px;
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  font-size: 0.875rem;
+}
+.runtime-offline > i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  animation: offline-pulse 1.6s ease-in-out infinite;
+}
+.runtime-offline > span:first-of-type { flex: 1; min-width: max-content; }
+.runtime-offline strong { font-weight: 600; }
+.runtime-offline-hint { color: var(--muted); }
+.runtime-offline-hint code { font-size: 0.8125rem; }
+@keyframes offline-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .runtime-offline > i { animation: none; } }
 
 .diagram-error {
   position: absolute;
@@ -1182,7 +1268,7 @@ h2 {
   flex-direction: column;
   overflow: hidden;
   border-left: 1px solid var(--line);
-  background: #0e0e11;
+  background: var(--panel);
 }
 
 .tabs {
@@ -1197,13 +1283,13 @@ h2 {
   border-bottom: 2px solid transparent;
   padding: 0 18px;
   background: transparent;
-  color: #77737e;
-  font-size: 11px;
+  color: var(--muted);
+  font-size: 0.8125rem;
 }
 
 .tabs button.active {
   border-bottom-color: var(--purple);
-  color: #e4ddee;
+  color: var(--text);
 }
 
 .source-title {
@@ -1211,9 +1297,9 @@ h2 {
   justify-content: space-between;
   height: 38px;
   padding: 0 14px;
-  border-bottom: 1px solid #222126;
-  color: #908b98;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .source-title span:last-child {
@@ -1227,7 +1313,7 @@ h2 {
 }
 
 .omar-tok-keyword {
-  color: #b49cff;
+  color: var(--link);
   font-weight: 600;
 }
 
@@ -1263,49 +1349,89 @@ h2 {
   margin: 0;
   overflow: auto;
   padding: 16px;
-  color: #bbb3c8;
-  font: 10.5px/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  color: var(--text-2);
+  font: 0.75rem/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
   tab-size: 2;
   white-space: pre-wrap;
 }
 
-/* The editable source: a transparent textarea over the highlighted text.
-
-   Every metric that decides where a glyph lands has to match between the two,
-   or the caret drifts from the colours behind it. They share one font
-   shorthand, one padding, and one wrapping rule; the pair below is the place to
-   change any of them. */
+/* The editable source: a CodeMirror editor coloured by the OMAR tokenizer. */
 .source-editor {
-  position: relative;
   flex: 1;
   min-height: 0;
-  display: grid;
+  display: flex;
 }
 
-.source-editor > .source-code,
-.source-input {
-  grid-area: 1 / 1;
-  margin: 0;
-  padding: 16px;
-  border: 0;
-  font: 10.5px/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
-  tab-size: 2;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  overflow: auto;
+.source-editor .cm-editor {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-2);
+  font: 0.75rem/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
 }
 
-.source-input {
-  resize: none;
-  background: transparent;
-  /* Transparent text over the highlighting, with a visible caret. */
-  color: transparent;
-  caret-color: #d8caff;
+.source-editor .cm-editor.cm-focused {
   outline: none;
 }
 
-.source-input::selection {
-  background: var(--purple-soft);
+.source-editor .cm-scroller {
+  font: inherit;
+  line-height: inherit;
+}
+
+.source-editor .cm-content {
+  padding: 16px 0;
+  caret-color: #d8caff;
+}
+
+.source-editor .cm-line,
+.source-editor .cm-deletedLine {
+  position: relative;
+  padding: 0 16px 0 22px;
+}
+
+.source-editor .cm-cursor {
+  border-left-color: #d8caff;
+}
+
+.source-editor .cm-selectionBackground,
+.source-editor .cm-focused .cm-selectionBackground {
+  background: var(--purple-soft) !important;
+}
+
+/* A change against what the run executes, as a code review shows one:
+   removed lines red and marked −, added lines green and marked +. */
+.source-editor .cm-deletedChunk {
+  padding-left: 0;
+  background: rgba(248, 81, 73, 0.16);
+}
+
+.source-editor .cm-deletedChunk .cm-deletedText {
+  background: rgba(248, 81, 73, 0.3);
+}
+
+.source-editor .cm-changedLine {
+  background: rgba(46, 160, 67, 0.18) !important;
+}
+
+.source-editor .cm-changedText {
+  background: rgba(46, 160, 67, 0.36) !important;
+}
+
+.source-editor .cm-changedLine::before,
+.source-editor .cm-deletedLine::before {
+  position: absolute;
+  left: 8px;
+  font-weight: 700;
+}
+
+.source-editor .cm-changedLine::before {
+  content: "+";
+  color: #3fb950;
+}
+
+.source-editor .cm-deletedLine::before {
+  content: "−";
+  color: #f85149;
 }
 
 .source-name {
@@ -1340,7 +1466,7 @@ h2 {
   background: rgba(194, 96, 122, 0.08);
   color: #e7a9b8;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: 0.8125rem;
   line-height: 1.6;
 }
 
@@ -1390,7 +1516,7 @@ h2 {
 
 .port-panel-head h2 {
   margin: 3px 0 0;
-  font-size: 15px;
+  font-size: 1.0625rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -1401,7 +1527,7 @@ h2 {
   padding: 5px 10px;
   background: var(--panel-2);
   color: var(--muted);
-  font-size: 11px;
+  font-size: 0.8125rem;
 }
 
 .port-panel-close:hover {
@@ -1419,7 +1545,7 @@ h2 {
 .port-panel-idle {
   margin: 0 0 16px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.875rem;
   line-height: 1.6;
 }
 
@@ -1442,13 +1568,13 @@ h2 {
 .port-waiting-head h3 {
   margin: 2px 0 0;
   color: #d8d4e0;
-  font-size: 13px;
+  font-size: 0.9375rem;
 }
 
 .port-waiting-prompt {
   margin: 0;
   color: #a5a0ae;
-  font-size: 11px;
+  font-size: 0.8125rem;
   line-height: 1.5;
   white-space: pre-wrap;
 }
@@ -1456,7 +1582,7 @@ h2 {
 .port-waiting-contract {
   margin: 0;
   color: #77727e;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field {
@@ -1468,12 +1594,12 @@ h2 {
 
 .port-field-name {
   color: #d8d4e0;
-  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field-type {
   color: #77727e;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field input {
@@ -1483,7 +1609,7 @@ h2 {
   border-radius: 5px;
   background: #131118;
   color: #e6e2ee;
-  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-field.invalid input {
@@ -1493,7 +1619,7 @@ h2 {
 .port-field-problem {
   grid-column: 1 / -1;
   color: #c0392b;
-  font-size: 10px;
+  font-size: 0.75rem;
 }
 
 .port-row {
@@ -1502,7 +1628,7 @@ h2 {
   gap: 2px 8px;
   padding: 8px 0;
   border-bottom: 1px solid #211f25;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .port-row-name {
@@ -1542,7 +1668,7 @@ h2 {
   padding: 8px 0;
   border-bottom: 1px solid #211f25;
   color: #77727e;
-  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 0.75rem ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .event-strip b {
@@ -1552,7 +1678,7 @@ h2 {
 
 .event-strip p {
   color: #77727e;
-  font-size: 11px;
+  font-size: 0.8125rem;
   line-height: 1.5;
 }
 
@@ -1573,23 +1699,6 @@ h2 {
 }
 
 @media (max-width: 760px) {
-  .topbar {
-    height: auto;
-    align-items: flex-start;
-    flex-wrap: wrap;
-    gap: 12px;
-    padding: 12px;
-  }
-
-  .runtime-controls {
-    flex-wrap: wrap;
-    max-width: 100%;
-  }
-
-  .runtime-controls label {
-    display: none;
-  }
-
   /* Still fills the viewport exactly — stacked rows rather than columns. */
   .workspace {
     grid-template-columns: 1fr;
@@ -1601,9 +1710,6 @@ h2 {
     border-bottom: 1px solid var(--line);
   }
 
-  .connection {
-    display: none;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1627,9 +1733,9 @@ h2 {
   border: 0;
   border-left: 1px solid var(--line);
   border-right: 1px solid var(--line);
-  background: #17161c;
-  color: #9d97a8;
-  font-size: 15px;
+  background: var(--panel-2);
+  color: var(--text-3);
+  font-size: 1.0625rem;
   line-height: 1;
   transition: background 140ms ease, color 140ms ease;
 }
@@ -1637,7 +1743,7 @@ h2 {
 .resizer-handle:hover,
 .resizer-handle:focus-visible {
   background: var(--purple-soft);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 /* What is left here acts on the message being written. */
@@ -1657,7 +1763,7 @@ h2 {
 .composer-actions .secondary-button {
   height: 30px;
   padding: 0 12px;
-  font-size: 11.5px;
+  font-size: 0.84375rem;
 }
 
 .composer-status {
@@ -1669,9 +1775,9 @@ h2 {
 
 /* With the window to itself the panel would stretch a conversation across the
    full width, which reads badly. Hold everything to a column instead. */
-.builder-panel.solo .panel-heading > div,
 .builder-panel.solo .messages > *,
 .builder-panel.solo .prompt-box,
+.builder-panel.solo .runtime-offline,
 .builder-panel.solo .connection-error {
   width: min(100% - 32px, 720px);
   margin-left: auto;
@@ -1685,19 +1791,6 @@ h2 {
   justify-content: center;
 }
 
-.builder-panel.opening .panel-heading {
-  min-height: auto;
-  border-bottom: 0;
-  padding-bottom: 4px;
-  text-align: center;
-}
-
-.builder-panel.opening .panel-heading h1 {
-  font-size: 26px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-}
-
 .builder-panel.opening .messages {
   flex: none;
   padding: 0;
@@ -1706,7 +1799,7 @@ h2 {
 
 /* A home-screen composer is a prompt, not a document editor: full width and
    five lines tall invites an essay. Claude.ai holds its opening box to roughly
-   500x93 in a 1000pt window; match that and let it grow as the operator types.
+   500px wide; keep that width with room for two lines at the chat font size.
    Only the opening screen is affected — inside a conversation the box still
    spans the thread. */
 .builder-panel.opening .prompt-box {
@@ -1719,12 +1812,21 @@ h2 {
 .builder-panel.opening .prompt-box textarea {
   display: block;
   min-height: 0;
-  height: 53px;
+  height: 76px;
 }
 
 /* Nothing has happened yet, so the status line has nothing to report. */
 .builder-panel.opening .composer-status {
   visibility: hidden;
+}
+
+/* A view port has no composer; what stands in for it says why. */
+.prompt-box.view-only {
+  padding: 10px;
+}
+
+.builder-panel.opening .view-only-badge {
+  visibility: visible;
 }
 
 /* Commentary while the assistant works. Present but recessive: it should be
@@ -1735,13 +1837,13 @@ h2 {
 
 .message.progress > span {
   background: transparent;
-  color: #6a6672;
-  font-size: 8px;
+  color: var(--muted);
+  font-size: 0.75rem;
 }
 
 .message.progress .message-body {
-  color: #8b8695;
-  font-size: 12px;
+  color: var(--text-3);
+  font-size: 1rem;
 }
 
 /* The operator names components by clicking them, so the message can say
@@ -1756,7 +1858,7 @@ h2 {
   border-radius: 9px;
   background: rgba(140, 99, 242, 0.1);
   color: #cbbdf6;
-  font-size: 11.5px;
+  font-size: 0.84375rem;
 }
 
 .selection-label {
@@ -1771,13 +1873,78 @@ h2 {
   margin-left: auto;
   border: 0;
   background: transparent;
-  color: #9d97a8;
-  font-size: 11px;
+  color: var(--text-3);
+  font-size: 0.8125rem;
   text-decoration: underline;
 }
 
 .selection-clear:hover {
-  color: #d8caff;
+  color: var(--accent-text);
+}
+
+/* "Chat about this": floats over highlighted message text. */
+.quote-selection {
+  position: fixed;
+  z-index: 40;
+  transform: translate(-50%, calc(-100% - 8px));
+  padding: 6px 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  font-size: 0.875rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.quote-selection:hover {
+  border-color: rgba(140, 99, 242, 0.75);
+  color: var(--accent-text);
+}
+
+.prompt-box > .composer-quote {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 10px 10px 0;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: var(--purple-soft);
+}
+
+.composer-quote blockquote,
+.message-quote {
+  margin: 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--line-2);
+  color: var(--text-3);
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.composer-quote blockquote {
+  flex: 1;
+  min-width: 0;
+  max-height: 6em;
+  overflow: auto;
+}
+
+.composer-quote button {
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 1.125rem;
+  line-height: 1;
+}
+
+.composer-quote button:hover {
+  color: var(--accent-text);
+}
+
+.message-quote {
+  margin: 4px 0 2px;
 }
 
 /* The team panel is a backdrop. Left hit-testable it swallows clicks aimed at
@@ -1810,7 +1977,7 @@ h2 {
 .omar-port-group.selected .omar-port-label,
 .omar-action-group.selected .omar-action-label,
 .omar-reaction.selected .omar-reaction-name {
-  fill: #4a2ba0;
+  fill: var(--dia-selected-text);
   font-weight: 600;
 }
 
@@ -1818,7 +1985,7 @@ h2 {
   margin-bottom: 4px;
   color: #9d8fd0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10.5px;
+  font-size: 0.78125rem;
 }
 
 /* A terminal attached to a running agent. It sits over the studio rather than
@@ -1829,6 +1996,10 @@ h2 {
    drawing is what exists, this is when it happens. */
 .timeline {
   flex: none;
+  /* The diagram keeps most of the column; a preview that outgrows this
+     scrolls within the strip instead of pushing its actions out of view. */
+  max-height: 45%;
+  overflow-y: auto;
   border-top: 1px solid var(--line);
   background: var(--panel-2);
   padding: 10px 14px;
@@ -1840,14 +2011,14 @@ h2 {
   border-top: 1px solid var(--line);
   background: var(--panel-2);
   color: var(--muted);
-  font-size: 11px;
+  font-size: 0.8125rem;
   letter-spacing: 0.04em;
   padding: 6px 14px;
   text-align: left;
 }
 
 .timeline-handle:hover {
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .timeline-controls {
@@ -1861,7 +2032,7 @@ h2 {
   border-radius: 6px;
   background: var(--ink);
   color: var(--text);
-  font-size: 13px;
+  font-size: 0.9375rem;
   line-height: 1;
   padding: 4px 9px;
 }
@@ -1876,16 +2047,227 @@ h2 {
   accent-color: var(--purple);
 }
 
+/* The slider, with a tick standing on its track wherever a checkpoint was
+   taken. The ticks overlay the input; each is its own button. */
+.timeline-rail {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  height: 28px;
+}
+
+.timeline-rail input[type="range"] {
+  width: 100%;
+}
+
+.timeline-ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* Above the slider and its thumb: a tick under the thumb must still take
+     the click. */
+  z-index: 1;
+}
+
+.timeline-controls .timeline-tick {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 12px;
+  margin-left: -1.5px;
+  padding: 0;
+  border: 0;
+  border-radius: 1.5px;
+  background: #4cc37a;
+  font-size: 0;
+  line-height: 0;
+  transform: translateY(-50%);
+  transition: height 120ms ease, width 120ms ease, background 120ms ease;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.timeline-controls .timeline-tick:hover,
+.timeline-controls .timeline-tick:focus-visible {
+  height: 24px;
+  width: 4px;
+  margin-left: -2px;
+  background: #7ef0a6;
+  z-index: 2;
+  outline: none;
+}
+
+.timeline-controls .timeline-tick.resume {
+  box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 3.5px #4cc37a;
+}
+
+.timeline-controls .timeline-tick.selected {
+  height: 24px;
+  width: 4px;
+  margin-left: -2px;
+  background: #7ef0a6;
+  z-index: 1;
+}
+
+/* A mutation is not a capture of the run but a change to its program, so it
+   stands apart from the green captures. */
+.timeline-controls .timeline-tick.mutation {
+  background: var(--purple);
+}
+
+.timeline-controls .timeline-tick.mutation:hover,
+.timeline-controls .timeline-tick.mutation:focus-visible,
+.timeline-controls .timeline-tick.mutation.selected {
+  background: var(--link);
+}
+
+.timeline-controls .timeline-tick.mutation.resume {
+  box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 3.5px var(--purple);
+}
+
+.timeline-preview-mutation {
+  margin: 6px 0;
+  padding-left: 18px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.mutation-plan {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--purple);
+  border-radius: 8px;
+  background: var(--purple-soft);
+}
+
+.mutation-plan ul {
+  margin: 0;
+  padding-left: 18px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.mutation-plan-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.timeline-checkpoints {
+  color: #7ef0a6;
+}
+
+.timeline-run-controls {
+  margin-left: auto;
+  order: 9;
+}
+
+/* Pause, Stop and Resume ride with the strip, folded or not. */
+.run-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 6px;
+}
+
+.run-controls .primary-button,
+.run-controls .secondary-button {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+.run-controls .secondary-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.timeline-handle-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  padding-right: 10px;
+}
+
+.timeline-handle-bar .timeline-handle {
+  border-top: 0;
+  flex: 1;
+}
+
+.timeline-preview {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #2f9e5f;
+  border-radius: 8px;
+  background: rgba(76, 195, 122, 0.06);
+  font-size: 0.84375rem;
+}
+
+.timeline-preview-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+  color: var(--text);
+}
+
+.timeline-preview-head span {
+  color: var(--muted);
+}
+
+.timeline-preview-body {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 12px;
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.timeline-preview-body dt {
+  color: var(--text);
+}
+
+.timeline-preview-body dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.timeline-preview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.timeline-preview-actions .primary-button {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 0.84375rem;
+}
+
+.timeline-preview-note {
+  color: var(--muted);
+}
+
 .timeline-close {
-  font-size: 11px !important;
+  font-size: 0.8125rem !important;
 }
 
 .timeline-readout {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 8px;
-  font-size: 11px;
+  font-size: 0.8125rem;
   color: var(--muted);
 }
 
@@ -1905,7 +2287,7 @@ h2 {
 /* Following a run rather than predicting one. */
 .timeline-mode.live {
   border-color: var(--purple);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .timeline-detail,
@@ -1917,7 +2299,7 @@ h2 {
 
 .timeline-truncated {
   margin: 6px 0 0;
-  font-size: 11px;
+  font-size: 0.8125rem;
   color: var(--muted);
 }
 
@@ -1978,25 +2360,25 @@ h2 {
 
 .input-panel-head h2 {
   margin: 2px 0 0;
-  font-size: 15px;
+  font-size: 1.0625rem;
 }
 
 .input-panel-close {
   border: 0;
   background: transparent;
-  color: #9d97a8;
-  font-size: 11px;
+  color: var(--text-3);
+  font-size: 0.8125rem;
   text-decoration: underline;
 }
 
 .input-panel-close:hover {
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .input-panel-note {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.875rem;
   line-height: 1.6;
 }
 
@@ -2027,14 +2409,14 @@ h2 {
 
 .input-port-name {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
+  font-size: 0.875rem;
   color: var(--text);
   overflow-wrap: anywhere;
 }
 
 .input-port-type {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: 0.8125rem;
   color: var(--muted);
 }
 
@@ -2046,7 +2428,7 @@ h2 {
   border-radius: 6px;
   background: var(--ink);
   color: var(--text);
-  font-size: 13px;
+  font-size: 0.9375rem;
 }
 
 .input-port input:focus {
@@ -2063,13 +2445,13 @@ h2 {
 .input-port-problem {
   grid-column: 1 / -1;
   color: #d98aa0;
-  font-size: 11px;
+  font-size: 0.8125rem;
 }
 
 .input-panel-empty {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.875rem;
 }
 
 /* An open input is the operator's to set, so it reads as actionable rather
@@ -2117,7 +2499,7 @@ h2 {
 
 .terminal-heading h2 {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 13px;
+  font-size: 0.9375rem;
   font-weight: 600;
 }
 
@@ -2127,23 +2509,23 @@ h2 {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: #8b8695;
-  font-size: 11px;
+  font-size: 0.8125rem;
 }
 
 .terminal-heading button {
   margin-left: auto;
   height: 26px;
   padding: 0 12px;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 7px;
   background: transparent;
-  color: #cbc6d6;
-  font-size: 11.5px;
+  color: var(--text-2);
+  font-size: 0.84375rem;
 }
 
 .terminal-heading button:hover {
   border-color: var(--purple);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 /* The screen reflows to the panel and the session is told to match, so the
@@ -2169,7 +2551,7 @@ h2 {
   padding: 8px 14px;
   border-top: 1px solid #26242d;
   color: #6f6b78;
-  font-size: 10.5px;
+  font-size: 0.78125rem;
 }
 
 /* Which assistant is answering. It sits at the bottom of the composer, so the
@@ -2186,19 +2568,19 @@ h2 {
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 22px;
+  height: 36px;
   padding: 0 8px;
-  border: 1px solid #302d39;
+  border: 1px solid var(--line);
   border-radius: 7px;
   background: transparent;
-  color: #9d97a8;
-  font-size: 11px;
+  color: var(--text-3);
+  font-size: 1rem;
 }
 
 .backend-trigger:hover,
 .backend-trigger[aria-expanded="true"] {
   border-color: var(--purple);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .backend-options {
@@ -2206,11 +2588,11 @@ h2 {
   bottom: calc(100% + 6px);
   left: 0;
   z-index: 20;
-  min-width: 190px;
+  min-width: 240px;
   overflow: hidden;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 9px;
-  background: #17161c;
+  background: var(--panel-2);
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
 }
 
@@ -2223,25 +2605,51 @@ h2 {
   padding: 7px 11px;
   border: 0;
   background: transparent;
-  color: #cbc6d6;
-  font-size: 11.5px;
+  color: var(--text-2);
+  font-size: 1rem;
   text-align: left;
 }
 
 .backend-options > button:hover {
   background: var(--purple-soft);
-  color: #d8caff;
+  color: var(--accent-text);
 }
 
 .backend-options > button.current {
-  color: #9d97a8;
+  color: var(--text-3);
+}
+
+.backend-options > button:disabled {
+  color: var(--text-3);
+  cursor: default;
+}
+
+.backend-options > button:disabled:hover {
+  background: transparent;
+  color: var(--text-3);
+}
+
+.backend-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.backend-note {
+  color: var(--text-3);
+  font-size: 0.82rem;
+}
+
+.backend-note code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
 }
 
 .backend-confirm {
   width: 230px;
   padding: 10px 11px;
-  color: #cbc6d6;
-  font-size: 11.5px;
+  color: var(--text-2);
+  font-size: 1rem;
 }
 
 .backend-confirm p {
@@ -2255,13 +2663,13 @@ h2 {
 }
 
 .backend-confirm button {
-  height: 24px;
+  height: 32px;
   padding: 0 10px;
-  border: 1px solid #3b3844;
+  border: 1px solid var(--line-2);
   border-radius: 7px;
   background: transparent;
-  color: #cbc6d6;
-  font-size: 11px;
+  color: var(--text-2);
+  font-size: 1rem;
 }
 
 .backend-confirm button:first-child {
@@ -2270,10 +2678,598 @@ h2 {
   color: white;
 }
 
+.backend-options > button.backend-connect-more {
+  border-top: 1px solid var(--line-2);
+  color: var(--accent-text);
+}
+
+/* Where backends are installed and signed in, over the whole window. */
+.backends-page {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(6, 6, 9, 0.8);
+}
+
+.backends-panel {
+  width: min(520px, 100%);
+  max-height: 100%;
+  overflow: auto;
+  padding: 18px 20px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--panel-2);
+  color: var(--text-2);
+}
+
+.backends-panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.backends-panel h2 {
+  font-size: 1.2rem;
+  color: var(--text);
+}
+
+.backends-intro {
+  margin-bottom: 12px;
+  color: var(--text-3);
+}
+
+.backends-error {
+  margin-bottom: 12px;
+  color: #e0777f;
+}
+
+.backends-rejected {
+  color: #e0777f;
+}
+
+.backends-rejected button {
+  margin-left: 4px;
+  text-decoration: underline;
+  color: inherit;
+}
+
+.backends-panel ul {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  list-style: none;
+  padding: 0;
+}
+
+.backends-panel li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 4px;
+  border-top: 1px solid var(--line-2);
+}
+
+.backends-panel li small {
+  color: var(--text-3);
+  font-size: 0.82rem;
+}
+
+.backends-panel button {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 1rem;
+}
+
+.backends-panel li button {
+  border-color: transparent;
+  background: var(--purple);
+  color: white;
+}
+
+.backend-status-failed {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 11px;
+  color: #e0777f;
+  font-size: 1rem;
+}
+
+.backend-status-failed button {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 1rem;
+}
+
 .backend-error {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: #e0777f;
-  font-size: 10.5px;
+  font-size: 1rem;
+}
+
+/* Saved conversations share the runtime's scope, including across reloads. */
+.history-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 0.875rem;
+  white-space: nowrap;
+}
+
+.studio-content { display: flex; flex: 1; min-height: 0; }
+.studio-content > .workspace { min-width: 0; }
+.chat-history {
+  flex: 0 0 260px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 18px 12px 12px;
+  color: var(--text);
+  background: var(--panel);
+  border: 0;
+  border-right: 1px solid var(--line);
+}
+.chat-history header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+.chat-history h2 { margin: 0 0 16px; font-size: 1.125rem; }
+.chat-history p, .chat-history small { color: var(--muted); font-size: 0.9375rem; }
+.chat-history button, .chat-history input {
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.chat-history header button { padding: 4px 10px; font-size: 1.25rem; }
+.chat-history button:disabled { opacity: 0.5; cursor: default; }
+.chat-history button:hover:not(:disabled), .history-button:hover { border-color: var(--purple); }
+.history-actions { display: grid; gap: 10px; }
+.history-actions input { width: 100%; min-width: 0; font-size: 1rem; }
+.history-actions button { text-align: left; font-size: 1rem; }
+.chat-history ul { flex: 1; min-height: 0; overflow-y: auto; list-style: none; padding: 0; margin: 18px 0 0; }
+.chat-history li + li { margin-top: 6px; }
+.chat-history li button { width: 100%; text-align: left; display: grid; gap: 6px; background: transparent; border-color: transparent; }
+.chat-history li span { overflow-wrap: anywhere; font-size: 1rem; }
+.chat-history [aria-current="true"] { border-color: var(--purple); background: var(--purple-soft); }
+.chat-history .history-error {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  color: var(--danger-text);
+  font-size: 0.875rem;
+}
+.chat-history .history-error .link-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--link);
+  font-size: 0.875rem;
+}
+/* The last list loaded, kept while the runtime is offline. */
+.chat-history ul.stale { opacity: 0.55; }
+.history-drawer {
+  position: fixed;
+  inset: 0 auto 0 0;
+  margin: 0;
+  padding: 0;
+  width: min(320px, calc(100vw - 44px));
+  max-width: none;
+  height: 100dvh;
+  max-height: none;
+}
+.history-drawer:not([open]) { display: none; }
+.history-drawer::backdrop { background: rgba(0, 0, 0, 0.65); }
+.history-content { display: flex; flex-direction: column; height: 100%; padding: 18px 12px 12px; }
+
+@media (max-width: 900px) {
+  .chat-history:not(.history-drawer) { display: none; }
+}
+
+/* Compact rail keeps chat navigation reachable when folded. */
+.history-rail {
+  flex: 0 0 64px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 12px;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+}
+.history-rail button,
+.chat-history header .history-fold {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.sidebar-icon { width: 21px; height: 21px; }
+.history-rail button:hover,
+.chat-history header .history-fold:hover {
+  border-color: var(--purple);
+  background: var(--purple-soft);
+}
+.history-rail button:focus-visible,
+.chat-history header .history-fold:focus-visible {
+  outline: 2px solid var(--purple);
+  outline-offset: 2px;
+}
+@media (max-width: 900px) { .history-rail { display: none; } }
+
+.chat-history .chat-running { color: #c4b5fd; font-weight: 700; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+.builder-panel { position: relative; }
+.composer-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.prompt-box > div { gap: 8px; align-items: flex-end; }
+.composer-actions { flex-shrink: 0; }
+.chat-mobile-controls { position: absolute; top: 12px; left: 12px; z-index: 5; }
+@media (max-width: 900px) {
+  .builder-panel { padding-top: 56px; }
+}
+
+
+.deploy-confirmation {
+  margin: auto;
+  inset: 0;
+  width: min(520px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px);
+  overflow: auto;
+  padding: 28px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 24px 80px #0006;
+}
+.deploy-confirmation::backdrop { background: #080b12aa; }
+.deploy-confirmation h2 { margin: 12px 0 20px; font-size: 1.5rem; }
+.deploy-confirmation p { margin: 12px 0; line-height: 1.6; font-size: 1rem; }
+.deploy-confirmation-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px; }
+.deploy-options { margin: 16px 0 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; }
+.deploy-options legend { padding: 0 6px; font-size: 0.875rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.deploy-check { display: flex; align-items: center; gap: 8px; font-size: 1rem; }
+.deploy-field { display: flex; flex-direction: column; gap: 4px; font-size: 0.9375rem; color: var(--muted); margin-top: 10px; }
+.deploy-field select, .deploy-field input { font: inherit; color: var(--text); background: var(--panel-raised, var(--panel)); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.deploy-period { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.deploy-period input { width: 100%; }
+.deploy-hint { margin: 8px 0 0; font-size: 0.875rem; color: var(--muted); }
+.deploy-invalid { color: var(--danger, #e5484d); }
+
+/* Workspace artifacts are a full-width inspector; editing opens separately. */
+
+.settings-menu { position: relative; }
+.settings-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text-3);
+}
+.settings-trigger:hover,
+.settings-trigger[aria-expanded="true"] { border-color: var(--purple); color: var(--accent-text); }
+.settings-options {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  min-width: 150px;
+  overflow: hidden;
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: var(--panel-2);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.3);
+}
+.settings-heading {
+  display: block;
+  padding: 8px 11px 4px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.settings-options > button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 11px;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 1rem;
+  text-align: left;
+}
+.settings-options > button:hover { background: var(--purple-soft); color: var(--accent-text); }
+.settings-options > button.current { color: var(--text-3); }
+.artifacts-dialog { margin: auto; width: min(1160px, 94vw); max-height: 90vh; padding: 24px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface, #17151d); color: var(--text, #eee); overflow: auto; }
+.artifacts-dialog::backdrop { background: #08060dcc; }
+.artifacts-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.artifacts-dialog h2 { margin: 4px 0 20px; }
+.artifact-controls { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.artifact-controls label { display: grid; gap: 6px; font-size: 0.875rem; flex: 1; min-width: 180px; }
+.artifact-controls select { width: 100%; padding: 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel, #25212e); color: inherit; }
+.artifact-guidance { font-size: 0.875rem; line-height: 1.6; opacity: .75; }
+.artifact-body { display: grid; grid-template-columns: 230px minmax(0, 1fr); min-height: 360px; border-top: 1px solid var(--line); }
+.artifact-body nav { border-right: 1px solid var(--line); padding: 12px 10px 12px 0; overflow: auto; max-height: 55vh; }
+.artifact-path { overflow-wrap: anywhere; font: 12px var(--font-mono, monospace); opacity: .7; padding: 8px; }
+.artifact-body nav button { display: block; text-align: left; width: 100%; padding: 7px 10px; color: inherit; background: transparent; border: none; border-radius: 5px; overflow-wrap: anywhere; cursor: pointer; }
+.artifact-body nav button:hover { background: #a78bfa22; }
+.artifact-body nav button:disabled { opacity: .45; cursor: default; }
+.artifact-preview { padding: 16px; min-width: 0; overflow: auto; max-height: 55vh; }
+.artifact-preview-title { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; font-size: 0.875rem; }
+.artifact-text { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.7 var(--font-mono, monospace); margin: 0; }
+.artifact-image { max-width: 100%; max-height: 400px; object-fit: contain; }
+.artifact-comparison { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+.artifact-comparison h3 { font-size: 0.875rem; color: #bca4f5; }
+.artifact-link { border: none; padding: 0; background: none; color: inherit; text-decoration: underline; cursor: pointer; }
+@media (max-width: 700px) { .artifact-body { grid-template-columns: 1fr; } .artifact-body nav { max-height: 180px; border-right: 0; } .artifact-comparison { grid-template-columns: 1fr; } .artifacts-dialog { padding: 16px; } }
+
+/* Keep run recovery and manual handoffs visible when the chat is collapsed. */
+.run-feedback { overflow-wrap: anywhere; flex-shrink: 0; padding: 14px 24px; border-bottom: 1px solid #d6d1c8; font-size: 0.9375rem; color: #28242f; }
+.run-feedback p { margin: 6px 0; line-height: 1.5; }
+.run-failure { background: #fff0ee; }
+.run-waiting { background: #f1edff; }
+.run-feedback details { margin-top: 8px; }
+.run-feedback summary { cursor: pointer; }
+.run-feedback pre { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.8125rem; }
+.run-waiting button { margin-top: 6px; }
+.deploy-timeout { display: grid; gap: 8px; margin-top: 20px; font-size: 1rem; }
+.deploy-timeout select { padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); font: inherit; }
+
+.diagram-heading { flex-wrap: wrap; }
+.diagram-heading > div:first-child { min-width: 0; overflow-wrap: anywhere; }
+
+.artifact-toolbar { display: flex; align-items: center; gap: 20px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+.artifact-tabs { display: flex; gap: 24px; min-width: 0; }
+.artifact-editor-button { margin-left: auto; flex-shrink: 0; margin-bottom: 6px; }
+.artifact-tabs [role="tab"] { appearance: none; border: 0; border-bottom: 3px solid transparent; border-radius: 0; background: transparent; color: var(--text-2, #b1a6bd); padding: 12px 0; font: inherit; font-size: 13px; cursor: pointer; }
+.artifact-tabs [role="tab"][aria-selected="true"] { color: var(--accent-text, #c4a7ff); border-bottom-color: var(--accent, #8b5cf6); font-weight: 600; }
+.artifact-tabs [role="tab"]:hover { color: var(--text, #eee); }
+.artifact-tabs [role="tab"]:focus-visible { outline: 2px solid var(--accent, #8b5cf6); outline-offset: 3px; }
+.workflow-editor-controls { align-items: center; }
+
+/* A formal property's components, singled out on the diagram; everything it
+   is not about steps back. */
+.in-focus .omar-port,
+.in-focus .omar-action,
+.in-focus .omar-reaction-body {
+  stroke: #3fb950;
+  stroke-width: 1.8;
+}
+
+.omar-team.in-focus .omar-team-body {
+  stroke: #3fb950;
+}
+
+.off-focus {
+  opacity: 0.22;
+}
+
+.properties {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 10px;
+}
+
+.properties-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+
+.properties-header span {
+  color: var(--text-3);
+  font-size: 0.8125rem;
+}
+
+.properties-header span.all-proved {
+  color: #3fb950;
+}
+
+.properties-guidance {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.properties-stale {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #b08800;
+  border-radius: 8px;
+  background: rgba(187, 128, 9, 0.12);
+  font-size: 0.8125rem;
+}
+
+.properties-editor {
+  justify-self: start;
+}
+
+.properties-error {
+  margin: 0;
+  color: var(--danger, #e5484d);
+  font-size: 0.8125rem;
+}
+
+.property-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+
+.property {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.property.selected {
+  border-color: #3fb950;
+}
+
+.property.unproved.selected {
+  border-color: var(--danger, #e5484d);
+}
+
+.property-summary {
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 10px;
+  padding: 10px 12px;
+  border: 0;
+  background: none;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.property-status {
+  grid-row: span 2;
+  align-self: start;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.proved .property-status {
+  color: #3fb950;
+  background: rgba(46, 160, 67, 0.15);
+}
+
+.unproved .property-status {
+  color: #f85149;
+  background: rgba(248, 81, 73, 0.15);
+}
+
+.property-description {
+  font-size: 0.875rem;
+  line-height: 1.4;
+}
+
+.property-name {
+  color: var(--text-3);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.property-detail {
+  padding: 0 12px 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+
+.property-mentions {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.lean-code {
+  margin: 0;
+  padding: 10px 0;
+  overflow-x: auto;
+  border-radius: 6px;
+  background: var(--pre-bg);
+  font: 0.75rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--code-text);
+}
+
+.lean-line {
+  display: block;
+  padding-right: 12px;
+  white-space: pre;
+}
+
+.lean-line.has-problem {
+  background: rgba(248, 81, 73, 0.14);
+}
+
+.lean-line-number {
+  display: inline-block;
+  width: 2.6em;
+  padding-right: 0.9em;
+  text-align: right;
+  color: var(--text-3);
+  opacity: 0.6;
+  user-select: none;
+}
+
+.property-problems {
+  margin: 0;
+  padding-left: 18px;
+  color: #f85149;
+  font: 0.75rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+}
+
+.tab-count {
+  margin-left: 4px;
+  color: var(--text-3);
+  font-size: 0.6875rem;
 }

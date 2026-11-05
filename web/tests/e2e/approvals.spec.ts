@@ -36,7 +36,7 @@ test("EA approvals work before a topology and survive terminal review and reload
   fake.setApprovals(feed([pending]));
   await open(page);
   await expect(page.locator(".omar-reaction")).toHaveCount(0);
-  await expect(page.locator(".panel-heading")).toContainText("Waiting for approval");
+  await expect(page.locator(".builder-panel")).toContainText("Waiting for approval");
   await page.getByRole("button", { name: "1 approval needed" }).click();
   const panel = page.getByRole("dialog", { name: "Approval required" });
   await expect(panel).toContainText("contract_milestone");
@@ -50,7 +50,7 @@ test("EA approvals work before a topology and survive terminal review and reload
   await page.getByRole("button", { name: "Close terminal" }).click();
   await expect(page.getByRole("button", { name: "1 approval needed" })).toBeVisible();
   await page.reload();
-  await expect(page.locator(".panel-heading")).toContainText("Waiting for approval");
+  await expect(page.locator(".builder-panel")).toContainText("Waiting for approval");
   expect(errors).toEqual([]);
 });
 

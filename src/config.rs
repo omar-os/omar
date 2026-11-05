@@ -19,9 +19,6 @@ pub struct Config {
 
     #[serde(default)]
     pub metrics: MetricsConfig,
-
-    #[serde(default)]
-    pub slack_bridge: SlackBridgeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,15 +77,6 @@ pub struct MetricsConfig {
     pub spawn_metrics_enabled: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SlackBridgeConfig {
-    /// EA name the slack bridge targets. The bridge resolves this against
-    /// the EA registry at startup; if unset or unresolvable it falls back
-    /// to the first registered EA. Set via the `/ea <name>` Slack command.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_ea: Option<String>,
-}
-
 fn default_true() -> bool {
     true
 }
@@ -121,17 +109,22 @@ fn default_error_patterns() -> Vec<String> {
 /// Detect which agent command is available on the system.
 /// Checks PATH for the supported first-class backends, falling back to `claude`.
 fn detect_agent_command() -> String {
-    detect_agent_command_from(&[
-        ("claude", "claude --dangerously-skip-permissions"),
-        (
-            "codex",
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
-        ),
-        ("cursor", "cursor agent --yolo"),
-        ("opencode", "opencode"),
-        ("agy", "agy --dangerously-skip-permissions"),
-    ])
-    .unwrap_or_else(|| "claude --dangerously-skip-permissions".to_string())
+    let candidates: Vec<(&str, &str)> = crate::backend::ASSISTANT
+        .iter()
+        .map(|kind| crate::backend::of(*kind))
+        .map(|backend| backend.default_command())
+        .map(|command| {
+            (
+                command.split_whitespace().next().unwrap_or(command),
+                command,
+            )
+        })
+        .collect();
+    detect_agent_command_from(&candidates).unwrap_or_else(|| {
+        crate::backend::of(crate::backend::Kind::Claude)
+            .default_command()
+            .to_string()
+    })
 }
 
 fn detect_agent_command_from(candidates: &[(&str, &str)]) -> Option<String> {
@@ -143,52 +136,6 @@ fn detect_agent_command_from(candidates: &[(&str, &str)]) -> Option<String> {
 
 fn default_command() -> String {
     detect_agent_command()
-}
-
-/// Backends an operator can run an assistant on.
-///
-/// `stub` is deliberately absent: it answers invocations without a model, which
-/// is useful for exercising a run and useless for talking to.
-pub const ASSISTANT_BACKENDS: [&str; 5] = ["claude", "codex", "cursor", "opencode", "agy"];
-
-/// The backend a launch command came from, when it came from one of ours.
-///
-/// The config stores a command rather than a name, so this is how the daemon
-/// reports which backend an assistant is currently running.
-pub fn backend_of_command(command: &str) -> Option<&'static str> {
-    ASSISTANT_BACKENDS
-        .into_iter()
-        .find(|name| resolve_backend(name).is_ok_and(|resolved| resolved == command))
-}
-
-/// Map shorthand agent names to full commands.
-///
-/// - `"claude"` → `"claude --dangerously-skip-permissions"`
-/// - `"codex"` → `"codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"`
-/// - `"cursor"` → `"cursor agent --yolo"`
-/// - `"opencode"` → `"opencode"` (opencode has no permission-skip flag)
-/// - `"agy"` → `"agy --dangerously-skip-permissions"`
-/// - `"stub"` → the model-free test agent
-/// - anything else → error
-pub fn resolve_backend(name: &str) -> Result<String, String> {
-    match name {
-        "claude" => Ok("claude --dangerously-skip-permissions".to_string()),
-        "codex" => {
-            Ok("codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox".to_string())
-        }
-        "cursor" => Ok("cursor agent --yolo".to_string()),
-        "opencode" => Ok("opencode".to_string()),
-        "agy" => Ok("agy --dangerously-skip-permissions".to_string()),
-        // Answers invocations without a model, so a run can be exercised end to
-        // end in a test. Resolved to this binary in `build_agent_command`.
-        "stub" => Ok("omar stub-agent".to_string()),
-        // `web` never reaches here — nothing is spawned for it, so there is
-        // no command to resolve. It is named so a typo is told what it meant.
-        other => Err(format!(
-            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, agy, stub, web",
-            other
-        )),
-    }
 }
 
 fn default_workdir() -> String {
@@ -229,10 +176,7 @@ impl Default for AgentConfig {
 impl Config {
     /// Default config path: ~/.omar/config.toml
     pub fn default_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".omar")
-            .join("config.toml")
+        crate::sessions::state_root().join("config.toml")
     }
 
     /// Resolve a config path from CLI input, expanding `~/`.
@@ -279,7 +223,7 @@ impl Config {
 
     /// Number of settings exposed in the dashboard panel.
     pub fn settings_count(&self) -> usize {
-        4
+        3
     }
 
     /// Settings panel entry: a labelled toggle or a labelled text field.
@@ -297,10 +241,6 @@ impl Config {
                 label: "Show inspirational quotes",
                 value: self.dashboard.show_quotes,
             }),
-            3 => Some(SettingItem::Text {
-                label: "Slack bridge target EA (name)",
-                value: self.slack_bridge.active_ea.as_deref().unwrap_or(""),
-            }),
             _ => None,
         }
     }
@@ -316,24 +256,10 @@ impl Config {
         self.save();
     }
 
-    /// Set a text-typed setting by index and save. An empty string clears
-    /// the field (serializes as a missing key thanks to
-    /// `skip_serializing_if = "Option::is_none"`). Returns `true` if the
-    /// index targets a text setting.
-    pub fn set_text_setting(&mut self, index: usize, value: &str) -> bool {
-        let trimmed = value.trim();
-        match index {
-            3 => {
-                self.slack_bridge.active_ea = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
-            }
-            _ => return false,
-        }
-        self.save();
-        true
+    /// Set a text-typed setting by index and save. Returns `true` if the
+    /// index targets a text setting; there are none today.
+    pub fn set_text_setting(&mut self, _index: usize, _value: &str) -> bool {
+        false
     }
 }
 
@@ -391,7 +317,7 @@ mod tests {
         let mut config = Config::default();
         assert!(config.dashboard.show_event_queue);
         assert!(!config.dashboard.show_quotes);
-        assert_eq!(config.settings_count(), 4);
+        assert_eq!(config.settings_count(), 3);
         assert!(matches!(
             config.settings_item(0),
             Some(SettingItem::Toggle {
@@ -402,39 +328,6 @@ mod tests {
         // Toggle without saving to disk (just test the in-memory toggle)
         config.dashboard.show_event_queue = !config.dashboard.show_event_queue;
         assert!(!config.dashboard.show_event_queue);
-    }
-
-    #[test]
-    fn slack_bridge_text_setting_round_trips() {
-        let _env_lock = crate::test_env_lock();
-        let mut config = Config::default();
-        // The default state is no persisted EA — exposed as the empty string.
-        assert!(matches!(
-            config.settings_item(3),
-            Some(SettingItem::Text {
-                label: "Slack bridge target EA (name)",
-                value: "",
-            })
-        ));
-        // Use a tempdir so save() doesn't write to ~/.omar in tests.
-        let dir = tempfile::tempdir().unwrap();
-        let original = std::env::var("HOME").ok();
-        std::env::set_var("HOME", dir.path());
-
-        assert!(config.set_text_setting(3, "Research"));
-        assert_eq!(config.slack_bridge.active_ea.as_deref(), Some("Research"));
-
-        // Whitespace-only input clears the field rather than storing blanks.
-        assert!(config.set_text_setting(3, "   "));
-        assert_eq!(config.slack_bridge.active_ea, None);
-
-        // Toggle indices return false (rejected).
-        assert!(!config.set_text_setting(0, "anything"));
-
-        match original {
-            Some(prev) => std::env::set_var("HOME", prev),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
@@ -559,30 +452,6 @@ session_prefix = "omar-agent"
 
         let config = Config::load(Some(config_path.to_str().unwrap())).unwrap();
         assert_eq!(config.dashboard.session_prefix, "omar-agent-");
-    }
-
-    #[test]
-    fn test_resolve_backend_known_names() {
-        assert_eq!(
-            resolve_backend("claude").unwrap(),
-            "claude --dangerously-skip-permissions"
-        );
-        assert_eq!(
-            resolve_backend("codex").unwrap(),
-            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox"
-        );
-        assert_eq!(resolve_backend("cursor").unwrap(), "cursor agent --yolo");
-        assert_eq!(resolve_backend("opencode").unwrap(), "opencode");
-        assert_eq!(
-            resolve_backend("agy").unwrap(),
-            "agy --dangerously-skip-permissions"
-        );
-    }
-
-    #[test]
-    fn test_resolve_backend_unknown_errors() {
-        assert!(resolve_backend("aider --yes").is_err());
-        assert!(resolve_backend("custom-agent").is_err());
     }
 
     #[test]
