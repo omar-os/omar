@@ -46,6 +46,24 @@ team Watcher[agent : Stub]
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input verdict : int
+    state verdicts : int = 0
+    // Long enough for a second firing to show up before the run ends.
+    action settle(delay=1s) : int
+    timer deadline(10min, 0)
+
+    reaction(verdict) -> settle {= self.verdicts += 1; settle = Some(1); =}
+    reaction(settle) -> {= request_stop(); =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert_eq!(self.verdicts, 1, "watch.verdict should fire exactly once");
+    =}
+}
+
 main {
     src = Source()
     near = Relay()
@@ -58,4 +76,7 @@ main {
     src.value -> near.value
     near.relayed -> far.value
     far.relayed -> watch.deep
+
+    smoke = Smoke()
+    watch.verdict -> smoke.verdict
 }

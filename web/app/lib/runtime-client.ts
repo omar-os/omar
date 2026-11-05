@@ -7,10 +7,11 @@ import {
   type DiagramEvent,
   type DiagramSnapshot,
   type PendingInvocation,
+  type PropertyVerdict,
   SERVE_PROTOCOL_VERSION,
   type RunRecord,
   type RunRequest,
-} from "./protocol";
+} from "./protocol.ts";
 
 export function normalizeRuntimeUrl(value: string): string {
   const parsed = new URL(value.trim());
@@ -37,6 +38,47 @@ export function terminalUrlFor(serveUrl: string, agent: string): string {
   return `${root}/v1/agents/${encodeURIComponent(agent)}/terminal`;
 }
 
+/** The terminal a backend's sign-in runs in. */
+export function connectTerminalUrl(serveUrl: string, backend: string): string {
+  const base = new URL(normalizeRuntimeUrl(serveUrl));
+  base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
+  const root = base.toString().replace(/\/$/, "");
+  return `${root}/v1/backends/${encodeURIComponent(backend)}/terminal`;
+}
+
+/**
+ * Start `omar connect <backend>` (install, then the CLI's own sign-in) on the
+ * runtime, for {@link connectTerminalUrl} to attach to.
+ */
+export async function startConnect(
+  serveUrl: string,
+  backend: string,
+): Promise<void> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/backends/${encodeURIComponent(backend)}/connect`,
+    { method: "POST", body: "{}" },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+}
+
+/**
+ * Has the backend's CLI answer a test prompt, which proves its sign-in works:
+ * a stored key its vendor rejects still reads as connected. Throws with the
+ * CLI's reason when it fails.
+ */
+export async function checkSignIn(
+  serveUrl: string,
+  backend: string,
+): Promise<void> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/backends/${encodeURIComponent(backend)}/check`,
+    { method: "POST", body: "{}" },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+}
+
 /** Stands for the assistant wherever an agent name is expected. */
 export const ASSISTANT = "\u0000assistant";
 
@@ -52,6 +94,30 @@ export async function fetchBackends(serveUrl: string): Promise<AgentBackends> {
     backend: typeof body.backend === "string" ? body.backend : null,
     available: Array.isArray(body.available) ? body.available : [],
   };
+}
+
+/** Whether a backend is installed and signed in, as its own CLI says. */
+export type BackendStatus = {
+  name: string;
+  status: "connected" | "signed_out" | "not_installed" | "unknown";
+  /** The account or credential it signed in with. */
+  via?: string;
+  /** Why the status is unknown. */
+  reason?: string;
+  /** What to run to install and sign it in. */
+  login?: string;
+};
+
+/** Each backend's status; `null` from a runtime that predates the endpoint. */
+export async function fetchBackendStatus(
+  serveUrl: string,
+): Promise<BackendStatus[] | null> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/agent/backends`);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { backends?: unknown };
+  return Array.isArray(body.backends) ? (body.backends as BackendStatus[]) : [];
 }
 
 /**
@@ -71,6 +137,18 @@ export async function switchBackend(
     body: JSON.stringify({ backend }),
   });
   if (!response.ok) throw new Error(await readError(response));
+}
+
+/** Browsers word a failed request differently ("Load failed" in Safari,
+    "Failed to fetch" in Chrome, "NetworkError…" in Firefox); all mean the
+    runtime did not answer. */
+const UNREACHABLE = /^(load failed|failed to fetch|networkerror\b|network error)/i;
+
+/** What to show for a failed call: the runtime's own message, or one plain
+    sentence when the request never reached it. */
+export function describeError(cause: unknown): string {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return UNREACHABLE.test(message) ? "Can't reach the runtime." : message;
 }
 
 async function readError(response: Response): Promise<string> {
@@ -118,22 +196,33 @@ export function subscribeToChat(
   onConversation?: (conversation: ConversationSummary) => void,
   onState?: (conversation: ConversationSummary) => void,
 ): () => void {
-  const stream = new EventSource(`${normalizeRuntimeUrl(serveUrl)}/v1/chat/events`);
+  const stream = new EventSource(
+    `${normalizeRuntimeUrl(serveUrl)}/v1/chat/events`,
+  );
   stream.addEventListener("conversation", (raw) => {
-    onConversation?.(JSON.parse((raw as MessageEvent<string>).data) as ConversationSummary);
+    onConversation?.(
+      JSON.parse((raw as MessageEvent<string>).data) as ConversationSummary,
+    );
   });
   stream.addEventListener("chat_state", (raw) => {
-    onState?.(JSON.parse((raw as MessageEvent<string>).data) as ConversationSummary);
+    onState?.(
+      JSON.parse((raw as MessageEvent<string>).data) as ConversationSummary,
+    );
   });
   stream.onopen = () => onConnectionChange(true);
   stream.onerror = () => onConnectionChange(false);
   for (const kind of ["message", "design_proposed"]) {
     stream.addEventListener(kind, (raw) => {
-      onMessage(assertChatMessage(JSON.parse((raw as MessageEvent<string>).data)));
+      onMessage(
+        assertChatMessage(JSON.parse((raw as MessageEvent<string>).data)),
+      );
     });
   }
   return () => stream.close();
 }
+
+/** A view port serves the same pages but refuses every write. */
+export type ServeAccess = "full" | "view";
 
 /**
  * Ask `omar serve` whether it is up and speaking a protocol we understand.
@@ -142,23 +231,30 @@ export function subscribeToChat(
 export async function checkServeHealth(
   serveUrl: string,
   signal?: AbortSignal,
-): Promise<{ ok: true } | { ok: false; reason: string }> {
+): Promise<{ ok: true; access: ServeAccess } | { ok: false; reason: string }> {
   try {
     const base = normalizeRuntimeUrl(serveUrl);
     const response = await fetch(`${base}/health`, { signal });
     if (!response.ok) {
       return { ok: false, reason: `HTTP ${response.status}` };
     }
-    const body = (await response.json()) as { protocol_version?: unknown };
+    const body = (await response.json()) as {
+      protocol_version?: unknown;
+      access?: unknown;
+    };
     if (body.protocol_version !== SERVE_PROTOCOL_VERSION) {
       return {
         ok: false,
         reason: `serve speaks protocol ${String(body.protocol_version)}, this client speaks ${SERVE_PROTOCOL_VERSION}`,
       };
     }
-    return { ok: true };
+    // A daemon that predates view ports does not say, and is full access.
+    return { ok: true, access: body.access === "view" ? "view" : "full" };
   } catch (cause) {
-    return { ok: false, reason: cause instanceof Error ? cause.message : String(cause) };
+    return {
+      ok: false,
+      reason: cause instanceof Error ? cause.message : String(cause),
+    };
   }
 }
 
@@ -283,7 +379,9 @@ export async function fetchPanel(
   if (response.status === 404) return [];
   if (!response.ok) throw new Error(await readError(response));
   const body = (await response.json()) as { pending?: unknown };
-  return Array.isArray(body.pending) ? (body.pending as PendingInvocation[]) : [];
+  return Array.isArray(body.pending)
+    ? (body.pending as PendingInvocation[])
+    : [];
 }
 
 /**
@@ -327,7 +425,12 @@ export async function stopRun(
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(
     `${base}/v1/runs/${encodeURIComponent(runId)}/stop`,
-    { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal },
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+      signal,
+    },
   );
   if (!response.ok) throw new Error(await readError(response));
   return assertRunRecord(await response.json());
@@ -338,10 +441,12 @@ export interface CheckpointSummary {
   id: string;
   sequence: number;
   parent: string | null;
-  trigger: "automatic" | "manual" | "pause";
+  trigger: "automatic" | "manual" | "pause" | "mutation";
   completed_tag: [number, number] | null;
   next_tag: [number, number] | null;
   created_at: number;
+  /** A mutation checkpoint's plan, one line per instruction. */
+  mutation?: string[];
 }
 
 export interface CheckpointListing {
@@ -356,13 +461,21 @@ export async function fetchCheckpoints(
   signal?: AbortSignal,
 ): Promise<CheckpointListing> {
   const base = normalizeRuntimeUrl(serveUrl);
-  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/checkpoints`, { signal });
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/checkpoints`,
+    { signal },
+  );
   if (!response.ok) throw new Error(await readError(response));
-  const body = (await response.json()) as { checkpoints?: unknown; resume_point?: unknown };
-  if (!Array.isArray(body.checkpoints)) throw new Error("checkpoint listing is not a list");
+  const body = (await response.json()) as {
+    checkpoints?: unknown;
+    resume_point?: unknown;
+  };
+  if (!Array.isArray(body.checkpoints))
+    throw new Error("checkpoint listing is not a list");
   return {
     checkpoints: body.checkpoints as CheckpointSummary[],
-    resume_point: typeof body.resume_point === "string" ? body.resume_point : null,
+    resume_point:
+      typeof body.resume_point === "string" ? body.resume_point : null,
   };
 }
 
@@ -377,7 +490,10 @@ export async function fetchRunSnapshot(
   signal?: AbortSignal,
 ): Promise<DiagramSnapshot> {
   const base = normalizeRuntimeUrl(serveUrl);
-  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/snapshot`, { signal });
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/snapshot`,
+    { signal },
+  );
   if (!response.ok) {
     throw new Error(`Runtime returned HTTP ${response.status}.`);
   }
@@ -390,9 +506,15 @@ export async function fetchRunTimeline(
   signal?: AbortSignal,
 ): Promise<{ steps: TimelineStep[]; truncated: boolean }> {
   const base = normalizeRuntimeUrl(serveUrl);
-  const response = await fetch(`${base}/v1/runs/${encodeURIComponent(runId)}/timeline`, { signal });
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/timeline`,
+    { signal },
+  );
   if (!response.ok) throw new Error(await readError(response));
-  const body = (await response.json()) as { steps?: unknown; truncated?: unknown };
+  const body = (await response.json()) as {
+    steps?: unknown;
+    truncated?: unknown;
+  };
   return {
     steps: Array.isArray(body.steps) ? (body.steps as TimelineStep[]) : [],
     truncated: body.truncated === true,
@@ -407,7 +529,10 @@ export interface CheckpointDetail extends CheckpointSummary {
   queue_len: number;
   queued_tags: [number, number][];
   elapsed_ns: number;
-  workspaces: Record<string, { workspace_id: string; snapshot_id: string; commit: string }>;
+  workspaces: Record<
+    string,
+    { workspace_id: string; snapshot_id: string; commit: string }
+  >;
   agents: Record<string, { backend: string; restoration: string }>;
 }
 
@@ -436,11 +561,57 @@ export async function rollbackRun(
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(
     `${base}/v1/runs/${encodeURIComponent(runId)}/rollback`,
-    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ checkpoint }), signal },
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ checkpoint }),
+      signal,
+    },
   );
   if (!response.ok) throw new Error(await readError(response));
   const body = (await response.json()) as { resume_point?: unknown };
   return typeof body.resume_point === "string" ? body.resume_point : null;
+}
+
+/**
+ * Change a running or paused run's program to `program`. A dry run, or a
+ * program that changes nothing, answers with the plan alone; otherwise the
+ * run's record, whose `mutation` is `pending` while a running run pauses.
+ */
+export async function mutateRun(
+  serveUrl: string,
+  runId: string,
+  request: {
+    program: string;
+    filename?: string;
+    files?: Record<string, string>;
+    dry_run?: boolean;
+  },
+  signal?: AbortSignal,
+): Promise<{ changes: string[]; record: RunRecord | null }> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/mutate`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+      signal,
+    },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as {
+    changes?: unknown;
+    run_id?: unknown;
+  };
+  if (typeof body.run_id === "string") {
+    const record = assertRunRecord(body);
+    return { changes: record.mutation?.changes ?? [], record };
+  }
+  return {
+    changes: Array.isArray(body.changes) ? (body.changes as string[]) : [],
+    record: null,
+  };
 }
 
 /** Ask a run to checkpoint at its next tag boundary and park; answers `pausing`. */
@@ -452,7 +623,12 @@ export async function pauseRun(
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(
     `${base}/v1/runs/${encodeURIComponent(runId)}/pause`,
-    { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal },
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+      signal,
+    },
   );
   if (!response.ok) throw new Error(await readError(response));
   return assertRunRecord(await response.json());
@@ -470,7 +646,12 @@ export async function resumeRun(
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(
     `${base}/v1/runs/${encodeURIComponent(runId)}/resume`,
-    { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal },
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+      signal,
+    },
   );
   if (!response.ok) throw new Error(await readError(response));
   return assertRunRecord(await response.json());
@@ -491,12 +672,77 @@ export async function fetchRun(
   return assertRunRecord(await response.json());
 }
 
-/** `omar serve` reports `host:port`; the diagram API is plain HTTP on loopback. */
-export function diagramUrlFor(record: RunRecord): string {
+/** The source a run executes now: what an edit to it is compared against. */
+export async function fetchRunProgram(
+  serveUrl: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<{ filename: string; program: string }> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/runs/${encodeURIComponent(runId)}/program`,
+    { signal },
+  );
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
+  return (await response.json()) as { filename: string; program: string };
+}
+
+/** Have Lean check properties again, against the program as it now reads. */
+export async function checkProperties(
+  serveUrl: string,
+  request: {
+    program: string;
+    files?: Record<string, string>;
+    lemmas?: string;
+    properties: { name: string; description: string; statement: string; proof: string }[];
+  },
+  signal?: AbortSignal,
+): Promise<PropertyVerdict[]> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(`${base}/v1/properties/check`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(request),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
+  return ((await response.json()) as { verdicts: PropertyVerdict[] }).verdicts;
+}
+
+/** Open properties' Lean files in Web VS Code, returning the editor's URL. */
+export async function openProofEditor(
+  serveUrl: string,
+  properties: { name: string; source: string }[],
+): Promise<string> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const post = async <T,>(path: string, body: object): Promise<T> => {
+    const response = await fetch(`${base}/v1/workspaces${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(await readError(response));
+    return (await response.json()) as T;
+  };
+  const { workspace } = await post<{ workspace: { id: string } }>("/properties", { properties });
+  const { url } = await post<{ url: string }>(`/${workspace.id}/editor`, {});
+  return url;
+}
+
+/**
+ * Where to watch a run's diagram: serve relays it under the run. The run's own
+ * diagram server is on serve's loopback, which a browser reaches only when it
+ * runs on the same machine, not through a tunnel or from another host.
+ */
+export function diagramUrlFor(record: RunRecord, serveUrl: string): string {
   if (!record.diagram_address) {
     throw new Error(`Run ${record.run_id} has no diagram address yet.`);
   }
-  return `http://${record.diagram_address}`;
+  return `${normalizeRuntimeUrl(serveUrl)}/v1/runs/${encodeURIComponent(record.run_id)}/diagram`;
 }
 
 export async function fetchDiagram(
@@ -542,18 +788,28 @@ export function subscribeToDiagram(
 }
 
 /** Conversations are saved by this runtime, shared by its connected tabs. */
-export async function fetchConversations(serveUrl: string, signal?: AbortSignal): Promise<{
+export async function fetchConversations(
+  serveUrl: string,
+  signal?: AbortSignal,
+): Promise<{
   active_id: string;
   conversations: ConversationSummary[];
   removed_ids?: string[];
 }> {
-  const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/chats`, { signal });
+  const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/chats`, {
+    signal,
+  });
   if (!response.ok) throw new Error(await readError(response));
   return response.json();
 }
 
-export async function selectConversation(serveUrl: string, id?: string): Promise<ConversationSummary> {
-  const path = id ? `/v1/chats/${encodeURIComponent(id)}/activate` : "/v1/chats";
+export async function selectConversation(
+  serveUrl: string,
+  id?: string,
+): Promise<ConversationSummary> {
+  const path = id
+    ? `/v1/chats/${encodeURIComponent(id)}/activate`
+    : "/v1/chats";
   const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}${path}`, {
     method: "POST",
     headers: { "content-type": "application/json" },

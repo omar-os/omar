@@ -9,11 +9,13 @@ mod config;
 mod deploy;
 mod diagram;
 mod ea;
+mod ea_lifecycle;
 mod event;
 mod manager;
 mod mcp;
 mod memory;
 mod metrics;
+mod mutation;
 mod panic_hook;
 mod paths;
 mod process;
@@ -21,6 +23,7 @@ mod projects;
 // The generator runs under `cargo test`; nothing in a release build calls it.
 mod artifacts;
 mod editor;
+mod properties;
 #[cfg(test)]
 mod protocol;
 mod reaction;
@@ -87,7 +90,8 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Target an existing runtime session by id or name
+    /// Target a runtime session by id or name; for up and serve, the name of
+    /// the session to start, or of a stopped one to restart
     #[arg(short = 's', long, global = true)]
     session: Option<String>,
 
@@ -148,7 +152,7 @@ enum Commands {
     },
     /// Remove a session and everything it kept; a running one is killed first
     Rm,
-    /// Stop one runtime: running workflows pause at their next tag boundary, and the stopped session keeps its state until `rm`, so `up --name` restarts it
+    /// Stop one runtime: running workflows pause at their next tag boundary, and the stopped session keeps its state until `rm`, so `up -s NAME` restarts it
     Down {
         #[arg(long)]
         force: bool,
@@ -235,6 +239,26 @@ enum Commands {
     /// Configure tmux for optimal omar experience
     SetupTmux,
 
+    /// Show which agent backends are installed and signed in
+    Backends {
+        /// Print JSON instead of a table
+        #[arg(long)]
+        json: bool,
+        /// Also have each signed-in backend answer a short test prompt, which
+        /// proves its sign-in works (a rejected key still reads as signed in);
+        /// exits 1 if one fails. Each check spends one prompt.
+        #[arg(long)]
+        check: bool,
+        /// Only these backends; with --check, each must be signed in
+        backends: Vec<String>,
+    },
+
+    /// Install an agent backend and sign it in
+    Connect {
+        /// claude, codex, cursor, opencode, pi or agy; omit to pick from a list
+        backend: Option<String>,
+    },
+
     /// Restore authoritative coordination state to a backend lifecycle hook.
     AgentHook {
         #[arg(long)]
@@ -285,6 +309,21 @@ enum Commands {
         deployment: String,
     },
 
+    /// Change a running or paused topology's program. A running one pauses at
+    /// its next tag boundary, takes the change, and resumes.
+    Mutate {
+        /// Team name or run id
+        deployment: String,
+        /// The new version of the program; its `main` must keep its name
+        program: PathBuf,
+        /// Print the changes and apply nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Wait until the change is applied
+        #[arg(long)]
+        wait: bool,
+    },
+
     /// Move a paused topology's resume point back to an earlier checkpoint.
     /// Nothing is deleted; `omar resume` then continues from there.
     Rollback {
@@ -311,12 +350,12 @@ enum Commands {
 
     /// Accept OMAR programs over HTTP and supervise their runs
     Serve {
-        /// Name for a new independent foreground session
-        #[arg(long)]
+        /// Deprecated: use -s NAME
+        #[arg(long, hide = true)]
         name: Option<String>,
-        /// Loopback address to bind the admission API
+        /// Port for the admission API, on 127.0.0.1
         #[arg(long)]
-        address: Option<std::net::SocketAddr>,
+        port: Option<u16>,
 
         /// Serve the API without starting an executive assistant. The agent
         /// context is still written, so a test harness can stand in for one.
@@ -438,8 +477,20 @@ fn open_browser(url: &str) {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::from_arg_matches(&Cli::command().help_template(help_template()).get_matches())
-        .unwrap_or_else(|error| error.exit());
+    // Before any thread starts: installers' directories join PATH.
+    crate::backend::connect::extend_path();
+    // Only help shows backend status, and only then is it worth asking.
+    // `args_os`: a path argument need not be UTF-8.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let help = args.is_empty()
+        || matches!(args.as_slice(), [arg] if arg == "-h" || arg == "--help" || arg == "help");
+    let backends = help.then(backends_help);
+    let cli = Cli::from_arg_matches(
+        &Cli::command()
+            .help_template(help_template(backends.as_deref()))
+            .get_matches(),
+    )
+    .unwrap_or_else(|error| error.exit());
     sessions::prepare_process(&cli)?;
     // Install the persisted-panic hook FIRST, before tokio builds its
     // runtime (and spawns worker threads). If the tmux parent dies it
@@ -507,6 +558,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Runs { .. }
             | Commands::Pause { .. }
             | Commands::Resume { .. }
+            | Commands::Mutate { .. }
             | Commands::Rollback { .. }
             | Commands::SessionDaemon { .. }
             | Commands::SessionExec { .. }
@@ -596,6 +648,31 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             status_deployment(&omar_dir, target.id, &deployment)
         }
         Some(Commands::SetupTmux) => setup_tmux(),
+        Some(Commands::Backends {
+            json,
+            check,
+            backends,
+        }) => check_backends(json, check, &backends),
+        Some(Commands::Connect { backend: None }) => {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                crate::backend::connect::wizard()
+            } else {
+                print!("{}", backends_report(false));
+                Ok(())
+            }
+        }
+        Some(Commands::Connect {
+            backend: Some(name),
+        }) => {
+            let backend = crate::backend::resolve(&name).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                crate::backend::ASSISTANT.contains(&backend.kind()),
+                "{} is not an agent backend to connect",
+                backend.kind().name()
+            );
+            crate::backend::connect::host(backend)
+        }
         Some(Commands::Ea {
             action: sessions::EaAction::Event { action },
         }) => {
@@ -705,6 +782,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
 /// `omar --help` lists commands by what they are for. The last section is
 /// what OMAR launches inside agent panes and hooks; a person never types it.
 const HELP_SECTIONS: &[(&str, &[&str])] = &[
+    ("Backends", &["connect", "backends"]),
     (
         "Sessions",
         &["up", "ls", "info", "attach", "logs", "down", "rm", "serve"],
@@ -718,6 +796,7 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
             "stop",
             "pause",
             "resume",
+            "mutate",
             "rollback",
             "checkpoint",
             "workspace",
@@ -734,7 +813,24 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
     ),
 ];
 
-fn help_template() -> String {
+/// Each backend's status, under the Backends commands in help.
+fn backends_help() -> String {
+    use crate::backend::{connection, Connection};
+    let mut out = String::new();
+    for (backend, status) in connection::assistants() {
+        let name = backend.kind().name();
+        let next = match status {
+            Connection::Connected { .. } => String::new(),
+            _ => format!("omar connect {name}"),
+        };
+        let row = format!("    {name:<10}{:<26}{next}", connection::label(&status));
+        out += row.trim_end();
+        out.push('\n');
+    }
+    out
+}
+
+fn help_template(backends: Option<&str>) -> String {
     let command = Cli::command();
     let about: std::collections::BTreeMap<String, String> = command
         .get_subcommands()
@@ -769,6 +865,11 @@ fn help_template() -> String {
     let mut listed = std::collections::BTreeSet::new();
     for (title, names) in HELP_SECTIONS {
         section(title, names, &about, width, &mut listed, &mut sections);
+        if let (&"Backends", Some(backends)) = (title, backends) {
+            sections.pop();
+            sections.push_str(backends);
+            sections.push('\n');
+        }
     }
     let rest: Vec<&str> = about
         .keys()
@@ -1407,6 +1508,138 @@ fn sync_tmux_setup_warning(app: &mut app::App) {
 }
 
 /// Interactive tmux configuration setup.
+/// Every assistant backend's sign-in, as a table or as JSON.
+fn backends_report(json: bool) -> String {
+    report_backends(&crate::backend::connection::assistants(), &[], json)
+}
+
+/// `omar backends`: the report for the named backends (all when none), and
+/// with `check`, each signed-in one's test prompt, run in parallel.
+fn check_backends(json: bool, check: bool, names: &[String]) -> Result<()> {
+    use crate::backend::{connection, Connection};
+    let mut statuses = connection::assistants();
+    if !names.is_empty() {
+        let named = |backend: &&dyn crate::backend::Backend, name: &String| {
+            backend
+                .aliases()
+                .contains(&name.to_ascii_lowercase().as_str())
+        };
+        for name in names {
+            anyhow::ensure!(
+                statuses.iter().any(|(backend, _)| named(backend, name)),
+                "'{name}' is not an assistant backend; see omar backends"
+            );
+        }
+        statuses.retain(|(backend, _)| names.iter().any(|name| named(backend, name)));
+    }
+    let checks: Vec<Option<Result<(), String>>> = if check {
+        std::thread::scope(|scope| {
+            // None: not signed in and not named, so nothing to check.
+            // Some(None): named but not signed in, which fails.
+            let runs: Vec<_> = statuses
+                .iter()
+                .map(|(backend, status)| {
+                    let backend = *backend;
+                    let name = backend.kind().name();
+                    let connected = matches!(status, Connection::Connected { .. });
+                    (connected || !names.is_empty()).then(|| {
+                        connected.then(|| {
+                            scope.spawn(move || {
+                                connection::check_sign_in(backend).map_err(|error| {
+                                    format!(
+                                        "{name} is signed in, but its test prompt failed: {error}"
+                                    )
+                                })
+                            })
+                        })
+                    })
+                })
+                .collect();
+            runs.into_iter()
+                .zip(&statuses)
+                .map(|(run, (backend, status))| match run {
+                    Some(Some(run)) => Some(
+                        run.join()
+                            .unwrap_or_else(|_| Err("the check panicked".into())),
+                    ),
+                    Some(None) => Some(Err(format!(
+                        "{} is {}; run `omar connect {}`",
+                        backend.kind().name(),
+                        connection::label(status),
+                        backend.kind().name()
+                    ))),
+                    None => None,
+                })
+                .collect()
+        })
+    } else {
+        Vec::new()
+    };
+    print!("{}", report_backends(&statuses, &checks, json));
+    let failed = checks
+        .iter()
+        .flatten()
+        .filter(|check| check.is_err())
+        .count();
+    anyhow::ensure!(failed == 0, "{failed} backend(s) failed their check");
+    Ok(())
+}
+
+fn report_backends(
+    statuses: &[(
+        &'static dyn crate::backend::Backend,
+        crate::backend::Connection,
+    )],
+    checks: &[Option<Result<(), String>>],
+    json: bool,
+) -> String {
+    use crate::backend::{connection, Connection};
+    let check_of = |index: usize| checks.get(index).and_then(Option::as_ref);
+    if json {
+        let rows: Vec<_> = statuses
+            .iter()
+            .enumerate()
+            .map(|(index, (backend, status))| {
+                let mut row = connection::describe(*backend, status);
+                match check_of(index) {
+                    Some(Ok(())) => row["check"] = serde_json::json!({"ok": true}),
+                    Some(Err(error)) => {
+                        row["check"] = serde_json::json!({"ok": false, "error": error})
+                    }
+                    None => {}
+                }
+                row
+            })
+            .collect();
+        return format!("{}\n", serde_json::Value::Array(rows));
+    }
+    let mut lines = String::new();
+    for (index, (backend, _)) in statuses.iter().enumerate() {
+        match check_of(index) {
+            Some(Ok(())) => {
+                lines += &format!("✓ {} answered its test prompt\n", backend.kind().name())
+            }
+            Some(Err(error)) => lines += &format!("✗ {error}\n"),
+            None => {}
+        }
+    }
+    let mut out = format!("{:<10}{:<28}NEXT\n", "BACKEND", "STATUS");
+    for (backend, status) in statuses {
+        let name = backend.kind().name();
+        let next = match status {
+            Connection::Connected { .. } => String::new(),
+            _ => format!("omar connect {name}"),
+        };
+        let row = format!("{name:<10}{:<28}{next}", connection::label(status));
+        out += row.trim_end();
+        out.push('\n');
+    }
+    if !lines.is_empty() {
+        out.push('\n');
+    }
+    out + &lines
+}
+
 fn setup_tmux() -> Result<()> {
     use std::io::Write;
 
@@ -1978,11 +2211,8 @@ async fn run_dashboard(config: Config, session: sessions::Session) -> Result<()>
                         }
                         KeyCode::Char('D') => {
                             // Delete the currently active EA (last EA is protected)
-                            if app.session.is_some() {
-                                app.set_status(
-                                    "EA deletion is not available while attached; the runtime owns EAs",
-                                );
-                            } else if app.registered_eas.len() > 1 {
+                            app.registered_eas = ea::load_registry(&app.omar_dir);
+                            if app.registered_eas.len() > 1 {
                                 app.pending_confirm = Some(app::ConfirmAction::DeleteEa);
                             } else {
                                 app.set_status("Cannot delete the only EA");

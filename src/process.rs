@@ -113,6 +113,23 @@ fn process_snapshot() -> Vec<(u32, u32, String)> {
         .unwrap_or_default()
 }
 
+/// Check captured identities rather than a potentially recycled PID.
+pub(crate) fn tree_alive(tree: &[(u32, String)]) -> bool {
+    let live = process_snapshot();
+    tree.iter().any(|(pid, started)| {
+        live.iter()
+            .any(|(id, _, time)| id == pid && time == started)
+            && std::process::Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .map(|output| {
+                    let state = String::from_utf8_lossy(&output.stdout);
+                    !state.trim().is_empty() && !state.trim().starts_with('Z')
+                })
+                .unwrap_or(true)
+    })
+}
+
 pub(crate) fn signal_tree(tree: &[(u32, String)], signal: &str) {
     let live = process_snapshot();
     for (pid, started) in tree {

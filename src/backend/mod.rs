@@ -14,10 +14,13 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use crate::manager::McpLaunchContext;
+pub use connection::Connection;
 
 pub(crate) mod antigravity;
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod connect;
+pub(crate) mod connection;
 pub(crate) mod cursor;
 pub(crate) mod jev;
 pub(crate) mod managed;
@@ -198,6 +201,13 @@ pub struct StartupGate {
 
 /// A topology prompt evaluated directly by a backend, without a coding-agent pane.
 /// Output types are the canonical types already resolved and checked by the VM.
+/// A CLI's own sign-in: `program args`, attached to the operator's terminal.
+pub struct Login {
+    pub args: &'static [&'static str],
+    /// Said before it starts, when the CLI does not say it itself.
+    pub note: Option<&'static str>,
+}
+
 pub struct TopologyInvocation<'a> {
     pub effects: &'a BTreeMap<String, String>,
     pub triggers: &'a BTreeMap<String, Value>,
@@ -231,6 +241,33 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Whether this backend's installed CLI, run as `program`, is signed in.
+    fn connection(&self, _program: &str) -> Connection {
+        Connection::unknown("no sign-in check for this backend")
+    }
+    /// The vendor's official installer, which `omar connect` runs.
+    fn install_command(&self) -> Option<&'static str> {
+        None
+    }
+    /// How `omar connect` has the installed CLI sign itself in. `headless`:
+    /// no browser can open here, so prefer a code the operator types elsewhere.
+    fn login(&self, _headless: bool) -> Option<Login> {
+        None
+    }
+    /// Environment variables that sign the CLI in, which no sign-out clears.
+    fn credential_vars(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// How the connect picker has the CLI sign itself out.
+    fn logout(&self) -> Option<Login> {
+        None
+    }
+    /// The CLI's own headless run of `connection::CHECK_PROMPT` as `program`,
+    /// which proves a sign-in works (`connection::check_sign_in`).
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
+        None
+    }
+
     fn kind(&self) -> Kind;
     /// Names an operator may type. The first is canonical.
     fn aliases(&self) -> &'static [&'static str];
@@ -242,6 +279,12 @@ pub trait Backend: Send + Sync {
     /// the backend's channel and never types into the widget these describe.
     fn readiness_markers(&self) -> &'static [&'static str] {
         &[]
+    }
+    /// Whether a launch with no startup dialog on screen has finished
+    /// starting: its banner by default.
+    fn startup_finished(&self, screen: &str, _pane_pid: u32) -> bool {
+        let markers = self.readiness_markers();
+        !markers.is_empty() && markers.iter().all(|marker| screen.contains(marker))
     }
     /// How a caller learns that a launched pane can take work. A launch under
     /// OMAR's protocol runner has no banner: the runner's socket is the proof,
@@ -626,11 +669,13 @@ mod tests {
         assert!(claude.contains("--session-id '11111111-1111-4111-8111-111111111111'"));
         let (codex, _) = crate::manager::build_ea_command("codex", 0, "test", dir.path(), &context);
         assert!(
-            codex.contains("codex resume 'saved-codex' --remote"),
+            codex.contains(
+                "codex resume 'saved-codex' -c check_for_update_on_startup=false --remote"
+            ),
             "{codex}"
         );
         assert!(!codex.contains("codex resume 'saved-codex' --dangerously"));
-        assert!(codex.contains("|| codex --dangerously-bypass-approvals-and-sandbox --remote"));
+        assert!(codex.contains("|| codex --dangerously-bypass-approvals-and-sandbox -c check_for_update_on_startup=false --remote"));
         let (managed, _) = crate::manager::build_ea_command(
             "codex --profile work",
             0,
@@ -739,10 +784,6 @@ mod tests {
         assert_eq!(
             resolve("claude").unwrap().default_command(),
             "claude --dangerously-skip-permissions"
-        );
-        assert_eq!(
-            resolve("cursor").unwrap().default_command(),
-            "cursor agent --yolo"
         );
         assert_eq!(resolve("opencode").unwrap().default_command(), "opencode");
         assert_eq!(

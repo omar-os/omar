@@ -138,13 +138,14 @@ export function Timeline({
                   type="button"
                   className={
                     "timeline-tick" +
+                    (checkpoint.trigger === "mutation" ? " mutation" : "") +
                     (isResume ? " resume" : "") +
                     (isSelected ? " selected" : "")
                   }
                   style={{ left: `calc(${fraction} * (100% - 16px) + 8px)` }}
                   aria-label={`Checkpoint #${checkpoint.sequence}`}
                   aria-pressed={isSelected}
-                  title={`Checkpoint #${checkpoint.sequence} · ${checkpoint.trigger} · after ${tagLabel(checkpoint.completed_tag)}${isResume ? " · resume point" : ""}`}
+                  title={`Checkpoint #${checkpoint.sequence} · ${checkpoint.trigger} · after ${tagLabel(checkpoint.completed_tag)}${checkpoint.mutation ? ` · ${checkpoint.mutation.length} change${checkpoint.mutation.length === 1 ? "" : "s"}` : ""}${isResume ? " · resume point" : ""}`}
                   onClick={() => {
                     if (at >= 0) onScrub(at);
                     onSelectCheckpoint?.(isSelected ? null : checkpoint.id);
@@ -224,12 +225,19 @@ export function Timeline({
                   {detail.is_resume_point ? " · resume point" : ""}
                 </span>
               </div>
+              {detail.mutation ? (
+                <ul className="timeline-preview-mutation" aria-label="Mutation">
+                  {detail.mutation.map((change, at) => (
+                    <li key={at}>{change}</li>
+                  ))}
+                </ul>
+              ) : null}
               <div className="timeline-preview-actions">
                 {detail.is_resume_point ? (
                   <span className="timeline-preview-note">
                     A resume continues from here.
                   </span>
-                ) : (
+                ) : onRollBack ? (
                   <>
                     <button
                       type="button"
@@ -240,7 +248,7 @@ export function Timeline({
                           ? "Moves the resume point here; later checkpoints stay on disk and external effects are not undone"
                           : rollBackHint
                       }
-                      onClick={() => onRollBack?.(detail.id)}
+                      onClick={() => onRollBack(detail.id)}
                     >
                       Roll back to this checkpoint
                     </button>
@@ -248,7 +256,7 @@ export function Timeline({
                       <span className="timeline-preview-note">{rollBackHint}</span>
                     ) : null}
                   </>
-                )}
+                ) : null}
               </div>
             </>
           ) : (

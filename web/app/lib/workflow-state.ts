@@ -29,13 +29,14 @@ export class WorkflowDraftStore {
   private status = "Saved";
   private blocked = false;
   readonly key: string;
-  constructor(readonly base: string) { this.key = `omar:workflow-draft:${base}`; }
+  constructor(readonly base: string, readonly readOnly = false) { this.key = `omar:workflow-draft:${base}`; }
   subscribe = (fn: () => void) => { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; };
   snapshot = () => this.status;
   private publish(status: string) { this.status = status; this.listeners.forEach(fn => fn()); }
   async load(): Promise<WorkflowState> {
     const saved = await fetchWorkflow(this.base);
     this.revision = saved.revision;
+    if (this.readOnly) return saved;
     let recovery: { revision: number; draft: WorkflowDraft } | null = null;
     try { recovery = JSON.parse(localStorage.getItem(this.key) || "null"); } catch { /* Server remains authoritative. */ }
     if (recovery?.draft?.design && typeof recovery.revision === "number") {

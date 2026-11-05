@@ -105,7 +105,7 @@ out = Some(cwd.display().to_string());
                             f"shutil.copyfile({str(bytecode)!r}, sys.argv[-1])\n")
         compiler.chmod(0o700)
         env["OMARC_BIN"] = str(compiler)
-        runtime = json.loads(subprocess.run([str(BIN), "up", "--no-ea", "--name", "workspaces", "--json"], cwd=source,
+        runtime = json.loads(subprocess.run([str(BIN), "up", "--no-ea", "-s", "workspaces", "--json"], cwd=source,
                                             env=env, text=True, capture_output=True, timeout=90, check=True).stdout)
         server = runtime["tmux_server"]
         try:

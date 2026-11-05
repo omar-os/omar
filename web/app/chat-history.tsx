@@ -5,7 +5,7 @@ import { forgetWorkflowCache, saveWorkflowName, useWorkflowNames } from "./lib/w
 import { WorkflowIcon } from "./workflow-icon";
 import { WorkflowSortMenu, type WorkflowSort } from "./workflow-sort-menu";
 import type { ConversationSummary } from "./lib/protocol";
-import { fetchConversations, deleteConversation, fetchArchivedConversations, setConversationArchived, selectConversation } from "./lib/runtime-client";
+import { describeError, fetchConversations, deleteConversation, fetchArchivedConversations, setConversationArchived, selectConversation } from "./lib/runtime-client";
 
 const mobileQuery = "(max-width: 900px)";
 function subscribeViewport(onChange: () => void) {
@@ -33,12 +33,17 @@ export function SidebarIcon({ direction }: { direction: "open" | "close" }) {
   );
 }
 
-export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, onClose, onSelect, onSwitchingChange }: {
+export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, readOnly = false, offline = false, onClose, onSelect, onSwitchingChange }: {
   serveUrl: string;
   activeId: string;
   mobile: boolean;
   revision: string;
   collapsed: boolean;
+  /** A view port refuses `activate`: selecting stays in this tab. */
+  readOnly?: boolean;
+  /** The runtime is down, which the studio already says: keep the last list,
+      dimmed, rather than a second error. It reloads once the runtime is back. */
+  offline?: boolean;
   onClose: () => void;
   onSelect: (conversation: ConversationSummary) => void;
   onSwitchingChange: (switching: boolean) => void;
@@ -75,7 +80,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
   const displayName = (chat: ConversationSummary) => chat.workflow_name ?? names[chat.id]?.name ?? chat.title;
   const updatedAt = (chat: ConversationSummary) => Math.max(chat.updated_at, names[chat.id]?.updatedAt ?? 0);
   async function saveName(id: string) {
-    if (cancelRename.current) return;
+    if (readOnly || cancelRename.current) return;
     try { await saveWorkflowName(serveUrl, id, editedName); setEditing(null); setError(""); }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Could not save the workflow name to this workspace."); }
   }
@@ -110,7 +115,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
         setChats(history.conversations);
         for (const chat of history.conversations) {
           const local = namesRef.current[chat.id];
-          if (local && !chat.workflow_name && !migratedNames.current.has(chat.id)) {
+          if (!readOnly && local && !chat.workflow_name && !migratedNames.current.has(chat.id)) {
             migratedNames.current.add(chat.id);
             void saveWorkflowName(serveUrl, chat.id, local.name).catch(() => migratedNames.current.delete(chat.id));
           }
@@ -119,18 +124,23 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
         setLoading(false);
       }).catch((cause) => {
         if (abort.signal.aborted) return;
-        setError(cause instanceof Error ? cause.message : String(cause));
+        setError(describeError(cause));
         setLoading(false);
       });
     };
     const timer = setTimeout(refresh, 150);
     const poll = setInterval(refresh, 2000);
     return () => { clearTimeout(timer); clearInterval(poll); abort.abort(); };
-  }, [serveUrl, revision, retry, showArchive]);
+  }, [serveUrl, revision, retry, showArchive, readOnly]);
 
   async function select(id?: string) {
     if (id === activeId) {
       if (mobile) onClose();
+      return;
+    }
+    if (readOnly) {
+      const conversation = chats.find((chat) => chat.id === id);
+      if (conversation) onSelect(conversation);
       return;
     }
     setSwitching(true);
@@ -142,7 +152,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
       setChats((current) => [conversation, ...current.filter((chat) => chat.id !== conversation.id)]);
       onSelect(conversation);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(describeError(cause));
     } finally {
       setSwitching(false);
       onSwitchingChange(false);
@@ -150,6 +160,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
   }
 
   async function archiveOrRestore(chat: ConversationSummary, removed: boolean) {
+    if (readOnly) return;
     mutation.current++;
     setSwitching(true);
     setActionError("");
@@ -169,6 +180,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
   }
 
   async function permanentlyDelete(chat: ConversationSummary) {
+    if (readOnly) return;
     mutation.current++;
     setSwitching(true);
     setDeleteError("");
@@ -205,25 +217,25 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, o
       <span className="workflow-count">{showArchive ? archivedChats.length : chats.length}</span>
     </div>
     <div className="history-actions">
-      <button className="new-workflow" type="button" disabled={loading || switching} onClick={() => void select()}><span className="new-icon"><WorkflowIcon name="plus" size={15} /></span>New workflow</button>
+      {readOnly ? null : <button className="new-workflow" type="button" disabled={loading || switching} onClick={() => void select()}><span className="new-icon"><WorkflowIcon name="plus" size={15} /></span>New workflow</button>}
       <label className="workflow-search"><WorkflowIcon name="search" size={15} /><input aria-label="Search workflows" placeholder="Search workflows…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
     </div>
     <div className="history-label"><span>{showArchive ? "ARCHIVE" : sort === "recent" ? "RECENT" : sort === "name" ? "NAME" : "STATUS"}</span><div className="history-view-actions">
       <button type="button" className="history-archive-toggle" aria-label={showArchive ? "Back to workflows" : "Archive"} title={showArchive ? "Back to workflows" : "Archive"} onClick={() => { setShowArchive(value => !value); setQuery(""); setError(""); }}><WorkflowIcon name={showArchive ? "back" : "archive"} size={16} /></button>
       {!showArchive ? <WorkflowSortMenu value={sort} onChange={setSort} /> : null}
     </div></div>
-    {lastArchived ? <div className="history-undo" role="status"><span>Workflow archived.</span><button type="button" disabled={switching} onClick={() => void archiveOrRestore(lastArchived, false)}>Undo</button></div> : null}
-    {error || actionError ? <div className="history-error"><p role="alert">{error || actionError}</p><button type="button" onClick={() => { setActionError(""); setRetry((current) => current + 1); }}>Retry</button></div> : null}
-    <ul aria-label={showArchive ? "Archive" : "Saved chats"} aria-busy={loading || switching}>
+    {lastArchived ? <div className="history-undo" role="status"><span>Workflow archived.</span><button type="button" disabled={readOnly || switching} onClick={() => void archiveOrRestore(lastArchived, false)}>Undo</button></div> : null}
+    {(error && !offline) || actionError ? <div className="history-error"><p role="alert">{actionError || (error.startsWith("Can't reach") ? "Couldn't load workflows." : error)}</p><button type="button" onClick={() => { setActionError(""); setRetry((current) => current + 1); }}>Retry</button></div> : null}
+    <ul aria-label={showArchive ? "Archive" : "Saved chats"} aria-busy={loading || switching} className={offline ? "stale" : undefined}>
       {visible.map((chat) => (
         <li key={chat.id} className="workflow-row">
-          {showArchive ? <div className="archived-workflow"><span className="workflow-title">{displayName(chat)}</span><small>{chat.message_count} messages · Saved workflow</small><div className="archived-workflow-actions"><button type="button" disabled={switching} onClick={() => void archiveOrRestore(chat, false)}>Restore workflow</button><button type="button" className="workflow-delete" aria-label="Delete workflow permanently" title={`Delete ${displayName(chat)} permanently`} disabled={switching} onClick={() => { setDeleteError(""); setDeleteTarget(chat); }}><WorkflowIcon name="trash" size={16} /></button></div></div> : <>
+          {showArchive ? <div className="archived-workflow"><span className="workflow-title">{displayName(chat)}</span><small>{chat.message_count} messages · Saved workflow</small><div className="archived-workflow-actions"><button type="button" disabled={readOnly || switching} onClick={() => void archiveOrRestore(chat, false)}>Restore workflow</button><button type="button" className="workflow-delete" aria-label="Delete workflow permanently" title={`Delete ${displayName(chat)} permanently`} disabled={readOnly || switching} onClick={() => { setDeleteError(""); setDeleteTarget(chat); }}><WorkflowIcon name="trash" size={16} /></button></div></div> : <>
           <button className="workflow-select" type="button" disabled={switching} aria-current={chat.id === activeId ? "true" : undefined} aria-keyshortcuts="F2" onKeyDown={(event) => { if (event.key === "F2") { event.preventDefault(); cancelRename.current = false; setEditedName(displayName(chat)); setEditing(chat.id); } }} onClick={() => void select(chat.id)}>
-            <span className="workflow-name"><span className="workflow-title" title={`${displayName(chat)} · Double-click to rename (saved automatically)`} onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); cancelRename.current = false; setEditedName(displayName(chat)); setEditing(chat.id); }}>{displayName(chat)}</span>{chat.id === activeId ? <WorkflowIcon name="chevron" size={14} /> : null}</span>
+            <span className="workflow-name"><span className="workflow-title" title={`${displayName(chat)} · Double-click to rename (saved automatically)`} onDoubleClick={(event) => { if (readOnly) return; event.preventDefault(); event.stopPropagation(); cancelRename.current = false; setEditedName(displayName(chat)); setEditing(chat.id); }}>{displayName(chat)}</span>{chat.id === activeId ? <WorkflowIcon name="chevron" size={14} /> : null}</span>
             <span className="workflow-description">{chat.run?.team ?? (chat.message_count ? `${chat.message_count} messages in this workflow` : "Describe what you want to automate")}</span>
             <span className="workflow-meta"><small className={`workflow-status status-${workflowStatus(chat).toLowerCase()}`}><i />{workflowStatus(chat)}</small><time dateTime={new Date(updatedAt(chat)).toISOString()}>{new Date(updatedAt(chat)).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</time>{chat.busy && chat.run ? <small>Thinking</small> : null}</span>
           </button>
-          <button type="button" className="workflow-archive" aria-label="Archive workflow" title={archiveReason(chat) || `Archive ${displayName(chat)}`} disabled={switching || !!archiveReason(chat)} onClick={() => void archiveOrRestore(chat, true)}><WorkflowIcon name="archive" size={16} /></button>
+          <button type="button" className="workflow-archive" aria-label="Archive workflow" title={archiveReason(chat) || `Archive ${displayName(chat)}`} disabled={readOnly || switching || !!archiveReason(chat)} onClick={() => void archiveOrRestore(chat, true)}><WorkflowIcon name="archive" size={16} /></button>
           {editing === chat.id ? <input className="workflow-rename" aria-label="Workflow name" maxLength={120} value={editedName} autoFocus onFocus={(event) => event.target.select()} onChange={(event) => setEditedName(event.target.value)} onBlur={() => void saveName(chat.id)} onKeyDown={(event) => {
             if (event.key === "Escape") { event.preventDefault(); cancelRename.current = true; setEditing(null); }
             if (event.key === "Enter") { event.preventDefault(); void saveName(chat.id); }

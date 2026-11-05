@@ -13,6 +13,10 @@ use serde_json::{json, Value};
 
 use crate::topology::VmState;
 
+/// What a body's answer carries when it called `request_stop()`. Not a name a
+/// port can have, so it cannot collide with one.
+pub const STOP: &str = "!stop";
+
 /// Boilerplate the generated crate needs. The wire format is one
 /// `name<TAB>value` per line because a sealed crate has no JSON to lean on.
 const RUNTIME: &str = r####"
@@ -78,6 +82,15 @@ fn get_string(m: &In, k: &str) -> Result<Option<String>, String> {
     Ok(m.get(k).cloned())
 }
 
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// End the run once this tag is over. `shutdown` reactions fire one microstep
+/// later, and nothing queued after that runs.
+#[allow(dead_code)]
+fn request_stop() {
+    STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn need<T>(v: Option<T>, k: &str) -> Result<T, String> {
     v.ok_or_else(|| format!("state '{k}' was not supplied"))
 }
@@ -128,6 +141,9 @@ fn main() {
                 out.push('\t');
                 out.push_str(&v);
                 out.push('\n');
+            }
+            if STOP.load(std::sync::atomic::Ordering::Relaxed) {
+                out.push_str("!stop\t\n");
             }
             print!("{out}");
         }
@@ -371,6 +387,8 @@ const TAKEN: &[&str] = &[
     "put_string",
     "dispatch",
     "main",
+    "request_stop",
+    "STOP",
     "In",
     "Out",
     "Some",
@@ -880,6 +898,10 @@ impl Reactions {
                 let Some((name, raw)) = line.split_once('\t') else {
                     continue;
                 };
+                if name == STOP {
+                    writes.insert(STOP.to_string(), Value::Bool(true));
+                    continue;
+                }
                 let ty = wire_type(state, name)
                     .with_context(|| format!("reaction wrote unknown name '{name}'"))?;
                 writes.insert(name.to_string(), decode(raw, ty)?);

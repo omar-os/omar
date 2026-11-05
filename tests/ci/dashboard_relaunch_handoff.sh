@@ -87,7 +87,7 @@ default_command = "bash"
 default_workdir = "."
 EOF
 
-session_json="$(cd "$work_dir" && HOME="$home_dir" "$OMAR_BIN" -a claude up --name handoff --json)" \
+session_json="$(cd "$work_dir" && HOME="$home_dir" "$OMAR_BIN" -a claude up -s handoff --json)" \
   || { echo "FAIL: omar up did not start" >&2; exit 1; }
 session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$session_json")"
 server="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tmux_server"])' <<<"$session_json")"
