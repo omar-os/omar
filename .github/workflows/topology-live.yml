@@ -1,0 +1,137 @@
+name: Live Topology
+
+# Every registered topology program, run end to end with live agents on the
+# maintainer's self-hosted runner (label `omar-live`), plus a core subset with
+# every agent on each other backend. Nightly and on demand only: a full run
+# takes about 25 minutes on one runner, too slow to queue every PR behind it.
+# That machine is logged in to
+# every agent CLI and holds TYPESAFE_API_KEY in the runner's .env, so no keys
+# pass through GitHub. Setup: .github/scripts/setup-live-runner.sh.
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+    inputs:
+      case:
+        description: Run one case by name (blank runs them all)
+        required: false
+        default: ""
+      backend:
+        description: Run the core subset on this backend (blank runs the suite as written)
+        required: false
+        default: ""
+
+concurrency:
+  group: live-topology-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}-${{ inputs.backend }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan backends
+    runs-on: ubuntu-latest
+    outputs:
+      backends: ${{ steps.plan.outputs.backends }}
+    steps:
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          BACKEND: ${{ inputs.backend }}
+        run: |
+          # Blank: each program on the backends it names. agy is off until
+          # the runner has a paid Antigravity plan.
+          case "$EVENT" in
+            schedule) backends='["","cursor","opencode","pi"]' ;;
+            *) backends=$(jq -cn --arg b "$BACKEND" '[$b]') ;;
+          esac
+          echo "backends=$backends" | tee -a "$GITHUB_OUTPUT"
+
+  live-topology:
+    name: Live Topology (${{ matrix.backend || 'self-hosted' }})
+    # The runner holds personal agent logins; only schedule and maintainers'
+    # manual runs reach it.
+    needs: plan
+    runs-on: [self-hosted, omar-live]
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: ${{ fromJSON(needs.plan.outputs.backends) }}
+    env:
+      CARGO_TERM_COLOR: always
+      DISABLE_AUTOUPDATER: "1"
+      OMAR_TEST_PEEK_AGENTS: "1"
+      OMAR_TEST_CASE: ${{ inputs.case }}
+      OMAR_TEST_BACKEND: ${{ matrix.backend }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # Keep target/ and lang/.lake between runs; the next step removes
+          # everything else a previous run left.
+          clean: false
+
+      - name: Isolate run state
+        run: |
+          git clean -ffdx -e target -e lang/.lake
+          # Agent CLIs, Rust and Lean are installed per user on this machine.
+          printf '%s\n' "$HOME/.local/bin" "$HOME/.opencode/bin" "$HOME/.cargo/bin" "$HOME/.elan/bin" >>"$GITHUB_PATH"
+          # Own tmux server and OMAR home, so runs never touch the
+          # maintainer's interactive sessions.
+          mkdir -m 700 -p "$RUNNER_TEMP/tmux"
+          {
+            echo "TMUX_TMPDIR=$RUNNER_TEMP/tmux"
+            echo "OMAR_HOME=$RUNNER_TEMP/omar-home"
+            echo "OMAR_TEST_RESULTS_DIR=$RUNNER_TEMP/topology-tests"
+          } >>"$GITHUB_ENV"
+
+      # Test against the backend's latest release.
+      - name: Update backend CLI
+        if: env.OMAR_TEST_BACKEND != ''
+        run: |
+          case "$OMAR_TEST_BACKEND" in
+            cursor) cursor-agent update ;;
+            opencode) opencode upgrade ;;
+            pi) pi update ;;
+            agy) agy update ;;
+          esac
+
+      - name: Verify live agent CLIs
+        run: |
+          case "$OMAR_TEST_BACKEND" in
+            "")
+              claude --version
+              codex --version
+              codex login status
+              claude auth status >/dev/null
+              test -n "${TYPESAFE_API_KEY:-}" || { echo "TYPESAFE_API_KEY not set" >&2; exit 1; } ;;
+            cursor) cursor-agent --version; cursor-agent status ;;
+            opencode) opencode --version; opencode auth list ;;
+            pi) pi --version ;;
+            agy) agy --version ;;
+          esac
+
+      - name: Run live topology suite
+        run: env -u TMUX -u TMUX_PANE ./tests/topology/run_local.sh
+
+      - name: Upload topology metrics and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-topology-${{ matrix.backend || 'default' }}-${{ github.run_id }}
+          path: ${{ env.OMAR_TEST_RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Stop run's agents
+        if: always()
+        run: |
+          # OMAR runs one named tmux server per session; all of them live here.
+          for socket in "$TMUX_TMPDIR"/tmux-*/*; do
+            [[ -S $socket ]] && env -u TMUX tmux -S "$socket" kill-server 2>/dev/null || true
+          done
+          rm -rf "$OMAR_HOME"

@@ -50,12 +50,12 @@ Control pointed at it, and opens a browser. Ctrl-C stops both.
 make dev
 ```
 
-`OMAR_SERVE_ADDRESS`, `OMAR_WEB_PORT` and `OMAR_DEV_OPEN=0` adjust it.
+`OMAR_SERVE_PORT`, `OMAR_WEB_PORT` and `OMAR_DEV_OPEN=0` adjust it.
 `OMAR_DEV_NO_EA=1` starts without an assistant for frontend-only development. The two
 halves separately, if you want them in separate terminals:
 
 ```bash
-cargo run --bin omar -- serve --address 127.0.0.1:7340   # from the repository root
+cargo run --bin omar -- serve --port 7340                 # from the repository root
 OMAR_SERVE_URL=http://127.0.0.1:7340 npm run dev         # from web/
 ```
 
@@ -167,21 +167,3 @@ requirements against it, so a runtime field rename fails here rather than
 silently. `tests/fake-serve.mjs` replays that snapshot over the real wire
 protocol, which is how the browser test runs without a model, a Lean toolchain,
 or tmux.
-
-### Descriptive workflow steps
-
-The assistant generates an action title and a short explanation for every task
-and code reaction using `display("Title", "Description")`. This metadata follows
-the optional deadline and precedes the prompt/code body. It never changes
-runtime identifiers, wiring, contracts, or execution. Proposal validation rejects
-missing copy, role-only titles and placeholder labels, returning the affected
-step IDs to the assistant for correction before publishing the proposal.
-
-Cards show the title on up to two lines; selecting a card shows its full title
-and explanation. Hover also exposes the complete copy. Backend names stay in
-the small execution line. Older saved workflows render without migration using
-their actual prompts, or readable team names and declared inputs/outputs for
-code steps. Those fallbacks do not infer code semantics or verify integrations.
-Changing instructions, triggers, or output contracts in the step editor clears
-old copy so the preview derives its explanation from the revised instructions.
-An assistant revision must supply fresh explicit metadata for every step.
