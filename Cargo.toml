@@ -1,13 +1,13 @@
 [workspace]
-members = [".", "bridges/slack", "bridges/computer"]
-default-members = [".", "bridges/slack", "bridges/computer"]
+members = ["."]
+default-members = ["."]
 
 [workspace.package]
 rust-version = "1.89"
 
 [package]
 name = "omar"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 rust-version.workspace = true
 description = "Agent dashboard for tmux"
@@ -15,8 +15,10 @@ license = "MIT"
 default-run = "omar"
 
 [dependencies]
+cap-std = "3"
 libc = "0.2"
 shlex = "2.0.1"
+sha2 = "0.10"
 ratatui = "0.29"
 crossterm = "0.28"
 tokio = { version = "1", features = ["full"] }
@@ -53,3 +55,7 @@ ui = []
 [[bin]]
 name = "omar"
 path = "src/omar.rs"
+
+# Fingerprinting pinned development binaries should not dominate session startup.
+[profile.dev.package.sha2]
+opt-level = 3

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Verify installed OpenCode's context-only vs inference-starting HTTP contract.
+"""Verify installed OpenCode's context-only vs inference-starting HTTP contract,
+and that it offers the model OMAR's MCP tools under the documented names.
 Uses an isolated project and a loopback mock model, with a provider allowlist.
 """
 import http.server
@@ -13,6 +14,8 @@ import tempfile
 import threading
 import time
 import urllib.request
+
+BIN = Path(os.environ.get("OMAR_BIN", Path(__file__).resolve().parents[2] / "target/debug/omar")).resolve()
 
 inference = threading.Event()
 requests = []
@@ -45,7 +48,17 @@ def main():
             root = Path(directory)
             plugin = root / "coordination.mjs"
             plugin.write_text('export const Coordination = async () => ({"experimental.chat.system.transform": async (_, output) => { output.system.push("OMAR_NATIVE_CONTEXT_PROOF"); }});')
-            config = {"enabled_providers": ["omar_mock"], "model": "omar_mock/mock", "plugin": [plugin.as_uri()],
+            # OpenCode names MCP tools `<server>_<tool>`. OMAR's server is told
+            # to list bare names so the model is offered `omar_set_port`, the
+            # name every OMAR prompt uses, not `omar_omar_set_port`.
+            context = root / "context.json"
+            context.write_text(json.dumps({
+                "omar_dir": str(root / "omar"), "ea_id": 0, "session_prefix": "omar-test-",
+                "default_command": "opencode", "default_workdir": str(root), "health_idle_warning": 15,
+                "topology": {"team": "T", "agent": "a", "endpoint": "127.0.0.1:1", "token": "t"}}))
+            mcp = {"omar": {"type": "local", "enabled": True, "command": [str(BIN), "mcp-server",
+                            "--context-file", str(context), "--bare-tool-names"]}}
+            config = {"enabled_providers": ["omar_mock"], "model": "omar_mock/mock", "plugin": [plugin.as_uri()], "mcp": mcp,
                       "provider": {"omar_mock": {"npm": "@ai-sdk/openai-compatible", "name": "OMAR local test",
                                    "options": {"baseURL": f"http://127.0.0.1:{mock.server_port}/v1", "apiKey": "local-only"},
                                    "models": {"mock": {"name": "Mock", "limit": {"context": 32000, "output": 1000}}}}}}
@@ -88,7 +101,12 @@ def main():
                     log.seek(0)
                     raise AssertionError("prompt_async never started inference: " + log.read()[-3000:])
                 assert "OMAR_NATIVE_CONTEXT_PROOF" in json.dumps(requests), "native system transform did not inject context"
-                print("PASS: native plugin injects system context; installed OpenCode noReply stays idle; prompt_async returns 204 and starts local inference", flush=True)
+                offered = sorted({t["function"]["name"] for r in requests for t in r.get("tools", [])
+                                  if t.get("type") == "function" and "omar" in t["function"]["name"]})
+                assert offered == ["omar_complete", "omar_pending", "omar_set_port"], \
+                    f"OpenCode offered OMAR's tools as {offered}; prompts say omar_set_port"
+                print("PASS: native plugin injects system context; installed OpenCode noReply stays idle; prompt_async returns 204 and starts local inference; "
+                      f"MCP tools offered as {offered}", flush=True)
     finally:
         if process is not None:
             process.terminate()

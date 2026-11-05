@@ -31,7 +31,10 @@ use crate::diagram::{
     DiagramPort, DiagramReaction, DiagramSnapshot, DiagramStatus, DiagramTag, DiagramTimer,
     EdgeKind, ReactionStatus,
 };
-use crate::serve::{ChatMessage, ChatRole, ProposedDesign, RunRecord, RunStatus};
+use crate::properties::{ProofProblem, PropertyVerdict};
+use crate::serve::{
+    ChatMessage, ChatRole, MutationRecord, MutationStatus, ProposedDesign, RunRecord, RunStatus,
+};
 use crate::topology::PortKind;
 
 /// Where the generated file lives, relative to the repository root.
@@ -87,7 +90,19 @@ fn vocabularies() -> Vec<Vocabulary> {
                 RunStatus::Stopping,
                 RunStatus::Completed,
                 RunStatus::Stopped,
+                RunStatus::Pausing,
+                RunStatus::Paused,
                 RunStatus::Failed,
+            ],
+        ),
+        vocabulary(
+            "MUTATION_STATUSES",
+            "MutationStatus",
+            "How a mutation asked of a run went. `pending` waits for the run to pause.",
+            &[
+                MutationStatus::Pending,
+                MutationStatus::Applied,
+                MutationStatus::Failed,
             ],
         ),
         vocabulary(
@@ -99,6 +114,7 @@ fn vocabularies() -> Vec<Vocabulary> {
                 DiagramStatus::Running,
                 DiagramStatus::Completed,
                 DiagramStatus::Failed,
+                DiagramStatus::Paused,
             ],
         ),
         vocabulary(
@@ -134,6 +150,9 @@ fn vocabularies() -> Vec<Vocabulary> {
                 DiagramEventKind::ReactionCompleted,
                 DiagramEventKind::RunCompleted,
                 DiagramEventKind::RunFailed,
+                DiagramEventKind::RunPaused,
+                DiagramEventKind::RunCheckpointed,
+                DiagramEventKind::ClockStarted,
             ],
         ),
         vocabulary(
@@ -184,10 +203,13 @@ pub fn generate() -> String {
         DiagramEdge::decl(&config),
         DiagramSnapshot::decl(&config),
         DiagramEvent::decl(&config),
+        ProofProblem::decl(&config),
+        PropertyVerdict::decl(&config),
         ProposedDesign::decl(&config),
         ChatMessage::decl(&config),
         Conversation::decl(&config),
         ConversationSummary::decl(&config),
+        MutationRecord::decl(&config),
         RunRecord::decl(&config),
     ];
     for decl in &mut decls {
@@ -195,7 +217,12 @@ pub fn generate() -> String {
         out.push_str(decl);
         out.push_str("\n\n");
     }
-    out
+    out.trim_end()
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 #[cfg(test)]
@@ -236,7 +263,7 @@ mod tests {
     fn the_values_are_spelled_the_way_serde_spells_them() {
         let generated = generate();
         assert!(generated.contains(
-            r#"export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "failed"] as const;"#
+            r#"export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "pausing", "paused", "failed"] as const;"#
         ));
         assert!(
             generated.contains(r#"export const CHAT_ROLES = ["operator", "assistant"] as const;"#)

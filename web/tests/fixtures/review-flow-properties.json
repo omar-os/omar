@@ -1,0 +1,63 @@
+[
+ {
+  "mentions": [
+   "flow.critique",
+   "flow.reaction.1"
+  ],
+  "name": "critique_comes_from_reviewer",
+  "problems": [],
+  "proved": true,
+  "source": "import Omar.Reactor\nimport Omar.Verify\nopen Omar.Reactor\n\n/-- `ReviewFlow` as `omarc` compiled it: the structure the semantics speaks of,\n    without prompts or code bodies. -/\ndef topology : Omar.Reactor.Topology where\n  name := \"ReviewFlow\"\n  instances := [\n    { name := \"flow\", team := \"ReviewFlow\", parent := \"\" }]\n  agents := [\n    { name := \"flow.planner\", backend := \"Codex\", owner := \"flow\" },\n    { name := \"flow.reviewer\", backend := \"Codex\", owner := \"flow\" }]\n  ports := [\n    { name := \"flow.request\", kind := .input, delay := none, owner := \"flow\" },\n    { name := \"flow.result\", kind := .output, delay := none, owner := \"flow\" },\n    { name := \"flow.plan\", kind := .action, delay := none, owner := \"flow\" },\n    { name := \"flow.critique\", kind := .action, delay := none, owner := \"flow\" }]\n  timers := []\n  connections := []\n  reactions := [\n    { id := \"flow.reaction.0\", owner := \"flow\", agent := \"flow.planner\",\n      triggers := [\"flow.request\"],\n      contract := [{ alternatives := [{ port := \"flow.plan\" }], optional := false }] },\n    { id := \"flow.reaction.1\", owner := \"flow\", agent := \"flow.reviewer\",\n      triggers := [\"flow.plan\"],\n      contract := [{ alternatives := [{ port := \"flow.critique\" }], optional := false }] },\n    { id := \"flow.reaction.2\", owner := \"flow\", agent := \"flow.planner\",\n      triggers := [\"flow.critique\"],\n      contract := [{ alternatives := [{ port := \"flow.result\" }], optional := false }] }]\n\ntheorem critique_comes_from_reviewer (e : Execution) (hv : Valid topology e) :\n    ∀ g v, e.present g \"flow.critique\" = some v →\n      ∃ g', e.wrote g' \"flow.reaction.1\" \"flow.critique\" = some v := by\n  intro g v hp\n  rcases present_from hv hp with ⟨g', id, hw, -, hwr, -⟩ | ⟨c, hc, -⟩ | ⟨port, hport, hn, hk, -⟩\n  · simp [topology, Topology.writers, Topology.Reaction.mayWrite] at hw\n    subst hw\n    exact ⟨g', hwr⟩\n  · simp [topology, Topology.sources] at hc\n  · simp [topology] at hport\n    rcases hport with rfl | rfl | rfl | rfl <;> simp_all\n\n#omar_verify critique_comes_from_reviewer\n",
+  "theorem": "theorem critique_comes_from_reviewer (e : Execution) (hv : Valid topology e) :\n    ∀ g v, e.present g \"flow.critique\" = some v →\n      ∃ g', e.wrote g' \"flow.reaction.1\" \"flow.critique\" = some v := by\n  intro g v hp\n  rcases present_from hv hp with ⟨g', id, hw, -, hwr, -⟩ | ⟨c, hc, -⟩ | ⟨port, hport, hn, hk, -⟩\n  · simp [topology, Topology.writers, Topology.Reaction.mayWrite] at hw\n    subst hw\n    exact ⟨g', hwr⟩\n  · simp [topology, Topology.sources] at hc\n  · simp [topology] at hport\n    rcases hport with rfl | rfl | rfl | rfl <;> simp_all\n",
+  "description": "Every critique the final step sees was written by the reviewer, never by the planner.",
+  "statement": "∀ g v, e.present g \"flow.critique\" = some v →\n      ∃ g', e.wrote g' \"flow.reaction.1\" \"flow.critique\" = some v",
+  "proof": "by\n  intro g v hp\n  rcases present_from hv hp with ⟨g', id, hw, -, hwr, -⟩ | ⟨c, hc, -⟩ | ⟨port, hport, hn, hk, -⟩\n  · simp [topology, Topology.writers, Topology.Reaction.mayWrite] at hw\n    subst hw\n    exact ⟨g', hwr⟩\n  · simp [topology, Topology.sources] at hc\n  · simp [topology] at hport\n    rcases hport with rfl | rfl | rfl | rfl <;> simp_all"
+ },
+ {
+  "mentions": [
+   "flow.reaction.2",
+   "flow.result",
+   "flow.critique"
+  ],
+  "name": "answer_only_after_critique",
+  "problems": [],
+  "proved": true,
+  "source": "import Omar.Reactor\nimport Omar.Verify\nopen Omar.Reactor\n\n/-- `ReviewFlow` as `omarc` compiled it: the structure the semantics speaks of,\n    without prompts or code bodies. -/\ndef topology : Omar.Reactor.Topology where\n  name := \"ReviewFlow\"\n  instances := [\n    { name := \"flow\", team := \"ReviewFlow\", parent := \"\" }]\n  agents := [\n    { name := \"flow.planner\", backend := \"Codex\", owner := \"flow\" },\n    { name := \"flow.reviewer\", backend := \"Codex\", owner := \"flow\" }]\n  ports := [\n    { name := \"flow.request\", kind := .input, delay := none, owner := \"flow\" },\n    { name := \"flow.result\", kind := .output, delay := none, owner := \"flow\" },\n    { name := \"flow.plan\", kind := .action, delay := none, owner := \"flow\" },\n    { name := \"flow.critique\", kind := .action, delay := none, owner := \"flow\" }]\n  timers := []\n  connections := []\n  reactions := [\n    { id := \"flow.reaction.0\", owner := \"flow\", agent := \"flow.planner\",\n      triggers := [\"flow.request\"],\n      contract := [{ alternatives := [{ port := \"flow.plan\" }], optional := false }] },\n    { id := \"flow.reaction.1\", owner := \"flow\", agent := \"flow.reviewer\",\n      triggers := [\"flow.plan\"],\n      contract := [{ alternatives := [{ port := \"flow.critique\" }], optional := false }] },\n    { id := \"flow.reaction.2\", owner := \"flow\", agent := \"flow.planner\",\n      triggers := [\"flow.critique\"],\n      contract := [{ alternatives := [{ port := \"flow.result\" }], optional := false }] }]\n\ntheorem answer_only_after_critique (e : Execution) (hv : Valid topology e) :\n    ∀ g, (e.wrote g \"flow.reaction.2\" \"flow.result\").isSome →\n      (e.present g \"flow.critique\").isSome := by\n  intro g hw\n  have hc := hv.wrote_completed g _ _ hw\n  obtain ⟨r, hr, hid, t, ht, htrig⟩ := invoked_from hv (hv.completed_invoked g _ hc)\n  simp [topology] at hr\n  rcases hr with rfl | rfl | rfl <;> simp at hid\n  simp at ht\n  subst ht\n  rcases htrig with hp | ⟨tm, htm, -⟩\n  · exact hp\n  · simp [topology] at htm\n\n#omar_verify answer_only_after_critique\n",
+  "theorem": "theorem answer_only_after_critique (e : Execution) (hv : Valid topology e) :\n    ∀ g, (e.wrote g \"flow.reaction.2\" \"flow.result\").isSome →\n      (e.present g \"flow.critique\").isSome := by\n  intro g hw\n  have hc := hv.wrote_completed g _ _ hw\n  obtain ⟨r, hr, hid, t, ht, htrig⟩ := invoked_from hv (hv.completed_invoked g _ hc)\n  simp [topology] at hr\n  rcases hr with rfl | rfl | rfl <;> simp at hid\n  simp at ht\n  subst ht\n  rcases htrig with hp | ⟨tm, htm, -⟩\n  · exact hp\n  · simp [topology] at htm\n",
+  "description": "The planner writes a final answer only at a tag where a critique is present.",
+  "statement": "∀ g, (e.wrote g \"flow.reaction.2\" \"flow.result\").isSome →\n      (e.present g \"flow.critique\").isSome",
+  "proof": "by\n  intro g hw\n  have hc := hv.wrote_completed g _ _ hw\n  obtain ⟨r, hr, hid, t, ht, htrig⟩ := invoked_from hv (hv.completed_invoked g _ hc)\n  simp [topology] at hr\n  rcases hr with rfl | rfl | rfl <;> simp at hid\n  simp at ht\n  subst ht\n  rcases htrig with hp | ⟨tm, htm, -⟩\n  · exact hp\n  · simp [topology] at htm"
+ },
+ {
+  "mentions": [],
+  "name": "plan_always_reviewed",
+  "problems": [
+   {
+    "column": 35,
+    "line": 4,
+    "message": "unsolved goals\ne : Execution\nhv : Valid topology e\ng : Tag\nhp : (e.present g \"flow.plan\").isSome = true\n⊢ ?m.11 =\n      { id := \"flow.reaction.0\", owner := \"flow\", agent := \"flow.planner\", triggers := [\"flow.request\"],\n        contract := [{ alternatives := [{ port := \"flow.plan\" }] }] } ∨\n    ?m.11 =\n        { id := \"flow.reaction.1\", owner := \"flow\", agent := \"flow.reviewer\", triggers := [\"flow.plan\"],\n          contract := [{ alternatives := [{ port := \"flow.critique\" }] }] } ∨\n      ?m.11 =\n        { id := \"flow.reaction.2\", owner := \"flow\", agent := \"flow.planner\", triggers := [\"flow.critique\"],\n          contract := [{ alternatives := [{ port := \"flow.result\" }] }] }"
+   },
+   {
+    "column": 71,
+    "line": 4,
+    "message": "`simp` made no progress"
+   },
+   {
+    "column": 89,
+    "line": 4,
+    "message": "unsolved goals\ne : Execution\nhv : Valid topology e\ng : Tag\nhp : (e.present g \"flow.plan\").isSome = true\n⊢ match e.ending with\n  | Ending.never => True\n  | Ending.shutdown last => g ≤ last\n  | Ending.cut last => g < last"
+   },
+   {
+    "column": 0,
+    "line": 6,
+    "message": "property plan_always_reviewed is not accepted: it relies on [sorryAx] rather than proving it"
+   }
+  ],
+  "proved": false,
+  "source": "import Omar.Reactor\nimport Omar.Verify\nopen Omar.Reactor\n\n/-- `ReviewFlow` as `omarc` compiled it: the structure the semantics speaks of,\n    without prompts or code bodies. -/\ndef topology : Omar.Reactor.Topology where\n  name := \"ReviewFlow\"\n  instances := [\n    { name := \"flow\", team := \"ReviewFlow\", parent := \"\" }]\n  agents := [\n    { name := \"flow.planner\", backend := \"Codex\", owner := \"flow\" },\n    { name := \"flow.reviewer\", backend := \"Codex\", owner := \"flow\" }]\n  ports := [\n    { name := \"flow.request\", kind := .input, delay := none, owner := \"flow\" },\n    { name := \"flow.result\", kind := .output, delay := none, owner := \"flow\" },\n    { name := \"flow.plan\", kind := .action, delay := none, owner := \"flow\" },\n    { name := \"flow.critique\", kind := .action, delay := none, owner := \"flow\" }]\n  timers := []\n  connections := []\n  reactions := [\n    { id := \"flow.reaction.0\", owner := \"flow\", agent := \"flow.planner\",\n      triggers := [\"flow.request\"],\n      contract := [{ alternatives := [{ port := \"flow.plan\" }], optional := false }] },\n    { id := \"flow.reaction.1\", owner := \"flow\", agent := \"flow.reviewer\",\n      triggers := [\"flow.plan\"],\n      contract := [{ alternatives := [{ port := \"flow.critique\" }], optional := false }] },\n    { id := \"flow.reaction.2\", owner := \"flow\", agent := \"flow.planner\",\n      triggers := [\"flow.critique\"],\n      contract := [{ alternatives := [{ port := \"flow.result\" }], optional := false }] }]\n\ntheorem plan_always_reviewed (e : Execution) (hv : Valid topology e) :\n    ∀ g, (e.present g \"flow.plan\").isSome → e.invoked g \"flow.reaction.1\" := by\n  intro g hp\n  exact hv.invoked_of_trigger g _ (by simp [topology]) \"flow.plan\" (by simp [topology]) (by simp [Execution.completes]) (Or.inl hp)\n\n#omar_verify plan_always_reviewed\n",
+  "theorem": "theorem plan_always_reviewed (e : Execution) (hv : Valid topology e) :\n    ∀ g, (e.present g \"flow.plan\").isSome → e.invoked g \"flow.reaction.1\" := by\n  intro g hp\n  exact hv.invoked_of_trigger g _ (by simp [topology]) \"flow.plan\" (by simp [topology]) (by simp [Execution.completes]) (Or.inl hp)\n",
+  "description": "Every plan is reviewed, even if the run is cut short.",
+  "statement": "∀ g, (e.present g \"flow.plan\").isSome → e.invoked g \"flow.reaction.1\"",
+  "proof": "by\n  intro g hp\n  exact hv.invoked_of_trigger g _ (by simp [topology]) \"flow.plan\" (by simp [topology]) (by simp [Execution.completes]) (Or.inl hp)"
+ }
+]

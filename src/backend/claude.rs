@@ -2,6 +2,7 @@
 //! through one `--settings`, and OMAR's tools over MCP.
 use std::path::{Path, PathBuf};
 
+use super::{connection, Connection, Login};
 use super::{delivery_failed, NotReady, PaneSetup, Target, WRITE_TIMEOUT};
 use super::{detect, detect_token, Backend, Kind, Launch};
 use crate::manager::{
@@ -16,6 +17,47 @@ use std::process::Command;
 pub struct Claude;
 
 impl Backend for Claude {
+    fn has_startup_gates(&self) -> bool {
+        true
+    }
+    fn startup_gate(&self, screen: &str) -> Option<super::StartupGate> {
+        // The workspace trust dialog is distinct from tool/command approvals.
+        // The bypass-permissions warning follows it on a machine that has never
+        // accepted it; OMAR launched with `--dangerously-skip-permissions`, so
+        // it is OMAR's choice to accept. Until accepted, Claude Code registers
+        // no peer socket.
+        let (id, yes) = if screen.contains("Accessing workspace:") {
+            ("workspace-trust", "Yes, I trust this folder")
+        } else if screen.contains("Bypass Permissions mode") {
+            ("bypass-permissions", "Yes, I accept")
+        } else {
+            return None;
+        };
+        let keys = (|| -> Option<&'static [&'static str]> {
+            if !screen.contains("Enter to confirm") {
+                return None;
+            }
+            let lines: Vec<_> = screen.lines().map(str::trim).collect();
+            let yes = lines.iter().position(|line| line.ends_with(yes))?;
+            let no = lines.iter().position(|line| line.ends_with("No, exit"))?;
+            let selected = |line: &str| line.starts_with(['❯', '›', '>']);
+            if selected(lines[yes]) {
+                Some(&["Enter"])
+            } else if selected(lines[no]) {
+                // Wait for the selection to repaint before confirming it.
+                Some(if yes > no { &["Down"] } else { &["Up"] })
+            } else {
+                None
+            }
+        })()
+        .unwrap_or(&[]);
+        Some(super::StartupGate {
+            id,
+            confirms: keys == ["Enter"],
+            keys,
+        })
+    }
+
     fn kind(&self) -> Kind {
         Kind::Claude
     }
@@ -29,6 +71,38 @@ impl Backend for Claude {
     }
     fn default_command(&self) -> &'static str {
         "claude --dangerously-skip-permissions"
+    }
+    fn connection(&self, program: &str) -> Connection {
+        match connection::run(program, &["auth", "status"]) {
+            Some(output) => auth_status(&output.stdout),
+            None => Connection::unknown("`claude auth status` did not answer"),
+        }
+    }
+    fn install_command(&self) -> Option<&'static str> {
+        Some("curl -fsSL https://claude.ai/install.sh | bash")
+    }
+    /// Without a browser it prints a link and takes the code back pasted.
+    fn login(&self, _headless: bool) -> Option<Login> {
+        Some(Login {
+            args: &["auth", "login"],
+            note: None,
+        })
+    }
+    fn credential_vars(&self) -> &'static [&'static str] {
+        &[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ]
+    }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: &["auth", "logout"],
+            note: None,
+        })
+    }
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
+        Some(vec!["-p", connection::CHECK_PROMPT])
     }
     fn conversation_id(&self, target: &Target<'_>) -> Option<String> {
         let directory = claude_sessions_dir()?;
@@ -44,6 +118,15 @@ impl Backend for Claude {
     }
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["Claude Code", "❯"]
+    }
+    /// A resumed conversation repaints its history and no banner, so a live
+    /// peer socket counts too. Claude opens it only once the workspace trust
+    /// dialog is answered.
+    fn startup_finished(&self, screen: &str, pane_pid: u32) -> bool {
+        self.readiness_markers()
+            .iter()
+            .all(|marker| screen.contains(marker))
+            || resolve_peer(pane_pid).is_some()
     }
     fn launch_command(&self, launch: &Launch<'_>) -> String {
         let base_command = with_coordination_hooks(launch.base_command, launch.context);
@@ -413,8 +496,112 @@ pub(crate) fn child_pids(parent: u32) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// `claude auth status` prints JSON, and exits 1 when signed out.
+fn auth_status(stdout: &str) -> Connection {
+    let Ok(status) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return Connection::unknown("`claude auth status` needs a newer Claude Code");
+    };
+    if status["loggedIn"] != true {
+        return Connection::SignedOut;
+    }
+    let via = match (
+        status["authMethod"].as_str(),
+        status["subscriptionType"].as_str(),
+    ) {
+        (Some("claude.ai"), Some(plan)) => {
+            let mut plan = plan.chars();
+            let first = plan.next().map(|c| c.to_uppercase().collect::<String>());
+            format!("Claude {}{}", first.unwrap_or_default(), plan.as_str())
+        }
+        (Some("api_key"), _) => match status["apiKeySource"].as_str() {
+            Some(source) => format!("API key ({source})"),
+            None => "API key".to_string(),
+        },
+        (Some(method), _) => method.to_string(),
+        (None, _) => return Connection::Connected { via: None },
+    };
+    Connection::connected(via)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auth_status_names_the_plan_or_the_key_it_signed_in_with() {
+        use super::{auth_status, Connection};
+        assert_eq!(
+            auth_status(
+                r#"{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}"#
+            ),
+            Connection::connected("Claude Max")
+        );
+        assert_eq!(
+            auth_status(
+                r#"{"loggedIn": true, "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"}"#
+            ),
+            Connection::connected("API key (ANTHROPIC_API_KEY)")
+        );
+        assert_eq!(
+            auth_status(r#"{"loggedIn": false, "authMethod": "none"}"#),
+            Connection::SignedOut
+        );
+        assert!(matches!(
+            auth_status("error: unknown command 'auth'"),
+            Connection::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn startup_trust_gate_handles_both_option_orders_and_current_selection() {
+        use super::Backend;
+        for (options, expected) in [
+            ("❯ No, exit\n  Yes, I trust this folder", vec!["Down"]),
+            ("  Yes, I trust this folder\n❯ No, exit", vec!["Up"]),
+            (
+                "❯ 1. Yes, I trust this folder\n  2. No, exit",
+                vec!["Enter"],
+            ),
+            ("  No, exit\n  Yes, I trust this folder", vec![]),
+        ] {
+            let screen = format!("Accessing workspace:\n/tmp/team/worktree\n{options}\nEnter to confirm · Esc to cancel");
+            assert_eq!(super::Claude.startup_gate(&screen).unwrap().keys, expected);
+        }
+        let partial = super::Claude
+            .startup_gate("Accessing workspace:\nClaude Code\n❯")
+            .unwrap();
+        assert!(partial.keys.is_empty());
+        assert!(!partial.confirms);
+        assert!(super::Claude
+            .startup_gate("Allow Bash?\n❯ Yes\nNo")
+            .is_none());
+        assert!(super::Claude
+            .startup_gate("Claude Code\n❯ Describe workspace trust")
+            .is_none());
+    }
+
+    #[test]
+    fn startup_bypass_permissions_warning_is_accepted() {
+        use super::Backend;
+        for (options, expected) in [
+            ("❯ No, exit\n  Yes, I accept", vec!["Down"]),
+            ("❯ 1. No, exit\n  2. Yes, I accept", vec!["Down"]),
+            ("  No, exit\n❯ Yes, I accept", vec!["Enter"]),
+            ("  No, exit\n  Yes, I accept", vec![]),
+        ] {
+            let screen = format!(
+                "WARNING: Claude Code running in Bypass Permissions mode\n{options}\nEnter to confirm · Esc to cancel"
+            );
+            let gate = super::Claude.startup_gate(&screen).unwrap();
+            assert_eq!(gate.id, "bypass-permissions");
+            assert_eq!(gate.keys, expected);
+            assert_eq!(gate.confirms, expected == ["Enter"]);
+        }
+        // Its own words on screen are not a dialog without the confirm hint.
+        let partial = super::Claude
+            .startup_gate("Claude Code running in Bypass Permissions mode\n❯")
+            .unwrap();
+        assert!(partial.keys.is_empty());
+    }
+
     use super::*;
     use crate::manager::tests::*;
     use crate::manager::TopologyMcpContext;
@@ -626,6 +813,16 @@ mod tests {
             .args(["-c", "sleep 30; :", "sh", "--dangerously-skip-permissions"])
             .spawn()
             .unwrap();
+        // spawn returns once exec swaps the child's memory, which can be
+        // before the kernel records its new argv; /proc then reads it empty.
+        for pid in [accepting.id(), holding.id()] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while process_argv(pid).is_none_or(|argv| argv.is_empty())
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
 
         assert!(launched_to_accept(accepting.id()));
         assert!(!launched_to_accept(holding.id()));

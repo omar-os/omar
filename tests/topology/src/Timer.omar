@@ -10,13 +10,34 @@ team Beacon(label : string)[agent : Codex]
     timer t(5ns, 0)
     output note : string
 
-    prompt agent(t) -> note
+    task agent(t) -> note
     "
         The $(label) timer fired at logical time $(t).
         Set `note` to exactly: fired at $(t)
     "
 }
 
+// Smoke test: passes once the program has produced what it owes, and
+// fails if the deadline comes first. A failed assert fails the run.
+team Smoke
+{
+    input note : string
+    state got_note : bool = false
+    timer deadline(10min, 0)
+
+    reaction(note) -> {=
+        if note.is_some() { self.got_note = true; }
+        if self.got_note { request_stop(); }
+    =}
+    reaction(deadline) -> {= request_stop(); =}
+    reaction(shutdown) -> {=
+        assert!(self.got_note, "no beacon.note by the deadline");
+    =}
+}
+
 main Timer {
     beacon = Beacon("beacon")
+
+    smoke = Smoke()
+    beacon.note -> smoke.note
 }

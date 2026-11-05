@@ -26,7 +26,7 @@ PROGRAM = '''team Ping[worker : {backend}] {{
     input request : string
     output result : string
 
-    prompt worker(request) -> result? within(15s)
+    task worker(request) -> result? within(15s)
     "Set `result` to pong. Request: $(request)"
 }}
 
@@ -58,7 +58,7 @@ def main():
             started = time.monotonic()
             try:
                 run = subprocess.run(
-                    [str(BIN), 'run', str(program), '--input', 'ping.request=smoke', '--replace'],
+                    [str(BIN), 'run', str(program), '--input', 'ping.request=smoke', '--replace', '--fg'],
                     env=env, capture_output=True, text=True, timeout=180)
             finally:
                 subprocess.run(['tmux', '-L', server, 'kill-server'], capture_output=True)
