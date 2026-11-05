@@ -167,3 +167,50 @@ requirements against it, so a runtime field rename fails here rather than
 silently. `tests/fake-serve.mjs` replays that snapshot over the real wire
 protocol, which is how the browser test runs without a model, a Lean toolchain,
 or tmux.
+
+### Saved work
+
+`omar open` (or `omar up --web` without a name) reopens the remembered workspace,
+starting the same runtime if it stopped. Use
+`omar up --name NAME` to explicitly create a separate workspace. The current
+conversation, source, companion files, inputs, and display names persist locally.
+A workflow editor shows **Saving…** until its draft is durable. Conflicting edits
+from another tab are rejected; the unsaved version stays in the browser for recovery.
+Legacy EA histories are backed up and imported once by chat ID without rewriting
+original transcripts. Reopening a workspace never starts a campaign.
+
+### Harness-independent saved work
+
+OMAR stores Mission Control transcripts, workflow drafts, companion files, inputs,
+and display names in the selected workspace under `OMAR_HOME` (default `~/.omar`).
+This location does not depend on Claude Code, Codex, Cursor, OpenCode, Pi, or
+Antigravity. Switching the assistant or restarting supplies both the saved transcript
+and current workflow edits to the selected backend. Imported draft-only workflows
+are preserved even when they have no chat messages.
+
+`Open OMAR.command` uses an installed OMAR executable, an explicit `OMAR_BIN`, or
+an adjacent source build. It contains no username, assistant directory, or worktree
+path. Install `omar` and `omarc` together so the compiler is found beside the runtime.
+The locally installed copy can live in `~/.omar/bin`; no assistant installation is
+needed merely to open and view saved work.
+
+This restores data created in OMAR. Standalone provider app histories and separate
+explicitly named OMAR workspaces retain their own boundaries; changing an assistant
+does not silently merge unrelated conversations or start an existing campaign.
+
+### Archiving and deleting workflows
+
+Select or hover a workflow to reveal its archive button (always visible on touch).
+Archive hides it from the recent list while keeping its conversation, saved draft,
+files, and run records. Undo or the sidebar's Archive view restores it, including
+after a reload or runtime restart. The Archive icon has no persistent highlight.
+A running or paused workflow must be stopped, and a busy assistant must finish,
+before archiving. Archiving the selected workflow opens another saved workflow,
+or a blank one if none remain. Other tabs follow that change when they refresh.
+
+The trash action appears only inside Archive. Its confirmation names the workflow,
+focuses Cancel initially, and requires Delete permanently before erasing its saved
+messages, title, and configuration. Errors leave it available for retry. Generated
+files, run records, and existing backups are retained. A content-free ID/EA mapping
+prevents deleted workflows from returning through legacy imports or stale writes.
+Old `/remove` and `/removed` routes remain compatible aliases for archiving.
