@@ -23,6 +23,7 @@
 //! runtime one — a hand-written list inside `assertRunRecord`. The array is
 //! what that check can be written against.
 
+use crate::activity::*;
 use ts_rs::{Config, TS};
 
 use crate::chat_history::{Conversation, ConversationSummary};
@@ -80,6 +81,8 @@ fn vocabulary<T: serde::Serialize>(
 
 fn vocabularies() -> Vec<Vocabulary> {
     vec![
+        vocabulary("ACTIVITY_EXECUTIONS", "ActivityExecution", "Runtime invocation outcome, independent of monitoring.", &[ActivityExecution::Running, ActivityExecution::Completed, ActivityExecution::Failed]),
+        vocabulary("ACTIVITY_CONNECTIONS", "ActivityConnection", "Availability of the backend monitoring connection.", &[ActivityConnection::Connecting, ActivityConnection::Connected, ActivityConnection::Disconnected, ActivityConnection::Unsupported]),
         vocabulary(
             "RUN_STATUSES",
             "RunStatus",
@@ -194,6 +197,15 @@ pub fn generate() -> String {
 
     // Declared after the vocabularies, because the structs refer to them.
     let mut decls = vec![
+        ActivityEvent::decl(&config),
+        ObservedTool::decl(&config),
+        ChangedArtifact::decl(&config),
+        RoleSelection::decl(&config),
+        InvocationActivity::decl(&config),
+        ActivitySnapshot::decl(&config),
+        SupportedModel::decl(&config),
+        SavedRoleSettings::decl(&config),
+        RoleSettingsSnapshot::decl(&config),
         DiagramTag::decl(&config),
         DiagramInstance::decl(&config),
         DiagramAgent::decl(&config),

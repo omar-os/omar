@@ -75,6 +75,15 @@ export async function startFakeServe({
       response.writeHead(204, CORS).end();
       return;
     }
+    if (request.method === "GET" && url.pathname === "/v1/role-settings") {
+      return json(response, 200, { roles: [], capabilities_available: false, codex_models: [] });
+    }
+    const activityRun = /^\/v1\/runs\/([^/]+)\/activity$/.exec(url.pathname);
+    if (request.method === "GET" && activityRun) {
+      const entry = chat.runs.get(decodeURIComponent(activityRun[1]));
+      if (!entry) return json(response, 404, { error: "unknown run" });
+      return json(response, 200, { run_id: entry.record.run_id, sequence: entry.sequence, server_time: Date.now(), invocations: [] });
+    }
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, { status: "ok", protocol_version: 1, access: "full" });
     }

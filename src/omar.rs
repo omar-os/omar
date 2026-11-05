@@ -1,3 +1,4 @@
+mod activity;
 mod app;
 mod backend;
 mod backend_probe;

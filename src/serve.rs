@@ -396,6 +396,8 @@ struct Context_ {
     /// whose program has no `Web` agent, which is what makes the panel routes
     /// 404 rather than offer an empty panel.
     panels: Panels,
+    activity: Arc<Mutex<BTreeMap<String, crate::activity::ActivityRun>>>,
+    role_settings: crate::activity::RoleSettings,
     /// Mutations waiting for their run to pause: the new program, compiled,
     /// and the directory its source is staged in.
     mutations: Mutex<BTreeMap<String, (topology::Bytecode, PathBuf)>>,
@@ -874,6 +876,10 @@ impl Serve {
             health_idle_warning: config.health.idle_warning,
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
+            activity: Arc::new(Mutex::new(BTreeMap::new())),
+            role_settings: crate::activity::RoleSettings::load(
+                omar_dir.join(format!("role-settings-{workspace_ea}.json")),
+            ),
             mutations: Mutex::default(),
             chat: Arc::new(Mutex::new(Chat {
                 latest_run: latest_parked,
@@ -1769,6 +1775,45 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             select_chat(&workspaces, Some(id))
         }
         ("GET", "/v1/agent") => (200, describe_agent(&context)),
+        ("GET", "/v1/role-settings") => {
+            let models = activity_models(&context);
+            (
+                200,
+                json!(crate::activity::RoleSettingsSnapshot {
+                    roles: context.role_settings.all(),
+                    capabilities_available: !models.is_empty(),
+                    codex_models: models,
+                }),
+            )
+        }
+        ("POST", "/v1/role-settings") if content_length > 16 * 1024 => {
+            (413, json!({"error":"role settings body too large"}))
+        }
+        ("POST", "/v1/role-settings") => {
+            match serde_json::from_slice::<crate::activity::SavedRoleSettings>(&read_body(
+                content_length,
+            )?) {
+                Ok(role) => match context.role_settings.save(role, &activity_models(&context)) {
+                    Ok(()) => (200, json!({"saved":true, "applies_to":"next_invocation"})),
+                    Err(error) => (400, json!({"error":error.to_string()})),
+                },
+                Err(_) => (400, json!({"error":"invalid role settings"})),
+            }
+        }
+        ("GET", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/activity") => {
+            let id = rest
+                .trim_start_matches("/v1/runs/")
+                .trim_end_matches("/activity");
+            match context
+                .activity
+                .lock()
+                .expect("activity runs poisoned")
+                .get(id)
+            {
+                Some(activity) => (200, json!(activity.snapshot())),
+                None => (404, json!({"error":"activity unavailable for this run"})),
+            }
+        }
         ("GET", "/v1/agent/backends") => (200, backend_connections()),
         ("POST", "/v1/agent/backend") => switch_backend(&context, &read_body(content_length)?),
         ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/connect") => {
@@ -2522,6 +2567,12 @@ impl Workspaces {
             health_idle_warning: self.settings.health_idle_warning,
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
+            activity: Arc::new(Mutex::new(BTreeMap::new())),
+            role_settings: crate::activity::RoleSettings::load(
+                self.settings
+                    .omar_dir
+                    .join(format!("role-settings-{ea_id}.json")),
+            ),
             mutations: Mutex::default(),
             chat: Arc::new(Mutex::new(Chat {
                 latest_run: latest_parked,
@@ -3516,6 +3567,42 @@ fn panel_answer(context: &Arc<Context_>, run_id: &str, body: &[u8]) -> (u16, Val
     }
 }
 
+/// Discover capabilities from an existing pane only; this never launches an
+/// agent, changes its backend, or treats a cached catalog as live support.
+fn activity_models(context: &Context_) -> Vec<crate::activity::SupportedModel> {
+    let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
+    let ea = crate::ea::ea_manager_session(context.ea_id, &context.session_prefix);
+    let mut sockets = Vec::new();
+    if let Some(stamp) = client.session_delivery(&ea) {
+        if let Some(path) = stamp.strip_prefix("codex:") {
+            sockets.push(PathBuf::from(path));
+        }
+    }
+    let agents: Vec<String> = context
+        .activity
+        .lock()
+        .expect("activity runs poisoned")
+        .values()
+        .flat_map(|run| {
+            run.backends
+                .iter()
+                .filter(|(_, b)| b.as_str() == "codex")
+                .map(|(a, _)| a.clone())
+        })
+        .collect();
+    for agent in agents {
+        if let Some(socket) = crate::activity::codex_socket(&client, &agent) {
+            sockets.push(socket);
+        }
+    }
+    for socket in sockets {
+        if let Ok(models) = crate::activity::models_from_socket(&socket) {
+            return models;
+        }
+    }
+    Vec::new()
+}
+
 fn spawn_run_thread(
     context: &Arc<Context_>,
     run_id: &str,
@@ -3550,6 +3637,28 @@ fn spawn_run_thread(
     } else {
         topology::Pace::RealTime
     };
+    let state = topology::verify(&bytecode).expect("admitted bytecode is verified");
+    let activity = crate::activity::ActivityRun::new(
+        run_id.clone(),
+        state.team.clone(),
+        state
+            .agents
+            .iter()
+            .map(|(name, agent)| {
+                (
+                    name.clone(),
+                    topology::canonical_backend(&agent.backend).to_string(),
+                )
+            })
+            .collect(),
+        context.role_settings.clone(),
+        PathBuf::from(&context.default_workdir),
+    );
+    context
+        .activity
+        .lock()
+        .expect("activity runs poisoned")
+        .insert(run_id.clone(), activity.clone());
     // Validated at admission, so a bad cadence was already a 400.
     let checkpoint_policy = request
         .checkpoint_period
@@ -3561,6 +3670,7 @@ fn spawn_run_thread(
         let outcome = topology::run_topology(
             &bytecode,
             TopologyRunConfig {
+                activity: Some(activity),
                 ea_id: context.ea_id,
                 omar_dir: &context.omar_dir,
                 generated: &topology::generated_dir(&program_path),
@@ -4581,6 +4691,14 @@ fn spawn_resume_thread(
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let generated = topology::generated_dir(&program_path);
+        // Copy the handle before entering the run loop: holding this map's
+        // lock would block another workflow from resuming in the same chat.
+        let activity = context
+            .activity
+            .lock()
+            .expect("activity runs poisoned")
+            .get(&run_id)
+            .cloned();
         let outcome = topology::resume_topology(
             TopologyRunConfig {
                 ea_id: context.ea_id,
@@ -4595,6 +4713,7 @@ fn spawn_resume_thread(
                 diagram_address: Some(diagram_address),
                 diagram_ready: Some(ready_sender),
                 panel_ready: Some(panel_sender),
+                activity,
                 checkpoint_policy: None,
                 keep_workspaces: false,
                 program_path: Some(&program_path),
