@@ -1065,7 +1065,7 @@ test("the confirmation chooses what the run keeps and how it checkpoints", async
   // What the daemon was asked for.
   const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
   const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
-  expect(options).toEqual({ keep_workspaces: true, checkpoint_period: "logical:2h30m" });
+  expect(options).toEqual({ keep_workspaces: true, checkpoint_period: "logical:2h30m", sandbox: false, no_sandbox: true });
 });
 
 test("checkpoints are off unless enabled", async ({ page }) => {
@@ -1078,7 +1078,7 @@ test("checkpoints are off unless enabled", async ({ page }) => {
   await expect(page.locator(".connection")).toContainText("observing");
   const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
   const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
-  expect(options).toEqual({ keep_workspaces: false, checkpoint_period: "off" });
+  expect(options).toEqual({ keep_workspaces: false, checkpoint_period: "off", sandbox: false, no_sandbox: true });
 });
 
 test("the file viewer shows the current run's instances only", async ({ page }) => {
@@ -1582,6 +1582,52 @@ test("a backend is connected from the Backends page, in a terminal that closes o
   await backends.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: /Codex/ }).click();
   await expect(page.getByRole("menuitem", { name: /Cursor/ })).toBeEnabled();
+});
+
+test("a backend is set up for sandboxes from the Backends page", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  // Each backend says whether sandboxed teams can use it.
+  await expect(backends.getByRole("listitem").first()).toHaveText(
+    /Claude CodeConnected · Claude MaxSandboxes · not connected/,
+  );
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(/Sandboxes · ChatGPT/);
+  await expect(backends.getByRole("button", { name: "Set up Codex for sandboxes" })).toHaveCount(0);
+
+  // `omar connect claude --sandbox`, in the same kind of terminal.
+  await backends.getByRole("button", { name: "Set up Claude Code for sandboxes" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Set up Claude Code for sandboxes" });
+  await expect(terminal).toContainText("claude $");
+  await expect(terminal).toContainText("inside a sandbox");
+  await page.keyboard.press("Enter");
+
+  // The key is checked in a sandbox, then the terminal goes on its own.
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").first()).toHaveText(
+    /Claude CodeConnected · Claude MaxSandboxes · fake key/,
+  );
+  await expect(backends.getByRole("button", { name: "Set up Claude Code for sandboxes" })).toHaveCount(0);
+});
+
+test("the confirmation opts a run into sandboxes", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  // Off unless the runtime turns sandboxes on.
+  const sandbox = dialog.getByRole("checkbox", { name: "Run each team in a Docker Sandbox" });
+  await expect(sandbox).not.toBeChecked();
+  await expect(dialog).toContainText("Agents run on this machine");
+  await sandbox.check();
+  await expect(dialog).toContainText("must be connected for sandboxes");
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
+  const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
+  expect(options).toMatchObject({ sandbox: true, no_sandbox: false });
 });
 
 test("a sign-in whose test prompt fails keeps its terminal open until one works", async ({

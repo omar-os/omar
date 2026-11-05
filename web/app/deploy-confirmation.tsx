@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { fetchBackends } from "./lib/runtime-client";
 
 /** What the operator chose for the run, beyond the program itself. */
 export type DeployOptions = {
@@ -9,6 +10,8 @@ export type DeployOptions = {
   keepWorkspaces: boolean;
   /** A cadence spec the daemon parses: `off`, `tag`, `1h`, `logical:2h30m`. */
   checkpointPeriod: string;
+  /** Run each team instance in a Docker Sandbox. */
+  sandbox: boolean;
 };
 
 type Cadence = "hour" | "tag" | "custom";
@@ -31,7 +34,9 @@ export function customSpec(clock: Clock, parts: Parts): string | null {
   return clock === "logical" ? `logical:${text}` : text;
 }
 
-export function DeployConfirmation({ team, disabled, retry = false, manual = false, initialTimeoutSeconds = 300, onCancel, onConfirm }: {
+export function DeployConfirmation({ serveUrl, team, disabled, retry = false, manual = false, initialTimeoutSeconds = 300, onCancel, onConfirm }: {
+  /** Where to read the runtime's sandbox default from. */
+  serveUrl: string;
   team: string;
   disabled: boolean;
   retry?: boolean;
@@ -50,6 +55,18 @@ export function DeployConfirmation({ team, disabled, retry = false, manual = fal
   const [cadence, setCadence] = useState<Cadence>("hour");
   const [clock, setClock] = useState<Clock>("physical");
   const [parts, setParts] = useState<Parts>({ days: 0, hours: 0, minutes: 0, seconds: 0 });
+  // Starts as the runtime would run it (`[sandbox] enabled`), unless the
+  // operator ticks it first.
+  const [sandbox, setSandbox] = useState<boolean | null>(null);
+  const [sandboxDefault, setSandboxDefault] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    fetchBackends(serveUrl)
+      .then((backends) => { if (!cancelled) setSandboxDefault(backends.sandboxDefault); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [serveUrl]);
+  const sandboxed = sandbox ?? sandboxDefault;
   useEffect(() => {
     const dialog = ref.current;
     const previous = document.activeElement as HTMLElement | null;
@@ -152,13 +169,25 @@ export function DeployConfirmation({ team, disabled, retry = false, manual = fal
         ) : null}
         {!checkpointing ? <p className="deploy-hint">Only Pause and a manual checkpoint will capture the run; enable to capture on a cadence.</p> : null}
       </fieldset>
+      <fieldset className="deploy-options">
+        <legend>Isolation</legend>
+        <label className="deploy-check">
+          <input type="checkbox" checked={sandboxed} onChange={(event) => setSandbox(event.target.checked)} />
+          Run each team in a Docker Sandbox
+        </label>
+        <p className="deploy-hint">
+          {sandboxed
+            ? "Each team instance runs in its own microVM that sees only its workspace. Every agent backend in the team must be connected for sandboxes (Settings → Connect backends…)."
+            : "Agents run on this machine, with your files and sign-ins."}
+        </p>
+      </fieldset>
       <div className="deploy-confirmation-actions">
         <button ref={cancel} type="button" className="secondary-button" onClick={onCancel}>Cancel</button>
         <button
           type="button"
           className="primary-button"
           disabled={disabled || invalidCustom}
-          onClick={() => { if (checkpointPeriod) onConfirm({ timeoutSeconds, keepWorkspaces, checkpointPeriod }); }}
+          onClick={() => { if (checkpointPeriod) onConfirm({ timeoutSeconds, keepWorkspaces, checkpointPeriod, sandbox: sandboxed }); }}
         >
           Confirm deploy
         </button>

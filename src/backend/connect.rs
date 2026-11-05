@@ -21,12 +21,14 @@ pub fn host(backend: &dyn Backend) -> Result<()> {
 }
 
 /// `omar connect` on a terminal: pick a backend with the arrow keys, connect
-/// or disconnect it, and come back to the list for the next one.
-pub fn wizard() -> Result<()> {
+/// or disconnect it, or connect it for sandboxes, and come back to the list
+/// for the next one.
+pub fn wizard(sandbox: &crate::sandbox::Config) -> Result<()> {
     let mut selected = 0;
     loop {
         println!("{}", "Checking backends…".dim());
-        let statuses = connection::assistants();
+        let (hosts, sandboxes) = connection::assistants_and_sandboxes();
+        let statuses: Vec<_> = hosts.into_iter().zip(sandboxes).collect();
         let mut stdout = std::io::stdout();
         stdout.queue(cursor::MoveToPreviousLine(1))?;
         stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
@@ -34,11 +36,15 @@ pub fn wizard() -> Result<()> {
             Choice::Quit => return Ok(()),
             Choice::Connect(index) => {
                 selected = index;
-                connect(statuses[index].0)
+                connect(statuses[index].0 .0)
             }
             Choice::Disconnect(index) => {
                 selected = index;
-                disconnect(statuses[index].0)
+                disconnect(statuses[index].0 .0)
+            }
+            Choice::Sandbox(index) => {
+                selected = index;
+                crate::sandbox::connect(statuses[index].0 .0, sandbox)
             }
         };
         if let Err(error) = outcome {
@@ -71,12 +77,23 @@ impl Drop for RawMode {
 enum Choice {
     Connect(usize),
     Disconnect(usize),
+    Sandbox(usize),
     Quit,
+}
+
+/// A backend's host sign-in, and its key for sandboxes.
+type Row = ((&'static dyn Backend, Connection), Connection);
+
+/// Whether sbx is here, so sandboxes are worth showing at all.
+fn sandboxed(statuses: &[Row]) -> bool {
+    statuses
+        .iter()
+        .any(|(_, sandbox)| *sandbox != Connection::NotInstalled)
 }
 
 /// What to do next. Drawn inline, so what each sign-in prints stays in the
 /// scrollback above the next list.
-fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choice> {
+fn pick(statuses: &[Row], selected: usize) -> Result<Choice> {
     let _raw = RawMode::enable()?;
     let mut stdout = std::io::stdout();
     let mut selected = selected.min(statuses.len().saturating_sub(1));
@@ -103,9 +120,10 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
             KeyCode::Char('y') if answering => Choice::Disconnect(selected),
             _ if answering => continue,
             KeyCode::Char('d') => {
-                confirming = matches!(statuses[selected].1, Connection::Connected { .. });
+                confirming = matches!(statuses[selected].0 .1, Connection::Connected { .. });
                 continue;
             }
+            KeyCode::Char('s') if sandboxed(statuses) => Choice::Sandbox(selected),
             KeyCode::Up | KeyCode::Char('k') => {
                 selected = selected.checked_sub(1).unwrap_or(statuses.len() - 1);
                 continue;
@@ -122,9 +140,15 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
         // Leave one line behind saying what was picked.
         up_over(&mut stdout, &drawn)?;
         let summary = match choice {
-            Choice::Connect(index) => format!("Connecting {}", statuses[index].0.kind().name()),
+            Choice::Connect(index) => format!("Connecting {}", statuses[index].0 .0.kind().name()),
             Choice::Disconnect(index) => {
-                format!("Disconnecting {}", statuses[index].0.kind().name())
+                format!("Disconnecting {}", statuses[index].0 .0.kind().name())
+            }
+            Choice::Sandbox(index) => {
+                format!(
+                    "Connecting {} for sandboxes",
+                    statuses[index].0 .0.kind().name()
+                )
             }
             Choice::Quit => "Done".to_string(),
         };
@@ -172,18 +196,33 @@ fn visible_width(line: &str) -> usize {
 
 /// The picker's lines, `selected` marked; `confirming` asks before signing
 /// it out.
-fn menu(statuses: &[(&dyn Backend, Connection)], selected: usize, confirming: bool) -> Vec<String> {
+fn menu(statuses: &[Row], selected: usize, confirming: bool) -> Vec<String> {
+    let sandboxed = sandboxed(statuses);
+    let keys = if sandboxed {
+        "↑/↓ move · enter connect · s sandbox · d disconnect · q quit"
+    } else {
+        "↑/↓ move · enter connect · d disconnect · q quit"
+    };
     let mut lines = vec![format!(
         "{} Connect an agent backend  {}",
         "◆".cyan(),
-        "↑/↓ move · enter connect · d disconnect · q quit".dim()
+        keys.dim()
     )];
-    for (index, (backend, status)) in statuses.iter().enumerate() {
+    for (index, ((backend, status), sandbox)) in statuses.iter().enumerate() {
         let name = format!("{:<10}", backend.kind().name());
-        let label = connection::label(status);
-        let label = match status {
+        let paint = |status: &Connection, label: String| match status {
             Connection::Connected { .. } => label.green(),
             _ => label.yellow(),
+        };
+        let label = if sandboxed {
+            let host = paint(status, format!("{:<26}", connection::label(status)));
+            let text = match sandbox {
+                Connection::SignedOut => "sandbox: not connected".to_string(),
+                other => format!("sandbox: {}", connection::label(other)),
+            };
+            format!("{host}{}", paint(sandbox, text))
+        } else {
+            paint(status, connection::label(status)).to_string()
         };
         lines.push(if index == selected {
             format!("{} {} {name}{label}", "│".cyan(), "●".cyan())
@@ -192,7 +231,7 @@ fn menu(statuses: &[(&dyn Backend, Connection)], selected: usize, confirming: bo
         });
     }
     lines.push(if confirming {
-        let name = statuses[selected].0.kind().name();
+        let name = statuses[selected].0 .0.kind().name();
         format!("{} Sign {name} out? {}", "└".cyan(), "y / n".dim())
     } else {
         format!("{}", "└".cyan())
@@ -459,7 +498,12 @@ mod tests {
     fn menu_widths() -> Vec<usize> {
         let statuses: Vec<_> = crate::backend::ASSISTANT
             .iter()
-            .map(|kind| (crate::backend::of(*kind), Connection::SignedOut))
+            .map(|kind| {
+                (
+                    (crate::backend::of(*kind), Connection::SignedOut),
+                    Connection::NotInstalled,
+                )
+            })
             .collect();
         menu(&statuses, 0, false)
             .iter()

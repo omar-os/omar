@@ -282,6 +282,10 @@ export type RunRequest = {
   keep_workspaces?: boolean;
   /** `off`, `tag`, `30m` (physical) or `logical:30m`; the daemon's default is an hour. */
   checkpoint_period?: string;
+  /** Run each team instance in a Docker Sandbox. */
+  sandbox?: boolean;
+  /** Run on the host even where the runtime's config turns sandboxes on. */
+  no_sandbox?: boolean;
 };
 
 /**

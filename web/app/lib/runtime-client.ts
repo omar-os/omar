@@ -53,11 +53,13 @@ export function connectTerminalUrl(serveUrl: string, backend: string): string {
 export async function startConnect(
   serveUrl: string,
   backend: string,
+  /** `omar connect <backend> --sandbox`: a key for sandboxed teams instead. */
+  sandbox = false,
 ): Promise<void> {
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(
     `${base}/v1/backends/${encodeURIComponent(backend)}/connect`,
-    { method: "POST", body: "{}" },
+    { method: "POST", body: JSON.stringify(sandbox ? { sandbox } : {}) },
   );
   if (!response.ok) throw new Error(await readError(response));
 }
@@ -70,11 +72,13 @@ export async function startConnect(
 export async function checkSignIn(
   serveUrl: string,
   backend: string,
+  /** Answer it inside a throwaway sandbox, with sbx's key. */
+  sandbox = false,
 ): Promise<void> {
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(
     `${base}/v1/backends/${encodeURIComponent(backend)}/check`,
-    { method: "POST", body: "{}" },
+    { method: "POST", body: JSON.stringify(sandbox ? { sandbox } : {}) },
   );
   if (!response.ok) throw new Error(await readError(response));
 }
@@ -83,22 +87,38 @@ export async function checkSignIn(
 export const ASSISTANT = "\u0000assistant";
 
 /** What the assistant runs on, and what else it could run on. */
-export type AgentBackends = { backend: string | null; available: string[] };
+export type AgentBackends = {
+  backend: string | null;
+  available: string[];
+  /** Whether a run that says nothing runs its teams in sandboxes. */
+  sandboxDefault: boolean;
+};
 
 export async function fetchBackends(serveUrl: string): Promise<AgentBackends> {
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(`${base}/v1/agent`);
   if (!response.ok) throw new Error(await readError(response));
-  const body = (await response.json()) as Partial<AgentBackends>;
+  const body = (await response.json()) as Partial<AgentBackends> & {
+    sandbox?: { default?: unknown };
+  };
   return {
     backend: typeof body.backend === "string" ? body.backend : null,
     available: Array.isArray(body.available) ? body.available : [],
+    sandboxDefault: body.sandbox?.default === true,
   };
 }
 
 /** Whether a backend is installed and signed in, as its own CLI says. */
-export type BackendStatus = {
+export type BackendStatus = Connection & {
   name: string;
+  /**
+   * Whether its agents can run in sandboxes: a key in Docker Sandboxes'
+   * store. `not_installed` means sbx is not. Absent from older runtimes.
+   */
+  sandbox?: Connection;
+};
+
+type Connection = {
   status: "connected" | "signed_out" | "not_installed" | "unknown";
   /** The account or credential it signed in with. */
   via?: string;

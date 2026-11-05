@@ -27,6 +27,7 @@ mod properties;
 #[cfg(test)]
 mod protocol;
 mod reaction;
+mod sandbox;
 mod scheduler;
 mod serve;
 mod sessions;
@@ -119,6 +120,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[command(hide = true)]
+    SandboxWorker,
     /// Create a new independent background runtime, or restart a stopped one by name on this build
     Up(sessions::UpOptions),
     /// List independently addressable runtime sessions
@@ -252,6 +255,13 @@ enum Commands {
     Connect {
         /// claude, codex, cursor, opencode, pi or agy; omit to pick from a list
         backend: Option<String>,
+        /// Connect it for sandboxed teams instead (`omar run --sandbox`): give
+        /// Docker Sandboxes a key its agents use from inside a sandbox, then
+        /// check it with a test prompt in one. Subscriptions other than
+        /// ChatGPT's cannot cross into a sandbox, so most backends need an
+        /// API key here.
+        #[arg(long, requires = "backend")]
+        sandbox: bool,
     },
 
     /// Restore authoritative coordination state to a backend lifecycle hook.
@@ -528,6 +538,9 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(mut cli: Cli) -> Result<()> {
+    if matches!(cli.command, Some(Commands::SandboxWorker)) {
+        return topology::sandbox_worker();
+    }
     let internal = if let Some(Commands::SessionExec { args }) = &cli.command {
         let args = args.clone();
         cli = Cli::try_parse_from(std::iter::once("omar".to_string()).chain(args))?;
@@ -669,10 +682,10 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             check,
             backends,
         }) => check_backends(json, check, &backends),
-        Some(Commands::Connect { backend: None }) => {
+        Some(Commands::Connect { backend: None, .. }) => {
             use std::io::IsTerminal;
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                crate::backend::connect::wizard()
+                crate::backend::connect::wizard(&config.sandbox)
             } else {
                 print!("{}", backends_report(false));
                 Ok(())
@@ -680,6 +693,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         }
         Some(Commands::Connect {
             backend: Some(name),
+            sandbox,
         }) => {
             let backend = crate::backend::resolve(&name).map_err(anyhow::Error::msg)?;
             anyhow::ensure!(
@@ -687,7 +701,11 @@ async fn async_main(mut cli: Cli) -> Result<()> {
                 "{} is not an agent backend to connect",
                 backend.kind().name()
             );
-            crate::backend::connect::host(backend)
+            if sandbox {
+                crate::sandbox::connect(backend, &config.sandbox)
+            } else {
+                crate::backend::connect::host(backend)
+            }
         }
         Some(Commands::Ea {
             action: sessions::EaAction::Event { action },
@@ -757,6 +775,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             }
             None => mcp::run_server_with_default_context(bare_tool_names, hold),
         },
+        Some(Commands::SandboxWorker) => unreachable!(),
         Some(Commands::Checkpoint { action }) => {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
             checkpoint_command(&omar_dir, target.id, action)
@@ -1351,7 +1370,11 @@ fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> R
     let dir = deployment_dir(omar_dir, ea_id, team)?;
     let mut record = deploy::DeploymentRecord::load(&dir)?
         .ok_or_else(|| anyhow::anyhow!("no deployment '{}'", team))?;
-    let client = record.session_client()?;
+    let client = if record.sandboxes.is_empty() {
+        Some(record.session_client()?)
+    } else {
+        None
+    };
     // A finished deployment's runner is done with it; the pid it recorded may
     // be a runtime that is still serving other work.
     if record.is_active() && record.pid != std::process::id() && record.runner_alive() {
@@ -1363,8 +1386,10 @@ fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> R
     }
     let failures = if record.sessions_cleaned {
         Vec::new()
-    } else {
+    } else if let Some(client) = client {
         deploy::teardown_sessions(&client, &record.sessions, &deploy::logs_dir(&dir))
+    } else {
+        sandbox::stop_all(&record.sandboxes)
     };
     for failure in &failures {
         eprintln!("warning: session not cleaned up: {failure}");
@@ -1551,14 +1576,16 @@ fn sync_tmux_setup_warning(app: &mut app::App) {
 /// Interactive tmux configuration setup.
 /// Every assistant backend's sign-in, as a table or as JSON.
 fn backends_report(json: bool) -> String {
-    report_backends(&crate::backend::connection::assistants(), &[], json)
+    let (statuses, sandboxes) = crate::backend::connection::assistants_and_sandboxes();
+    report_backends(&statuses, &sandboxes, &[], json)
 }
 
 /// `omar backends`: the report for the named backends (all when none), and
 /// with `check`, each signed-in one's test prompt, run in parallel.
 fn check_backends(json: bool, check: bool, names: &[String]) -> Result<()> {
     use crate::backend::{connection, Connection};
-    let mut statuses = connection::assistants();
+    let (statuses, sandboxes) = connection::assistants_and_sandboxes();
+    let mut statuses: Vec<_> = statuses.into_iter().zip(sandboxes).collect();
     if !names.is_empty() {
         let named = |backend: &&dyn crate::backend::Backend, name: &String| {
             backend
@@ -1567,12 +1594,15 @@ fn check_backends(json: bool, check: bool, names: &[String]) -> Result<()> {
         };
         for name in names {
             anyhow::ensure!(
-                statuses.iter().any(|(backend, _)| named(backend, name)),
+                statuses
+                    .iter()
+                    .any(|((backend, _), _)| named(backend, name)),
                 "'{name}' is not an assistant backend; see omar backends"
             );
         }
-        statuses.retain(|(backend, _)| names.iter().any(|name| named(backend, name)));
+        statuses.retain(|((backend, _), _)| names.iter().any(|name| named(backend, name)));
     }
+    let (statuses, sandboxes): (Vec<_>, Vec<_>) = statuses.into_iter().unzip();
     let checks: Vec<Option<Result<(), String>>> = if check {
         std::thread::scope(|scope| {
             // None: not signed in and not named, so nothing to check.
@@ -1616,7 +1646,7 @@ fn check_backends(json: bool, check: bool, names: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
-    print!("{}", report_backends(&statuses, &checks, json));
+    print!("{}", report_backends(&statuses, &sandboxes, &checks, json));
     let failed = checks
         .iter()
         .flatten()
@@ -1631,6 +1661,7 @@ fn report_backends(
         &'static dyn crate::backend::Backend,
         crate::backend::Connection,
     )],
+    sandboxes: &[crate::backend::Connection],
     checks: &[Option<Result<(), String>>],
     json: bool,
 ) -> String {
@@ -1641,7 +1672,8 @@ fn report_backends(
             .iter()
             .enumerate()
             .map(|(index, (backend, status))| {
-                let mut row = connection::describe(*backend, status);
+                let mut row =
+                    connection::describe_with_sandbox(*backend, status, &sandboxes[index]);
                 match check_of(index) {
                     Some(Ok(())) => row["check"] = serde_json::json!({"ok": true}),
                     Some(Err(error)) => {
@@ -1664,14 +1696,31 @@ fn report_backends(
             None => {}
         }
     }
-    let mut out = format!("{:<10}{:<28}NEXT\n", "BACKEND", "STATUS");
-    for (backend, status) in statuses {
+    // Sandboxes are opt-in: without sbx, the table is as it always was.
+    let sandboxed = sandboxes.iter().any(|s| *s != Connection::NotInstalled);
+    let mut out = if sandboxed {
+        format!("{:<10}{:<28}{:<20}NEXT\n", "BACKEND", "STATUS", "SANDBOX")
+    } else {
+        format!("{:<10}{:<28}NEXT\n", "BACKEND", "STATUS")
+    };
+    for ((backend, status), sandbox) in statuses.iter().zip(sandboxes) {
         let name = backend.kind().name();
         let next = match status {
             Connection::Connected { .. } => String::new(),
             _ => format!("omar connect {name}"),
         };
-        let row = format!("{name:<10}{:<28}{next}", connection::label(status));
+        let row = if sandboxed {
+            let sandbox = match sandbox {
+                Connection::SignedOut => "not connected".to_string(),
+                other => connection::label(other),
+            };
+            format!(
+                "{name:<10}{:<28}{sandbox:<20}{next}",
+                connection::label(status)
+            )
+        } else {
+            format!("{name:<10}{:<28}{next}", connection::label(status))
+        };
         out += row.trim_end();
         out.push('\n');
     }
