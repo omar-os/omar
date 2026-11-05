@@ -154,7 +154,12 @@ async function startRealServe() {
     stateDir,
     sessionPrefix,
     async close() {
-      child.kill();
+      // Wait for the daemon's writers to stop before deleting their files.
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((done) => child.once("close", done));
+        child.kill();
+        await exited;
+      }
       // A failed or finished run leaves its agent sessions behind, so the
       // harness clears its own namespace rather than accumulating panes.
       await new Promise((done) => {
