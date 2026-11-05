@@ -4691,6 +4691,14 @@ fn spawn_resume_thread(
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let generated = topology::generated_dir(&program_path);
+        // Copy the handle before entering the run loop: holding this map's
+        // lock would block another workflow from resuming in the same chat.
+        let activity = context
+            .activity
+            .lock()
+            .expect("activity runs poisoned")
+            .get(&run_id)
+            .cloned();
         let outcome = topology::resume_topology(
             TopologyRunConfig {
                 ea_id: context.ea_id,
@@ -4705,12 +4713,7 @@ fn spawn_resume_thread(
                 diagram_address: Some(diagram_address),
                 diagram_ready: Some(ready_sender),
                 panel_ready: Some(panel_sender),
-                activity: context
-                    .activity
-                    .lock()
-                    .expect("activity runs poisoned")
-                    .get(&run_id)
-                    .cloned(),
+                activity,
                 checkpoint_policy: None,
                 keep_workspaces: false,
                 program_path: Some(&program_path),
