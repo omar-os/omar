@@ -62,6 +62,12 @@ test("only the affected invocation turns orange and keyboard review opens its te
   fake.setApprovals(feed([pending]));
   const node = page.locator(".omar-reaction.approval-pending");
   await expect(node).toHaveCount(1);
+  const labelBounds = await node.evaluate((element) => {
+    const label = (element.querySelector(".omar-reaction-meta") as SVGGraphicsElement).getBBox();
+    const card = (element.querySelector(".omar-reaction-body") as SVGGraphicsElement).getBBox();
+    return { bottom: label.y + label.height, cardBottom: card.y + card.height };
+  });
+  expect(labelBounds.bottom).toBeLessThanOrEqual(labelBounds.cardBottom);
   await expect(page.locator(".omar-reaction.running")).toHaveCount(1);
   expect(await node.evaluate((el) => getComputedStyle(el).animationName)).toBe("none");
   await expect.poll(() => node.locator(".omar-reaction-body").evaluate((el) => getComputedStyle(el).fill)).toBe("rgb(255, 241, 222)");

@@ -1906,12 +1906,12 @@ export function DiagramCanvas({
                       <title>{approval.summary}</title>
                       <rect x={REACTION_TEXT_X + 19} y={57} width={reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING - 22} height={18} fill="transparent" />
                       <circle cx={REACTION_TEXT_X + 25} cy={65} r={3} />
-                      <text className="omar-reaction-meta" x={REACTION_TEXT_X + 34} y={572}>Waiting for approval</text>
+                      <text className="omar-reaction-meta" x={REACTION_TEXT_X + 34} y={68}>Waiting for approval</text>
                     </g>
                   ) : <text
                     className="omar-reaction-meta"
                     x={REACTION_TEXT_X + 22}
-                    y={572}
+                    y={68}
                   >
                     {reaction.meta}
                   </text>}
