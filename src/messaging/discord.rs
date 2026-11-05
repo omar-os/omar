@@ -134,14 +134,21 @@ async fn acknowledge_interaction(base: &str, event: &Value) -> Result<()> {
 
 // Text files are UTF-8, with generated header-safe attachment names. No new
 // HTTP/multipart dependency is needed for this small fixed upload format.
-fn multipart(payload: &Value, files: &[(String, String)]) -> (String, Vec<u8>) {
+fn multipart(payload: &Value, files: &[(String, Vec<u8>)]) -> (String, Vec<u8>) {
     let boundary = format!("omar-{}", uuid::Uuid::new_v4());
-    let mut body=format!("--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n{}\r\n",payload);
-    for (i, (name, text)) in files.iter().enumerate() {
-        body.push_str(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"files[{i}]\"; filename=\"{name}\"\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{text}\r\n"));
+    let mut body=format!("--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n{}\r\n",payload).into_bytes();
+    for (i, (name, bytes)) in files.iter().enumerate() {
+        let mime = if name.ends_with(".png") {
+            "image/png"
+        } else {
+            "text/plain; charset=utf-8"
+        };
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"files[{i}]\"; filename=\"{name}\"\r\nContent-Type: {mime}\r\n\r\n").as_bytes());
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
     }
-    body.push_str(&format!("--{boundary}--\r\n"));
-    (boundary, body.into_bytes())
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (boundary, body)
 }
 
 fn message_parts(text: &str) -> Vec<String> {
@@ -197,7 +204,7 @@ impl DiscordApi {
         method: reqwest::Method,
         path: &str,
         body: Option<Value>,
-        files: &[(String, String)],
+        files: &[(String, Vec<u8>)],
     ) -> Result<Value> {
         let mut next = self.next_request.lock().await;
         for _ in 0..3 {
@@ -289,20 +296,39 @@ impl Messenger for DiscordApi {
         proposal: &super::runtime::Proposal,
         token: &str,
     ) -> Result<()> {
+        let snapshot = proposal.design.preview.clone();
+        let image =
+            tokio::task::spawn_blocking(move || super::graph_preview::png(&snapshot)).await??;
+        let graph_files = vec![("workflow.png".to_owned(), image)];
+        let payload = json!({"content":format!("**{}** — workflow preview",proposal.design.preview.team),"allowed_mentions":{"parse":[]},
+            "attachments":[{"id":0,"filename":"workflow.png","description":"Checked workflow graph: teams, agents, ports and connections"}]});
+        timeout(
+            Duration::from_secs(45),
+            self.request(
+                reqwest::Method::POST,
+                &format!("/channels/{}/messages", destination.conversation_id),
+                Some(payload),
+                &graph_files,
+            ),
+        )
+        .await??;
         self.send(
             destination,
             Reply {
-                text: super::proposal::summary(proposal)?,
+                text: super::proposal::visual_summary(proposal)?,
                 run_id: None,
             },
         )
         .await?;
-        let mut files = vec![("workflow.omar".to_owned(), proposal.design.program.clone())];
+        let mut files = vec![(
+            "workflow.omar".to_owned(),
+            proposal.design.program.as_bytes().to_vec(),
+        )];
         let mut names = vec!["workflow.omar = program.omar".to_owned()];
         for (i, (path, text)) in proposal.design.files.iter().enumerate() {
             let name = format!("schema-{i}.json");
             names.push(format!("{name} = {path}"));
-            files.push((name, text.clone()));
+            files.push((name, text.as_bytes().to_vec()));
         }
         for (batch, mapping) in files.chunks(8).zip(names.chunks(8)) {
             let payload = json!({"content":format!("Review files:\n{}",mapping.join("\n")),"allowed_mentions":{"parse":[]},"flags":4,

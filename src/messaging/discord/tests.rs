@@ -457,10 +457,20 @@ fn review_upload_preserves_source_schema_and_json_without_header_injection() {
     assert!(summary.contains("Graph:"));
     assert!(summary.contains("No formal properties"));
     let files = vec![
-        ("workflow.omar".into(), proposal.design.program.clone()),
+        (
+            "workflow.omar".into(),
+            proposal.design.program.as_bytes().to_vec(),
+        ),
         (
             "schema-0.json".into(),
-            proposal.design.files.values().next().unwrap().clone(),
+            proposal
+                .design
+                .files
+                .values()
+                .next()
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
         ),
     ];
     let payload = json!({"attachments":[{"id":0,"filename":"workflow.omar"},{"id":1,"filename":"schema-0.json"}]});
@@ -491,7 +501,7 @@ async fn discord_review_sends_graph_and_source_before_enabling_version_bound_but
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let mut wires = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut data = Vec::new();
             let mut buf = [0; 4096];
@@ -517,7 +527,7 @@ async fn discord_review_sends_graph_and_source_before_enabling_version_bound_but
                 }
             }
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
-            wires.push(String::from_utf8(data).unwrap());
+            wires.push(data);
         }
         wires
     });
@@ -530,6 +540,12 @@ async fn discord_review_sends_graph_and_source_before_enabling_version_bound_but
         .destination;
     api.review(&destination, &proposal, &token).await.unwrap();
     let wires = server.await.unwrap();
+    assert!(wires[0].windows(8).any(|w| w == b"\x89PNG\r\n\x1a\n"));
+    assert!(String::from_utf8_lossy(&wires[0]).contains("image/png"));
+    let wires = wires[1..]
+        .iter()
+        .map(|w| String::from_utf8(w.clone()).unwrap())
+        .collect::<Vec<_>>();
     assert!(wires[0].contains("Graph:"));
     assert!(!wires[0].contains("custom_id"));
     assert!(wires[1].contains("multipart/form-data"));

@@ -21,6 +21,12 @@ pub(super) fn action(command: &str) -> bool {
 }
 
 pub(super) fn summary(proposal: &Proposal) -> Result<String> {
+    summary_text(proposal, true)
+}
+pub(super) fn visual_summary(proposal: &Proposal) -> Result<String> {
+    summary_text(proposal, false)
+}
+fn summary_text(proposal: &Proposal, text_graph: bool) -> Result<String> {
     let d = &proposal.design;
     ensure!(
         d.files.keys().all(|path| path.len() <= 180),
@@ -89,7 +95,12 @@ pub(super) fn summary(proposal: &Proposal) -> Result<String> {
         .map(|p| format!("{}: {}", p.name, p.ty))
         .collect::<Vec<_>>()
         .join("\n");
-    let text = format!("Workflow proposal: {}\n{}\n\nAgents: {}\n\nGraph:\n```text\n{}```\nPorts and constraints:\n```text\n{}\n```\nInputs:\n```json\n{}\n```\nCompile check: passed. {}\nReview the source and schema files before approving. Nothing has run yet.",d.preview.team,proposal.summary,agents,graph,ports,serde_json::to_string_pretty(&d.inputs)?,proofs);
+    let graph = if text_graph {
+        format!("Graph:\n```text\n{graph}```")
+    } else {
+        "Graph: image attached above.".into()
+    };
+    let text = format!("Workflow proposal: {}\n{}\n\nAgents: {}\n\n{}\nPorts and constraints:\n```text\n{}\n```\nInputs:\n```json\n{}\n```\nCompile check: passed. {}\nReview the source and schema files before approving. Nothing has run yet.",d.preview.team,proposal.summary,agents,graph,ports,serde_json::to_string_pretty(&d.inputs)?,proofs);
     ensure!(
         text.len() <= 24 * 1024,
         "Proposal summary exceeds Discord review limit"

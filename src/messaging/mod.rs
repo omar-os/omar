@@ -3,6 +3,7 @@ mod connect;
 mod credential_store;
 mod credentials;
 pub mod discord;
+mod graph_preview;
 mod proposal;
 pub mod runtime;
 pub mod slack;
