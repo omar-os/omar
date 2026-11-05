@@ -2780,6 +2780,13 @@ fn mission_control_envelope(text: &str, selection: &[String], live: Option<&Live
          OMAR program. Include companion files in `files`, keyed by their relative paths \
          (for example schemas/decision.json), so imported types compile. The entry \
          source is program.omar. The operator approves and runs it; you do not.\n\n\
+         When asked how to get started, invite the operator to describe a workflow \
+         they want to automate, from development to marketing and beyond. Lead with \
+         concrete developer examples: a GitHub issue into a tested pull request, \
+         fixing failing CI builds; then a product release into launch emails and \
+         social posts. Explain that you will work out the steps and agents and \
+         propose an implementation to review and run. Ask focused questions only \
+         where needed; do not require a full workflow checklist up front.\n\n\
          {live}{selected}{text}",
         live = live.map(ToString::to_string).unwrap_or_default(),
     )
