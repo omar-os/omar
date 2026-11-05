@@ -35,6 +35,10 @@ impl Default for FakeRuntime {
     }
 }
 impl Runtime for FakeRuntime {
+    async fn converse(&self, sender: &str, text: &str) -> Result<String> {
+        Ok(format!("Answer to {sender}: {text}"))
+    }
+
     async fn start(&self, _: &Value) -> Result<Run> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         if self.mode == "uncertain" {
@@ -760,4 +764,28 @@ async fn real_registry() {
         .filter_map(|(_, r)| r.run_id.as_ref())
         .collect();
     assert_eq!(ids.len(), c.workflows.len());
+}
+
+#[tokio::test]
+async fn discord_plain_text_uses_assistant_with_authorization_and_dedup() {
+    let mut config = fixture();
+    config.platform = "discord".into();
+    let g = Gateway::new(config, FakeRuntime::default(), FakeMessenger::default());
+    let mut m = incoming();
+    m.platform = "discord".into();
+    m.destination.platform = "discord".into();
+    m.command = "Help me plan some research".into();
+    let mut unauthorized = m.clone();
+    unauthorized.sender_id = "outsider".into();
+    g.handle(unauthorized).await;
+    assert!(g.messenger.replies.lock().unwrap().is_empty());
+    g.handle(m.clone()).await;
+    g.handle(m).await;
+    assert_eq!(g.runtime.starts.load(Ordering::SeqCst), 0);
+    let replies = g.messenger.replies.lock().unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(
+        replies[0].1.text,
+        "Answer to user: Help me plan some research"
+    );
 }

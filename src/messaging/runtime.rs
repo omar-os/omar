@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
@@ -20,6 +20,13 @@ pub struct RuntimeError {
 }
 
 pub trait Runtime: Send + Sync {
+    fn converse(
+        &self,
+        _sender: &str,
+        _text: &str,
+    ) -> impl std::future::Future<Output = Result<String>> + Send {
+        async { bail!("Conversation is unavailable") }
+    }
     fn start(&self, request: &Value) -> impl std::future::Future<Output = Result<Run>> + Send;
     fn wait(&self, run: Run, timeout: u64)
         -> impl std::future::Future<Output = Result<Run>> + Send;
@@ -36,12 +43,16 @@ pub fn client() -> Result<reqwest::Client> {
 pub struct OmarRuntime {
     pub base: String,
     client: reqwest::Client,
+    conversations: tokio::sync::Mutex<BTreeMap<String, String>>,
+    session: String,
 }
 impl OmarRuntime {
     pub fn new(base: String) -> Result<Self> {
         Ok(Self {
             base,
             client: client()?,
+            conversations: tokio::sync::Mutex::new(BTreeMap::new()),
+            session: uuid::Uuid::new_v4().to_string(),
         })
     }
     pub async fn call(&self, path: &str, body: Option<&Value>) -> Result<Value> {
@@ -75,6 +86,46 @@ impl OmarRuntime {
     }
 }
 impl Runtime for OmarRuntime {
+    async fn converse(&self, sender: &str, text: &str) -> Result<String> {
+        // Separate users and connector lifetimes; the runtime retains its archive,
+        // but a newly opened connector never resumes yesterday's assistant.
+        let base =
+            {
+                let mut conversations = self.conversations.lock().await;
+                if let Some(base) = conversations.get(sender) {
+                    base.clone()
+                } else {
+                    let root = self.base.split("/chats/").next().unwrap_or(&self.base);
+                    let root = OmarRuntime::new(root.to_owned())?;
+                    let chat = root.call("/v1/chats/messaging", Some(&serde_json::json!({
+                    "platform":"discord", "accountId":format!("{}-{}", self.session, sender)
+                }))).await?;
+                    let id = chat["id"].as_str().context("Missing conversation ID")?;
+                    uuid::Uuid::parse_str(id)?;
+                    let base = format!("{}/chats/{id}", root.base);
+                    conversations.insert(sender.to_owned(), base.clone());
+                    base
+                }
+            };
+        let chat = OmarRuntime::new(base)?;
+        // Do not retry a POST: a lost response can follow successful delivery.
+        let accepted = chat
+            .call("/v1/chat", Some(&serde_json::json!({"text":text})))
+            .await?;
+        let sequence = accepted["sequence"]
+            .as_u64()
+            .context("Missing message sequence")?;
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let history = chat.call("/v1/chat", None).await?;
+            if let Some(reply) = conversation_reply(&history, sequence) {
+                return Ok(reply);
+            }
+            anyhow::ensure!(Instant::now() < deadline, "Assistant reply timed out");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     async fn start(&self, request: &Value) -> Result<Run> {
         let run: Run = serde_json::from_value(self.call("/v1/runs", Some(request)).await?)?;
         anyhow::ensure!(!run.run_id.is_empty(), "Missing run ID");
@@ -136,4 +187,113 @@ pub(super) async fn bind_chat(config: &mut super::config::Config) -> Result<()> 
     config.auto_chat = false;
     eprintln!("Using dedicated {} chat {id} at {base}.", config.platform);
     Ok(())
+}
+
+// Ignore old replies and interim commentary, including after an HTTP reconnect.
+fn conversation_reply(history: &Value, after: u64) -> Option<String> {
+    let reply = history["messages"].as_array()?.iter().find(|m| {
+        m["sequence"].as_u64().is_some_and(|s| s > after)
+            && m["role"] == "assistant"
+            && m["progress"] == false
+    })?;
+    let mut text = reply["text"].as_str()?.to_owned();
+    if reply.get("design").is_some_and(|d| !d.is_null()) {
+        text.push_str("\nWorkflow proposal saved in OMAR. Review and approve it in Mission Control; it has not been run.");
+    }
+    Some(text)
+}
+
+#[cfg(test)]
+mod conversation_tests {
+    use super::*;
+    #[test]
+    fn only_returns_new_final_assistant_replies_and_labels_proposals() {
+        let mut history = serde_json::json!({"messages":[
+            {"sequence":1,"role":"assistant","text":"old","progress":false},
+            {"sequence":3,"role":"operator","text":"question","progress":false},
+            {"sequence":4,"role":"assistant","text":"working","progress":true}
+        ]});
+        assert_eq!(conversation_reply(&history, 2), None);
+        history["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "sequence":5,"role":"assistant","text":"answer","progress":false,"design":{}
+            }));
+        assert!(conversation_reply(&history, 2)
+            .unwrap()
+            .starts_with("answer\nWorkflow proposal"));
+        assert_eq!(conversation_reply(&history, 5), None);
+    }
+}
+
+#[cfg(test)]
+mod conversation_http_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    #[tokio::test]
+    async fn conversation_context_is_reused_only_for_the_same_user_and_connector() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let root = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut creations = Vec::new();
+            let mut routes = Vec::new();
+            for _ in 0..11 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut raw = Vec::new();
+                while !raw.ends_with(b"\r\n\r\n") {
+                    let mut b = [0];
+                    stream.read_exact(&mut b).unwrap();
+                    raw.push(b[0]);
+                }
+                let headers = String::from_utf8(raw).unwrap();
+                let route = headers.lines().next().unwrap().to_owned();
+                let len = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; len];
+                stream.read_exact(&mut body).unwrap();
+                let value = if route.starts_with("POST /v1/chats/messaging ") {
+                    creations.push(
+                        serde_json::from_slice::<Value>(&body).unwrap()["accountId"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                    );
+                    serde_json::json!({"id":uuid::Uuid::new_v4().to_string()})
+                } else if route.starts_with("POST ") {
+                    routes.push(route);
+                    serde_json::json!({"sequence":10})
+                } else {
+                    serde_json::json!({"messages":[{"sequence":11,"role":"assistant","progress":false,"text":"hello"}]})
+                };
+                let body = value.to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+            assert_eq!(creations.len(), 3);
+            assert_ne!(creations[0], creations[1]);
+            assert_ne!(creations[0], creations[2]);
+            assert_eq!(routes[0], routes[1]);
+            assert_ne!(routes[0], routes[2]);
+            assert_ne!(routes[0], routes[3]);
+        });
+        let runtime = OmarRuntime::new(root.clone()).unwrap();
+        assert_eq!(runtime.converse("111", "hello").await.unwrap(), "hello");
+        runtime.converse("111", "follow up").await.unwrap();
+        runtime.converse("222", "different user").await.unwrap();
+        OmarRuntime::new(root)
+            .unwrap()
+            .converse("111", "fresh session")
+            .await
+            .unwrap();
+        server.join().unwrap();
+    }
 }

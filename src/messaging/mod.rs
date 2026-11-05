@@ -117,6 +117,11 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
         {
             return;
         }
+        let conversational = c.platform == "discord"
+            && !message.command.is_empty()
+            && message.command != "list"
+            && message.command != "run"
+            && !message.command.starts_with("run ");
         let selected = message
             .command
             .strip_prefix("run ")
@@ -136,7 +141,7 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
             state.seen.insert(key, now + self.dedup_ttl);
             if message.command == "list" {
                 Some(c.listing())
-            } else if selected.is_none() {
+            } else if selected.is_none() && !conversational {
                 let usage = self.messenger.usage(if c.workflows.is_empty() {
                     &c.command
                 } else {
@@ -163,6 +168,14 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
             return;
         }
         let _busy = Busy(&self.state);
+        if conversational {
+            let text = match self.runtime.converse(&message.sender_id, &message.command).await {
+                Ok(text) => text,
+                Err(_) => "Could not retrieve the assistant's answer. Check OMAR before sending again; your message was not automatically retried.".into(),
+            };
+            self.reply(d, text, None).await;
+            return;
+        }
         let selected = selected.expect("run admitted only for a registered workflow");
         let record = match self.runtime.start(selected.request).await {
             Ok(record) => record,
