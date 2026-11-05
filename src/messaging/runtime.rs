@@ -30,7 +30,21 @@ pub struct ApprovedWorkflow {
     pub timeout_seconds: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct Proposal {
+    pub conversation_id: String,
+    pub sequence: u64,
+    pub summary: String,
+    pub design: crate::serve::ProposedDesign,
+}
+
 pub trait Runtime: Send + Sync {
+    fn proposal(
+        &self,
+        _sender: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Proposal>>> + Send {
+        async { Ok(None) }
+    }
     fn approved(&self) -> impl std::future::Future<Output = Result<Vec<ApprovedWorkflow>>> + Send {
         async { Ok(Vec::new()) }
     }
@@ -100,6 +114,45 @@ impl OmarRuntime {
     }
 }
 impl Runtime for OmarRuntime {
+    async fn proposal(&self, sender: &str) -> Result<Option<Proposal>> {
+        let base = self.conversations.lock().await.get(sender).cloned();
+        let Some(base) = base else {
+            return Ok(None);
+        };
+        let chat = OmarRuntime::new(base)?;
+        let history = chat.call("/v1/chat", None).await?;
+        let messages = history["messages"]
+            .as_array()
+            .context("Invalid chat history")?;
+        let after = messages
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "operator")
+            .and_then(|m| m["sequence"].as_u64())
+            .unwrap_or(0);
+        let Some(message) = messages.iter().find(|m| {
+            m["sequence"].as_u64().is_some_and(|s| s > after)
+                && m["role"] == "assistant"
+                && m["progress"] == false
+        }) else {
+            return Ok(None);
+        };
+        if message["design"].is_null() {
+            return Ok(None);
+        }
+        let conversation_id = history["id"]
+            .as_str()
+            .context("Missing chat ID")?
+            .to_owned();
+        uuid::Uuid::parse_str(&conversation_id)?;
+        Ok(Some(Proposal {
+            conversation_id,
+            sequence: message["sequence"].as_u64().context("Missing sequence")?,
+            summary: message["text"].as_str().unwrap_or("").to_owned(),
+            design: serde_json::from_value(message["design"].clone())?,
+        }))
+    }
+
     async fn approved(&self) -> Result<Vec<ApprovedWorkflow>> {
         let root = self.base.split("/chats/").next().unwrap_or(&self.base);
         let runtime = OmarRuntime::new(root.to_owned())?;
@@ -166,7 +219,17 @@ impl Runtime for OmarRuntime {
             }
             None => OmarRuntime::new(self.base.clone())?,
         };
-        let mut run: Run = serde_json::from_value(target.call("/v1/runs", Some(request)).await?)?;
+        let response = if let Some(sequence) = request.get("proposal_sequence") {
+            target
+                .call(
+                    "/v1/chat/approve",
+                    Some(&serde_json::json!({"sequence":sequence})),
+                )
+                .await?
+        } else {
+            target.call("/v1/runs", Some(request)).await?
+        };
+        let mut run: Run = serde_json::from_value(response)?;
         run.conversation_id = conversation.map(str::to_owned);
         anyhow::ensure!(!run.run_id.is_empty(), "Missing run ID");
         Ok(run)
@@ -248,7 +311,7 @@ fn conversation_reply(history: &Value, after: u64) -> Option<String> {
     })?;
     let mut text = reply["text"].as_str()?.to_owned();
     if reply.get("design").is_some_and(|d| !d.is_null()) {
-        text.push_str("\nWorkflow proposal saved in OMAR. Review and approve it in Mission Control; it has not been run.");
+        text.push_str("\nWorkflow proposal saved; it has not been run.");
     }
     Some(text)
 }

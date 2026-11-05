@@ -1,6 +1,6 @@
 //! Durable Mission Control conversations, scoped to one executive assistant.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,6 +24,11 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[ts(skip)]
     pub approved_workflows: BTreeMap<String, serde_json::Value>,
+    /// Consumed before execution: a lost approval response must not start a
+    /// second run, including after a runtime restart.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[ts(skip)]
+    pub consumed_proposals: BTreeSet<u64>,
     #[serde(default)]
     pub ea_id: Option<crate::ea::EaId>,
     pub created_at: u64,
@@ -66,6 +71,7 @@ impl Conversation {
             title: "New chat".into(),
             messaging_key: None,
             approved_workflows: BTreeMap::new(),
+            consumed_proposals: BTreeSet::new(),
             ea_id: None,
             created_at: now(),
             updated_at: now(),
@@ -225,6 +231,22 @@ impl History {
         next.save()?;
         *self = next;
         Ok(id)
+    }
+
+    pub fn consume_proposal(&mut self, id: &str, sequence: u64) -> Result<()> {
+        let mut next = self.clone();
+        let chat = next
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == id)
+            .context("unknown chat")?;
+        anyhow::ensure!(
+            chat.consumed_proposals.insert(sequence),
+            "This proposal has already been submitted"
+        );
+        next.save()?;
+        *self = next;
+        Ok(())
     }
 
     pub fn approve_workflow(

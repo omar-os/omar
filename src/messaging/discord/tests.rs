@@ -260,6 +260,7 @@ async fn gateway_heartbeats_during_work_and_resumes_without_duplicate_execution(
         token: "fixture-token".into(),
         bot: "999".into(),
         channels: channels(),
+        callback_base: "https://discord.com/api/v10".into(),
     };
     let mut session = Session::default();
     let mut tasks = JoinSet::new();
@@ -371,6 +372,7 @@ async fn missing_heartbeat_ack_and_authentication_close_end_the_session() {
         token: "fixture-token".into(),
         bot: "999".into(),
         channels: channels(),
+        callback_base: "https://discord.com/api/v10".into(),
     };
     let mut session = Session::default();
     let mut tasks = JoinSet::new();
@@ -424,4 +426,118 @@ async fn discord_rate_limit_waits_before_retry_and_never_leaks_the_body() {
     assert!(started.elapsed() >= Duration::from_millis(100));
     assert!(!format!("{error:#}").contains("private-response"));
     server.await.unwrap();
+}
+
+#[test]
+fn buttons_only_normalize_verified_dm_actions_and_never_accept_client_programs() {
+    let token = uuid::Uuid::new_v4().to_string();
+    let e = json!({"id":"1001","application_id":"999","type":3,"channel_id":"456","user":{"id":"123"},
+        "message":{"id":"1000","author":{"id":"999"}},"data":{"component_type":2,"custom_id":format!("omar:approve:{token}")}});
+    let m = normalize_interaction(&e, "999", &channels()).unwrap();
+    assert_eq!(m.command, format!("approve {token}"));
+    for (field, value) in [
+        ("guild_id", json!("1")),
+        ("application_id", json!("111")),
+        ("channel_id", json!("777")),
+        ("type", json!(2)),
+        ("user", json!({"id":"111"})),
+    ] {
+        let mut bad = e.clone();
+        bad[field] = value;
+        assert!(normalize_interaction(&bad, "999", &channels()).is_none());
+    }
+    let mut bad = e.clone();
+    bad["data"]["custom_id"] = json!("omar:approve:../../program");
+    assert!(normalize_interaction(&bad, "999", &channels()).is_none());
+}
+#[test]
+fn review_upload_preserves_source_schema_and_json_without_header_injection() {
+    let proposal = crate::messaging::tests::review_fixture();
+    let summary = super::super::proposal::summary(&proposal).unwrap();
+    assert!(summary.contains("Graph:"));
+    assert!(summary.contains("No formal properties"));
+    let files = vec![
+        ("workflow.omar".into(), proposal.design.program.clone()),
+        (
+            "schema-0.json".into(),
+            proposal.design.files.values().next().unwrap().clone(),
+        ),
+    ];
+    let payload = json!({"attachments":[{"id":0,"filename":"workflow.omar"},{"id":1,"filename":"schema-0.json"}]});
+    let (boundary, bytes) = multipart(&payload, &files);
+    let body = String::from_utf8(bytes).unwrap();
+    assert!(body.contains(&proposal.design.program));
+    assert!(body.contains("files[1]"));
+    assert!(body.ends_with(&format!("--{boundary}--\r\n")));
+}
+
+#[tokio::test]
+async fn interaction_ack_is_deferred_before_work_and_never_uses_the_bot_token() {
+    let (api, server) = fixture_http("200 OK", json!({})).await;
+    acknowledge_interaction(&api.base, &json!({"id":"123","token":"temporary-token"}))
+        .await
+        .unwrap();
+    let wire = server.await.unwrap();
+    assert!(wire.starts_with("POST /interactions/123/temporary-token/callback "));
+    assert!(!wire.to_lowercase().contains("authorization:"));
+    let body: Value = serde_json::from_str(wire.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["type"], 6);
+}
+
+#[tokio::test]
+async fn discord_review_sends_graph_and_source_before_enabling_version_bound_buttons() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut wires = Vec::new();
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+                if let Some(pos) = data.windows(4).position(|p| p == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&data[..pos]);
+                    let len = header
+                        .lines()
+                        .find_map(|l| {
+                            l.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= pos + 4 + len {
+                        break;
+                    }
+                }
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+            wires.push(String::from_utf8(data).unwrap());
+        }
+        wires
+    });
+    let mut api = DiscordApi::new("fixture-token".into()).unwrap();
+    api.base = format!("http://{address}");
+    let proposal = crate::messaging::tests::review_fixture();
+    let token = uuid::Uuid::new_v4().to_string();
+    let destination = normalize(&event("create"), "999", &channels())
+        .unwrap()
+        .destination;
+    api.review(&destination, &proposal, &token).await.unwrap();
+    let wires = server.await.unwrap();
+    assert!(wires[0].contains("Graph:"));
+    assert!(!wires[0].contains("custom_id"));
+    assert!(wires[1].contains("multipart/form-data"));
+    assert!(wires[1].contains(&proposal.design.program));
+    assert!(wires[1].contains("schema-0.json"));
+    let buttons: Value = serde_json::from_str(wires[2].split_once("\r\n\r\n").unwrap().1).unwrap();
+    let components = buttons["components"][0]["components"].as_array().unwrap();
+    assert_eq!(components.len(), 3);
+    assert_eq!(components[0]["custom_id"], format!("omar:approve:{token}"));
+    assert_eq!(buttons["allowed_mentions"]["parse"], json!([]));
 }

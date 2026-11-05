@@ -860,3 +860,132 @@ async fn web_approval_becomes_listable_and_runnable_without_restarting_the_gatew
         .text
         .contains("first.result: first output"));
 }
+
+pub(super) fn review_fixture() -> runtime::Proposal {
+    runtime::Proposal {
+        conversation_id:uuid::Uuid::new_v4().to_string(),sequence:2,summary:"Review this workflow".into(),
+        design:crate::serve::ProposedDesign {
+            program:"main Review {}".into(),files:std::collections::BTreeMap::from([("schemas/decision.json".into(),r#"{"type":"string","enum":["yes","no"]}"#.into())]),
+            inputs:Default::default(),lemmas:String::new(),properties:vec![],
+            preview:serde_json::from_value(json!({"protocol_version":1,"team":"Review","sequence":0,"status":"ready","current_tag":null,"lag":null,"instances":[],"agents":[],"ports":[],"reactions":[],"edges":[]})).unwrap(),
+        },
+    }
+}
+struct ReviewRuntime {
+    starts: Mutex<Vec<Value>>,
+}
+impl Runtime for ReviewRuntime {
+    async fn converse(&self, _: &str, _: &str) -> Result<String> {
+        Ok("draft".into())
+    }
+    async fn proposal(&self, _: &str) -> Result<Option<runtime::Proposal>> {
+        Ok(Some(review_fixture()))
+    }
+    async fn start(&self, request: &Value) -> Result<Run> {
+        self.starts.lock().unwrap().push(request.clone());
+        Ok(Run {
+            run_id: "review-run".into(),
+            status: "completed".into(),
+            outputs: std::collections::BTreeMap::from([(
+                "verify.report".into(),
+                json!("Final report"),
+            )]),
+            conversation_id: None,
+        })
+    }
+    async fn wait(&self, run: Run, _: u64) -> Result<Run> {
+        Ok(run)
+    }
+}
+fn review_gateway() -> Gateway<ReviewRuntime, FakeMessenger> {
+    let mut c = fixture();
+    c.platform = "discord".into();
+    c.allowed_users.push("other".into());
+    Gateway::new(
+        c,
+        ReviewRuntime {
+            starts: Mutex::new(vec![]),
+        },
+        FakeMessenger::default(),
+    )
+}
+fn review_message(text: &str, event: &str) -> Incoming {
+    let mut m = incoming();
+    m.platform = "discord".into();
+    m.destination.platform = "discord".into();
+    m.command = text.into();
+    m.event_id = event.into();
+    m
+}
+#[tokio::test]
+async fn discord_approval_is_explicit_user_scoped_once_only_and_returns_the_report() {
+    let g = review_gateway();
+    g.handle(review_message("Create a workflow", "create"))
+        .await;
+    assert!(g.runtime.starts.lock().unwrap().is_empty());
+    let token = g
+        .state
+        .lock()
+        .unwrap()
+        .pending
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let mut outsider = review_message(&format!("approve {token}"), "other");
+    outsider.sender_id = "other".into();
+    g.handle(outsider).await;
+    assert!(g.runtime.starts.lock().unwrap().is_empty());
+    assert!(g.state.lock().unwrap().pending.contains_key(&token));
+    g.handle(review_message(&format!("approve {token}"), "approve-1"))
+        .await;
+    g.handle(review_message(&format!("approve {token}"), "approve-2"))
+        .await;
+    let starts = g.runtime.starts.lock().unwrap();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["proposal_sequence"], 2);
+    assert!(starts[0].get("program").is_none());
+    assert!(g
+        .messenger
+        .replies
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, r)| r.text.contains("verify.report: Final report")));
+}
+#[tokio::test]
+async fn discord_cancel_revision_expiry_and_new_messages_never_execute_old_proposals() {
+    for action in ["cancel", "revise", "expired", "new-message"] {
+        let g = review_gateway();
+        g.handle(review_message("Create a workflow", "create"))
+            .await;
+        let token = g
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        match action {
+            "expired" => {
+                g.state
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .get_mut(&token)
+                    .unwrap()
+                    .expires = Instant::now()
+            }
+            "new-message" => g.handle(review_message("Change the input", "new")).await,
+            action => {
+                g.handle(review_message(&format!("{action} {token}"), "action"))
+                    .await
+            }
+        }
+        g.handle(review_message(&format!("approve {token}"), "old-button"))
+            .await;
+        assert!(g.runtime.starts.lock().unwrap().is_empty(), "{action}");
+    }
+}

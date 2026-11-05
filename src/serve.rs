@@ -1749,6 +1749,14 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             let history = context.history.lock().expect("history poisoned");
             (200, json!(history.conversation(&context.conversation_id)))
         }
+        ("POST", "/v1/chat/approve") => {
+            let presence = workspaces.presence.lock().expect("presence poisoned");
+            if let Some(refusal) = presence.refusal() {
+                (503, json!({"error":refusal}))
+            } else {
+                approve_chat_proposal(&context, &read_body(content_length)?)
+            }
+        }
         ("POST", "/v1/chat") => {
             if content_length > MAX_BODY_BYTES {
                 (413, json!({"error": "message too large"}))
@@ -3140,6 +3148,62 @@ fn write_chat_event(stream: &mut TcpStream, message: &ChatMessage) -> Result<()>
     Ok(())
 }
 
+/// Approve the exact saved version, never source supplied by a button/client.
+fn approve_chat_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Approval {
+        sequence: u64,
+    }
+    let approval: Approval = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return (400, json!({"error":"Expected proposal sequence"})),
+    };
+    let _admission = match context.admit() {
+        Ok(lease) => lease,
+        Err(error) => return (410, json!({"error":error.to_string()})),
+    };
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
+    if context.chat.lock().expect("chat poisoned").busy {
+        return (
+            409,
+            json!({"error":"The assistant is still replying; wait for the updated proposal"}),
+        );
+    }
+    let design = {
+        let mut history = context.history.lock().expect("history poisoned");
+        let chat = history.conversation(&context.conversation_id);
+        let Some(message) = chat
+            .messages
+            .iter()
+            .find(|m| m.sequence == approval.sequence && m.design.is_some())
+        else {
+            return (409, json!({"error":"Proposal is unavailable"}));
+        };
+        if chat.messages.iter().any(|m| {
+            m.sequence > approval.sequence && (m.role == ChatRole::Operator || m.design.is_some())
+        }) {
+            return (
+                409,
+                json!({"error":"Proposal has changed; review the latest version"}),
+            );
+        }
+        let design = message.design.clone().unwrap();
+        if let Err(error) = history.consume_proposal(&context.conversation_id, approval.sequence) {
+            return (409, json!({"error":error.to_string()}));
+        }
+        design
+    };
+    let body = json!({"program":design.program,"files":design.files,"inputs":design.inputs,"conversation_id":context.conversation_id});
+    start_run_locked(
+        context,
+        &serde_json::to_vec(&body).expect("serializable proposal"),
+    )
+}
+
 fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     let _admission = match context.admit() {
         Ok(admission) => admission,
@@ -3149,6 +3213,11 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         .chat_operation
         .lock()
         .expect("chat operation poisoned");
+    start_run_locked(context, body)
+}
+
+/// Caller holds chat_operation and an EA admission lease.
+fn start_run_locked(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     let request: StartRunRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
@@ -4922,6 +4991,93 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(runtime.approved().await.unwrap().len(), 1);
+        // Discord approval submits only a version number. Source, schemas and
+        // inputs are resolved by the runtime, and replay cannot execute again.
+        let response = request(
+            server.address(),
+            "POST",
+            "/v1/agent/proposals",
+            Some(&proposal.to_string()),
+        );
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        let sequence = server
+            .context
+            .history
+            .lock()
+            .unwrap()
+            .conversation(&server.context.conversation_id)
+            .messages
+            .last()
+            .unwrap()
+            .sequence;
+        let approval =
+            json!({"conversation_id":server.context.conversation_id,"proposal_sequence":sequence});
+        let run = connector.start(&approval).await.unwrap();
+        assert_eq!(
+            connector.wait(run, 30).await.unwrap().outputs["run.result"],
+            "approved"
+        );
+        assert_eq!(
+            connector
+                .start(&approval)
+                .await
+                .unwrap_err()
+                .downcast_ref::<crate::messaging::runtime::RuntimeError>()
+                .unwrap()
+                .status,
+            409
+        );
+        let persisted = History::load_session(&server.context.omar_dir).unwrap();
+        assert!(persisted
+            .conversation(&server.context.conversation_id)
+            .consumed_proposals
+            .contains(&sequence));
+        let response = request(
+            server.address(),
+            "POST",
+            "/v1/agent/proposals",
+            Some(&proposal.to_string()),
+        );
+        assert!(response.starts_with("HTTP/1.1 202"));
+        let sequence = server
+            .context
+            .history
+            .lock()
+            .unwrap()
+            .conversation(&server.context.conversation_id)
+            .messages
+            .last()
+            .unwrap()
+            .sequence;
+        server
+            .context
+            .history
+            .lock()
+            .unwrap()
+            .append_to(
+                &server.context.conversation_id,
+                ChatMessage {
+                    sequence: 0,
+                    role: ChatRole::Operator,
+                    text: "change the workflow".into(),
+                    progress: false,
+                    design: None,
+                    selection: vec![],
+                },
+            )
+            .unwrap();
+        let stale =
+            json!({"conversation_id":server.context.conversation_id,"proposal_sequence":sequence});
+        assert_eq!(
+            connector
+                .start(&stale)
+                .await
+                .unwrap_err()
+                .downcast_ref::<crate::messaging::runtime::RuntimeError>()
+                .unwrap()
+                .status,
+            409
+        );
     }
 
     #[test]

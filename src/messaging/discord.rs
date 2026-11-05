@@ -56,6 +56,94 @@ pub(super) fn normalize(
     })
 }
 
+fn normalize_interaction(
+    event: &Value,
+    bot: &str,
+    channels: &HashMap<String, String>,
+) -> Option<Incoming> {
+    if event.get("guild_id").is_some()
+        || event["type"] != 3
+        || event["data"]["component_type"] != 2
+        || event["application_id"] != bot
+        || event["user"]["bot"] == true
+        || event["message"]["author"]["id"] != bot
+    {
+        return None;
+    }
+    let sender = id(&event["user"]["id"])?;
+    let channel = id(&event["channel_id"])?;
+    if channels.get(sender).map(String::as_str) != Some(channel) {
+        return None;
+    }
+    let custom = event["data"]["custom_id"].as_str()?;
+    let mut parts = custom.split(':');
+    if parts.next()? != "omar" {
+        return None;
+    }
+    let verb = parts.next()?;
+    let token = parts.next()?;
+    if !matches!(verb, "approve" | "revise" | "cancel")
+        || parts.next().is_some()
+        || uuid::Uuid::parse_str(token).ok()?.to_string() != token
+    {
+        return None;
+    }
+    Some(Incoming {
+        platform: "discord".into(),
+        account_id: bot.into(),
+        sender_id: sender.into(),
+        event_id: id(&event["id"])?.into(),
+        command: format!("{verb} {token}"),
+        destination: Destination {
+            platform: "discord".into(),
+            account_id: bot.into(),
+            conversation_id: channel.into(),
+            thread_id: Some(id(&event["message"]["id"])?.into()),
+        },
+    })
+}
+
+async fn acknowledge_interaction(base: &str, event: &Value) -> Result<()> {
+    let interaction = id(&event["id"]).context("Invalid interaction ID")?;
+    let token = event["token"]
+        .as_str()
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 512
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        })
+        .context("Invalid interaction token")?;
+    // Acknowledge immediately, before compilation/model work. Never log the
+    // callback URL: it contains a short-lived interaction credential.
+    let response = client()?
+        .post(format!(
+            "{base}/interactions/{interaction}/{token}/callback"
+        ))
+        .json(&json!({"type":6}))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("Discord interaction acknowledgement failed"))?;
+    ensure!(
+        response.status().is_success(),
+        "Discord interaction acknowledgement rejected"
+    );
+    Ok(())
+}
+
+// Text files are UTF-8, with generated header-safe attachment names. No new
+// HTTP/multipart dependency is needed for this small fixed upload format.
+fn multipart(payload: &Value, files: &[(String, String)]) -> (String, Vec<u8>) {
+    let boundary = format!("omar-{}", uuid::Uuid::new_v4());
+    let mut body=format!("--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n{}\r\n",payload);
+    for (i, (name, text)) in files.iter().enumerate() {
+        body.push_str(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"files[{i}]\"; filename=\"{name}\"\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{text}\r\n"));
+    }
+    body.push_str(&format!("--{boundary}--\r\n"));
+    (boundary, body.into_bytes())
+}
+
 fn message_parts(text: &str) -> Vec<String> {
     // Count UTF-16 units conservatively, including emoji, against Discord's limit.
     let mut parts = Vec::new();
@@ -97,15 +185,19 @@ impl DiscordApi {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value> {
-        timeout(Duration::from_secs(45), self.request(method, path, body))
-            .await
-            .map_err(|_| anyhow::anyhow!("Discord API timed out"))?
+        timeout(
+            Duration::from_secs(45),
+            self.request(method, path, body, &[]),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Discord API timed out"))?
     }
     async fn request(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<Value>,
+        files: &[(String, String)],
     ) -> Result<Value> {
         let mut next = self.next_request.lock().await;
         for _ in 0..3 {
@@ -120,7 +212,17 @@ impl DiscordApi {
                 )
                 .timeout(Duration::from_secs(15));
             if let Some(body) = &body {
-                request = request.json(body);
+                if files.is_empty() {
+                    request = request.json(body);
+                } else {
+                    let (boundary, bytes) = multipart(body, files);
+                    request = request
+                        .header(
+                            "Content-Type",
+                            format!("multipart/form-data; boundary={boundary}"),
+                        )
+                        .body(bytes);
+                }
             }
             let mut response = request
                 .send()
@@ -181,6 +283,53 @@ impl DiscordApi {
     }
 }
 impl Messenger for DiscordApi {
+    async fn review(
+        &self,
+        destination: &Destination,
+        proposal: &super::runtime::Proposal,
+        token: &str,
+    ) -> Result<()> {
+        self.send(
+            destination,
+            Reply {
+                text: super::proposal::summary(proposal)?,
+                run_id: None,
+            },
+        )
+        .await?;
+        let mut files = vec![("workflow.omar".to_owned(), proposal.design.program.clone())];
+        let mut names = vec!["workflow.omar = program.omar".to_owned()];
+        for (i, (path, text)) in proposal.design.files.iter().enumerate() {
+            let name = format!("schema-{i}.json");
+            names.push(format!("{name} = {path}"));
+            files.push((name, text.clone()));
+        }
+        for (batch, mapping) in files.chunks(8).zip(names.chunks(8)) {
+            let payload = json!({"content":format!("Review files:\n{}",mapping.join("\n")),"allowed_mentions":{"parse":[]},"flags":4,
+                "attachments":batch.iter().enumerate().map(|(i,(name,_))|json!({"id":i,"filename":name})).collect::<Vec<_>>()});
+            timeout(
+                Duration::from_secs(45),
+                self.request(
+                    reqwest::Method::POST,
+                    &format!("/channels/{}/messages", destination.conversation_id),
+                    Some(payload),
+                    batch,
+                ),
+            )
+            .await??;
+        }
+        self.call(reqwest::Method::POST,&format!("/channels/{}/messages",destination.conversation_id),Some(json!({
+            "content":"Approve and run this exact version? Run starts its agents locally. Revise asks for changes; Cancel starts nothing. Buttons expire in 30 minutes or when you send a new message.",
+            "allowed_mentions":{"parse":[]},"flags":4,
+            "components":[{"type":1,"components":[
+                {"type":2,"style":3,"label":"Run workflow","custom_id":format!("omar:approve:{token}")},
+                {"type":2,"style":2,"label":"Revise","custom_id":format!("omar:revise:{token}")},
+                {"type":2,"style":4,"label":"Cancel","custom_id":format!("omar:cancel:{token}")}
+            ]}]
+        }))).await?;
+        Ok(())
+    }
+
     async fn send(&self, destination: &Destination, reply: Reply) -> Result<()> {
         ensure!(
             id(&json!(destination.conversation_id)).is_some(),
@@ -270,6 +419,7 @@ struct Identity {
     token: String,
     bot: String,
     channels: HashMap<String, String>,
+    callback_base: String,
 }
 
 async fn connection<R: super::runtime::Runtime + 'static, M: Messenger + 'static>(
@@ -353,6 +503,11 @@ where
                             Some(0) => match event["t"].as_str() {
                                 Some("READY") => { session.ready(&event["d"], &identity.bot)?; ready = true; eprintln!("Discord DMs connected."); }
                                 Some("RESUMED") => { ready = true; eprintln!("Discord DMs resumed."); }
+                                Some("INTERACTION_CREATE") => if let Some(message) = normalize_interaction(&event["d"], &identity.bot, &identity.channels) {
+                                    if tasks.len()<64 && acknowledge_interaction(&identity.callback_base,&event["d"]).await.is_ok() {
+                                        let gateway=gateway.clone(); tasks.spawn(async move { gateway.handle(message).await; });
+                                    }
+                                },
                                 Some("MESSAGE_CREATE") => if let Some(message) = normalize(&event["d"], &identity.bot, &identity.channels) {
                                     // Bound task creation; retained gateway state survives reconnects.
                                     if tasks.len() < 64 { let gateway = gateway.clone(); tasks.spawn(async move { gateway.handle(message).await; }); }
@@ -443,6 +598,7 @@ pub async fn run(mut config: Config) -> Result<()> {
         bot: config.account_id.clone(),
         token: api.token.clone(),
         channels,
+        callback_base: api.base.clone(),
     };
     let gateway = Arc::new(Gateway::new(config, runtime, api));
     let mut session = Session::default();

@@ -3,6 +3,7 @@ mod connect;
 mod credential_store;
 mod credentials;
 pub mod discord;
+mod proposal;
 pub mod runtime;
 pub mod slack;
 #[cfg(test)]
@@ -45,6 +46,26 @@ pub struct Reply {
     pub run_id: Option<String>,
 }
 pub trait Messenger: Send + Sync {
+    fn review(
+        &self,
+        destination: &Destination,
+        proposal: &runtime::Proposal,
+        token: &str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            self.send(
+                destination,
+                Reply {
+                    text: format!(
+                        "{}\nReply approve {token}, revise {token}, or cancel {token}.",
+                        proposal::summary(proposal)?
+                    ),
+                    run_id: None,
+                },
+            )
+            .await
+        }
+    }
     fn send(
         &self,
         destination: &Destination,
@@ -59,6 +80,7 @@ struct State {
     seen: HashMap<(String, String, String), Instant>,
     busy: bool,
     uncertain: bool,
+    pending: HashMap<String, proposal::Pending>,
 }
 pub struct Gateway<R, M> {
     pub config: Config,
@@ -126,7 +148,11 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
             let mut state = self.state.lock().unwrap();
             let now = Instant::now();
             state.seen.retain(|_, expires| *expires > now);
-            let key = (message.platform, message.account_id, message.event_id);
+            let key = (
+                message.platform.clone(),
+                message.account_id.clone(),
+                message.event_id.clone(),
+            );
             if state.seen.contains_key(&key) {
                 return;
             }
@@ -135,6 +161,10 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
                 return;
             }
             state.seen.insert(key, now + self.dedup_ttl);
+        }
+        if c.platform == "discord" && proposal::action(&message.command) {
+            self.review_action(&message).await;
+            return;
         }
         let configured = message
             .command
@@ -205,14 +235,24 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
         }
         let _busy = Busy(&self.state);
         if conversational {
-            let text = match self.runtime.converse(&message.sender_id, &message.command).await {
-                Ok(text) => text,
-                Err(_) => "Could not retrieve the assistant's answer. Check OMAR before sending again; your message was not automatically retried.".into(),
-            };
-            self.reply(d, text, None).await;
+            self.state.lock().unwrap().pending.retain(|_, p| {
+                !(p.sender == message.sender_id
+                    && p.destination.conversation_id == d.conversation_id)
+            });
+            match self.runtime.converse(&message.sender_id, &message.command).await {
+                Ok(text)=>match self.runtime.proposal(&message.sender_id).await {
+                    Ok(Some(proposal))=>self.present_proposal(&message,proposal).await,
+                    Ok(None)=>self.reply(d,text,None).await,
+                    Err(_)=>self.reply(d,"The assistant replied, but I could not retrieve its proposal safely. Nothing has run; ask again.".into(),None).await,
+                },
+                Err(_)=>self.reply(d,"Could not retrieve the assistant's answer. Check OMAR before sending again; your message was not automatically retried.".into(),None).await,
+            }
             return;
         }
         let selected = selected.expect("run admitted only for a registered workflow");
+        self.execute(d, selected).await;
+    }
+    async fn execute(&self, d: &Destination, selected: config::Selected<'_>) {
         let record = match self.runtime.start(selected.request).await {
             Ok(record) => record,
             Err(error) => {
@@ -222,7 +262,11 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
                 });
                 let run_id = error.and_then(|e| e.run_id.clone());
                 self.state.lock().unwrap().uncertain = !rejected;
-                let text = if error.is_some_and(|e| e.status == 409) {
+                let text = if selected.request.get("proposal_sequence").is_some()
+                    && error.is_some_and(|e| e.status == 409)
+                {
+                    "This proposal is stale, already handled, or its workflow is active. Wait for the current run or ask for a fresh proposal."
+                } else if error.is_some_and(|e| e.status == 409) {
                     "This workflow is already active or paused in OMAR. No new run started."
                 } else if rejected {
                     "OMAR rejected the request. Ask the operator to check the configuration."
