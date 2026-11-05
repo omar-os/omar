@@ -479,7 +479,7 @@ fn assistant_approvals(ea_id: EaId, prefix: &str, command: &str) -> crate::appro
         let session = crate::ea::ea_manager_session(ea_id, prefix);
         let backend = TmuxClient::new("")
             .session_backend(&session)
-            .or_else(|| crate::manager::command_backend_name(command).map(str::to_owned))
+            .or_else(|| crate::backend::command_name(command).map(str::to_owned))
             .unwrap_or_default();
         approvals.watch(
             crate::approvals::ApprovalTarget {
