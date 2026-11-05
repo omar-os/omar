@@ -292,7 +292,22 @@ async fn ensure_runtime() -> Result<()> {
     Ok(())
 }
 
-fn connector_lock(folder: &Path, platform: &str) -> Result<std::fs::File> {
+struct ConnectorLock(std::fs::File);
+impl Drop for ConnectorLock {
+    fn drop(&mut self) {
+        // A concurrently spawned child can briefly inherit this descriptor
+        // before exec closes it. Unlock explicitly when this connector ends.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+fn connector_lock(folder: &Path, platform: &str) -> Result<ConnectorLock> {
     credential_store::private_directory(folder, true)?;
     #[cfg(unix)]
     {
@@ -318,7 +333,7 @@ fn connector_lock(folder: &Path, platform: &str) -> Result<std::fs::File> {
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "A {platform} connect command is already running; use its terminal or stop it first"
         );
-        Ok(file)
+        Ok(ConnectorLock(file))
     }
     #[cfg(not(unix))]
     anyhow::bail!("Messaging connect currently requires Unix; use WSL on Windows")

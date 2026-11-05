@@ -182,3 +182,34 @@ fn runtime_selection_restarts_the_saved_port_owner_without_repurposing_others() 
     assert!(runtime_session(&[session("messaging", "http://127.0.0.1:9000", "stopped")]).is_err());
     assert!(runtime_session(&[old, session("second", RUNTIME_URL, "stopped")]).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn connector_exit_unlocks_even_when_a_child_inherits_the_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = connector_lock(dir.path(), "discord").unwrap();
+    let mut pipe = [0; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        // Only async-signal-safe operations after fork in a multithreaded test.
+        unsafe {
+            libc::close(pipe[1]);
+            let mut byte = 0u8;
+            libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    unsafe {
+        libc::close(pipe[0]);
+    }
+    drop(lock);
+    let replacement = connector_lock(dir.path(), "discord");
+    unsafe {
+        libc::write(pipe[1], [1u8].as_ptr().cast(), 1);
+        libc::close(pipe[1]);
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    }
+    assert!(replacement.is_ok());
+}
