@@ -138,6 +138,7 @@ jobs:
       - name: Verify legacy supervision through MCP and tmux
         run: |
           cargo build -p omar
+          python3 tests/ci/scoped_memory.py
           python3 tests/ci/independent_sessions.py
           python3 tests/ci/ea_deletion.py
           python3 tests/ci/team_workspaces.py

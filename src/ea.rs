@@ -312,6 +312,7 @@ pub fn unregister_ea(base_dir: &Path, ea_id: EaId) -> anyhow::Result<()> {
         anyhow::bail!("EA {} not found in registry", ea_id);
     }
     crate::supervision::remove_ea(base_dir, ea_id)?;
+    crate::knowledge::delete_ea(base_dir, ea_id)?;
     eas.retain(|e| e.id != ea_id);
     save_registry(base_dir, &eas)
 }
@@ -569,7 +570,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         register_ea(dir.path(), "Research", None).unwrap(); // id=1
         register_ea(dir.path(), "Extra", None).unwrap(); // id=2 — needed so 1 can be deleted
+        let memory = serde_json::from_value(serde_json::json!({
+            "action":"save","scope":"ea","key":"format","kind":"preference",
+            "text":"Use five sections","source":"operator request"
+        }))
+        .unwrap();
+        crate::knowledge::operator(dir.path(), 1, memory).unwrap();
+        assert!(!crate::knowledge::startup_context(dir.path(), 1).is_empty());
         unregister_ea(dir.path(), 1).unwrap();
+        assert!(crate::knowledge::startup_context(dir.path(), 1).is_empty());
         let eas = load_registry(dir.path());
         assert_eq!(eas.len(), 1);
         assert!(eas.iter().all(|e| e.id != 1));

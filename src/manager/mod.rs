@@ -497,7 +497,7 @@ pub fn build_ea_command(
     let combined_path = state_dir.join("ea_prompt_combined.md");
     std::fs::create_dir_all(&state_dir).ok();
 
-    let combined = match (mem.is_empty(), notes.is_empty()) {
+    let mut combined = match (mem.is_empty(), notes.is_empty()) {
         (true, true) => prompt_content,
         (false, true) => format!(
             "{}\n\n---\n\n## Current OMAR State (from previous session)\n\n{}",
@@ -512,6 +512,10 @@ pub fn build_ea_command(
             prompt_content, mem, notes
         ),
     };
+    if mcp_context.topology.is_none() && mcp_context.agent_name.as_deref().is_none_or(|a| a == "ea")
+    {
+        combined.push_str(&crate::knowledge::startup_context(omar_dir, ea_id));
+    }
     // For claude (file flag) we resolve `{{EA_ID}}` / `{{EA_NAME}}` on
     // disk. The other backends still go through `build_agent_command`,
     // which pipes the file through sed at launch time, so we leave the
@@ -1219,20 +1223,33 @@ pub(crate) mod tests {
         // 200 KB of notes — well past MAX_ARG_STRLEN.
         let huge_notes: String = "x".repeat(200 * 1024);
 
-        for backend in [
-            "claude",
-            "codex --dangerously-bypass-approvals-and-sandbox",
-            "opencode",
-            "agy --dangerously-skip-permissions",
-        ] {
+        for kind in crate::backend::ASSISTANT {
+            let backend = crate::backend::of(kind).default_command();
             let dir = tempfile::tempdir().unwrap();
             let omar_dir = dir.path();
             let state_dir = ea::ea_state_dir(7, omar_dir);
             std::fs::create_dir_all(&state_dir).unwrap();
             std::fs::write(memory::manager_notes_path(omar_dir, 7), &huge_notes).unwrap();
+            std::fs::write(state_dir.join("memory.md"), &huge_notes).unwrap();
+            for n in 0..20 {
+                let action = serde_json::from_value(serde_json::json!({
+                    "action":"save","scope":"ea","key":format!("format-{n}"),"kind":"preference",
+                    "text":"K".repeat(500),"source":"operator request"
+                }))
+                .unwrap();
+                crate::knowledge::operator(omar_dir, 7, action).unwrap();
+            }
 
             let (cmd, _ws) =
                 build_ea_command(backend, 7, "Big", omar_dir, &test_mcp_context(omar_dir));
+            let combined =
+                std::fs::read_to_string(state_dir.join("ea_prompt_combined.md")).unwrap();
+            assert!(combined.contains("## Saved knowledge"));
+            assert!(
+                combined.len() < 124 * 1024,
+                "combined prompt has {} bytes",
+                combined.len()
+            );
 
             // No single argv element (whitespace-separated token) may exceed
             // a safe ceiling — 96 KB leaves comfortable headroom under the
@@ -1245,6 +1262,38 @@ pub(crate) mod tests {
                      exec(3) E2BIG (MAX_ARG_STRLEN ≈ 128 KB): {}",
                     tok.len(),
                     &tok[..tok.len().min(120)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saved_knowledge_startup_is_backend_portable_and_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let action = serde_json::from_value(serde_json::json!({
+            "action":"save","scope":"ea","key":"format","kind":"preference",
+            "text":"PORTABLE_MEMORY_SENTINEL","source":"operator request"
+        }))
+        .unwrap();
+        crate::knowledge::operator(dir.path(), 7, action).unwrap();
+        for kind in crate::backend::ASSISTANT {
+            let backend = crate::backend::of(kind).default_command();
+            for ea in [7, 8] {
+                build_ea_command(
+                    backend,
+                    ea,
+                    "Test",
+                    dir.path(),
+                    &test_mcp_context(dir.path()),
+                );
+                let combined = std::fs::read_to_string(
+                    ea::ea_state_dir(ea, dir.path()).join("ea_prompt_combined.md"),
+                )
+                .unwrap();
+                assert_eq!(
+                    combined.contains("PORTABLE_MEMORY_SENTINEL"),
+                    ea == 7,
+                    "{backend}"
                 );
             }
         }
