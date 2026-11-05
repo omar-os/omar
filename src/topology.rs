@@ -29,7 +29,7 @@ pub struct Bytecode {
     pub instructions: Vec<Instruction>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Instruction {
     BeginPlan {
@@ -102,6 +102,9 @@ pub enum Instruction {
         period: u64,
         #[serde(default)]
         instance: String,
+        /// `shutdown`: fired once at the run's last tag, not by the clock.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        shutdown: bool,
     },
     ConnectPorts {
         source: String,
@@ -129,6 +132,55 @@ pub enum Instruction {
         within: Option<u64>,
     },
     CommitPlan,
+    /// Opens a mutation plan: what turns the running program into a new one.
+    /// Everything below up to `commit_plan` is the diff, removals first; the
+    /// rest of the program is left as it was.
+    BeginMutation {
+        team: String,
+    },
+    RemoveType {
+        name: String,
+    },
+    RemoveInstance {
+        name: String,
+    },
+    KillAgent {
+        name: String,
+    },
+    RemovePort {
+        name: String,
+    },
+    RemoveTimer {
+        name: String,
+    },
+    RemoveState {
+        name: String,
+    },
+    RemoveParam {
+        name: String,
+    },
+    DisconnectPorts {
+        source: String,
+        target: String,
+    },
+    RemoveReaction {
+        id: String,
+    },
+    /// A reaction kept under its id with anything else about it changed.
+    UpdateReaction {
+        id: String,
+        agent: String,
+        triggers: Vec<String>,
+        effects: Vec<String>,
+        contract: String,
+        prompt: String,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        instance: String,
+        #[serde(default)]
+        within: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -197,6 +249,9 @@ pub struct TimerState {
     pub period: u64,
     #[serde(default)]
     pub instance: String,
+    /// `shutdown`: fired once, at the run's last tag, and never by the clock.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shutdown: bool,
 }
 
 /// A state variable: typed as OMAR's types so its value can be recorded and
@@ -484,6 +539,39 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
 
     load_bytecode(&output_path)
         .with_context(|| format!("omarc failed to compile {}", source.display()))
+}
+
+/// The plan that turns the program at `old` into the one at `new`. The
+/// compiler computes it (`omarc --diff`), with the plan function its proofs
+/// are about; the runtime checks it before applying anything.
+pub fn compile_mutation(old: &Path, new: &Path) -> Result<Bytecode> {
+    let plan_path = new
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".plan.json");
+    let compiler = resolve_omarc();
+    let output = Command::new(&compiler)
+        .arg("--local-imports")
+        .arg("--diff")
+        .arg(old)
+        .arg(new)
+        .arg(&plan_path)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to invoke OMAR compiler '{}'; install omarc beside omar, \
+                 add it to PATH, or set OMARC_BIN",
+                compiler.display()
+            )
+        })?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&plan_path);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("omarc failed: {stderr}");
+    }
+    let plan = load_bytecode(&plan_path);
+    let _ = fs::remove_file(&plan_path);
+    plan
 }
 
 /// The identity in a claim, waiting for it to be written.
@@ -781,6 +869,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 offset,
                 period,
                 instance,
+                shutdown,
             } => {
                 require_identifier("timer", name)?;
                 check_instance(&state, "timer", name, instance)?;
@@ -789,7 +878,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 if state.ports.contains_key(name) {
                     bail!("timer '{name}' is also a port; a trigger has one name");
                 }
-                if *offset == 0 && *period == 0 {
+                if *offset == 0 && *period == 0 && !shutdown {
                     bail!("timer '{name}' never fires; give it an offset, a period, or both");
                 }
                 if state
@@ -800,6 +889,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                             offset: *offset,
                             period: *period,
                             instance: instance.clone(),
+                            shutdown: *shutdown,
                         },
                     )
                     .is_some()
@@ -907,6 +997,10 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 }
             }
             Instruction::CommitPlan => committed = true,
+            other => bail!(
+                "instruction {index} ({}) belongs to a mutation plan, not a program",
+                crate::mutation::op_name(other)
+            ),
         }
     }
     reject_causality_loops(&state)?;
@@ -2046,7 +2140,10 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
                 // State comes back beside the effects and is not one of them.
                 let effects: BTreeMap<_, _> = writes
                     .iter()
-                    .filter(|(name, _)| !self.state.state_vars.contains_key(*name))
+                    .filter(|(name, _)| {
+                        !self.state.state_vars.contains_key(*name)
+                            && name.as_str() != crate::reaction::STOP
+                    })
                     .map(|(name, value)| (name.clone(), value.clone()))
                     .collect();
                 validate_contract(&invocation.contract, &effects)?;
@@ -2192,6 +2289,9 @@ struct RunCheckpointer<'a> {
     workspaces: &'a BTreeMap<String, crate::workspace::Workspace>,
     program: Value,
     program_path: Option<String>,
+    /// The program's source, read once at the start so an edit to the file
+    /// after it was compiled does not reach the checkpoints.
+    source: Option<checkpoint::Source>,
     team: String,
     ea_id: u32,
     pace: Pace,
@@ -2286,6 +2386,18 @@ impl<'a> RunCheckpointer<'a> {
             .program_path
             .map(|path| path.to_string_lossy().into_owned())
             .or_else(|| resumed_from.and_then(|m| m.program_path.clone()));
+        let source = match config.program_path {
+            Some(path) if path.extension().is_some_and(|e| e == "omar") => {
+                Some(checkpoint::Source::read(path)?)
+            }
+            _ => match resumed_from {
+                Some(manifest) => store
+                    .source(&manifest.id)?
+                    .map(|path| checkpoint::Source::read(&path))
+                    .transpose()?,
+                None => None,
+            },
+        };
         Ok(Self {
             omar_dir,
             dir: dir.to_path_buf(),
@@ -2294,6 +2406,7 @@ impl<'a> RunCheckpointer<'a> {
             workspaces,
             program: serde_json::to_value(bytecode)?,
             program_path,
+            source,
             team: state.team.clone(),
             ea_id: config.ea_id,
             pace: config.pace,
@@ -2359,6 +2472,7 @@ impl Checkpointer for RunCheckpointer<'_> {
             Trigger::Automatic => "automatic",
             Trigger::Manual => "manual",
             Trigger::Pause => "pause",
+            Trigger::Mutation => "mutation",
         };
         let label = format!("Checkpoint {} ({kind})", schedule.sequence);
         // Each instance's files, as a version its own history keeps. The
@@ -2406,8 +2520,10 @@ impl Checkpointer for RunCheckpointer<'_> {
             elapsed_ns: state.elapsed_ns,
             workspaces: artifacts,
             agents: self.agents.clone(),
+            mutation: Vec::new(),
         };
-        self.store.publish(&manifest, state, &self.program)?;
+        self.store
+            .publish(&manifest, state, &self.program, self.source.as_ref())?;
         schedule.sequence += 1;
         schedule.parent = Some(id.clone());
         schedule.next_due = schedule
@@ -3461,7 +3577,7 @@ pub fn timeline(
         .map(|name| (name.clone(), Value::Null))
         .collect();
     let mut queue = BTreeMap::from([(Tag::START, seed)]);
-    for (name, timer) in &state.timers {
+    for (name, timer) in state.timers.iter().filter(|(_, timer)| !timer.shutdown) {
         queue
             .entry(Tag {
                 timestamp: timer.offset,
@@ -3650,6 +3766,7 @@ fn settle_boundary(
                     Trigger::Automatic => "automatic",
                     Trigger::Manual => "manual",
                     Trigger::Pause => "pause",
+                    Trigger::Mutation => "mutation",
                 };
                 observer.checkpoint_published(&id, kind, captured.completed_tag);
                 break;
@@ -3775,8 +3892,8 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
             let mut queue = BTreeMap::from([(Tag::START, inputs)]);
             // Arm every timer for its first firing. A timer's value is the
             // timestamp it fired at, which is what makes `$(t)` in a prompt
-            // worth reading.
-            for (name, timer) in &state.timers {
+            // worth reading. `shutdown` waits for the run's last tag.
+            for (name, timer) in state.timers.iter().filter(|(_, timer)| !timer.shutdown) {
                 queue
                     .entry(Tag {
                         timestamp: timer.offset,
@@ -3839,6 +3956,10 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
     // Fixed before the first tag: precedence follows from the wiring, and the
     // wiring does not change while a run is in flight.
     let layers = precedence_layers(state)?;
+    // A body called `request_stop()` at this tag.
+    let mut stop_requested = false;
+    // The queue holds only the `shutdown` tag: the run ends once it is over.
+    let mut shutting_down = false;
 
     loop {
         // A tag boundary: nothing is in flight, so this is where an
@@ -3855,7 +3976,13 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
                 state_vars: store.clone(),
                 elapsed_ns: elapsed().as_nanos() as u64,
             };
-            settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
+            // The last tag is not a boundary a pause can hold: resumed, it
+            // would end the run without remembering it had begun to.
+            if shutting_down {
+                Boundary::Continue
+            } else {
+                settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
+            }
         };
         match settled {
             Boundary::Continue => {}
@@ -3868,7 +3995,12 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
             Boundary::Pause(state) => return Ok(LoopEnd::Paused(state)),
         }
         let Some((&tag, next_events)) = queue.first_key_value() else {
-            break;
+            // Nothing left to happen is an end too, and `shutdown` hears of it.
+            if shutting_down || !arm_shutdown(state, &mut queue, completed)? {
+                break;
+            }
+            shutting_down = true;
+            continue;
         };
         // A tag nothing is present at is not a moment the run passed through.
         // No reaction can fire at one -- enabling asks whether any trigger is
@@ -4002,7 +4134,8 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
                 .iter()
                 .zip(task_ids)
                 .zip(results)
-                .map(|(((id, reaction), task_id), writes)| {
+                .map(|(((id, reaction), task_id), mut writes)| {
+                    stop_requested |= writes.remove(crate::reaction::STOP).is_some();
                     observer.reaction_completed(
                         tag.timestamp,
                         tag.microstep,
@@ -4048,11 +4181,51 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
             }
         }
         completed = Some((tag.timestamp, tag.microstep));
+        if shutting_down {
+            break;
+        }
+        // Whatever else was queued never happens: the run ends here, after
+        // one more microstep for `shutdown`.
+        if stop_requested {
+            queue.clear();
+            if !arm_shutdown(state, &mut queue, completed)? {
+                break;
+            }
+            shutting_down = true;
+        }
     }
     Ok(LoopEnd::Completed(Settled {
         outputs,
         state_vars: store,
     }))
+}
+
+/// Queue every `shutdown` trigger one microstep after the last tag, or at the
+/// start of a run that passed through none. False when nothing reacts to it.
+fn arm_shutdown(
+    state: &VmState,
+    queue: &mut BTreeMap<Tag, BTreeMap<String, Value>>,
+    last: Option<(u64, u64)>,
+) -> Result<bool> {
+    let tag = match last {
+        Some((timestamp, microstep)) => Tag {
+            timestamp,
+            microstep,
+        }
+        .advance(Delay::MICROSTEP)?,
+        None => Tag::START,
+    };
+    let events: BTreeMap<_, _> = state
+        .timers
+        .iter()
+        .filter(|(_, timer)| timer.shutdown)
+        .map(|(name, _)| (name.clone(), json!(tag.timestamp)))
+        .collect();
+    if events.is_empty() {
+        return Ok(false);
+    }
+    queue.insert(tag, events);
+    Ok(true)
 }
 
 fn invocation_spec(
@@ -6434,6 +6607,93 @@ mod tests {
         assert_eq!(*fired.last().unwrap(), 10 * 1499);
     }
 
+    /// A clock that ticks every 10ns, and a reaction to `shutdown`.
+    fn shutdown_bytecode(period: u64) -> Bytecode {
+        serde_json::from_str(&format!(
+            r#"{{
+              "version": 1,
+              "team": "Smoke",
+              "instructions": [
+                {{"op":"begin_plan","team":"Smoke"}},
+                {{"op":"spawn_agent","name":"agent","backend":"Codex"}},
+                {{"op":"define_port","kind":"output","name":"note","type":"string"}},
+                {{"op":"declare_timer","name":"t","offset":5,"period":{period}}},
+                {{"op":"declare_timer","name":"shutdown","offset":0,"period":0,"shutdown":true}},
+                {{"op":"install_reaction","id":"reaction.0","agent":"agent","triggers":["t"],"effects":["note"],"contract":"note","prompt":"tick"}},
+                {{"op":"install_reaction","id":"reaction.1","agent":"agent","triggers":["shutdown"],"effects":["note"],"contract":"note","prompt":"bye"}},
+                {{"op":"commit_plan"}}
+              ]
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    /// Records which trigger fired when, and asks to stop at a given firing.
+    struct StopExecutor {
+        fired: Mutex<Vec<(String, u64)>>,
+        stop_at: usize,
+    }
+
+    impl ReactionExecutor for StopExecutor {
+        fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+            let (trigger, at) = invocation.trigger_values.iter().next().unwrap();
+            let count = {
+                let mut fired = self.fired.lock().unwrap();
+                fired.push((trigger.clone(), at.as_u64().unwrap()));
+                fired.len()
+            };
+            let mut writes = BTreeMap::from([("note".into(), json!(trigger))]);
+            if count == self.stop_at {
+                writes.insert(crate::reaction::STOP.into(), json!(true));
+            }
+            Ok(writes)
+        }
+    }
+
+    #[test]
+    fn a_requested_stop_ends_the_run_after_one_shutdown_microstep() {
+        let state = verify(&shutdown_bytecode(10)).unwrap();
+        let executor = StopExecutor {
+            fired: Mutex::new(Vec::new()),
+            stop_at: 3,
+        };
+        // A periodic timer never ends on its own; the request is what ends it.
+        let outputs = run_event_loop(&state, BTreeMap::new(), &executor).unwrap();
+        let fired = executor.fired.lock().unwrap().clone();
+        let at = |name: &str, time| (name.to_string(), time);
+        assert_eq!(
+            fired,
+            vec![at("t", 5), at("t", 15), at("t", 25), at("shutdown", 25)]
+        );
+        assert_eq!(outputs["note"], json!("shutdown"));
+    }
+
+    #[test]
+    fn a_run_that_runs_out_of_events_still_shuts_down() {
+        let state = verify(&shutdown_bytecode(0)).unwrap();
+        let executor = StopExecutor {
+            fired: Mutex::new(Vec::new()),
+            stop_at: 0,
+        };
+        run_event_loop(&state, BTreeMap::new(), &executor).unwrap();
+        let fired = executor.fired.lock().unwrap().clone();
+        assert_eq!(
+            fired,
+            vec![("t".to_string(), 5), ("shutdown".to_string(), 5)]
+        );
+    }
+
+    #[test]
+    fn a_stop_with_nothing_reacting_to_shutdown_ends_at_its_tag() {
+        let state = verify(&timer_bytecode(0, 10)).unwrap();
+        let executor = StopExecutor {
+            fired: Mutex::new(Vec::new()),
+            stop_at: 2,
+        };
+        run_event_loop(&state, BTreeMap::new(), &executor).unwrap();
+        assert_eq!(executor.fired.lock().unwrap().len(), 2);
+    }
+
     #[test]
     fn a_timer_cannot_share_a_name_with_a_port_or_be_written_to() {
         let shadowing: Bytecode = serde_json::from_str(
@@ -7869,6 +8129,58 @@ mod tests {
             }}"#
         ))
         .unwrap()
+    }
+
+    /// The smoke-test shape: a body records what it saw and asks to stop, and
+    /// a `shutdown` body checks the record. A failed check fails the run.
+    #[test]
+    #[ignore = "shells out to cargo; run with --ignored"]
+    fn a_shutdown_body_decides_whether_the_run_passed() {
+        struct Unused;
+        impl ReactionExecutor for Unused {
+            fn invoke(&self, _: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+                panic!("every reaction has a body, so no agent is asked");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let run = |expected: i64| {
+            let bytecode: Bytecode = serde_json::from_str(&format!(
+                r#"{{
+                  "version": 1,
+                  "team": "Smoke",
+                  "instructions": [
+                    {{"op":"begin_plan","team":"Smoke"}},
+                    {{"op":"declare_instance","name":"s","parent":"","team":"Smoke"}},
+                    {{"op":"declare_timer","instance":"s","name":"s.tick","offset":1,"period":1}},
+                    {{"op":"declare_timer","instance":"s","name":"s.shutdown","offset":0,"period":0,"shutdown":true}},
+                    {{"op":"declare_state","instance":"s","name":"s.ticks","type":"int","initial":0}},
+                    {{"op":"install_reaction","instance":"s","id":"s.reaction.0","agent":"",
+                      "triggers":["s.tick"],"effects":[],"contract":"","prompt":"",
+                      "body":"self.ticks += 1; if self.ticks == 3 {{ request_stop(); }}"}},
+                    {{"op":"install_reaction","instance":"s","id":"s.reaction.1","agent":"",
+                      "triggers":["s.shutdown"],"effects":[],"contract":"","prompt":"",
+                      "body":"assert_eq!(self.ticks, {expected}, \"ticks before shutdown\");"}},
+                    {{"op":"commit_plan"}}
+                  ]
+                }}"#
+            ))
+            .unwrap();
+            let state = verify(&bytecode).unwrap();
+            let code = crate::reaction::build(&state, dir.path()).unwrap().unwrap();
+            let executor = DispatchExecutor {
+                workspace_dirs: BTreeMap::new(),
+                state: &state,
+                code: Some(code),
+                timeout: Duration::from_secs(30),
+                agents: Unused,
+            };
+            run_event_loop(&state, BTreeMap::new(), &executor)
+        };
+
+        // The periodic timer would tick forever; the request ends it at three.
+        run(3).unwrap();
+        let error = format!("{:#}", run(4).unwrap_err());
+        assert!(error.contains("ticks before shutdown"), "{error}");
     }
 
     /// The generated directory belongs to the program, so two runs of it share

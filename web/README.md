@@ -50,12 +50,12 @@ Control pointed at it, and opens a browser. Ctrl-C stops both.
 make dev
 ```
 
-`OMAR_SERVE_ADDRESS`, `OMAR_WEB_PORT` and `OMAR_DEV_OPEN=0` adjust it.
+`OMAR_SERVE_PORT`, `OMAR_WEB_PORT` and `OMAR_DEV_OPEN=0` adjust it.
 `OMAR_DEV_NO_EA=1` starts without an assistant for frontend-only development. The two
 halves separately, if you want them in separate terminals:
 
 ```bash
-cargo run --bin omar -- serve --address 127.0.0.1:7340   # from the repository root
+cargo run --bin omar -- serve --port 7340                 # from the repository root
 OMAR_SERVE_URL=http://127.0.0.1:7340 npm run dev         # from web/
 ```
 
@@ -160,34 +160,6 @@ npm run test:conformance
 
 It skips itself when those binaries are absent, so a Node-only checkout is
 unaffected. `OMAR_BIN` and `OMARC_BIN` override the paths.
-
-### Manual response panels
-
-Optional companion file `omar.response.json` provides human-facing copy for Web
-steps. It does not change port types, contracts, execution, or authorization:
-
-```json
-{
-  "steps": {
-    "prepare.chatgpt": {
-      "title": "Paste the prepared production packet",
-      "summary": "Complete preparation in ChatGPT, then return its result here.",
-      "instructions": ["Follow the full task instructions in ChatGPT.", "Paste the verified result below."],
-      "next": "A valid packet starts the connected production step.",
-      "outcomes": {
-        "prepare.packet": {"label": "Prepared packet", "format": "json", "help": "Paste the complete JSON packet."},
-        "prepare.blocked": {"label": "Blocker report", "format": "json", "help": "Describe what prevents preparation."}
-      }
-    }
-  }
-}
-```
-
-Existing workflows still work without this file. Setup-review inputs explicitly
-marked `mode: setup_review_only` or `productionAuthorized: false`, with a wired
-`blocked` output, surface their setup requirements and only offer reporting a
-blocker. Providing new setup details requires editing the request; submitting a
-blocker is not authorization to produce or publish.
 
 `tests/fixtures/diagram-snapshot.v1.json` was captured from a real `omar serve`
 run. `tests/protocol-contract.test.mjs` asserts the client's and renderer's

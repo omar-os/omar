@@ -1330,6 +1330,7 @@ export function DiagramCanvas({
   onOpenTerminal,
   onOpenPanel,
   highlight,
+  focus,
 }: {
   snapshot: DiagramSnapshot;
   selection?: string[];
@@ -1345,8 +1346,24 @@ export function DiagramCanvas({
    * has picked out to talk about.
    */
   highlight?: ReadonlySet<string>;
+  /**
+   * Ids a formal property is about: its ports, reactions and timers, and the
+   * teams they sit in. Everything else, connections included, is dimmed.
+   */
+  focus?: ReadonlySet<string>;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const edgeEnds = useMemo(
+    () => new Map(snapshot.edges.map((edge) => [edge.id, edge] as const)),
+    [snapshot.edges],
+  );
+  /** The class that dims what a property is not about, if one is focused. */
+  const focusClass = (id: string) => (focus ? (focus.has(id) ? " in-focus" : " off-focus") : "");
+  const edgeFocusClass = (id: string) => {
+    if (!focus) return "";
+    const edge = edgeEnds.get(id);
+    return edge && focus.has(edge.source) && focus.has(edge.target) ? " in-focus" : " off-focus";
+  };
   const [layout, setLayout] = useState<Layout | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [size, setSize] = useState<Size>({ width: 0, height: 0 });
@@ -1404,7 +1421,7 @@ export function DiagramCanvas({
   function selectable(id: string, base: string) {
     // Dimming is a property of the drawing, not of selection, so it applies
     // whether or not anything is selectable.
-    const lit = highlight ? (highlight.has(id) ? " at-tag" : " off-tag") : "";
+    const lit = highlight ? (highlight.has(id) ? " at-tag" : " off-tag") : focusClass(id);
     if (!onToggleComponent) return { className: `${base}${lit}` };
     const component = componentName(id);
     return {
@@ -1643,7 +1660,7 @@ export function DiagramCanvas({
             {layout.containers.map((container) => (
               <g
                 key={container.id}
-                className={`omar-team ${layout.status}`}
+                className={`omar-team ${layout.status}${focusClass(container.id)}`}
                 // Which box this one sits in. Nesting is structure, so it is
                 // readable from the drawing rather than only inferable from
                 // the geometry.
@@ -1690,7 +1707,7 @@ export function DiagramCanvas({
 
             <g className="omar-edges">
               {layout.edges.map((edge) => (
-                <g key={edge.id}>
+                <g key={edge.id} className={edgeFocusClass(edge.id).trim() || undefined}>
                   <path
                     data-id={edge.id}
                     className={`omar-edge ${edge.kind}`}

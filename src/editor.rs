@@ -74,6 +74,36 @@ impl Editors {
         self.sessions.clear();
     }
 }
+/// Install Lean's VS Code extension into OMAR's extension directory, once.
+fn ensure_lean_extension(executable: &std::ffi::OsStr, extensions: &Path) -> Result<()> {
+    let installed = fs::read_dir(extensions)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("leanprover.lean4-")
+            })
+        })
+        .unwrap_or(false);
+    if installed {
+        return Ok(());
+    }
+    fs::create_dir_all(extensions)?;
+    let output = Command::new(executable)
+        .arg("--extensions-dir")
+        .arg(extensions)
+        .args(["--install-extension", "leanprover.lean4"])
+        .output()
+        .context("Could not start code-server. Install code-server from https://coder.com/docs/code-server/install, then try again (or set OMAR_CODE_SERVER_BIN).")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Could not install Lean's extension into code-server: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
 impl Editor {
     fn url(&self) -> String {
         format!(
@@ -114,7 +144,27 @@ impl Editor {
         });
         let executable =
             std::env::var_os("OMAR_CODE_SERVER_BIN").unwrap_or_else(|| "code-server".into());
-        let child = Command::new(executable)
+        // Properties are Lean: the editor needs Lean's extension, and Lean
+        // needs to find the semantics the files import.
+        let proofs = workspace.deployment_id.starts_with("properties:");
+        if proofs {
+            ensure_lean_extension(&executable, &root.join("editors/extensions"))?;
+            // Restricted Mode disables every extension, Lean's included. A
+            // proof workspace holds only the Lean files OMAR wrote.
+            let settings = data.join("data/User/settings.json");
+            if !settings.exists() {
+                fs::create_dir_all(settings.parent().expect("settings have a directory"))?;
+                fs::write(
+                    &settings,
+                    "{\n  \"security.workspace.trust.enabled\": false\n}\n",
+                )?;
+            }
+        }
+        let mut command = Command::new(&executable);
+        if proofs {
+            command.env("LEAN_PATH", crate::properties::lean_library());
+        }
+        let child = command
             .args(["--auth", "none", "--socket-mode", "0600", "--disable-telemetry", "--disable-update-check", "--disable-proxy"])
             .arg("--config").arg(config).arg("--socket").arg(socket)
             .arg("--user-data-dir").arg(data.join("data"))

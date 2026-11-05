@@ -123,7 +123,7 @@ trust_level="trusted"
             if index == 0:
                 # The runtime launches EA 0; the dashboard then attaches inside
                 # a PTY, which must join that EA rather than allocate another.
-                session = json.loads(subprocess.run([OMAR, '-a', 'codex', 'up', '--name', 'shared', '--json'], cwd=work, env=env,
+                session = json.loads(subprocess.run([OMAR, '-a', 'codex', 'up', '-s', 'shared', '--json'], cwd=work, env=env,
                                                     capture_output=True, text=True, timeout=120, check=True).stdout)
                 server = session['tmux_server']
                 state = Path(session['directory'])

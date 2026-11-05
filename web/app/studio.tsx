@@ -11,10 +11,12 @@ import { defaultRunTimeout, describeRunFailure } from "./lib/run-feedback";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
+import { BackendsPage } from "./backends-page";
 import { SettingsMenu } from "./settings-menu";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
 import { PortPanel } from "./port-panel";
+import { PropertiesPanel } from "./properties";
 import { Resizer } from "./resizer";
 import { useWorkflowNames } from "./lib/workflow-names";
 import { WorkflowIcon } from "./workflow-icon";
@@ -53,6 +55,8 @@ import {
   fetchCheckpoint,
   fetchCheckpoints,
   fetchRunTimeline,
+  mutateRun,
+  fetchRunProgram,
   pauseRun,
   resumeRun,
   rollbackRun,
@@ -62,6 +66,10 @@ import {
   stopRun,
   subscribeToDiagram,
   fetchConversations,
+  fetchBackendStatus,
+  checkProperties,
+  openProofEditor,
+  describeError,
 } from "./lib/runtime-client";
 
 /**
@@ -107,6 +115,8 @@ type StudioProps = { serveUrl?: string; designAgent?: DesignAgent };
 export function Studio({ serveUrl = "", designAgent }: StudioProps) {
   const [selected, setSelected] = useState<string | null>(null);
   const [restoredUrl, setRestoredUrl] = useState<string | null>(null);
+  // Known before the workspace renders, so a view port never flashes controls.
+  const [readOnly, setReadOnly] = useState(false);
   const select = useCallback((conversation: ConversationSummary) => {
     setSelected(conversation.id);
     sessionStorage.setItem(`omar-chat:${serveUrl}`, conversation.id);
@@ -115,11 +125,15 @@ export function Studio({ serveUrl = "", designAgent }: StudioProps) {
     if (!serveUrl) return;
     const saved = sessionStorage.getItem(`omar-chat:${serveUrl}`);
     const abort = new AbortController();
-    void fetchConversations(serveUrl, abort.signal).then((history) => {
+    const health = checkServeHealth(serveUrl, abort.signal).then((health) => {
+      if (!abort.signal.aborted && health.ok) setReadOnly(health.access === "view");
+    });
+    void fetchConversations(serveUrl, abort.signal).then(async (history) => {
+      await health;
       if (abort.signal.aborted) return;
       if (saved && history.conversations.some((chat) => chat.id === saved)) setSelected(saved);
       setRestoredUrl(serveUrl);
-    }).catch(() => { if (!abort.signal.aborted) setRestoredUrl(serveUrl); });
+    }).catch(async () => { await health; if (!abort.signal.aborted) setRestoredUrl(serveUrl); });
     return () => abort.abort();
   }, [serveUrl]);
   // Resolve the tab's saved selection before subscribing to the daemon's
@@ -127,13 +141,17 @@ export function Studio({ serveUrl = "", designAgent }: StudioProps) {
   if (serveUrl && restoredUrl !== serveUrl) return <main className="studio-shell"><p className="workspace-loading" role="status">Opening your workflows…</p></main>;
   const scopedUrl = selected ? `${serveUrl.replace(/\/$/, "")}/chats/${encodeURIComponent(selected)}` : serveUrl;
   return <StudioWorkspace serveUrl={scopedUrl} historyUrl={serveUrl}
-    designAgent={designAgent} selectedId={selected} onSelect={select} />;
+    designAgent={designAgent} selectedId={selected} onSelect={select}
+    readOnly={readOnly} onReadOnly={setReadOnly} />;
 }
 
-function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, onSelect }: StudioProps & {
+function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, onSelect, readOnly, onReadOnly }: StudioProps & {
   historyUrl: string;
   selectedId: string | null;
   onSelect: (conversation: ConversationSummary) => void;
+  /** Served from a view port: watch everything, change nothing. */
+  readOnly: boolean;
+  onReadOnly: (readOnly: boolean) => void;
 }) {
   const isDemo = serveUrl.trim().length === 0;
   // Requests from a previous selection must not update the retained workspace.
@@ -157,6 +175,18 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [checking, setChecking] = useState(false);
   const [applyingConfiguration, setApplyingConfiguration] = useState(false);
+  // What applying the edited source to the run would change, while the
+  // operator decides; and whether an applied change is still landing.
+  const [mutationPlan, setMutationPlan] = useState<{ fromAssistant: boolean } | null>(null);
+  /** The source the live run executes, which an edit is shown against. */
+  const [runningProgram, setRunningProgram] = useState<{ run: string; program: string } | null>(null);
+  const [mutating, setMutating] = useState(false);
+  /** What the source pane held before the assistant's change replaced it, so
+      declining the change puts the running program back. */
+  const declinedRef = useRef<{ source: string; design: ProposedDesign | null } | null>(null);
+  /** Takes a proposal that arrives while the run is live; set after render
+      so the chat subscription always reaches the current one. */
+  const proposeChangeRef = useRef<(design: ProposedDesign) => void>(() => {});
   /** Every tag the program passes through, projected or observed. */
   const [steps, setSteps] = useState<TimelineStep[]>([]);
   const [truncated, setTruncated] = useState(false);
@@ -166,7 +196,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [following, setFollowing] = useState(true);
   /** Ports the operator has set on the live run. */
   // can flip back and forth once there is.
-  const [tab, setTab] = useState<"source" | "events">("source");
+  const [tab, setTab] = useState<"source" | "events" | "properties">("source");
   /** What the run's web agents are waiting to be given. */
   const [pending, setPending] = useState<PendingInvocation[]>([]);
   const [answering, setAnswering] = useState(false);
@@ -185,12 +215,22 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [daemon, setDaemon] = useState<Daemon>(
     isDemo ? { state: "demo" } : { state: "checking" },
   );
+  // Bumped by "Retry now" to probe at once instead of at the next poll.
+  const [healthProbe, setHealthProbe] = useState(0);
   const [phase, setPhase] = useState<Phase>("idle");
   const [assistantBusy, setAssistantBusy] = useState(false);
   const [selectingChat, setSelectingChat] = useState(false);
   const [hydratedUrl, setHydratedUrl] = useState(isDemo ? serveUrl : null);
   const switchingChat = selectingChat || hydratedUrl !== serveUrl;
   const [design, setDesign] = useState<ProposedDesign | null>(null);
+  /** The property whose components the diagram singles out, in the design it
+      belongs to: a new design starts with none. */
+  const [propertyPick, setPropertyPick] = useState<{ design: ProposedDesign; name: string } | null>(null);
+  /** The program a design's verdicts were last checked against, if not its own. */
+  const [recheckedProgram, setRecheckedProgram] = useState<{ design: ProposedDesign; program: string } | null>(null);
+  const [checkingProperties, setCheckingProperties] = useState(false);
+  const [openingProofs, setOpeningProofs] = useState(false);
+  const [propertyError, setPropertyError] = useState("");
   const [run, setRun] = useState<RunRecord | null>(null);
   const [error, setError] = useState("");
   // The run's checkpoints, drawn on the timeline; the one a resume would
@@ -210,6 +250,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
+  const [backendsOpen, setBackendsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [historyRevision, setHistoryRevision] = useState(0);
@@ -305,6 +346,83 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     mark(snapshot.reactions, step.reactions);
     return lit;
   }, [steps, stepIndex, snapshot]);
+  const properties = useMemo(() => design?.properties ?? [], [design]);
+  const property = propertyPick && propertyPick.design === design ? propertyPick.name : null;
+  const setProperty = (name: string | null) =>
+    setPropertyPick(name && design ? { design, name } : null);
+  // A new design brings its own verdicts, checked against its own program.
+  const checkedProgram =
+    recheckedProgram && recheckedProgram.design === design ? recheckedProgram.program : design?.program ?? null;
+  // A design without properties has no tab to show them in.
+  const shownTab = tab === "properties" && properties.length === 0 ? "source" : tab;
+  /**
+   * What the selected property is about: the components its statement names,
+   * the teams they sit in, and every team those sit in. The diagram dims the
+   * rest, so the operator sees which part of the system a guarantee covers.
+   */
+  const propertyFocus = useMemo(() => {
+    const verdict = properties.find((candidate) => candidate.name === property);
+    if (!verdict || !snapshot) return undefined;
+    const ids = new Set<string>();
+    const owners = new Set<string>();
+    for (const name of verdict.mentions) {
+      for (const entity of [
+        ...snapshot.ports.filter((port) => port.name === name),
+        ...snapshot.timers.filter((timer) => timer.name === name),
+        ...snapshot.reactions.filter((reaction) => reaction.id === `reaction::${name}`),
+      ]) {
+        ids.add(entity.id);
+        owners.add(entity.instance);
+      }
+    }
+    for (let owner of owners) {
+      // Instances are named by their full path, so each prefix is a parent.
+      while (owner) {
+        ids.add(`instance::${owner}`);
+        owner = owner.includes(".") ? owner.slice(0, owner.lastIndexOf(".")) : "";
+      }
+    }
+    return ids;
+  }, [properties, property, snapshot]);
+  const propertiesStale = properties.length > 0 && checkedProgram !== null && source !== checkedProgram;
+  async function recheckProperties() {
+    if (!design) return;
+    setCheckingProperties(true);
+    setPropertyError("");
+    const program = source;
+    try {
+      const verdicts = await checkProperties(serveUrl, {
+        program,
+        files: design.files,
+        lemmas: design.lemmas,
+        properties: properties.map(({ name, description, statement, proof }) => ({ name, description, statement, proof })),
+      });
+      const next = { ...design, properties: verdicts };
+      setDesign((current) => (current === design ? next : current));
+      setRecheckedProgram({ design: next, program });
+    } catch (cause) {
+      setPropertyError(describeError(cause));
+    } finally {
+      setCheckingProperties(false);
+    }
+  }
+  async function openProofs() {
+    // Opened synchronously from the click, so a popup blocker allows it.
+    const tab = window.open("about:blank", "_blank");
+    if (tab) tab.opener = null;
+    setOpeningProofs(true);
+    setPropertyError("");
+    try {
+      const url = await openProofEditor(serveUrl, properties.map(({ name, source }) => ({ name, source })));
+      if (tab) tab.location.replace(url);
+      else window.open(url, "_blank", "noopener");
+    } catch (cause) {
+      tab?.close();
+      setPropertyError(describeError(cause));
+    } finally {
+      setOpeningProofs(false);
+    }
+  }
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [events, setEvents] = useState<DiagramEvent[]>([]);
   const disconnectRef = useRef<null | (() => void)>(null);
@@ -321,6 +439,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       const health = await checkServeHealth(serveUrl);
       if (cancelled) return;
       setDaemon(health.ok ? { state: "live" } : { state: "offline", reason: health.reason });
+      if (health.ok) onReadOnly(health.access === "view");
     };
     void probe();
     const timer = setInterval(() => void probe(), HEALTH_POLL_MS);
@@ -328,7 +447,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       cancelled = true;
       clearInterval(timer);
     };
-  }, [isDemo, serveUrl]);
+  }, [isDemo, serveUrl, onReadOnly, healthProbe]);
 
   // One agent for the lifetime of a mode. Demo mode never reaches the network.
   const agent = useMemo(
@@ -383,7 +502,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   async function submitPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const request = prompt.trim();
-    if (!request || (switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning") return;
+    if (readOnly || !request || (switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning") return;
     const selected = selection;
     const quoted = withQuote(quote, request);
     setPrompt("");
@@ -399,7 +518,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       await agent.send(quoted, selected);
     } catch (cause) {
       if (scope !== scopeRef.current) return;
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(describeError(cause));
       setAssistantBusy(false);
       setPhase(run && !isRunFinished(run.status) ? "observing" : "idle");
     }
@@ -408,6 +527,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   /** What the run's web agents are waiting on, as of now. */
   const loadPanel = useCallback(
     async (runId: string) => {
+      // A view port refuses the panel: what a web agent is owed is not public.
+      if (readOnly) return;
       try {
         const next = await fetchPanel(serveUrl, runId);
         if (runRef.current?.run_id === runId && !isRunFinished(runRef.current.status)) setPending(next);
@@ -416,7 +537,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         // event asks again.
       }
     },
-    [serveUrl],
+    [serveUrl, readOnly],
   );
 
   /** Answer one invocation, as one completion. */
@@ -424,6 +545,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     invocation: PendingInvocation,
     values: Record<string, unknown>,
   ) {
+    if (readOnly) throw new Error("This view cannot submit responses.");
     if (!run) throw new Error("This run is no longer waiting for a response.");
     setAnswering(true);
     const scope = scopeRef.current;
@@ -438,7 +560,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       await loadPanel(run.run_id);
     } catch (cause) {
       if (scope !== scopeRef.current) return;
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(describeError(cause));
       throw cause;
     } finally {
       if (scope === scopeRef.current) setAnswering(false);
@@ -448,7 +570,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   /** Watch a live run until it reaches a terminal status. */
   const observe = useCallback(
     (record: RunRecord) => {
-      const diagramUrl = diagramUrlFor(record);
+      const diagramUrl = diagramUrlFor(record, serveUrl);
       disconnectRef.current?.();
       let connected = true;
 
@@ -623,6 +745,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       if (replaying) replayedProposal = true;
       // A fresh proposal remains in the transcript while this chat's
       // deployed topology continues to own the live diagram and controls.
+      // A change to the live run, paused or not: shown as the plan that
+      // applies it rather than as a design to deploy.
+      if (!replaying && runRef.current && ["running", "paused"].includes(runRef.current.status)) {
+        proposeChangeRef.current(message.design);
+        return;
+      }
       if (!replaying && runRef.current && !isRunFinished(runRef.current.status)) return;
       if (!runRef.current || isRunFinished(runRef.current.status)) {
         // The proposal now owns the view. Disconnecting also invalidates any
@@ -683,7 +811,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           // and its live snapshot is fetched. Commit them in one React batch.
           // A paused run's diagram server is gone; serve kept its last picture.
           const liveSnapshot = activeRun && conversation.run?.diagram_address
-            ? await fetchDiagram(diagramUrlFor(conversation.run), abort.signal).catch(() => null)
+            ? await fetchDiagram(diagramUrlFor(conversation.run, serveUrl), abort.signal).catch(() => null)
             : conversation.run?.status === "paused"
               ? await fetchRunSnapshot(serveUrl, conversation.run.run_id, abort.signal).catch(() => null)
               : null;
@@ -770,7 +898,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       observe(record);
     } catch (cause) {
       if (scope !== scopeRef.current) return;
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(describeError(cause));
       setPhase("review");
     }
   }
@@ -796,7 +924,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       if (scope === scopeRef.current) setRun(record);
     } catch (cause) {
       if (scope !== scopeRef.current) return;
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(describeError(cause));
     }
   }
 
@@ -829,7 +957,125 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       if (scope === scopeRef.current) setRun(record);
     } catch (cause) {
       if (scope !== scopeRef.current) return;
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(describeError(cause));
+    }
+  }
+
+  /**
+   * Show what changing the run to `program` would do: the operator's edited
+   * source, or a program the assistant proposed for the live run.
+   */
+  async function previewMutation(program = source, files = design?.files, fromAssistant = false) {
+    const current = runRef.current;
+    // Even the preview is a POST, which a view port refuses.
+    if (readOnly || !current || mutating) return;
+    const scope = scopeRef.current;
+    setError("");
+    try {
+      const { changes } = await mutateRun(serveUrl, current.run_id, {
+        program,
+        filename,
+        files,
+        dry_run: true,
+      });
+      if (scope !== scopeRef.current) return;
+      if (changes.length === 0) {
+        if (fromAssistant) restoreDeclined();
+        setError(fromAssistant
+          ? "OMAR's proposal matches what the run is executing; there is nothing to apply."
+          : "The source matches what the run is executing; there is nothing to apply.");
+        return;
+      }
+      setMutationPlan({ fromAssistant });
+      // The plan is shown above the source it came from.
+      setTab("source");
+      setInspectorWidth((width) => width || DEFAULT_INSPECTOR);
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      if (fromAssistant) restoreDeclined();
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(fromAssistant ? `OMAR's proposal cannot be applied to this run: ${message}` : message);
+    }
+  }
+
+  /** Put back what the source pane held before the assistant's change. */
+  function restoreDeclined() {
+    const declined = declinedRef.current;
+    declinedRef.current = null;
+    if (!declined) return;
+    setSource(declined.source);
+    setDesign(declined.design);
+  }
+
+  function cancelMutation() {
+    if (mutationPlan?.fromAssistant) restoreDeclined();
+    declinedRef.current = null;
+    setMutationPlan(null);
+  }
+
+  useEffect(() => {
+    proposeChangeRef.current = (proposed) => {
+      if (mutating) return;
+      // The first change still pending keeps what the run really executes.
+      if (!declinedRef.current) declinedRef.current = { source, design };
+      setDesign(proposed);
+      setSource(proposed.program);
+      setSourceErrors([]);
+      void previewMutation(proposed.program, proposed.files, true);
+    };
+  });
+
+  /**
+   * Change the run to the edited source. A running run pauses at its next tag
+   * boundary, takes the change and resumes on its own, under a new diagram
+   * address; this follows it until it is back, then watches it again.
+   */
+  async function applyMutation() {
+    if (!run || mutating) return;
+    const scope = scopeRef.current;
+    setMutating(true);
+    setError("");
+    try {
+      let { record } = await mutateRun(serveUrl, run.run_id, {
+        program: source,
+        filename,
+        files: design?.files,
+      });
+      if (scope !== scopeRef.current) return;
+      setMutationPlan(null);
+      declinedRef.current = null;
+      if (!record) return;
+      runRef.current = record;
+      setRun(record);
+      const wasPaused = record.status === "paused";
+      // As long as a pause may take: the tag in progress closes first.
+      const deadline = Date.now() + 420_000;
+      while (
+        Date.now() < deadline &&
+        (record.mutation?.status === "pending" ||
+          record.status === "pausing" ||
+          record.status === "starting" ||
+          (!wasPaused && record.status === "paused"))
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        record = await fetchRun(serveUrl, record.run_id);
+        if (scope !== scopeRef.current) return;
+      }
+      runRef.current = record;
+      setRun(record);
+      setCheckpointEpoch((n) => n + 1);
+      if (record.mutation?.status === "failed") {
+        setError(`The change was not applied: ${record.mutation.error ?? "unknown error"}`);
+      }
+      if (record.status === "running" && record.diagram_address) {
+        setPhase("observing");
+        observe(record);
+      }
+    } catch (cause) {
+      if (scope !== scopeRef.current) return;
+      setError(describeError(cause));
+    } finally {
+      if (scope === scopeRef.current) setMutating(false);
     }
   }
 
@@ -845,7 +1091,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       setCheckpointEpoch((n) => n + 1);
     } catch (cause) {
       if (scope !== scopeRef.current) return;
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(describeError(cause));
     }
   }
 
@@ -863,7 +1109,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       observe(record);
     } catch (cause) {
       if (scope !== scopeRef.current) return;
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(describeError(cause));
     }
   }
 
@@ -907,8 +1153,22 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   // messages, which told an operator nothing they wanted to know.
   const lag = typeof snapshot?.lag === "number" ? formatDuration(snapshot.lag) : "—";
   const canRun = daemon.state === "live";
+  // With no backend signed in there is nothing for the assistant to run on,
+  // so the Backends page comes first. Asked once per runtime.
+  useEffect(() => {
+    if (!canRun || readOnly || isDemo) return;
+    let cancelled = false;
+    fetchBackendStatus(serveUrl)
+      .then((list) => {
+        if (!cancelled && list && !list.some((status) => status.status === "connected")) setBackendsOpen(true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [canRun, readOnly, isDemo, serveUrl]);
   const retrying = run !== null && isRunFinished(run.status);
-  const canConfirm = design !== null && ["review", "finished", "failed"].includes(phase);
+  const canConfirm = !readOnly && design !== null && ["review", "finished", "failed"].includes(phase);
   const failedRun = run?.status === "failed";
   const failureDetails = failedRun ? (run.error || error || "The run failed.") : "";
   const failure = failedRun ? describeRunFailure(failureDetails, snapshot?.agents ?? []) : null;
@@ -926,7 +1186,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     const timer = setTimeout(() => {
       // Nothing to check against, or nothing to check: clear rather than leave
       // an error standing for text that is gone.
-      if (!canRun || source.trim() === "") {
+      if (!canRun || readOnly || source.trim() === "") {
         setSourceErrors([]);
         return;
       }
@@ -976,7 +1236,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       clearTimeout(timer);
       abort.abort();
     };
-  }, [source, filename, serveUrl, canRun, presentKey, switchingChat, phase, design?.files]);
+  }, [source, filename, serveUrl, canRun, readOnly, presentKey, switchingChat, phase, design?.files]);
 
   const isDeployed = run !== null;
   // The daemon's own word for it. Every terminal status replaces it, so the
@@ -1002,6 +1262,19 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       })
       .catch(() => {});
   }, [runId, serveUrl, checkpointEpoch]);
+
+  // What the run executes, refetched when a mutation or a rollback changes it.
+  const runLive = run ? ["running", "pausing", "paused"].includes(run.status) : false;
+  useEffect(() => {
+    if (!runId || !runLive) return;
+    const scope = scopeRef.current;
+    void fetchRunProgram(serveUrl, runId)
+      .then(({ program }) => {
+        if (scope === scopeRef.current) setRunningProgram({ run: runId, program });
+      })
+      .catch(() => {});
+  }, [runId, runLive, serveUrl, checkpointEpoch]);
+  const diffBase = runLive && runningProgram && runningProgram.run === runId ? runningProgram.program : null;
 
   // A run observed without a draft behind it (admitted over the API, or the
   // page reloaded) still gets its timeline: the daemon projects it from the
@@ -1036,15 +1309,18 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   // Pause, Stop and Resume act on the run's timeline — a pause lands at a tag
   // boundary, a resume continues from a checkpointed tag — so they live with
   // the strip rather than in the heading, and stay reachable when it is folded.
+  // Each of these asks the runtime to act, so none can while it is offline.
+  const offline = daemon.state === "offline";
   const runControls =
-    (phase === "observing" && run) || (isPaused && run) ? (
+    !readOnly && ((phase === "observing" && run) || (isPaused && run)) ? (
       <span className="run-controls" role="group" aria-label="Run controls">
         {isPaused && run ? (
           <button
             className="primary-button"
             onClick={() => void requestResume()}
             type="button"
-            title="Restores the resume point's files and agents, then continues the queue"
+            disabled={offline}
+            title={offline ? "Runtime offline" : "Restores the resume point's files and agents, then continues the queue"}
           >
             Resume
           </button>
@@ -1054,9 +1330,11 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             className="secondary-button"
             onClick={() => void requestPause()}
             type="button"
-            disabled={isStopping || isPausing}
+            disabled={offline || isStopping || isPausing}
             title={
-              isPausing
+              offline
+                ? "Runtime offline"
+                : isPausing
                 ? "The current tag has to close first"
                 : "Checkpoints at the next tag boundary, then parks the run"
             }
@@ -1064,14 +1342,27 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             {isPausing ? "Pausing…" : "Pause"}
           </button>
         ) : null}
+        {((phase === "observing" && run?.status === "running") || isPaused) && run ? (
+          <button
+            className="secondary-button"
+            onClick={() => void previewMutation()}
+            type="button"
+            disabled={offline || mutating || sourceErrors.length > 0 || run.mutation?.status === "pending"}
+            title={offline ? "Runtime offline" : "Shows what changing the run to the edited source would do, then applies it"}
+          >
+            {mutating || run.mutation?.status === "pending" ? "Applying…" : "Apply edits"}
+          </button>
+        ) : null}
         {(phase === "observing" || isPaused) && run ? (
           <button
             className="secondary-button"
             onClick={() => void requestStop()}
             type="button"
-            disabled={isStopping}
+            disabled={offline || isStopping}
             title={
-              isStopping
+              offline
+                ? "Runtime offline"
+                : isStopping
                 ? "The current tag has to close first"
                 : isPaused
                   ? "Gives the paused run up, which frees its team; its checkpoints stay on disk"
@@ -1127,6 +1418,18 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     setInspector(DEFAULT_INSPECTOR);
   }
 
+  const assistantTerminal = (
+    <button
+      type="button"
+      className="terminal-button"
+      onClick={() => setTerminalAgent(ASSISTANT)}
+      disabled={daemon.state !== "live" || switchingChat || !conversationId}
+      aria-haspopup="dialog"
+    >
+      Inspect terminal
+    </button>
+  );
+
   function askAboutStep(request: string) {
     setPrompt(request);
     if (builderWidth === 0) setBuilder(DEFAULT_BUILDER);
@@ -1149,6 +1452,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             serveUrl={historyUrl}
             activeId={selectedId ?? conversationId}
             onSwitchingChange={setSelectingChat}
+            readOnly={readOnly}
+            offline={daemon.state === "offline"}
             mobile={historyDrawer}
             revision={`${historyRevision}:${messages.length}`}
             collapsed={!historyDrawer && !historyOpen}
@@ -1196,8 +1501,19 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
             <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
-            <div className="conversation-actions"><SettingsMenu />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+            <div className="conversation-actions"><SettingsMenu onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
           </header>
+          {daemon.state === "offline" ? (
+            // The one place the outage is reported: the sidebar and composer
+            // defer to it. Amber, since it clears by itself once the runtime
+            // answers the next health probe.
+            <div className="runtime-offline" role="status" title={`${historyUrl}: ${daemon.reason}`}>
+              <i aria-hidden="true" />
+              <span><strong>Runtime offline</strong> · reconnecting…</span>
+              <span className="runtime-offline-hint">Start it with <code>omar up -s &lt;session&gt;</code></span>
+              <button type="button" className="link-button" onClick={() => setHealthProbe((n) => n + 1)}>Retry now</button>
+            </div>
+          ) : null}
           <div className="messages" ref={threadRef}>
             {messages.length > 0 ? <div className="date-divider">Conversation</div> : null}
             {messages.length === 0 && snapshot ? (
@@ -1213,12 +1529,16 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             {assistantBusy ? <Waiting /> : null}
             {phase === "spawning" ? <Waiting label="Starting the run" /> : null}
           </div>
-          <QuoteSelection threadRef={threadRef} onQuote={(text) => { setQuote(text); composerRef.current?.focus(); }} />
+          {readOnly ? null : <QuoteSelection threadRef={threadRef} onQuote={(text) => { setQuote(text); composerRef.current?.focus(); }} />}
 
-          {error ? <div className="connection-error">{error}</div> : null}
-          {daemon.state === "offline" ? <div className="connection-error" role="status">Cannot reach the runtime at {historyUrl}.</div> : null}
+          {error ? (
+            <div className="connection-error" role="alert">
+              <span>{error}</span>
+              <button type="button" className="error-dismiss" aria-label="Dismiss error" onClick={() => setError("")}>×</button>
+            </div>
+          ) : null}
 
-          {selection.length > 0 ? (
+          {selection.length > 0 && !readOnly ? (
             <div className="selection-bar">
               <span className="selection-label">
                 [{selection.join(", ")}] selected
@@ -1233,6 +1553,15 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             </div>
           ) : null}
 
+          {readOnly ? (
+            // Nothing here writes, so the composer gives way to saying so.
+            <div className="prompt-box view-only">
+              <div className="composer-tools">
+                <span className="composer-status view-only-badge" role="status">View only</span>
+                {assistantTerminal}
+              </div>
+            </div>
+          ) : (
           <form className="prompt-box" onSubmit={(event) => void submitPrompt(event)}>
             {quote ? (
               <div className="composer-quote">
@@ -1268,26 +1597,17 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                   <span className="composer-status">
                     {daemon.state === "demo"
                       ? "Demo topology — relaunch with OMAR_SERVE_URL to deploy"
-                      : `Cannot reach omar serve at ${serveUrl}`}
+                      : "Runtime offline"}
                   </span>
                 ) : (
                   <BackendMenu
                     key={conversationId}
                     serveUrl={hydratedUrl ?? serveUrl}
                     live={daemon.state === "live"}
+                    onConnectMore={readOnly ? undefined : () => setBackendsOpen(true)}
                   />
                 )}
-                {!isDemo ? (
-                  <button
-                    type="button"
-                    className="terminal-button"
-                    onClick={() => setTerminalAgent(ASSISTANT)}
-                    disabled={daemon.state !== "live" || switchingChat || !conversationId}
-                    aria-haspopup="dialog"
-                  >
-                    Inspect terminal
-                  </button>
-                ) : null}
+                {!isDemo ? assistantTerminal : null}
                 {!isDemo ? (
                   <button
                     type="button"
@@ -1308,14 +1628,17 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                   className="send-button"
                   type="submit"
                   aria-label="Draft workflow"
-                  disabled={(switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning"}
+                  // The draft stays in the box; only sending waits for the runtime.
+                  disabled={(switchingChat || (!isDemo && !conversationId)) || assistantBusy || phase === "spawning" || daemon.state === "offline"}
+                  title={daemon.state === "offline" ? "Runtime offline" : undefined}
                 >
                   <WorkflowIcon name="send" size={19} />
                 </button>
               </div>
             </div>
           </form>
-          <p className="composer-footnote">OMAR can make mistakes. Review changes before running.</p>
+          )}
+          {readOnly ? null : <p className="composer-footnote">OMAR can make mistakes. Review changes before running.</p>}
         </aside>
 
         {snapshot ? (
@@ -1367,6 +1690,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                     disabled={!canRun || applyingConfiguration || switchingChat || sourceErrors.length > 0}
                     aria-haspopup="dialog"
                     aria-label={retrying ? "Run again" : "Deploy"}
+                    title={daemon.state === "offline" ? "Runtime offline" : undefined}
                   >
                     <WorkflowIcon name="arrow" size={14} /> {retrying ? "Run again" : "Run workflow"}
                   </button>
@@ -1399,12 +1723,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             // Agents outlive the run that spawned them, so a finished run can
             // still be opened; before a run there is nothing behind the node.
             highlight={timelineOpen ? highlighted : undefined}
+            focus={shownTab === "properties" ? propertyFocus : undefined}
             onOpenTerminal={canRun && run ? setTerminalAgent : undefined}
             // A web agent has no pane; double-clicking it opens the panel it is
             // answered through instead, which is the only thing there is.
             onOpenPanel={run ? setPanelAgent : undefined}
           />
-          {inspected ? <StepInspector key={`${serveUrl}:${inspected}`} component={inspected} snapshot={snapshot} source={source} editable={canRun && !switchingChat && (!run || isRunFinished(run.status))} onApply={applyStepConfiguration} onClose={() => setInspected(null)} onEdit={editSource} onAsk={askAboutStep} /> : null}
+          {inspected ? <StepInspector key={`${serveUrl}:${inspected}`} component={inspected} snapshot={snapshot} source={source} readOnly={readOnly} editable={canRun && !readOnly && !switchingChat && (!run || isRunFinished(run.status))} onApply={applyStepConfiguration} onClose={() => setInspected(null)} onEdit={editSource} onAsk={askAboutStep} /> : null}
           </div>
           {timelineOpen ? (
             <Timeline
@@ -1426,7 +1751,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               onSelectCheckpoint={(id) =>
                 setCheckpointPick(id && runId ? { run: runId, id } : null)
               }
-              onRollBack={(id) => void requestRollback(id)}
+              onRollBack={readOnly ? undefined : (id) => void requestRollback(id)}
               onScrub={(next) => {
                 // Scrubbing takes the strip off the run: the operator is
                 // looking at a tag, not at where execution has reached.
@@ -1470,12 +1795,22 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <div className="tabs" role="tablist">
             <button
               role="tab"
-              aria-selected={tab === "source"}
-              className={tab === "source" ? "active" : ""}
+              aria-selected={shownTab === "source"}
+              className={shownTab === "source" ? "active" : ""}
               onClick={() => setTab("source")}
             >
               Source
             </button>
+            {properties.length ? (
+              <button
+                role="tab"
+                aria-selected={shownTab === "properties"}
+                className={shownTab === "properties" ? "active" : ""}
+                onClick={() => setTab("properties")}
+              >
+                Properties <small className="tab-count">{properties.filter((verdict) => verdict.proved).length}/{properties.length}</small>
+              </button>
+            ) : null}
             {/* Events only exist once something has been deployed. */}
             {isDeployed ? (
               <button
@@ -1489,19 +1824,58 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             ) : null}
           </div>
 
-          {tab === "source" ? (
+          {shownTab === "source" ? (
             <>
-            {Object.keys(design?.files ?? {}).length > 0 ? <button className="secondary-button" onClick={() => setFilesOpen(true)}>View companion files ({Object.keys(design?.files ?? {}).length})</button> : null}
+            {!readOnly && Object.keys(design?.files ?? {}).length > 0 ? <button className="secondary-button" onClick={() => setFilesOpen(true)}>View companion files ({Object.keys(design?.files ?? {}).length})</button> : null}
+            {mutationPlan && !readOnly ? (
+              <section className="mutation-plan" aria-label="Mutation plan">
+                <strong>{mutationPlan.fromAssistant ? "OMAR proposes changes to the run" : "Apply your changes to the run?"}</strong>
+                <span>
+                  Review them in the source below: green lines are added, red lines removed.{" "}
+                  {run?.status === "paused"
+                    ? "The paused run takes them and stays paused."
+                    : "It pauses at the next tag boundary, changes, and resumes."}
+                </span>
+                <div className="mutation-plan-actions">
+                  <button className="primary-button" type="button" disabled={mutating} onClick={() => void applyMutation()}>
+                    {mutating ? "Applying…" : "Apply"}
+                  </button>
+                  <button className="secondary-button" type="button" disabled={mutating} onClick={cancelMutation}>
+                    {mutationPlan.fromAssistant ? "Decline" : "Cancel"}
+                  </button>
+                </div>
+              </section>
+            ) : null}
             <OmarEditor
               source={source}
+              base={diffBase}
               filename={filename}
               status={run ? run.status : "draft"}
               errors={sourceErrors}
               checking={checking}
-              onSourceChange={setSource}
+              readOnly={readOnly}
+              onSourceChange={(next) => {
+                setSource(next);
+                // A plan describes the text it was made from; edited, the
+                // text is the operator's own.
+                setMutationPlan(null);
+                declinedRef.current = null;
+              }}
               onFilenameChange={setFilename}
             />
             </>
+          ) : shownTab === "properties" ? (
+            <PropertiesPanel
+              verdicts={properties}
+              selected={property}
+              onSelect={setProperty}
+              stale={propertiesStale}
+              checking={checkingProperties}
+              onRecheck={readOnly ? undefined : () => void recheckProperties()}
+              onOpenEditor={readOnly ? undefined : () => void openProofs()}
+              opening={openingProofs}
+              error={propertyError}
+            />
           ) : (
             <div className="event-strip" role="tabpanel">
               {events.length ? (
@@ -1547,11 +1921,15 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         />
       ) : null}
 
-      {filesOpen ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); }} onClose={() => setFilesOpen(false)} /> : null}
+      {filesOpen && !readOnly ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); }} onClose={() => setFilesOpen(false)} /> : null}
+      {backendsOpen && !readOnly ? (
+        <BackendsPage serveUrl={hydratedUrl ?? serveUrl} onClose={() => setBackendsOpen(false)} />
+      ) : null}
       {terminalAgent ? (
         <AgentTerminal
           serveUrl={serveUrl}
           agent={terminalAgent}
+          readOnly={readOnly}
           onClose={() => setTerminalAgent(null)}
         />
       ) : null}

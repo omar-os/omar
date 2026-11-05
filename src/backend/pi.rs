@@ -3,6 +3,7 @@ use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
+use super::{connection, Connection, Login};
 use super::{Backend, Kind, Launch, NotReady, PaneSetup, Readiness, Target, WRITE_TIMEOUT};
 use crate::manager::{
     materialize_mcp_context_file, mcp_ea_dir, omar_server_exe, shell_single_quote,
@@ -24,6 +25,48 @@ impl Backend for Pi {
     }
     fn default_command(&self) -> &'static str {
         "pi"
+    }
+    /// Pi has no status command, so this lists the providers in its own
+    /// store (names only), then the keys most people sign in with. The one
+    /// place OMAR opens a credential file.
+    fn connection(&self, _program: &str) -> Connection {
+        let dir = std::env::var_os("PI_CODING_AGENT_DIR")
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".pi").join("agent")));
+        let store = match dir {
+            Some(dir) => std::fs::read_to_string(dir.join("auth.json")),
+            None => Err(std::io::ErrorKind::NotFound.into()),
+        };
+        store_connection(store, connection::env_credential(connection::PROVIDER_KEYS))
+    }
+    fn install_command(&self) -> Option<&'static str> {
+        Some("npm install -g @earendil-works/pi-coding-agent")
+    }
+    /// Pi signs in only from inside its TUI.
+    fn login(&self, _headless: bool) -> Option<Login> {
+        Some(Login {
+            args: &[],
+            note: Some("In pi, type /login and pick a provider, then /quit."),
+        })
+    }
+    fn credential_vars(&self) -> &'static [&'static str] {
+        connection::PROVIDER_KEYS
+    }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: &[],
+            note: Some("In pi, type /logout and pick the provider, then /quit."),
+        })
+    }
+    /// Its default model, through whichever provider that needs: a stored
+    /// key can be rejected, or not reach that model.
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
+        Some(vec![
+            "-p",
+            "--no-session",
+            "--no-tools",
+            connection::CHECK_PROMPT,
+        ])
     }
     fn readiness(&self, _command: &str) -> Readiness {
         Readiness::Channel
@@ -124,8 +167,73 @@ fn launch_command(launch: &Launch<'_>) -> Result<String> {
     ))
 }
 
+/// Pi's sign-in from its store and any provider key. Only a missing store or
+/// one that parses can say signed out; anything else is unknown.
+fn store_connection(store: std::io::Result<String>, env: Option<String>) -> Connection {
+    let stored = match store {
+        Ok(text) => stored_providers(&text).ok_or("pi's auth.json is not a store OMAR can read"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(_) => Err("cannot read pi's auth.json"),
+    };
+    match (stored, env) {
+        (Ok(names), _) if !names.is_empty() => Connection::connected(names.join(", ")),
+        (_, Some(name)) => Connection::connected(name),
+        (Ok(_), None) => Connection::SignedOut,
+        (Err(reason), None) => Connection::unknown(reason),
+    }
+}
+
+/// `auth.json` maps each provider signed in through `/login` to its credential.
+/// Only the names are kept; each credential is skipped as it is parsed.
+fn stored_providers(text: &str) -> Option<Vec<String>> {
+    serde_json::from_str::<std::collections::BTreeMap<String, serde::de::IgnoredAny>>(text)
+        .ok()
+        .map(|providers| providers.into_keys().collect())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stored_providers_are_the_keys_of_auth_json() {
+        use super::stored_providers;
+        assert_eq!(
+            stored_providers(r#"{"anthropic":{"type":"oauth"},"openai":{"type":"api_key"}}"#)
+                .unwrap(),
+            ["anthropic", "openai"]
+        );
+        assert_eq!(stored_providers("{}"), Some(vec![]));
+        assert_eq!(stored_providers("not json"), None);
+    }
+
+    #[test]
+    fn only_a_missing_or_empty_store_says_signed_out() {
+        use super::{store_connection, Connection};
+        use std::io::{Error, ErrorKind};
+        let missing = || Err(Error::from(ErrorKind::NotFound));
+        assert_eq!(store_connection(missing(), None), Connection::SignedOut);
+        assert_eq!(
+            store_connection(Ok("{}".into()), None),
+            Connection::SignedOut
+        );
+        assert_eq!(
+            store_connection(Ok(r#"{"openai":{}}"#.into()), None),
+            Connection::connected("openai")
+        );
+        // Unreadable or corrupt: nobody knows, unless a key settles it.
+        assert!(matches!(
+            store_connection(Ok("{corrupt".into()), None),
+            Connection::Unknown { .. }
+        ));
+        assert!(matches!(
+            store_connection(Err(Error::from(ErrorKind::PermissionDenied)), None),
+            Connection::Unknown { .. }
+        ));
+        assert_eq!(
+            store_connection(Ok("{corrupt".into()), Some("OPENAI_API_KEY".into())),
+            Connection::connected("OPENAI_API_KEY")
+        );
+    }
+
     use super::*;
     #[test]
     fn pi_launch_materializes_scoped_bridge_and_resumes_only_saved_chat() {
