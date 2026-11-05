@@ -148,16 +148,12 @@ test("the diagram reflects live reaction state from the run, relayed by serve", 
   await expect(reactions).toHaveCount(3);
   await expect(page.locator(".omar-reaction.completed")).toHaveCount(1);
   await expect(page.locator(".omar-reaction.idle")).toHaveCount(2);
-  // Numbered within the team instance, named by the agent alone, summarised
-  // by the prompt in one line that never widens the card.
+  // Legacy snapshots derive readable titles from their actual prompts.
   const first = reactions.first();
   await expect(first.locator(".omar-reaction-index")).toHaveText("01");
-  await expect(first.locator(".omar-reaction-name")).toHaveText("planner");
-  await expect(first.locator(".omar-reaction-description")).toHaveText(/^Draft a release plan.*…$/);
-  await expect(reactions.nth(1).locator(".omar-reaction-description")).toHaveText("Critique the plan: plan");
-  // Reactions are anonymous in OMAR, so the agent is the headline.
-  await expect(page.locator(".omar-reactions")).toContainText("planner");
-  await expect(page.locator(".omar-reactions")).toContainText("reviewer");
+  await expect(first.locator(".omar-reaction-name")).toContainText("Draft a release plan");
+  await expect(first.locator(".omar-reaction-description")).toHaveText(/^Draft a release plan/);
+  await expect(reactions.nth(1).locator(".omar-reaction-name")).toContainText("Critique the plan");
 
   // Effects written during the run mark their action ports as carrying a value.
   await expect(page.locator(".omar-action.filled")).toHaveCount(2);
@@ -217,7 +213,7 @@ test("a reaction's deadline is drawn as a stopwatch on its chevron", async ({
   expect(markedBox.width).toBeGreaterThan(plainBox.width);
 });
 
-test("a web component's panel opens from the diagram, and answers it", async ({
+test("a manual task is answered inside its workflow step and retains rejected drafts", async ({
   page,
 }) => {
   // Its own topology: one reaction on the `Web` backend. Kept apart from the
@@ -233,13 +229,13 @@ test("a web component's panel opens from the diagram, and answers it", async ({
   await draftUntilProposed(page);
   await deploy(page);
 
-  const panel = page.getByRole("dialog", { name: /Port panel for/ });
-  // The handoff stays visible even when its dialog is closed.
+  const panel = page.getByRole("complementary", { name: "Step details" });
+  // The compact notice stays visible while the step inspector is closed.
   await expect(panel).toBeHidden();
-  await expect(page.locator(".run-waiting")).toContainText("Waiting for your response");
-  await page.getByRole("button", { name: "Open response panel" }).click();
+  await expect(page.locator(".run-waiting")).toContainText("Provide critique");
+  await page.getByRole("button", { name: "Open task" }).click();
   await expect(panel).toBeVisible();
-  await panel.getByRole("button", { name: "Close", exact: true }).click();
+  await panel.getByRole("button", { name: "Close step details", exact: true }).click();
   await expect(panel).toBeHidden();
 
   // Drawn as reachable before it is touched: exactly one reaction on the
@@ -247,33 +243,52 @@ test("a web component's panel opens from the diagram, and answers it", async ({
   const web = page.locator(".omar-reaction.web");
   await expect(web).toHaveCount(1, { timeout: 30_000 });
   await expect(page.locator(".omar-reaction")).toHaveCount(3);
-  await expect(web).toContainText("reviewer");
+  await expect(web.locator(".omar-reaction-name")).toContainText("Request human response");
 
   // Double-clicking a reaction opens the agent that runs it; this one has no
   // pane, so what opens is its panel.
   await web.dblclick();
 
   await expect(panel).toBeVisible();
+  await expect(panel.getByRole("region", {name:"Manual task"})).toBeVisible();
+  await expect(page.locator("dialog[open]")).toHaveCount(0);
+  await panel.getByText("Technical details", { exact: true }).click();
   await expect(panel).toContainText("flow.reviewer");
-  // Scoped to this component's wiring: what it reads, and what it may set.
-  await expect(panel.locator(".port-list").first()).toContainText("flow.plan");
-  await expect(panel).toContainText("flow.critique");
+  // Technical details retain the input and the declared output contract.
+  await expect(panel.locator(".step-response")).toContainText("flow.plan");
+  await expect(panel.locator(".port-waiting-contract")).toHaveText("critique");
 
   // Only what this invocation is allowed to write, with its declared type.
   const waiting = panel.locator(".port-waiting");
   await expect(waiting).toHaveCount(1);
-  await expect(waiting.locator(".port-field-name")).toHaveText("flow.critique");
-  await expect(waiting.locator(".port-field-type")).toHaveText("string");
-
-  await waiting.getByLabel("flow.critique (string)").fill("looks fine");
-  await waiting.getByRole("button", { name: /^Send/ }).click();
+  await expect(waiting.locator(".port-field-name")).toHaveText("Critique");
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    expect(await panel.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    if (width === 390) expect((await panel.boundingBox())!.height).toBeGreaterThan(300);
+  }
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await waiting.getByRole("textbox").fill("looks fine");
+  await page.route("**/v1/runs/*/panel", async route => {
+    if (route.request().method() === "POST") return route.fulfill({ status:400, json:{error:"Test rejection"} });
+    return route.continue();
+  });
+  await waiting.getByRole("button", { name: "Submit result and continue" }).click();
+  await expect(waiting.getByRole("alert")).toContainText("Test rejection");
+  await expect(waiting.getByRole("textbox")).toHaveValue("looks fine");
+  await page.unroute("**/v1/runs/*/panel");
+  const response = page.waitForRequest(request =>
+    request.method() === "POST" && /\/v1\/runs\/[^/]+\/panel$/.test(new URL(request.url()).pathname));
+  await waiting.getByRole("button", { name: "Submit result and continue" }).click();
+  // Friendly labels still submit to the exact qualified runtime output.
+  expect((await response).postDataJSON().values).toEqual({ "flow.critique": "looks fine" });
 
   // Answered, so it leaves the queue; the panel stays open on the component.
   await expect(panel.locator(".port-waiting")).toHaveCount(0);
-  await expect(panel).toContainText("Nothing is waiting on you");
+  await expect(panel).toContainText("Response accepted");
 
-  // And it closes, rather than living beside the events forever.
-  await panel.getByRole("button", { name: "Close" }).click();
+  // Closing the inspector returns to the full canvas.
+  await panel.getByRole("button", { name: "Close step details" }).click();
   await expect(panel).toBeHidden();
 });
 
@@ -1963,7 +1978,7 @@ test("an edge into a reaction actually reaches it", async ({ page }) => {
   const strays = async () => {
     const found: string[] = [];
     for (const reaction of reactions) {
-      const id = (await reaction.getAttribute("aria-label"))?.replace(/^Inspect /, "");
+      const id = await reaction.getAttribute("data-component");
       const box = (await reaction.boundingBox())!;
       const edges = page.locator(`[data-id$="${id}"]`);
       if ((await edges.count()) === 0) found.push(`${id}: no edge`);
@@ -2791,7 +2806,7 @@ test("failed manual handoffs explain the cause and can restart after reload", as
   const feedback = page.locator(".run-failure");
   await expect(feedback).toContainText("No response was submitted for flow.reviewer within 5 minutes");
   await expect(page.locator(".omar-reaction.running")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Open response panel" })).toBeHidden();
+  await expect(page.getByRole("button", { name: "Open task" })).toBeHidden();
   await dragDivider(page, "Resize the conversation", -600);
   await expect(feedback).toBeVisible();
   const again = page.getByRole("button", { name: "Run again", exact: true });

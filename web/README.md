@@ -161,9 +161,55 @@ npm run test:conformance
 It skips itself when those binaries are absent, so a Node-only checkout is
 unaffected. `OMAR_BIN` and `OMARC_BIN` override the paths.
 
+### Manual response panels
+
+Optional companion file `omar.response.json` provides human-facing copy for Web
+steps. It does not change port types, contracts, execution, or authorization:
+
+```json
+{
+  "steps": {
+    "prepare.chatgpt": {
+      "title": "Paste the prepared production packet",
+      "summary": "Complete preparation in ChatGPT, then return its result here.",
+      "instructions": ["Follow the full task instructions in ChatGPT.", "Paste the verified result below."],
+      "next": "A valid packet starts the connected production step.",
+      "outcomes": {
+        "prepare.packet": {"label": "Prepared packet", "format": "json", "help": "Paste the complete JSON packet."},
+        "prepare.blocked": {"label": "Blocker report", "format": "json", "help": "Describe what prevents preparation."}
+      }
+    }
+  }
+}
+```
+
+Existing workflows still work without this file. Setup-review inputs explicitly
+marked `mode: setup_review_only` or `productionAuthorized: false`, with a wired
+`blocked` output, surface their setup requirements and only offer reporting a
+blocker. Providing new setup details requires editing the request; submitting a
+blocker is not authorization to produce or publish.
+
 `tests/fixtures/diagram-snapshot.v1.json` was captured from a real `omar serve`
 run. `tests/protocol-contract.test.mjs` asserts the client's and renderer's
 requirements against it, so a runtime field rename fails here rather than
 silently. `tests/fake-serve.mjs` replays that snapshot over the real wire
 protocol, which is how the browser test runs without a model, a Lean toolchain,
 or tmux.
+
+### Descriptive workflow steps
+
+The assistant generates an action title and a short explanation for every task
+and code reaction using `display("Title", "Description")`. This metadata follows
+the optional deadline and precedes the prompt/code body. It never changes
+runtime identifiers, wiring, contracts, or execution. Proposal validation rejects
+missing copy, role-only titles and placeholder labels, returning the affected
+step IDs to the assistant for correction before publishing the proposal.
+
+Cards show the title on up to two lines; selecting a card shows its full title
+and explanation. Hover also exposes the complete copy. Backend names stay in
+the small execution line. Older saved workflows render without migration using
+their actual prompts, or readable team names and declared inputs/outputs for
+code steps. Those fallbacks do not infer code semantics or verify integrations.
+Changing instructions, triggers, or output contracts in the step editor clears
+old copy so the preview derives its explanation from the revised instructions.
+An assistant revision must supply fresh explicit metadata for every step.

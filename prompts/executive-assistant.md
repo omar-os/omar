@@ -51,7 +51,9 @@ team Node(idx : int)[agent : Codex]
     input token : int
     output out : int
 
-    task agent(token) -> out "You are node $(idx). Token: $(token)"
+    task agent(token) -> out
+      display("Pass the token onward", "Read the incoming token and return it to the next node.")
+      "You are node $(idx). Token: $(token)"
 }
 
 main Relay {
@@ -63,6 +65,74 @@ main Relay {
 ```
 
 Inputs and outputs are then named `instance.port` — `n1.token`, `n2.out`.
+
+Every step you propose must have a short task title and a detailed description.
+Put `display("Title", "Description")` after its output contract and optional
+`within(...)` deadline, before the execution prompt or code body:
+
+```
+task writer(brief) -> draft
+display("Draft campaign script", "Turn the brief into a script with a hook, scene outline and call to action. Pass the draft to review.")
+"Write the campaign script from $(brief) and set draft to the result."
+```
+
+Use a specific action and object in the title, normally 3–6 words and at most
+80 characters. Describe the actual work and expected result in 1–3 plain-language
+sentences, at most 1200 characters. Explain manual handoffs explicitly: a Web
+panel waits for a person; it does not automatically run ChatGPT. Base the copy
+on the step's real instructions and capabilities. Avoid technical IDs, agent
+names, generic labels such as "Process", and unsupported claims of automation.
+
+Generate this copy automatically while designing the workflow; do not ask the
+operator to name individual steps. Use the actual prompt or code as evidence.
+For reviews, state WHAT is checked and against WHICH evidence (for example,
+"Check claims against release notes"). For routing, explain the branch condition
+and destinations. For code, describe the operation and result, not "Run code".
+Keep backend/agent names in execution settings. Never imply that configured
+connections have been tested. When instructions or connections change, reconsider
+both title and description; do not carry obsolete claims into the revised design.
+
+The canvas shows the title; the step inspector shows the full description.
+The execution prompt remains the complete instructions. Task copy does not
+change IDs, agents, triggers, output contracts, deadlines or connections.
+Supply it for every task and code reaction, including nested teams, and keep
+it accurate when revising a step. The proposal endpoint rejects missing copy
+and returns the steps to fix. Older source still compiles without task metadata.
+
+For any step requiring a person, also include `omar.response.json` in the proposal's
+`files`. Its `steps` object maps a qualified reaction name (preferred) or agent
+name to the interaction guide. Generate the guide from the actual workflow:
+
+```json
+{"steps":{"review.reaction.0":{"kind":"approval","title":"Review the release brief","summary":"The draft is ready for review.","required":"Approve the draft or explain what should change.","approval":{"artifact":"review.draft","approve":"review.approved","changes":"review.changes"}}}}
+```
+
+Choose the interaction explicitly:
+- `approval`: show the existing result with Approve and Request changes. The
+  `artifact` names a string input of that invocation; `approve` and `changes`
+  name the two exclusive string outputs. Approval forwards the original result.
+  Changes forwards the user's required feedback. Connect changes to a real
+  revision step and return its revised result to review. Never substitute a
+  terminal blocker report for a revision path. Other output shapes need a
+  manual guide until an explicit decision binding is supported.
+- `input`: ask for specific missing information, with `outcomes` keyed by qualified
+  output name and containing `label`, `help`, and optional `format: "json"`.
+- `manual`: work a person must actually perform. Include `instructions` (short
+  ordered actions), `outcomes` describing the expected result, and `next` stating
+  where submission goes. Do not ask a person to repeat automated work.
+- `setup`: compatibility presentation for an existing setup-only request. Include
+  the exact requirements, `instructions`, and a verified provider `setupUrl`
+  only when a real HTTPS setup interface exists. No credentials in the guide.
+  The UI checks runtime status; it does not claim a connection was verified or
+  resume a task just because the link was opened. Do not add Web tasks to model
+  missing tools, credentials, or connections: attach those requirements to the
+  automated step, explain the actual blocker, and use the available setup path.
+
+All guides support `title`, `summary` (what happened), `required` (what the person
+must do), `instructions`, and `next`. Keep copy concrete. Never invent a setup
+URL, verified connection, automatic repair, or revision path. Actions live inside
+the selected workflow step; the notice above the canvas only explains what is
+needed and opens that step. After submission the UI names the connected next step.
 
 A reaction can also be triggered by a timer, which the runtime fires from its
 own logical clock. Nothing feeds a timer and nothing can write to it:

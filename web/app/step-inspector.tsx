@@ -1,14 +1,16 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { locateStep, replaceStep, type StepSource } from "./lib/step-source";
 import type { DiagramSnapshot } from "./lib/protocol";
 import { formatDuration } from "./lib/protocol";
 import { componentName } from "./diagram/diagram-canvas";
+import { taskCopy } from "./lib/task-copy";
 import { WorkflowIcon } from "./workflow-icon";
 
 /** Details come from the compiled topology, never from prototype sample data. */
-export function StepInspector({ component, snapshot, source, editable, readOnly = false, onApply, onClose, onEdit, onAsk }: {
+export function StepInspector({ component, snapshot, source, editable, readOnly = false, children, onApply, onClose, onEdit, onAsk }: {
+  children?: ReactNode;
   source: string;
   editable: boolean;
   /** Details only: nothing here may lead to a change. */
@@ -20,21 +22,24 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
   onEdit: () => void;
   onAsk: (request: string) => void;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const reaction = snapshot.reactions.find((item) => componentName(item.id) === component);
   const port = snapshot.ports.find((item) => componentName(item.id) === component);
   const timer = (snapshot.timers ?? []).find((item) => componentName(item.id) === component);
   const agent = snapshot.agents.find((item) => item.id === reaction?.agent);
   const configuration = useMemo(() => reaction ? locateStep(source, snapshot, reaction) : null, [source, snapshot, reaction]);
-  const name = reaction ? (/(?:^|\.)reaction\.\d+$/.test(reaction.name) ? agent?.name ?? reaction.name : reaction.name) : port?.name ?? timer?.name ?? component;
+  const copy = reaction ? taskCopy(reaction, agent, snapshot) : null;
+  const name = copy?.title ?? port?.name ?? timer?.name ?? component;
   const label = (id: string) => snapshot.ports.find((item) => item.id === id)?.name ?? (snapshot.timers ?? []).find((item) => item.id === id)?.name ?? componentName(id);
   const connectionNames = (ids: string[]) => ids.length ? ids.map((id) => <span className="step-connection" key={id}><i />{label(id)}</span>) : <span className="step-empty">None declared</span>;
 
   return (
-    <aside className="step-inspector" aria-label="Step details">
-      <header><span className="inspector-type">{reaction ? "TASK" : timer ? "TIMER" : port?.kind === "action" ? "ACTION" : "CONNECTION"}</span><button type="button" aria-label="Close step details" onClick={onClose}><WorkflowIcon name="close" size={16} /></button></header>
+    <aside className={`step-inspector${children ? " has-response" : ""}${expanded ? " expanded" : ""}`} aria-label="Step details">
+      <header><span className="inspector-type">{reaction ? "TASK" : timer ? "TIMER" : port?.kind === "action" ? "ACTION" : "CONNECTION"}</span><div className="step-inspector-actions">{children ? <button type="button" aria-label={expanded ? "Collapse step" : "Expand step"} aria-expanded={expanded} onClick={() => setExpanded(!expanded)}><WorkflowIcon name={expanded ? "chevron" : "plus"} size={16} /></button> : null}<button type="button" aria-label="Close step details" onClick={onClose}><WorkflowIcon name="close" size={16} /></button></div></header>
       <h3>{name}</h3>
-      <p className="inspector-description">{component}</p>
-      {reaction ? <>
+      {children ? null : <p className="inspector-description">{copy?.description ?? component}</p>}
+      {children}
+      {reaction ? <details className="step-configuration" open={children ? undefined : true}><summary>Step configuration</summary>
         {!configuration ? <>
         <div className="inspector-field"><span>Execution backend</span><div className="step-model"><i>{(agent?.backend ?? "?").slice(0, 1)}</i>{agent?.backend ?? "Not specified"}<span className={`step-status ${reaction.status}`}>{reaction.status}</span></div></div>
         <div className="inspector-field"><span>Output contract</span><div className="step-contract">{reaction.contract || "No contract declared"}</div></div>
@@ -48,7 +53,7 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
         <button type="button" className="step-edit" onClick={onEdit}>Edit prompt & backend in source <WorkflowIcon name="arrow" size={14} /></button>
         <button type="button" className="step-ask" onClick={() => onAsk(`Update the prompt or execution backend for ${component}: `)}>Edit with OMAR</button>
         </>}
-      </> : null}
+      </details> : null}
       {port ? <>
         <div className="inspector-field"><span>Value type</span><strong>{port.type}</strong></div>
         <div className="inspector-field"><span>Current value</span><pre className="step-contract">{port.value === null ? "Waiting for input" : typeof port.value === "string" ? port.value : JSON.stringify(port.value, null, 2)}</pre></div>

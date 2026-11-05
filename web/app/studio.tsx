@@ -6,15 +6,16 @@ import { QuoteSelection, withQuote } from "./quote-selection";
 import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
 import { Artifacts } from "./artifacts";
 import { DeployConfirmation, type DeployOptions } from "./deploy-confirmation";
+import { guideForFiles, responseGuide } from "./lib/response-guide";
 import { defaultRunTimeout, describeRunFailure } from "./lib/run-feedback";
 import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
 import { BackendsPage } from "./backends-page";
 import { SettingsMenu } from "./settings-menu";
-import { DiagramCanvas } from "./diagram/diagram-canvas";
+import { DiagramCanvas, componentName } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
-import { PortPanel } from "./port-panel";
+import { StepResponse } from "./port-panel";
 import { PropertiesPanel } from "./properties";
 import { Resizer } from "./resizer";
 import { useWorkflowNames } from "./lib/workflow-names";
@@ -280,10 +281,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [conversationId, setConversationId] = useState("");
   const workflowNames = useWorkflowNames(historyUrl);
   const [conversationTitle, setConversationTitle] = useState("What should the team do?");
-  /** The web agent whose port panel is open. A program may declare several,
-      each with its own ports and prompts, so this names one rather than
-      merging them into a shared view. */
-  const [panelAgent, setPanelAgent] = useState<string | null>(null);
+  /** Keep accepted responses visible after the invocation leaves the queue. */
+  const [responseReceipt, setResponseReceipt] = useState<{ run: string; reaction: string; text: string } | null>(null);
 
   /**
    * Which inputs the projection should treat as arriving.
@@ -485,7 +484,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     setQuote("");
     setError("");
     setTerminalAgent(null);
-    setPanelAgent(null);
+    setResponseReceipt(null);
     setSteps([]);
     setStepIndex(0);
     setTimelineOpen(false);
@@ -543,8 +542,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   async function answer(
     invocation: PendingInvocation,
     values: Record<string, unknown>,
+    receipt: string,
   ) {
-    if (!run || readOnly) return;
+    if (readOnly) throw new Error("This view is read-only.");
+    if (!run) throw new Error("This run is no longer waiting for a response.");
     setAnswering(true);
     const scope = scopeRef.current;
     setError("");
@@ -555,10 +556,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         values,
       });
       if (scope !== scopeRef.current) return;
+      setResponseReceipt({ run: run.run_id, reaction: componentName(invocation.reaction), text: receipt });
       await loadPanel(run.run_id);
     } catch (cause) {
       if (scope !== scopeRef.current) return;
       setError(describeError(cause));
+      throw cause;
     } finally {
       if (scope === scopeRef.current) setAnswering(false);
     }
@@ -596,7 +599,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             // must not undo a terminal event while persistence catches up.
             setPhase(latest.status === "failed" ? "failed" : "finished");
             setPending([]);
-            if (latest.status === "failed") setPanelAgent(null);
+            if (latest.status === "failed") setResponseReceipt(null);
             if (latest.error) setError(latest.error);
             return;
           }
@@ -665,7 +668,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             setRun(runRef.current);
             setPhase("failed");
             setPending([]);
-            setPanelAgent(null);
+            setResponseReceipt(null);
             const message = (event.payload as { message?: unknown }).message;
             setError(typeof message === "string" ? message : "The run failed.");
             void settle();
@@ -758,7 +761,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         setRun(null);
         setEvents([]);
         setPending([]);
-        setPanelAgent(null);
+        setResponseReceipt(null);
         setSelection([]);
         setTab("source");
         setError("");
@@ -871,6 +874,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   async function confirmDesign(options: DeployOptions) {
     if (!design || !["review", "finished", "failed"].includes(phase)) return;
     setConfirming(false);
+    setResponseReceipt(null);
     setPhase("spawning");
     const scope = scopeRef.current;
     setError("");
@@ -1169,7 +1173,26 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const failedRun = run?.status === "failed";
   const failureDetails = failedRun ? (run.error || error || "The run failed.") : "";
   const failure = failedRun ? describeRunFailure(failureDetails, snapshot?.agents ?? []) : null;
-  const manualStep = phase === "observing" ? pending[0] : undefined;
+  const manualStep = phase === "observing" ? pending.find(item => componentName(item.reaction) === inspected) ?? pending[0] : undefined;
+  const responseGuides = guideForFiles(design?.files);
+  const manualCopy = manualStep ? responseGuide(manualStep, (responseGuides[componentName(manualStep.reaction)] ?? responseGuides[manualStep.agent])) : null;
+  const receipt = responseReceipt?.run === run?.run_id ? responseReceipt : null;
+  const stepResponses = readOnly ? [] : pending.filter(item => componentName(item.reaction) === inspected);
+  function openResponse(agent: string) {
+    const invocation = pending.find(item => item.agent === agent);
+    const reaction = snapshot?.reactions.find(item => item.agent === `agent::${agent}` || item.agent === agent);
+    const component = invocation?.reaction ?? reaction?.id;
+    if (component) { setInspected(componentName(component)); setSelection([componentName(component)]); }
+  }
+  async function checkRequirement(invocation: PendingInvocation) {
+    if (!run || readOnly) throw new Error("No active run.");
+    const scope = scopeRef.current;
+    const next = await fetchPanel(serveUrl, run.run_id);
+    if (scope !== scopeRef.current) throw new Error("The workflow changed.");
+    setPending(next);
+    return next.some(item => item.task_id === invocation.task_id && item.agent === invocation.agent);
+  }
+
   // The compiler answers on every pause in typing. Debounced because a check
   // compiles a real program on disk, and aborted on the next keystroke so a
   // stale answer cannot land after a newer one.
@@ -1663,7 +1686,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               <h2>{snapshot?.team}</h2>
             </div>
             <div className="run-stats">
-              <span><small>{phase === "review" && failedRun ? "LAST RUN" : "STATUS"}</small>{run?.status ?? snapshot?.status}</span>
+              <span><small>{phase === "review" && failedRun ? "LAST RUN" : "STATUS"}</small>{manualCopy ? manualCopy.label : run?.status ?? snapshot?.status}</span>
               <span><small>TAG</small>{tag}</span>
               <span><small>LAG</small>{lag}</span>
             </div>
@@ -1702,13 +1725,15 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               <details><summary>Error details</summary><pre>{failureDetails}</pre></details>
             </div>
           ) : null}
-          {manualStep ? (
-            <div className="run-feedback run-waiting" role="status">
-              <strong>Waiting for your response · {manualStep.agent}</strong>
-              <p>This Web step needs a response from you. Open the response panel to read the task and submit its result.</p>
-              <button type="button" className="primary-button" onClick={() => setPanelAgent(manualStep.agent)}>Open response panel</button>
+          {manualStep && manualCopy ? (
+            <div className="workflow-notice run-waiting" role="status">
+              <span className="notice-indicator" aria-hidden="true" />
+              <div className="workflow-notice-copy"><strong>{manualCopy.label} · {manualCopy.title}</strong><p>{manualCopy.summary} {manualCopy.required}</p></div>
+              {pending.length > 1 ? <select aria-label="Waiting steps" value={manualStep.task_id} onChange={event => { const item = pending.find(item => item.task_id === Number(event.target.value)); if (item) { setInspected(componentName(item.reaction)); setSelection([componentName(item.reaction)]); } }}>{pending.map(item => <option key={item.task_id} value={item.task_id}>{responseGuide(item, (responseGuides[componentName(item.reaction)] ?? responseGuides[item.agent])).title}</option>)}</select> : null}
+              <button type="button" className="notice-action" onClick={() => { setInspected(componentName(manualStep.reaction)); setSelection([componentName(manualStep.reaction)]); }}>{manualCopy.action}</button>
             </div>
           ) : null}
+          {receipt ? <div className="workflow-notice response-receipt" role="status"><span className="notice-indicator" aria-hidden="true" /><p>{receipt.text}</p><button type="button" className="notice-action" aria-label="Dismiss response confirmation" onClick={() => setResponseReceipt(null)}>Dismiss</button></div> : null}
           <div className="topology-body">
           <DiagramCanvas
             snapshot={snapshot}
@@ -1720,11 +1745,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             highlight={timelineOpen ? highlighted : undefined}
             focus={shownTab === "properties" ? propertyFocus : undefined}
             onOpenTerminal={canRun && run ? setTerminalAgent : undefined}
-            // A web agent has no pane; double-clicking it opens the panel it is
-            // answered through instead, which is the only thing there is.
-            onOpenPanel={run ? setPanelAgent : undefined}
+            // Web tasks use the same step inspector as the rest of the workflow.
+            onOpenPanel={run ? openResponse : undefined}
           />
-          {inspected ? <StepInspector key={`${serveUrl}:${inspected}`} component={inspected} snapshot={snapshot} source={source} readOnly={readOnly} editable={canRun && !readOnly && !switchingChat && (!run || isRunFinished(run.status))} onApply={applyStepConfiguration} onClose={() => setInspected(null)} onEdit={editSource} onAsk={askAboutStep} /> : null}
+          {inspected ? <StepInspector key={`${serveUrl}:${inspected}`} component={inspected} snapshot={snapshot} source={source} readOnly={readOnly} editable={canRun && !readOnly && !switchingChat && (!run || isRunFinished(run.status))} onApply={applyStepConfiguration} onClose={() => setInspected(null)} onEdit={editSource} onAsk={askAboutStep}>
+            {stepResponses.length ? stepResponses.map(item => <StepResponse key={`${run?.run_id}:${item.task_id}`} invocation={item} snapshot={snapshot} sending={answering} guide={(responseGuides[componentName(item.reaction)] ?? responseGuides[item.agent])} onAnswer={answer} onCheck={() => checkRequirement(item)} onConfigure={() => askAboutStep(`Resolve the ${responseGuide(item, (responseGuides[componentName(item.reaction)] ?? responseGuides[item.agent])).kind} requirements for ${componentName(item.reaction)}. ${responseGuide(item, (responseGuides[componentName(item.reaction)] ?? responseGuides[item.agent])).required} Explain the exact configuration steps and verify readiness before continuing. `)} />)
+              : receipt?.reaction === inspected ? <p className="step-response-success" role="status">{receipt.text}</p> : null}
+          </StepInspector> : null}
           </div>
           {timelineOpen ? (
             <Timeline
@@ -1901,17 +1928,6 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           initialTimeoutSeconds={defaultRunTimeout(snapshot?.agents ?? [])}
           onCancel={() => setConfirming(false)}
           onConfirm={(options) => void confirmDesign(options)}
-        />
-      ) : null}
-
-      {panelAgent && snapshot ? (
-        <PortPanel
-          agent={panelAgent}
-          snapshot={snapshot}
-          pending={pending.filter((item) => item.agent === panelAgent)}
-          sending={answering}
-          onAnswer={(invocation, values) => void answer(invocation, values)}
-          onClose={() => setPanelAgent(null)}
         />
       ) : null}
 
