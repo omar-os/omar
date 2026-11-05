@@ -15,6 +15,7 @@ import {
   runClockAt,
   webAgents,
   type DiagramSnapshot,
+  type PendingApproval,
 } from "../lib/protocol";
 
 /**
@@ -573,6 +574,7 @@ function reactionWidth(labels: ReactionLabels, within: number | null): number {
   const widest = Math.max(
     textWidth(labels.name, 8.1),
     textWidth(labels.meta, 6.4) + 22,
+    textWidth("Waiting for approval", 6.4) + 22,
   );
   // A deadline is drawn between the text and the point, so the node has to be
   // wider for it rather than the stopwatch sitting on top of the name.
@@ -1330,6 +1332,9 @@ export function DiagramCanvas({
   onOpenTerminal,
   onOpenPanel,
   highlight,
+  approvals = [],
+  onReviewApproval,
+  focusApproval,
   focus,
 }: {
   snapshot: DiagramSnapshot;
@@ -1346,12 +1351,23 @@ export function DiagramCanvas({
    * has picked out to talk about.
    */
   highlight?: ReadonlySet<string>;
+  approvals?: PendingApproval[];
+  onReviewApproval?: (request: PendingApproval) => void;
+  focusApproval?: PendingApproval | null;
   /**
    * Ids a formal property is about: its ports, reactions and timers, and the
    * teams they sit in. Everything else, connections included, is dimmed.
    */
   focus?: ReadonlySet<string>;
 }) {
+  const approvalByReaction = new Map<string, PendingApproval>();
+  for (const request of approvals) {
+    const candidates = snapshot.reactions.filter((reaction) => reaction.agent === request.agent_id);
+    const reaction = request.invocation_id
+      ? candidates.find((candidate) => candidate.invocation_id === request.invocation_id)
+      : candidates.find((candidate) => candidate.status === "running") ?? candidates[0];
+    if (reaction) approvalByReaction.set(reaction.id, request);
+  }
   const hostRef = useRef<HTMLDivElement | null>(null);
   const edgeEnds = useMemo(
     () => new Map(snapshot.edges.map((edge) => [edge.id, edge] as const)),
@@ -1525,6 +1541,18 @@ export function DiagramCanvas({
   }, [layout, size]);
 
   const view = userView ?? fitted;
+
+  useEffect(() => {
+    if (!focusApproval || !layout || size.width === 0) return;
+    const source = snapshot.reactions.find((r) => r.agent === focusApproval.agent_id && (!focusApproval.invocation_id || r.invocation_id === focusApproval.invocation_id));
+    const node = layout.reactions.find((r) => r.id === source?.id);
+    if (!node) return;
+    const frame = requestAnimationFrame(() => {
+      const scale = Math.min(1.2, size.width / (node.box.width + 100));
+      setUserView({ scale, x: size.width / 2 - (node.box.x + node.box.width / 2) * scale, y: size.height / 2 - (node.box.y + node.box.height / 2) * scale });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [focusApproval, layout, size.width, size.height, snapshot.reactions]);
 
   /**
    * Ease the viewport to `target` instead of jumping.
@@ -1815,12 +1843,14 @@ export function DiagramCanvas({
             </g>
 
             <g className="omar-reactions">
-              {layout.reactions.map((reaction) => (
+              {layout.reactions.map((reaction) => {
+                const approval = approvalByReaction.get(reaction.id);
+                return (
                 <g
                   key={reaction.id}
                   {...selectable(
                     reaction.id,
-                    `omar-reaction ${reaction.status}${reaction.web ? " web" : ""}`,
+                    `omar-reaction ${approval ? "approval-pending" : reaction.status}${reaction.web ? " web" : ""}`,
                   )}
                   onDoubleClick={(event) => {
                     // The canvas resets the view on double click; a reaction
@@ -1869,7 +1899,22 @@ export function DiagramCanvas({
                   <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 59) scale(0.5)`}>
                     <BackendMark backend={reaction.backend} />
                   </g>
-                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={68}>{reaction.meta}</text>
+                  {approval ? (
+                    <g className="omar-approval-control" role="button" tabIndex={0} aria-label={`Review request: ${approval.agent_name} — Waiting for approval`} onClick={(event) => { event.stopPropagation(); onReviewApproval?.(approval); }} onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); event.stopPropagation(); onReviewApproval?.(approval); }
+                    }}>
+                      <title>{approval.summary}</title>
+                      <rect x={REACTION_TEXT_X + 19} y={57} width={reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING - 22} height={18} fill="transparent" />
+                      <circle cx={REACTION_TEXT_X + 25} cy={65} r={3} />
+                      <text className="omar-reaction-meta" x={REACTION_TEXT_X + 34} y={68}>Waiting for approval</text>
+                    </g>
+                  ) : <text
+                    className="omar-reaction-meta"
+                    x={REACTION_TEXT_X + 22}
+                    y={68}
+                  >
+                    {reaction.meta}
+                  </text>}
                   {/* A deadline the program set for itself. A stopwatch rather
                       than a clock: a timer fires on its own, this counts down
                       against work already running. */}
@@ -1903,7 +1948,7 @@ export function DiagramCanvas({
                     </g>
                   )}
                 </g>
-              ))}
+              ); })}
             </g>
 
             <g className="omar-ports">

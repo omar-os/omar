@@ -400,6 +400,7 @@ struct Context_ {
     /// and the directory its source is staged in.
     mutations: Mutex<BTreeMap<String, (topology::Bytecode, PathBuf)>>,
     chat: Arc<Mutex<Chat>>,
+    approvals: crate::approvals::ApprovalHub,
     /// Authenticates the EA's MCP sidecar on the agent-only endpoints.
     agent_token: Mutex<String>,
     /// Serialize sends, replies and backend changes within this EA.
@@ -471,11 +472,37 @@ pub enum AttachEa {
     },
 }
 
+fn assistant_approvals(ea_id: EaId, prefix: &str, command: &str) -> crate::approvals::ApprovalHub {
+    let approvals = crate::approvals::ApprovalHub::default();
+    #[cfg(not(test))]
+    {
+        let session = crate::ea::ea_manager_session(ea_id, prefix);
+        let backend = TmuxClient::new("")
+            .session_backend(&session)
+            .or_else(|| crate::backend::command_name(command).map(str::to_owned))
+            .unwrap_or_default();
+        approvals.watch(
+            crate::approvals::ApprovalTarget {
+                session,
+                backend,
+                command: Some(command.to_string()),
+            },
+            "assistant".into(),
+            "Executive assistant".into(),
+            None,
+        );
+    }
+    #[cfg(test)]
+    let _ = (ea_id, prefix, command);
+    approvals
+}
+
 pub struct Serve {
     ea_id: EaId,
     address: SocketAddr,
     agent_token: String,
     running: Arc<AtomicBool>,
+    approvals: crate::approvals::ApprovalHub,
     thread: Option<thread::JoinHandle<()>>,
     /// The state the request handlers share. Kept only so a test can seed a
     /// run the daemon believes is live, which is otherwise reachable only by
@@ -540,6 +567,7 @@ impl Serve {
                     },
                 )?;
                 for context in &contexts {
+                    context.approvals.shutdown();
                     context.agent_token.lock().unwrap().clear();
                     context.chat.lock().unwrap().subscribers.clear();
                     context.panels.lock().unwrap().clear();
@@ -864,6 +892,11 @@ impl Serve {
             .values()
             .max_by_key(|run| run.started_at)
             .map(|run| run.run_id.clone());
+        let approvals = assistant_approvals(
+            workspace_ea,
+            &config.dashboard.session_prefix,
+            &config.agent.default_command,
+        );
         let context = Arc::new(Context_ {
             history: history.clone(),
             conversation_id: conversation_id.clone(),
@@ -874,6 +907,7 @@ impl Serve {
             health_idle_warning: config.health.idle_warning,
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
+            approvals: approvals.clone(),
             mutations: Mutex::default(),
             chat: Arc::new(Mutex::new(Chat {
                 latest_run: latest_parked,
@@ -942,6 +976,7 @@ impl Serve {
             address,
             agent_token,
             running,
+            approvals,
             thread: Some(thread),
             #[cfg(test)]
             context: shared,
@@ -1126,6 +1161,16 @@ impl Serve {
 
 impl Drop for Serve {
     fn drop(&mut self) {
+        self.approvals.shutdown();
+        for context in self
+            .workspaces
+            .contexts
+            .lock()
+            .expect("workspaces poisoned")
+            .values()
+        {
+            context.approvals.shutdown();
+        }
         self.workspaces.shutdown.store(true, Ordering::SeqCst);
         self.workspaces
             .editors
@@ -1681,6 +1726,9 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         return stream_chat(stream, &context, origin, admission);
     }
+    if method == "GET" && path == "/v1/approvals/events" {
+        return stream_approvals(stream, &context, origin, admission);
+    }
 
     if method == "GET" {
         if let Some((run_id, upstream)) = path
@@ -1720,6 +1768,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
     }
 
     let (status, body) = match (method.as_str(), path.as_str()) {
+        ("GET", "/v1/approvals") => (200, json!(context.approvals.snapshot())),
         ("GET", "/health") => (
             200,
             json!({
@@ -2522,6 +2571,11 @@ impl Workspaces {
             health_idle_warning: self.settings.health_idle_warning,
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
+            approvals: assistant_approvals(
+                ea_id,
+                &self.settings.session_prefix,
+                &assistant_command(&self.settings.omar_dir, ea_id, &self.settings.command),
+            ),
             mutations: Mutex::default(),
             chat: Arc::new(Mutex::new(Chat {
                 latest_run: latest_parked,
@@ -2941,6 +2995,44 @@ fn prove_properties(
     })?;
     let outcome = crate::properties::prove(&staged.path, lemmas, properties);
     staged.finish(outcome)
+}
+
+fn stream_approvals(
+    mut stream: TcpStream,
+    context: &Arc<Context_>,
+    origin: Option<&str>,
+    admission: crate::ea_lifecycle::Admission,
+) -> Result<()> {
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n{}Vary: Origin\r\n\r\n", crate::diagram::cors_origin_header(origin))?;
+    drop(admission);
+    let mut previous = None;
+    let mut heartbeat = std::time::Instant::now();
+    loop {
+        if context.approvals.stopped()
+            || context.shutdown.load(Ordering::SeqCst)
+            || context.admit().is_err()
+        {
+            return Ok(());
+        }
+        let snapshot = context.approvals.snapshot();
+        if previous != Some(snapshot.sequence) {
+            writeln!(
+                stream,
+                "id: {}\nevent: approvals\ndata: {}\n",
+                snapshot.sequence,
+                serde_json::to_string(&snapshot)?
+            )?;
+            stream.flush()?;
+            previous = Some(snapshot.sequence);
+            heartbeat = std::time::Instant::now();
+        } else if heartbeat.elapsed() >= Duration::from_secs(15) {
+            stream.write_all(b": keepalive\n\n")?;
+            stream.flush()?;
+            heartbeat = std::time::Instant::now();
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// Check properties without proposing anything: how the assistant works a
@@ -3573,6 +3665,10 @@ fn spawn_run_thread(
                 diagram_address: Some(diagram_address),
                 diagram_ready: Some(ready_sender),
                 panel_ready: Some(panel_sender),
+                approvals: Some(crate::approvals::ApprovalRun {
+                    hub: context.approvals.clone(),
+                    run_id: run_id.clone(),
+                }),
                 checkpoint_policy,
                 keep_workspaces,
                 program_path: Some(&program_path),
@@ -4517,6 +4613,7 @@ fn run_program(context: &Arc<Context_>, id: &str) -> (u16, Value) {
 
 /// What the daemon records once a run's loop returns, however it returned.
 fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::RunOutcome>) {
+    context.approvals.finish_run(run_id);
     // The run is over, so its invocation service is gone with it. Leaving
     // the entry would let a panel offer work nothing can accept.
     context
@@ -4595,6 +4692,10 @@ fn spawn_resume_thread(
                 diagram_address: Some(diagram_address),
                 diagram_ready: Some(ready_sender),
                 panel_ready: Some(panel_sender),
+                approvals: Some(crate::approvals::ApprovalRun {
+                    hub: context.approvals.clone(),
+                    run_id: run_id.clone(),
+                }),
                 checkpoint_policy: None,
                 keep_workspaces: false,
                 program_path: Some(&program_path),
