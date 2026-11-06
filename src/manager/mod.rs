@@ -39,6 +39,19 @@ pub struct TopologyMcpContext {
     pub agent: String,
     pub endpoint: String,
     pub token: String,
+    /// Set for an invocation-scoped agent's worker, which exists for one
+    /// invocation. Its calls carry the attempt, so a worker from an earlier
+    /// attempt cannot answer for a later one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<TopologyAttempt>,
+}
+
+/// One invocation-scoped worker: the attempt OMAR started it for, and the
+/// native conversation it was told to open, which no earlier worker used.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TopologyAttempt {
+    pub id: String,
+    pub native_session: String,
 }
 
 /// Lets the EA talk back to whoever is driving `omar serve` — replies and

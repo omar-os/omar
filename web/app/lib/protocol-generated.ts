@@ -28,8 +28,12 @@ export type EdgeKind = (typeof EDGE_KINDS)[number];
 export const PORT_KINDS = ["input", "output", "action"] as const;
 export type PortKind = (typeof PORT_KINDS)[number];
 
+/** How long an agent's conversation lives. */
+export const AGENT_SCOPES = ["agent", "invocation"] as const;
+export type AgentScope = (typeof AGENT_SCOPES)[number];
+
 /** What happened, as the event stream names it. */
-export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started"] as const;
+export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started", "agent_attempt"] as const;
 export type DiagramEventKind = (typeof DIAGRAM_EVENT_KINDS)[number];
 
 /** Who spoke. */
@@ -56,7 +60,17 @@ export type DiagramAgent = { id: string, name: string, backend: string,
 /**
  * The container it is drawn inside.
  */
-instance: string, };
+instance: string,
+/**
+ * How long its conversation lives: the run, or one invocation.
+ */
+scope: AgentScope,
+/**
+ * An invocation-scoped agent's latest worker attempt, once one ended:
+ * `attempt_id`, `native_session_id`, `outcome`, `cleanup_status` and the
+ * rest of the record the run keeps in `attempts.jsonl`.
+ */
+attempt: Record<string, unknown> | null, };
 
 export type DiagramPort = { id: string, name: string, kind: PortKind, type: string, delay: number | null, value: unknown | null, last_tag: DiagramTag | null, instance: string, };
 

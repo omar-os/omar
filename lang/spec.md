@@ -22,8 +22,9 @@ team        = "team", identifier, [ "(", [ params ], ")" ],
 params      = param, { ",", param } ;
 param       = identifier, ":", type ;
 agents      = agent, { ",", agent } ;
-agent       = identifier, ":", backend ;
+agent       = identifier, ":", backend, [ "(", "scope", "=", scope, ")" ] ;
 backend     = identifier ;
+scope       = "agent" | "invocation" ;
 
 main        = "main", [ identifier ], "{", { instance | wiring }, "}" ;
 wiring      = qualified, "->", qualified, [ "after", delay ] ;
@@ -101,6 +102,55 @@ An agent's backend names what answers its reactions: `Claude` (or
 `ClaudeCode`), `Codex`, `Cursor`, `OpenCode`, `Agy`, `Stub`, or `Web`. The
 compiler takes any identifier here; an unknown one compiles and fails when the
 runtime tries to start it. Case does not matter.
+
+An agent's scope says how long its native conversation lives. `agent`, the
+default, is one conversation for the whole run: every invocation of the agent
+is delivered into it. `invocation` is a new worker and a new conversation for
+every invocation:
+
+```omar
+team Synth[step : Claude(scope = invocation)]
+{
+    input brief : string
+    action draft : string
+    output report : string
+
+    task step(brief) -> draft "Draft $(brief) into draft.md."
+    task step(draft) -> report "Review draft.md and report."
+}
+
+main Lead {
+    synth = Synth()
+}
+```
+
+The logical name stays `synth.step`; each invocation of it is an attempt with
+its own worker. Nothing of an earlier attempt is put in front of a later one —
+no transcript, no summary. What carries over is what an attempt wrote down:
+the instance's workspace is the same for every attempt, so `draft.md` written
+by the first is there for the second.
+
+The runtime makes sure of it rather than assuming it:
+
+- before the run starts, the backend must be one that can promise a fresh
+  conversation per invocation, or the program is refused. Only `Claude` can
+  today; it is told the id of the new conversation to open (`--session-id`),
+  and the runtime checks the worker reports that id before delivering;
+- a worker that cannot be started, or that opens any other conversation, fails
+  the invocation. There is no falling back to a worker that has one;
+- the attempt is the only caller that may answer its invocation: a worker
+  left from an earlier attempt of the same agent is refused;
+- after the invocation is answered, or expires, the worker's processes are
+  stopped and seen gone before its effects are released downstream. If that
+  cannot be confirmed in time, the invocation fails with the effects withheld.
+
+Each attempt is recorded, as it starts and as it ends, in `attempts.jsonl` in
+the run's directory: `run`, `logical_agent`, `invocation_id`, `attempt_id`,
+`backend`, `native_session_id`, `scope`, `outcome` and `cleanup_status`.
+Mission Control shows an agent's scope and its latest attempt.
+
+Any other value or option is refused: `Claude(scope = conversation)`,
+`Claude(lifetime = invocation)` and `Claude()` do not compile.
 
 An argument is an int or a string literal, and nothing else — there are no
 expressions. `main` may be named or bare; the name identifies the run, and a
@@ -513,6 +563,8 @@ Executing a plan on a checkpoint:
 - an instance whose team, parent or arguments changed is replaced whole, with
   everything it contains: state from its initial values, a new empty
   workspace;
+- an agent whose backend or scope changed is killed and spawned again, so no
+  conversation outlives the scope it was started under;
 - a removed port or timer drops its queued events (reported); a removed
   instance's workspace stays reachable from earlier checkpoints;
 - a new timer is armed from the last completed tag: `timer t(1s, …)` first
@@ -537,7 +589,7 @@ BEGIN_PLAN team
 
 DEFINE_TYPE name type [title] [description]
 DECLARE_INSTANCE name team parent
-SPAWN_AGENT name backend
+SPAWN_AGENT name backend [scope]
 DEFINE_PORT kind name type [delay]
 DECLARE_TIMER name offset period
 DECLARE_STATE name type initial
@@ -592,7 +644,16 @@ op, kind, name, type, delay
 op, source, target, delay
 ```
 
-The port `delay` field is omitted when no fixed delay is declared.
+The port `delay` field is omitted when no fixed delay is declared. An agent's
+`scope` is omitted for the default, `agent`.
+
+A program with an invocation-scoped agent is bytecode version 2; every other
+program, and every plan that produces one, stays version 1, byte for byte. A
+version 1 runtime does not know `scope` and would read it as absent, reusing
+the conversation the program said to throw away; the version is what makes it
+refuse the program instead, whether it arrives compiled or in a checkpoint,
+whose `program.json` is the bytecode. Version 1 bytecode that carries
+`"scope": "invocation"` is rejected for the same reason.
 Reaction fields are ordered:
 
 ```text

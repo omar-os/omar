@@ -280,6 +280,10 @@ jobs:
           sudo apt-get update && sudo apt-get install -y tmux
           cargo build --bin omar
           python3 tests/ci/team_mutation.py
+      - name: Verify an invocation-scoped agent gets a fresh worker per invocation
+        run: |
+          cargo build --bin omar
+          python3 tests/ci/invocation_scope.py
       - name: Verify safety properties are proved through serve
         run: |
           cargo build --bin omar

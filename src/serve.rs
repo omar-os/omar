@@ -4917,6 +4917,7 @@ mod tests {
                 AgentState {
                     backend: "codex".to_string(),
                     instance: String::new(),
+                    scope: Default::default(),
                 },
             )]),
             ports: BTreeMap::from([

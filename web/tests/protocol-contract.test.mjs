@@ -14,7 +14,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { startFakeServe, INVALID_MARKER } from "./fake-serve.mjs";
-import { RUN_STATUSES, assertRunRecord, isRunFinished, parseInputValue, assertChatMessage } from "../app/lib/protocol.ts";
+import { RUN_STATUSES, applyDiagramEvent, assertRunRecord, isRunFinished, parseInputValue, assertChatMessage } from "../app/lib/protocol.ts";
 import { defaultRunTimeout, describeRunFailure } from "../app/lib/run-feedback.ts";
 
 const golden = JSON.parse(
@@ -352,5 +352,18 @@ test("builder schema bundles survive chat normalization and old proposals defaul
   assert.deepEqual(assertChatMessage(legacy).design.files, {});
   for (const files of [[], { "schemas/decision.json": 42 }]) {
     assert.throws(() => assertChatMessage({ ...message, design: { ...message.design, files } }), /files must map/);
+  }
+});
+
+test("an agent attempt lands on the agent it names and no other", () => {
+  const [agent, ...others] = golden.agents;
+  const attempt = { attempt_id: "a1", native_session_id: "s1", outcome: "completed", cleanup_status: "stopped" };
+  const next = applyDiagramEvent(golden, {
+    protocol_version: 1, sequence: golden.sequence + 1, team: golden.team, tag: null,
+    kind: "agent_attempt", payload: { agent: agent.id, attempt },
+  });
+  assert.deepEqual(next.agents[0].attempt, attempt);
+  for (const [index, other] of others.entries()) {
+    assert.equal(next.agents[index + 1], other);
   }
 });

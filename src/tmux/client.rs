@@ -466,7 +466,7 @@ impl TmuxClient {
     /// Resolve only known launch-time gates, before any protocol prompt is sent.
     /// The launch stamp is cleared permanently once the native TUI is ready;
     /// normal delivery never scans or edits an existing conversation's composer.
-    fn finish_backend_startup(&self, session: &str, timeout: Duration) -> Result<()> {
+    pub(crate) fn finish_backend_startup(&self, session: &str, timeout: Duration) -> Result<()> {
         if self.startup_state(session, SESSION_STARTUP_VAR).as_deref() != Some("1") {
             return Ok(());
         }

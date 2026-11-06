@@ -372,6 +372,13 @@ export function applyDiagramEvent(
     );
 
   switch (event.kind) {
+    case "agent_attempt": {
+      const { agent, attempt } = event.payload as { agent?: unknown; attempt?: Record<string, unknown> };
+      return {
+        ...snapshot,
+        agents: snapshot.agents.map((item) => item.id === agent ? { ...item, attempt: attempt ?? null } : item),
+      };
+    }
     case "reaction_started":
       return {
         ...snapshot,

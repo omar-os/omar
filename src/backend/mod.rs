@@ -369,6 +369,16 @@ pub trait Backend: Send + Sync {
     /// before its pane is killed. Errors are ignored.
     fn forget(&self, _target: &Target<'_>) {}
 
+    /// Whether this backend can run an invocation-scoped agent: a launch whose
+    /// topology context names an attempt opens a new native conversation with
+    /// the attempt's `native_session` id, holding nothing from an earlier one,
+    /// and `conversation_id` reports that id once it is open. That report is
+    /// what the runtime checks before it delivers anything, so a backend that
+    /// cannot make it must say no here.
+    fn fresh_conversation(&self) -> bool {
+        false
+    }
+
     /// An executive assistant's launch line, when it differs from a worker's.
     /// `prompt_file` holds the prompt with its placeholders intact and
     /// `prompt` is the same text with them resolved; a backend that takes the
@@ -489,6 +499,14 @@ pub const ASSISTANT: [Kind; 6] = [
     Kind::Pi,
     Kind::Antigravity,
 ];
+
+/// The backends an invocation-scoped agent may name, as an error lists them.
+pub fn fresh_conversation_backends() -> Vec<&'static str> {
+    ALL.iter()
+        .filter(|backend| backend.fresh_conversation())
+        .map(|backend| backend.kind().name())
+        .collect()
+}
 
 pub fn of(kind: Kind) -> &'static dyn Backend {
     ALL.into_iter()

@@ -3492,6 +3492,7 @@ mod tests {
                 agent: "a".to_string(),
                 endpoint: "127.0.0.1:1".to_string(),
                 token: "t".to_string(),
+                attempt: None,
             }),
             ..test_context()
         });
@@ -3535,6 +3536,7 @@ mod tests {
                     agent: "a".to_string(),
                     endpoint: "127.0.0.1:1".to_string(),
                     token: "t".to_string(),
+                    attempt: None,
                 }),
                 ..test_context()
             },
@@ -3624,6 +3626,7 @@ mod tests {
                 agent: "a".to_string(),
                 endpoint: "127.0.0.1:1".to_string(),
                 token: "t".to_string(),
+                attempt: None,
             }),
             ..test_context()
         };

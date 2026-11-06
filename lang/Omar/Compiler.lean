@@ -203,9 +203,17 @@ private partial def lexChars : List Char -> Except String (List Token)
 
 def lex (source : String) : Except String (List Token) := lexChars source.toList
 
+/-- How long an agent's native conversation lives. `agent`, the default, is
+    one conversation for the whole run. `invocation` starts a new one for
+    every invocation and throws it away once that invocation completes. -/
+inductive AgentScope where
+  | agent | invocation
+  deriving Repr, BEq
+
 structure Agent where
   name : String
   backend : String
+  scope : AgentScope := .agent
   /-- The instance it belongs to. Every program instantiates, so this is never
       empty by the time elaboration is done. -/
   instance_ : String := ""
@@ -449,6 +457,21 @@ private def parseScalarType (what : String) (aliases : Array (String × String))
       state and parameters take built-in types, and a schema type is for ports"
   pure (type, rest)
 
+/-- `Claude(scope = invocation)`: what follows an agent's backend. The one
+    option is `scope`; anything else is refused rather than ignored, since a
+    misspelled option would silently keep the conversation it meant to drop. -/
+private def parseAgentOptions (agent : String) : Parser AgentScope
+  | Token.sym "(" :: Token.word "scope" :: Token.sym "=" :: Token.word value :: Token.sym ")" :: rest =>
+      match value with
+      | "agent" => pure (.agent, rest)
+      | "invocation" => pure (.invocation, rest)
+      | _ => throw s!"agent '{agent}' has unknown scope '{value}'; expected agent or invocation"
+  | Token.sym "(" :: Token.word key :: Token.sym "=" :: _ =>
+      throw s!"agent '{agent}' has unknown option '{key}'; the only option is scope"
+  | Token.sym "(" :: _ =>
+      throw s!"agent '{agent}' options must be written (scope = agent) or (scope = invocation)"
+  | rest => pure (.agent, rest)
+
 private partial def parseAgents (tokens : List Token) : Except String (Array Agent × List Token) := do
   match tokens with
   | Token.sym "]" :: _ => pure (#[], tokens)
@@ -456,7 +479,8 @@ private partial def parseAgents (tokens : List Token) : Except String (Array Age
       let (name, tokens) ← word tokens
       let (_, tokens) ← expectSym ":" tokens
       let (backend, tokens) ← word tokens
-      let agent := { name, backend : Agent }
+      let (scope, tokens) ← parseAgentOptions name tokens
+      let agent := { name, backend, scope : Agent }
       match tokens with
       | Token.sym "," :: rest =>
           let (agents, tail) ← parseAgents rest
@@ -1081,11 +1105,11 @@ def instructionTexts (program : Program) : Array String :=
       ("team", toJson inst.team)
     ]
   let agents := program.agents.map fun agent =>
-    instruction "spawn_agent" [
+    instruction "spawn_agent" ([
       ("instance", toJson agent.instance_),
       ("name", toJson agent.name),
       ("backend", toJson agent.backend)
-    ]
+    ] ++ (if agent.scope == .invocation then [("scope", toJson "invocation")] else []))
   let ports := program.ports.map fun port =>
     let fields := [
       ("instance", toJson port.instance_),
@@ -1146,13 +1170,21 @@ def instructionTexts (program : Program) : Array String :=
   #[begin] ++ types ++ instances ++ agents ++ ports ++ timers ++ states ++ params ++ connections ++
     reactions ++ #[commit]
 
-private def renderBytecode (team : String) (instructions : Array String) : String :=
+/-- Version 2 is version 1 with invocation-scoped agents. A program without
+    one stays at 1, byte for byte, so every runtime that ran it still does; a
+    program with one is refused by a runtime that would otherwise drop the
+    `scope` it does not know and keep the conversation the program said to
+    throw away. -/
+def bytecodeVersion (program : Program) : Nat :=
+  if program.agents.any (·.scope == .invocation) then 2 else 1
+
+private def renderBytecode (version : Nat) (team : String) (instructions : Array String) : String :=
   let rendered := String.intercalate ",\n    " instructions.toList
-  "{\n  \"version\": 1,\n  \"team\": " ++ (toJson team).compress ++
+  "{\n  \"version\": " ++ toString version ++ ",\n  \"team\": " ++ (toJson team).compress ++
     ",\n  \"instructions\": [\n    " ++ rendered ++ "\n  ]\n}\n"
 
 def compile (program : Program) : String :=
-  renderBytecode program.team (instructionTexts program)
+  renderBytecode (bytecodeVersion program) program.team (instructionTexts program)
 
 /-- What a string enum schema says: the values, and the `title` and
     `description` it may carry, which are shown to the agent. -/
@@ -1275,6 +1307,7 @@ private def declarationOwner (instruction : Json) : Option String :=
     in it is replaced. -/
 def compileDiff (old new : Program) : Except String String := do
   let team := old.team
+  let version := bytecodeVersion new
   if team != new.team then
     throw s!"a mutation keeps the program's main: the old program is '{team}', \
       the new program is '{new.team}'"
@@ -1325,7 +1358,7 @@ def compileDiff (old new : Program) : Except String String := do
           (text.drop "{\"op\": \"install_reaction\"".length).toString)
       | none => throw s!"nothing to update at '{d.key.2}'"
   let body ← ((Mutation.plan forced oldDecls newDecls).map Mutation.emit).mapM render
-  pure (renderBytecode team
+  pure (renderBytecode version team
     ((#[instruction "begin_mutation" [("team", toJson team)]] ++ body.toArray).push
       (instruction "commit_plan")))
 

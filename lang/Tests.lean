@@ -737,6 +737,57 @@ def testProve : IO Unit := do
   -- The mistake is reported where it is, counting from the theorem.
   assertEqual "wrong proof's line" ((verdict "wrong").map (·.problems.map (·.line) |>.contains 4)) (some true)
 
+/-- `agent : Backend(scope = invocation)`: the default, the opt-in, what is
+    refused, and that only the opt-in changes the bytecode. -/
+def testAgentScope : IO Unit := do
+  let source (decl : String) :=
+    "team T[" ++ decl ++ "] { input token : string output out : string " ++
+    "task coder(token) -> out \"Go $(token)\" } main Scoped { t = T() }"
+  let compiled (decl : String) : IO Json := do
+    match compileSource "Scoped" (source decl) >>= Json.parse with
+    | .ok json => pure json
+    | .error error => throw (IO.userError s!"{decl}: {error}")
+  let spawn (json : Json) : IO Json := do
+    let instructions ← IO.ofExcept (json.getObjValAs? (Array Json) "instructions")
+    match instructions.find? (fun i => (i.getObjValAs? String "op").toOption == some "spawn_agent") with
+    | some instruction => pure instruction
+    | none => throw (IO.userError "no spawn_agent")
+  let version (json : Json) := (json.getObjValAs? Nat "version").toOption
+  let scope (instruction : Json) := (instruction.getObjValAs? String "scope").toOption
+  -- The default leaves the bytecode exactly as it was before scopes existed.
+  let plain ← compiled "coder : Claude"
+  let explicit ← compiled "coder : Claude(scope = agent)"
+  assertEqual "default version" (version plain) (some 1)
+  assertEqual "default scope omitted" (scope (← spawn plain)) none
+  assertEqual "explicit agent scope is the default" explicit.compress plain.compress
+  -- The opt-in is carried, and versioned so an older runtime refuses it.
+  let fresh ← compiled "coder : Claude(scope = invocation)"
+  assertEqual "invocation version" (version fresh) (some 2)
+  assertEqual "invocation scope" (scope (← spawn fresh)) (some "invocation")
+  let _ ← compiled "coder : Claude(scope = invocation), other : Codex"
+  for (decl, expected) in [
+      ("coder : Claude(scope = conversation)", "unknown scope 'conversation'"),
+      ("coder : Claude(lifetime = invocation)", "unknown option 'lifetime'"),
+      ("coder : Claude(scope invocation)", "options must be written"),
+      ("coder : Claude()", "options must be written")] do
+    match compileSource "Scoped" (source decl) with
+    | .ok _ => throw (IO.userError s!"accepted {decl}")
+    | .error error =>
+      if !mentions error expected then
+        throw (IO.userError s!"{decl}: expected '{expected}', got {error}")
+  -- A scope change is a different agent: killed and spawned again, never
+  -- kept with the conversation it had. The plan is versioned like the
+  -- program it produces.
+  let plan ← match compileDiffSourcesWithSchemas "Scoped" (source "coder : Claude") #[]
+      "Scoped" (source "coder : Claude(scope = invocation)") #[] >>= Json.parse with
+    | .ok plan => pure plan
+    | .error error => throw (IO.userError s!"scope plan: {error}")
+  assertEqual "scope plan version" (version plan) (some 2)
+  let ops := ((plan.getObjValAs? (Array Json) "instructions").toOption.getD #[]).map
+    (fun i => (i.getObjValAs? String "op").toOption.getD "")
+  assertEqual "scope plan" ops #["begin_mutation", "kill_agent", "spawn_agent", "commit_plan"]
+  IO.println "agent scope tests passed"
+
 def main : IO UInt32 := do
   try
     for test in topologyCases do
@@ -753,6 +804,7 @@ def main : IO UInt32 := do
     testExternalSchemas
     testSchemaTypeResolution
     testMutation
+    testAgentScope
     testContracts
     testModels
     testProve

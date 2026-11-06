@@ -84,6 +84,9 @@ pub enum DiagramEventKind {
     /// The run's clock started: the payload's `clock_origin` is the unix
     /// millisecond its logical time zero stands at.
     ClockStarted,
+    /// An invocation-scoped agent's worker attempt ended: the payload is the
+    /// agent's id and the attempt as `DiagramAgent::attempt` holds it.
+    AgentAttempt,
 }
 
 impl std::fmt::Display for DiagramEventKind {
@@ -99,6 +102,15 @@ pub struct DiagramAgent {
     pub backend: String,
     /// The container it is drawn inside.
     pub instance: String,
+    /// How long its conversation lives: the run, or one invocation.
+    #[serde(default)]
+    pub scope: crate::topology::AgentScope,
+    /// An invocation-scoped agent's latest worker attempt, once one ended:
+    /// `attempt_id`, `native_session_id`, `outcome`, `cleanup_status` and the
+    /// rest of the record the run keeps in `attempts.jsonl`.
+    #[serde(default)]
+    #[ts(type = "Record<string, unknown> | null")]
+    pub attempt: Option<Value>,
 }
 
 /// A team `main` instantiated: one container in the drawing.
@@ -251,6 +263,8 @@ impl DiagramSnapshot {
                 name: name.clone(),
                 backend: agent.backend.clone(),
                 instance: agent.instance.clone(),
+                scope: agent.scope,
+                attempt: None,
             })
             .collect();
         let ports = state
@@ -466,6 +480,23 @@ impl DiagramPublisher {
         self.publish_with(kind, None, payload, |snapshot| {
             snapshot.status = status;
         });
+    }
+}
+
+impl DiagramPublisher {
+    /// An invocation-scoped agent's worker attempt ended.
+    pub fn agent_attempt(&self, agent: &str, attempt: &Value) {
+        let id = agent_id(agent);
+        self.publish_with(
+            DiagramEventKind::AgentAttempt,
+            None,
+            json!({ "agent": id, "attempt": attempt }),
+            |snapshot| {
+                if let Some(item) = snapshot.agents.iter_mut().find(|item| item.id == id) {
+                    item.attempt = Some(attempt.clone());
+                }
+            },
+        );
     }
 }
 
@@ -906,6 +937,7 @@ mod tests {
                 AgentState {
                     backend: "codex".to_string(),
                     instance: String::new(),
+                    scope: Default::default(),
                 },
             )]),
             ports: BTreeMap::from([
@@ -989,6 +1021,7 @@ mod tests {
                 AgentState {
                     backend: "codex".to_string(),
                     instance: "writer".to_string(),
+                    scope: Default::default(),
                 },
             )]),
             ports: BTreeMap::from([

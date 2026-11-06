@@ -506,6 +506,47 @@ mod tests {
         bytecode
     }
 
+    /// A scope change is a different agent: the plan must kill it and spawn
+    /// it again, so no conversation outlives the scope that made it.
+    #[test]
+    fn a_scope_change_replaces_the_agent() {
+        let agent = |scope: Option<&str>| {
+            let mut agent = json!({"op":"spawn_agent","name":"coder","backend":"Claude"});
+            if let Some(scope) = scope {
+                agent["scope"] = json!(scope);
+            }
+            agent
+        };
+        let program = |version: u32, scope| -> Bytecode {
+            let bytecode =
+                serde_json::from_value(json!({"version":version,"team":"Relay","instructions":[
+                    {"op":"begin_plan","team":"Relay"}, agent(scope), {"op":"commit_plan"}
+                ]}))
+                .unwrap();
+            topology::verify(&bytecode).unwrap();
+            bytecode
+        };
+        let from = program(1, None);
+        let to = program(2, Some("invocation"));
+        check(
+            &from,
+            &plan(vec![
+                json!({"op":"kill_agent","name":"coder"}),
+                agent(Some("invocation")),
+            ]),
+            &to,
+        )
+        .unwrap();
+        let error = check(&from, &plan(vec![]), &to).unwrap_err().to_string();
+        assert!(error.contains("agent 'coder'"), "{error}");
+        check(
+            &to,
+            &plan(vec![json!({"op":"kill_agent","name":"coder"}), agent(None)]),
+            &from,
+        )
+        .unwrap();
+    }
+
     /// A plan as the compiler writes one: `begin_mutation`, the changes,
     /// `commit_plan`. How plans are computed is the compiler's, and proved
     /// there; these check what the runtime does with one.
