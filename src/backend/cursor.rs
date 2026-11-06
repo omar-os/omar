@@ -76,11 +76,6 @@ impl Backend for Cursor {
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["Cursor Agent"]
     }
-    /// The conversation OMAR's runner reports opening, which cursor-agent
-    /// mints: ACP `session/new` ignores an id it is given.
-    fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
-        managed::reported_conversation(target)
-    }
     // No `fresh_conversation`: cursor-agent saves every chat under
     // `~/.cursor/projects/<workspace>/agent-transcripts/` and names that
     // folder in each new chat's context, where the agent greps it and finds
@@ -88,17 +83,6 @@ impl Backend for Cursor {
     // `--exclude-workspace-context`, is print-mode only and rejected for some
     // accounts. A new conversation id is not a new context, so omarc refuses
     // `Cursor(scope = invocation)`.
-    fn freshness(&self) -> super::Freshness {
-        super::Freshness::Reported
-    }
-    fn prove_fresh(
-        &self,
-        target: &super::Target<'_>,
-        id: &str,
-        _since: std::time::SystemTime,
-    ) -> Result<()> {
-        managed::prove_reported(target, id)
-    }
     /// Cursor takes no message from outside its protocol, so it runs under
     /// OMAR's protocol runner, which owns a durable inbox for it.
     fn launch_command(&self, launch: &Launch<'_>) -> String {

@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -262,100 +262,12 @@ async fn codex_turn(
     Ok(())
 }
 
-/// What an invocation-scoped attempt's runner may start from: nothing an
-/// earlier worker had. Its config, inbox and socket directory are new to its
-/// launch; this refuses any sign they are not, and every runner but
-/// cursor's: agy hands a new conversation its earlier ones, and the exec
-/// runner resumes one conversation turn after turn.
-fn fresh_start(config: &Config, inbox_existed: bool) -> Result<()> {
-    anyhow::ensure!(
-        config.backend == "cursor",
-        "the {} runner resumes one conversation; an invocation-scoped attempt cannot use it",
-        config.backend
-    );
-    anyhow::ensure!(
-        !inbox_existed && config.initial_session.is_none(),
-        "an invocation-scoped attempt was handed a conversation to resume"
-    );
-    Ok(())
-}
-
-/// Where cursor-agent keeps one entry per conversation it opens: 2026.09
-/// adds `acp-sessions/<id>/meta.json` before `session/new` answers.
-fn conversation_store() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".cursor").join("acp-sessions"))
-}
-
-fn store_entry(store: &Path, id: &str) -> PathBuf {
-    store.join(id).join("meta.json")
-}
-
-/// What a directory holds by name; none when it does not exist.
-fn names(dir: &Path) -> std::io::Result<BTreeSet<String>> {
-    match std::fs::read_dir(dir) {
-        Ok(entries) => entries
-            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-            .collect(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
-        Err(error) => Err(error),
-    }
-}
-
-/// A conversation store as it stood before an attempt's worker started, or
-/// why it could not be read.
-type Snapshot = std::result::Result<(PathBuf, BTreeSet<String>), String>;
-
-fn snapshot() -> Snapshot {
-    let store = conversation_store().ok_or("there is no home directory")?;
-    let before = names(&store).map_err(|error| format!("{}: {error}", store.display()))?;
-    Ok((store, before))
-}
-
-/// Why the conversation `id` an attempt's backend opened cannot be shown new,
-/// if it cannot: it is no plain id, or its CLI's store held it before the
-/// worker started or holds nothing for it now.
-fn unproven(snapshot: &Snapshot, id: &str) -> Option<String> {
-    let (store, before) = match snapshot {
-        Ok(snapshot) => snapshot,
-        Err(error) => return Some(format!("its store could not be read: {error}")),
-    };
-    if id.is_empty() || id.starts_with('.') || id.contains(['/', '\\']) {
-        return Some(format!("{id:?} is not a conversation id"));
-    }
-    let held = |name: &String| {
-        name == id
-            || name
-                .strip_prefix(id)
-                .is_some_and(|rest| rest.starts_with('.'))
-    };
-    if before.iter().any(held) {
-        return Some(format!(
-            "{} already held it before the worker started",
-            store.display()
-        ));
-    }
-    let entry = store_entry(store, id);
-    if !entry.exists() {
-        return Some(format!("{} does not exist", entry.display()));
-    }
-    None
-}
-
-/// Report the conversation an attempt's backend opened, and why it cannot be
-/// shown new if it cannot, where `crate::backend::managed` reads it: written
-/// once, before the socket exists, into the launch's own directory.
-fn report(socket: &Path, id: &str, refused: Option<String>) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(crate::backend::managed::report_path(socket))?;
-    let report = json!({"conversation_id": id, "pid": std::process::id(), "refused": refused});
-    file.write_all(report.to_string().as_bytes())?;
-    file.sync_all()?;
-    Ok(())
+/// No protocol runner can show a conversation new to an invocation-scoped
+/// attempt (cursor-agent's chats find earlier transcripts; the others resume
+/// one conversation), so omarc and the VM refuse such a launch. This fails
+/// closed if one gets through.
+fn fresh_start() -> Result<()> {
+    bail!("a protocol runner cannot start an invocation-scoped attempt")
 }
 
 pub async fn run(path: &Path) -> Result<()> {
@@ -376,14 +288,12 @@ pub async fn run(path: &Path) -> Result<()> {
         .open(path.with_extension("lock"))?;
     lock.try_lock()
         .context("protocol session already running")?;
-    // An invocation-scoped attempt opens a new conversation, checked by the
-    // runtime from this runner's report before it hands the worker anything.
     let attempt = context
         .topology
         .as_ref()
         .is_some_and(|topology| topology.attempt.is_some());
     if attempt {
-        fresh_start(&config, inbox_path.exists())?;
+        fresh_start()?;
     }
     let inbox: Inbox = match std::fs::read(&inbox_path) {
         Ok(bytes) => serde_json::from_slice(&bytes).context("invalid protocol inbox; preserved")?,
@@ -413,8 +323,6 @@ pub async fn run(path: &Path) -> Result<()> {
         "codex" => {}
         _ => unreachable!(),
     }
-    // Taken before the backend starts, so nothing it opens is in it.
-    let store = attempt.then(snapshot);
     let mut engine = if config.backend == "codex" {
         None
     } else {
@@ -451,8 +359,7 @@ pub async fn run(path: &Path) -> Result<()> {
             engine.rpc("authenticate", json!({"methodId":"cursor_login"})).await?;
             let previous = queue.state.lock().await.session.clone();
             let mut params = json!({"cwd":std::env::current_dir()?,"mcpServers":[{"name":"omar","command":std::env::current_exe()?,"args":["mcp-server","--context-file",config.context_file],"env":[]}]});
-            // An attempt never loads a session, so it never falls back from one.
-            let mut method = if let Some(session) = previous.filter(|_| store.is_none()) { params["sessionId"] = session.into(); "session/load" } else { "session/new" };
+            let mut method = if let Some(session) = previous { params["sessionId"] = session.into(); "session/load" } else { "session/new" };
             let result = match engine.rpc(method, params.clone()).await {
                 Ok(result) => result,
                 Err(error) if method == "session/load" => {
@@ -464,9 +371,6 @@ pub async fn run(path: &Path) -> Result<()> {
                 Err(error) => return Err(error),
             };
             let session = if method == "session/load" { params["sessionId"].as_str() } else { result["sessionId"].as_str() }.context("ACP omitted sessionId")?;
-            if let Some(store) = &store {
-                report(&config.socket, session, unproven(store, session))?;
-            }
             let mut state = queue.state.lock().await;
             crate::backend::remember_conversation(&context, "cursor", session)?;
             state.session = Some(session.to_owned());
@@ -564,77 +468,13 @@ mod protocol_tests {
         assert_eq!(reply["result"]["protocolVersion"], 1);
     }
 
-    fn attempt_config(backend: &str, command: &str) -> Config {
-        Config {
-            backend: backend.into(),
-            command: command.into(),
-            context_file: "context.json".into(),
-            prompt_file: "prompt.md".into(),
-            socket: "agent.sock".into(),
-            initial_session: None,
-        }
-    }
-
-    /// An attempt starts from nothing: no inbox, no conversation to resume,
-    /// and only on cursor's runner.
+    /// A protocol runner never starts an invocation-scoped attempt.
     #[test]
-    fn an_attempt_starts_from_no_conversation() {
-        fresh_start(&attempt_config("cursor", "cursor-agent --yolo"), false).unwrap();
-        let error =
-            |config: &Config, existed| fresh_start(config, existed).unwrap_err().to_string();
-        assert!(error(&attempt_config("codex", "codex"), false).contains("cannot use it"));
-        assert!(error(&attempt_config("agy", "agy"), false).contains("cannot use it"));
-        assert!(error(&attempt_config("cursor", "cursor-agent"), true).contains("to resume"));
-        let mut handed = attempt_config("cursor", "cursor-agent");
-        handed.initial_session = Some("earlier".into());
-        assert!(error(&handed, false).contains("to resume"));
-    }
-
-    /// A conversation is taken only when its CLI's store had no entry for it
-    /// before the worker started and has one now.
-    #[test]
-    fn a_conversation_new_to_its_store_and_no_other() {
-        let home = tempfile::tempdir().unwrap();
-        let cursor = home.path().join("acp-sessions");
-        std::fs::create_dir_all(cursor.join("old")).unwrap();
-        let before = |store: &Path| -> Snapshot { Ok((store.to_owned(), names(store).unwrap())) };
-        let cursor_before = before(&cursor);
-        let entry = store_entry(&cursor, "new");
-        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
-        std::fs::write(entry, "").unwrap();
-        assert_eq!(unproven(&cursor_before, "new"), None);
-        let why = |id| unproven(&cursor_before, id).unwrap_or_else(|| panic!("{id}"));
-        assert!(why("old").contains("already held"));
-        assert!(why("missing").contains("does not exist"));
-        for id in ["", "../new", ".", "a/b"] {
-            assert!(why(id).contains("not a conversation id"), "{id:?}");
-        }
-        // A store that does not exist holds nothing, so nothing is new to it.
-        let none = before(&home.path().join("nowhere"));
-        assert!(unproven(&none, "new").unwrap().contains("does not exist"));
-        assert!(unproven(&Err("unreadable".into()), "new")
-            .unwrap()
-            .contains("unreadable"));
-    }
-
-    /// The report is written once, beside the socket, for this runner.
-    #[test]
-    fn the_report_is_written_once_for_this_runner() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("agent.sock");
-        report(&socket, "new", None).unwrap();
-        let path = crate::backend::managed::report_path(&socket);
-        let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            written,
-            json!({"conversation_id": "new", "pid": std::process::id(), "refused": null})
-        );
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(report(&socket, "other", None).is_err());
+    fn a_protocol_runner_refuses_an_attempt() {
+        assert!(fresh_start()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot start"));
     }
 
     #[test]
