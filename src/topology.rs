@@ -2111,9 +2111,10 @@ impl ReactionExecutor for AgentReactionExecutor {
             .scoped
             .as_ref()
             .filter(|scoped| scoped.states.contains_key(&invocation.agent));
-        let attempt = scoped.map(|_| manager::TopologyAttempt {
+        let attempt = scoped.map(|scoped| manager::TopologyAttempt {
             id: Uuid::new_v4().to_string(),
-            native_session: Uuid::new_v4().to_string(),
+            native_session: crate::backend::by_name(&scoped.states[&invocation.agent].backend)
+                .map_or_else(|| Uuid::new_v4().to_string(), |b| b.new_conversation_id()),
         });
         let record = InvocationRecord {
             id: task_id,
@@ -8952,17 +8953,17 @@ mod tests {
         assert!(error.contains("needs bytecode version 2"), "{error}");
         // A backend that cannot promise a new conversation is refused before
         // anything starts, naming what can.
-        for backend in ["Codex", "Cursor", "OpenCode", "Agy", "Pi", "Web", "Nope"] {
+        for backend in ["Codex", "Cursor", "Agy", "Web", "Nope"] {
             let error = verify(&scoped_program(2, backend, Some("invocation")))
                 .unwrap_err()
                 .to_string();
             assert!(
                 error.contains("cannot start a fresh conversation per invocation")
-                    && error.contains("supported: claude, jev, stub"),
+                    && error.contains("supported: claude, opencode, pi, jev, stub"),
                 "{backend}: {error}"
             );
         }
-        for backend in ["Claude", "Jev", "Stub"] {
+        for backend in ["Claude", "OpenCode", "Pi", "Jev", "Stub"] {
             verify(&scoped_program(2, backend, Some("invocation"))).unwrap();
         }
         // A scope this runtime does not know is an error, not the default.

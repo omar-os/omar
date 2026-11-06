@@ -405,6 +405,12 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// A new attempt's `native_session`: the id its launch is told to open,
+    /// in whatever form the backend takes one.
+    fn new_conversation_id(&self) -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
     /// How the runtime checks the conversation an attempt reports, when
     /// `fresh_conversation` is true. The default is the strict form: a
     /// backend that mints its own id fails it, closed, until it says so.

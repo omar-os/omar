@@ -18,6 +18,12 @@ Checked, from what the fake logged and the run recorded:
   attempt is recorded as stopped;
 - a worker that opens some other conversation fails the run, and is never
   handed the invocation;
+- the same for fake `pi` (an in-memory conversation by `--no-session
+  --session-id`, reported over OMAR's extension socket) and fake `opencode`
+  (a session created by id over `/api/session`, unknown before, empty after),
+  and each fails closed: a pi that opens another conversation or ignores the
+  id; an opencode whose `/api/session` hands back an older session, one that
+  already holds messages, or is missing, with no fallback to `/session`;
 - the model-free `Stub(scope = invocation)` does the same for real, with no
   fake and no credentials: two attempts, each reporting the new conversation
   its attempt named, the first stopped before the second started;
@@ -35,8 +41,11 @@ REPO = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get('OMAR_BIN', REPO / 'target/debug/omar')).resolve()
 OMARC = Path(os.environ.get('OMARC_BIN', REPO / 'lang/.lake/build/bin/omarc')).resolve()
 
-FAKE = r'''
-import json, os, re, socket, subprocess, sys, threading
+# What every fake backend shares: its log, and answering an invocation through
+# the real `omar mcp-server` its launch names (`server`, set by each fake's
+# startup below, as are `topology` and `session`).
+COMMON = r'''
+import json, os, re, socket, subprocess, sys, threading, uuid
 from pathlib import Path
 
 log = Path(LOG)
@@ -48,40 +57,21 @@ def write(entry):
     with log.open("a") as out:
         out.write(json.dumps(entry) + "\n")
 
-mcp = json.loads(Path(flag("--mcp-config")).read_text())["mcpServers"]["omar"]
-context = json.loads(Path(mcp["args"][mcp["args"].index("--context-file") + 1]).read_text())
-topology = context["topology"]
-session = flag("--session-id") or "chosen-by-claude"
-if os.environ.get("FAKE_WRONG_SESSION") and flag("--session-id"):
-    session = "an-old-conversation"
-write({"event": "launch", "agent": topology["agent"], "attempt": topology.get("attempt"),
-       "session_id": flag("--session-id"), "argv": " ".join(argv),
-       "system_prompt": flag("--append-system-prompt")})
-print("\x1b[2J\x1b[H Claude Code v0\n" + "─" * 40 + "\n❯ \n" + "─" * 40, flush=True)
-
-home = Path(os.environ["HOME"])
-sessions = home / ".claude" / "sessions"
-sessions.mkdir(parents=True, exist_ok=True)
-peer = socket.socket(socket.AF_UNIX)
-peer.bind(str(home / f"peer-{os.getpid()}.sock"))
-peer.listen()
-(sessions / f"{os.getpid()}.json").write_text(json.dumps(
-    {"sessionId": session, "messagingSocketPath": peer.getsockname()}))
-(sessions / f"{os.getpid()}.0.key").write_text(json.dumps({"peerToken": "token"}))
-
 def call(tool, arguments):
-    server = subprocess.Popen([mcp["command"], *mcp["args"]], stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, text=True)
+    # opencode lists OMAR's tools by their bare names.
+    if "--bare-tool-names" in server:
+        tool = tool.removeprefix("omar_")
+    process = subprocess.Popen(server, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     for request in [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
          "params": {"name": tool, "arguments": arguments}},
     ]:
-        server.stdin.write(json.dumps(request) + "\n")
-        server.stdin.flush()
-        reply = json.loads(server.stdout.readline())
-    server.stdin.close()
-    server.wait()
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        reply = json.loads(process.stdout.readline())
+    process.stdin.close()
+    process.wait()
     return reply
 
 def alive(pid):
@@ -111,6 +101,30 @@ def answer(text):
         write({"event": "reply", "reply": call("omar_set_port",
                {"task_id": task, "port": port, "value": value})})
     write({"event": "reply", "reply": call("omar_complete", {"task_id": task})})
+'''
+
+FAKE = COMMON + r'''
+mcp = json.loads(Path(flag("--mcp-config")).read_text())["mcpServers"]["omar"]
+server = [mcp["command"], *mcp["args"]]
+context = json.loads(Path(mcp["args"][mcp["args"].index("--context-file") + 1]).read_text())
+topology = context["topology"]
+session = flag("--session-id") or "chosen-by-claude"
+if os.environ.get("FAKE_WRONG_SESSION") and flag("--session-id"):
+    session = "an-old-conversation"
+write({"event": "launch", "agent": topology["agent"], "attempt": topology.get("attempt"),
+       "session_id": flag("--session-id"), "argv": " ".join(argv),
+       "system_prompt": flag("--append-system-prompt")})
+print("\x1b[2J\x1b[H Claude Code v0\n" + "─" * 40 + "\n❯ \n" + "─" * 40, flush=True)
+
+home = Path(os.environ["HOME"])
+sessions = home / ".claude" / "sessions"
+sessions.mkdir(parents=True, exist_ok=True)
+peer = socket.socket(socket.AF_UNIX)
+peer.bind(str(home / f"peer-{os.getpid()}.sock"))
+peer.listen()
+(sessions / f"{os.getpid()}.json").write_text(json.dumps(
+    {"sessionId": session, "messagingSocketPath": peer.getsockname()}))
+(sessions / f"{os.getpid()}.0.key").write_text(json.dumps({"peerToken": "token"}))
 
 def serve(conn):
     for frame in map(json.loads, conn.makefile().read().splitlines()):
@@ -120,6 +134,130 @@ def serve(conn):
 while True:
     threading.Thread(target=serve, args=(peer.accept()[0],), daemon=True).start()
 '''
+
+# pi, as OMAR's extension makes it look: a socket at OMAR_PI_SOCKET that
+# reports the conversation and takes each message. The conversation is the
+# `--session-id` it was given under `--no-session`, as pi >= 0.80.3 opens one.
+FAKE_PI = COMMON + r'''
+context = json.loads(Path(os.environ["OMAR_MCP_CONTEXT_FILE"]).read_text())
+server = [os.environ["OMAR_BINARY"], "mcp-server", "--context-file",
+          os.environ["OMAR_MCP_CONTEXT_FILE"]]
+topology = context["topology"]
+session = flag("--session-id") if "--no-session" in argv else None
+if os.environ.get("FAKE_WRONG_SESSION") and flag("--session-id"):
+    session = "an-old-conversation"
+if os.environ.get("FAKE_IGNORE_SESSION_ID") or session is None:
+    # An older pi, which opens a conversation of its own choosing.
+    session = str(uuid.uuid4())
+write({"event": "launch", "agent": topology["agent"], "attempt": topology.get("attempt"),
+       "session_id": flag("--session-id"), "argv": " ".join(argv),
+       "system_prompt": flag("--system-prompt")})
+
+channel = socket.socket(socket.AF_UNIX)
+channel.bind(os.environ["OMAR_PI_SOCKET"])
+channel.listen()
+while True:
+    conn = channel.accept()[0]
+    message = json.loads(conn.makefile().readline())
+    if message.get("session") is True:
+        conn.sendall((json.dumps({"session": None, "id": session}) + "\n").encode())
+        conn.close()
+    else:
+        conn.sendall(b'{"accepted":true}\n')
+        conn.close()
+        threading.Thread(target=answer, args=(message["text"],), daemon=True).start()
+'''
+
+# opencode's loopback server, as much of it as OMAR uses. Sessions live in a
+# store shared by every fake process, as opencode's global database is, and
+# `/api/session` hands back an existing session rather than refuse, as the
+# real one does.
+FAKE_OPENCODE = COMMON + r'''
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+config = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
+server = config["mcp"]["omar"]["command"]
+context = json.loads(Path(server[server.index("--context-file") + 1]).read_text())
+topology = context["topology"]
+session = None
+store = Path(os.environ["HOME"]) / "opencode-sessions.json"
+lock = threading.Lock()
+def sessions():
+    return json.loads(store.read_text()) if store.exists() else {}
+def save(all):
+    store.write_text(json.dumps(all))
+if os.environ.get("FAKE_IGNORE_ID"):
+    with lock:
+        save(dict(sessions(), ses_old=["an earlier conversation"]))
+
+write({"event": "launch", "agent": topology["agent"], "attempt": topology.get("attempt"),
+       "session_id": os.environ.get("OMAR_OPENCODE_SESSION"), "argv": " ".join(argv)})
+print("\x1b[2J\x1b[H opencode\n tab agents   ctrl+p commands", flush=True)
+
+class Handler(BaseHTTPRequestHandler):
+    def reply(self, status, body=None):
+        data = b"" if body is None else json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(data)
+    def handle_one(self, method):
+        global session
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"null")
+        write({"event": "request", "agent": topology["agent"], "method": method,
+               "path": self.path})
+        parts = self.path.strip("/").split("/")
+        with lock:
+            all = sessions()
+            if method == "POST" and self.path == "/api/session":
+                if os.environ.get("FAKE_NO_API_SESSION"):
+                    return self.reply(404, {"error": "not found"})
+                id = "ses_old" if os.environ.get("FAKE_IGNORE_ID") else body["id"]
+                all.setdefault(id, ["preseeded"] if os.environ.get("FAKE_PRESEEDED") else [])
+                save(all)
+                session = id
+                return self.reply(200, {"data": {"id": id}})
+            if method == "POST" and self.path == "/session":
+                id = f"ses_{uuid.uuid4().hex}"
+                all[id] = []
+                save(all)
+                session = id
+                return self.reply(200, {"id": id})
+            if method == "POST" and self.path == "/tui/select-session":
+                return self.reply(200, True)
+            if parts[0] == "session" and len(parts) >= 2 and parts[1] in all:
+                id = parts[1]
+                if method == "GET" and len(parts) == 2:
+                    return self.reply(200, {"id": id})
+                if method == "GET" and parts[2:] == ["message"]:
+                    return self.reply(200, [{"text": text} for text in all[id]])
+                if method == "DELETE" and len(parts) == 2:
+                    del all[id]
+                    save(all)
+                    return self.reply(200, True)
+                if method == "POST" and parts[2:] == ["prompt_async"]:
+                    text = body["parts"][0]["text"]
+                    all[id].append(text)
+                    save(all)
+                    self.reply(204)
+                    threading.Thread(target=answer, args=(text,), daemon=True).start()
+                    return
+        self.reply(404, {"name": "NotFoundError"})
+    def do_GET(self):
+        self.handle_one("GET")
+    def do_POST(self):
+        self.handle_one("POST")
+    def do_DELETE(self):
+        self.handle_one("DELETE")
+    def log_message(self, *args):
+        pass
+
+ThreadingHTTPServer(("127.0.0.1", int(flag("--port"))), Handler).serve_forever()
+'''
+
+FAKES = {'claude': FAKE, 'pi': FAKE_PI, 'opencode': FAKE_OPENCODE}
 
 PROGRAM = '''team Pipe[coder : {coder}, keeper : Claude] {{
     input start : string
@@ -144,6 +282,11 @@ main Scoped {{
 # with "stub".
 STUB_PROGRAM = PROGRAM.replace('keeper : Claude', 'keeper : Stub')
 
+OTHER = object()
+
+# Each faked backend as a program spells it.
+SPELLED = {'claude': 'Claude', 'pi': 'Pi', 'opencode': 'OpenCode'}
+
 
 def supported():
     """The backends omarc names as able to run an invocation scope."""
@@ -151,14 +294,15 @@ def supported():
     return ', '.join(re.findall(r'#\["([^"]+)"', table))
 
 
-def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM):
+def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM,
+        backend='claude'):
     home = root / 'home'
     shims = home / 'shims'
     shims.mkdir(parents=True, exist_ok=True)
-    log = root / 'claude.jsonl'
-    fake = root / 'fake_claude.py'
-    fake.write_text(f'LOG = {str(log)!r}\n' + FAKE)
-    shim = shims / 'claude'
+    log = root / f'{backend}.jsonl'
+    fake = root / f'fake_{backend}.py'
+    fake.write_text(f'LOG = {str(log)!r}\n' + FAKES[backend])
+    shim = shims / backend
     shim.write_text(f"#!/bin/sh\nexec python3 '{fake}' \"$@\"\n")
     shim.chmod(0o700)
     (home / '.profile').write_text(f'export PATH="{shims}:$PATH"\n')
@@ -191,9 +335,16 @@ def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM
     return result, events, attempts
 
 
-def fresh_worker_per_invocation():
+def on(backend):
+    """`run`'s arguments for the pipeline with both agents on `backend`."""
+    spelled = SPELLED[backend]
+    return {'coder': f'{spelled}(scope = invocation)', 'backend': backend,
+            'program_text': PROGRAM.replace('keeper : Claude', f'keeper : {spelled}')}
+
+
+def fresh_worker_per_invocation(backend='claude'):
     with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
-        result, events, attempts = run(Path(directory))
+        result, events, attempts = run(Path(directory), **on(backend))
         output = result.stdout + result.stderr
         assert result.returncode == 0, output
         assert 'Output p.result = "note from step one"' in output, output
@@ -235,17 +386,39 @@ def fresh_worker_per_invocation():
                    and a['verification'] == 'chosen' for a in attempts), attempts
         replies = [e['reply'] for e in events if e['event'] == 'reply']
         assert all(not r.get('result', {}).get('isError') for r in replies), replies
-        print('PASS: two coder invocations ran in two fresh conversations, '
+        # What the worker reported is what it was handed the invocation in.
+        assert [m['session_id'] for m in coder_messages] == [c['session_id'] for c in coder]
+        if backend == 'pi':
+            # In memory: `--no-session` even where workers keep theirs.
+            for launch in coder:
+                assert f"--no-session --session-id {launch['session_id']}" in launch['argv'], launch
+        if backend == 'opencode':
+            assert all(c['session_id'].startswith('ses_') for c in coder), coder
+            requests = [(e['pid'], e['method'], e['path']) for e in events
+                        if e['event'] == 'request' and e['agent'] == 'p.coder']
+            for launch in coder:
+                mine = [(m, path) for pid, m, path in requests if pid == launch['pid']]
+                session = launch['session_id']
+                # Unknown before it was created by id, empty after; never one
+                # opencode named.
+                assert mine.index(('GET', f'/session/{session}')) < \
+                    mine.index(('POST', '/api/session')) < \
+                    mine.index(('GET', f'/session/{session}/message')), mine
+                assert ('POST', '/session') not in mine, mine
+        print(f'PASS: {SPELLED[backend]}: two coder invocations ran in two fresh conversations, '
               'keeper reused one; sentinel absent, file visible, worker 1 stopped first')
 
 
-def a_reused_conversation_fails_closed():
+def a_reused_conversation_fails_closed(backend='claude', fault='FAKE_WRONG_SESSION',
+                                       says='an-old-conversation', recorded='an-old-conversation'):
+    """`says` is in the error; `recorded` is the conversation the attempt
+    records the worker reporting: None for none, OTHER for one not its own."""
     with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
-        result, events, attempts = run(Path(directory), env={'FAKE_WRONG_SESSION': '1'})
+        result, events, attempts = run(Path(directory), env={fault: '1'}, **on(backend))
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
         assert 'did not start a fresh conversation' in output, output
-        assert 'an-old-conversation' in output, output
+        assert says in output, output
         coder_messages = [e for e in events if e['event'] == 'message' and e['agent'] == 'p.coder']
         assert coder_messages == [], coder_messages
         launches = [e for e in events if e['event'] == 'launch' and e['agent'] == 'p.coder']
@@ -253,8 +426,18 @@ def a_reused_conversation_fails_closed():
         finished = [a for a in attempts if a['outcome'] != 'started']
         assert [(a['outcome'], a['cleanup_status']) for a in finished] == [('failed', 'stopped')], attempts
         # What it actually opened is on record, refused or not.
-        assert finished[0]['native_session_id'] == 'an-old-conversation', attempts
-        print('PASS: a worker that opened another conversation failed the run and was never handed the invocation')
+        if recorded is OTHER:
+            assert finished[0]['native_session_id'] not in (
+                None, launches[0]['attempt']['native_session']), attempts
+        else:
+            assert finished[0]['native_session_id'] == recorded, attempts
+        if backend == 'opencode':
+            # Refused at creation, with no fallback to a session opencode names.
+            requests = [e for e in events if e['event'] == 'request' and e['agent'] == 'p.coder']
+            assert not any(e['method'] == 'POST' and e['path'] == '/session'
+                           for e in requests), requests
+        print(f'PASS: {SPELLED[backend]} ({fault}): a worker that could not show a new '
+              'conversation failed the run and was never handed the invocation')
 
 
 def a_stub_worker_per_invocation():
@@ -318,5 +501,19 @@ def an_unsupported_backend_is_refused():
 if __name__ == '__main__':
     fresh_worker_per_invocation()
     a_reused_conversation_fails_closed()
+    fresh_worker_per_invocation('pi')
+    a_reused_conversation_fails_closed('pi')
+    # pi before 0.80.3 opens a conversation of its own under --no-session.
+    a_reused_conversation_fails_closed('pi', 'FAKE_IGNORE_SESSION_ID',
+                                       says='not the new conversation', recorded=OTHER)
+    fresh_worker_per_invocation('opencode')
+    # /api/session answers with an older session than the one asked for; with
+    # the one asked for, already holding messages; or not at all.
+    # Refused before the worker reports anything, so nothing is recorded.
+    a_reused_conversation_fails_closed('opencode', 'FAKE_IGNORE_ID', says='ses_old', recorded=None)
+    a_reused_conversation_fails_closed('opencode', 'FAKE_PRESEEDED', says='already holds',
+                                       recorded=None)
+    a_reused_conversation_fails_closed('opencode', 'FAKE_NO_API_SESSION', says='/api/session',
+                                       recorded=None)
     a_stub_worker_per_invocation()
     an_unsupported_backend_is_refused()

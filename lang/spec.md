@@ -99,7 +99,7 @@ A parameter is read back in a prompt as `$(idx)`, the same spelling a trigger
 uses.
 
 An agent's backend names what answers its reactions: `Claude` (or
-`ClaudeCode`), `Codex`, `Cursor`, `OpenCode`, `Agy`, `Stub`, or `Web`. The
+`ClaudeCode`), `Codex`, `Cursor`, `OpenCode`, `Pi`, `Agy`, `Stub`, or `Web`. The
 compiler takes any identifier here; an unknown one compiles and fails when the
 runtime tries to start it, unless the agent is invocation-scoped (below). Case
 does not matter.
@@ -139,17 +139,21 @@ The runtime makes sure of it rather than assuming it:
 
   ```text
   agent 'step' is invocation-scoped, but backend 'Codex' cannot start a fresh
-  conversation per invocation; supported: claude, jev, stub
+  conversation per invocation; supported: claude, opencode, pi, jev, stub
   ```
 
   The runtime refuses it again before the run starts, so bytecode from
   anywhere else cannot get one through. `Web` is always refused: its client
   is no process OMAR starts, so nothing can show its context is new.
-  `Claude`, `Stub` and `Jev` can today;
+  `Claude`, `OpenCode`, `Pi`, `Stub` and `Jev` can today;
 - the runtime checks the conversation a worker reports before delivering
   anything. Where the backend is told the id of the new conversation to open
-  (`Claude`, by `--session-id`; `Stub`, in its launch context), the worker
-  must report exactly that id. Where the backend mints its own, the id must
+  (`Claude`, by `--session-id`; `Pi`, by `--no-session --session-id`, an
+  in-memory conversation that reads nothing from disk; `OpenCode`, created
+  through its `/api/session`, which needs an opencode that has it, only once
+  the server has no session of that id, and taken only while it holds no
+  message; `Stub`, in its launch context), the worker must report exactly
+  that id. Where the backend mints its own, the id must
   be non-empty, never reported by an earlier attempt of the deployment (those
   recorded in `attempts.jsonl` included), and pass whatever proof the backend
   has that the conversation is new;

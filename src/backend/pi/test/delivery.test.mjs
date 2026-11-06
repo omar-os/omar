@@ -21,17 +21,27 @@ test("private delivery wakes a turn with a custom message and exposes the native
   const path = `${dir}/in.sock`;
   const sent = [];
   const stop = await startDelivery(path, { sendMessage: (...args) => sent.push(args) },
-    { sessionManager: { getSessionFile: () => "/tmp/saved.jsonl" } });
+    { sessionManager: { getSessionFile: () => "/tmp/saved.jsonl", getSessionId: () => "saved-id" } });
   try {
     assert.equal((await stat(path)).mode & 0o777, 0o600);
     assert.deepEqual(await request(path, { text: "event\nsecond line" }), { accepted: true });
     assert.deepEqual(sent, [[{ customType: "omar_event", content: "event\nsecond line", display: true },
       { triggerTurn: true, deliverAs: "followUp" }]]);
-    assert.deepEqual(await request(path, { session: true }), { session: "/tmp/saved.jsonl" });
+    assert.deepEqual(await request(path, { session: true }), { session: "/tmp/saved.jsonl", id: "saved-id" });
     assert.ok((await request(path, { text: null })).error);
     assert.equal(sent.length, 1);
   } finally { await stop(); await rm(dir, { recursive: true, force: true }); }
   await assert.rejects(request(path, { text: "late" }));
+});
+
+test("a conversation with no file reports its in-memory id", async () => {
+  const dir = await mkdtemp("/tmp/omar-pi-");
+  const path = `${dir}/in.sock`;
+  const stop = await startDelivery(path, { sendMessage() {} },
+    { sessionManager: { getSessionFile: () => undefined, getSessionId: () => "abc" } });
+  try {
+    assert.deepEqual(await request(path, { session: true }), { session: null, id: "abc" });
+  } finally { await stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
 test("failed tool discovery never publishes delivery; retry and shutdown manage the socket", async () => {

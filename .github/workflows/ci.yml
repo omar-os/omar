@@ -284,6 +284,14 @@ jobs:
         run: |
           cargo build --bin omar
           python3 tests/ci/invocation_scope.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Real pinned Pi, with a local deterministic provider: no credentials.
+      - name: Verify real Pi runs an invocation-scoped agent in a new conversation each time
+        run: |
+          cargo build --bin omar
+          python3 tests/ci/pi_invocation_scope.py
       - name: Verify safety properties are proved through serve
         run: |
           cargo build --bin omar
