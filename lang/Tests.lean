@@ -773,6 +773,11 @@ def testAgentScope : IO Unit := do
       for spelled in [alias, alias.capitalize, alias.toUpper] do
         let decl := s!"coder : {spelled}(scope = invocation)"
         assertEqual decl (version (← compiled decl)) (some 2)
+  -- The model-free stub, which CI runs scoped end to end, and Jev, which
+  -- holds no conversation at all, are among them.
+  for backend in ["Stub", "Jev"] do
+    let decl := s!"coder : {backend}(scope = invocation)"
+    assertEqual decl (scope (← spawn (← compiled decl))) (some "invocation")
   -- One that cannot, or one omarc does not know, is refused before bytecode
   -- exists, naming those that can. Its default scope still compiles,
   -- unknown backend included.

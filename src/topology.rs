@@ -8952,17 +8952,18 @@ mod tests {
         assert!(error.contains("needs bytecode version 2"), "{error}");
         // A backend that cannot promise a new conversation is refused before
         // anything starts, naming what can.
-        for backend in [
-            "Codex", "Cursor", "OpenCode", "Agy", "Pi", "Stub", "Web", "Nope",
-        ] {
+        for backend in ["Codex", "Cursor", "OpenCode", "Agy", "Pi", "Web", "Nope"] {
             let error = verify(&scoped_program(2, backend, Some("invocation")))
                 .unwrap_err()
                 .to_string();
             assert!(
                 error.contains("cannot start a fresh conversation per invocation")
-                    && error.contains("supported: claude"),
+                    && error.contains("supported: claude, jev, stub"),
                 "{backend}: {error}"
             );
+        }
+        for backend in ["Claude", "Jev", "Stub"] {
+            verify(&scoped_program(2, backend, Some("invocation"))).unwrap();
         }
         // A scope this runtime does not know is an error, not the default.
         let unknown = serde_json::from_value::<Bytecode>(json!({

@@ -397,6 +397,9 @@ pub trait Backend: Send + Sync {
     /// holding nothing from an earlier one, and `conversation_id` reports it
     /// once it is open. That report is what the runtime checks before it
     /// delivers anything, so a backend that cannot make it must say no here.
+    /// A `topology_only` backend starts no worker and has no conversation; it
+    /// may say yes only if no `invoke_topology` call carries anything from an
+    /// earlier one.
     /// omarc's copy of this, `lang/Omar/Backends.lean`, is generated from it.
     fn fresh_conversation(&self) -> bool {
         false

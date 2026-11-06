@@ -139,20 +139,20 @@ The runtime makes sure of it rather than assuming it:
 
   ```text
   agent 'step' is invocation-scoped, but backend 'Codex' cannot start a fresh
-  conversation per invocation; supported: claude
+  conversation per invocation; supported: claude, jev, stub
   ```
 
   The runtime refuses it again before the run starts, so bytecode from
   anywhere else cannot get one through. `Web` is always refused: its client
-  is no process OMAR starts, so nothing can show its context is new. Only
-  `Claude` can today;
+  is no process OMAR starts, so nothing can show its context is new.
+  `Claude`, `Stub` and `Jev` can today;
 - the runtime checks the conversation a worker reports before delivering
   anything. Where the backend is told the id of the new conversation to open
-  (`Claude`, by `--session-id`), the worker must report exactly that id. Where
-  the backend mints its own, the id must be non-empty, never reported by an
-  earlier attempt of the deployment (those recorded in `attempts.jsonl`
-  included), and pass whatever proof the backend has that the conversation is
-  new;
+  (`Claude`, by `--session-id`; `Stub`, in its launch context), the worker
+  must report exactly that id. Where the backend mints its own, the id must
+  be non-empty, never reported by an earlier attempt of the deployment (those
+  recorded in `attempts.jsonl` included), and pass whatever proof the backend
+  has that the conversation is new;
 - a worker that cannot be started, or whose conversation fails the check, fails
   the invocation, and is stopped without being handed it. There is no falling
   back to a worker that has one;
@@ -161,6 +161,12 @@ The runtime makes sure of it rather than assuming it:
 - after the invocation is answered, or expires, the worker's processes are
   stopped and seen gone before its effects are released downstream. If that
   cannot be confirmed in time, the invocation fails with the effects withheld.
+
+`Jev` starts no worker and has no conversation, so there is nothing to check
+or stop: every invocation is one request built from that invocation's
+triggers and prompt alone, sent by a process of its own that has exited
+before the answer is used. Its scope changes nothing it does, and it records
+no attempts.
 
 Each attempt is recorded, as it starts, once its conversation is checked, and
 as it ends, in `attempts.jsonl` in the run's directory: `run`,

@@ -6,7 +6,9 @@ namespace Omar.Backends
 /-- The backends an invocation-scoped agent may name, each by its aliases,
     its name first: those whose `fresh_conversation` is true. -/
 def freshConversation : Array (Array String) := #[
-  #["claude", "claude-code", "claude_code", "claudecode"]
+  #["claude", "claude-code", "claude_code", "claudecode"],
+  #["jev"],
+  #["stub"]
 ]
 
 end Omar.Backends

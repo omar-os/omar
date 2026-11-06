@@ -18,12 +18,16 @@ Checked, from what the fake logged and the run recorded:
   attempt is recorded as stopped;
 - a worker that opens some other conversation fails the run, and is never
   handed the invocation;
+- the model-free `Stub(scope = invocation)` does the same for real, with no
+  fake and no credentials: two attempts, each reporting the new conversation
+  its attempt named, the first stopped before the second started;
 - a backend that cannot promise a fresh conversation, or that omarc does not
   know, is refused by omarc itself, which writes no bytecode or plan.
 """
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -136,7 +140,18 @@ main Scoped {{
 '''
 
 
-def run(root, coder='Claude(scope = invocation)', env=None):
+# The same pipeline on the real `omar stub-agent`, which answers every string
+# with "stub".
+STUB_PROGRAM = PROGRAM.replace('keeper : Claude', 'keeper : Stub')
+
+
+def supported():
+    """The backends omarc names as able to run an invocation scope."""
+    table = (REPO / 'lang/Omar/Backends.lean').read_text()
+    return ', '.join(re.findall(r'#\["([^"]+)"', table))
+
+
+def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM):
     home = root / 'home'
     shims = home / 'shims'
     shims.mkdir(parents=True, exist_ok=True)
@@ -148,7 +163,7 @@ def run(root, coder='Claude(scope = invocation)', env=None):
     shim.chmod(0o700)
     (home / '.profile').write_text(f'export PATH="{shims}:$PATH"\n')
     program = root / 'Scoped.omar'
-    program.write_text(PROGRAM.format(coder=coder))
+    program.write_text(program_text.format(coder=coder))
     server = 'omar-scope-' + root.name.rsplit('-', 1)[-1]
     # Nothing of an enclosing OMAR session or tmux client may leak in.
     inherited = {k: v for k, v in os.environ.items()
@@ -242,6 +257,39 @@ def a_reused_conversation_fails_closed():
         print('PASS: a worker that opened another conversation failed the run and was never handed the invocation')
 
 
+def a_stub_worker_per_invocation():
+    with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
+        result, events, attempts = run(Path(directory), coder='Stub(scope = invocation)',
+                                       program_text=STUB_PROGRAM)
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert 'Output p.result = "stub"' in output, output
+        assert 'Output p.kept = "stub"' in output, output
+        assert events == [], events
+        assert all(a['logical_agent'] == 'p.coder' and a['backend'] == 'Stub'
+                   and a['scope'] == 'invocation' and a['verification'] == 'chosen'
+                   for a in attempts), attempts
+
+        # Two invocations, two attempts, two conversations: each the id its
+        # attempt named, as the stub worker itself reported it.
+        order = list(dict.fromkeys(a['attempt_id'] for a in attempts))
+        assert len(order) == 2, attempts
+        finished = [a for a in attempts if a['outcome'] != 'started']
+        assert [a['attempt_id'] for a in finished] == order, attempts
+        assert [(a['outcome'], a['cleanup_status']) for a in finished] == \
+            [('completed', 'stopped')] * 2, attempts
+        ids = [a['native_session_id'] for a in finished]
+        assert all(ids) and ids[0] != ids[1], ids
+        assert len({a['invocation_id'] for a in finished}) == 2, attempts
+
+        # The first worker was seen gone before the second was started.
+        first_stopped = attempts.index(finished[0])
+        second_started = next(i for i, a in enumerate(attempts) if a['attempt_id'] == order[1])
+        assert first_stopped < second_started, attempts
+        print('PASS: Stub(scope = invocation) ran two attempts in two conversations '
+              f'({ids[0]}, {ids[1]}); worker 1 stopped before worker 2 started')
+
+
 def an_unsupported_backend_is_refused():
     with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
         root = Path(directory)
@@ -258,7 +306,7 @@ def an_unsupported_backend_is_refused():
                                    capture_output=True, text=True)
                 assert r.returncode == 1 and not out.exists(), (backend, args, r)
                 assert (f"backend '{backend}' cannot start a fresh conversation per "
-                        'invocation; supported: claude') in r.stderr, r.stderr
+                        f'invocation; supported: {supported()}') in r.stderr, r.stderr
         result, events, _ = run(root, coder='Web(scope = invocation)')
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
@@ -270,4 +318,5 @@ def an_unsupported_backend_is_refused():
 if __name__ == '__main__':
     fresh_worker_per_invocation()
     a_reused_conversation_fails_closed()
+    a_stub_worker_per_invocation()
     an_unsupported_backend_is_refused()

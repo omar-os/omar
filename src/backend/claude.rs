@@ -805,7 +805,10 @@ mod tests {
         assert!(line.contains("--session-id '11111111-1111-4111-8111-111111111111'"));
         assert!(!line.contains("--resume"));
         assert!(Claude.fresh_conversation());
-        assert_eq!(super::super::fresh_conversation_backends(), ["claude"]);
+        assert_eq!(
+            super::super::fresh_conversation_backends(),
+            ["claude", "jev", "stub"]
+        );
     }
 
     #[test]
