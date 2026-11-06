@@ -33,6 +33,29 @@ pub(crate) mod stub;
 /// reading. A timeout reports failure; it never enables terminal-input delivery.
 pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How an invocation-scoped worker's conversation is shown to be new.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    /// The launch opens the attempt's `native_session` id, and the worker
+    /// must report exactly that one.
+    Chosen,
+    /// The backend mints the id. The runtime takes it only when it is
+    /// non-empty, no earlier attempt of the deployment reported it, and
+    /// [`Backend::prove_fresh`] holds.
+    #[allow(dead_code)] // No backend mints its own ids yet.
+    Reported,
+}
+
+impl Freshness {
+    /// As `attempts.jsonl` records it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Freshness::Chosen => "chosen",
+            Freshness::Reported => "reported",
+        }
+    }
+}
+
 /// A retryable pre-send condition: nothing has been sent, and the caller may
 /// try again once the backend has come up.
 #[derive(Debug)]
@@ -370,13 +393,27 @@ pub trait Backend: Send + Sync {
     fn forget(&self, _target: &Target<'_>) {}
 
     /// Whether this backend can run an invocation-scoped agent: a launch whose
-    /// topology context names an attempt opens a new native conversation with
-    /// the attempt's `native_session` id, holding nothing from an earlier one,
-    /// and `conversation_id` reports that id once it is open. That report is
-    /// what the runtime checks before it delivers anything, so a backend that
-    /// cannot make it must say no here.
+    /// topology context names an attempt opens a new native conversation,
+    /// holding nothing from an earlier one, and `conversation_id` reports it
+    /// once it is open. That report is what the runtime checks before it
+    /// delivers anything, so a backend that cannot make it must say no here.
+    /// omarc's copy of this, `lang/Omar/Backends.lean`, is generated from it.
     fn fresh_conversation(&self) -> bool {
         false
+    }
+
+    /// How the runtime checks the conversation an attempt reports, when
+    /// `fresh_conversation` is true. The default is the strict form: a
+    /// backend that mints its own id fails it, closed, until it says so.
+    fn freshness(&self) -> Freshness {
+        Freshness::Chosen
+    }
+
+    /// Any proof beyond the id itself that the conversation `id`, which the
+    /// worker in `target` reported, is new: checked after the id passes, and
+    /// before anything is delivered. An error refuses the attempt.
+    fn prove_fresh(&self, _target: &Target<'_>, _id: &str) -> Result<()> {
+        Ok(())
     }
 
     /// An executive assistant's launch line, when it differs from a worker's.
@@ -678,6 +715,54 @@ pub fn command_name(command: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `lang/Omar/Backends.lean` as it should be: omarc's copy of which
+    /// backends may run an invocation-scoped agent. Committed, not built:
+    /// `lake build` must not need cargo.
+    fn lean_backends() -> String {
+        let rows: Vec<String> = ALL
+            .iter()
+            .filter(|backend| backend.fresh_conversation())
+            .map(|backend| {
+                let aliases: Vec<String> =
+                    backend.aliases().iter().map(|a| format!("{a:?}")).collect();
+                format!("  #[{}]", aliases.join(", "))
+            })
+            .collect();
+        format!(
+            "-- Generated from src/backend/mod.rs; do not edit. Regenerate with\n\
+             --     UPDATE_BACKENDS=1 cargo test --bin omar the_lean_backends_are_current\n\
+             \n\
+             namespace Omar.Backends\n\
+             \n\
+             /-- The backends an invocation-scoped agent may name, each by its aliases,\n    \
+             its name first: those whose `fresh_conversation` is true. -/\n\
+             def freshConversation : Array (Array String) := #[\n{}\n]\n\
+             \n\
+             end Omar.Backends\n",
+            rows.join(",\n")
+        )
+    }
+
+    /// The checked-in table is what the backends say, so omarc refuses an
+    /// invocation scope exactly where the runtime would.
+    #[test]
+    fn the_lean_backends_are_current() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lang/Omar/Backends.lean");
+        let generated = lean_backends();
+        if std::fs::read_to_string(&path).unwrap_or_default() == generated {
+            return;
+        }
+        if std::env::var_os("UPDATE_BACKENDS").is_some() {
+            std::fs::write(&path, &generated).expect("failed to write lang/Omar/Backends.lean");
+            panic!("lang/Omar/Backends.lean was stale and has been rewritten; commit it");
+        }
+        panic!(
+            "lang/Omar/Backends.lean is stale: a backend's fresh_conversation or aliases \
+             changed and omarc's copy did not.\nRegenerate it with:\n\n    \
+             UPDATE_BACKENDS=1 cargo test --bin omar the_lean_backends_are_current\n"
+        );
+    }
 
     #[test]
     fn interactive_backends_take_color_preferences_from_the_launcher_not_tmux() {

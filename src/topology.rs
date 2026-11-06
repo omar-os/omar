@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::backend::Freshness;
 use crate::checkpoint::{self, ExecutionState, QueuedTag, Trigger};
 use crate::deploy::{self, ControlOp, DeploymentState};
 use crate::diagram::{DiagramServer, NoopTopologyObserver, TopologyObserver};
@@ -2176,17 +2177,24 @@ impl AgentReactionExecutor {
 /// invocation, and none in between.
 ///
 /// An attempt is one worker for one invocation. It is started, proved to have
-/// opened the conversation the attempt named — never one an earlier attempt
-/// had — and handed the invocation. Once answered, or not, its process tree is
-/// stopped and seen gone before anything it wrote is released downstream. If
+/// opened a new conversation — the one the attempt named, or, for a backend
+/// that mints its own id, one no earlier attempt reported — and handed the
+/// invocation. Once answered, or not, its process tree is stopped and seen
+/// gone before anything it wrote is released downstream. If
 /// any of that cannot be made sure of, the invocation fails: there is no
 /// falling back to a worker that already has a conversation.
 struct ScopedWorkers {
     states: BTreeMap<String, AgentState>,
     launcher: AgentLauncher,
     run: String,
-    /// One JSON line per attempt as it starts and as it ends.
+    /// One JSON line per attempt as it starts, once its conversation is
+    /// checked, and as it ends.
     log: PathBuf,
+    /// Every conversation an attempt has reported, seeded from `log`, which
+    /// outlives the process: a backend that mints its own id must never hand
+    /// one back. An error is a log that could not be read; it refuses every
+    /// minted id rather than trust a partial set.
+    seen: Mutex<Result<BTreeSet<String>, String>>,
     publisher: Option<crate::diagram::DiagramPublisher>,
 }
 
@@ -2208,9 +2216,11 @@ impl ScopedWorkers {
             .filter(|(_, agent)| agent.scope == AgentScope::Invocation)
             .map(|(name, agent)| (name.clone(), agent.clone()))
             .collect();
+        let log = launcher.runtime_dir.join("attempts.jsonl");
         (!states.is_empty()).then(|| Self {
             states,
-            log: launcher.runtime_dir.join("attempts.jsonl"),
+            seen: Mutex::new(reported_conversations(&log)),
+            log,
             launcher,
             run,
             publisher,
@@ -2224,6 +2234,8 @@ impl ScopedWorkers {
         answer: impl FnOnce() -> Result<BTreeMap<String, Value>>,
     ) -> Result<BTreeMap<String, Value>> {
         let agent = &self.states[&invocation.agent];
+        let backend = crate::backend::by_name(&agent.backend)
+            .context("invocation-scoped agent has no backend")?;
         let client = &self.launcher.client;
         let session = client.session_for(&invocation.agent);
         let mut record = json!({
@@ -2233,6 +2245,7 @@ impl ScopedWorkers {
             "attempt_id": attempt.id,
             "backend": agent.backend,
             "native_session_id": Value::Null,
+            "verification": backend.freshness().name(),
             "scope": "invocation",
             "outcome": "started",
             "cleanup_status": "pending",
@@ -2253,21 +2266,34 @@ impl ScopedWorkers {
         // Every process the worker had, captured while it runs. Identities,
         // not bare pids: confirming the stop must not mistake a recycled pid.
         let mut tree = Vec::new();
-        let started = (|| -> Result<String> {
+        // Whatever the worker reported, kept even when it is refused.
+        let mut reported = None;
+        let started = (|| -> Result<()> {
             let command = self
                 .launcher
                 .launch(&invocation.agent, agent, Some(attempt))?;
             self.launcher
                 .wait_ready(&invocation.agent, agent, &command)?;
             client.finish_backend_startup(&session, WORKER_START_TIMEOUT)?;
-            let native = self.opened_conversation(&session, agent, attempt, &mut tree)?;
-            Ok(native)
+            self.opened_conversation(&session, backend, attempt, &mut tree, &mut reported)
         })();
-        let result = match started {
-            Ok(native) => {
-                record["native_session_id"] = json!(native);
-                answer()
+        record["native_session_id"] = json!(reported);
+        // A minted id is on disk before the worker hears anything: the next
+        // run's check is only as good as this log.
+        let started = started.and_then(|()| match backend.freshness() {
+            Freshness::Chosen => {
+                self.record(&record);
+                Ok(())
             }
+            Freshness::Reported => self.append(&record).with_context(|| {
+                format!(
+                    "could not record the conversation it reported in {}",
+                    self.log.display()
+                )
+            }),
+        });
+        let result = match started {
+            Ok(()) => answer(),
             Err(error) => Err(error.context(format!(
                 "agent '{}' invocation {}: worker attempt {} did not start a fresh conversation",
                 invocation.agent, invocation.id, attempt.id
@@ -2298,34 +2324,39 @@ impl ScopedWorkers {
         result
     }
 
-    /// The conversation the started worker reports it opened, which must be
-    /// the one the attempt named.
+    /// Wait for the started worker to report the conversation it opened,
+    /// into `reported`, and check that conversation is new.
     fn opened_conversation(
         &self,
         session: &str,
-        agent: &AgentState,
+        backend: &dyn crate::backend::Backend,
         attempt: &manager::TopologyAttempt,
         tree: &mut Vec<(u32, String)>,
-    ) -> Result<String> {
+        reported: &mut Option<String>,
+    ) -> Result<()> {
         let client = &self.launcher.client;
-        let backend = crate::backend::by_name(&agent.backend)
-            .context("invocation-scoped agent has no backend")?;
         let deadline = Instant::now() + WORKER_START_TIMEOUT;
         loop {
             let pane_pid = client.get_pane_pid(session)?;
             *tree = client.session_process_tree(session)?;
             let stamp = client.session_delivery(session);
-            let reported = backend.conversation_id(&crate::backend::Target {
+            let target = crate::backend::Target {
                 name: session,
                 pane_pid,
                 stamp: stamp.as_deref(),
-            });
-            match reported {
-                Some(native) if native == attempt.native_session => return Ok(native),
-                Some(native) => bail!(
-                    "it opened conversation {native}, not the new conversation {} it was given",
-                    attempt.native_session
-                ),
+            };
+            match backend.conversation_id(&target) {
+                Some(native) => {
+                    let verified = fresh_conversation(
+                        backend.freshness(),
+                        &attempt.native_session,
+                        &native,
+                        &self.seen,
+                        || backend.prove_fresh(&target, &native),
+                    );
+                    *reported = Some(native);
+                    return verified;
+                }
                 None if Instant::now() < deadline => thread::sleep(Duration::from_millis(250)),
                 None => bail!(
                     "it never reported a conversation within {:?}",
@@ -2358,19 +2389,81 @@ impl ScopedWorkers {
 
     /// Best effort: a record that cannot be written does not decide the run.
     fn record(&self, record: &Value) {
-        let line = format!("{record}\n");
-        let written = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log)
-            .and_then(|mut file| file.write_all(line.as_bytes()));
-        if let Err(error) = written {
+        if let Err(error) = self.append(record) {
             eprintln!(
                 "warning: could not record worker attempt in {}: {error}",
                 self.log.display()
             );
         }
     }
+
+    fn append(&self, record: &Value) -> std::io::Result<()> {
+        let line = format!("{record}\n");
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .and_then(|mut file| file.write_all(line.as_bytes()))
+    }
+}
+
+/// Every conversation an attempt recorded in `log`, in this run or an earlier
+/// one of the same deployment. No log is none; one that cannot be read, or
+/// has a line that is not a record, is an error.
+fn reported_conversations(log: &Path) -> Result<BTreeSet<String>, String> {
+    let text = match fs::read_to_string(log) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(format!("could not read {}: {error}", log.display())),
+    };
+    let mut seen = BTreeSet::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let record: Value = serde_json::from_str(line).map_err(|error| {
+            format!("{} has a line that is not a record: {error}", log.display())
+        })?;
+        if let Some(native) = record["native_session_id"].as_str() {
+            seen.insert(native.to_owned());
+        }
+    }
+    Ok(seen)
+}
+
+/// Whether `reported`, the conversation a newly started worker opened, is a
+/// new one, by the backend's form of proof. Either way it joins `seen`, so no
+/// later attempt can report it again; `prove` is the backend's own check,
+/// run once the id itself has passed.
+fn fresh_conversation(
+    freshness: Freshness,
+    chosen: &str,
+    reported: &str,
+    seen: &Mutex<Result<BTreeSet<String>, String>>,
+    prove: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if freshness == Freshness::Chosen && reported != chosen {
+        bail!("it opened conversation {reported}, not the new conversation {chosen} it was given");
+    }
+    if reported.trim().is_empty() {
+        bail!("it reported an empty conversation id");
+    }
+    {
+        let mut seen = seen
+            .lock()
+            .map_err(|_| anyhow::anyhow!("conversation log lock poisoned"))?;
+        match &mut *seen {
+            Ok(seen) => {
+                if !seen.insert(reported.to_owned()) {
+                    bail!("it opened conversation {reported}, which an earlier attempt already had");
+                }
+            }
+            // A chosen id was minted for this attempt alone; only a minted one
+            // rests on the log.
+            Err(_) if freshness == Freshness::Chosen => {}
+            Err(error) => bail!(
+                "the conversations earlier attempts had are unknown, so {reported} cannot be shown new: {error}"
+            ),
+        }
+    }
+    prove().with_context(|| format!("conversation {reported} could not be shown new"))
 }
 
 /// A body reaches its own instance's state and no other's.
@@ -8882,6 +8975,84 @@ mod tests {
         assert!(unknown.is_err());
         // Nor does a newer version pass.
         assert!(verify(&scoped_program(3, "Claude", Some("invocation"))).is_err());
+    }
+
+    /// A conversation a backend minted is taken only when it is new: not
+    /// empty, not one any attempt reported before, and passing the backend's
+    /// own proof. Whatever is refused is never taken later either.
+    #[test]
+    fn a_reported_conversation_is_refused_unless_it_is_shown_new() {
+        let seen = Mutex::new(Ok(BTreeSet::new()));
+        let fresh = |reported: &str, seen: &Mutex<Result<BTreeSet<String>, String>>| {
+            fresh_conversation(Freshness::Reported, "chosen", reported, seen, || Ok(()))
+        };
+        fresh("first", &seen).unwrap();
+        let reused = fresh("first", &seen).unwrap_err().to_string();
+        assert!(
+            reused.contains("an earlier attempt already had"),
+            "{reused}"
+        );
+        for empty in ["", "  "] {
+            let error = fresh(empty, &seen).unwrap_err().to_string();
+            assert!(error.contains("empty conversation id"), "{error}");
+        }
+        let unproved = fresh_conversation(Freshness::Reported, "chosen", "forked", &seen, || {
+            bail!("it was forked from another thread")
+        })
+        .unwrap_err();
+        assert!(
+            format!("{unproved:#}").contains("it was forked from another thread"),
+            "{unproved:#}"
+        );
+        assert!(fresh("forked", &seen).is_err());
+        // Nor is a minted id taken when the earlier ones are unknown.
+        let unknown = Mutex::new(Err("unreadable log".to_string()));
+        let error = fresh("second", &unknown).unwrap_err().to_string();
+        assert!(error.contains("unreadable log"), "{error}");
+    }
+
+    /// A chosen conversation must be the one given; its proof still runs; and
+    /// it closes the id to a later minted report.
+    #[test]
+    fn a_chosen_conversation_must_be_the_one_given() {
+        let seen = Mutex::new(Ok(BTreeSet::new()));
+        let error = fresh_conversation(Freshness::Chosen, "given", "other", &seen, || Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not the new conversation given"), "{error}");
+        assert!(
+            fresh_conversation(Freshness::Chosen, "given", "given", &seen, || bail!("no")).is_err()
+        );
+        assert!(fresh_conversation(Freshness::Reported, "x", "given", &seen, || Ok(())).is_err());
+        // An unreadable log does not stand in the way of an id minted for
+        // this attempt alone.
+        let unknown = Mutex::new(Err("unreadable log".to_string()));
+        fresh_conversation(Freshness::Chosen, "new", "new", &unknown, || Ok(())).unwrap();
+    }
+
+    /// The conversations a resumed run must not take again are every one its
+    /// log recorded; a log that cannot be read is an error, not empty.
+    #[test]
+    fn earlier_conversations_are_read_from_the_attempt_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("attempts.jsonl");
+        assert_eq!(reported_conversations(&log), Ok(BTreeSet::new()));
+        fs::write(
+            &log,
+            "{\"native_session_id\":null,\"outcome\":\"started\"}\n\
+             {\"native_session_id\":\"a\",\"outcome\":\"started\"}\n\
+             {\"native_session_id\":\"a\",\"outcome\":\"completed\"}\n\
+             {\"native_session_id\":\"b\",\"outcome\":\"failed\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            reported_conversations(&log),
+            Ok(BTreeSet::from(["a".to_string(), "b".to_string()]))
+        );
+        let seen = Mutex::new(reported_conversations(&log));
+        assert!(fresh_conversation(Freshness::Reported, "x", "b", &seen, || Ok(())).is_err());
+        fs::write(&log, "{\"native_session_id\":\"a\"}\n{\"native_sess").unwrap();
+        assert!(reported_conversations(&log).is_err());
     }
 
     #[test]

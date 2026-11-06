@@ -1,4 +1,5 @@
 import Lean
+import Omar.Backends
 import Omar.Mutation
 
 open Lean
@@ -480,6 +481,15 @@ private partial def parseAgents (tokens : List Token) : Except String (Array Age
       let (_, tokens) ← expectSym ":" tokens
       let (backend, tokens) ← word tokens
       let (scope, tokens) ← parseAgentOptions name tokens
+      -- Refused here, before any bytecode exists, in the runtime's words: a
+      -- backend that cannot promise a new conversation per invocation, or one
+      -- omarc does not know, would otherwise compile and fail once deployed.
+      -- Resolved as the runtime resolves it: any case, any alias.
+      if scope == .invocation &&
+          !Backends.freshConversation.any (·.contains backend.toLower) then
+        throw s!"agent '{name}' is invocation-scoped, but backend '{backend}' cannot start \
+          a fresh conversation per invocation; supported: \
+          {", ".intercalate (Backends.freshConversation.map (·[0]!)).toList}"
       let agent := { name, backend, scope : Agent }
       match tokens with
       | Token.sym "," :: rest =>

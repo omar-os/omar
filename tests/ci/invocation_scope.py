@@ -18,7 +18,8 @@ Checked, from what the fake logged and the run recorded:
   attempt is recorded as stopped;
 - a worker that opens some other conversation fails the run, and is never
   handed the invocation;
-- a backend that cannot promise a fresh conversation is refused up front.
+- a backend that cannot promise a fresh conversation, or that omarc does not
+  know, is refused by omarc itself, which writes no bytecode or plan.
 """
 import json
 import os
@@ -216,7 +217,7 @@ def fresh_worker_per_invocation():
         assert {a['cleanup_status'] for a in finished} == {'stopped'}, attempts
         assert [a['native_session_id'] for a in finished] == [c['session_id'] for c in coder]
         assert all(a['logical_agent'] == 'p.coder' and a['scope'] == 'invocation'
-                   for a in finished), attempts
+                   and a['verification'] == 'chosen' for a in attempts), attempts
         replies = [e['reply'] for e in events if e['event'] == 'reply']
         assert all(not r.get('result', {}).get('isError') for r in replies), replies
         print('PASS: two coder invocations ran in two fresh conversations, '
@@ -236,17 +237,34 @@ def a_reused_conversation_fails_closed():
         assert len(launches) == 1, launches
         finished = [a for a in attempts if a['outcome'] != 'started']
         assert [(a['outcome'], a['cleanup_status']) for a in finished] == [('failed', 'stopped')], attempts
+        # What it actually opened is on record, refused or not.
+        assert finished[0]['native_session_id'] == 'an-old-conversation', attempts
         print('PASS: a worker that opened another conversation failed the run and was never handed the invocation')
 
 
 def an_unsupported_backend_is_refused():
     with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
-        result, events, _ = run(Path(directory), coder='Codex(scope = invocation)')
+        root = Path(directory)
+        # omarc is the layer that refuses: nothing is written for the runtime
+        # to refuse again, whether a program or a mutation plan.
+        old = root / 'Old.omar'
+        old.write_text(PROGRAM.format(coder='Codex'))
+        for backend in ['Codex', 'Web', 'Nope']:
+            program = root / 'Scoped.omar'
+            program.write_text(PROGRAM.format(coder=f'{backend}(scope = invocation)'))
+            for args in [[program], ['--diff', old, program]]:
+                out = root / 'out.json'
+                r = subprocess.run([str(OMARC), *map(str, args), str(out)],
+                                   capture_output=True, text=True)
+                assert r.returncode == 1 and not out.exists(), (backend, args, r)
+                assert (f"backend '{backend}' cannot start a fresh conversation per "
+                        'invocation; supported: claude') in r.stderr, r.stderr
+        result, events, _ = run(root, coder='Web(scope = invocation)')
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
         assert 'cannot start a fresh conversation per invocation' in output, output
         assert events == [], events
-        print('PASS: Codex(scope = invocation) refused before anything started')
+        print('PASS: Codex, Web and unknown backends refused by omarc, no bytecode written')
 
 
 if __name__ == '__main__':

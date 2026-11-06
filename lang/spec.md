@@ -101,7 +101,8 @@ uses.
 An agent's backend names what answers its reactions: `Claude` (or
 `ClaudeCode`), `Codex`, `Cursor`, `OpenCode`, `Agy`, `Stub`, or `Web`. The
 compiler takes any identifier here; an unknown one compiles and fails when the
-runtime tries to start it. Case does not matter.
+runtime tries to start it, unless the agent is invocation-scoped (below). Case
+does not matter.
 
 An agent's scope says how long its native conversation lives. `agent`, the
 default, is one conversation for the whole run: every invocation of the agent
@@ -132,25 +133,47 @@ by the first is there for the second.
 
 The runtime makes sure of it rather than assuming it:
 
-- before the run starts, the backend must be one that can promise a fresh
-  conversation per invocation, or the program is refused. Only `Claude` can
-  today; it is told the id of the new conversation to open (`--session-id`),
-  and the runtime checks the worker reports that id before delivering;
-- a worker that cannot be started, or that opens any other conversation, fails
-  the invocation. There is no falling back to a worker that has one;
+- the compiler refuses an invocation-scoped agent whose backend cannot promise
+  a fresh conversation per invocation, or that it does not know, before it
+  writes any bytecode or mutation plan, and names the backends that can:
+
+  ```text
+  agent 'step' is invocation-scoped, but backend 'Codex' cannot start a fresh
+  conversation per invocation; supported: claude
+  ```
+
+  The runtime refuses it again before the run starts, so bytecode from
+  anywhere else cannot get one through. `Web` is always refused: its client
+  is no process OMAR starts, so nothing can show its context is new. Only
+  `Claude` can today;
+- the runtime checks the conversation a worker reports before delivering
+  anything. Where the backend is told the id of the new conversation to open
+  (`Claude`, by `--session-id`), the worker must report exactly that id. Where
+  the backend mints its own, the id must be non-empty, never reported by an
+  earlier attempt of the deployment (those recorded in `attempts.jsonl`
+  included), and pass whatever proof the backend has that the conversation is
+  new;
+- a worker that cannot be started, or whose conversation fails the check, fails
+  the invocation, and is stopped without being handed it. There is no falling
+  back to a worker that has one;
 - the attempt is the only caller that may answer its invocation: a worker
   left from an earlier attempt of the same agent is refused;
 - after the invocation is answered, or expires, the worker's processes are
   stopped and seen gone before its effects are released downstream. If that
   cannot be confirmed in time, the invocation fails with the effects withheld.
 
-Each attempt is recorded, as it starts and as it ends, in `attempts.jsonl` in
-the run's directory: `run`, `logical_agent`, `invocation_id`, `attempt_id`,
-`backend`, `native_session_id`, `scope`, `outcome` and `cleanup_status`.
+Each attempt is recorded, as it starts, once its conversation is checked, and
+as it ends, in `attempts.jsonl` in the run's directory: `run`,
+`logical_agent`, `invocation_id`, `attempt_id`, `backend`, `native_session_id`
+(what the worker reported, refused or not), `verification` (`chosen` or
+`reported`, the form of the check), `scope`, `outcome` and `cleanup_status`.
+A minted id that cannot be recorded fails the attempt: the next run's check
+reads it from there.
 Mission Control shows an agent's scope and its latest attempt.
 
 Any other value or option is refused: `Claude(scope = conversation)`,
-`Claude(lifetime = invocation)` and `Claude()` do not compile.
+`Claude(lifetime = invocation)`, `Claude()`, `Codex(scope = invocation)` and
+`Web(scope = invocation)` do not compile.
 
 An argument is an int or a string literal, and nothing else — there are no
 expressions. `main` may be named or bare; the name identifies the run, and a
@@ -516,6 +539,10 @@ topology and an inbox in the invocation registry.
 The name says what answers the reaction, not how the bytes get there. `Codex`
 and `ClaudeCode` do not encode their transport either; a `Web` agent's panel may
 reach it however it likes, and changing that must not mean editing the program.
+
+A `Web` agent cannot be invocation-scoped (§2.1): whatever answers it may
+remember every earlier invocation, and the runtime cannot tell, so the
+compiler refuses `Web(scope = invocation)`.
 
 Everything after that is unchanged. Its reactions are invoked when their
 triggers are present, their prompts are interpolated the same way, and their

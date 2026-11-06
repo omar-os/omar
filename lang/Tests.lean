@@ -765,6 +765,33 @@ def testAgentScope : IO Unit := do
   assertEqual "invocation version" (version fresh) (some 2)
   assertEqual "invocation scope" (scope (← spawn fresh)) (some "invocation")
   let _ ← compiled "coder : Claude(scope = invocation), other : Codex"
+  -- Every backend that can start a fresh conversation is accepted by any
+  -- alias a source file can spell, in any case, as the runtime resolves it.
+  let supported := Omar.Backends.freshConversation
+  for aliases in supported do
+    for alias in aliases.filter (!·.contains '-') do
+      for spelled in [alias, alias.capitalize, alias.toUpper] do
+        let decl := s!"coder : {spelled}(scope = invocation)"
+        assertEqual decl (version (← compiled decl)) (some 2)
+  -- One that cannot, or one omarc does not know, is refused before bytecode
+  -- exists, naming those that can. Its default scope still compiles,
+  -- unknown backend included.
+  let names := ", ".intercalate (supported.map (·[0]!)).toList
+  for backend in ["Codex", "Web", "Nope"] do
+    let _ ← compiled s!"coder : {backend}"
+    match compileSource "Scoped" (source s!"coder : {backend}(scope = invocation)") with
+    | .ok _ => throw (IO.userError s!"accepted {backend}(scope = invocation)")
+    | .error error =>
+      if error != s!"agent 'coder' is invocation-scoped, but backend '{backend}' cannot start \
+          a fresh conversation per invocation; supported: {names}" then
+        throw (IO.userError s!"{backend}: {error}")
+  -- Nor does a mutation to one plan.
+  match compileDiffSourcesWithSchemas "Scoped" (source "coder : Codex") #[]
+      "Scoped" (source "coder : Codex(scope = invocation)") #[] with
+  | .ok _ => throw (IO.userError "planned a mutation to Codex(scope = invocation)")
+  | .error error =>
+    if !mentions error "cannot start a fresh conversation per invocation" then
+      throw (IO.userError s!"scope plan to Codex: {error}")
   for (decl, expected) in [
       ("coder : Claude(scope = conversation)", "unknown scope 'conversation'"),
       ("coder : Claude(lifetime = invocation)", "unknown option 'lifetime'"),
