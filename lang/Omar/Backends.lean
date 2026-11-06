@@ -7,6 +7,7 @@ namespace Omar.Backends
     its name first: those whose `fresh_conversation` is true. -/
 def freshConversation : Array (Array String) := #[
   #["claude", "claude-code", "claude_code", "claudecode"],
+  #["codex"],
   #["opencode"],
   #["pi"],
   #["jev"],

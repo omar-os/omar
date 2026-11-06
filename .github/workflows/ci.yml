@@ -292,6 +292,12 @@ jobs:
         run: |
           cargo build --bin omar
           python3 tests/ci/pi_invocation_scope.py
+      # Real pinned Codex, with a local deterministic provider: no credentials.
+      - name: Verify real Codex runs an invocation-scoped agent in a new thread each time
+        run: |
+          npm install -g @openai/codex@0.154.0
+          cargo build --bin omar
+          python3 tests/ci/codex_invocation_scope.py
       - name: Verify safety properties are proved through serve
         run: |
           cargo build --bin omar

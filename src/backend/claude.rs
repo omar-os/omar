@@ -807,7 +807,7 @@ mod tests {
         assert!(Claude.fresh_conversation());
         assert_eq!(
             super::super::fresh_conversation_backends(),
-            ["claude", "opencode", "pi", "jev", "stub"]
+            ["claude", "codex", "opencode", "pi", "jev", "stub"]
         );
     }
 

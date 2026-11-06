@@ -138,14 +138,14 @@ The runtime makes sure of it rather than assuming it:
   writes any bytecode or mutation plan, and names the backends that can:
 
   ```text
-  agent 'step' is invocation-scoped, but backend 'Codex' cannot start a fresh
-  conversation per invocation; supported: claude, opencode, pi, jev, stub
+  agent 'step' is invocation-scoped, but backend 'Cursor' cannot start a fresh
+  conversation per invocation; supported: claude, codex, opencode, pi, jev, stub
   ```
 
   The runtime refuses it again before the run starts, so bytecode from
   anywhere else cannot get one through. `Web` is always refused: its client
   is no process OMAR starts, so nothing can show its context is new.
-  `Claude`, `OpenCode`, `Pi`, `Stub` and `Jev` can today;
+  `Claude`, `Codex`, `OpenCode`, `Pi`, `Stub` and `Jev` can today;
 - the runtime checks the conversation a worker reports before delivering
   anything. Where the backend is told the id of the new conversation to open
   (`Claude`, by `--session-id`; `Pi`, by `--no-session --session-id`, an
@@ -153,10 +153,14 @@ The runtime makes sure of it rather than assuming it:
   through its `/api/session`, which needs an opencode that has it, only once
   the server has no session of that id, and taken only while it holds no
   message; `Stub`, in its launch context), the worker must report exactly
-  that id. Where the backend mints its own, the id must
-  be non-empty, never reported by an earlier attempt of the deployment (those
-  recorded in `attempts.jsonl` included), and pass whatever proof the backend
-  has that the conversation is new;
+  that id. Where the backend mints its own (`Codex`, which takes no id), the
+  id must be non-empty, never reported by an earlier attempt of the deployment
+  (those recorded in `attempts.jsonl` included), and pass whatever proof the
+  backend has that the conversation is new. A `Codex` attempt starts an
+  app-server of its own with memories off, never resumes, and never falls back
+  to the exec runner; its thread must be the server's only loaded one, not
+  forked, no subagent's, hold no message, and be created after the attempt
+  began;
 - a worker that cannot be started, or whose conversation fails the check, fails
   the invocation, and is stopped without being handed it. There is no falling
   back to a worker that has one;
@@ -182,7 +186,7 @@ reads it from there.
 Mission Control shows an agent's scope and its latest attempt.
 
 Any other value or option is refused: `Claude(scope = conversation)`,
-`Claude(lifetime = invocation)`, `Claude()`, `Codex(scope = invocation)` and
+`Claude(lifetime = invocation)`, `Claude()`, `Cursor(scope = invocation)` and
 `Web(scope = invocation)` do not compile.
 
 An argument is an int or a string literal, and nothing else — there are no

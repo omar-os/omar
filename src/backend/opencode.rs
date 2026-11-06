@@ -81,7 +81,12 @@ impl Backend for Opencode {
     }
     /// Asked of the live server just before delivery, not only the stamp:
     /// the conversation is there, and still empty.
-    fn prove_fresh(&self, target: &super::Target<'_>, id: &str) -> Result<()> {
+    fn prove_fresh(
+        &self,
+        target: &super::Target<'_>,
+        id: &str,
+        _since: std::time::SystemTime,
+    ) -> Result<()> {
         let (port, _) = target
             .stamp
             .and_then(from_stamp)

@@ -42,7 +42,6 @@ pub enum Freshness {
     /// The backend mints the id. The runtime takes it only when it is
     /// non-empty, no earlier attempt of the deployment reported it, and
     /// [`Backend::prove_fresh`] holds.
-    #[allow(dead_code)] // No backend mints its own ids yet.
     Reported,
 }
 
@@ -420,8 +419,14 @@ pub trait Backend: Send + Sync {
 
     /// Any proof beyond the id itself that the conversation `id`, which the
     /// worker in `target` reported, is new: checked after the id passes, and
-    /// before anything is delivered. An error refuses the attempt.
-    fn prove_fresh(&self, _target: &Target<'_>, _id: &str) -> Result<()> {
+    /// before anything is delivered. `since` is when the attempt began, before
+    /// its worker was launched. An error refuses the attempt.
+    fn prove_fresh(
+        &self,
+        _target: &Target<'_>,
+        _id: &str,
+        _since: std::time::SystemTime,
+    ) -> Result<()> {
         Ok(())
     }
 

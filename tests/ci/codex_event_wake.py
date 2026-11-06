@@ -5,8 +5,12 @@ Run: python3 tests/ci/codex_event_wake.py
 Uses an isolated CODEX_HOME and a loopback-only mock provider; no model calls
 or user credentials are needed. The ordinary Rust socket tests exercise OMAR's
 implementation; this optional integration check verifies the server semantics.
+It also checks what an invocation-scoped attempt relies on: the server knows
+the keys that turn memories off (under --strict-config), and a new thread
+reads back, without turns, as not forked, no subagent's, holding no message,
+and created now.
 """
-import json, os, selectors, subprocess, tempfile, threading
+import json, os, selectors, subprocess, tempfile, threading, time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 entered = threading.Event()
@@ -23,7 +27,8 @@ http = HTTPServer(('127.0.0.1', 0), Mock)
 threading.Thread(target=http.serve_forever, daemon=True).start()
 with tempfile.TemporaryDirectory(prefix='omar-wake-check-') as work:
     env = dict(os.environ, CODEX_HOME=work)
-    args = ['codex', 'app-server', '--listen', 'stdio://', '-c', 'model_provider="wake_test"', '-c', 'model="wake-test"', '-c', 'model_providers.wake_test.name="Local wake test"', '-c', f'model_providers.wake_test.base_url="http://127.0.0.1:{http.server_port}/v1"', '-c', 'model_providers.wake_test.wire_api="responses"', '-c', 'model_providers.wake_test.requires_openai_auth=false', '-c', 'model_providers.wake_test.supports_websockets=false']
+    no_memories = ['-c', 'features.memories=false', '-c', 'memories.use_memories=false', '-c', 'memories.generate_memories=false']
+    args = ['codex', 'app-server', '--strict-config', '--listen', 'stdio://', *no_memories, '-c', 'model_provider="wake_test"', '-c', 'model="wake-test"', '-c', 'model_providers.wake_test.name="Local wake test"', '-c', f'model_providers.wake_test.base_url="http://127.0.0.1:{http.server_port}/v1"', '-c', 'model_providers.wake_test.wire_api="responses"', '-c', 'model_providers.wake_test.requires_openai_auth=false', '-c', 'model_providers.wake_test.supports_websockets=false']
     err = open(work+'/stderr', 'w')
     proc = subprocess.Popen(args, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err)
     sel = selectors.DefaultSelector(); sel.register(proc.stdout, selectors.EVENT_READ)
@@ -47,7 +52,12 @@ with tempfile.TemporaryDirectory(prefix='omar-wake-check-') as work:
     try:
         call(1, 'initialize', {'clientInfo': {'name':'omar_wake_test', 'version':'1'}})
         send({'method':'initialized','params':{}})
+        began = int(time.time())
         thread = call(2, 'thread/start', {'cwd':work, 'ephemeral':True, 'approvalPolicy':'never', 'sandbox':'read-only'})['thread']['id']
+        read = call(5, 'thread/read', {'threadId':thread, 'includeTurns':False})['thread']
+        assert read['id'] == thread and read.get('forkedFromId') is None and read.get('parentThreadId') is None, read
+        assert read['preview'] == '' and read['createdAt'] >= began, read
+        print('PASS: a new thread reads back unforked, empty and created now, with memories off.')
         params = {'threadId':thread, 'input':[], 'toolOutput':{'name':'omar_event','namespace':'omar','output':'test event'}}
         first = call(3, 'turn/start', params)
         assert first['turn']['status'] == 'inProgress', first

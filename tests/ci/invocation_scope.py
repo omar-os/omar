@@ -24,6 +24,11 @@ Checked, from what the fake logged and the run recorded:
   and each fails closed: a pi that opens another conversation or ignores the
   id; an opencode whose `/api/session` hands back an older session, one that
   already holds messages, or is missing, with no fallback to `/session`;
+- the same for fake `codex` (an app-server of its own per attempt, memories
+  off, and a TUI that attaches to it and starts one thread, whose id codex
+  mints), and it fails closed on a thread forked from another, one already
+  holding a message, one created before the attempt began, or one an earlier
+  attempt had;
 - the model-free `Stub(scope = invocation)` does the same for real, with no
   fake and no credentials: two attempts, each reporting the new conversation
   its attempt named, the first stopped before the second started;
@@ -257,7 +262,147 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("127.0.0.1", int(flag("--port"))), Handler).serve_forever()
 '''
 
-FAKES = {'claude': FAKE, 'pi': FAKE_PI, 'opencode': FAKE_OPENCODE}
+# codex, as OMAR runs it: `codex app-server --listen unix://P` serving
+# JSON-RPC over a WebSocket, and a TUI `codex ... --remote unix://P` that
+# attaches and starts one thread, whose id the server mints. The calls and
+# fields are 0.154's (checked against the real one in codex_event_wake.py).
+FAKE_CODEX = COMMON + r"""
+import base64, hashlib, struct, time
+
+def exact(conn, n):
+    data = b""
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            raise EOFError
+        data += chunk
+    return data
+def frame(conn):
+    first, second = exact(conn, 2)
+    length = second & 0x7f
+    if length == 126:
+        length = struct.unpack(">H", exact(conn, 2))[0]
+    elif length == 127:
+        length = struct.unpack(">Q", exact(conn, 8))[0]
+    mask = exact(conn, 4) if second & 0x80 else b"\0\0\0\0"
+    data = bytes(b ^ mask[i % 4] for i, b in enumerate(exact(conn, length)))
+    return first & 0x0f, data
+def send(conn, message, masked=False):
+    data = json.dumps(message).encode()
+    n = len(data)
+    bit = 0x80 if masked else 0
+    header = bytes([0x81]) + (bytes([bit | n]) if n < 126 else
+                              bytes([bit | 126]) + struct.pack(">H", n) if n < 65536 else
+                              bytes([bit | 127]) + struct.pack(">Q", n))
+    if masked:
+        key = os.urandom(4)
+        header += key
+        data = bytes(b ^ key[i % 4] for i, b in enumerate(data))
+    conn.sendall(header + data)
+def text(conn):
+    while True:
+        opcode, data = frame(conn)
+        if opcode == 0x8:
+            raise EOFError
+        if opcode == 0x1:
+            return json.loads(data)
+
+if "app-server" in argv:
+    overrides = dict(argv[i + 1].split("=", 1) for i, a in enumerate(argv) if a == "-c")
+    server = [json.loads(overrides["mcp_servers.omar.command"]),
+              *json.loads(overrides["mcp_servers.omar.args"])]
+    context = json.loads(Path(server[server.index("--context-file") + 1]).read_text())
+    topology = context["topology"]
+    session = None
+    threads = {}
+    write({"event": "launch", "agent": topology["agent"], "attempt": topology.get("attempt"),
+           "session_id": None, "argv": " ".join(argv),
+           "system_prompt": overrides.get("developer_instructions")})
+
+    def start_thread():
+        global session
+        reused = Path(os.environ["HOME"]) / "fake-codex-thread"
+        if os.environ.get("FAKE_REUSE_THREAD"):
+            if not reused.exists():
+                reused.write_text(str(uuid.uuid4()))
+            session = reused.read_text()
+        else:
+            session = str(uuid.uuid4())
+        threads[session] = {
+            "id": session, "preview": "",
+            "forkedFromId": "an-old-thread" if os.environ.get("FAKE_FORKED") else None,
+            "parentThreadId": None,
+            "createdAt": int(time.time()) - (3600 if os.environ.get("FAKE_OLD_THREAD") else 0),
+        }
+        if os.environ.get("FAKE_PREVIEW"):
+            # A thread the TUI resumed: it already holds a message.
+            threads[session]["preview"] = "an earlier message"
+        write({"event": "thread", "agent": topology["agent"], "session_id": session})
+        return threads[session]
+
+    def serve(conn):
+        request = b""
+        while not request.endswith(b"\r\n\r\n"):
+            request += exact(conn, 1)
+        key = re.search(rb"Sec-WebSocket-Key: *(\S+)", request, re.I).group(1)
+        accept = base64.b64encode(hashlib.sha1(
+            key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest()).decode()
+        conn.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                      f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+        while True:
+            try:
+                message = text(conn)
+            except (EOFError, OSError):
+                return
+            method, params = message.get("method"), message.get("params") or {}
+            write({"event": "rpc", "agent": topology["agent"], "method": method,
+                   "params": params})
+            if "id" not in message:
+                continue
+            result = {}
+            if method == "initialize":
+                result = {"userAgent": "fake-codex/0.154.0"}
+            elif method == "thread/start":
+                result = {"thread": start_thread()}
+            elif method == "thread/loaded/list":
+                result = {"data": list(threads), "nextCursor": None}
+            elif method == "thread/read":
+                result = {"thread": threads[params["threadId"]]}
+            elif method == "thread/delete":
+                threads.pop(params["threadId"], None)
+            elif method == "turn/start":
+                said = params["toolOutput"]["output"]
+                threads[params["threadId"]]["preview"] = said
+                result = {"turn": {"id": str(uuid.uuid4()), "status": "inProgress"}}
+                threading.Thread(target=answer, args=(said,), daemon=True).start()
+            send(conn, {"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+    listen = socket.socket(socket.AF_UNIX)
+    listen.bind(flag("--listen").removeprefix("unix://"))
+    listen.listen()
+    while True:
+        threading.Thread(target=serve, args=(listen.accept()[0],), daemon=True).start()
+else:
+    # The TUI: attach to the server it names and start the thread it shows.
+    write({"event": "tui", "argv": " ".join(argv)})
+    print("\x1b[2J\x1b[H OpenAI Codex (fake)\n› ", flush=True)
+    conn = socket.socket(socket.AF_UNIX)
+    conn.connect(flag("--remote").removeprefix("unix://"))
+    conn.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                 b"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+                 b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+    reply = b""
+    while not reply.endswith(b"\r\n\r\n"):
+        reply += exact(conn, 1)
+    for id, method in [(1, "initialize"), (2, "thread/start")]:
+        send(conn, {"jsonrpc": "2.0", "id": id, "method": method, "params": {}}, masked=True)
+        while text(conn).get("id") != id:
+            pass
+    while True:
+        time.sleep(60)
+"""
+
+FAKES = {'claude': FAKE, 'pi': FAKE_PI, 'opencode': FAKE_OPENCODE, 'codex': FAKE_CODEX}
 
 PROGRAM = '''team Pipe[coder : {coder}, keeper : Claude] {{
     input start : string
@@ -285,7 +430,7 @@ STUB_PROGRAM = PROGRAM.replace('keeper : Claude', 'keeper : Stub')
 OTHER = object()
 
 # Each faked backend as a program spells it.
-SPELLED = {'claude': 'Claude', 'pi': 'Pi', 'opencode': 'OpenCode'}
+SPELLED = {'claude': 'Claude', 'pi': 'Pi', 'opencode': 'OpenCode', 'codex': 'Codex'}
 
 
 def supported():
@@ -354,12 +499,19 @@ def fresh_worker_per_invocation(backend='claude'):
         keeper = [e for e in launches if e['agent'] == 'p.keeper']
 
         # Two invocations, two workers, two conversations, each the one its
-        # attempt named; the agent-scoped keeper kept one of each.
+        # attempt named, or for codex the one its own server minted; the
+        # agent-scoped keeper kept one of each.
         assert len(coder) == 2 and len(keeper) == 1, launches
         assert coder[0]['pid'] != coder[1]['pid'], coder
-        assert coder[0]['session_id'] != coder[1]['session_id'], coder
-        for launch in coder:
-            assert launch['session_id'] == launch['attempt']['native_session'], launch
+        if backend == 'codex':
+            minted = {e['pid']: e['session_id'] for e in events if e['event'] == 'thread'}
+            opened = [minted[launch['pid']] for launch in coder]
+        else:
+            opened = [launch['session_id'] for launch in coder]
+            for launch in coder:
+                assert launch['session_id'] == launch['attempt']['native_session'], launch
+        assert opened[0] != opened[1], coder
+        assert all(launch['attempt'] for launch in coder), coder
         assert keeper[0]['session_id'] is None and keeper[0]['attempt'] is None, keeper
         coder_messages = [m for m in messages if m['agent'] == 'p.coder']
         keeper_messages = [m for m in messages if m['agent'] == 'p.keeper']
@@ -381,13 +533,14 @@ def fresh_worker_per_invocation(backend='claude'):
         finished = [a for a in attempts if a['outcome'] != 'started']
         assert [a['outcome'] for a in finished] == ['completed', 'completed'], attempts
         assert {a['cleanup_status'] for a in finished} == {'stopped'}, attempts
-        assert [a['native_session_id'] for a in finished] == [c['session_id'] for c in coder]
+        assert [a['native_session_id'] for a in finished] == opened, attempts
+        verification = 'reported' if backend == 'codex' else 'chosen'
         assert all(a['logical_agent'] == 'p.coder' and a['scope'] == 'invocation'
-                   and a['verification'] == 'chosen' for a in attempts), attempts
+                   and a['verification'] == verification for a in attempts), attempts
         replies = [e['reply'] for e in events if e['event'] == 'reply']
         assert all(not r.get('result', {}).get('isError') for r in replies), replies
         # What the worker reported is what it was handed the invocation in.
-        assert [m['session_id'] for m in coder_messages] == [c['session_id'] for c in coder]
+        assert [m['session_id'] for m in coder_messages] == opened, coder_messages
         if backend == 'pi':
             # In memory: `--no-session` even where workers keep theirs.
             for launch in coder:
@@ -405,6 +558,22 @@ def fresh_worker_per_invocation(backend='claude'):
                     mine.index(('POST', '/api/session')) < \
                     mine.index(('GET', f'/session/{session}/message')), mine
                 assert ('POST', '/session') not in mine, mine
+        if backend == 'codex':
+            # Each attempt's own server, memories off, its thread proved new
+            # over thread/read without turns; the keeper's server as ever.
+            tuis = [e['argv'] for e in events if e['event'] == 'tui']
+            assert not any('resume' in line for line in tuis + [l['argv'] for l in launches])
+            for launch in coder:
+                for override in ['features.memories=false', 'memories.use_memories=false',
+                                 'memories.generate_memories=false']:
+                    assert f'-c {override}' in launch['argv'], launch
+            assert 'memories' not in keeper[0]['argv'], keeper
+            sockets = {launch['argv'].split('--listen ')[1].split()[0] for launch in launches}
+            assert len(sockets) == 3, sockets
+            reads = [e for e in events if e['event'] == 'rpc' and e['method'] == 'thread/read']
+            assert [(r['pid'], r['params']) for r in reads] == [
+                (launch['pid'], {'threadId': thread, 'includeTurns': False})
+                for launch, thread in zip(coder, opened)], reads
         print(f'PASS: {SPELLED[backend]}: two coder invocations ran in two fresh conversations, '
               'keeper reused one; sentinel absent, file visible, worker 1 stopped first')
 
@@ -438,6 +607,26 @@ def a_reused_conversation_fails_closed(backend='claude', fault='FAKE_WRONG_SESSI
                            for e in requests), requests
         print(f'PASS: {SPELLED[backend]} ({fault}): a worker that could not show a new '
               'conversation failed the run and was never handed the invocation')
+
+
+def a_codex_thread_seen_before_fails_closed():
+    """A codex that hands the second attempt the thread the first one had."""
+    with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
+        result, events, attempts = run(Path(directory), env={'FAKE_REUSE_THREAD': '1'},
+                                       **on('codex'))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, output
+        assert 'which an earlier attempt already had' in output, output
+        coder_messages = [e for e in events if e['event'] == 'message' and e['agent'] == 'p.coder']
+        assert len(coder_messages) == 1 and 'Step one' in coder_messages[0]['text'], coder_messages
+        launches = [e for e in events if e['event'] == 'launch' and e['agent'] == 'p.coder']
+        assert len(launches) == 2, launches
+        finished = [a for a in attempts if a['outcome'] != 'started']
+        assert [(a['outcome'], a['cleanup_status']) for a in finished] == \
+            [('completed', 'stopped'), ('failed', 'stopped')], attempts
+        assert finished[0]['native_session_id'] == finished[1]['native_session_id'], attempts
+        print('PASS: Codex (FAKE_REUSE_THREAD): a thread an earlier attempt had was refused, '
+              'and the second worker was never handed the invocation')
 
 
 def a_stub_worker_per_invocation():
@@ -479,8 +668,8 @@ def an_unsupported_backend_is_refused():
         # omarc is the layer that refuses: nothing is written for the runtime
         # to refuse again, whether a program or a mutation plan.
         old = root / 'Old.omar'
-        old.write_text(PROGRAM.format(coder='Codex'))
-        for backend in ['Codex', 'Web', 'Nope']:
+        old.write_text(PROGRAM.format(coder='Web'))
+        for backend in ['Web', 'Nope']:
             program = root / 'Scoped.omar'
             program.write_text(PROGRAM.format(coder=f'{backend}(scope = invocation)'))
             for args in [[program], ['--diff', old, program]]:
@@ -495,7 +684,7 @@ def an_unsupported_backend_is_refused():
         assert result.returncode != 0, output
         assert 'cannot start a fresh conversation per invocation' in output, output
         assert events == [], events
-        print('PASS: Codex, Web and unknown backends refused by omarc, no bytecode written')
+        print('PASS: Web and unknown backends refused by omarc, no bytecode written')
 
 
 if __name__ == '__main__':
@@ -515,5 +704,16 @@ if __name__ == '__main__':
                                        recorded=None)
     a_reused_conversation_fails_closed('opencode', 'FAKE_NO_API_SESSION', says='/api/session',
                                        recorded=None)
+    fresh_worker_per_invocation('codex')
+    # codex mints the id: a thread forked from another, one that already holds
+    # a message, one created before the attempt began, or one an earlier
+    # attempt had.
+    a_reused_conversation_fails_closed('codex', 'FAKE_FORKED', says='forked from',
+                                       recorded=OTHER)
+    a_reused_conversation_fails_closed('codex', 'FAKE_PREVIEW', says='already holds',
+                                       recorded=OTHER)
+    a_reused_conversation_fails_closed('codex', 'FAKE_OLD_THREAD', says='before the attempt',
+                                       recorded=OTHER)
+    a_codex_thread_seen_before_fails_closed()
     a_stub_worker_per_invocation()
     an_unsupported_backend_is_refused()

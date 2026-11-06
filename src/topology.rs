@@ -2269,6 +2269,7 @@ impl ScopedWorkers {
         let mut tree = Vec::new();
         // Whatever the worker reported, kept even when it is refused.
         let mut reported = None;
+        let since = std::time::SystemTime::now();
         let started = (|| -> Result<()> {
             let command = self
                 .launcher
@@ -2276,7 +2277,7 @@ impl ScopedWorkers {
             self.launcher
                 .wait_ready(&invocation.agent, agent, &command)?;
             client.finish_backend_startup(&session, WORKER_START_TIMEOUT)?;
-            self.opened_conversation(&session, backend, attempt, &mut tree, &mut reported)
+            self.opened_conversation(&session, backend, attempt, since, &mut tree, &mut reported)
         })();
         record["native_session_id"] = json!(reported);
         // A minted id is on disk before the worker hears anything: the next
@@ -2332,6 +2333,7 @@ impl ScopedWorkers {
         session: &str,
         backend: &dyn crate::backend::Backend,
         attempt: &manager::TopologyAttempt,
+        since: std::time::SystemTime,
         tree: &mut Vec<(u32, String)>,
         reported: &mut Option<String>,
     ) -> Result<()> {
@@ -2353,7 +2355,7 @@ impl ScopedWorkers {
                         &attempt.native_session,
                         &native,
                         &self.seen,
-                        || backend.prove_fresh(&target, &native),
+                        || backend.prove_fresh(&target, &native, since),
                     );
                     *reported = Some(native);
                     return verified;
@@ -8953,17 +8955,17 @@ mod tests {
         assert!(error.contains("needs bytecode version 2"), "{error}");
         // A backend that cannot promise a new conversation is refused before
         // anything starts, naming what can.
-        for backend in ["Codex", "Cursor", "Agy", "Web", "Nope"] {
+        for backend in ["Cursor", "Agy", "Web", "Nope"] {
             let error = verify(&scoped_program(2, backend, Some("invocation")))
                 .unwrap_err()
                 .to_string();
             assert!(
                 error.contains("cannot start a fresh conversation per invocation")
-                    && error.contains("supported: claude, opencode, pi, jev, stub"),
+                    && error.contains("supported: claude, codex, opencode, pi, jev, stub"),
                 "{backend}: {error}"
             );
         }
-        for backend in ["Claude", "OpenCode", "Pi", "Jev", "Stub"] {
+        for backend in ["Claude", "Codex", "OpenCode", "Pi", "Jev", "Stub"] {
             verify(&scoped_program(2, backend, Some("invocation"))).unwrap();
         }
         // A scope this runtime does not know is an error, not the default.
