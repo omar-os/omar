@@ -2350,7 +2350,7 @@ impl ScopedWorkers {
                 invocation.agent, invocation.id, attempt.id
             ))),
         };
-        let stopped = self.stop(&session, attempt, &mut tree, &mut sessions);
+        let stopped = self.stop(&session, attempt, (agent, since), &mut tree, &mut sessions);
         if stopped.is_ok() {
             if let Err(error) = self.track(&invocation.agent, None) {
                 eprintln!("warning: could not record {session} as stopped: {error:#}");
@@ -2425,12 +2425,14 @@ impl ScopedWorkers {
     }
 
     /// Stop the worker's process tree, and whatever it left running outside
-    /// it (see [`crate::process::leftovers`]), and see them gone; then remove
-    /// the attempt's own files.
+    /// it (see [`crate::process::leftovers`], and on macOS
+    /// [`crate::process::touching`] its instance's workspace since `since`),
+    /// and see them gone; then remove the attempt's own files.
     fn stop(
         &self,
         session: &str,
         attempt: &manager::TopologyAttempt,
+        (agent, since): (&AgentState, std::time::SystemTime),
         tree: &mut Vec<(u32, String)>,
         sessions: &mut BTreeSet<u32>,
     ) -> Result<()> {
@@ -2443,8 +2445,37 @@ impl ScopedWorkers {
         }
         let marker = format!("{ATTEMPT_MARKER}={}", attempt.id);
         let deadline = Instant::now() + WORKER_STOP_TIMEOUT;
+        #[cfg(target_os = "macos")]
+        let workspace: Vec<PathBuf> = self
+            .launcher
+            .workspaces
+            .get(&agent.instance)
+            .map(|(worktree, temp)| vec![worktree.clone(), temp.clone()])
+            .context("agent instance has no workspace")?;
+        #[cfg(not(target_os = "macos"))]
+        let _ = (agent, since);
         loop {
             let left = crate::process::leftovers(sessions, &marker);
+            // macOS hides its own binaries' environments, the shells' among
+            // them, so one that left the session is found by what it touches
+            // instead: never this runtime or another live worker, whose
+            // processes may share the workspace.
+            #[cfg(target_os = "macos")]
+            let left = {
+                let spared = crate::process::descendants(
+                    client
+                        .other_pane_pids(session)?
+                        .into_iter()
+                        .chain([std::process::id()]),
+                );
+                let mut left = left;
+                for found in crate::process::touching(&workspace, since, &spared)? {
+                    if !left.contains(&found) {
+                        left.push(found);
+                    }
+                }
+                left
+            };
             crate::process::signal_tree(&left, "-KILL");
             if !crate::process::tree_alive(tree)
                 && !crate::process::tree_alive(&left)

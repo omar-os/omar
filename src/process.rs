@@ -146,12 +146,10 @@ fn session_of(pid: u32) -> Option<u32> {
 }
 
 /// What is left of a stopped tree that no ppid walk finds: every process,
-/// other than this one, in one of `sessions`, or (Linux) whose environment
-/// holds `marker`. A process whose parent exits is reparented out of every
-/// tree, but keeps its session unless it starts one of its own, and its
-/// environment unless it clears it. macOS shows no other process's
-/// environment, so there a process that starts a session of its own, and
-/// outlives its leader unseen, is not found.
+/// other than this one, in one of `sessions`, or whose environment holds
+/// `marker`. A process whose parent exits is reparented out of every tree,
+/// but keeps its session unless it starts one of its own, and its
+/// environment unless it clears it. One that does both is not found.
 pub(crate) fn leftovers(sessions: &BTreeSet<u32>, marker: &str) -> Vec<(u32, String)> {
     let me = std::process::id();
     process_snapshot()
@@ -173,9 +171,156 @@ fn carries(pid: u32, marker: &str) -> bool {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+/// The environment a process was started with, as KERN_PROCARGS2 gives it
+/// (argc, executable path, arguments, then the environment, NUL-separated),
+/// which macOS shows for this user's own processes, whatever their session.
+#[cfg(target_os = "macos")]
+fn carries(pid: u32, marker: &str) -> bool {
+    let Ok(pid) = libc::c_int::try_from(pid) else {
+        return false;
+    };
+    let none = std::ptr::null_mut();
+    // The most it can be: the kernel's limit on arguments and environment.
+    let mut argmax: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: each call writes at most `size` bytes into a buffer of that
+    // length.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&mut argmax as *mut libc::c_int).cast(),
+            &mut size,
+            none,
+            0,
+        )
+    } != 0
+    {
+        return false;
+    }
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size = usize::try_from(argmax).unwrap_or(0);
+    let mut args = vec![0u8; size];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            args.as_mut_ptr().cast(),
+            &mut size,
+            none,
+            0,
+        )
+    } != 0
+    {
+        return false;
+    }
+    args.truncate(size);
+    args.split(|byte| *byte == 0)
+        .any(|var| var == marker.as_bytes())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn carries(_pid: u32, _marker: &str) -> bool {
     false
+}
+
+/// Every process descended from one of `roots`, the roots included.
+#[cfg(target_os = "macos")]
+pub(crate) fn descendants(roots: impl IntoIterator<Item = u32>) -> BTreeSet<u32> {
+    let all = process_snapshot();
+    let mut found = BTreeSet::new();
+    let mut pending: Vec<u32> = roots.into_iter().collect();
+    while let Some(pid) = pending.pop() {
+        if found.insert(pid) {
+            pending.extend(
+                all.iter()
+                    .filter(|(_, parent, _)| *parent == pid)
+                    .map(|(id, _, _)| *id),
+            );
+        }
+    }
+    found
+}
+
+/// What a worker may have left running that neither its session nor its
+/// environment shows (macOS hides the environment of its own binaries, the
+/// shells among them): every process started since `since`, to the second,
+/// whose working directory, or a file it holds open, is under one of `dirs`.
+/// Never this process, one in `spared`, or one in a session a process of
+/// either is in. An error is a listing that could not be made, never an
+/// empty one.
+#[cfg(target_os = "macos")]
+pub(crate) fn touching(
+    dirs: &[std::path::PathBuf],
+    since: std::time::SystemTime,
+    spared: &BTreeSet<u32>,
+) -> anyhow::Result<Vec<(u32, String)>> {
+    let since = i64::try_from(since.duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
+    let me = std::process::id();
+    let spared_sessions: BTreeSet<u32> = spared
+        .iter()
+        .copied()
+        .chain([0])
+        .filter_map(session_of)
+        .collect();
+    // A start time that cannot be read could be a recent one.
+    let candidates: Vec<(u32, String)> = process_snapshot()
+        .into_iter()
+        .filter(|(pid, _, _)| *pid > 1 && *pid != me && !spared.contains(pid))
+        .filter(|(_, _, started)| started_at(started).is_none_or(|at| at >= since))
+        .filter(|(pid, _, _)| session_of(*pid).is_none_or(|sid| !spared_sessions.contains(&sid)))
+        .map(|(pid, _, started)| (pid, started))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pids = candidates
+        .iter()
+        .map(|(pid, _)| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let output = std::process::Command::new("lsof")
+        .args(["-nP", "-w", "-F", "pn", "-p", &pids])
+        .output()?;
+    // lsof exits 1, saying nothing, when a process it was named has exited.
+    anyhow::ensure!(
+        output.status.success() || output.stderr.is_empty(),
+        "lsof failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dirs: Vec<_> = dirs
+        .iter()
+        .map(|dir| fs::canonicalize(dir).unwrap_or_else(|_| dir.clone()))
+        .collect();
+    let mut found = BTreeSet::new();
+    let mut pid = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(id) = line.strip_prefix('p') {
+            pid = id.parse::<u32>().ok();
+        } else if let (Some(name), Some(id)) = (line.strip_prefix('n'), pid) {
+            if dirs.iter().any(|dir| Path::new(name).starts_with(dir)) {
+                found.insert(id);
+            }
+        }
+    }
+    Ok(candidates
+        .into_iter()
+        .filter(|(pid, _)| found.contains(pid))
+        .collect())
+}
+
+/// `ps -o lstart` as seconds since the epoch, in local time.
+#[cfg(target_os = "macos")]
+fn started_at(lstart: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let at = chrono::NaiveDateTime::parse_from_str(lstart, "%a %b %e %H:%M:%S %Y").ok()?;
+    Some(
+        chrono::Local
+            .from_local_datetime(&at)
+            .earliest()?
+            .timestamp(),
+    )
 }
 
 /// The processes listening on TCP `port`, any address. An error is a listing
@@ -326,6 +471,104 @@ mod tests {
         // This process's own session is never one of them.
         assert!(!super::sessions(&super::process_tree(std::process::id()))
             .contains(&super::session_of(0).unwrap()));
+    }
+
+    /// What `a_process_in_a_session_of_its_own_is_found_by_its_marker`
+    /// starts: this test binary, which macOS shows the environment of, as it
+    /// does not its own binaries' (`sleep`, `sh`).
+    #[test]
+    #[ignore = "started by a_process_in_a_session_of_its_own_is_found_by_its_marker"]
+    fn marked_sleeper() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    /// A process in a session of its own, which no session finds, is still
+    /// found by the marker in its environment.
+    #[test]
+    fn a_process_in_a_session_of_its_own_is_found_by_its_marker() {
+        use std::os::unix::process::CommandExt;
+        let marker = format!("OMAR_ATTEMPT=marker-test-{}", std::process::id());
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["process::tests::marked_sleeper", "--exact", "--ignored"])
+            .stdout(std::process::Stdio::null())
+            .env("OMAR_ATTEMPT", marker.split_once('=').unwrap().1);
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut escaped = command.spawn().unwrap();
+        // Once it has exec'd: until then it shows its parent's environment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let found = loop {
+            let found = super::leftovers(&super::BTreeSet::new(), &marker);
+            if !found.is_empty() || std::time::Instant::now() > deadline {
+                break found;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let unmarked = super::leftovers(&super::BTreeSet::new(), "OMAR_ATTEMPT=nobody");
+        escaped.kill().unwrap();
+        escaped.wait().unwrap();
+        assert_eq!(
+            found.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(),
+            vec![escaped.id()]
+        );
+        assert!(!unmarked.iter().any(|(pid, _)| *pid == escaped.id()));
+    }
+
+    /// macOS: a process in a session of its own, whose environment a shell
+    /// would hide, is found by its working directory under the workspace,
+    /// unless it is spared; one elsewhere, or started earlier, is not.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_in_the_workspace_is_found_by_its_working_directory() {
+        use std::os::unix::process::CommandExt;
+        let earlier = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let since = std::time::SystemTime::now();
+        let workspace = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let spawn = |dir: &std::path::Path| {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "sleep 30"]).current_dir(dir);
+            unsafe {
+                command.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            command.spawn().unwrap()
+        };
+        let mut inside = spawn(workspace.path());
+        let mut outside = spawn(elsewhere.path());
+        let dirs = [workspace.path().to_path_buf()];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let found = loop {
+            let found = super::touching(&dirs, since, &super::BTreeSet::new()).unwrap();
+            if !found.is_empty() || std::time::Instant::now() > deadline {
+                break found;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let spared = super::touching(&dirs, since, &super::BTreeSet::from([inside.id()])).unwrap();
+        let mut earlier = earlier;
+        for child in [&mut inside, &mut outside, &mut earlier] {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(
+            found.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(),
+            vec![inside.id()]
+        );
+        assert!(spared.is_empty(), "{spared:?}");
+        // Read from `ps -o lstart`.
+        assert!(super::started_at("Fri Nov 6 00:41:45 2026").is_some());
     }
 
     /// A listener is found by its port, as this process's; a closed one is

@@ -23,10 +23,11 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from scratch_session import assert_none_left, scratch
 
 REPO = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get('OMAR_BIN', REPO / 'target/debug/omar')).resolve()
@@ -142,9 +143,8 @@ class Responses(BaseHTTPRequestHandler):
 def main():
     server = ThreadingHTTPServer(('127.0.0.1', 0), Responses)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    # Short: codex binds no socket path of 96 bytes or more.
-    with tempfile.TemporaryDirectory(prefix='omar-cx-scope-', dir='/tmp') as directory:
-        root = Path(directory).resolve()
+    # Short: codex binds no socket path of 96 bytes or more (scratch is in /tmp).
+    with scratch('omar-cx-scope-', BIN, 'cx-scope-test') as root:
         home = root / 'home'
         codex_home = home / '.codex'
         codex_home.mkdir(parents=True)
@@ -172,7 +172,7 @@ trust_level="trusted"
         inherited = {k: v for k, v in os.environ.items()
                      if not k.startswith(('OMAR_', 'CODEX_')) and k not in ('TMUX', 'TMUX_PANE')}
         environment = dict(inherited, HOME=str(home), CODEX_HOME=str(codex_home),
-                           OMAR_TMUX_SERVER=tmux, OMARC_BIN=str(OMARC))
+                           OMAR_TMUX_SERVER=tmux, TMUX_TMPDIR=str(root / 'tmux'), OMARC_BIN=str(OMARC))
         session = ['-s', 'cx-scope-test']
         try:
             up = subprocess.run([str(BIN), 'up', *session, '--no-ea'], env=environment,
@@ -186,9 +186,6 @@ trust_level="trusted"
                         for line in path.read_text().splitlines()]
             servers = list(home.rglob('codex-runtime/*/server.log'))
         finally:
-            subprocess.run([str(BIN), 'down', *session], env=environment, capture_output=True,
-                           timeout=60)
-            subprocess.run(['tmux', '-L', tmux, 'kill-server'], capture_output=True)
             server.shutdown()
 
     output = result.stdout + result.stderr
@@ -219,3 +216,5 @@ trust_level="trusted"
 
 if __name__ == '__main__':
     main()
+    assert_none_left('omar-cx-scope-')
+    print('PASS: no session, daemon or worker of the run is still running')

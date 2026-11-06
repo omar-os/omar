@@ -154,8 +154,9 @@ The runtime makes sure of it rather than assuming it:
   `OpenCode`, `Pi`, `Stub` and `Jev` can today;
 - the runtime checks the conversation a worker reports before delivering
   anything. Where the backend is told the id of the new conversation to open
-  (`Claude`, by `--session-id`, with auto memory off, since its memory files
-  outlive the conversation; `Pi`, by `--no-session --session-id`, an
+  (`Claude`, by `--session-id`, with auto memory, and the team and subagent
+  memory it gates, off, and org memory off, since all of them outlive the
+  conversation; `Pi`, by `--no-session --session-id`, an
   in-memory conversation that reads nothing from disk; `OpenCode`, created
   through its `/api/session`, which needs an opencode that has it, only once
   the server has no session of that id, and taken only while it holds no
@@ -184,10 +185,16 @@ The runtime makes sure of it rather than assuming it:
 - after the invocation is answered, or expires, the worker's processes are
   stopped and seen gone before its effects are released downstream: its
   process tree, and whatever it left running outside it, found by the
-  session it was started in and, on Linux, by an `OMAR_ATTEMPT` variable in
-  its environment. On macOS, which shows no other process's environment, a
-  process that starts a session of its own and outlives its leader unseen is
-  not found. If the stop cannot be confirmed in time, the invocation fails
+  session it was started in and by an `OMAR_ATTEMPT` variable in its
+  environment. macOS hides the environment of its own binaries, the shells
+  among them, so there a process is also found by having its working
+  directory, or a file open, in the instance's workspace, if it started
+  during the attempt and is no process of the runtime's or of another live
+  worker's (their trees and sessions). Not found: a process that starts a
+  session of its own and clears its environment (on macOS: or is one of its
+  binaries) and holds nothing in the workspace when the worker is stopped,
+  say one that writes there later by its full path. If the stop cannot be
+  confirmed in time, or what is left cannot be listed, the invocation fails
   with the effects withheld.
 
 `Jev` starts no worker and has no conversation, so there is nothing to check

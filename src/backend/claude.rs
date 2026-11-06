@@ -173,11 +173,13 @@ impl Backend for Claude {
         } else {
             ""
         };
-        // Auto memory lives outside the workspace and outlives the run, so it
-        // would carry one attempt's notes into the next. An env var, since
-        // Claude keeps only the last `--settings`, which the hooks may use.
+        // Auto memory (with the team and subagent memory it gates) lives
+        // outside the workspace and outlives the run, and org memory stores
+        // are shared by every conversation that syncs them: either would
+        // carry one attempt's notes into the next. Env vars, since Claude
+        // keeps only the last `--settings`, which the hooks may use.
         let no_memory = if attempt.is_some() {
-            "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 "
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_ORG_MEMORY=1 "
         } else {
             ""
         };
@@ -805,6 +807,7 @@ mod tests {
         };
         assert!(!launch(&context).contains("--session-id"));
         assert!(!launch(&context).contains("CLAUDE_CODE_DISABLE_AUTO_MEMORY"));
+        assert!(!launch(&context).contains("CLAUDE_CODE_DISABLE_ORG_MEMORY"));
         context.topology = Some(TopologyMcpContext {
             attempt: Some(crate::manager::TopologyAttempt {
                 id: "attempt".into(),
@@ -816,7 +819,7 @@ mod tests {
         let line = launch(&context);
         assert!(line.contains("--session-id '11111111-1111-4111-8111-111111111111'"));
         assert!(
-            line.starts_with("CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 "),
+            line.starts_with("CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_ORG_MEMORY=1 "),
             "an attempt must not read an earlier one's memory: {line}"
         );
         assert!(!line.contains("--resume"));

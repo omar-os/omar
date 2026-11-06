@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import unittest
 
+from scratch_session import left_running
+
 REPO = Path(__file__).resolve().parents[2]
 PROGRAM = '''type Decision from "./schemas/decision.json"
 team Review[reviewer : Jev] {
@@ -92,7 +94,7 @@ class JevBackendTests(unittest.TestCase):
                 env.pop("OMAR_JEV_ON_ERROR", None)
                 if policy != "default": env["OMAR_JEV_ON_ERROR"] = policy
                 if mode == "missing_key": env.pop("TYPESAFE_API_KEY", None)
-                env["OMAR_HOME"] = tempfile.mkdtemp(prefix="omar-jev-adapter-test-")
+                env["OMAR_HOME"] = str(temp / "home")
                 message = "test request" + ("x" * 65536 if mode == "blocked_input" else "")
                 result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(temp / "workflow.omar"),
                     "--input", "review.request=" + message, "--timeout-seconds", "30", "--fast", "--fg"],
@@ -154,7 +156,7 @@ main JevConfigurationTest { review = Review() }
                 env = dict(os.environ, TYPESAFE_API_KEY="fixture-not-a-real-key", OMAR_JEV_MODEL="jev-fixture-selected")
                 env["PATH"] = f"{temp}:{REPO}/target/debug:{REPO}/lang/.lake/build/bin:{Path.home()}/.cargo/bin:" + env.get("PATH", "")
                 env["OMARC_BIN"] = str(REPO / "lang/.lake/build/bin/omarc")
-                env["OMAR_HOME"] = tempfile.mkdtemp(prefix="omar-jev-configuration-test-")
+                env["OMAR_HOME"] = str(temp / "home")
                 env["OMAR_JEV_ON_ERROR"] = "bad" if mode == "bad_policy" else "defer"
                 if mode == "empty_model": env["OMAR_JEV_MODEL"] = " "
                 result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(temp / "workflow.omar"),
@@ -328,6 +330,9 @@ main JevScoped { review = Review() }
             self.assertEqual(calls[1]["request"]["state"], {"review.mid": "continue"})
             # No worker, so no attempt to record.
             self.assertEqual(list((temp / "home").rglob("attempts.jsonl")), [])
+            # The session the run made for itself went with it.
+            self.assertEqual(list((temp / "home/sessions").iterdir()), [])
+            self.assertEqual(left_running(temp), [])
 
 
 if __name__ == "__main__":

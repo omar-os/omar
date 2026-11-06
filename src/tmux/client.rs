@@ -895,6 +895,43 @@ impl TmuxClient {
         Ok(tree)
     }
 
+    /// The process of every live pane on the server outside session
+    /// `except`: no server is none.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn other_pane_pids(&self, except: &str) -> Result<Vec<u32>> {
+        let output = self
+            .command()
+            .args([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}|#{pane_dead}|#{pane_pid}",
+            ])
+            .output()
+            .context("Failed to execute tmux - is tmux installed?")?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            anyhow::ensure!(
+                stderr.contains("no server running") || stderr.contains("error connecting to"),
+                "tmux list-panes failed: {stderr}"
+            );
+            return Ok(Vec::new());
+        }
+        let mut pids = Vec::new();
+        for pane in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut fields = pane.rsplitn(3, '|');
+            let (Some(pid), Some(dead), Some(session)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                anyhow::bail!("invalid tmux pane identity: {pane}");
+            };
+            if session != except && dead != "1" {
+                pids.push(pid.parse()?);
+            }
+        }
+        Ok(pids)
+    }
+
     /// Check if a session exists
     pub fn has_session(&self, name: &str) -> Result<bool> {
         self.check_session(name, false)

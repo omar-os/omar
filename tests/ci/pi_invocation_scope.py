@@ -21,10 +21,11 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
-import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from scratch_session import assert_none_left, scratch
 
 REPO = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get('OMAR_BIN', REPO / 'target/debug/omar')).resolve()
@@ -141,8 +142,7 @@ def pi_command(root):
 def main():
     server = ThreadingHTTPServer(('127.0.0.1', 0), Responses)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    with tempfile.TemporaryDirectory(prefix='omar-pi-scope-') as directory:
-        root = Path(directory)
+    with scratch('omar-pi-scope-', BIN, 'pi-scope-test') as root:
         home = root / 'home'
         shims = home / 'shims'
         agent_dir = home / '.pi' / 'agent'
@@ -171,7 +171,7 @@ def main():
         inherited = {k: v for k, v in os.environ.items()
                      if not k.startswith(('OMAR_', 'PI_')) and k not in ('TMUX', 'TMUX_PANE')}
         environment = dict(inherited, HOME=str(home), OMAR_TMUX_SERVER=tmux,
-                           OMARC_BIN=str(OMARC))
+                           TMUX_TMPDIR=str(root / 'tmux'), OMARC_BIN=str(OMARC))
         session = ['-s', 'pi-scope-test']
         try:
             up = subprocess.run([str(BIN), 'up', *session, '--no-ea'], env=environment,
@@ -184,9 +184,6 @@ def main():
             attempts = [json.loads(line) for path in home.rglob('attempts.jsonl')
                         for line in path.read_text().splitlines()]
         finally:
-            subprocess.run([str(BIN), 'down', *session], env=environment, capture_output=True,
-                           timeout=60)
-            subprocess.run(['tmux', '-L', tmux, 'kill-server'], capture_output=True)
             server.shutdown()
 
     output = result.stdout + result.stderr
@@ -214,3 +211,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+    assert_none_left('omar-pi-scope-')
+    print('PASS: no session, daemon or worker of the run is still running')

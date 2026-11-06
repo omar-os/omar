@@ -10,8 +10,8 @@ No model, no credentials.
 
 Checked, from what the fake logged and the run recorded:
 - the two coder invocations ran in two processes, each opening the new
-  conversation its attempt named, with auto memory off; the keeper's two ran
-  in one;
+  conversation its attempt named, with auto and org memory off; the keeper's
+  two ran in one;
 - a sentinel in the first coder prompt is nowhere in what the second was
   handed: not its launch line, its system prompt, nor its message;
 - a file the first coder wrote is what the second read;
@@ -37,7 +37,8 @@ Checked, from what the fake logged and the run recorded:
   in the next run, and so is every minted one while that record is unreadable;
 - what a worker leaves running, reparented out of its process tree, is
   stopped before its effects are released: a background writer it started
-  never writes;
+  never writes, whether in the worker's session or a session of its own
+  (on macOS too, where a shell's environment is hidden);
 - each attempt's calls carry a key no record holds, from files of its own
   that are gone once it stops;
 - the model-free `Stub(scope = invocation)` does the same for real, with no
@@ -52,8 +53,9 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import tempfile
 import time
+
+from scratch_session import assert_none_left, scratch
 
 REPO = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get('OMAR_BIN', REPO / 'target/debug/omar')).resolve()
@@ -94,13 +96,14 @@ def call(tool, arguments):
 
 def leave_writers():
     """Background writers whose parent exits at once, so no tree holds them:
-    one in the worker's session, and (Linux) one in a session of its own."""
-    later = "sleep 3; echo late > $HOME/late-{}.txt"
+    one in the worker's session, and one in a session of its own, a shell
+    (whose environment macOS hides) working in the workspace. Each writes
+    into the workspace, and to HOME, which outlives the run, to be seen."""
+    later = "sleep 3; echo late > late-{0}.txt; echo late > $HOME/late-{0}.txt"
     subprocess.run(["sh", "-c", f"nohup sh -c '{later.format('session')}' >/dev/null 2>&1 &"])
-    if sys.platform.startswith("linux"):
-        subprocess.run(["sh", "-c", "python3 -c \"import os, subprocess; os.setsid(); "
-                        f"subprocess.run(['sh', '-c', '{later.format('setsid')}'])\" "
-                        ">/dev/null 2>&1 &"])
+    subprocess.run(["sh", "-c", "python3 -c \"import os; os.setsid(); "
+                    f"os.execvp('sh', ['sh', '-c', '{later.format('setsid')}'])\" "
+                    ">/dev/null 2>&1 &"])
 
 def alive(pid):
     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
@@ -144,7 +147,8 @@ if os.environ.get("FAKE_WRONG_SESSION") and flag("--session-id"):
 write({"event": "launch", "agent": topology["agent"], "attempt": topology.get("attempt"),
        "session_id": flag("--session-id"), "argv": " ".join(argv),
        "system_prompt": flag("--append-system-prompt"),
-       "no_auto_memory": os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY")})
+       "no_memory": [os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"),
+                     os.environ.get("CLAUDE_CODE_DISABLE_ORG_MEMORY")]})
 print("\x1b[2J\x1b[H Claude Code v0\n" + "─" * 40 + "\n❯ \n" + "─" * 40, flush=True)
 
 home = Path(os.environ["HOME"])
@@ -522,10 +526,9 @@ def supported():
 
 
 def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM,
-        backend='claude', prepare=None, keep_server=False):
+        backend='claude', prepare=None):
     """`prepare`, if any, is handed the private HOME before anything runs.
-    `keep_server` leaves OMAR and its tmux server up for another run in
-    `root`; the last run there takes them down."""
+    OMAR stays up for another run in `root`; `scratch` takes it down."""
     home = root / 'home'
     shims = home / 'shims'
     shims.mkdir(parents=True, exist_ok=True)
@@ -546,27 +549,21 @@ def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM
     inherited = {k: v for k, v in os.environ.items()
                  if not k.startswith('OMAR_') and k not in ('TMUX', 'TMUX_PANE')}
     environment = dict(inherited, HOME=str(home), OMAR_TMUX_SERVER=server,
-                       OMARC_BIN=str(OMARC), **(env or {}))
+                       TMUX_TMPDIR=str(root / 'tmux'), OMARC_BIN=str(OMARC), **(env or {}))
     # A session of its own, so the run's records outlive the run: one that
     # `omar run` makes for itself is removed with it.
     session = ['-s', 'scope-test']
-    try:
-        up = subprocess.run([str(BIN), 'up', *session, '--no-ea'], env=environment,
-                            capture_output=True, text=True, timeout=120)
-        # Already up for a run before this one in `root`, kept.
-        assert up.returncode == 0 or "already exists" in up.stderr, up.stdout + up.stderr
-        result = subprocess.run(
-            [str(BIN), 'run', *session, str(program), '--input', 'p.start=alpha',
-             '--timeout-seconds', '60', '--replace', '--fg'],
-            env=environment, capture_output=True, text=True, timeout=300)
-        # Records only: a scenario may have spoiled the log on purpose.
-        attempts = [json.loads(line) for path in home.rglob('attempts.jsonl')
-                    for line in path.read_text().splitlines() if line.startswith('{')]
-    finally:
-        if not keep_server:
-            subprocess.run([str(BIN), 'down', *session], env=environment, capture_output=True,
-                           timeout=60)
-            subprocess.run(['tmux', '-L', server, 'kill-server'], capture_output=True)
+    up = subprocess.run([str(BIN), 'up', *session, '--no-ea'], env=environment,
+                        capture_output=True, text=True, timeout=120)
+    # Already up for a run before this one in `root`.
+    assert up.returncode == 0 or "already exists" in up.stderr, up.stdout + up.stderr
+    result = subprocess.run(
+        [str(BIN), 'run', *session, str(program), '--input', 'p.start=alpha',
+         '--timeout-seconds', '60', '--replace', '--fg'],
+        env=environment, capture_output=True, text=True, timeout=300)
+    # Records only: a scenario may have spoiled the log on purpose.
+    attempts = [json.loads(line) for path in home.rglob('attempts.jsonl')
+                for line in path.read_text().splitlines() if line.startswith('{')]
     events = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     return result, events, attempts
 
@@ -579,7 +576,7 @@ def on(backend):
 
 
 def fresh_worker_per_invocation(backend='claude'):
-    with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
+    with scratch('omar-scope-', BIN, 'scope-test') as directory:
         result, events, attempts = run(Path(directory), **on(backend))
         output = result.stdout + result.stderr
         assert result.returncode == 0, output
@@ -682,9 +679,10 @@ def fresh_worker_per_invocation(backend='claude'):
         if backend == 'claude':
             for launch in coder:
                 assert f"/attempt-{launch['attempt']['id']}/" in launch['argv'], launch
-            # Auto memory, which outlives a conversation, is off for an
-            # attempt alone.
-            assert [l['no_auto_memory'] for l in coder + keeper] == ['1', '1', None], launches
+            # Auto and org memory, which outlive a conversation, are off for
+            # an attempt alone.
+            assert [l['no_memory'] for l in coder + keeper] == \
+                [['1', '1'], ['1', '1'], [None, None]], launches
         print(f'PASS: {SPELLED[backend]}: two coder invocations ran in two fresh conversations, '
               'keeper reused one; sentinel absent, file visible, worker 1 stopped first')
 
@@ -696,7 +694,7 @@ def a_reused_conversation_fails_closed(backend='claude', fault='FAKE_WRONG_SESSI
     records the worker reporting: None for none, OTHER for one not its own.
     `fault`, if any, is set to `value`, and `prepare` is handed the private
     HOME."""
-    with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
+    with scratch('omar-scope-', BIN, 'scope-test') as directory:
         result, events, attempts = run(Path(directory), env=fault and {fault: value},
                                        prepare=prepare, **on(backend))
         output = result.stdout + result.stderr
@@ -726,7 +724,7 @@ def a_reused_conversation_fails_closed(backend='claude', fault='FAKE_WRONG_SESSI
 
 def a_conversation_seen_before_fails_closed(backend='codex', fault='FAKE_REUSE_THREAD'):
     """A CLI that hands the second attempt the conversation the first one had."""
-    with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
+    with scratch('omar-scope-', BIN, 'scope-test') as directory:
         result, events, attempts = run(Path(directory), env={fault: '1'}, **on(backend))
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
@@ -745,9 +743,9 @@ def a_conversation_seen_before_fails_closed(backend='codex', fault='FAKE_REUSE_T
 
 def a_conversation_an_earlier_run_had_fails_closed():
     """The minted ids an earlier run recorded are what the next run checks."""
-    with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
+    with scratch('omar-scope-', BIN, 'scope-test') as directory:
         root = Path(directory)
-        first, events, attempts = run(root, keep_server=True, **on('codex'))
+        first, events, attempts = run(root, **on('codex'))
         assert first.returncode == 0, first.stdout + first.stderr
         handed = len([e for e in events if e['event'] == 'message' and e['agent'] == 'p.coder'])
         threads = [a['native_session_id'] for a in attempts if a['outcome'] == 'completed']
@@ -757,7 +755,7 @@ def a_conversation_an_earlier_run_had_fails_closed():
         # had, created now, empty and unforked: only the record can tell.
         reused = root / 'home' / 'fake-codex-thread'
         reused.write_text(threads[0])
-        result, events, after = run(root, keep_server=True, **on('codex'))
+        result, events, after = run(root, **on('codex'))
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
         assert f'it opened conversation {threads[0]}, which an earlier attempt already had' \
@@ -783,7 +781,7 @@ def a_conversation_an_earlier_run_had_fails_closed():
 
 
 def leftovers_are_stopped_before_release():
-    with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
+    with scratch('omar-scope-', BIN, 'scope-test') as directory:
         root = Path(directory)
         result, events, attempts = run(root, env={'FAKE_LEFTOVER': '1'})
         output = result.stdout + result.stderr
@@ -796,8 +794,9 @@ def leftovers_are_stopped_before_release():
         time.sleep(5)
         late = sorted(path.name for path in root.rglob('late-*.txt'))
         assert late == [], late
-        print('PASS: Claude: background writers a worker left outside its process tree were '
-              'stopped before its effects were released, and never wrote')
+        print('PASS: Claude: background writers a worker left outside its process tree, one '
+              'in a session of its own, were stopped before its effects were released, and '
+              'never wrote')
 
 
 def seed(path):
@@ -807,7 +806,7 @@ def seed(path):
 
 
 def a_stub_worker_per_invocation():
-    with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
+    with scratch('omar-scope-', BIN, 'scope-test') as directory:
         result, events, attempts = run(Path(directory), coder='Stub(scope = invocation)',
                                        program_text=STUB_PROGRAM)
         output = result.stdout + result.stderr
@@ -840,7 +839,7 @@ def a_stub_worker_per_invocation():
 
 
 def an_unsupported_backend_is_refused():
-    with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
+    with scratch('omar-scope-', BIN, 'scope-test') as directory:
         root = Path(directory)
         # omarc is the layer that refuses: nothing is written for the runtime
         # to refuse again, whether a program or a mutation plan.
@@ -903,3 +902,5 @@ if __name__ == '__main__':
     leftovers_are_stopped_before_release()
     a_stub_worker_per_invocation()
     an_unsupported_backend_is_refused()
+    assert_none_left('omar-scope-')
+    print('PASS: no session, daemon or worker of any scenario is still running')

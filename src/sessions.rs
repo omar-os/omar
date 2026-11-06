@@ -1650,8 +1650,14 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             Ok(())
         }),
         Some(Commands::Run(options)) => (|| {
+            // Read before any session is made for it: a bad path or input must
+            // not leave one behind.
+            for input in &options.inputs { anyhow::ensure!(input.contains('='), "input must be NAME=VALUE"); }
+            // The runtime compiles what it is sent, so a program's imports go with it.
+            let program = fs::read_to_string(&options.program)?;
+            let files = crate::topology::imported_files(&options.program, &program)?;
             // No runtime selected: this run gets a session of its own, removed
-            // again after a foreground run ends.
+            // again after a foreground run ends, or once the run cannot go on.
             let (s, owned) = match target(cli) {
                 Ok(s) => {
                     anyhow::ensure!(cli.config.is_none() && cli.agent.is_none() && !cli.spawn_metrics,
@@ -1666,14 +1672,18 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
                 Err(error) => return Err(error),
             };
             let ea = ea_selector(cli);
-            for input in &options.inputs { anyhow::ensure!(input.contains('='), "input must be NAME=VALUE"); }
-            // The runtime compiles what it is sent, so a program's imports go with it.
-            let program = fs::read_to_string(&options.program)?;
-            let files = crate::topology::imported_files(&options.program, &program)?;
             // The file name names a program whose `main` does not.
             let filename = options.program.file_name().map(|name| name.to_string_lossy().into_owned());
             let body=json!({"program":program,"filename":filename,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces});
-            let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
+            // A session made for a run that was never admitted goes with it.
+            let discard = |error: anyhow::Error| {
+                if owned {
+                    let _ = rpc(&s,json!({"op":"down","force":true}),Duration::from_secs(10));
+                    let _ = wait_stopped(&s, Duration::from_secs(30)).and_then(|s| remove_session(&s));
+                }
+                error
+            };
+            let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120)).map_err(discard)?;
             if owned { run["session"] = json!(s.name); }
             // One structured result: the admission record, or with --fg the terminal record.
             if !options.fg { return print_value(run); }
