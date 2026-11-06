@@ -775,9 +775,9 @@ def testAgentScope : IO Unit := do
         assertEqual decl (version (← compiled decl)) (some 2)
   -- The model-free stub, which CI runs scoped end to end, Jev, which holds
   -- no conversation at all, Pi and OpenCode, which open one by the id they
-  -- are given, and Codex, which mints one the runtime checks is new, are
-  -- among them.
-  for backend in ["Stub", "Jev", "Pi", "OpenCode", "Codex"] do
+  -- are given, and Codex, Cursor and Antigravity, which mint one the runtime
+  -- checks is new, are among them.
+  for backend in ["Stub", "Jev", "Pi", "OpenCode", "Codex", "Cursor", "Agy", "Antigravity"] do
     let decl := s!"coder : {backend}(scope = invocation)"
     assertEqual decl (scope (← spawn (← compiled decl))) (some "invocation")
   -- One that cannot, or one omarc does not know, is refused before bytecode

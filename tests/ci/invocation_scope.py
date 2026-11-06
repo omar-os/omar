@@ -29,6 +29,13 @@ Checked, from what the fake logged and the run recorded:
   mints), and it fails closed on a thread forked from another, one already
   holding a message, one created before the attempt began, or one an earlier
   attempt had;
+- the same for fake `cursor-agent` (ACP `session/new` under a new runner,
+  never `session/load`) and fake `agy` (stream-json, announcing the
+  conversation it minted before it reads anything, and reaching OMAR through
+  the EA's shared plugin registration with its pane's own identity), and each
+  fails closed on a conversation an earlier attempt had, or one its CLI's own
+  store held before the worker started; agy also while it holds Knowledge
+  Items;
 - the model-free `Stub(scope = invocation)` does the same for real, with no
   fake and no credentials: two attempts, each reporting the new conversation
   its attempt named, the first stopped before the second started;
@@ -402,7 +409,89 @@ else:
         time.sleep(60)
 """
 
-FAKES = {'claude': FAKE, 'pi': FAKE_PI, 'opencode': FAKE_OPENCODE, 'codex': FAKE_CODEX}
+# cursor-agent, as OMAR's protocol runner drives it: `<command> acp`, ACP
+# JSON-RPC on stdio. `session/new` mints the id, as the real one does whatever
+# it is given, and adds the session to the CLI's own store under HOME;
+# `session/load` of anything fails. The faults apply to attempts only: one
+# hands every attempt the same session, one the session FAKE_SESSION_ID that
+# the store already held.
+FAKE_CURSOR = COMMON + r"""
+context = json.loads(Path(os.environ["OMAR_MCP_CONTEXT_FILE"]).read_text())
+topology = context["topology"]
+session = None
+store = Path(os.environ["HOME"]) / ".cursor" / "acp-sessions"
+write({"event": "launch", "agent": topology["agent"], "attempt": topology.get("attempt"),
+       "session_id": None, "argv": " ".join(argv)})
+
+def new_session():
+    reused = Path(os.environ["HOME"]) / "fake-cursor-session"
+    if topology.get("attempt") and os.environ.get("FAKE_REUSE_SESSION"):
+        if not reused.exists():
+            reused.write_text(str(uuid.uuid4()))
+        return reused.read_text()
+    if topology.get("attempt") and os.environ.get("FAKE_SESSION_ID"):
+        return os.environ["FAKE_SESSION_ID"]
+    return str(uuid.uuid4())
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method, params = message.get("method"), message.get("params") or {}
+    write({"event": "rpc", "agent": topology["agent"], "method": method})
+    reply = {"jsonrpc": "2.0", "id": message["id"], "result": {}}
+    if method == "session/new":
+        mcp = params["mcpServers"][0]
+        server = [mcp["command"], *mcp["args"]]
+        session = new_session()
+        (store / session).mkdir(parents=True, exist_ok=True)
+        (store / session / "meta.json").write_text(json.dumps({"cwd": params["cwd"]}))
+        write({"event": "thread", "agent": topology["agent"], "session_id": session})
+        reply["result"] = {"sessionId": session}
+    elif method == "session/load":
+        reply = {"jsonrpc": "2.0", "id": message["id"],
+                 "error": {"code": -32602, "message": "Session not found"}}
+    elif method == "session/prompt":
+        assert params["sessionId"] == session, params
+        answer(params["prompt"][0]["text"])
+        reply["result"] = {"stopReason": "end_turn"}
+    print(json.dumps(reply), flush=True)
+"""
+
+# agy, as OMAR's protocol runner drives it: stream-json on stdio, announcing
+# the conversation it minted in an `init` event before it reads anything, and
+# adding it to its own store under HOME as it does. It reaches OMAR as the
+# real one does: through the EA's plugin registration under ~/.gemini/config,
+# shared by every agy pane, with this pane's environment. FAKE_SESSION_ID is
+# the conversation every attempt opens.
+FAKE_AGY = COMMON + r"""
+context = json.loads(Path(os.environ["OMAR_MCP_CONTEXT_FILE"]).read_text())
+topology = context["topology"]
+plugin = "omar-ea-" + os.environ["OMAR_EA_ID"]
+registered = Path(os.environ["HOME"]) / ".gemini" / "config" / "plugins" / plugin
+mcp = json.loads((registered / "mcp_config.json").read_text())["mcpServers"][plugin]
+server = [mcp["command"], *mcp["args"]]
+session = (topology.get("attempt") and os.environ.get("FAKE_SESSION_ID")) or str(uuid.uuid4())
+store = Path(os.environ["HOME"]) / ".gemini" / "antigravity-cli" / "conversations"
+store.mkdir(parents=True, exist_ok=True)
+(store / f"{session}.db").write_text("")
+write({"event": "launch", "agent": topology["agent"], "attempt": topology.get("attempt"),
+       "session_id": None, "argv": " ".join(argv)})
+write({"event": "thread", "agent": topology["agent"], "session_id": session})
+print(json.dumps({"event": "init", "conversation_id": session,
+                  "init": {"cwd": os.getcwd(), "tools": []}}), flush=True)
+for line in sys.stdin:
+    message = json.loads(line)
+    answer(message["message"]["content"])
+    print(json.dumps({"event": "result", "result": {
+        "status": "SUCCESS", "response": "done", "conversation_id": session}}), flush=True)
+"""
+
+FAKES = {'claude': FAKE, 'pi': FAKE_PI, 'opencode': FAKE_OPENCODE, 'codex': FAKE_CODEX,
+         'cursor': FAKE_CURSOR, 'agy': FAKE_AGY}
+# The names a backend's CLI is found by: OMAR runs `cursor-agent`, `agent` or
+# `cursor agent`, whichever is on its own PATH.
+SHIMS = {'cursor': ['cursor', 'cursor-agent', 'agent']}
+# Those whose CLI mints the conversation id, which the runtime checks is new.
+MINTED = {'codex', 'cursor', 'agy'}
 
 PROGRAM = '''team Pipe[coder : {coder}, keeper : Claude] {{
     input start : string
@@ -430,7 +519,8 @@ STUB_PROGRAM = PROGRAM.replace('keeper : Claude', 'keeper : Stub')
 OTHER = object()
 
 # Each faked backend as a program spells it.
-SPELLED = {'claude': 'Claude', 'pi': 'Pi', 'opencode': 'OpenCode', 'codex': 'Codex'}
+SPELLED = {'claude': 'Claude', 'pi': 'Pi', 'opencode': 'OpenCode', 'codex': 'Codex',
+           'cursor': 'Cursor', 'agy': 'Agy'}
 
 
 def supported():
@@ -440,16 +530,20 @@ def supported():
 
 
 def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM,
-        backend='claude'):
+        backend='claude', prepare=None):
+    """`prepare`, if any, is handed the private HOME before anything runs."""
     home = root / 'home'
     shims = home / 'shims'
     shims.mkdir(parents=True, exist_ok=True)
     log = root / f'{backend}.jsonl'
     fake = root / f'fake_{backend}.py'
     fake.write_text(f'LOG = {str(log)!r}\n' + FAKES[backend])
-    shim = shims / backend
-    shim.write_text(f"#!/bin/sh\nexec python3 '{fake}' \"$@\"\n")
-    shim.chmod(0o700)
+    for name in SHIMS.get(backend, [backend]):
+        shim = shims / name
+        shim.write_text(f"#!/bin/sh\nexec python3 '{fake}' \"$@\"\n")
+        shim.chmod(0o700)
+    if prepare:
+        prepare(home)
     (home / '.profile').write_text(f'export PATH="{shims}:$PATH"\n')
     program = root / 'Scoped.omar'
     program.write_text(program_text.format(coder=coder))
@@ -499,11 +593,11 @@ def fresh_worker_per_invocation(backend='claude'):
         keeper = [e for e in launches if e['agent'] == 'p.keeper']
 
         # Two invocations, two workers, two conversations, each the one its
-        # attempt named, or for codex the one its own server minted; the
-        # agent-scoped keeper kept one of each.
+        # attempt named, or the one its CLI minted; the agent-scoped keeper
+        # kept one of each.
         assert len(coder) == 2 and len(keeper) == 1, launches
         assert coder[0]['pid'] != coder[1]['pid'], coder
-        if backend == 'codex':
+        if backend in MINTED:
             minted = {e['pid']: e['session_id'] for e in events if e['event'] == 'thread'}
             opened = [minted[launch['pid']] for launch in coder]
         else:
@@ -534,7 +628,7 @@ def fresh_worker_per_invocation(backend='claude'):
         assert [a['outcome'] for a in finished] == ['completed', 'completed'], attempts
         assert {a['cleanup_status'] for a in finished} == {'stopped'}, attempts
         assert [a['native_session_id'] for a in finished] == opened, attempts
-        verification = 'reported' if backend == 'codex' else 'chosen'
+        verification = 'reported' if backend in MINTED else 'chosen'
         assert all(a['logical_agent'] == 'p.coder' and a['scope'] == 'invocation'
                    and a['verification'] == verification for a in attempts), attempts
         replies = [e['reply'] for e in events if e['event'] == 'reply']
@@ -574,16 +668,35 @@ def fresh_worker_per_invocation(backend='claude'):
             assert [(r['pid'], r['params']) for r in reads] == [
                 (launch['pid'], {'threadId': thread, 'includeTurns': False})
                 for launch, thread in zip(coder, opened)], reads
+        if backend == 'cursor':
+            # Each worker opened one session, by `session/new`, and none was
+            # ever loaded: not an attempt's, not the keeper's.
+            rpcs = [(e['pid'], e['method']) for e in events if e['event'] == 'rpc']
+            assert not any(method == 'session/load' for _, method in rpcs), rpcs
+            for launch in coder + keeper:
+                assert [m for pid, m in rpcs if pid == launch['pid']
+                        and m.startswith('session/new')] == ['session/new'], rpcs
+        if backend == 'agy':
+            # Nothing on any line reopens a conversation, and the keeper,
+            # reaching OMAR through the same shared registration, answered as
+            # itself.
+            for launch in launches:
+                words = launch['argv'].split()
+                assert not {'--conversation', '--continue', '-c'} & set(words), launch
         print(f'PASS: {SPELLED[backend]}: two coder invocations ran in two fresh conversations, '
               'keeper reused one; sentinel absent, file visible, worker 1 stopped first')
 
 
 def a_reused_conversation_fails_closed(backend='claude', fault='FAKE_WRONG_SESSION',
-                                       says='an-old-conversation', recorded='an-old-conversation'):
+                                       says='an-old-conversation', recorded='an-old-conversation',
+                                       value='1', prepare=None):
     """`says` is in the error; `recorded` is the conversation the attempt
-    records the worker reporting: None for none, OTHER for one not its own."""
+    records the worker reporting: None for none, OTHER for one not its own.
+    `fault`, if any, is set to `value`, and `prepare` is handed the private
+    HOME."""
     with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
-        result, events, attempts = run(Path(directory), env={fault: '1'}, **on(backend))
+        result, events, attempts = run(Path(directory), env=fault and {fault: value},
+                                       prepare=prepare, **on(backend))
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
         assert 'did not start a fresh conversation' in output, output
@@ -605,15 +718,14 @@ def a_reused_conversation_fails_closed(backend='claude', fault='FAKE_WRONG_SESSI
             requests = [e for e in events if e['event'] == 'request' and e['agent'] == 'p.coder']
             assert not any(e['method'] == 'POST' and e['path'] == '/session'
                            for e in requests), requests
-        print(f'PASS: {SPELLED[backend]} ({fault}): a worker that could not show a new '
+        print(f'PASS: {SPELLED[backend]} ({fault or prepare.__doc__}): a worker that could not show a new '
               'conversation failed the run and was never handed the invocation')
 
 
-def a_codex_thread_seen_before_fails_closed():
-    """A codex that hands the second attempt the thread the first one had."""
+def a_conversation_seen_before_fails_closed(backend='codex', fault='FAKE_REUSE_THREAD'):
+    """A CLI that hands the second attempt the conversation the first one had."""
     with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
-        result, events, attempts = run(Path(directory), env={'FAKE_REUSE_THREAD': '1'},
-                                       **on('codex'))
+        result, events, attempts = run(Path(directory), env={fault: '1'}, **on(backend))
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
         assert 'which an earlier attempt already had' in output, output
@@ -625,8 +737,19 @@ def a_codex_thread_seen_before_fails_closed():
         assert [(a['outcome'], a['cleanup_status']) for a in finished] == \
             [('completed', 'stopped'), ('failed', 'stopped')], attempts
         assert finished[0]['native_session_id'] == finished[1]['native_session_id'], attempts
-        print('PASS: Codex (FAKE_REUSE_THREAD): a thread an earlier attempt had was refused, '
-              'and the second worker was never handed the invocation')
+        print(f'PASS: {SPELLED[backend]} ({fault}): a conversation an earlier attempt had was '
+              'refused, and the second worker was never handed the invocation')
+
+
+def seed(path):
+    """A file the CLI's own store already holds before the run."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{}')
+
+
+def knowledge_items(home):
+    """agy holds a Knowledge Item"""
+    seed(home / '.gemini/antigravity-cli/knowledge/item/metadata.json')
 
 
 def a_stub_worker_per_invocation():
@@ -714,6 +837,20 @@ if __name__ == '__main__':
                                        recorded=OTHER)
     a_reused_conversation_fails_closed('codex', 'FAKE_OLD_THREAD', says='before the attempt',
                                        recorded=OTHER)
-    a_codex_thread_seen_before_fails_closed()
+    a_conversation_seen_before_fails_closed()
+    for backend, store, entry in [
+            ('cursor', '.cursor/acp-sessions', 'ses-old/meta.json'),
+            ('agy', '.gemini/antigravity-cli/conversations', 'ses-old.db')]:
+        fresh_worker_per_invocation(backend)
+        # The CLI mints the id: one an earlier attempt had, or one its own
+        # store held before the worker started.
+        a_conversation_seen_before_fails_closed(backend, 'FAKE_REUSE_SESSION'
+                                                if backend == 'cursor' else 'FAKE_SESSION_ID')
+        a_reused_conversation_fails_closed(
+            backend, 'FAKE_SESSION_ID', value='ses-old', says='already held it', recorded='ses-old',
+            prepare=lambda home, path=f'{store}/{entry}': seed(home / path))
+    # agy hands a new conversation summaries of its Knowledge Items.
+    a_reused_conversation_fails_closed('agy', None, says='Knowledge Items', recorded=OTHER,
+                                       prepare=knowledge_items)
     a_stub_worker_per_invocation()
     an_unsupported_backend_is_refused()

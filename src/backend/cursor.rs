@@ -76,6 +76,30 @@ impl Backend for Cursor {
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["Cursor Agent"]
     }
+    /// The conversation OMAR's runner reports opening, which cursor-agent
+    /// mints: ACP `session/new` ignores an id it is given.
+    fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
+        managed::reported_conversation(target)
+    }
+    /// An attempt's worker is a new runner and a new `cursor-agent acp`,
+    /// sent only `session/new`: never `session/load`, the one call that
+    /// reopens an earlier chat. The runner reports the id before its socket
+    /// exists, and whether cursor-agent's own store held it before the worker
+    /// started. cursor-agent keeps no memory across chats.
+    fn fresh_conversation(&self) -> bool {
+        true
+    }
+    fn freshness(&self) -> super::Freshness {
+        super::Freshness::Reported
+    }
+    fn prove_fresh(
+        &self,
+        target: &super::Target<'_>,
+        id: &str,
+        _since: std::time::SystemTime,
+    ) -> Result<()> {
+        managed::prove_reported(target, id)
+    }
     /// Cursor takes no message from outside its protocol, so it runs under
     /// OMAR's protocol runner, which owns a durable inbox for it.
     fn launch_command(&self, launch: &Launch<'_>) -> String {

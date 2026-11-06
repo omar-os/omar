@@ -314,9 +314,12 @@ pub(crate) fn actor_file(actor: Option<&str>, stem: &str) -> String {
 pub(crate) fn materialize_shared_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
     // User-global backend configs must not overwrite the EA's private context.
     // Each launched pane supplies its own full context through the environment.
+    // Nor carry a topology agent's: every MCP server reading this file would
+    // act as whichever agent, or attempt, launched last.
     let mut shared = context.clone();
     shared.agent_name = None;
     shared.serve = None;
+    shared.topology = None;
     let path = mcp_ea_dir(context)?.join("context-shared.json");
     write_private_file(&path, &serde_json::to_vec(&shared).ok()?).ok()?;
     Some(path)
@@ -683,6 +686,22 @@ pub(crate) mod tests {
         assert_eq!(read(a_path).agent_name.as_deref(), Some("worker/a"));
         assert_eq!(read(b_path).agent_name.as_deref(), Some("worker-b"));
         assert!(read(shared_path).serve.is_none());
+        // A topology agent's identity, and its attempt's, stay in its own file.
+        let mut scoped = a.clone();
+        scoped.topology = Some(TopologyMcpContext {
+            team: "Scoped".into(),
+            agent: "t.coder".into(),
+            endpoint: "localhost:1".into(),
+            token: "t".into(),
+            attempt: Some(TopologyAttempt {
+                id: "attempt".into(),
+                native_session: "unused".into(),
+            }),
+        });
+        let shared_path = materialize_shared_mcp_context_file(&scoped).unwrap();
+        assert!(read(shared_path).topology.is_none());
+        let scoped_path = materialize_mcp_context_file(&scoped).unwrap();
+        assert_eq!(read(scoped_path).topology.unwrap().agent, "t.coder");
     }
 
     // Exercise the real manager lifecycle: worktree/backend launchers can keep

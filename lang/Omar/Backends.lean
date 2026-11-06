@@ -8,8 +8,10 @@ namespace Omar.Backends
 def freshConversation : Array (Array String) := #[
   #["claude", "claude-code", "claude_code", "claudecode"],
   #["codex"],
+  #["cursor"],
   #["opencode"],
   #["pi"],
+  #["agy", "antigravity"],
   #["jev"],
   #["stub"]
 ]
