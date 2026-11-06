@@ -284,6 +284,10 @@ jobs:
         run: |
           cargo build --bin omar
           python3 tests/ci/property_proofs.py
+      - name: Verify the terminal console follows and stops a run through serve
+        run: |
+          cargo build --bin omar
+          python3 tests/ci/tui_console.py
 
       - name: Compile topology corpus to bytecode (offline)
         working-directory: lang

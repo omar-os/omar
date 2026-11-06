@@ -6,6 +6,7 @@ mod chat_history;
 mod checkpoint;
 mod computer;
 mod config;
+mod console;
 mod deploy;
 mod diagram;
 mod ea;
@@ -128,9 +129,12 @@ enum Commands {
     /// Attach to the selected runtime with the terminal dashboard or Mission Control
     #[command(group = clap::ArgGroup::new("mode").required(true).args(["tui", "web"]))]
     Attach {
-        /// Terminal dashboard inside the session's tmux server (z detaches; Q stops the session)
+        /// Mission Control in the terminal: chat, designs and their proofs, runs in logical time
         #[arg(long)]
         tui: bool,
+        /// With --tui: the agent dashboard inside the session's tmux server instead (z detaches; Q stops the session)
+        #[arg(long, requires = "tui")]
+        agents: bool,
         /// Mission Control in the browser
         #[arg(long)]
         web: bool,

@@ -414,7 +414,11 @@ pub fn prepare_process(cli: &Cli) -> Result<()> {
 
 fn dashboard_target(cli: &Cli) -> Result<Option<Session>> {
     match &cli.command {
-        Some(Commands::Attach { tui: true, .. }) => target(cli).map(Some),
+        Some(Commands::Attach {
+            tui: true,
+            agents: true,
+            ..
+        }) => target(cli).map(Some),
         _ => Ok(None),
     }
 }
@@ -527,6 +531,7 @@ fn relaunch_dashboard(
                 "-s",
                 &session.name,
                 "--tui",
+                "--agents",
                 "--ea",
                 &ea.to_string(),
             ]);
@@ -1583,7 +1588,14 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
     {
         return Some(Err(anyhow::anyhow!("configuration options apply when creating a session; target an existing session without changing its configuration")));
     }
-    if matches!(cli.command, Some(Commands::Attach { tui: true, .. })) {
+    if matches!(
+        cli.command,
+        Some(Commands::Attach {
+            tui: true,
+            agents: true,
+            ..
+        })
+    ) {
         return Some(attach_dashboard().await);
     }
     let result = match &cli.command {
@@ -1621,6 +1633,11 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             rpc(&s,json!({"op":"hello"}),Duration::from_secs(5))?;
             if *print_url { println!("{}",s.url); } else { crate::open_browser(&s.url); }
             Ok(())
+        }),
+        Some(Commands::Attach { tui: true, .. }) => target(cli).and_then(|s| {
+            anyhow::ensure!(s.state == "ready", "session '{}' is {}; attach needs a ready runtime", s.name, s.state);
+            rpc(&s,json!({"op":"hello"}),Duration::from_secs(5))?;
+            crate::console::run(&s)
         }),
         Some(Commands::Attach { .. }) => Err(anyhow::anyhow!("attach needs --tui or --web")),
         Some(Commands::Logs { follow, tail }) => target(cli).and_then(|s| {

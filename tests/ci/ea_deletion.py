@@ -82,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix="omar-delete-") as folder:
         current_session = session
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
-        args = [str(BIN), "attach", "-s", session["name"], "--tui"]
+        args = [str(BIN), "attach", "-s", session["name"], "--tui", "--agents"]
         if ea is not None:
             args += ["--ea", str(ea)]
         terminal = subprocess.Popen(args, env=env, stdin=slave, stdout=slave, stderr=slave)

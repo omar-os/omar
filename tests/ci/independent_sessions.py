@@ -61,7 +61,7 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
     def terminal_attach(name, context=None):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
-        process = subprocess.Popen([str(BIN), "attach", "-s", name, "--tui"], env=context or env, stdin=slave, stdout=slave, stderr=slave)
+        process = subprocess.Popen([str(BIN), "attach", "-s", name, "--tui", "--agents"], env=context or env, stdin=slave, stdout=slave, stderr=slave)
         os.close(slave)
         return process, master
 
