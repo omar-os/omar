@@ -30,9 +30,6 @@ Checked, from what the fake logged and the run recorded:
   mints), and it fails closed on a thread forked from another, one already
   holding a message, one created before the attempt began, or one an earlier
   attempt had;
-- the same for fake `cursor-agent` (ACP `session/new` under a new runner,
-  never `session/load`), and it fails closed on a conversation an earlier
-  attempt had, or one its CLI's own store held before the worker started;
 - a minted conversation an earlier run of the deployment recorded is refused
   in the next run, and so is every minted one while that record is unreadable;
 - what a worker leaves running, reparented out of its process tree, is
@@ -434,60 +431,9 @@ else:
         time.sleep(60)
 """
 
-# cursor-agent, as OMAR's protocol runner drives it: `<command> acp`, ACP
-# JSON-RPC on stdio. `session/new` mints the id, as the real one does whatever
-# it is given, and adds the session to the CLI's own store under HOME;
-# `session/load` of anything fails. The faults apply to attempts only: one
-# hands every attempt the same session, one the session FAKE_SESSION_ID that
-# the store already held.
-FAKE_CURSOR = COMMON + r"""
-context = json.loads(Path(os.environ["OMAR_MCP_CONTEXT_FILE"]).read_text())
-topology = context["topology"]
-session = None
-store = Path(os.environ["HOME"]) / ".cursor" / "acp-sessions"
-write({"event": "launch", "agent": topology["agent"], "attempt": topology.get("attempt"),
-       "session_id": None, "argv": " ".join(argv)})
-
-def new_session():
-    reused = Path(os.environ["HOME"]) / "fake-cursor-session"
-    if topology.get("attempt") and os.environ.get("FAKE_REUSE_SESSION"):
-        if not reused.exists():
-            reused.write_text(str(uuid.uuid4()))
-        return reused.read_text()
-    if topology.get("attempt") and os.environ.get("FAKE_SESSION_ID"):
-        return os.environ["FAKE_SESSION_ID"]
-    return str(uuid.uuid4())
-
-for line in sys.stdin:
-    message = json.loads(line)
-    method, params = message.get("method"), message.get("params") or {}
-    write({"event": "rpc", "agent": topology["agent"], "method": method})
-    reply = {"jsonrpc": "2.0", "id": message["id"], "result": {}}
-    if method == "session/new":
-        mcp = params["mcpServers"][0]
-        server = [mcp["command"], *mcp["args"]]
-        session = new_session()
-        (store / session).mkdir(parents=True, exist_ok=True)
-        (store / session / "meta.json").write_text(json.dumps({"cwd": params["cwd"]}))
-        write({"event": "thread", "agent": topology["agent"], "session_id": session})
-        reply["result"] = {"sessionId": session}
-    elif method == "session/load":
-        reply = {"jsonrpc": "2.0", "id": message["id"],
-                 "error": {"code": -32602, "message": "Session not found"}}
-    elif method == "session/prompt":
-        assert params["sessionId"] == session, params
-        answer(params["prompt"][0]["text"])
-        reply["result"] = {"stopReason": "end_turn"}
-    print(json.dumps(reply), flush=True)
-"""
-
-FAKES = {'claude': FAKE, 'pi': FAKE_PI, 'opencode': FAKE_OPENCODE, 'codex': FAKE_CODEX,
-         'cursor': FAKE_CURSOR}
-# The names a backend's CLI is found by: OMAR runs `cursor-agent`, `agent` or
-# `cursor agent`, whichever is on its own PATH.
-SHIMS = {'cursor': ['cursor', 'cursor-agent', 'agent']}
+FAKES = {'claude': FAKE, 'pi': FAKE_PI, 'opencode': FAKE_OPENCODE, 'codex': FAKE_CODEX}
 # Those whose CLI mints the conversation id, which the runtime checks is new.
-MINTED = {'codex', 'cursor'}
+MINTED = {'codex'}
 
 PROGRAM = '''team Pipe[coder : {coder}, keeper : Claude] {{
     input start : string
@@ -515,8 +461,7 @@ STUB_PROGRAM = PROGRAM.replace('keeper : Claude', 'keeper : Stub')
 OTHER = object()
 
 # Each faked backend as a program spells it.
-SPELLED = {'claude': 'Claude', 'pi': 'Pi', 'opencode': 'OpenCode', 'codex': 'Codex',
-           'cursor': 'Cursor'}
+SPELLED = {'claude': 'Claude', 'pi': 'Pi', 'opencode': 'OpenCode', 'codex': 'Codex'}
 
 
 def supported():
@@ -535,7 +480,7 @@ def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM
     log = root / f'{backend}.jsonl'
     fake = root / f'fake_{backend}.py'
     fake.write_text(f'LOG = {str(log)!r}\n' + FAKES[backend])
-    for name in SHIMS.get(backend, [backend]):
+    for name in [backend]:
         shim = shims / name
         shim.write_text(f"#!/bin/sh\nexec python3 '{fake}' \"$@\"\n")
         shim.chmod(0o700)
@@ -662,14 +607,6 @@ def fresh_worker_per_invocation(backend='claude'):
             assert [(r['pid'], r['params']) for r in reads] == [
                 (launch['pid'], {'threadId': thread, 'includeTurns': False})
                 for launch, thread in zip(coder, opened)], reads
-        if backend == 'cursor':
-            # Each worker opened one session, by `session/new`, and none was
-            # ever loaded: not an attempt's, not the keeper's.
-            rpcs = [(e['pid'], e['method']) for e in events if e['event'] == 'rpc']
-            assert not any(method == 'session/load' for _, method in rpcs), rpcs
-            for launch in coder + keeper:
-                assert [m for pid, m in rpcs if pid == launch['pid']
-                        and m.startswith('session/new')] == ['session/new'], rpcs
         # Each attempt's calls carried a key of its own that no record
         # holds, from files of its own, gone once it stopped.
         keys = [launch['attempt']['key'] for launch in coder]
@@ -845,7 +782,7 @@ def an_unsupported_backend_is_refused():
         # to refuse again, whether a program or a mutation plan.
         old = root / 'Old.omar'
         old.write_text(PROGRAM.format(coder='Web'))
-        for backend in ['Web', 'Agy', 'Antigravity', 'Nope']:
+        for backend in ['Web', 'Agy', 'Antigravity', 'Cursor', 'Nope']:
             program = root / 'Scoped.omar'
             program.write_text(PROGRAM.format(coder=f'{backend}(scope = invocation)'))
             for args in [[program], ['--diff', old, program]]:
@@ -860,7 +797,7 @@ def an_unsupported_backend_is_refused():
         assert result.returncode != 0, output
         assert 'cannot start a fresh conversation per invocation' in output, output
         assert events == [], events
-        print('PASS: Web, Agy and unknown backends refused by omarc, no bytecode written')
+        print('PASS: Web, Agy, Cursor and unknown backends refused by omarc, no bytecode written')
 
 
 if __name__ == '__main__':
@@ -892,13 +829,6 @@ if __name__ == '__main__':
                                        recorded=OTHER)
     a_conversation_seen_before_fails_closed()
     a_conversation_an_earlier_run_had_fails_closed()
-    fresh_worker_per_invocation('cursor')
-    # The CLI mints the id: one an earlier attempt had, or one its own store
-    # held before the worker started.
-    a_conversation_seen_before_fails_closed('cursor', 'FAKE_REUSE_SESSION')
-    a_reused_conversation_fails_closed(
-        'cursor', 'FAKE_SESSION_ID', value='ses-old', says='already held it', recorded='ses-old',
-        prepare=lambda home: seed(home / '.cursor/acp-sessions/ses-old/meta.json'))
     leftovers_are_stopped_before_release()
     a_stub_worker_per_invocation()
     an_unsupported_backend_is_refused()

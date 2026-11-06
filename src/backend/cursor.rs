@@ -81,14 +81,13 @@ impl Backend for Cursor {
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         managed::reported_conversation(target)
     }
-    /// An attempt's worker is a new runner and a new `cursor-agent acp`,
-    /// sent only `session/new`: never `session/load`, the one call that
-    /// reopens an earlier chat. The runner reports the id before its socket
-    /// exists, and whether cursor-agent's own store held it before the worker
-    /// started. cursor-agent keeps no memory across chats.
-    fn fresh_conversation(&self) -> bool {
-        true
-    }
+    // No `fresh_conversation`: cursor-agent saves every chat under
+    // `~/.cursor/projects/<workspace>/agent-transcripts/` and names that
+    // folder in each new chat's context, where the agent greps it and finds
+    // what an earlier chat said. The only switch,
+    // `--exclude-workspace-context`, is print-mode only and rejected for some
+    // accounts. A new conversation id is not a new context, so omarc refuses
+    // `Cursor(scope = invocation)`.
     fn freshness(&self) -> super::Freshness {
         super::Freshness::Reported
     }

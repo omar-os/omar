@@ -140,8 +140,8 @@ The runtime makes sure of it rather than assuming it:
 
   ```text
   agent 'step' is invocation-scoped, but backend 'Web' cannot start a fresh
-  conversation per invocation; supported: claude, codex, cursor, opencode, pi,
-  jev, stub
+  conversation per invocation; supported: claude, codex, opencode, pi, jev,
+  stub
   ```
 
   The runtime refuses it again before the run starts, so bytecode from
@@ -161,20 +161,16 @@ The runtime makes sure of it rather than assuming it:
   through its `/api/session`, which needs an opencode that has it, only once
   the server has no session of that id, and taken only while it holds no
   message and the server is the worker's own; `Stub`, in its launch context), the worker must report exactly
-  that id. Where the backend mints its own (`Codex` and `Cursor`, which take
+  that id. Where the backend mints its own (`Codex`, which takes
   no id), the id must be non-empty, never reported by an earlier
   attempt of the deployment (those recorded in `attempts.jsonl` included), and
   pass whatever proof the backend has that the conversation is new. A `Codex`
   attempt starts an app-server of its own with memories off, never resumes,
   and never falls back to the exec runner; its thread must be the server's
   only loaded one, not forked, no subagent's, hold no message, and be created
-  after the attempt began. A `Cursor` attempt is a new protocol runner, with
-  an inbox and socket of its own, and a new CLI process under it:
-  `cursor-agent acp` is sent only `session/new`, never `session/load`. The
-  runner reports the id the CLI minted, from the attempt's own process tree,
-  before anything can be sent. The CLI's own store
-  (`~/.cursor/acp-sessions/<id>`) must have had no entry for it before the
-  worker started and have one once it reports;
+  after the attempt began. `Cursor` and `Antigravity` are refused: each saves
+  earlier conversations' transcripts where a new one finds them, with no
+  switch to stop it;
 - a worker that cannot be started, or whose conversation fails the check, fails
   the invocation, and is stopped without being handed it. There is no falling
   back to a worker that has one;
