@@ -264,11 +264,12 @@ async fn codex_turn(
 
 /// What an invocation-scoped attempt's runner may start from: nothing an
 /// earlier worker had. Its config, inbox and socket directory are new to its
-/// launch; this refuses any sign they are not, the exec runner (which resumes
-/// one conversation turn after turn), and an agy line that would resume one.
+/// launch; this refuses any sign they are not, and every runner but
+/// cursor's: agy hands a new conversation its earlier ones, and the exec
+/// runner resumes one conversation turn after turn.
 fn fresh_start(config: &Config, inbox_existed: bool) -> Result<()> {
     anyhow::ensure!(
-        matches!(config.backend.as_str(), "cursor" | "agy"),
+        config.backend == "cursor",
         "the {} runner resumes one conversation; an invocation-scoped attempt cannot use it",
         config.backend
     );
@@ -276,51 +277,17 @@ fn fresh_start(config: &Config, inbox_existed: bool) -> Result<()> {
         !inbox_existed && config.initial_session.is_none(),
         "an invocation-scoped attempt was handed a conversation to resume"
     );
-    if config.backend == "agy" {
-        if let Some(word) = resume_flag(&config.command) {
-            bail!("an invocation-scoped agent's command must not pass {word}");
-        }
-    }
     Ok(())
 }
 
-/// A word on an agy line that reopens a conversation. agy reads flags as Go
-/// does: one dash or two, a value after `=` or not.
-fn resume_flag(command: &str) -> Option<String> {
-    shlex::split(command)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|word| {
-            let name = word
-                .strip_prefix("--")
-                .or_else(|| word.strip_prefix('-'))
-                .unwrap_or_default();
-            matches!(
-                name.split('=').next(),
-                Some("c" | "continue" | "conversation")
-            )
-        })
+/// Where cursor-agent keeps one entry per conversation it opens: 2026.09
+/// adds `acp-sessions/<id>/meta.json` before `session/new` answers.
+fn conversation_store() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".cursor").join("acp-sessions"))
 }
 
-/// Where a backend's CLI keeps one entry per conversation it opens:
-/// cursor-agent 2026.09 adds `acp-sessions/<id>/meta.json` before
-/// `session/new` answers, agy 1.5 `conversations/<id>.db` before its `init`.
-fn conversation_store(backend: &str) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(match backend {
-        "cursor" => home.join(".cursor").join("acp-sessions"),
-        _ => home
-            .join(".gemini")
-            .join("antigravity-cli")
-            .join("conversations"),
-    })
-}
-
-fn store_entry(backend: &str, store: &Path, id: &str) -> PathBuf {
-    match backend {
-        "cursor" => store.join(id).join("meta.json"),
-        _ => store.join(format!("{id}.db")),
-    }
+fn store_entry(store: &Path, id: &str) -> PathBuf {
+    store.join(id).join("meta.json")
 }
 
 /// What a directory holds by name; none when it does not exist.
@@ -338,17 +305,16 @@ fn names(dir: &Path) -> std::io::Result<BTreeSet<String>> {
 /// why it could not be read.
 type Snapshot = std::result::Result<(PathBuf, BTreeSet<String>), String>;
 
-fn snapshot(backend: &str) -> Snapshot {
-    let store = conversation_store(backend).ok_or("there is no home directory")?;
+fn snapshot() -> Snapshot {
+    let store = conversation_store().ok_or("there is no home directory")?;
     let before = names(&store).map_err(|error| format!("{}: {error}", store.display()))?;
     Ok((store, before))
 }
 
 /// Why the conversation `id` an attempt's backend opened cannot be shown new,
-/// if it cannot: it is no plain id, its CLI's store held it before the worker
-/// started or holds nothing for it now, or (agy) the CLI holds Knowledge
-/// Items, whose summaries it hands every new conversation.
-fn unproven(backend: &str, snapshot: &Snapshot, id: &str) -> Option<String> {
+/// if it cannot: it is no plain id, or its CLI's store held it before the
+/// worker started or holds nothing for it now.
+fn unproven(snapshot: &Snapshot, id: &str) -> Option<String> {
     let (store, before) = match snapshot {
         Ok(snapshot) => snapshot,
         Err(error) => return Some(format!("its store could not be read: {error}")),
@@ -368,23 +334,9 @@ fn unproven(backend: &str, snapshot: &Snapshot, id: &str) -> Option<String> {
             store.display()
         ));
     }
-    let entry = store_entry(backend, store, id);
+    let entry = store_entry(store, id);
     if !entry.exists() {
         return Some(format!("{} does not exist", entry.display()));
-    }
-    if backend == "agy" {
-        // agy keeps its own `knowledge.lock` there, items or none.
-        let knowledge = store.with_file_name("knowledge");
-        match names(&knowledge) {
-            Ok(items) if items.iter().all(|name| name.ends_with(".lock")) => {}
-            Ok(_) => {
-                return Some(format!(
-                "agy holds Knowledge Items in {}, whose summaries it hands every new conversation",
-                knowledge.display()
-            ))
-            }
-            Err(error) => return Some(format!("{}: {error}", knowledge.display())),
-        }
     }
     None
 }
@@ -461,8 +413,8 @@ pub async fn run(path: &Path) -> Result<()> {
         "codex" => {}
         _ => unreachable!(),
     }
-    // Taken before the backend starts, as agy opens its conversation then.
-    let store = attempt.then(|| snapshot(&config.backend));
+    // Taken before the backend starts, so nothing it opens is in it.
+    let store = attempt.then(snapshot);
     let mut engine = if config.backend == "codex" {
         None
     } else {
@@ -513,7 +465,7 @@ pub async fn run(path: &Path) -> Result<()> {
             };
             let session = if method == "session/load" { params["sessionId"].as_str() } else { result["sessionId"].as_str() }.context("ACP omitted sessionId")?;
             if let Some(store) = &store {
-                report(&config.socket, session, unproven("cursor", store, session))?;
+                report(&config.socket, session, unproven(store, session))?;
             }
             let mut state = queue.state.lock().await;
             crate::backend::remember_conversation(&context, "cursor", session)?;
@@ -521,28 +473,6 @@ pub async fn run(path: &Path) -> Result<()> {
             save(&queue.path, &state)?;
             Ok::<_, anyhow::Error>(())
         }).await.context("ACP startup timed out")??;
-    }
-    // agy reports the conversation it opened before it reads any input; an
-    // attempt's is reported before anything can be sent, and is the only one
-    // its turns may name.
-    let mut opened = None;
-    if let (Some(store), "agy") = (&store, config.backend.as_str()) {
-        let engine = engine.as_mut().unwrap();
-        let event = tokio::time::timeout(std::time::Duration::from_secs(45), engine.next())
-            .await
-            .context("agy did not report its conversation in time")??;
-        anyhow::ensure!(
-            event["event"] == "init",
-            "agy said {event} before reporting its conversation"
-        );
-        let session = event["conversation_id"]
-            .as_str()
-            .context("agy's init named no conversation")?;
-        report(&config.socket, session, unproven("agy", store, session))?;
-        let mut state = queue.state.lock().await;
-        state.session = Some(session.to_owned());
-        save(&queue.path, &state)?;
-        opened = Some(session.to_owned());
     }
     if config.socket.exists() {
         std::fs::remove_file(&config.socket)?;
@@ -596,13 +526,6 @@ pub async fn run(path: &Path) -> Result<()> {
                 engine.write(json!({"event":"user","message":{"content":prompt}})).await?;
                 loop {
                     let event = engine.next().await?;
-                    if let Some(opened) = &opened {
-                        for id in [&event["conversation_id"], &event["result"]["conversation_id"]] {
-                            if let Some(id) = id.as_str() {
-                                anyhow::ensure!(id == opened, "agy moved to conversation {id} from {opened}");
-                            }
-                        }
-                    }
                     if event["event"] == "init" {
                         if let Some(session) = event["conversation_id"].as_str() {
                             let mut state = queue.state.lock().await;
@@ -653,89 +576,45 @@ mod protocol_tests {
     }
 
     /// An attempt starts from nothing: no inbox, no conversation to resume,
-    /// not the exec runner, and no agy flag that reopens a conversation,
-    /// spelled however Go's flag parser takes it.
+    /// and only on cursor's runner.
     #[test]
     fn an_attempt_starts_from_no_conversation() {
         fresh_start(&attempt_config("cursor", "cursor-agent --yolo"), false).unwrap();
-        fresh_start(
-            &attempt_config("agy", "agy --dangerously-skip-permissions"),
-            false,
-        )
-        .unwrap();
         let error =
             |config: &Config, existed| fresh_start(config, existed).unwrap_err().to_string();
-        assert!(error(&attempt_config("codex", "codex"), false).contains("resumes one"));
+        assert!(error(&attempt_config("codex", "codex"), false).contains("cannot use it"));
+        assert!(error(&attempt_config("agy", "agy"), false).contains("cannot use it"));
         assert!(error(&attempt_config("cursor", "cursor-agent"), true).contains("to resume"));
-        let mut handed = attempt_config("agy", "agy");
+        let mut handed = attempt_config("cursor", "cursor-agent");
         handed.initial_session = Some("earlier".into());
         assert!(error(&handed, false).contains("to resume"));
-        for flag in [
-            "-c",
-            "--continue",
-            "-continue",
-            "--conversation x",
-            "--conversation=x",
-            "-conversation=x",
-            "--continue=true",
-        ] {
-            let config =
-                attempt_config("agy", &format!("agy --dangerously-skip-permissions {flag}"));
-            assert!(error(&config, false).contains("must not pass"), "{flag}");
-        }
-        for line in ["agy --model gemini-3 --mode auto", "agy --cwd x"] {
-            assert_eq!(resume_flag(line), None, "{line}");
-        }
     }
 
     /// A conversation is taken only when its CLI's store had no entry for it
-    /// before the worker started and has one now; for agy, only while it
-    /// holds no Knowledge Items.
+    /// before the worker started and has one now.
     #[test]
     fn a_conversation_new_to_its_store_and_no_other() {
         let home = tempfile::tempdir().unwrap();
         let cursor = home.path().join("acp-sessions");
-        let agy = home.path().join("antigravity-cli").join("conversations");
         std::fs::create_dir_all(cursor.join("old")).unwrap();
-        std::fs::create_dir_all(&agy).unwrap();
-        std::fs::write(agy.join("old.db"), "").unwrap();
         let before = |store: &Path| -> Snapshot { Ok((store.to_owned(), names(store).unwrap())) };
-        let (cursor_before, agy_before) = (before(&cursor), before(&agy));
-        for (backend, store) in [("cursor", &cursor), ("agy", &agy)] {
-            let entry = store_entry(backend, store, "new");
-            std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
-            std::fs::write(entry, "").unwrap();
-        }
-        assert_eq!(unproven("cursor", &cursor_before, "new"), None);
-        assert_eq!(unproven("agy", &agy_before, "new"), None);
-        for (backend, snapshot) in [("cursor", &cursor_before), ("agy", &agy_before)] {
-            let why =
-                |id| unproven(backend, snapshot, id).unwrap_or_else(|| panic!("{backend} {id}"));
-            assert!(why("old").contains("already held"), "{backend}");
-            assert!(why("missing").contains("does not exist"), "{backend}");
-            for id in ["", "../new", ".", "a/b"] {
-                assert!(
-                    why(id).contains("not a conversation id"),
-                    "{backend} {id:?}"
-                );
-            }
+        let cursor_before = before(&cursor);
+        let entry = store_entry(&cursor, "new");
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::fs::write(entry, "").unwrap();
+        assert_eq!(unproven(&cursor_before, "new"), None);
+        let why = |id| unproven(&cursor_before, id).unwrap_or_else(|| panic!("{id}"));
+        assert!(why("old").contains("already held"));
+        assert!(why("missing").contains("does not exist"));
+        for id in ["", "../new", ".", "a/b"] {
+            assert!(why(id).contains("not a conversation id"), "{id:?}");
         }
         // A store that does not exist holds nothing, so nothing is new to it.
         let none = before(&home.path().join("nowhere"));
-        assert!(unproven("cursor", &none, "new")
-            .unwrap()
-            .contains("does not exist"));
-        assert!(unproven("agy", &Err("unreadable".into()), "new")
+        assert!(unproven(&none, "new").unwrap().contains("does not exist"));
+        assert!(unproven(&Err("unreadable".into()), "new")
             .unwrap()
             .contains("unreadable"));
-        let knowledge = agy.with_file_name("knowledge");
-        std::fs::create_dir_all(&knowledge).unwrap();
-        std::fs::write(knowledge.join("knowledge.lock"), "").unwrap();
-        assert_eq!(unproven("agy", &agy_before, "new"), None);
-        std::fs::create_dir_all(knowledge.join("item")).unwrap();
-        assert!(unproven("agy", &agy_before, "new")
-            .unwrap()
-            .contains("Knowledge Items"));
     }
 
     /// The report is written once, beside the socket, for this runner.

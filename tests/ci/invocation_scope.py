@@ -10,7 +10,8 @@ No model, no credentials.
 
 Checked, from what the fake logged and the run recorded:
 - the two coder invocations ran in two processes, each opening the new
-  conversation its attempt named; the keeper's two ran in one;
+  conversation its attempt named, with auto memory off; the keeper's two ran
+  in one;
 - a sentinel in the first coder prompt is nowhere in what the second was
   handed: not its launch line, its system prompt, nor its message;
 - a file the first coder wrote is what the second read;
@@ -30,17 +31,21 @@ Checked, from what the fake logged and the run recorded:
   holding a message, one created before the attempt began, or one an earlier
   attempt had;
 - the same for fake `cursor-agent` (ACP `session/new` under a new runner,
-  never `session/load`) and fake `agy` (stream-json, announcing the
-  conversation it minted before it reads anything, and reaching OMAR through
-  the EA's shared plugin registration with its pane's own identity), and each
-  fails closed on a conversation an earlier attempt had, or one its CLI's own
-  store held before the worker started; agy also while it holds Knowledge
-  Items;
+  never `session/load`), and it fails closed on a conversation an earlier
+  attempt had, or one its CLI's own store held before the worker started;
+- a minted conversation an earlier run of the deployment recorded is refused
+  in the next run, and so is every minted one while that record is unreadable;
+- what a worker leaves running, reparented out of its process tree, is
+  stopped before its effects are released: a background writer it started
+  never writes;
+- each attempt's calls carry a key no record holds, from files of its own
+  that are gone once it stops;
 - the model-free `Stub(scope = invocation)` does the same for real, with no
   fake and no credentials: two attempts, each reporting the new conversation
   its attempt named, the first stopped before the second started;
-- a backend that cannot promise a fresh conversation, or that omarc does not
-  know, is refused by omarc itself, which writes no bytecode or plan.
+- a backend that cannot promise a fresh conversation (Web, and Agy, which
+  hands a new conversation its earlier ones), or that omarc does not know, is
+  refused by omarc itself, which writes no bytecode or plan.
 """
 import json
 import os
@@ -48,6 +53,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import time
 
 REPO = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get('OMAR_BIN', REPO / 'target/debug/omar')).resolve()
@@ -86,6 +92,16 @@ def call(tool, arguments):
     process.wait()
     return reply
 
+def leave_writers():
+    """Background writers whose parent exits at once, so no tree holds them:
+    one in the worker's session, and (Linux) one in a session of its own."""
+    later = "sleep 3; echo late > $HOME/late-{}.txt"
+    subprocess.run(["sh", "-c", f"nohup sh -c '{later.format('session')}' >/dev/null 2>&1 &"])
+    if sys.platform.startswith("linux"):
+        subprocess.run(["sh", "-c", "python3 -c \"import os, subprocess; os.setsid(); "
+                        f"subprocess.run(['sh', '-c', '{later.format('setsid')}'])\" "
+                        ">/dev/null 2>&1 &"])
+
 def alive(pid):
     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
     return bool(state.stdout.strip()) and not state.stdout.strip().startswith("Z")
@@ -98,6 +114,8 @@ def answer(text):
     history.append(text)
     if "Step one" in text:
         Path("note.txt").write_text("note from step one")
+        if os.environ.get("FAKE_LEFTOVER"):
+            leave_writers()
         writes = {"mid": "ok"}
     elif "Step two" in text:
         earlier = [json.loads(line) for line in log.read_text().splitlines()]
@@ -125,7 +143,8 @@ if os.environ.get("FAKE_WRONG_SESSION") and flag("--session-id"):
     session = "an-old-conversation"
 write({"event": "launch", "agent": topology["agent"], "attempt": topology.get("attempt"),
        "session_id": flag("--session-id"), "argv": " ".join(argv),
-       "system_prompt": flag("--append-system-prompt")})
+       "system_prompt": flag("--append-system-prompt"),
+       "no_auto_memory": os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY")})
 print("\x1b[2J\x1b[H Claude Code v0\n" + "─" * 40 + "\n❯ \n" + "─" * 40, flush=True)
 
 home = Path(os.environ["HOME"])
@@ -329,7 +348,9 @@ if "app-server" in argv:
     def start_thread():
         global session
         reused = Path(os.environ["HOME"]) / "fake-codex-thread"
-        if os.environ.get("FAKE_REUSE_THREAD"):
+        # The file alone also counts: a later run's agents keep the
+        # environment of the OMAR an earlier run started.
+        if os.environ.get("FAKE_REUSE_THREAD") or reused.exists():
             if not reused.exists():
                 reused.write_text(str(uuid.uuid4()))
             session = reused.read_text()
@@ -456,42 +477,13 @@ for line in sys.stdin:
     print(json.dumps(reply), flush=True)
 """
 
-# agy, as OMAR's protocol runner drives it: stream-json on stdio, announcing
-# the conversation it minted in an `init` event before it reads anything, and
-# adding it to its own store under HOME as it does. It reaches OMAR as the
-# real one does: through the EA's plugin registration under ~/.gemini/config,
-# shared by every agy pane, with this pane's environment. FAKE_SESSION_ID is
-# the conversation every attempt opens.
-FAKE_AGY = COMMON + r"""
-context = json.loads(Path(os.environ["OMAR_MCP_CONTEXT_FILE"]).read_text())
-topology = context["topology"]
-plugin = "omar-ea-" + os.environ["OMAR_EA_ID"]
-registered = Path(os.environ["HOME"]) / ".gemini" / "config" / "plugins" / plugin
-mcp = json.loads((registered / "mcp_config.json").read_text())["mcpServers"][plugin]
-server = [mcp["command"], *mcp["args"]]
-session = (topology.get("attempt") and os.environ.get("FAKE_SESSION_ID")) or str(uuid.uuid4())
-store = Path(os.environ["HOME"]) / ".gemini" / "antigravity-cli" / "conversations"
-store.mkdir(parents=True, exist_ok=True)
-(store / f"{session}.db").write_text("")
-write({"event": "launch", "agent": topology["agent"], "attempt": topology.get("attempt"),
-       "session_id": None, "argv": " ".join(argv)})
-write({"event": "thread", "agent": topology["agent"], "session_id": session})
-print(json.dumps({"event": "init", "conversation_id": session,
-                  "init": {"cwd": os.getcwd(), "tools": []}}), flush=True)
-for line in sys.stdin:
-    message = json.loads(line)
-    answer(message["message"]["content"])
-    print(json.dumps({"event": "result", "result": {
-        "status": "SUCCESS", "response": "done", "conversation_id": session}}), flush=True)
-"""
-
 FAKES = {'claude': FAKE, 'pi': FAKE_PI, 'opencode': FAKE_OPENCODE, 'codex': FAKE_CODEX,
-         'cursor': FAKE_CURSOR, 'agy': FAKE_AGY}
+         'cursor': FAKE_CURSOR}
 # The names a backend's CLI is found by: OMAR runs `cursor-agent`, `agent` or
 # `cursor agent`, whichever is on its own PATH.
 SHIMS = {'cursor': ['cursor', 'cursor-agent', 'agent']}
 # Those whose CLI mints the conversation id, which the runtime checks is new.
-MINTED = {'codex', 'cursor', 'agy'}
+MINTED = {'codex', 'cursor'}
 
 PROGRAM = '''team Pipe[coder : {coder}, keeper : Claude] {{
     input start : string
@@ -520,7 +512,7 @@ OTHER = object()
 
 # Each faked backend as a program spells it.
 SPELLED = {'claude': 'Claude', 'pi': 'Pi', 'opencode': 'OpenCode', 'codex': 'Codex',
-           'cursor': 'Cursor', 'agy': 'Agy'}
+           'cursor': 'Cursor'}
 
 
 def supported():
@@ -530,8 +522,10 @@ def supported():
 
 
 def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM,
-        backend='claude', prepare=None):
-    """`prepare`, if any, is handed the private HOME before anything runs."""
+        backend='claude', prepare=None, keep_server=False):
+    """`prepare`, if any, is handed the private HOME before anything runs.
+    `keep_server` leaves OMAR and its tmux server up for another run in
+    `root`; the last run there takes them down."""
     home = root / 'home'
     shims = home / 'shims'
     shims.mkdir(parents=True, exist_ok=True)
@@ -559,17 +553,20 @@ def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM
     try:
         up = subprocess.run([str(BIN), 'up', *session, '--no-ea'], env=environment,
                             capture_output=True, text=True, timeout=120)
-        assert up.returncode == 0, up.stdout + up.stderr
+        # Already up for a run before this one in `root`, kept.
+        assert up.returncode == 0 or "already exists" in up.stderr, up.stdout + up.stderr
         result = subprocess.run(
             [str(BIN), 'run', *session, str(program), '--input', 'p.start=alpha',
              '--timeout-seconds', '60', '--replace', '--fg'],
             env=environment, capture_output=True, text=True, timeout=300)
+        # Records only: a scenario may have spoiled the log on purpose.
         attempts = [json.loads(line) for path in home.rglob('attempts.jsonl')
-                    for line in path.read_text().splitlines()]
+                    for line in path.read_text().splitlines() if line.startswith('{')]
     finally:
-        subprocess.run([str(BIN), 'down', *session], env=environment, capture_output=True,
-                       timeout=60)
-        subprocess.run(['tmux', '-L', server, 'kill-server'], capture_output=True)
+        if not keep_server:
+            subprocess.run([str(BIN), 'down', *session], env=environment, capture_output=True,
+                           timeout=60)
+            subprocess.run(['tmux', '-L', server, 'kill-server'], capture_output=True)
     events = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     return result, events, attempts
 
@@ -676,13 +673,18 @@ def fresh_worker_per_invocation(backend='claude'):
             for launch in coder + keeper:
                 assert [m for pid, m in rpcs if pid == launch['pid']
                         and m.startswith('session/new')] == ['session/new'], rpcs
-        if backend == 'agy':
-            # Nothing on any line reopens a conversation, and the keeper,
-            # reaching OMAR through the same shared registration, answered as
-            # itself.
-            for launch in launches:
-                words = launch['argv'].split()
-                assert not {'--conversation', '--continue', '-c'} & set(words), launch
+        # Each attempt's calls carried a key of its own that no record
+        # holds, from files of its own, gone once it stopped.
+        keys = [launch['attempt']['key'] for launch in coder]
+        assert all(keys) and keys[0] != keys[1], coder
+        assert not any(key in json.dumps(attempts) for key in keys), attempts
+        assert not list((Path(directory) / 'home').rglob('attempt-*')), 'attempt files left'
+        if backend == 'claude':
+            for launch in coder:
+                assert f"/attempt-{launch['attempt']['id']}/" in launch['argv'], launch
+            # Auto memory, which outlives a conversation, is off for an
+            # attempt alone.
+            assert [l['no_auto_memory'] for l in coder + keeper] == ['1', '1', None], launches
         print(f'PASS: {SPELLED[backend]}: two coder invocations ran in two fresh conversations, '
               'keeper reused one; sentinel absent, file visible, worker 1 stopped first')
 
@@ -741,15 +743,67 @@ def a_conversation_seen_before_fails_closed(backend='codex', fault='FAKE_REUSE_T
               'refused, and the second worker was never handed the invocation')
 
 
+def a_conversation_an_earlier_run_had_fails_closed():
+    """The minted ids an earlier run recorded are what the next run checks."""
+    with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
+        root = Path(directory)
+        first, events, attempts = run(root, keep_server=True, **on('codex'))
+        assert first.returncode == 0, first.stdout + first.stderr
+        handed = len([e for e in events if e['event'] == 'message' and e['agent'] == 'p.coder'])
+        threads = [a['native_session_id'] for a in attempts if a['outcome'] == 'completed']
+        assert len(threads) == 2, attempts
+
+        # The next run's codex hands its first attempt a thread the first run
+        # had, created now, empty and unforked: only the record can tell.
+        reused = root / 'home' / 'fake-codex-thread'
+        reused.write_text(threads[0])
+        result, events, after = run(root, keep_server=True, **on('codex'))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, output
+        assert f'it opened conversation {threads[0]}, which an earlier attempt already had' \
+            in output, output
+        coder = [e for e in events if e['event'] == 'message' and e['agent'] == 'p.coder']
+        assert len(coder) == handed, coder
+        assert [(a['outcome'], a['native_session_id']) for a in after[len(attempts):]
+                if a['outcome'] != 'started'] == [('failed', threads[0])], after
+
+        # A record that cannot be read refuses every minted id, new or not.
+        reused.unlink()
+        log = next((root / 'home').rglob('attempts.jsonl'))
+        with log.open('a') as out:
+            out.write('not a record\n')
+        result, events, _ = run(root, **on('codex'))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, output
+        assert 'cannot be shown new' in output and 'not a record' in output, output
+        coder = [e for e in events if e['event'] == 'message' and e['agent'] == 'p.coder']
+        assert len(coder) == handed, coder
+        print('PASS: Codex: a thread an earlier run recorded was refused in the next run, '
+              'and every thread while the record was unreadable')
+
+
+def leftovers_are_stopped_before_release():
+    with tempfile.TemporaryDirectory(prefix='omar-scope-') as directory:
+        root = Path(directory)
+        result, events, attempts = run(root, env={'FAKE_LEFTOVER': '1'})
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        finished = [a for a in attempts if a['outcome'] != 'started']
+        assert [(a['outcome'], a['cleanup_status']) for a in finished] == \
+            [('completed', 'stopped')] * 2, attempts
+        # Past when the writers would have written, had they outlived the
+        # attempt that started them.
+        time.sleep(5)
+        late = sorted(path.name for path in root.rglob('late-*.txt'))
+        assert late == [], late
+        print('PASS: Claude: background writers a worker left outside its process tree were '
+              'stopped before its effects were released, and never wrote')
+
+
 def seed(path):
     """A file the CLI's own store already holds before the run."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text('{}')
-
-
-def knowledge_items(home):
-    """agy holds a Knowledge Item"""
-    seed(home / '.gemini/antigravity-cli/knowledge/item/metadata.json')
 
 
 def a_stub_worker_per_invocation():
@@ -792,7 +846,7 @@ def an_unsupported_backend_is_refused():
         # to refuse again, whether a program or a mutation plan.
         old = root / 'Old.omar'
         old.write_text(PROGRAM.format(coder='Web'))
-        for backend in ['Web', 'Nope']:
+        for backend in ['Web', 'Agy', 'Antigravity', 'Nope']:
             program = root / 'Scoped.omar'
             program.write_text(PROGRAM.format(coder=f'{backend}(scope = invocation)'))
             for args in [[program], ['--diff', old, program]]:
@@ -807,7 +861,7 @@ def an_unsupported_backend_is_refused():
         assert result.returncode != 0, output
         assert 'cannot start a fresh conversation per invocation' in output, output
         assert events == [], events
-        print('PASS: Web and unknown backends refused by omarc, no bytecode written')
+        print('PASS: Web, Agy and unknown backends refused by omarc, no bytecode written')
 
 
 if __name__ == '__main__':
@@ -838,19 +892,14 @@ if __name__ == '__main__':
     a_reused_conversation_fails_closed('codex', 'FAKE_OLD_THREAD', says='before the attempt',
                                        recorded=OTHER)
     a_conversation_seen_before_fails_closed()
-    for backend, store, entry in [
-            ('cursor', '.cursor/acp-sessions', 'ses-old/meta.json'),
-            ('agy', '.gemini/antigravity-cli/conversations', 'ses-old.db')]:
-        fresh_worker_per_invocation(backend)
-        # The CLI mints the id: one an earlier attempt had, or one its own
-        # store held before the worker started.
-        a_conversation_seen_before_fails_closed(backend, 'FAKE_REUSE_SESSION'
-                                                if backend == 'cursor' else 'FAKE_SESSION_ID')
-        a_reused_conversation_fails_closed(
-            backend, 'FAKE_SESSION_ID', value='ses-old', says='already held it', recorded='ses-old',
-            prepare=lambda home, path=f'{store}/{entry}': seed(home / path))
-    # agy hands a new conversation summaries of its Knowledge Items.
-    a_reused_conversation_fails_closed('agy', None, says='Knowledge Items', recorded=OTHER,
-                                       prepare=knowledge_items)
+    a_conversation_an_earlier_run_had_fails_closed()
+    fresh_worker_per_invocation('cursor')
+    # The CLI mints the id: one an earlier attempt had, or one its own store
+    # held before the worker started.
+    a_conversation_seen_before_fails_closed('cursor', 'FAKE_REUSE_SESSION')
+    a_reused_conversation_fails_closed(
+        'cursor', 'FAKE_SESSION_ID', value='ses-old', says='already held it', recorded='ses-old',
+        prepare=lambda home: seed(home / '.cursor/acp-sessions/ses-old/meta.json'))
+    leftovers_are_stopped_before_release()
     a_stub_worker_per_invocation()
     an_unsupported_backend_is_refused()

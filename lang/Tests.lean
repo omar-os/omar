@@ -775,16 +775,17 @@ def testAgentScope : IO Unit := do
         assertEqual decl (version (← compiled decl)) (some 2)
   -- The model-free stub, which CI runs scoped end to end, Jev, which holds
   -- no conversation at all, Pi and OpenCode, which open one by the id they
-  -- are given, and Codex, Cursor and Antigravity, which mint one the runtime
-  -- checks is new, are among them.
-  for backend in ["Stub", "Jev", "Pi", "OpenCode", "Codex", "Cursor", "Agy", "Antigravity"] do
+  -- are given, and Codex and Cursor, which mint one the runtime checks is
+  -- new, are among them.
+  for backend in ["Stub", "Jev", "Pi", "OpenCode", "Codex", "Cursor"] do
     let decl := s!"coder : {backend}(scope = invocation)"
     assertEqual decl (scope (← spawn (← compiled decl))) (some "invocation")
   -- One that cannot, or one omarc does not know, is refused before bytecode
   -- exists, naming those that can. Its default scope still compiles,
   -- unknown backend included.
   let names := ", ".intercalate (supported.map (·[0]!)).toList
-  for backend in ["Web", "Nope"] do
+  -- Antigravity hands every new conversation its earlier ones' transcripts.
+  for backend in ["Web", "Agy", "Antigravity", "Nope"] do
     let _ ← compiled s!"coder : {backend}"
     match compileSource "Scoped" (source s!"coder : {backend}(scope = invocation)") with
     | .ok _ => throw (IO.userError s!"accepted {backend}(scope = invocation)")
@@ -803,7 +804,10 @@ def testAgentScope : IO Unit := do
       ("coder : Claude(scope = conversation)", "unknown scope 'conversation'"),
       ("coder : Claude(lifetime = invocation)", "unknown option 'lifetime'"),
       ("coder : Claude(scope invocation)", "options must be written"),
-      ("coder : Claude()", "options must be written")] do
+      ("coder : Claude()", "options must be written"),
+      ("coder : Claude(scope = invocation", "options must be written"),
+      ("coder : Claude(scope = agent, lifetime = x)", "options must be written"),
+      ("coder : Claude(scope = invocation, x = y)", "options must be written")] do
     match compileSource "Scoped" (source decl) with
     | .ok _ => throw (IO.userError s!"accepted {decl}")
     | .error error =>

@@ -129,18 +129,20 @@ impl Backend for Claude {
             || resolve_peer(pane_pid).is_some()
     }
     /// `--session-id` names the conversation a launch opens, and Claude Code
-    /// refuses one it already has, so a new id is a new conversation.
+    /// refuses one it already has, so a new id is a new conversation. Auto
+    /// memory would hand it what an earlier one saved, so an attempt runs
+    /// with it off.
     fn fresh_conversation(&self) -> bool {
         true
     }
     fn launch_command(&self, launch: &Launch<'_>) -> String {
         let base_command = with_coordination_hooks(launch.base_command, launch.context);
-        let base_command = match launch
+        let attempt = launch
             .context
             .topology
             .as_ref()
-            .and_then(|topology| topology.attempt.as_ref())
-        {
+            .and_then(|topology| topology.attempt.as_ref());
+        let base_command = match attempt {
             Some(attempt) => format!(
                 "{base_command} --session-id {}",
                 shell_single_quote(&attempt.native_session)
@@ -171,7 +173,15 @@ impl Backend for Claude {
         } else {
             ""
         };
-        format!("{skip_history}{command}")
+        // Auto memory lives outside the workspace and outlives the run, so it
+        // would carry one attempt's notes into the next. An env var, since
+        // Claude keeps only the last `--settings`, which the hooks may use.
+        let no_memory = if attempt.is_some() {
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 "
+        } else {
+            ""
+        };
+        format!("{no_memory}{skip_history}{command}")
     }
     /// The prompt goes in by file, so it never touches argv and is unbounded;
     /// the placeholders are resolved on disk since nothing pipes it through
@@ -794,20 +804,26 @@ mod tests {
             })
         };
         assert!(!launch(&context).contains("--session-id"));
+        assert!(!launch(&context).contains("CLAUDE_CODE_DISABLE_AUTO_MEMORY"));
         context.topology = Some(TopologyMcpContext {
             attempt: Some(crate::manager::TopologyAttempt {
                 id: "attempt".into(),
+                key: "key".into(),
                 native_session: "11111111-1111-4111-8111-111111111111".into(),
             }),
             ..topology
         });
         let line = launch(&context);
         assert!(line.contains("--session-id '11111111-1111-4111-8111-111111111111'"));
+        assert!(
+            line.starts_with("CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 "),
+            "an attempt must not read an earlier one's memory: {line}"
+        );
         assert!(!line.contains("--resume"));
         assert!(Claude.fresh_conversation());
         assert_eq!(
             super::super::fresh_conversation_backends(),
-            ["claude", "codex", "cursor", "opencode", "pi", "agy", "jev", "stub"]
+            ["claude", "codex", "cursor", "opencode", "pi", "jev", "stub"]
         );
     }
 

@@ -80,7 +80,7 @@ impl Backend for Opencode {
         format!("ses_{}", uuid::Uuid::new_v4().simple())
     }
     /// Asked of the live server just before delivery, not only the stamp:
-    /// the conversation is there, and still empty.
+    /// it is this worker's own, and the conversation is there, still empty.
     fn prove_fresh(
         &self,
         target: &super::Target<'_>,
@@ -91,6 +91,7 @@ impl Backend for Opencode {
             .stamp
             .and_then(from_stamp)
             .context("no opencode delivery channel")?;
+        served_by_worker(port, target.pane_pid)?;
         empty_session(port, id)
     }
     fn forget(&self, target: &super::Target<'_>) {
@@ -421,6 +422,23 @@ fn provision_fresh_session(port: u16, id: &str, timeout: Duration) -> Result<Str
     Ok(format!("opencode:{port}:{id}"))
 }
 
+/// Only processes of the worker in pane `pane_pid` listen on `port`: the
+/// port was free when it was picked, not held, so another server may have
+/// taken it first, and that one's session is neither new nor stopped with
+/// the worker.
+fn served_by_worker(port: u16, pane_pid: u32) -> Result<()> {
+    let listeners = crate::process::tcp_listeners(port)?;
+    let worker: std::collections::BTreeSet<u32> = crate::process::process_tree(pane_pid)
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .collect();
+    anyhow::ensure!(
+        !listeners.is_empty() && listeners.is_subset(&worker),
+        "port {port} is served by {listeners:?}, not by this worker's opencode"
+    );
+    Ok(())
+}
+
 /// The server has session `id`, and it holds no message.
 fn empty_session(port: u16, id: &str) -> Result<()> {
     let (status, session) = http_json(port, "GET", &format!("/session/{id}"), None)?;
@@ -745,6 +763,36 @@ mod tests {
         }
     }
 
+    /// The session is proved new only on the worker's own server: one that
+    /// some other process listens on is refused before it is asked anything.
+    #[test]
+    fn a_session_is_proved_only_on_the_workers_own_server() {
+        let (port, server) = scripted(vec![(200, r#"{"id":"ses_new"}"#), (200, "[]")]);
+        let stamp = format!("opencode:{port}:ses_new");
+        let prove = |pane_pid| {
+            Opencode.prove_fresh(
+                &super::super::Target {
+                    name: "t",
+                    pane_pid,
+                    stamp: Some(&stamp),
+                },
+                "ses_new",
+                std::time::SystemTime::now(),
+            )
+        };
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let error = prove(other.id()).unwrap_err().to_string();
+        other.kill().unwrap();
+        other.wait().unwrap();
+        assert!(error.contains("not by this worker's opencode"), "{error}");
+        // This process listens, so as its own worker it passes.
+        prove(std::process::id()).unwrap();
+        server.join().unwrap();
+    }
+
     /// An attempt's launch names its session only to `provision`, which
     /// creates it; it never resumes one.
     #[test]
@@ -758,6 +806,7 @@ mod tests {
             token: "t".into(),
             attempt: Some(crate::manager::TopologyAttempt {
                 id: "attempt".into(),
+                key: "key".into(),
                 native_session: "ses_abc".into(),
             }),
         });

@@ -51,6 +51,10 @@ pub struct TopologyMcpContext {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TopologyAttempt {
     pub id: String,
+    /// What the worker's calls carry, and the only thing that tells them from
+    /// an earlier attempt's. Unlike `id`, which `attempts.jsonl` records, it
+    /// is written only to the attempt's own files, removed when it stops.
+    pub key: String,
     pub native_session: String,
 }
 
@@ -227,12 +231,29 @@ pub fn ea_mcp_context_path(omar_dir: &Path, ea_id: EaId) -> PathBuf {
 }
 
 pub(crate) fn mcp_ea_dir(context: &McpLaunchContext) -> Option<PathBuf> {
-    let dir = context
-        .omar_dir
-        .join("mcp")
-        .join(format!("ea-{}", context.ea_id));
+    let attempt = context
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.attempt.as_ref());
+    let dir = match attempt {
+        Some(attempt) => attempt_mcp_dir(&context.omar_dir, context.ea_id, &attempt.id),
+        None => context
+            .omar_dir
+            .join("mcp")
+            .join(format!("ea-{}", context.ea_id)),
+    };
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// Where an invocation-scoped attempt's launch writes its context and
+/// configs: its own, so a process left from an earlier attempt that rereads
+/// its paths finds nothing of a later one's. Removed once the attempt stops.
+pub(crate) fn attempt_mcp_dir(omar_dir: &Path, ea_id: EaId, attempt: &str) -> PathBuf {
+    omar_dir
+        .join("mcp")
+        .join(format!("ea-{ea_id}"))
+        .join(format!("attempt-{attempt}"))
 }
 
 /// Atomically write `bytes` to `path` with mode 0600 on Unix.
@@ -695,6 +716,7 @@ pub(crate) mod tests {
             token: "t".into(),
             attempt: Some(TopologyAttempt {
                 id: "attempt".into(),
+                key: "key".into(),
                 native_session: "unused".into(),
             }),
         });

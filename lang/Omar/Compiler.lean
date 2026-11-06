@@ -467,8 +467,13 @@ private def parseAgentOptions (agent : String) : Parser AgentScope
       | "agent" => pure (.agent, rest)
       | "invocation" => pure (.invocation, rest)
       | _ => throw s!"agent '{agent}' has unknown scope '{value}'; expected agent or invocation"
+  -- `scope` itself, but not closed right after its value, is malformed, not
+  -- an unknown option.
   | Token.sym "(" :: Token.word key :: Token.sym "=" :: _ =>
-      throw s!"agent '{agent}' has unknown option '{key}'; the only option is scope"
+      if key == "scope" then
+        throw s!"agent '{agent}' options must be written (scope = agent) or (scope = invocation)"
+      else
+        throw s!"agent '{agent}' has unknown option '{key}'; the only option is scope"
   | Token.sym "(" :: _ =>
       throw s!"agent '{agent}' options must be written (scope = agent) or (scope = invocation)"
   | rest => pure (.agent, rest)

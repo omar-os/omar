@@ -55,32 +55,11 @@ impl Backend for Antigravity {
     fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
         Some(vec!["-p", connection::CHECK_PROMPT])
     }
-    /// The conversation OMAR's runner reports opening, which agy mints:
-    /// `--conversation` only resumes, and silently opens a new one when it
-    /// does not know the id.
-    fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
-        managed::reported_conversation(target)
-    }
-    /// An attempt's worker is a new runner and a new `agy`, never passed
-    /// `--conversation`, `--continue` or `-c` (a line that has one is
-    /// refused). The runner reports the id agy announces in its `init`,
-    /// before it reads anything, and whether agy's own store held it before
-    /// the worker started or holds Knowledge Items, which agy summarizes
-    /// into every new conversation. agy has no switch for those.
-    fn fresh_conversation(&self) -> bool {
-        true
-    }
-    fn freshness(&self) -> super::Freshness {
-        super::Freshness::Reported
-    }
-    fn prove_fresh(
-        &self,
-        target: &super::Target<'_>,
-        id: &str,
-        _since: std::time::SystemTime,
-    ) -> Result<()> {
-        managed::prove_reported(target, id)
-    }
+    // No `fresh_conversation`: agy's system prompt points every new
+    // conversation at earlier ones' transcripts under `brain/`, and its
+    // Knowledge Items and conversation search reach them too, with no switch
+    // for any of it. A new conversation id is not a new context, so omarc
+    // refuses `Antigravity(scope = invocation)`.
     // No readiness banner is pinned: `agy` is not available in CI or local
     // discovery, so a marker would be an unverified guess.
     /// Antigravity takes no message from outside its protocol, so it runs

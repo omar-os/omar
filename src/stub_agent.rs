@@ -164,13 +164,13 @@ fn send(topology: &TopologyMcpContext, command: Value) -> Result<()> {
         .with_context(|| format!("topology runtime '{}' is unavailable", topology.endpoint))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    // The attempt, for a scoped worker: the runtime takes its writes only
-    // for the invocation it was started for.
+    // The attempt's key, for a scoped worker: the runtime takes its writes
+    // only for the invocation it was started for.
     let request = json!({
         "token": topology.token,
         "team": topology.team,
         "agent": topology.agent,
-        "attempt": topology.attempt.as_ref().map(|attempt| &attempt.id),
+        "attempt": topology.attempt.as_ref().map(|attempt| &attempt.key),
         "command": command,
     });
     serde_json::to_writer(&mut stream, &request)?;

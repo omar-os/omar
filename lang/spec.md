@@ -99,7 +99,8 @@ A parameter is read back in a prompt as `$(idx)`, the same spelling a trigger
 uses.
 
 An agent's backend names what answers its reactions: `Claude` (or
-`ClaudeCode`), `Codex`, `Cursor`, `OpenCode`, `Pi`, `Agy`, `Stub`, or `Web`. The
+`ClaudeCode`), `Codex`, `Cursor`, `OpenCode`, `Pi`, `Agy` (or `Antigravity`),
+`Jev`, `Stub`, or `Web`. The
 compiler takes any identifier here; an unknown one compiles and fails when the
 runtime tries to start it, unless the agent is invocation-scoped (below). Case
 does not matter.
@@ -140,48 +141,54 @@ The runtime makes sure of it rather than assuming it:
   ```text
   agent 'step' is invocation-scoped, but backend 'Web' cannot start a fresh
   conversation per invocation; supported: claude, codex, cursor, opencode, pi,
-  agy, jev, stub
+  jev, stub
   ```
 
   The runtime refuses it again before the run starts, so bytecode from
   anywhere else cannot get one through. `Web` is always refused: its client
-  is no process OMAR starts, so nothing can show its context is new.
-  `Claude`, `Codex`, `Cursor`, `OpenCode`, `Pi`, `Agy` (or `Antigravity`),
-  `Stub` and `Jev` can today;
+  is no process OMAR starts, so nothing can show its context is new. `Agy`
+  (or `Antigravity`) is refused too: its system prompt points every new
+  conversation at earlier conversations' transcripts, and its Knowledge Items
+  and conversation search reach them, with no switch for any of it, so a new
+  conversation id is not a new context. `Claude`, `Codex`, `Cursor`,
+  `OpenCode`, `Pi`, `Stub` and `Jev` can today;
 - the runtime checks the conversation a worker reports before delivering
   anything. Where the backend is told the id of the new conversation to open
-  (`Claude`, by `--session-id`; `Pi`, by `--no-session --session-id`, an
+  (`Claude`, by `--session-id`, with auto memory off, since its memory files
+  outlive the conversation; `Pi`, by `--no-session --session-id`, an
   in-memory conversation that reads nothing from disk; `OpenCode`, created
   through its `/api/session`, which needs an opencode that has it, only once
   the server has no session of that id, and taken only while it holds no
-  message; `Stub`, in its launch context), the worker must report exactly
-  that id. Where the backend mints its own (`Codex`, `Cursor` and `Agy`,
-  which take no id), the id must be non-empty, never reported by an earlier
+  message and the server is the worker's own; `Stub`, in its launch context), the worker must report exactly
+  that id. Where the backend mints its own (`Codex` and `Cursor`, which take
+  no id), the id must be non-empty, never reported by an earlier
   attempt of the deployment (those recorded in `attempts.jsonl` included), and
   pass whatever proof the backend has that the conversation is new. A `Codex`
   attempt starts an app-server of its own with memories off, never resumes,
   and never falls back to the exec runner; its thread must be the server's
   only loaded one, not forked, no subagent's, hold no message, and be created
-  after the attempt began. A `Cursor` or `Agy` attempt is a new protocol
-  runner, with an inbox and socket of its own, and a new CLI process under it:
-  `cursor-agent acp` is sent only `session/new`, never `session/load`, and
-  `agy` is never passed `--conversation`, `--continue` or `-c` (a command that
-  has one is refused). The runner reports the id the CLI minted, from the
-  attempt's own process tree, before anything can be sent. The CLI's own
-  store (`~/.cursor/acp-sessions/<id>`,
-  `~/.gemini/antigravity-cli/conversations/<id>.db`) must have had no entry
-  for it before the worker started and have one once it reports, and every
-  later turn of `agy` must name it. `agy` hands every new conversation
-  summaries of its Knowledge Items and has no switch for that, so an `Agy`
-  attempt is refused while `~/.gemini/antigravity-cli/knowledge` holds any;
+  after the attempt began. A `Cursor` attempt is a new protocol runner, with
+  an inbox and socket of its own, and a new CLI process under it:
+  `cursor-agent acp` is sent only `session/new`, never `session/load`. The
+  runner reports the id the CLI minted, from the attempt's own process tree,
+  before anything can be sent. The CLI's own store
+  (`~/.cursor/acp-sessions/<id>`) must have had no entry for it before the
+  worker started and have one once it reports;
 - a worker that cannot be started, or whose conversation fails the check, fails
   the invocation, and is stopped without being handed it. There is no falling
   back to a worker that has one;
-- the attempt is the only caller that may answer its invocation: a worker
-  left from an earlier attempt of the same agent is refused;
+- the attempt is the only caller that may answer its invocation: its calls
+  carry a key that only its own files hold, never recorded, and those files
+  are removed when it stops, so a worker left from an earlier attempt of the
+  same agent is refused;
 - after the invocation is answered, or expires, the worker's processes are
-  stopped and seen gone before its effects are released downstream. If that
-  cannot be confirmed in time, the invocation fails with the effects withheld.
+  stopped and seen gone before its effects are released downstream: its
+  process tree, and whatever it left running outside it, found by the
+  session it was started in and, on Linux, by an `OMAR_ATTEMPT` variable in
+  its environment. On macOS, which shows no other process's environment, a
+  process that starts a session of its own and outlives its leader unseen is
+  not found. If the stop cannot be confirmed in time, the invocation fails
+  with the effects withheld.
 
 `Jev` starts no worker and has no conversation, so there is nothing to check
 or stop: every invocation is one request built from that invocation's
@@ -199,8 +206,8 @@ reads it from there.
 Mission Control shows an agent's scope and its latest attempt.
 
 Any other value or option is refused: `Claude(scope = conversation)`,
-`Claude(lifetime = invocation)`, `Claude()` and `Web(scope = invocation)` do
-not compile.
+`Claude(lifetime = invocation)`, `Claude()`, `Claude(scope = agent, x = y)`
+and `Web(scope = invocation)` do not compile.
 
 An argument is an int or a string literal, and nothing else — there are no
 expressions. `main` may be named or bare; the name identifies the run, and a

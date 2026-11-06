@@ -1116,6 +1116,7 @@ mod tests {
             token: "t".into(),
             attempt: Some(crate::manager::TopologyAttempt {
                 id: "attempt".into(),
+                key: "key".into(),
                 native_session: "unused".into(),
             }),
         });

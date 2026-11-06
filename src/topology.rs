@@ -1324,8 +1324,8 @@ struct InvocationRecord {
     prompt: String,
     writes: BTreeMap<String, Value>,
     completed: bool,
-    /// The worker attempt an invocation-scoped agent was started for. Only a
-    /// call carrying it may answer; `None` for every other agent.
+    /// The key of the worker attempt an invocation-scoped agent was started
+    /// for. Only a call carrying it may answer; `None` for every other agent.
     attempt: Option<String>,
 }
 
@@ -1654,7 +1654,7 @@ fn send_invocation_command(
         token: context.token.clone(),
         team: context.team.clone(),
         agent: context.agent.clone(),
-        attempt: context.attempt.as_ref().map(|attempt| attempt.id.clone()),
+        attempt: context.attempt.as_ref().map(|attempt| attempt.key.clone()),
         command,
     };
     serde_json::to_writer(&mut stream, &request)?;
@@ -1776,12 +1776,12 @@ fn validate_invocation_owner(
     }
     // An invocation-scoped agent's earlier worker has the same name; only the
     // attempt tells it from the worker this invocation was started for.
+    // The key is not echoed: the caller that lacks it must not learn it.
     if let Some(expected) = &invocation.attempt {
         if attempt != Some(expected.as_str()) {
             bail!(
-                "invocation '{}' belongs to worker attempt {expected}, not {}",
-                invocation.id,
-                attempt.unwrap_or("an unscoped worker")
+                "invocation '{}' belongs to another worker attempt",
+                invocation.id
             );
         }
     }
@@ -2113,6 +2113,7 @@ impl ReactionExecutor for AgentReactionExecutor {
             .filter(|scoped| scoped.states.contains_key(&invocation.agent));
         let attempt = scoped.map(|scoped| manager::TopologyAttempt {
             id: Uuid::new_v4().to_string(),
+            key: Uuid::new_v4().to_string(),
             native_session: crate::backend::by_name(&scoped.states[&invocation.agent].backend)
                 .map_or_else(|| Uuid::new_v4().to_string(), |b| b.new_conversation_id()),
         });
@@ -2127,7 +2128,7 @@ impl ReactionExecutor for AgentReactionExecutor {
             prompt: rendered.clone(),
             writes: BTreeMap::new(),
             completed: false,
-            attempt: attempt.as_ref().map(|attempt| attempt.id.clone()),
+            attempt: attempt.as_ref().map(|attempt| attempt.key.clone()),
         };
         let completion = self.registry.register(record)?;
         let answer = || self.answer(&invocation, &rendered, completion);
@@ -2188,6 +2189,11 @@ struct ScopedWorkers {
     states: BTreeMap<String, AgentState>,
     launcher: AgentLauncher,
     run: String,
+    /// The run's record, whose `sessions` holds an attempt's session from
+    /// before its worker is launched until it is seen stopped, so a run that
+    /// dies in between leaves it for `--replace` and snapshots to find, and
+    /// one that does not leaves nothing to clean.
+    deployment: Arc<Mutex<deploy::DeploymentRecord>>,
     /// One JSON line per attempt as it starts, once its conversation is
     /// checked, and as it ends.
     log: PathBuf,
@@ -2199,6 +2205,8 @@ struct ScopedWorkers {
     publisher: Option<crate::diagram::DiagramPublisher>,
 }
 
+/// What every process of an attempt's worker inherits, as `NAME=<attempt id>`.
+const ATTEMPT_MARKER: &str = "OMAR_ATTEMPT";
 /// How long a stopped worker's processes get to be seen gone.
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a started worker gets to open its conversation.
@@ -2208,9 +2216,9 @@ impl ScopedWorkers {
     fn new(
         state: &VmState,
         launcher: AgentLauncher,
-        run: String,
+        deployment: Arc<Mutex<deploy::DeploymentRecord>>,
         publisher: Option<crate::diagram::DiagramPublisher>,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>> {
         let states: BTreeMap<String, AgentState> = state
             .agents
             .iter()
@@ -2218,14 +2226,36 @@ impl ScopedWorkers {
             .map(|(name, agent)| (name.clone(), agent.clone()))
             .collect();
         let log = launcher.runtime_dir.join("attempts.jsonl");
-        (!states.is_empty()).then(|| Self {
+        let run = deployment
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
+            .deployment_id
+            .clone();
+        Ok((!states.is_empty()).then(|| Self {
             states,
             seen: Mutex::new(reported_conversations(&log)),
             log,
             launcher,
             run,
+            deployment,
             publisher,
-        })
+        }))
+    }
+
+    /// Record `agent`'s session as one the run must clean up, or, with
+    /// `None`, as gone.
+    fn track(&self, agent: &str, session: Option<&str>) -> Result<()> {
+        let mut deployment = self
+            .deployment
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
+        match session {
+            Some(session) => deployment
+                .sessions
+                .insert(agent.to_owned(), session.to_owned()),
+            None => deployment.sessions.remove(agent),
+        };
+        deployment.save(&self.launcher.runtime_dir)
     }
 
     fn run(
@@ -2264,9 +2294,21 @@ impl ScopedWorkers {
             );
         }
         self.record(&record);
+        if let Err(error) = self.track(&invocation.agent, Some(&session)) {
+            record["outcome"] = json!("refused");
+            record["cleanup_status"] = json!("not_started");
+            self.record(&record);
+            return Err(error.context(format!(
+                "agent '{}' invocation {}: its worker could not be recorded for cleanup",
+                invocation.agent, invocation.id
+            )));
+        }
         // Every process the worker had, captured while it runs. Identities,
         // not bare pids: confirming the stop must not mistake a recycled pid.
+        // With the sessions they ran in, which a process its parent leaves
+        // behind keeps.
         let mut tree = Vec::new();
+        let mut sessions = BTreeSet::new();
         // Whatever the worker reported, kept even when it is refused.
         let mut reported = None;
         let since = std::time::SystemTime::now();
@@ -2277,7 +2319,14 @@ impl ScopedWorkers {
             self.launcher
                 .wait_ready(&invocation.agent, agent, &command)?;
             client.finish_backend_startup(&session, WORKER_START_TIMEOUT)?;
-            self.opened_conversation(&session, backend, attempt, since, &mut tree, &mut reported)
+            self.opened_conversation(
+                &session,
+                backend,
+                attempt,
+                since,
+                (&mut tree, &mut sessions),
+                &mut reported,
+            )
         })();
         record["native_session_id"] = json!(reported);
         // A minted id is on disk before the worker hears anything: the next
@@ -2301,7 +2350,12 @@ impl ScopedWorkers {
                 invocation.agent, invocation.id, attempt.id
             ))),
         };
-        let stopped = self.stop(&session, &mut tree);
+        let stopped = self.stop(&session, attempt, &mut tree, &mut sessions);
+        if stopped.is_ok() {
+            if let Err(error) = self.track(&invocation.agent, None) {
+                eprintln!("warning: could not record {session} as stopped: {error:#}");
+            }
+        }
         record["outcome"] = json!(match &result {
             Ok(_) => "completed",
             Err(_) => "failed",
@@ -2334,7 +2388,7 @@ impl ScopedWorkers {
         backend: &dyn crate::backend::Backend,
         attempt: &manager::TopologyAttempt,
         since: std::time::SystemTime,
-        tree: &mut Vec<(u32, String)>,
+        (tree, sessions): (&mut Vec<(u32, String)>, &mut BTreeSet<u32>),
         reported: &mut Option<String>,
     ) -> Result<()> {
         let client = &self.launcher.client;
@@ -2342,6 +2396,7 @@ impl ScopedWorkers {
         loop {
             let pane_pid = client.get_pane_pid(session)?;
             *tree = client.session_process_tree(session)?;
+            sessions.extend(crate::process::sessions(tree));
             let stamp = client.session_delivery(session);
             let target = crate::backend::Target {
                 name: session,
@@ -2369,25 +2424,50 @@ impl ScopedWorkers {
         }
     }
 
-    /// Stop the worker's process tree and see it gone.
-    fn stop(&self, session: &str, tree: &mut Vec<(u32, String)>) -> Result<()> {
+    /// Stop the worker's process tree, and whatever it left running outside
+    /// it (see [`crate::process::leftovers`]), and see them gone; then remove
+    /// the attempt's own files.
+    fn stop(
+        &self,
+        session: &str,
+        attempt: &manager::TopologyAttempt,
+        tree: &mut Vec<(u32, String)>,
+        sessions: &mut BTreeSet<u32>,
+    ) -> Result<()> {
         let client = &self.launcher.client;
         if client.has_session(session)? {
-            tree.extend(client.session_process_tree(session)?);
+            let live = client.session_process_tree(session)?;
+            sessions.extend(crate::process::sessions(&live));
+            tree.extend(live);
             crate::backend::kill_worker(client, session, true)?;
         }
+        let marker = format!("{ATTEMPT_MARKER}={}", attempt.id);
         let deadline = Instant::now() + WORKER_STOP_TIMEOUT;
         loop {
-            if !crate::process::tree_alive(tree) && !client.has_session(session)? {
-                return Ok(());
+            let left = crate::process::leftovers(sessions, &marker);
+            crate::process::signal_tree(&left, "-KILL");
+            if !crate::process::tree_alive(tree)
+                && !crate::process::tree_alive(&left)
+                && !client.has_session(session)?
+            {
+                break;
             }
             anyhow::ensure!(
                 Instant::now() < deadline,
-                "worker processes in {session} were still running {:?} after they were stopped",
-                WORKER_STOP_TIMEOUT
+                "worker processes of {session} were still running {:?} after they were stopped: {:?}",
+                WORKER_STOP_TIMEOUT,
+                left.iter().map(|(pid, _)| pid).collect::<Vec<_>>()
             );
             thread::sleep(Duration::from_millis(100));
         }
+        let files =
+            manager::attempt_mcp_dir(&self.launcher.omar_dir, self.launcher.ea_id, &attempt.id);
+        if let Err(error) = fs::remove_dir_all(&files) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("warning: could not remove {}: {error}", files.display());
+            }
+        }
+        Ok(())
     }
 
     /// Best effort: a record that cannot be written does not decide the run.
@@ -3131,10 +3211,14 @@ fn launch(
         fs::remove_dir_all(&obsolete_invocations)?;
     }
     let client = TmuxClient::new(crate::ea::ea_prefix(config.ea_id, config.base_prefix));
+    // An invocation-scoped agent's session is recorded only while an
+    // attempt may have one: see `ScopedWorkers::track`.
     let planned_sessions: BTreeMap<String, String> = state
         .agents
         .iter()
-        .filter(|(_, agent)| needs_agent_process(&agent.backend))
+        .filter(|(_, agent)| {
+            needs_agent_process(&agent.backend) && agent.scope != AgentScope::Invocation
+        })
         .map(|(name, _)| (name.clone(), client.session_for(name)))
         .collect();
     let record = Arc::new(Mutex::new(deploy::DeploymentRecord::create(
@@ -3284,13 +3368,9 @@ fn launch(
             scoped: ScopedWorkers::new(
                 &state,
                 launcher,
-                record
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
-                    .deployment_id
-                    .clone(),
+                record.clone(),
                 diagram_publisher.clone(),
-            ),
+            )?,
         },
     };
     let checkpointer = match RunCheckpointer::new(
@@ -3649,16 +3729,21 @@ impl AgentLauncher {
             }),
         };
         let command = manager::build_agent_command(&base_command, &prompt_file, &[], &context);
+        let mut environment = vec![
+            ("OMAR_WORKTREE".into(), workdir.into()),
+            ("OMAR_TEMP".into(), temp.to_string_lossy().into_owned()),
+            ("TMPDIR".into(), temp.to_string_lossy().into_owned()),
+        ];
+        // So what the attempt leaves running can be found once it stops.
+        if let Some(attempt) = attempt {
+            environment.push((ATTEMPT_MARKER.into(), attempt.id.clone()));
+        }
         self.client.new_session_with_backend_env(
             &session,
             &command,
             Some(workdir),
             Some(backend),
-            &[
-                ("OMAR_WORKTREE".into(), workdir.into()),
-                ("OMAR_TEMP".into(), temp.to_string_lossy().into_owned()),
-                ("TMPDIR".into(), temp.to_string_lossy().into_owned()),
-            ],
+            &environment,
         )?;
         Ok(command)
     }
@@ -8955,28 +9040,17 @@ mod tests {
         assert!(error.contains("needs bytecode version 2"), "{error}");
         // A backend that cannot promise a new conversation is refused before
         // anything starts, naming what can.
-        for backend in ["Web", "Nope"] {
+        for backend in ["Web", "Agy", "Antigravity", "Nope"] {
             let error = verify(&scoped_program(2, backend, Some("invocation")))
                 .unwrap_err()
                 .to_string();
             assert!(
                 error.contains("cannot start a fresh conversation per invocation")
-                    && error
-                        .contains("supported: claude, codex, cursor, opencode, pi, agy, jev, stub"),
+                    && error.contains("supported: claude, codex, cursor, opencode, pi, jev, stub"),
                 "{backend}: {error}"
             );
         }
-        for backend in [
-            "Claude",
-            "Codex",
-            "Cursor",
-            "OpenCode",
-            "Pi",
-            "Agy",
-            "Antigravity",
-            "Jev",
-            "Stub",
-        ] {
+        for backend in ["Claude", "Codex", "Cursor", "OpenCode", "Pi", "Jev", "Stub"] {
             verify(&scoped_program(2, backend, Some("invocation"))).unwrap();
         }
         // A scope this runtime does not know is an error, not the default.
@@ -9104,7 +9178,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("belongs to worker attempt second"),
+                error.contains("belongs to another worker attempt") && !error.contains("second"),
                 "{error}"
             );
             assert!(registry

@@ -11,7 +11,6 @@ def freshConversation : Array (Array String) := #[
   #["cursor"],
   #["opencode"],
   #["pi"],
-  #["agy", "antigravity"],
   #["jev"],
   #["stub"]
 ]
