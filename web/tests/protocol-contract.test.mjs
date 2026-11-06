@@ -356,13 +356,20 @@ test("builder schema bundles survive chat normalization and old proposals defaul
 });
 
 test("an agent attempt lands on the agent it names and no other", () => {
-  const [agent, ...others] = golden.agents;
-  const attempt = { attempt_id: "a1", native_session_id: "s1", outcome: "completed", cleanup_status: "stopped" };
-  const next = applyDiagramEvent(golden, {
-    protocol_version: 1, sequence: golden.sequence + 1, team: golden.team, tag: null,
+  const [first, ...others] = golden.agents;
+  const agent = { ...first, attempts: [] };
+  const base = { ...golden, agents: [agent, ...others] };
+  const attempt = { reaction: "reaction.0", attempt_id: "a1", native_session_id: "s1", outcome: "completed", cleanup_status: "stopped" };
+  const next = applyDiagramEvent(base, {
+    protocol_version: 1, sequence: base.sequence + 1, team: base.team, tag: null,
     kind: "agent_attempt", payload: { agent: agent.id, attempt },
   });
-  assert.deepEqual(next.agents[0].attempt, attempt);
+  assert.deepEqual(next.agents[0].attempts, [...agent.attempts, attempt]);
+  const again = applyDiagramEvent(next, {
+    protocol_version: 1, sequence: next.sequence + 1, team: next.team, tag: null,
+    kind: "agent_attempt", payload: { agent: agent.id, attempt: { ...attempt, reaction: "reaction.1", attempt_id: "a2" } },
+  });
+  assert.deepEqual(again.agents[0].attempts.map((item) => item.reaction), ["reaction.0", "reaction.1"]);
   for (const [index, other] of others.entries()) {
     assert.equal(next.agents[index + 1], other);
   }

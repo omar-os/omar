@@ -164,6 +164,8 @@ type ReactionView = {
   /** One line of what the task asks, from its prompt; the contract for a code reaction. */
   summary: string;
   backend: string;
+  /** Its agent starts a new conversation for every invocation. */
+  fresh: boolean;
   status: string;
   box: Box;
   /** The agent that runs it, which is whose terminal opens on double click. */
@@ -433,7 +435,7 @@ function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> 
   const agents = new Map(
     snapshot.agents.map((agent) => [
       agent.id,
-      { name: agent.name, backend: agent.backend },
+      { name: agent.name, backend: agent.backend, scope: agent.scope },
     ]),
   );
   return new Map(
@@ -443,7 +445,9 @@ function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> 
       const agent = localName(owner?.name ?? reaction.agent, reaction.instance);
       // Which model is behind an agent changes how you read what it did, and
       // the program picked it deliberately, so it belongs on the task card.
-      const detail = [owner?.backend, reaction.status]
+      // An invocation-scoped agent starts over each time, which also changes
+      // how to read it, so the card says so.
+      const detail = [owner?.backend, reaction.status, owner?.scope === "invocation" ? "\u21bb fresh" : ""]
         .filter(Boolean)
         .join(" \u00b7 ");
       // The runtime names reactions `reaction.N` because OMAR prompts are
@@ -932,6 +936,7 @@ function buildLayout(
       contract: reaction.contract,
       summary: reaction.prompt ? summarisePrompt(reaction.prompt) : reaction.contract,
       backend: snapshot.agents.find((agent) => agent.id === reaction.agent)?.backend ?? "Agent",
+      fresh: snapshot.agents.find((agent) => agent.id === reaction.agent)?.scope === "invocation",
       status: reaction.status,
       box: nodeBoxes.get(reaction.id) ?? { x: 0, y: 0, ...REACTION_SIZE },
       agent: componentName(reaction.agent),
@@ -1869,7 +1874,10 @@ export function DiagramCanvas({
                   <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 59) scale(0.5)`}>
                     <BackendMark backend={reaction.backend} />
                   </g>
-                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={68}>{reaction.meta}</text>
+                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={68}>
+                    {reaction.fresh ? <title>New conversation every invocation</title> : null}
+                    {reaction.meta}
+                  </text>
                   {/* A deadline the program set for itself. A stopwatch rather
                       than a clock: a timer fires on its own, this counts down
                       against work already running. */}

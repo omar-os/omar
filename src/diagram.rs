@@ -85,7 +85,7 @@ pub enum DiagramEventKind {
     /// millisecond its logical time zero stands at.
     ClockStarted,
     /// An invocation-scoped agent's worker attempt ended: the payload is the
-    /// agent's id and the attempt as `DiagramAgent::attempt` holds it.
+    /// agent's id and the attempt as `DiagramAgent::attempts` holds it.
     AgentAttempt,
 }
 
@@ -105,12 +105,13 @@ pub struct DiagramAgent {
     /// How long its conversation lives: the run, or one invocation.
     #[serde(default)]
     pub scope: crate::topology::AgentScope,
-    /// An invocation-scoped agent's latest worker attempt, once one ended:
-    /// `attempt_id`, `native_session_id`, `outcome`, `cleanup_status` and the
-    /// rest of the record the run keeps in `attempts.jsonl`.
+    /// An invocation-scoped agent's worker attempts that ended, oldest first:
+    /// `reaction`, `attempt_id`, `native_session_id`, `outcome`,
+    /// `cleanup_status` and the rest of the record the run keeps in
+    /// `attempts.jsonl`.
     #[serde(default)]
-    #[ts(type = "Record<string, unknown> | null")]
-    pub attempt: Option<Value>,
+    #[ts(type = "Record<string, unknown>[]")]
+    pub attempts: Vec<Value>,
 }
 
 /// A team `main` instantiated: one container in the drawing.
@@ -264,7 +265,7 @@ impl DiagramSnapshot {
                 backend: agent.backend.clone(),
                 instance: agent.instance.clone(),
                 scope: agent.scope,
-                attempt: None,
+                attempts: Vec::new(),
             })
             .collect();
         let ports = state
@@ -493,7 +494,7 @@ impl DiagramPublisher {
             json!({ "agent": id, "attempt": attempt }),
             |snapshot| {
                 if let Some(item) = snapshot.agents.iter_mut().find(|item| item.id == id) {
-                    item.attempt = Some(attempt.clone());
+                    item.attempts.push(attempt.clone());
                 }
             },
         );

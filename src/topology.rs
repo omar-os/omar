@@ -2272,6 +2272,7 @@ impl ScopedWorkers {
         let mut record = json!({
             "run": self.run,
             "logical_agent": invocation.agent,
+            "reaction": invocation.reaction_id,
             "invocation_id": invocation.id,
             "attempt_id": attempt.id,
             "backend": agent.backend,

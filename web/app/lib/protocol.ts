@@ -376,7 +376,7 @@ export function applyDiagramEvent(
       const { agent, attempt } = event.payload as { agent?: unknown; attempt?: Record<string, unknown> };
       return {
         ...snapshot,
-        agents: snapshot.agents.map((item) => item.id === agent ? { ...item, attempt: attempt ?? null } : item),
+        agents: snapshot.agents.map((item) => item.id === agent ? { ...item, attempts: attempt ? [...item.attempts, attempt] : item.attempts } : item),
       };
     }
     case "reaction_started":

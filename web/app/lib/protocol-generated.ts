@@ -66,11 +66,12 @@ instance: string,
  */
 scope: AgentScope,
 /**
- * An invocation-scoped agent's latest worker attempt, once one ended:
- * `attempt_id`, `native_session_id`, `outcome`, `cleanup_status` and the
- * rest of the record the run keeps in `attempts.jsonl`.
+ * An invocation-scoped agent's worker attempts that ended, oldest first:
+ * `reaction`, `attempt_id`, `native_session_id`, `outcome`,
+ * `cleanup_status` and the rest of the record the run keeps in
+ * `attempts.jsonl`.
  */
-attempt: Record<string, unknown> | null, };
+attempts: Record<string, unknown>[], };
 
 export type DiagramPort = { id: string, name: string, kind: PortKind, type: string, delay: number | null, value: unknown | null, last_tag: DiagramTag | null, instance: string, };
 
