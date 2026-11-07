@@ -135,6 +135,13 @@ impl Backend for Claude {
     fn fresh_conversation(&self) -> bool {
         true
     }
+    /// `--model`, which takes a full name or an alias.
+    fn model_flag(&self, model: &str) -> Option<String> {
+        Some(format!(
+            "--model {}",
+            crate::manager::shell_single_quote(model)
+        ))
+    }
     fn launch_command(&self, launch: &Launch<'_>) -> String {
         let base_command = with_coordination_hooks(launch.base_command, launch.context);
         let attempt = launch

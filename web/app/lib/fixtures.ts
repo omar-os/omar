@@ -24,6 +24,7 @@ export const reviewWorkflow: DiagramSnapshot = {
       backend: "Codex",
       instance: "flow",
       lifetime: null,
+      model: null,
       attempts: [],
     },
     {
@@ -32,6 +33,7 @@ export const reviewWorkflow: DiagramSnapshot = {
       backend: "Codex",
       instance: "flow",
       lifetime: null,
+      model: null,
       attempts: [],
     },
   ],

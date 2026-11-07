@@ -235,6 +235,8 @@ pub struct TopologyInvocation<'a> {
     pub triggers: &'a BTreeMap<String, Value>,
     pub instructions: &'a str,
     pub timeout: Duration,
+    /// The agent's `model`, when its program named one.
+    pub model: Option<&'a str>,
 }
 
 pub trait Backend: Send + Sync {
@@ -404,6 +406,13 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// The words that make this backend's worker run `model`, appended to its
+    /// command; `None` if it cannot be told one. omarc's copy of which
+    /// backends can, `lang/Omar/Backends.lean`, is generated from this.
+    fn model_flag(&self, _model: &str) -> Option<String> {
+        None
+    }
+
     /// A new attempt's `native_session`: the id its launch is told to open,
     /// in whatever form the backend takes one.
     fn new_conversation_id(&self) -> String {
@@ -555,6 +564,14 @@ pub const ASSISTANT: [Kind; 6] = [
 pub fn fresh_conversation_backends() -> Vec<&'static str> {
     ALL.iter()
         .filter(|backend| backend.fresh_conversation())
+        .map(|backend| backend.kind().name())
+        .collect()
+}
+
+/// The backends an agent may give a model, as an error lists them.
+pub fn model_backends() -> Vec<&'static str> {
+    ALL.iter()
+        .filter(|backend| backend.model_flag("m").is_some())
         .map(|backend| backend.kind().name())
         .collect()
 }
@@ -743,6 +760,15 @@ mod tests {
                 format!("  #[{}]", aliases.join(", "))
             })
             .collect();
+        let models: Vec<String> = ALL
+            .iter()
+            .filter(|backend| backend.model_flag("m").is_some())
+            .map(|backend| {
+                let aliases: Vec<String> =
+                    backend.aliases().iter().map(|a| format!("{a:?}")).collect();
+                format!("  #[{}]", aliases.join(", "))
+            })
+            .collect();
         format!(
             "-- Generated from src/backend/mod.rs; do not edit. Regenerate with\n\
              --     UPDATE_BACKENDS=1 cargo test --bin omar the_lean_backends_are_current\n\
@@ -753,8 +779,13 @@ mod tests {
              its name first: those whose `fresh_conversation` is true. -/\n\
              def freshConversation : Array (Array String) := #[\n{}\n]\n\
              \n\
+             /-- The backends an agent may give a model, likewise: those whose\n    \
+             `model_flag` is some. -/\n\
+             def modelSelectable : Array (Array String) := #[\n{}\n]\n\
+             \n\
              end Omar.Backends\n",
-            rows.join(",\n")
+            rows.join(",\n"),
+            models.join(",\n")
         )
     }
 
