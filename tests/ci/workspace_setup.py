@@ -74,7 +74,7 @@ def main():
             worktree = Path(started[0]["cwd"])
             assert (worktree / "seed.txt").read_text() == "seeded\n"
             assert (worktree / "where.txt").read_text().strip() == str(worktree), "setup runs with a worker's environment"
-            record = json.loads(next(state.glob("**/topologies/Seeded/setup/s.json")).read_text())
+            record = json.loads(next(state.glob("**/setup/s.json")).read_text())
             assert record["exit_code"] == 0 and not record["timed_out"], record
 
             # Failure: the run fails with the command's output, before any launch.
@@ -82,7 +82,7 @@ def main():
             assert bad.returncode != 0, bad.stdout
             assert "exited 3" in bad.stdout + bad.stderr and "nope" in bad.stdout + bad.stderr, bad.stdout + bad.stderr
             assert launches.read_text() == "", "an agent launched after a failed setup"
-            record = json.loads(next(state.glob("**/topologies/Seeded/setup/s.json")).read_text())
+            record = json.loads(next(state.glob("**/setup/s.json")).read_text())
             assert record["exit_code"] == 3 and "nope" in record["output_tail"], record
 
             # An empty setup does not compile.
