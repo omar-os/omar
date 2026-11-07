@@ -2169,3 +2169,57 @@ NOTES",
 
     cleanup_session(&manager_session);
 }
+
+/// A run that is never admitted leaves no session of its own behind: not one
+/// whose program is missing, nor one the runtime refuses to compile.
+#[test]
+fn a_run_never_admitted_leaves_no_session() {
+    let home = tempfile::tempdir().expect("temp home");
+    let omarc = home.path().join("omarc");
+    fs::write(&omarc, "#!/bin/sh\necho refused >&2\nexit 1\n").expect("write omarc");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&omarc, fs::Permissions::from_mode(0o755)).expect("chmod omarc");
+    }
+    let program = home.path().join("Refused.omar");
+    fs::write(
+        &program,
+        "team T[a : Stub] { input i : string }\nmain M { t = T() }\n",
+    )
+    .expect("write program");
+    let missing = home.path().join("Missing.omar");
+    for path in [&missing, &program] {
+        let mut command = Command::new(omar_bin());
+        for key in [
+            "TMUX",
+            "TMUX_PANE",
+            "OMAR_SESSION_ID",
+            "OMAR_STATE_DIR",
+            "OMAR_TMUX_SERVER",
+            "OMAR_HOME",
+            "OMAR_EA_ID",
+        ] {
+            command.env_remove(key);
+        }
+        let output = command
+            .args(["run", path.to_str().unwrap(), "--fg"])
+            .env("HOME", home.path())
+            .env("OMARC_BIN", &omarc)
+            .output()
+            .expect("run omar run");
+        assert!(!output.status.success(), "{path:?} was admitted");
+        let omar = home.path().join(".omar");
+        let left: Vec<_> = ["registry", "sessions"]
+            .iter()
+            .flat_map(|dir| fs::read_dir(omar.join(dir)).into_iter().flatten().flatten())
+            .map(|entry| entry.file_name())
+            .filter(|name| name != ".lock")
+            .collect();
+        assert!(
+            left.is_empty(),
+            "{path:?} left {left:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

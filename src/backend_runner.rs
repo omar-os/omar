@@ -262,6 +262,14 @@ async fn codex_turn(
     Ok(())
 }
 
+/// No protocol runner can show a conversation new to a `per`-lifetime
+/// attempt (cursor-agent's chats find earlier transcripts; the others resume
+/// one conversation), so omarc and the VM refuse such a launch. This fails
+/// closed if one gets through.
+fn fresh_start() -> Result<()> {
+    bail!("a protocol runner cannot start a fresh conversation for a `per` lifetime")
+}
+
 pub async fn run(path: &Path) -> Result<()> {
     let config: Config = serde_json::from_slice(&std::fs::read(path)?)?;
     anyhow::ensure!(
@@ -280,6 +288,13 @@ pub async fn run(path: &Path) -> Result<()> {
         .open(path.with_extension("lock"))?;
     lock.try_lock()
         .context("protocol session already running")?;
+    let attempt = context
+        .topology
+        .as_ref()
+        .is_some_and(|topology| topology.attempt.is_some());
+    if attempt {
+        fresh_start()?;
+    }
     let inbox: Inbox = match std::fs::read(&inbox_path) {
         Ok(bytes) => serde_json::from_slice(&bytes).context("invalid protocol inbox; preserved")?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Inbox {
@@ -451,6 +466,15 @@ mod protocol_tests {
         let reply: Value = serde_json::from_str(protocol_line(wire)).unwrap();
         assert_eq!(reply["id"], 1);
         assert_eq!(reply["result"]["protocolVersion"], 1);
+    }
+
+    /// A protocol runner never starts a `per` lifetime's attempt.
+    #[test]
+    fn a_protocol_runner_refuses_an_attempt() {
+        assert!(fresh_start()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot start"));
     }
 
     #[test]

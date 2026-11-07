@@ -506,6 +506,61 @@ mod tests {
         bytecode
     }
 
+    /// A lifetime change is a different agent: the plan must kill it and
+    /// spawn it again, so no conversation outlives the lifetime that made it.
+    #[test]
+    fn a_lifetime_change_replaces_the_agent() {
+        let agent = |lifetime: Option<Value>| {
+            let mut agent = json!({"op":"spawn_agent","name":"coder","backend":"Claude"});
+            if let Some(lifetime) = lifetime {
+                agent["lifetime"] = lifetime;
+            }
+            agent
+        };
+        let per_tag = || Some(json!({"unit":"tag","count":1}));
+        let per_two_tags = || Some(json!({"unit":"tag","count":2}));
+        let program = |version: u32, lifetime| -> Bytecode {
+            let bytecode =
+                serde_json::from_value(json!({"version":version,"team":"Relay","instructions":[
+                    {"op":"begin_plan","team":"Relay"}, agent(lifetime), {"op":"commit_plan"}
+                ]}))
+                .unwrap();
+            topology::verify(&bytecode).unwrap();
+            bytecode
+        };
+        let from = program(1, None);
+        let to = program(2, per_tag());
+        check(
+            &from,
+            &plan(vec![
+                json!({"op":"kill_agent","name":"coder"}),
+                agent(per_tag()),
+            ]),
+            &to,
+        )
+        .unwrap();
+        let error = check(&from, &plan(vec![]), &to).unwrap_err().to_string();
+        assert!(error.contains("agent 'coder'"), "{error}");
+        // Changing the count is as much a replacement as adding one.
+        let more = program(2, per_two_tags());
+        check(
+            &to,
+            &plan(vec![
+                json!({"op":"kill_agent","name":"coder"}),
+                agent(per_two_tags()),
+            ]),
+            &more,
+        )
+        .unwrap();
+        assert!(check(&to, &plan(vec![]), &more).is_err());
+        check(
+            &to,
+            &plan(vec![json!({"op":"kill_agent","name":"coder"}), agent(None)]),
+            &from,
+        )
+        .unwrap();
+    }
+
     /// A plan as the compiler writes one: `begin_mutation`, the changes,
     /// `commit_plan`. How plans are computed is the compiler's, and proved
     /// there; these check what the runtime does with one.

@@ -30,16 +30,37 @@ pub fn run(context_file: &Path) -> Result<()> {
         .topology
         .context("stub agent requires a topology context")?;
 
-    // Backends announce themselves; do the same so pane-readiness checks and a
-    // human watching both see something sensible.
-    println!(
-        "OMAR stub agent ready: {}/{}",
-        topology.team, topology.agent
-    );
-    std::io::stdout().flush().ok();
-
     let spool =
         std::env::var_os("OMAR_EVENT_SPOOL").context("stub agent requires OMAR_EVENT_SPOOL")?;
+    // A worker of a `per` lifetime opens the conversation its attempt names,
+    // and says so beside its spool for the runtime to check. The pid is what
+    // ties the report to this worker, not an earlier one.
+    let conversation = topology
+        .attempt
+        .as_ref()
+        .map(|attempt| &attempt.native_session);
+    if let Some(conversation) = conversation {
+        let file = crate::backend::stub::conversation_file(Path::new(&spool));
+        let record = json!({"pid": std::process::id(), "session_id": conversation});
+        if !crate::backend::spool::write_json_atomically(&file, &record) {
+            bail!("could not record the conversation in {}", file.display());
+        }
+    }
+
+    // Backends announce themselves; do the same so pane-readiness checks and a
+    // human watching both see something sensible.
+    match conversation {
+        Some(conversation) => println!(
+            "OMAR stub agent ready: {}/{} conversation {conversation}",
+            topology.team, topology.agent
+        ),
+        None => println!(
+            "OMAR stub agent ready: {}/{}",
+            topology.team, topology.agent
+        ),
+    }
+    std::io::stdout().flush().ok();
+
     loop {
         for message in crate::backend::spool::drain_spool(Path::new(&spool)) {
             let mut lines = message.lines();
@@ -143,10 +164,13 @@ fn send(topology: &TopologyMcpContext, command: Value) -> Result<()> {
         .with_context(|| format!("topology runtime '{}' is unavailable", topology.endpoint))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // The attempt's key, for a scoped worker: the runtime takes its writes
+    // only for the invocation it was started for.
     let request = json!({
         "token": topology.token,
         "team": topology.team,
         "agent": topology.agent,
+        "attempt": topology.attempt.as_ref().map(|attempt| &attempt.key),
         "command": command,
     });
     serde_json::to_writer(&mut stream, &request)?;

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::backend::Freshness;
 use crate::checkpoint::{self, ExecutionState, QueuedTag, Trigger};
 use crate::deploy::{self, ControlOp, DeploymentState};
 use crate::diagram::{DiagramServer, NoopTopologyObserver, TopologyObserver};
@@ -48,6 +49,10 @@ pub enum Instruction {
         backend: String,
         #[serde(default)]
         instance: String,
+        /// Absent for the whole run, so a program without `per` has the
+        /// bytecode it always had.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lifetime: Option<Lifetime>,
     },
     DefinePort {
         name: String,
@@ -191,6 +196,46 @@ pub enum PortKind {
     Action,
 }
 
+/// What a lifetime counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum LifetimeUnit {
+    /// The agent's own invocations.
+    Task,
+    /// The tags in which the agent is invoked.
+    Tag,
+}
+
+/// How long an agent's native conversation lives: `coder : Claude per 5
+/// tasks`. An agent without one keeps a single conversation for the whole
+/// run. `per task` and `per tag` are counts of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct Lifetime {
+    pub unit: LifetimeUnit,
+    pub count: u32,
+}
+
+impl std::fmt::Display for Lifetime {
+    /// As the program spells it, with a count of one left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let unit = match self.unit {
+            LifetimeUnit::Task => "task",
+            LifetimeUnit::Tag => "tag",
+        };
+        match self.count {
+            1 => write!(f, "per {unit}"),
+            count => write!(f, "per {count} {unit}s"),
+        }
+    }
+}
+
+/// The bytecode version a program with an agent lifetime carries. Version 1
+/// runtimes ignore fields they do not know, so they would read `lifetime` as
+/// absent and keep the conversation; the version is what makes them refuse it
+/// instead.
+pub const LIFETIME_BYTECODE: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentState {
     pub backend: String,
@@ -198,6 +243,8 @@ pub struct AgentState {
     /// instances being carried through.
     #[serde(default)]
     pub instance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<Lifetime>,
 }
 
 /// A team instantiated by `main`, and the team it came from.
@@ -627,7 +674,7 @@ pub(crate) fn resolve_build_omarc() -> PathBuf {
 }
 
 pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
-    if bytecode.version != 1 {
+    if bytecode.version != 1 && bytecode.version != LIFETIME_BYTECODE {
         bail!("unsupported bytecode version {}", bytecode.version);
     }
     if !valid_identifier(&bytecode.team) {
@@ -697,11 +744,33 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 name,
                 backend,
                 instance,
+                lifetime,
             } => {
                 check_instance(&state, "agent", name, instance)?;
                 require_identifier("agent", name)?;
                 if backend.trim().is_empty() {
                     bail!("agent '{name}' has an empty backend");
+                }
+                if let Some(lifetime) = lifetime {
+                    if lifetime.count == 0 {
+                        bail!("agent '{name}' lifetime must count at least 1");
+                    }
+                    // Version 1 promises a runtime that predates lifetimes can
+                    // run it, and that runtime would keep the conversation.
+                    if bytecode.version < LIFETIME_BYTECODE {
+                        bail!(
+                            "agent '{name}' resets its conversation ({lifetime}), which needs bytecode version {LIFETIME_BYTECODE}"
+                        );
+                    }
+                    // Checked before anything starts: a backend that cannot
+                    // promise a fresh conversation must not get the chance to
+                    // reuse one.
+                    if !crate::backend::by_name(backend).is_some_and(|b| b.fresh_conversation()) {
+                        bail!(
+                            "agent '{name}' resets its conversation ({lifetime}), but backend '{backend}' cannot start a fresh conversation; supported: {}",
+                            crate::backend::fresh_conversation_backends().join(", ")
+                        );
+                    }
                 }
                 // Agents live in tmux sessions, and qualification is flattened
                 // to get there, so two names that differ only by a '.' would
@@ -720,6 +789,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                         AgentState {
                             backend: backend.clone(),
                             instance: instance.clone(),
+                            lifetime: *lifetime,
                         },
                     )
                     .is_some()
@@ -1272,6 +1342,9 @@ struct InvocationRecord {
     prompt: String,
     writes: BTreeMap<String, Value>,
     completed: bool,
+    /// The key of the worker attempt an agent that resets its conversation was started
+    /// for. Only a call carrying it may answer; `None` for every other agent.
+    attempt: Option<String>,
 }
 
 /// One invocation waiting to be answered, as a panel needs to draw it.
@@ -1317,6 +1390,8 @@ struct InvocationRequest {
     token: String,
     team: String,
     agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt: Option<String>,
     command: InvocationCommand,
 }
 
@@ -1411,7 +1486,13 @@ impl InvocationRegistry {
         }
     }
 
-    fn execute(&self, team: &str, agent: &str, command: InvocationCommand) -> Result<Value> {
+    fn execute(
+        &self,
+        team: &str,
+        agent: &str,
+        attempt: Option<&str>,
+        command: InvocationCommand,
+    ) -> Result<Value> {
         let mut entries = self
             .entries
             .lock()
@@ -1421,7 +1502,7 @@ impl InvocationRegistry {
                 let invocation = entries
                     .get_mut(&args.task_id)
                     .with_context(|| format!("unknown task_id {}", args.task_id))?;
-                validate_invocation_owner(team, agent, &invocation.record)?;
+                validate_invocation_owner(team, agent, attempt, &invocation.record)?;
                 if invocation.record.completed {
                     bail!("invocation '{}' is already complete", invocation.record.id);
                 }
@@ -1440,6 +1521,8 @@ impl InvocationRegistry {
                         !entry.record.completed
                             && entry.record.team == team
                             && entry.record.agent == agent
+                            && (entry.record.attempt.is_none()
+                                || entry.record.attempt.as_deref() == attempt)
                     })
                     .map(|entry| PendingInvocation {
                         task_id: entry.record.id,
@@ -1456,7 +1539,7 @@ impl InvocationRegistry {
                 let invocation = entries
                     .get_mut(&args.task_id)
                     .with_context(|| format!("unknown task_id {}", args.task_id))?;
-                validate_invocation_owner(team, agent, &invocation.record)?;
+                validate_invocation_owner(team, agent, attempt, &invocation.record)?;
                 if invocation.record.completed {
                     return Ok(json!({"status":"already_complete"}));
                 }
@@ -1547,7 +1630,12 @@ fn serve_invocation_connection(
     BufReader::new(stream.try_clone()?).read_line(&mut request_line)?;
     let response = match serde_json::from_str::<InvocationRequest>(&request_line) {
         Ok(request) if request.token == token => {
-            match registry.execute(&request.team, &request.agent, request.command) {
+            match registry.execute(
+                &request.team,
+                &request.agent,
+                request.attempt.as_deref(),
+                request.command,
+            ) {
                 Ok(result) => InvocationResponse {
                     result: Some(result),
                     error: None,
@@ -1584,6 +1672,7 @@ fn send_invocation_command(
         token: context.token.clone(),
         team: context.team.clone(),
         agent: context.agent.clone(),
+        attempt: context.attempt.as_ref().map(|attempt| attempt.key.clone()),
         command,
     };
     serde_json::to_writer(&mut stream, &request)?;
@@ -1636,6 +1725,7 @@ fn panel_context(access: &PanelAccess, team: &str, agent: &str) -> TopologyMcpCo
         agent: agent.to_string(),
         endpoint: access.endpoint.clone(),
         token: access.token.clone(),
+        attempt: None,
     }
 }
 
@@ -1693,9 +1783,25 @@ pub fn panel_submit(
     Ok(())
 }
 
-fn validate_invocation_owner(team: &str, agent: &str, invocation: &InvocationRecord) -> Result<()> {
+fn validate_invocation_owner(
+    team: &str,
+    agent: &str,
+    attempt: Option<&str>,
+    invocation: &InvocationRecord,
+) -> Result<()> {
     if invocation.team != team || invocation.agent != agent {
         bail!("invocation does not belong to this topology agent");
+    }
+    // An earlier worker of an agent with a `per` lifetime has the same name; only the
+    // attempt tells it from the worker this invocation was started for.
+    // The key is not echoed: the caller that lacks it must not learn it.
+    if let Some(expected) = &invocation.attempt {
+        if attempt != Some(expected.as_str()) {
+            bail!(
+                "invocation '{}' belongs to another worker attempt",
+                invocation.id
+            );
+        }
     }
     Ok(())
 }
@@ -1971,6 +2077,8 @@ struct InvocationSpec {
     /// What the program allows this invocation, overriding the run-wide
     /// timeout. `None` means the program said nothing and the run's applies.
     within: Option<Duration>,
+    /// The tag it runs in, which an agent's `per tag` lifetime counts.
+    tag: Tag,
 }
 
 trait ReactionExecutor: Sync {
@@ -2008,12 +2116,30 @@ struct AgentReactionExecutor {
     /// no pane to deliver a prompt to — the registration is the work item, and
     /// a web client picks it up from there.
     web: BTreeSet<String>,
+    /// Agents with a `per` lifetime, whose workers this executor starts and
+    /// stops. `None` for a program with none.
+    scoped: Option<ScopedWorkers>,
 }
 
 impl ReactionExecutor for AgentReactionExecutor {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
         let task_id = invocation.id;
         let rendered = render_prompt(&invocation.prompt, &invocation.trigger_values)?;
+        let windowed = self
+            .scoped
+            .as_ref()
+            .filter(|scoped| scoped.states.contains_key(&invocation.agent));
+        // One invocation of such an agent at a time: they share a
+        // conversation, and the window an invocation falls in depends on the
+        // ones before it.
+        let mut slot = windowed.map(|scoped| scoped.slot(&invocation.agent));
+        // Decided here, before the invocation can be answered, so only the
+        // worker of its window can answer.
+        let admitted = match (windowed, slot.as_mut()) {
+            (Some(scoped), Some(slot)) => Some(scoped.admit(&invocation, slot)?),
+            _ => None,
+        };
+        let attempt = admitted.as_ref().map(|(attempt, _)| attempt);
         let record = InvocationRecord {
             id: task_id,
             team: self.team.clone(),
@@ -2025,39 +2151,766 @@ impl ReactionExecutor for AgentReactionExecutor {
             prompt: rendered.clone(),
             writes: BTreeMap::new(),
             completed: false,
+            attempt: attempt.map(|attempt| attempt.key.clone()),
         };
         let completion = self.registry.register(record)?;
-
-        // A web agent has no pane to deliver to: nothing was spawned for it,
-        // and the registration above is the work item a panel asks for. What
-        // follows is the same either way — a client answering is a slow agent,
-        // and the registry does not care which kind it is waiting on.
-        if !self.web.contains(&invocation.agent) {
-            let message = invocation_message(&invocation, &rendered)?;
-            let session = self.client.session_for(&invocation.agent);
-            if let Err(error) = self
-                .client
-                .deliver_prompt_until(&session, &message, &DeliveryOptions::default(), &|| {
-                    self.registry.answered(&task_id)
-                })
-                .with_context(|| format!("failed to deliver {}", invocation.reaction_id))
-            {
-                self.registry.remove(&task_id);
-                return Err(error);
+        let answer = || self.answer(&invocation, &rendered, completion);
+        let result = match (windowed, slot.as_mut(), &admitted) {
+            (Some(scoped), Some(slot), Some((attempt, fresh))) => {
+                scoped.run(&invocation, attempt, *fresh, slot, answer)
             }
-        }
-
-        let deadline = invocation.within.unwrap_or(self.timeout);
-        let result = match completion.recv_timeout(deadline) {
-            Ok(writes) => Ok(writes),
-            Err(mpsc::RecvTimeoutError::Timeout) => expired(&invocation, deadline),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-                "topology invocation service stopped unexpectedly"
-            )),
+            _ => answer().map(|(writes, _)| writes),
         };
         self.registry.remove(&task_id);
         result
     }
+}
+
+impl AgentReactionExecutor {
+    /// Hand the invocation to its agent and wait for the answer. The flag is
+    /// whether the deadline expired, in which case the writes are empty and
+    /// the agent may still be working on it.
+    fn answer(
+        &self,
+        invocation: &InvocationSpec,
+        rendered: &str,
+        completion: mpsc::Receiver<BTreeMap<String, Value>>,
+    ) -> Result<(BTreeMap<String, Value>, bool)> {
+        let task_id = invocation.id;
+        // A web agent has no pane to deliver to: nothing was spawned for it,
+        // and the registration is the work item a panel asks for. What
+        // follows is the same either way — a client answering is a slow agent,
+        // and the registry does not care which kind it is waiting on.
+        if !self.web.contains(&invocation.agent) {
+            let message = invocation_message(invocation, rendered)?;
+            let session = self.client.session_for(&invocation.agent);
+            self.client
+                .deliver_prompt_until(&session, &message, &DeliveryOptions::default(), &|| {
+                    self.registry.answered(&task_id)
+                })
+                .with_context(|| format!("failed to deliver {}", invocation.reaction_id))?;
+        }
+
+        let deadline = invocation.within.unwrap_or(self.timeout);
+        match completion.recv_timeout(deadline) {
+            Ok(writes) => Ok((writes, false)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                expired(invocation, deadline).map(|writes| (writes, true))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "topology invocation service stopped unexpectedly"
+            )),
+        }
+    }
+}
+
+/// Agents with a `per` lifetime: a worker, and a native conversation, for each
+/// window of invocations.
+///
+/// A window is one worker and one conversation, serving the invocations the
+/// agent's lifetime lets share it: `per task` serves one, `per tag` all the
+/// agent's invocations in a tag, `per 5 tasks` five. The first is started,
+/// proved to have opened a new conversation -- the one the attempt named,
+/// or, for a backend that mints its own id, one no earlier attempt reported --
+/// and handed the invocation. Later ones are handed to the same worker, and
+/// the conversation it reports must still be that one before an invocation's
+/// writes are released. The window ends lazily, when an invocation falls
+/// outside it, or at once when its count of tasks is spent, or when the run
+/// ends or an invocation in it fails: its process tree is stopped and seen
+/// gone. If any of that cannot be made sure of, the invocation fails: there is
+/// no falling back to a worker that already has a conversation.
+struct ScopedWorkers {
+    states: BTreeMap<String, AgentState>,
+    /// Each agent's open window, if any. Locked for a whole invocation.
+    windows: BTreeMap<String, Mutex<Option<Window>>>,
+    launcher: AgentLauncher,
+    run: String,
+    /// The run's record, whose `sessions` holds a window's session from
+    /// before its worker is launched until it is seen stopped, so a run that
+    /// dies in between leaves it for `--replace` and snapshots to find, and
+    /// one that does not leaves nothing to clean.
+    deployment: Arc<Mutex<deploy::DeploymentRecord>>,
+    /// One JSON line per window as it starts, once its conversation is
+    /// checked, after each invocation it serves, and as it ends. The last line
+    /// of an `attempt_id` is its record.
+    log: PathBuf,
+    /// Every conversation an attempt has reported, seeded from `log`, which
+    /// outlives the process: a backend that mints its own id must never hand
+    /// one back. An error is a log that could not be read; it refuses every
+    /// minted id rather than trust a partial set.
+    seen: Mutex<Result<BTreeSet<String>, String>>,
+    publisher: Option<crate::diagram::DiagramPublisher>,
+}
+
+/// One agent's open window: the worker, and what is needed to stop it and to
+/// tell whether the next invocation still belongs to it.
+struct Window {
+    agent: String,
+    attempt: manager::TopologyAttempt,
+    session: String,
+    /// Every process the worker had, captured while it runs. Identities, not
+    /// bare pids: confirming the stop must not mistake a recycled pid. With
+    /// the sessions they ran in, which a process its parent leaves behind
+    /// keeps.
+    tree: Vec<(u32, String)>,
+    sessions: BTreeSet<u32>,
+    since: std::time::SystemTime,
+    /// The conversation the worker reported when it started.
+    conversation: String,
+    used: Used,
+    failed: bool,
+    /// What `attempts.jsonl` holds for it.
+    record: Value,
+}
+
+/// What every process of an attempt's worker inherits, as `NAME=<attempt id>`.
+const ATTEMPT_MARKER: &str = "OMAR_ATTEMPT";
+/// How long a stopped worker's processes get to be seen gone.
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a started worker gets to open its conversation.
+const WORKER_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How much of a window its invocations have used. Counts only the agent's
+/// own invocations, and the tags they run in: another agent's tags never reach
+/// it.
+#[derive(Debug, Clone, Copy)]
+struct Used {
+    tasks: u32,
+    tags: u32,
+    last_tag: Tag,
+}
+
+impl Used {
+    /// A window opened by an invocation at `tag`.
+    fn first(tag: Tag) -> Self {
+        Self {
+            tasks: 1,
+            tags: 1,
+            last_tag: tag,
+        }
+    }
+
+    /// Whether an invocation at `tag` falls outside the window. Invocations
+    /// in a tag already counted share it: a `per tag` window ends only when
+    /// the agent runs in a tag after it.
+    fn spent(&self, lifetime: Lifetime, tag: Tag) -> bool {
+        match lifetime.unit {
+            LifetimeUnit::Task => self.tasks >= lifetime.count,
+            LifetimeUnit::Tag => tag != self.last_tag && self.tags >= lifetime.count,
+        }
+    }
+
+    /// Count an invocation at `tag` that is inside the window.
+    fn take(&mut self, tag: Tag) {
+        self.tasks += 1;
+        if tag != self.last_tag {
+            self.tags += 1;
+            self.last_tag = tag;
+        }
+    }
+
+    /// Whether no later invocation can join: the tasks are all used. Tags
+    /// cannot say, since the agent may run again in the same one.
+    fn exhausted(&self, lifetime: Lifetime) -> bool {
+        lifetime.unit == LifetimeUnit::Task && self.tasks >= lifetime.count
+    }
+}
+
+fn served_invocation(invocation: &InvocationSpec) -> Value {
+    json!({
+        "invocation_id": invocation.id,
+        "reaction": invocation.reaction_id,
+        "tag": {"timestamp": invocation.tag.timestamp, "microstep": invocation.tag.microstep},
+    })
+}
+
+impl ScopedWorkers {
+    fn new(
+        state: &VmState,
+        launcher: AgentLauncher,
+        deployment: Arc<Mutex<deploy::DeploymentRecord>>,
+        publisher: Option<crate::diagram::DiagramPublisher>,
+    ) -> Result<Option<Self>> {
+        let states: BTreeMap<String, AgentState> = state
+            .agents
+            .iter()
+            .filter(|(_, agent)| agent.lifetime.is_some())
+            .map(|(name, agent)| (name.clone(), agent.clone()))
+            .collect();
+        let log = launcher.runtime_dir.join("attempts.jsonl");
+        let run = deployment
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
+            .deployment_id
+            .clone();
+        Ok((!states.is_empty()).then(|| Self {
+            windows: states
+                .keys()
+                .map(|name| (name.clone(), Mutex::new(None)))
+                .collect(),
+            states,
+            seen: Mutex::new(reported_conversations(&log)),
+            log,
+            launcher,
+            run,
+            deployment,
+            publisher,
+        }))
+    }
+
+    /// Record `agent`'s session as one the run must clean up, or, with
+    /// `None`, as gone.
+    fn track(&self, agent: &str, session: Option<&str>) -> Result<()> {
+        let mut deployment = self
+            .deployment
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?;
+        match session {
+            Some(session) => deployment
+                .sessions
+                .insert(agent.to_owned(), session.to_owned()),
+            None => deployment.sessions.remove(agent),
+        };
+        deployment.save(&self.launcher.runtime_dir)
+    }
+
+    fn slot(&self, agent: &str) -> std::sync::MutexGuard<'_, Option<Window>> {
+        self.windows[agent]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Which window `invocation` falls in: the attempt of `slot`'s open one
+    /// and `false`, or, once the open one is spent, a new attempt and `true`.
+    /// Counts only this agent's own invocations and the tags they run in. A
+    /// window that is spent is stopped here, before anything of the new one
+    /// starts.
+    fn admit(
+        &self,
+        invocation: &InvocationSpec,
+        slot: &mut Option<Window>,
+    ) -> Result<(manager::TopologyAttempt, bool)> {
+        let lifetime = self.states[&invocation.agent]
+            .lifetime
+            .context("agent has no lifetime")?;
+        if let Some(window) = slot.as_mut() {
+            if !window.used.spent(lifetime, invocation.tag) {
+                window.used.take(invocation.tag);
+                return Ok((window.attempt.clone(), false));
+            }
+            self.close(slot).with_context(|| {
+                format!(
+                    "agent '{}' invocation {}: the worker of its previous conversation was not confirmed stopped",
+                    invocation.agent, invocation.id
+                )
+            })?;
+        }
+        let backend = crate::backend::by_name(&self.states[&invocation.agent].backend)
+            .context("agent with a lifetime has no backend")?;
+        Ok((
+            manager::TopologyAttempt {
+                id: Uuid::new_v4().to_string(),
+                key: Uuid::new_v4().to_string(),
+                native_session: backend.new_conversation_id(),
+            },
+            true,
+        ))
+    }
+
+    /// Run `invocation` in its window: start the window's worker when
+    /// `fresh`, hand it `answer`, and check the worker still holds the
+    /// conversation it started with before the writes are released.
+    fn run(
+        &self,
+        invocation: &InvocationSpec,
+        attempt: &manager::TopologyAttempt,
+        fresh: bool,
+        slot: &mut Option<Window>,
+        answer: impl FnOnce() -> Result<(BTreeMap<String, Value>, bool)>,
+    ) -> Result<BTreeMap<String, Value>> {
+        let agent = &self.states[&invocation.agent];
+        let backend = crate::backend::by_name(&agent.backend)
+            .context("agent with a lifetime has no backend")?;
+        if fresh {
+            *slot = Some(self.open(invocation, attempt)?);
+        }
+        let window = slot.as_mut().context("agent has no open window")?;
+        let result = (|| -> Result<(BTreeMap<String, Value>, bool)> {
+            if !fresh {
+                self.same_conversation(window, backend)?;
+            }
+            let (writes, timed_out) = answer()?;
+            // A worker that ran out of time is busy and about to be stopped,
+            // so what it holds is no longer asked.
+            if !timed_out {
+                self.same_conversation(window, backend)?;
+            }
+            Ok((writes, timed_out))
+        })();
+        if !fresh {
+            window.record["invocations"]
+                .as_array_mut()
+                .context("window record has no invocations")?
+                .push(served_invocation(invocation));
+        }
+        let lifetime = agent.lifetime.context("agent has no lifetime")?;
+        match result {
+            Ok((writes, true)) => {
+                // The contract let it stay silent, but the worker is still on
+                // the invocation, so no later one may join its window.
+                window.failed = true;
+                self.close(slot).with_context(|| {
+                    format!(
+                        "agent '{}' invocation {}: worker attempt {} was not confirmed stopped, so its effects are withheld",
+                        invocation.agent, invocation.id, attempt.id
+                    )
+                })?;
+                Ok(writes)
+            }
+            Ok((writes, false)) => {
+                // No later invocation can join a window whose tasks are
+                // spent, so its worker is stopped before the writes are
+                // released, as the last thing it did.
+                if window.used.exhausted(lifetime) {
+                    self.close(slot).with_context(|| {
+                        format!(
+                            "agent '{}' invocation {}: worker attempt {} was not confirmed stopped, so its effects are withheld",
+                            invocation.agent, invocation.id, attempt.id
+                        )
+                    })?;
+                } else {
+                    window.record["outcome"] = json!("open");
+                    self.record(&window.record);
+                    self.publish(&window.agent, &window.record);
+                }
+                Ok(writes)
+            }
+            Err(error) => {
+                // A worker that failed an invocation is in an unknown state.
+                window.failed = true;
+                let error = error.context(format!(
+                    "agent '{}' invocation {}: worker attempt {}",
+                    invocation.agent, invocation.id, attempt.id
+                ));
+                match self.close(slot) {
+                    Ok(()) => Err(error),
+                    Err(stop) => Err(stop.context(format!(
+                        "agent '{}' invocation {}: worker attempt {} was not confirmed stopped, so its effects are withheld",
+                        invocation.agent, invocation.id, attempt.id
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Start a window's worker for `invocation`, the first it serves, and
+    /// prove its conversation new. On failure the worker is stopped.
+    fn open(
+        &self,
+        invocation: &InvocationSpec,
+        attempt: &manager::TopologyAttempt,
+    ) -> Result<Window> {
+        let agent = &self.states[&invocation.agent];
+        let backend = crate::backend::by_name(&agent.backend)
+            .context("agent with a lifetime has no backend")?;
+        let client = &self.launcher.client;
+        let session = client.session_for(&invocation.agent);
+        let mut record = json!({
+            "run": self.run,
+            "logical_agent": invocation.agent,
+            "attempt_id": attempt.id,
+            "backend": agent.backend,
+            "native_session_id": Value::Null,
+            "verification": backend.freshness().name(),
+            "lifetime": agent.lifetime,
+            "invocations": [served_invocation(invocation)],
+            "outcome": "started",
+            "cleanup_status": "pending",
+        });
+        // Anything already in the session is some earlier worker, and taking
+        // it over would be the reuse a new window rules out.
+        if client.has_session(&session)? {
+            record["outcome"] = json!("refused");
+            record["cleanup_status"] = json!("not_started");
+            self.record(&record);
+            bail!(
+                "agent '{}' invocation {}: a worker is already running in {session}; refusing to reuse it",
+                invocation.agent,
+                invocation.id
+            );
+        }
+        self.record(&record);
+        if let Err(error) = self.track(&invocation.agent, Some(&session)) {
+            record["outcome"] = json!("refused");
+            record["cleanup_status"] = json!("not_started");
+            self.record(&record);
+            return Err(error.context(format!(
+                "agent '{}' invocation {}: its worker could not be recorded for cleanup",
+                invocation.agent, invocation.id
+            )));
+        }
+        let mut tree = Vec::new();
+        let mut sessions = BTreeSet::new();
+        // Whatever the worker reported, kept even when it is refused.
+        let mut reported = None;
+        let since = std::time::SystemTime::now();
+        let started = (|| -> Result<()> {
+            let command = self
+                .launcher
+                .launch(&invocation.agent, agent, Some(attempt))?;
+            self.launcher
+                .wait_ready(&invocation.agent, agent, &command)?;
+            client.finish_backend_startup(&session, WORKER_START_TIMEOUT)?;
+            self.opened_conversation(
+                &session,
+                backend,
+                attempt,
+                since,
+                (&mut tree, &mut sessions),
+                &mut reported,
+            )
+        })();
+        record["native_session_id"] = json!(reported);
+        // A minted id is on disk before the worker hears anything: the next
+        // run's check is only as good as this log.
+        let started = started.and_then(|()| match backend.freshness() {
+            Freshness::Chosen => {
+                self.record(&record);
+                Ok(())
+            }
+            Freshness::Reported => self.append(&record).with_context(|| {
+                format!(
+                    "could not record the conversation it reported in {}",
+                    self.log.display()
+                )
+            }),
+        });
+        match started {
+            Ok(()) => {
+                // Mission Control shows the window as soon as it is proved.
+                self.publish(&invocation.agent, &record);
+                Ok(Window {
+                    agent: invocation.agent.clone(),
+                    attempt: attempt.clone(),
+                    session,
+                    tree,
+                    sessions,
+                    since,
+                    conversation: reported.unwrap_or_default(),
+                    used: Used::first(invocation.tag),
+                    failed: false,
+                    record,
+                })
+            }
+            Err(error) => {
+                let stopped =
+                    self.stop(&session, attempt, (agent, since), &mut tree, &mut sessions);
+                if stopped.is_ok() {
+                    if let Err(error) = self.track(&invocation.agent, None) {
+                        eprintln!("warning: could not record {session} as stopped: {error:#}");
+                    }
+                }
+                record["outcome"] = json!("failed");
+                record["cleanup_status"] = json!(if stopped.is_ok() {
+                    "stopped"
+                } else {
+                    "unconfirmed"
+                });
+                self.record(&record);
+                self.publish(&invocation.agent, &record);
+                let error = error.context(format!(
+                    "agent '{}' invocation {}: worker attempt {} did not start a fresh conversation",
+                    invocation.agent, invocation.id, attempt.id
+                ));
+                match stopped {
+                    Ok(()) => Err(error),
+                    Err(stop) => Err(stop.context(format!(
+                        "agent '{}' invocation {}: worker attempt {} was not confirmed stopped, so its effects are withheld",
+                        invocation.agent, invocation.id, attempt.id
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Whether the window's worker still holds the conversation it started
+    /// with. A later invocation in a different conversation would have
+    /// reached something the window did not promise.
+    fn same_conversation(
+        &self,
+        window: &Window,
+        backend: &dyn crate::backend::Backend,
+    ) -> Result<()> {
+        let client = &self.launcher.client;
+        let pane_pid = client.get_pane_pid(&window.session)?;
+        let stamp = client.session_delivery(&window.session);
+        let target = crate::backend::Target {
+            name: &window.session,
+            pane_pid,
+            stamp: stamp.as_deref(),
+        };
+        match backend.conversation_id(&target) {
+            Some(native) if native == window.conversation => Ok(()),
+            Some(native) => bail!(
+                "its worker moved to conversation {native} from {}; the window's writes are refused",
+                window.conversation
+            ),
+            None => bail!(
+                "its worker no longer reports conversation {}; the window's writes are refused",
+                window.conversation
+            ),
+        }
+    }
+
+    /// End `slot`'s window: stop its worker, see its processes gone, and
+    /// record how it went.
+    fn close(&self, slot: &mut Option<Window>) -> Result<()> {
+        let Some(mut window) = slot.take() else {
+            return Ok(());
+        };
+        let agent = &self.states[&window.agent];
+        let stopped = self.stop(
+            &window.session,
+            &window.attempt,
+            (agent, window.since),
+            &mut window.tree,
+            &mut window.sessions,
+        );
+        if stopped.is_ok() {
+            if let Err(error) = self.track(&window.agent, None) {
+                eprintln!(
+                    "warning: could not record {} as stopped: {error:#}",
+                    window.session
+                );
+            }
+        }
+        window.record["outcome"] = json!(if window.failed { "failed" } else { "completed" });
+        window.record["cleanup_status"] = json!(if stopped.is_ok() {
+            "stopped"
+        } else {
+            "unconfirmed"
+        });
+        self.record(&window.record);
+        self.publish(&window.agent, &window.record);
+        stopped
+    }
+
+    /// Stop every open window, as the run ends.
+    fn close_all(&self) {
+        for (agent, window) in &self.windows {
+            let mut slot = window
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(error) = self.close(&mut slot) {
+                eprintln!("warning: could not stop the worker of agent '{agent}': {error:#}");
+            }
+        }
+    }
+
+    fn publish(&self, agent: &str, record: &Value) {
+        if let Some(publisher) = &self.publisher {
+            publisher.agent_attempt(agent, record);
+        }
+    }
+
+    /// Wait for the started worker to report the conversation it opened,
+    /// into `reported`, and check that conversation is new.
+    fn opened_conversation(
+        &self,
+        session: &str,
+        backend: &dyn crate::backend::Backend,
+        attempt: &manager::TopologyAttempt,
+        since: std::time::SystemTime,
+        (tree, sessions): (&mut Vec<(u32, String)>, &mut BTreeSet<u32>),
+        reported: &mut Option<String>,
+    ) -> Result<()> {
+        let client = &self.launcher.client;
+        let deadline = Instant::now() + WORKER_START_TIMEOUT;
+        loop {
+            let pane_pid = client.get_pane_pid(session)?;
+            *tree = client.session_process_tree(session)?;
+            sessions.extend(crate::process::sessions(tree));
+            let stamp = client.session_delivery(session);
+            let target = crate::backend::Target {
+                name: session,
+                pane_pid,
+                stamp: stamp.as_deref(),
+            };
+            match backend.conversation_id(&target) {
+                Some(native) => {
+                    let verified = fresh_conversation(
+                        backend.freshness(),
+                        &attempt.native_session,
+                        &native,
+                        &self.seen,
+                        || backend.prove_fresh(&target, &native, since),
+                    );
+                    *reported = Some(native);
+                    return verified;
+                }
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(250)),
+                None => bail!(
+                    "it never reported a conversation within {:?}",
+                    WORKER_START_TIMEOUT
+                ),
+            }
+        }
+    }
+
+    /// Stop the worker's process tree, and whatever it left running outside
+    /// it (see [`crate::process::leftovers`], and on macOS
+    /// [`crate::process::touching`] its instance's workspace since `since`),
+    /// and see them gone; then remove the attempt's own files.
+    fn stop(
+        &self,
+        session: &str,
+        attempt: &manager::TopologyAttempt,
+        (agent, since): (&AgentState, std::time::SystemTime),
+        tree: &mut Vec<(u32, String)>,
+        sessions: &mut BTreeSet<u32>,
+    ) -> Result<()> {
+        let client = &self.launcher.client;
+        if client.has_session(session)? {
+            let live = client.session_process_tree(session)?;
+            sessions.extend(crate::process::sessions(&live));
+            tree.extend(live);
+            crate::backend::kill_worker(client, session, true)?;
+        }
+        let marker = format!("{ATTEMPT_MARKER}={}", attempt.id);
+        let deadline = Instant::now() + WORKER_STOP_TIMEOUT;
+        #[cfg(target_os = "macos")]
+        let workspace: Vec<PathBuf> = self
+            .launcher
+            .workspaces
+            .get(&agent.instance)
+            .map(|(worktree, temp)| vec![worktree.clone(), temp.clone()])
+            .context("agent instance has no workspace")?;
+        #[cfg(not(target_os = "macos"))]
+        let _ = (agent, since);
+        loop {
+            let left = crate::process::leftovers(sessions, &marker);
+            // macOS hides its own binaries' environments, the shells' among
+            // them, so one that left the session is found by what it touches
+            // instead: never this runtime or another live worker, whose
+            // processes may share the workspace.
+            #[cfg(target_os = "macos")]
+            let left = {
+                let spared = crate::process::descendants(
+                    client
+                        .other_pane_pids(session)?
+                        .into_iter()
+                        .chain([std::process::id()]),
+                );
+                let mut left = left;
+                for found in crate::process::touching(&workspace, since, &spared)? {
+                    if !left.contains(&found) {
+                        left.push(found);
+                    }
+                }
+                left
+            };
+            crate::process::signal_tree(&left, "-KILL");
+            if !crate::process::tree_alive(tree)
+                && !crate::process::tree_alive(&left)
+                && !client.has_session(session)?
+            {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "worker processes of {session} were still running {:?} after they were stopped: {:?}",
+                WORKER_STOP_TIMEOUT,
+                left.iter().map(|(pid, _)| pid).collect::<Vec<_>>()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        let files =
+            manager::attempt_mcp_dir(&self.launcher.omar_dir, self.launcher.ea_id, &attempt.id);
+        if let Err(error) = fs::remove_dir_all(&files) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("warning: could not remove {}: {error}", files.display());
+            }
+        }
+        Ok(())
+    }
+
+    /// Best effort: a record that cannot be written does not decide the run.
+    fn record(&self, record: &Value) {
+        if let Err(error) = self.append(record) {
+            eprintln!(
+                "warning: could not record worker attempt in {}: {error}",
+                self.log.display()
+            );
+        }
+    }
+
+    fn append(&self, record: &Value) -> std::io::Result<()> {
+        let line = format!("{record}\n");
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .and_then(|mut file| file.write_all(line.as_bytes()))
+    }
+}
+
+/// Every conversation an attempt recorded in `log`, in this run or an earlier
+/// one of the same deployment. No log is none; one that cannot be read, or
+/// has a line that is not a record, is an error.
+fn reported_conversations(log: &Path) -> Result<BTreeSet<String>, String> {
+    let text = match fs::read_to_string(log) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(format!("could not read {}: {error}", log.display())),
+    };
+    let mut seen = BTreeSet::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let record: Value = serde_json::from_str(line).map_err(|error| {
+            format!("{} has a line that is not a record: {error}", log.display())
+        })?;
+        if let Some(native) = record["native_session_id"].as_str() {
+            seen.insert(native.to_owned());
+        }
+    }
+    Ok(seen)
+}
+
+/// Whether `reported`, the conversation a newly started worker opened, is a
+/// new one, by the backend's form of proof. Either way it joins `seen`, so no
+/// later attempt can report it again; `prove` is the backend's own check,
+/// run once the id itself has passed.
+fn fresh_conversation(
+    freshness: Freshness,
+    chosen: &str,
+    reported: &str,
+    seen: &Mutex<Result<BTreeSet<String>, String>>,
+    prove: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if freshness == Freshness::Chosen && reported != chosen {
+        bail!("it opened conversation {reported}, not the new conversation {chosen} it was given");
+    }
+    if reported.trim().is_empty() {
+        bail!("it reported an empty conversation id");
+    }
+    {
+        let mut seen = seen
+            .lock()
+            .map_err(|_| anyhow::anyhow!("conversation log lock poisoned"))?;
+        match &mut *seen {
+            Ok(seen) => {
+                if !seen.insert(reported.to_owned()) {
+                    bail!("it opened conversation {reported}, which an earlier attempt already had");
+                }
+            }
+            // A chosen id was minted for this attempt alone; only a minted one
+            // rests on the log.
+            Err(_) if freshness == Freshness::Chosen => {}
+            Err(error) => bail!(
+                "the conversations earlier attempts had are unknown, so {reported} cannot be shown new: {error}"
+            ),
+        }
+    }
+    prove().with_context(|| format!("conversation {reported} could not be shown new"))
 }
 
 /// A body reaches its own instance's state and no other's.
@@ -2722,10 +3575,12 @@ fn launch(
         fs::remove_dir_all(&obsolete_invocations)?;
     }
     let client = TmuxClient::new(crate::ea::ea_prefix(config.ea_id, config.base_prefix));
+    // A session of an agent with a lifetime is recorded only while a window
+    // may have one: see `ScopedWorkers::track`.
     let planned_sessions: BTreeMap<String, String> = state
         .agents
         .iter()
-        .filter(|(_, agent)| needs_agent_process(&agent.backend))
+        .filter(|(_, agent)| needs_agent_process(&agent.backend) && agent.lifetime.is_none())
         .map(|(name, _)| (name.clone(), client.session_for(name)))
         .collect();
     let record = Arc::new(Mutex::new(deploy::DeploymentRecord::create(
@@ -2776,6 +3631,7 @@ fn launch(
         BTreeMap<String, Value>,
         Option<crate::reaction::Reactions>,
         BTreeMap<String, crate::workspace::Workspace>,
+        AgentLauncher,
     );
     let prepared = (|| -> Result<Prepared> {
         // Before anything is spawned: compiling the bodies is the step most
@@ -2808,16 +3664,16 @@ fn launch(
             guard.save(&runtime_dir)?;
         }
         let invocation_server = InvocationServer::start()?;
-        spawn_topology_agents(
+        let launcher = AgentLauncher::new(
             &state,
             &client,
             &runtime_dir,
             &invocation_server,
             &config,
             &workspaces,
-            &mut spawned,
             resumed_from.as_ref(),
-        )?;
+        );
+        spawn_topology_agents(&state, &launcher, config.replace, &mut spawned)?;
         // A resumed run's inputs were consumed at its start tag; what it
         // continues with is in the checkpoint's queue.
         let inputs = if start_state.is_some() {
@@ -2825,9 +3681,9 @@ fn launch(
         } else {
             parse_inputs(&state, config.inputs)?
         };
-        Ok((invocation_server, inputs, reactions, workspaces))
+        Ok((invocation_server, inputs, reactions, workspaces, launcher))
     })();
-    let (invocation_server, inputs, reactions, workspaces) = match prepared {
+    let (invocation_server, inputs, reactions, workspaces, launcher) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             observer.run_failed(&error.to_string());
@@ -2871,6 +3727,12 @@ fn launch(
             registry: invocation_server.registry.clone(),
             timeout: config.timeout,
             web,
+            scoped: ScopedWorkers::new(
+                &state,
+                launcher,
+                record.clone(),
+                diagram_publisher.clone(),
+            )?,
         },
     };
     let checkpointer = match RunCheckpointer::new(
@@ -2941,6 +3803,11 @@ fn launch(
         Some(&runtime_dir),
         Some(&checkpointer),
     );
+    // However the loop ended, no window's worker outlives it: a resume starts
+    // new conversations, as a conversation cannot be rolled back.
+    if let Some(scoped) = &executor.agents.scoped {
+        scoped.close_all();
+    }
     watcher_shutdown.store(true, Ordering::Release);
     let _ = watcher.join();
     let end = match outcome {
@@ -3108,35 +3975,176 @@ fn launch(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+const AGENT_PROTOCOL: &str = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
+
+/// What it takes to start one topology agent's worker. Kept for the whole
+/// run, because an agent with a `per` lifetime is started again for every
+/// window.
+#[derive(Clone)]
+struct AgentLauncher {
+    client: TmuxClient,
+    team: String,
+    runtime_dir: PathBuf,
+    omar_dir: PathBuf,
+    ea_id: crate::ea::EaId,
+    base_prefix: String,
+    health_idle_warning: i64,
+    endpoint: String,
+    token: String,
+    /// Each instance's worktree and temp directory.
+    workspaces: BTreeMap<String, (PathBuf, PathBuf)>,
+    /// What every agent of a resumed run is told; empty for a fresh run.
+    resumed: String,
+}
+
+impl AgentLauncher {
+    fn new(
+        state: &VmState,
+        client: &TmuxClient,
+        runtime_dir: &Path,
+        invocation_server: &InvocationServer,
+        config: &TopologyRunConfig<'_>,
+        workspaces: &BTreeMap<String, crate::workspace::Workspace>,
+        resumed_from: Option<&checkpoint::Manifest>,
+    ) -> Self {
+        // No backend restores a conversation at a recorded turn, so a resumed
+        // agent is told plainly that it continues a run it has no memory of.
+        let resumed = resumed_from
+            .map(|m| {
+                let at = m
+                    .completed_tag
+                    .map(|(t, s)| format!("logical tag ({t}, {s})"))
+                    .unwrap_or_else(|| "its start".to_string());
+                format!(
+                    "\n\nThis run resumed from checkpoint {} taken after {at}. Your earlier conversation was not restored; the files in your workspace are exactly as they were at that checkpoint. Continue from them.",
+                    m.id
+                )
+            })
+            .unwrap_or_default();
+        Self {
+            client: client.clone(),
+            team: state.team.clone(),
+            runtime_dir: runtime_dir.to_path_buf(),
+            omar_dir: config.omar_dir.to_path_buf(),
+            ea_id: config.ea_id,
+            base_prefix: config.base_prefix.to_string(),
+            health_idle_warning: config.health_idle_warning,
+            endpoint: invocation_server.endpoint.clone(),
+            token: invocation_server.token.clone(),
+            workspaces: workspaces
+                .iter()
+                .map(|(name, ws)| {
+                    (
+                        name.clone(),
+                        (ws.worktree(config.omar_dir), ws.temp(config.omar_dir)),
+                    )
+                })
+                .collect(),
+            resumed,
+        }
+    }
+
+    /// Start `name`'s worker in its session and return the line it was
+    /// launched with, which says how it proves readiness. `attempt` is set
+    /// for an agent with a lifetime: the worker serves one window of it and
+    /// opens the native conversation the attempt names.
+    fn launch(
+        &self,
+        name: &str,
+        agent: &AgentState,
+        attempt: Option<&manager::TopologyAttempt>,
+    ) -> Result<String> {
+        let session = self.client.session_for(name);
+        let agent_dir = self.runtime_dir.join("agents").join(name);
+        fs::create_dir_all(&agent_dir)?;
+        let prompt_file = agent_dir.join("system.md");
+        let (worktree, temp) = self
+            .workspaces
+            .get(&agent.instance)
+            .context("agent instance has no workspace")?;
+        let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
+        // Nothing of an earlier window is put in front of it: what it knows
+        // of the run is what the workspace holds.
+        let scoped = match (attempt, agent.lifetime) {
+            (Some(_), Some(lifetime)) => format!(
+                "\n\nYour conversation is reset {lifetime}. Invocations within it share it. After a reset, earlier conversations are gone and you cannot see them; whatever later work needs from them is in the workspace files."
+            ),
+            _ => String::new(),
+        };
+        fs::write(&prompt_file, format!("{AGENT_PROTOCOL}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.{}{scoped}\n", temp.display(), self.resumed))?;
+        let backend = canonical_backend(&agent.backend);
+        let base_command = crate::backend::resolve(backend)
+            .map(|backend| backend.default_command().to_string())
+            .map_err(anyhow::Error::msg)?;
+        let context = McpLaunchContext {
+            omar_dir: self.omar_dir.clone(),
+            ea_id: self.ea_id,
+            session_prefix: self.base_prefix.clone(),
+            default_command: base_command.clone(),
+            default_workdir: workdir.to_string(),
+            health_idle_warning: self.health_idle_warning,
+            agent_name: None,
+            tmux_server: std::env::var("OMAR_TMUX_SERVER").ok(),
+            // Topology agents answer invocations; they do not chat with the
+            // operator, so they get no serve context.
+            serve: None,
+            topology: Some(TopologyMcpContext {
+                team: self.team.clone(),
+                agent: name.to_string(),
+                endpoint: self.endpoint.clone(),
+                token: self.token.clone(),
+                attempt: attempt.cloned(),
+            }),
+        };
+        let command = manager::build_agent_command(&base_command, &prompt_file, &[], &context);
+        let mut environment = vec![
+            ("OMAR_WORKTREE".into(), workdir.into()),
+            ("OMAR_TEMP".into(), temp.to_string_lossy().into_owned()),
+            ("TMPDIR".into(), temp.to_string_lossy().into_owned()),
+        ];
+        // So what the attempt leaves running can be found once it stops.
+        if let Some(attempt) = attempt {
+            environment.push((ATTEMPT_MARKER.into(), attempt.id.clone()));
+        }
+        self.client.new_session_with_backend_env(
+            &session,
+            &command,
+            Some(workdir),
+            Some(backend),
+            &environment,
+        )?;
+        Ok(command)
+    }
+
+    /// Wait for a launched worker's banner, when its backend paints one.
+    fn wait_ready(&self, name: &str, agent: &AgentState, command: &str) -> Result<()> {
+        let Some(backend) = crate::backend::by_name(canonical_backend(&agent.backend)) else {
+            return Ok(());
+        };
+        if let crate::backend::Readiness::Banner(markers) = backend.readiness(command) {
+            if !self.client.wait_for_markers(
+                &self.client.session_for(name),
+                markers,
+                Duration::from_secs(60),
+                Duration::from_millis(250),
+            ) {
+                bail!("agent '{}' did not become ready", name);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn spawn_topology_agents(
     state: &VmState,
-    client: &TmuxClient,
-    runtime_dir: &Path,
-    invocation_server: &InvocationServer,
-    config: &TopologyRunConfig<'_>,
-    workspaces: &BTreeMap<String, crate::workspace::Workspace>,
+    launcher: &AgentLauncher,
+    replace: bool,
     spawned: &mut BTreeMap<String, String>,
-    resumed_from: Option<&checkpoint::Manifest>,
 ) -> Result<()> {
+    let client = &launcher.client;
     // The line each agent was launched with, which is what says how it
     // proves readiness.
     let mut launched: BTreeMap<String, String> = BTreeMap::new();
-    // No backend restores a conversation at a recorded turn, so a resumed
-    // agent is told plainly that it continues a run it has no memory of.
-    let resumed = resumed_from
-        .map(|m| {
-            let at = m
-                .completed_tag
-                .map(|(t, s)| format!("logical tag ({t}, {s})"))
-                .unwrap_or_else(|| "its start".to_string());
-            format!(
-                "\n\nThis run resumed from checkpoint {} taken after {at}. Your earlier conversation was not restored; the files in your workspace are exactly as they were at that checkpoint. Continue from them.",
-                m.id
-            )
-        })
-        .unwrap_or_default();
-    let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
     for (name, agent) in &state.agents {
         // A web agent is not spawned. There is no command to resolve, no pane
         // to put it in, and no readiness to wait for — the agent exists as a
@@ -3146,7 +4154,7 @@ fn spawn_topology_agents(
         }
         let session = client.session_for(name);
         if client.has_session(&session)? {
-            if !config.replace {
+            if !replace {
                 bail!(
                     "agent '{}' already exists; use --replace to restart it with scoped topology tools",
                     name
@@ -3155,73 +4163,18 @@ fn spawn_topology_agents(
             client.ensure_session_not_attached(&session)?;
             crate::backend::kill_worker(client, &session, true)?;
         }
-        let agent_dir = runtime_dir.join("agents").join(name);
-        fs::create_dir_all(&agent_dir)?;
-        let prompt_file = agent_dir.join("system.md");
-        let workspace = workspaces
-            .get(&agent.instance)
-            .context("agent instance has no workspace")?;
-        let worktree = workspace.worktree(config.omar_dir);
-        let temp = workspace.temp(config.omar_dir);
-        let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
-        fs::write(&prompt_file, format!("{protocol}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.{resumed}\n", temp.display()))?;
-        let backend = canonical_backend(&agent.backend);
-        let base_command = crate::backend::resolve(backend)
-            .map(|backend| backend.default_command().to_string())
-            .map_err(anyhow::Error::msg)?;
-        let context = McpLaunchContext {
-            omar_dir: config.omar_dir.to_path_buf(),
-            ea_id: config.ea_id,
-            session_prefix: config.base_prefix.to_string(),
-            default_command: base_command.clone(),
-            default_workdir: workdir.to_string(),
-            health_idle_warning: config.health_idle_warning,
-            agent_name: None,
-            tmux_server: std::env::var("OMAR_TMUX_SERVER").ok(),
-            // Topology agents answer invocations; they do not chat with the
-            // operator, so they get no serve context.
-            serve: None,
-            topology: Some(TopologyMcpContext {
-                team: state.team.clone(),
-                agent: name.clone(),
-                endpoint: invocation_server.endpoint.clone(),
-                token: invocation_server.token.clone(),
-            }),
-        };
-        let command = manager::build_agent_command(&base_command, &prompt_file, &[], &context);
-        client.new_session_with_backend_env(
-            &session,
-            &command,
-            Some(workdir),
-            Some(backend),
-            &[
-                ("OMAR_WORKTREE".into(), workdir.into()),
-                ("OMAR_TEMP".into(), temp.to_string_lossy().into_owned()),
-                ("TMPDIR".into(), temp.to_string_lossy().into_owned()),
-            ],
-        )?;
+        // An agent with a lifetime has no worker until an invocation starts
+        // its window.
+        if agent.lifetime.is_some() {
+            continue;
+        }
+        let command = launcher.launch(name, agent, None)?;
         spawned.insert(name.clone(), session);
         launched.insert(name.clone(), command);
     }
 
-    for (name, agent) in &state.agents {
-        if !needs_agent_process(&agent.backend) {
-            continue;
-        }
-        let Some(backend) = crate::backend::by_name(canonical_backend(&agent.backend)) else {
-            continue;
-        };
-        let command = launched.get(name).map(String::as_str).unwrap_or_default();
-        if let crate::backend::Readiness::Banner(markers) = backend.readiness(command) {
-            if !client.wait_for_markers(
-                &client.session_for(name),
-                markers,
-                Duration::from_secs(60),
-                Duration::from_millis(250),
-            ) {
-                bail!("agent '{}' did not become ready", name);
-            }
-        }
+    for (name, command) in &launched {
+        launcher.wait_ready(name, &state.agents[name], command)?;
     }
     Ok(())
 }
@@ -3302,7 +4255,7 @@ fn parse_input_value(ty: &str, value: &str) -> Result<Value> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Tag {
     timestamp: u64,
     microstep: u64,
@@ -4102,7 +5055,7 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
 
             let specs: Vec<_> = enabled
                 .iter()
-                .map(|entry| invocation_spec(state, *entry, &events, &store))
+                .map(|entry| invocation_spec(state, *entry, &events, &store, tag))
                 .collect::<Result<_>>()?;
             for spec in &specs {
                 observer.reaction_started(
@@ -4113,20 +5066,63 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
                 );
             }
             let task_ids: Vec<_> = specs.iter().map(|spec| spec.id).collect();
-            let results = thread::scope(|scope| {
-                let handles: Vec<_> = specs
-                    .into_iter()
-                    .map(|spec| scope.spawn(move || executor.invoke(spec)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|handle| {
-                        handle
-                            .join()
-                            .map_err(|_| anyhow::anyhow!("reaction executor panicked"))?
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })?;
+            // An agent with a lifetime shares a conversation between its
+            // invocations in a tag, so they run one after another in
+            // declaration order, the later one seeing what the earlier left
+            // in it; every other invocation runs beside the rest.
+            let mut sequences: Vec<Vec<(usize, InvocationSpec)>> = Vec::new();
+            for (index, spec) in specs.into_iter().enumerate() {
+                let shared = state
+                    .agents
+                    .get(&spec.agent)
+                    .is_some_and(|agent| agent.lifetime.is_some());
+                match sequences
+                    .iter_mut()
+                    .find(|run| shared && run[0].1.agent == spec.agent)
+                {
+                    Some(run) => run.push((index, spec)),
+                    None => sequences.push(vec![(index, spec)]),
+                }
+            }
+            let mut results: Vec<(usize, Result<BTreeMap<String, Value>>)> =
+                thread::scope(|scope| {
+                    let handles: Vec<_> = sequences
+                        .into_iter()
+                        .map(|run| {
+                            scope.spawn(move || {
+                                // Stops at the first failure: nothing later
+                                // in the sequence may start a worker or act
+                                // in a run that is already failing.
+                                let mut done = Vec::new();
+                                for (index, spec) in run {
+                                    let result = executor.invoke(spec);
+                                    let failed = result.is_err();
+                                    done.push((index, result));
+                                    if failed {
+                                        break;
+                                    }
+                                }
+                                done
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|handle| {
+                            handle
+                                .join()
+                                .map_err(|_| anyhow::anyhow!("reaction executor panicked"))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })?
+                .into_iter()
+                .flatten()
+                .collect();
+            results.sort_by_key(|(index, _)| *index);
+            let results = results
+                .into_iter()
+                .map(|(_, result)| result)
+                .collect::<Result<Vec<_>>>()?;
 
             // Declaration order decides who wins a port two reactions in this
             // layer both write, which is the rule the language states.
@@ -4233,6 +5229,7 @@ fn invocation_spec(
     (reaction_id, reaction): (&String, &ReactionState),
     events: &BTreeMap<String, Value>,
     store: &BTreeMap<String, Value>,
+    tag: Tag,
 ) -> Result<InvocationSpec> {
     let trigger_values = reaction
         .triggers
@@ -4278,6 +5275,7 @@ fn invocation_spec(
         contract: reaction.contract.clone(),
         prompt: reaction.prompt.clone(),
         within: reaction.within.map(Duration::from_nanos),
+        tag,
     })
 }
 
@@ -4944,6 +5942,7 @@ mod tests {
             reaction,
             &BTreeMap::from([("topic".to_string(), json!("t"))]),
             &BTreeMap::new(),
+            Tag::default(),
         )
         .unwrap();
         assert_eq!(spec.effect_names["out"], "B");
@@ -4984,6 +5983,7 @@ mod tests {
             contract: "out".into(),
             prompt: "Decide.".into(),
             within: None,
+            tag: Tag::default(),
         };
         let message = invocation_message(&spec, "Decide.").unwrap();
         let header: Vec<&str> = message
@@ -5038,6 +6038,7 @@ mod tests {
             reaction,
             &BTreeMap::from([("token".to_string(), json!("t"))]),
             &BTreeMap::new(),
+            Tag::default(),
         )
         .unwrap();
         assert!(spec.types.is_empty(), "{:?}", spec.types);
@@ -5239,6 +6240,7 @@ mod tests {
                     AgentState {
                         backend: "claude".into(),
                         instance: String::new(),
+                        lifetime: None,
                     },
                 ),
                 (
@@ -5246,6 +6248,7 @@ mod tests {
                     AgentState {
                         backend: "codex".into(),
                         instance: String::new(),
+                        lifetime: None,
                     },
                 ),
                 (
@@ -5253,6 +6256,7 @@ mod tests {
                     AgentState {
                         backend: "opencode".into(),
                         instance: String::new(),
+                        lifetime: None,
                     },
                 ),
             ]),
@@ -5499,6 +6503,7 @@ mod tests {
                 name: "n1_agent".to_string(),
                 backend: "Codex".to_string(),
                 instance: String::new(),
+                lifetime: None,
             },
         );
 
@@ -5585,6 +6590,7 @@ mod tests {
             (id, reaction),
             &BTreeMap::from([("topic".to_string(), json!("x"))]),
             &BTreeMap::new(),
+            Tag::default(),
         )
         .unwrap()
     }
@@ -5847,12 +6853,14 @@ mod tests {
             registry: server.registry.clone(),
             timeout: Duration::from_secs(10),
             web: BTreeSet::from(["panel".to_string()]),
+            scoped: None,
         };
         let context = TopologyMcpContext {
             team: state.team.clone(),
             agent: "panel".into(),
             endpoint: server.endpoint.clone(),
             token: server.token.clone(),
+            attempt: None,
         };
 
         let person = thread::spawn(move || {
@@ -5931,12 +6939,13 @@ mod tests {
                 prompt: "decide".into(),
                 writes: BTreeMap::new(),
                 completed: false,
+                attempt: None,
             })
             .unwrap();
 
         let mine = server
             .registry
-            .execute("Desk", "panel", InvocationCommand::Pending)
+            .execute("Desk", "panel", None, InvocationCommand::Pending)
             .unwrap();
         assert_eq!(mine["pending"].as_array().unwrap().len(), 1);
 
@@ -5944,7 +6953,7 @@ mod tests {
         // work: an invocation is addressed to one agent.
         let theirs = server
             .registry
-            .execute("Desk", "clerk", InvocationCommand::Pending)
+            .execute("Desk", "clerk", None, InvocationCommand::Pending)
             .unwrap();
         assert!(theirs["pending"].as_array().unwrap().is_empty());
         server.registry.remove(&3);
@@ -7053,6 +8062,7 @@ mod tests {
             prompt: "answer".into(),
             writes: BTreeMap::new(),
             completed: false,
+            attempt: None,
         };
         let completion = registry.register(record.clone()).unwrap();
         let set = |id| {
@@ -7063,27 +8073,29 @@ mod tests {
             })
         };
         // Even with only one pending task, an incorrect ID is never guessed.
-        assert!(registry.execute("Desk", "worker", set(8)).is_err());
+        assert!(registry.execute("Desk", "worker", None, set(8)).is_err());
         assert!(registry
             .execute(
                 "Desk",
                 "worker",
+                None,
                 InvocationCommand::Complete(CompleteArgs { task_id: 8 })
             )
             .is_err());
         // A real ID is not a credential: both commands still check ownership.
         for (team, agent) in [("Desk", "other"), ("Other", "worker")] {
-            assert!(registry.execute(team, agent, set(7)).is_err());
+            assert!(registry.execute(team, agent, None, set(7)).is_err());
             assert!(registry
                 .execute(
                     team,
                     agent,
+                    None,
                     InvocationCommand::Complete(CompleteArgs { task_id: 7 })
                 )
                 .is_err());
         }
         let pending = registry
-            .execute("Desk", "worker", InvocationCommand::Pending)
+            .execute("Desk", "worker", None, InvocationCommand::Pending)
             .unwrap();
         assert_eq!(pending["pending"][0]["task_id"], json!(7));
         assert!(pending["pending"][0].get("invocation_id").is_none());
@@ -7091,18 +8103,19 @@ mod tests {
         let second = registry
             .register(InvocationRecord { id: 8, ..record })
             .unwrap();
-        registry.execute("Desk", "worker", set(7)).unwrap();
+        registry.execute("Desk", "worker", None, set(7)).unwrap();
         registry
             .execute(
                 "Desk",
                 "worker",
+                None,
                 InvocationCommand::Complete(CompleteArgs { task_id: 7 }),
             )
             .unwrap();
         assert_eq!(completion.try_recv().unwrap()["answer"], json!("hello"));
         assert!(second.try_recv().is_err());
         registry.remove(&7);
-        assert!(registry.execute("Desk", "worker", set(7)).is_err());
+        assert!(registry.execute("Desk", "worker", None, set(7)).is_err());
     }
 
     #[test]
@@ -7137,6 +8150,7 @@ mod tests {
             agent: "worker".into(),
             endpoint: server.endpoint.clone(),
             token: server.token.clone(),
+            attempt: None,
         };
         let record = InvocationRecord {
             id: 1,
@@ -7149,6 +8163,7 @@ mod tests {
             prompt: "p".into(),
             writes: BTreeMap::new(),
             completed: false,
+            attempt: None,
         };
         let completion = server.registry.register(record).unwrap();
 
@@ -7174,6 +8189,7 @@ mod tests {
             agent: "worker".into(),
             endpoint: server.endpoint.clone(),
             token: server.token.clone(),
+            attempt: None,
         };
         let completion = server
             .registry
@@ -7191,6 +8207,7 @@ mod tests {
                 prompt: "Choose a permitted decision.".into(),
                 writes: BTreeMap::new(),
                 completed: false,
+                attempt: None,
             })
             .unwrap();
 
@@ -7254,6 +8271,7 @@ mod tests {
             agent: "worker".into(),
             endpoint: server.endpoint.clone(),
             token: server.token.clone(),
+            attempt: None,
         };
         let record = InvocationRecord {
             id: 2,
@@ -7266,6 +8284,7 @@ mod tests {
             prompt: "p".into(),
             writes: BTreeMap::new(),
             completed: false,
+            attempt: None,
         };
         let completion = server.registry.register(record).unwrap();
 
@@ -8094,6 +9113,7 @@ mod tests {
                 ("c.count".to_string(), json!(0)),
                 ("d.count".to_string(), json!(0)),
             ]),
+            Tag::default(),
         )
         .unwrap();
         assert_eq!(spec.state_values.keys().collect::<Vec<_>>(), ["c.count"]);
@@ -8311,6 +9331,7 @@ mod tests {
             state.reactions.get_key_value("s.reaction.0").unwrap(),
             &BTreeMap::from([("s.tick".to_string(), json!(1))]),
             &BTreeMap::new(),
+            Tag::default(),
         )
         .unwrap();
 
@@ -8355,6 +9376,7 @@ mod tests {
                 state.reactions.get_key_value("s.reaction.0").unwrap(),
                 &BTreeMap::from([("s.tick".to_string(), json!(1))]),
                 &BTreeMap::new(),
+                Tag::default(),
             )
             .unwrap();
             DispatchExecutor {
@@ -8375,5 +9397,367 @@ mod tests {
         let error = run("s.out").unwrap_err().to_string();
         assert!(error.contains("requires an effect"), "{error}");
         assert!(error.contains("its body"), "{error}");
+    }
+
+    /// `coder : Claude per tag` as `omarc` emits it, at `version`.
+    fn lifetime_program(version: u32, backend: &str, lifetime: Option<Value>) -> Bytecode {
+        let mut agent =
+            json!({"op":"spawn_agent","instance":"t","name":"t.coder","backend":backend});
+        if let Some(lifetime) = lifetime {
+            agent["lifetime"] = lifetime;
+        }
+        serde_json::from_value(json!({
+            "version": version,
+            "team": "Scoped",
+            "instructions": [
+                {"op":"begin_plan","team":"Scoped"},
+                {"op":"declare_instance","name":"t","parent":"","team":"T"},
+                agent,
+                {"op":"commit_plan"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn per(unit: &str, count: u32) -> Option<Value> {
+        Some(json!({"unit": unit, "count": count}))
+    }
+
+    #[test]
+    fn a_lifetime_is_carried_and_none_is_not_written() {
+        let program = lifetime_program(2, "Claude", per("tag", 3));
+        let state = verify(&program).unwrap();
+        let lifetime = state.agents["t.coder"].lifetime.unwrap();
+        assert_eq!(
+            lifetime,
+            Lifetime {
+                unit: LifetimeUnit::Tag,
+                count: 3
+            }
+        );
+        assert_eq!(lifetime.to_string(), "per 3 tags");
+        // Round trips through the bytecode a checkpoint keeps as program.json.
+        let kept: Bytecode =
+            serde_json::from_value(serde_json::to_value(&program).unwrap()).unwrap();
+        assert_eq!(kept.instructions, program.instructions);
+        assert_eq!(
+            serde_json::to_value(&kept.instructions[2]).unwrap()["lifetime"],
+            json!({"unit":"tag","count":3})
+        );
+        assert_eq!(
+            serde_json::to_value(&state.agents["t.coder"]).unwrap()["lifetime"],
+            json!({"unit":"tag","count":3})
+        );
+        for (count, unit, spelled) in [
+            (1, "task", "per task"),
+            (1, "tag", "per tag"),
+            (5, "task", "per 5 tasks"),
+        ] {
+            let state = verify(&lifetime_program(2, "Stub", per(unit, count))).unwrap();
+            assert_eq!(
+                state.agents["t.coder"].lifetime.unwrap().to_string(),
+                spelled
+            );
+        }
+        // Without one the agent's bytecode and state are as they always were.
+        let plain = lifetime_program(1, "Claude", None);
+        let state = verify(&plain).unwrap();
+        assert_eq!(state.agents["t.coder"].lifetime, None);
+        assert!(serde_json::to_value(&plain.instructions[2])
+            .unwrap()
+            .get("lifetime")
+            .is_none());
+        assert!(serde_json::to_value(&state.agents["t.coder"])
+            .unwrap()
+            .get("lifetime")
+            .is_none());
+    }
+
+    #[test]
+    fn a_lifetime_is_refused_where_it_could_be_dropped_or_unkept() {
+        // Version 1 is what a runtime that predates lifetimes reads, ignoring
+        // `lifetime`: such a program would keep the conversation.
+        let error = verify(&lifetime_program(1, "Claude", per("tag", 1)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs bytecode version 2"), "{error}");
+        // A backend that cannot promise a fresh conversation is refused before
+        // anything starts, naming what can.
+        for backend in ["Web", "Agy", "Antigravity", "Cursor", "Nope"] {
+            let error = verify(&lifetime_program(2, backend, per("task", 5)))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "agent 't.coder' resets its conversation (per 5 tasks), but backend '{backend}' cannot start a fresh conversation"
+                )) && error.contains("supported: claude, codex, opencode, pi, jev, stub"),
+                "{backend}: {error}"
+            );
+        }
+        for backend in ["Claude", "Codex", "OpenCode", "Pi", "Jev", "Stub"] {
+            verify(&lifetime_program(2, backend, per("tag", 1))).unwrap();
+        }
+        // Never a count of nothing.
+        let error = verify(&lifetime_program(2, "Claude", per("tag", 0)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least 1"), "{error}");
+        // A lifetime this runtime does not know is an error, not the default.
+        for lifetime in [
+            json!({"unit":"week","count":1}),
+            json!({"unit":"tag"}),
+            json!({"unit":"tag","count":1,"extra":true}),
+            json!("tag"),
+        ] {
+            let unknown = serde_json::from_value::<Bytecode>(json!({
+                "version": 2, "team": "Scoped", "instructions": [
+                    {"op":"begin_plan","team":"Scoped"},
+                    {"op":"spawn_agent","name":"coder","backend":"Claude","lifetime":lifetime},
+                    {"op":"commit_plan"}
+                ]
+            }));
+            assert!(unknown.is_err(), "{lifetime}");
+        }
+        // Nor does a newer version pass.
+        assert!(verify(&lifetime_program(3, "Claude", per("tag", 1))).is_err());
+    }
+
+    /// Which window each of an agent's invocations, at `tags`, falls in: the
+    /// runtime's own rule, driven the way `admit` drives it.
+    fn windows_of(lifetime: Lifetime, tags: &[(u64, u64)]) -> Vec<usize> {
+        let tag = |(timestamp, microstep)| Tag {
+            timestamp,
+            microstep,
+        };
+        let mut windows = Vec::new();
+        let mut open: Option<(usize, Used)> = None;
+        for &at in tags {
+            let at = tag(at);
+            let window = match open {
+                Some((window, mut used)) if !used.spent(lifetime, at) => {
+                    used.take(at);
+                    open = Some((window, used));
+                    window
+                }
+                _ => {
+                    let window = windows.last().map_or(0, |last| last + 1);
+                    open = Some((window, Used::first(at)));
+                    window
+                }
+            };
+            windows.push(window);
+        }
+        windows
+    }
+
+    fn life(unit: LifetimeUnit, count: u32) -> Lifetime {
+        Lifetime { unit, count }
+    }
+
+    #[test]
+    fn per_task_gives_every_invocation_a_window_of_its_own() {
+        // Two in one tag are still two windows.
+        assert_eq!(
+            windows_of(life(LifetimeUnit::Task, 1), &[(1, 0), (1, 0), (2, 0)]),
+            [0, 1, 2]
+        );
+        assert!(Used::first(Tag::default()).exhausted(life(LifetimeUnit::Task, 1)));
+    }
+
+    #[test]
+    fn per_n_tasks_ends_a_window_after_that_many_invocations() {
+        // Three invocations, two windows.
+        assert_eq!(
+            windows_of(life(LifetimeUnit::Task, 2), &[(1, 0), (1, 0), (2, 0)]),
+            [0, 0, 1]
+        );
+        let mut used = Used::first(Tag::default());
+        assert!(!used.exhausted(life(LifetimeUnit::Task, 2)));
+        used.take(Tag::default());
+        assert!(used.exhausted(life(LifetimeUnit::Task, 2)));
+    }
+
+    #[test]
+    fn per_tag_shares_one_window_between_invocations_in_a_tag() {
+        // The same agent twice in one tag (a loop's second reaction arrives at
+        // the same tag) shares a conversation; the next tag starts another.
+        assert_eq!(
+            windows_of(
+                life(LifetimeUnit::Tag, 1),
+                &[(1, 0), (1, 0), (2, 0), (2, 0)]
+            ),
+            [0, 0, 1, 1]
+        );
+        // A tag is a timestamp and a microstep: a loop through `after 0`
+        // reaches a new tag on every pass.
+        assert_eq!(
+            windows_of(life(LifetimeUnit::Tag, 1), &[(1, 0), (1, 1), (1, 2)]),
+            [0, 1, 2]
+        );
+        // Tags cannot say a window is over: the agent may run in it again.
+        assert!(!Used::first(Tag::default()).exhausted(life(LifetimeUnit::Tag, 1)));
+    }
+
+    #[test]
+    fn per_n_tags_counts_only_the_tags_the_agent_runs_in() {
+        // Other agents' tags (here 2, 3, 4, 6, 7, 8) never reach this one, so
+        // they do not shorten its window: it runs at 1, 5 and 9.
+        assert_eq!(
+            windows_of(life(LifetimeUnit::Tag, 2), &[(1, 0), (5, 0), (9, 0)]),
+            [0, 0, 1]
+        );
+        assert_eq!(
+            windows_of(
+                life(LifetimeUnit::Tag, 2),
+                &[(1, 0), (1, 0), (2, 0), (3, 0), (3, 0), (4, 0)]
+            ),
+            [0, 0, 0, 1, 1, 1]
+        );
+    }
+
+    /// A conversation a backend minted is taken only when it is new: not
+    /// empty, not one any attempt reported before, and passing the backend's
+    /// own proof. Whatever is refused is never taken later either.
+    #[test]
+    fn a_reported_conversation_is_refused_unless_it_is_shown_new() {
+        let seen = Mutex::new(Ok(BTreeSet::new()));
+        let fresh = |reported: &str, seen: &Mutex<Result<BTreeSet<String>, String>>| {
+            fresh_conversation(Freshness::Reported, "chosen", reported, seen, || Ok(()))
+        };
+        fresh("first", &seen).unwrap();
+        let reused = fresh("first", &seen).unwrap_err().to_string();
+        assert!(
+            reused.contains("an earlier attempt already had"),
+            "{reused}"
+        );
+        for empty in ["", "  "] {
+            let error = fresh(empty, &seen).unwrap_err().to_string();
+            assert!(error.contains("empty conversation id"), "{error}");
+        }
+        let unproved = fresh_conversation(Freshness::Reported, "chosen", "forked", &seen, || {
+            bail!("it was forked from another thread")
+        })
+        .unwrap_err();
+        assert!(
+            format!("{unproved:#}").contains("it was forked from another thread"),
+            "{unproved:#}"
+        );
+        assert!(fresh("forked", &seen).is_err());
+        // Nor is a minted id taken when the earlier ones are unknown.
+        let unknown = Mutex::new(Err("unreadable log".to_string()));
+        let error = fresh("second", &unknown).unwrap_err().to_string();
+        assert!(error.contains("unreadable log"), "{error}");
+    }
+
+    /// A chosen conversation must be the one given; its proof still runs; and
+    /// it closes the id to a later minted report.
+    #[test]
+    fn a_chosen_conversation_must_be_the_one_given() {
+        let seen = Mutex::new(Ok(BTreeSet::new()));
+        let error = fresh_conversation(Freshness::Chosen, "given", "other", &seen, || Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not the new conversation given"), "{error}");
+        assert!(
+            fresh_conversation(Freshness::Chosen, "given", "given", &seen, || bail!("no")).is_err()
+        );
+        assert!(fresh_conversation(Freshness::Reported, "x", "given", &seen, || Ok(())).is_err());
+        // An unreadable log does not stand in the way of an id minted for
+        // this attempt alone.
+        let unknown = Mutex::new(Err("unreadable log".to_string()));
+        fresh_conversation(Freshness::Chosen, "new", "new", &unknown, || Ok(())).unwrap();
+    }
+
+    /// The conversations a resumed run must not take again are every one its
+    /// log recorded; a log that cannot be read is an error, not empty.
+    #[test]
+    fn earlier_conversations_are_read_from_the_attempt_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("attempts.jsonl");
+        assert_eq!(reported_conversations(&log), Ok(BTreeSet::new()));
+        fs::write(
+            &log,
+            "{\"native_session_id\":null,\"outcome\":\"started\"}\n\
+             {\"native_session_id\":\"a\",\"outcome\":\"started\"}\n\
+             {\"native_session_id\":\"a\",\"outcome\":\"completed\"}\n\
+             {\"native_session_id\":\"b\",\"outcome\":\"failed\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            reported_conversations(&log),
+            Ok(BTreeSet::from(["a".to_string(), "b".to_string()]))
+        );
+        let seen = Mutex::new(reported_conversations(&log));
+        assert!(fresh_conversation(Freshness::Reported, "x", "b", &seen, || Ok(())).is_err());
+        fs::write(&log, "{\"native_session_id\":\"a\"}\n{\"native_sess").unwrap();
+        assert!(reported_conversations(&log).is_err());
+    }
+
+    #[test]
+    fn only_the_attempt_an_invocation_was_started_for_may_answer_it() {
+        let registry = InvocationRegistry::default();
+        let completion = registry
+            .register(InvocationRecord {
+                id: 9,
+                team: "Scoped".into(),
+                agent: "t.coder".into(),
+                reaction: "t.reaction.0".into(),
+                contract: "t.out".into(),
+                allowed_effects: BTreeMap::from([("t.out".into(), "string".into())]),
+                trigger_values: BTreeMap::new(),
+                prompt: "go".into(),
+                writes: BTreeMap::new(),
+                completed: false,
+                attempt: Some("second".into()),
+            })
+            .unwrap();
+        let set = || {
+            InvocationCommand::SetPort(SetPortArgs {
+                task_id: 9,
+                port: "t.out".into(),
+                value: json!("v"),
+            })
+        };
+        let complete = || InvocationCommand::Complete(CompleteArgs { task_id: 9 });
+        // The worker of an earlier attempt has the same name, and is refused;
+        // so is a call that names no attempt at all.
+        for stale in [Some("first"), None] {
+            let error = registry
+                .execute("Scoped", "t.coder", stale, set())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("belongs to another worker attempt") && !error.contains("second"),
+                "{error}"
+            );
+            assert!(registry
+                .execute("Scoped", "t.coder", stale, complete())
+                .is_err());
+            let pending = registry
+                .execute("Scoped", "t.coder", stale, InvocationCommand::Pending)
+                .unwrap();
+            assert_eq!(pending["pending"], json!([]));
+        }
+        assert!(completion.try_recv().is_err(), "a stale attempt published");
+        registry
+            .execute("Scoped", "t.coder", Some("second"), set())
+            .unwrap();
+        registry
+            .execute("Scoped", "t.coder", Some("second"), complete())
+            .unwrap();
+        assert_eq!(completion.try_recv().unwrap()["t.out"], json!("v"));
+        // A duplicate completion publishes nothing more.
+        assert_eq!(
+            registry
+                .execute("Scoped", "t.coder", Some("second"), complete())
+                .unwrap()["status"],
+            json!("already_complete")
+        );
+        assert!(completion.try_recv().is_err());
+        // Nor can anything answer once the invocation is over.
+        registry.remove(&9);
+        assert!(registry
+            .execute("Scoped", "t.coder", Some("second"), complete())
+            .is_err());
     }
 }

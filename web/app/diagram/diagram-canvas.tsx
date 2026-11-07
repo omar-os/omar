@@ -12,9 +12,11 @@ import {
 import {
   formatCountdown,
   formatDuration,
+  lifetimeLabel,
   runClockAt,
   webAgents,
   type DiagramSnapshot,
+  type Lifetime,
 } from "../lib/protocol";
 
 /**
@@ -164,6 +166,8 @@ type ReactionView = {
   /** One line of what the task asks, from its prompt; the contract for a code reaction. */
   summary: string;
   backend: string;
+  /** How long its agent's conversation lives, when the program says: `per tag`. */
+  lifetime: string | null;
   status: string;
   box: Box;
   /** The agent that runs it, which is whose terminal opens on double click. */
@@ -424,6 +428,11 @@ function flattenLayout(
 }
 
 type ReactionLabels = { name: string; meta: string };
+
+/** `per tag`, or nothing for an agent that keeps one conversation for the run. */
+function lifetimeOf(lifetime: Lifetime | null | undefined): string | null {
+  return lifetime ? lifetimeLabel(lifetime) : null;
+}
 
 /**
  * Labels are needed before layout (to size the task card) and after it (to draw
@@ -932,6 +941,7 @@ function buildLayout(
       contract: reaction.contract,
       summary: reaction.prompt ? summarisePrompt(reaction.prompt) : reaction.contract,
       backend: snapshot.agents.find((agent) => agent.id === reaction.agent)?.backend ?? "Agent",
+      lifetime: lifetimeOf(snapshot.agents.find((agent) => agent.id === reaction.agent)?.lifetime),
       status: reaction.status,
       box: nodeBoxes.get(reaction.id) ?? { x: 0, y: 0, ...REACTION_SIZE },
       agent: componentName(reaction.agent),
@@ -1820,7 +1830,7 @@ export function DiagramCanvas({
                   key={reaction.id}
                   {...selectable(
                     reaction.id,
-                    `omar-reaction ${reaction.status}${reaction.web ? " web" : ""}`,
+                    `omar-reaction ${reaction.status}${reaction.web ? " web" : ""}${reaction.lifetime ? " resets" : ""}`,
                   )}
                   onDoubleClick={(event) => {
                     // The canvas resets the view on double click; a reaction
@@ -1834,6 +1844,8 @@ export function DiagramCanvas({
                   }}
                   transform={`translate(${reaction.box.x},${reaction.box.y})`}
                 >
+                  {/* Anywhere on the card says what the lifetime means. */}
+                  {reaction.lifetime ? <title>{`Conversation: new ${reaction.lifetime}`}</title> : null}
                   <rect className="omar-reaction-body" width={reaction.box.width} height={reaction.box.height} rx={9} />
                   <path className="omar-reaction-accent" d={`M9 1.5 H${reaction.box.width - 9}`} />
                   <circle className="node-connection" cx={0} cy={reaction.box.height / 2} r={4} />
@@ -1869,7 +1881,21 @@ export function DiagramCanvas({
                   <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 59) scale(0.5)`}>
                     <BackendMark backend={reaction.backend} />
                   </g>
-                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={68}>{reaction.meta}</text>
+                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={68}>
+                    {reaction.meta}
+                  </text>
+                  {/* An agent that resets its conversation says when, small and
+                      apart from the backend and status it would crowd. */}
+                  {reaction.lifetime ? (
+                    <text
+                      className="omar-reaction-lifetime"
+                      x={reaction.box.width - CARD_END_PADDING}
+                      y={14}
+                      textAnchor="end"
+                    >
+                      {reaction.lifetime}
+                    </text>
+                  ) : null}
                   {/* A deadline the program set for itself. A stopwatch rather
                       than a clock: a timer fires on its own, this counts down
                       against work already running. */}
@@ -1975,6 +2001,12 @@ export function DiagramCanvas({
             <rect className="omar-reaction-body running" x="1" y="1" width="16" height="10" rx="2" />
           </svg>
           running
+        </span>
+        <span>
+          <svg viewBox="0 0 18 12" aria-hidden="true">
+            <rect className="omar-reaction-body resets" x="1" y="1" width="16" height="10" rx="2" />
+          </svg>
+          resets conversation
         </span>
       </div>
     </div>

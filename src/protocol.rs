@@ -35,7 +35,7 @@ use crate::properties::{ProofProblem, PropertyVerdict};
 use crate::serve::{
     ChatMessage, ChatRole, MutationRecord, MutationStatus, ProposedDesign, RunRecord, RunStatus,
 };
-use crate::topology::PortKind;
+use crate::topology::{Lifetime, LifetimeUnit, PortKind};
 
 /// Where the generated file lives, relative to the repository root.
 pub const GENERATED_PATH: &str = "web/app/lib/protocol-generated.ts";
@@ -140,6 +140,12 @@ fn vocabularies() -> Vec<Vocabulary> {
             &[PortKind::Input, PortKind::Output, PortKind::Action],
         ),
         vocabulary(
+            "LIFETIME_UNITS",
+            "LifetimeUnit",
+            "What an agent's `per` lifetime counts.",
+            &[LifetimeUnit::Task, LifetimeUnit::Tag],
+        ),
+        vocabulary(
             "DIAGRAM_EVENT_KINDS",
             "DiagramEventKind",
             "What happened, as the event stream names it.",
@@ -153,6 +159,7 @@ fn vocabularies() -> Vec<Vocabulary> {
                 DiagramEventKind::RunPaused,
                 DiagramEventKind::RunCheckpointed,
                 DiagramEventKind::ClockStarted,
+                DiagramEventKind::AgentAttempt,
             ],
         ),
         vocabulary(
@@ -196,6 +203,7 @@ pub fn generate() -> String {
     let mut decls = vec![
         DiagramTag::decl(&config),
         DiagramInstance::decl(&config),
+        Lifetime::decl(&config),
         DiagramAgent::decl(&config),
         DiagramPort::decl(&config),
         DiagramTimer::decl(&config),
@@ -243,6 +251,7 @@ mod tests {
             "ReactionStatus",
             "EdgeKind",
             "PortKind",
+            "LifetimeUnit",
             "DiagramEventKind",
             "ChatRole",
         ] {

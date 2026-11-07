@@ -450,13 +450,13 @@ pub fn run_server_from_context_file(
             .with_context(|| format!("Failed to read MCP context file {}", path.display()))?,
     )
     .with_context(|| format!("Failed to parse MCP context file {}", path.display()))?;
+    // A context shared by every pane of the EA (Antigravity's user-global MCP
+    // registration) names no agent; the pane's own, from its environment,
+    // does, topology agent and attempt included.
     if context.topology.is_none() {
         if let Some(path) = std::env::var_os("OMAR_MCP_CONTEXT_FILE") {
             let scoped: McpLaunchContext = serde_json::from_slice(&fs::read(path)?)?;
-            if scoped.ea_id == context.ea_id
-                && scoped.omar_dir == context.omar_dir
-                && scoped.topology.is_none()
-            {
+            if scoped.ea_id == context.ea_id && scoped.omar_dir == context.omar_dir {
                 context = scoped;
             }
         }
@@ -3492,6 +3492,7 @@ mod tests {
                 agent: "a".to_string(),
                 endpoint: "127.0.0.1:1".to_string(),
                 token: "t".to_string(),
+                attempt: None,
             }),
             ..test_context()
         });
@@ -3535,6 +3536,7 @@ mod tests {
                     agent: "a".to_string(),
                     endpoint: "127.0.0.1:1".to_string(),
                     token: "t".to_string(),
+                    attempt: None,
                 }),
                 ..test_context()
             },
@@ -3624,6 +3626,7 @@ mod tests {
                 agent: "a".to_string(),
                 endpoint: "127.0.0.1:1".to_string(),
                 token: "t".to_string(),
+                attempt: None,
             }),
             ..test_context()
         };

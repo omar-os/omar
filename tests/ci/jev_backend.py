@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import unittest
 
+from scratch_session import left_running
+
 REPO = Path(__file__).resolve().parents[2]
 PROGRAM = '''type Decision from "./schemas/decision.json"
 team Review[reviewer : Jev] {
@@ -92,7 +94,7 @@ class JevBackendTests(unittest.TestCase):
                 env.pop("OMAR_JEV_ON_ERROR", None)
                 if policy != "default": env["OMAR_JEV_ON_ERROR"] = policy
                 if mode == "missing_key": env.pop("TYPESAFE_API_KEY", None)
-                env["OMAR_HOME"] = tempfile.mkdtemp(prefix="omar-jev-adapter-test-")
+                env["OMAR_HOME"] = str(temp / "home")
                 message = "test request" + ("x" * 65536 if mode == "blocked_input" else "")
                 result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(temp / "workflow.omar"),
                     "--input", "review.request=" + message, "--timeout-seconds", "30", "--fast", "--fg"],
@@ -154,7 +156,7 @@ main JevConfigurationTest { review = Review() }
                 env = dict(os.environ, TYPESAFE_API_KEY="fixture-not-a-real-key", OMAR_JEV_MODEL="jev-fixture-selected")
                 env["PATH"] = f"{temp}:{REPO}/target/debug:{REPO}/lang/.lake/build/bin:{Path.home()}/.cargo/bin:" + env.get("PATH", "")
                 env["OMARC_BIN"] = str(REPO / "lang/.lake/build/bin/omarc")
-                env["OMAR_HOME"] = tempfile.mkdtemp(prefix="omar-jev-configuration-test-")
+                env["OMAR_HOME"] = str(temp / "home")
                 env["OMAR_JEV_ON_ERROR"] = "bad" if mode == "bad_policy" else "defer"
                 if mode == "empty_model": env["OMAR_JEV_MODEL"] = " "
                 result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(temp / "workflow.omar"),
@@ -276,6 +278,61 @@ main JevConfigurationTest { review = Review() }
                 self.assertNotIn('fixture-not-a-real-key', result.stdout + result.stderr)
                 self.assertNotIn('private-service-error', result.stdout + result.stderr)
 
+    def test_an_invocation_scoped_jev_agent_carries_nothing_between_invocations(self):
+        # Jev holds no conversation: each invocation is one request in a curl
+        # process of its own, built from that invocation alone.
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            (temp / "schemas").mkdir()
+            (temp / "schemas/decision.json").write_text(json.dumps({"type":"string", "enum":["continue","stop"]}))
+            (temp / "workflow.omar").write_text('''type Decision from "./schemas/decision.json"
+team Review[reviewer : Jev per task] {
+    input request : string
+    action mid : Decision
+    output out : Decision
+    task reviewer(request) -> mid "First. The secret is SENTINEL-$(request)."
+    task reviewer(mid) -> out "Second. Got $(mid)."
+}
+main JevScoped { review = Review() }
+''')
+            log = temp / "requests.jsonl"
+            response = {"model":"jev-1.13.0", "answers":{"decision":{"type":"choice", "choice":"continue",
+                "confidence":.99, "probabilities":{"continue":.99,"stop":.01}},
+                "sufficient_context":{"type":"noul","noul":.99}}}
+            curl = temp / "curl"
+            curl.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+                "config=sys.stdin.read()\n"
+                "line=next(line for line in config.splitlines() if line.startswith('data = '))\n"
+                "request=json.loads(json.loads(line[7:]))\n"
+                + "open(" + repr(str(log)) + ",'a').write(json.dumps({'pid':os.getpid(),'request':request})+'\\n')\n"
+                + "sys.stdout.write(" + repr(json.dumps(response) + "\n200") + ")\n")
+            curl.chmod(0o700)
+            env = dict(os.environ, TYPESAFE_API_KEY="fixture-not-a-real-key")
+            for name in ("OMAR_JEV_MODEL", "OMAR_JEV_ON_ERROR"): env.pop(name, None)
+            env["PATH"] = f"{temp}:{REPO}/target/debug:{REPO}/lang/.lake/build/bin:" + env.get("PATH", "")
+            env["OMARC_BIN"] = str(REPO / "lang/.lake/build/bin/omarc")
+            env["OMAR_HOME"] = str(temp / "home")
+            result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(temp / "workflow.omar"),
+                "--input", "review.request=alpha", "--timeout-seconds", "30", "--fast", "--fg"],
+                env=env, text=True, capture_output=True, timeout=60)
+            session = re.search(r"Started session ([\w-]+)", result.stderr)
+            if session:
+                subprocess.run([str(REPO / "target/debug/omar"), "down", "-s", session.group(1)], env=env, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('Output review.out = "continue"', result.stdout)
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual(len(calls), 2, calls)
+            self.assertNotEqual(calls[0]["pid"], calls[1]["pid"])
+            for call in calls:
+                self.assertEqual(set(call["request"]), {"model", "state", "questions"})
+            self.assertIn("SENTINEL-alpha", json.dumps(calls[0]["request"]))
+            self.assertNotIn("SENTINEL", json.dumps(calls[1]["request"]))
+            self.assertEqual(calls[1]["request"]["state"], {"review.mid": "continue"})
+            # No worker, so no attempt to record.
+            self.assertEqual(list((temp / "home").rglob("attempts.jsonl")), [])
+            # The session the run made for itself went with it.
+            self.assertEqual(list((temp / "home/sessions").iterdir()), [])
+            self.assertEqual(left_running(temp), [])
 
 
 if __name__ == "__main__":
