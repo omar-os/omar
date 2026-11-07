@@ -778,6 +778,7 @@ export function subscribeToDiagram(
     "run_paused",
     "run_checkpointed",
     "clock_started",
+    "check_completed",
   ];
   for (const kind of kinds) {
     stream.addEventListener(kind, (raw) => {

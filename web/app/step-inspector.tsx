@@ -39,6 +39,7 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
         <div className="inspector-field"><span>Execution backend</span><div className="step-model"><i>{(agent?.backend ?? "?").slice(0, 1)}</i>{agent?.backend ?? "Not specified"}<span className={`step-status ${reaction.status}`}>{reaction.status}</span></div></div>
         <div className="inspector-field"><span>Output contract</span><div className="step-contract">{reaction.contract || "No contract declared"}</div></div>
         {reaction.within != null ? <div className="inspector-field"><span>Deadline</span><strong>{formatDuration(reaction.within)}</strong></div> : null}
+        {reaction.check ? <div className="inspector-field"><span>Check</span><strong>{reaction.check.passed ? "passed" : "failed"}{reaction.check.exit_code != null ? ` (exit ${reaction.check.exit_code})` : " (killed)"}</strong></div> : null}
         <div className="connections-heading"><span>Connections</span>{readOnly ? null : <button type="button" onClick={() => onAsk(`Update the connections for ${component}: `)}><WorkflowIcon name="plus" size={12} /> Edit</button>}</div>
         <div className="inspector-field"><span>Receives</span>{connectionNames(reaction.triggers)}</div>
         <div className="inspector-field"><span>Produces</span>{connectionNames(reaction.effects)}</div>

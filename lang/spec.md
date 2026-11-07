@@ -45,11 +45,12 @@ endpoint    = identifier | qualified ;
 qualified   = identifier, ".", identifier ;
 
 task        = "task", identifier, "(", [ triggers ], ")",
-              "->", effects, [ deadline ], string ;
+              "->", effects, [ deadline ], string, [ check ] ;
 reaction    = "reaction", "(", [ triggers ], ")", "->", effects,
               [ deadline ], code-body ;
 code-body   = "{=", rust, "=}" ;
 deadline    = "within", "(", duration, ")" ;
+check       = "check", string ;
 delay       = duration | "0" ;
 duration    = natural, unit ;
 unit        = "ns" | "us" | "ms" | "s" | "sec" | "min" | "h" | "hr" ;
@@ -254,6 +255,15 @@ second clause saying what to fall back to:
 A body that expires is killed with nothing written, so its instance keeps the
 state it held before the invocation.
 
+A task may end with `check "command"`, after its prompt: a shell command its
+completion must pass (§4.2). A command must not be empty, and a code reaction
+has no completion to check, so it takes none. `check` stays an ordinary port
+name; only a string after it makes the clause.
+
+```
+task coder(job) -> impl within(2h) "Implement the job." check "bash delivery_check.sh"
+```
+
 ### 2.5 Durations
 
 Every span of time in the language is a duration: `after`, a timer's offset and
@@ -437,6 +447,25 @@ value `null`; this preserves the distinction between absence and a signal.
 Writes remain private until `omar_complete`. Completion validates the final
 port snapshot against the contract. Calls after completion are rejected.
 
+A task with a `check` has one more step. After the contract holds,
+`omar_complete` runs the command with `sh -c`, in the instance workspace the
+agent works in. A check runs with the worker's environment plus `OMAR_*`
+(`OMAR_WORKTREE`, `OMAR_TEMP`, `OMAR_TASK_ID`, `OMAR_REACTION` and `OMAR_EFFECTS`,
+the path of a JSON file mapping each port written so far to its value). Stdin is empty. Exit 0 accepts the completion and
+releases the writes as above. Any other exit refuses it: `omar_complete` returns
+an error holding the command's stdout and stderr (the last 16 KiB), the
+invocation stays open, and the writes stay private and may be changed. The agent
+fixes the cause and calls `omar_complete` again, which runs the check again, in
+the same turn. While the check runs, `omar_set_port` is rejected.
+
+The check is bounded by the task's deadline (§2.4). One still running then is
+killed and refuses, and the invocation expires like any other. The command's
+whole process group is killed however it ends. Each run's start, end, exit code
+and output are recorded in the run's `checks.jsonl` and published on the
+diagram stream. The check refines when a completion is accepted and never what
+it releases, so §8 is unchanged. An agent that answers without calling
+`omar_complete` (a direct backend) cannot have a check, and the VM rejects one.
+
 The topology runner owns invocation records in memory. Topology-scoped MCP
 processes send authenticated commands to the runner over a loopback connection.
 Each active invocation has a completion channel, so `omar_complete` wakes the
@@ -543,7 +572,7 @@ DECLARE_TIMER name offset period
 DECLARE_STATE name type initial
 DECLARE_PARAM name type value
 CONNECT_PORTS source target [delay]
-INSTALL_REACTION id agent triggers effects contract prompt [body] [within]
+INSTALL_REACTION id agent triggers effects contract prompt [body] [within] [check]
 
 COMMIT_PLAN
 ```
@@ -565,7 +594,7 @@ KILL_AGENT name
 REMOVE_INSTANCE name
 REMOVE_TYPE name
 
-UPDATE_REACTION id agent triggers effects contract prompt [body] [within]
+UPDATE_REACTION id agent triggers effects contract prompt [body] [within] [check]
 ```
 
 Removals run in the reverse of declaration order. A changed declaration other
@@ -596,12 +625,14 @@ The port `delay` field is omitted when no fixed delay is declared.
 Reaction fields are ordered:
 
 ```text
-op, id, agent, triggers, effects, contract, prompt, body, within
+op, id, agent, triggers, effects, contract, prompt, body, within, check
 ```
 
 `body` is a code reaction's Rust and is omitted for a task; `agent` is empty
 for a code reaction. `within` is nanoseconds, and is omitted when the reaction
-declares no deadline.
+declares no deadline. `check` is the task's check command, and is omitted
+when it has none, so a program without checks compiles to the same bytes as
+before.
 
 The VM verifies the complete plan before performing effects. Unknown
 instructions, invalid references, invalid types, or inconsistent contracts are

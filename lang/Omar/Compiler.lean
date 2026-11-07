@@ -265,6 +265,10 @@ structure Reaction where
   /-- How long one invocation may take, in nanoseconds. `none` leaves it to the
       run-wide timeout. -/
   within : Option Nat := none
+  /-- A shell command a task's completion must pass: `omar_complete` runs it and
+      accepts the completion only on exit 0. `none` accepts as soon as the
+      contract holds. Tasks only; a code reaction has no completion to refuse. -/
+  check : Option String := none
   instance_ : String := ""
   deriving Repr
 
@@ -655,11 +659,21 @@ private partial def parseDeclarations
       let (prompt, rest) ← match rest with
         | Token.text prompt :: tail => pure (prompt, tail)
         | _ => throw "expected the task's prompt string after the production contract"
+      -- `check "cmd"` follows the prompt, which closes every other clause: two
+      -- strings side by side would read as one prompt. `check -> x` is still a
+      -- connection from a port of that name, so only a string makes it a clause.
+      let (check, rest) ← match rest with
+        | Token.word "check" :: Token.text command :: tail =>
+            if command.trimAscii.isEmpty then
+              throw "the task's check command is empty"
+            else
+              pure (some command, tail)
+        | _ => pure (none, rest)
       let effects := productionTargets contractTokens
       let contract := String.intercalate " " (contractTokens.map tokenSource)
       let reaction := {
         id := s!"reaction.{reactionIndex}"
-        agent, triggers, effects, contract, prompt, within
+        agent, triggers, effects, contract, prompt, within, check
       }
       parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
   -- `task` asks an agent, `reaction` just runs, so a reaction names none.
@@ -680,6 +694,9 @@ private partial def parseDeclarations
       let (body, rest) ← match rest with
         | Token.code body :: tail => pure (body, tail)
         | _ => throw "expected code block after production contract"
+      -- A body completes by returning; there is no `omar_complete` to check.
+      if let Token.word "check" :: Token.text _ :: _ := rest then
+        throw "a check applies to a task, not a code reaction: a body completes by returning"
       let effects := productionTargets contractTokens
       let contract := String.intercalate " " (contractTokens.map tokenSource)
       let reaction := {
@@ -1138,8 +1155,10 @@ def instructionTexts (program : Program) : Array String :=
       ("prompt", toJson reaction.prompt)
     ] ++ (match reaction.body with
       | some body => [("body", toJson body)]
-      | none => []) ++ match reaction.within with
+      | none => []) ++ (match reaction.within with
       | some within => [("within", toJson within)]
+      | none => []) ++ match reaction.check with
+      | some check => [("check", toJson check)]
       | none => []
     instruction "install_reaction" fields
   let commit := instruction "commit_plan"

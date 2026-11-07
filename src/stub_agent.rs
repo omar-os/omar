@@ -83,7 +83,16 @@ fn answer(topology: &TopologyMcpContext, fields: &BTreeMap<String, String>) -> R
             }),
         )?;
     }
-    send(topology, json!({"op": "complete", "task_id": task_id}))?;
+    // A refused completion (a failing check) is a cue to keep working: the
+    // writes stand, so completing again is the whole fix a stub can make.
+    let mut refused = 0;
+    while let Err(error) = send(topology, json!({"op": "complete", "task_id": task_id})) {
+        refused += 1;
+        if refused >= 5 || !error.to_string().contains("completion refused") {
+            return Err(error);
+        }
+        println!("stub agent was refused on {task_id}, trying again");
+    }
     println!("stub agent answered {task_id}");
     std::io::stdout().flush().ok();
     Ok(())
