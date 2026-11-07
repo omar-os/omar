@@ -1513,6 +1513,17 @@ pub(crate) mod tests {
             ("stub", "omar stub-agent"),
             ("unknown", "custom-agent --x"),
             ("env-wrapper", "FOO=bar claude"),
+            // A topology agent with `model = "..."`: the backend's own words
+            // for it, added after the operator's command.
+            (
+                "claude-model",
+                "claude --some-flag --model 'claude-haiku-5-5'",
+            ),
+            ("codex-model", "codex -m 'gpt-5.1-codex'"),
+            (
+                "opencode-model",
+                "opencode --port 4444 --model 'openrouter/nvidia/x:free'",
+            ),
         ] {
             lines.push((name, mask(build_agent_command(base, &prompt, &subs, &ctx))));
         }
@@ -1525,6 +1536,59 @@ pub(crate) mod tests {
             lines.push((name, mask(build_ea_command(base, 7, "Seven", dir, &ctx).0)));
         }
         lines
+    }
+
+    /// What the topology launcher adds for `model = "..."` reaches each
+    /// backend's real launch: on the line for the TUI backends, in the
+    /// runner's saved command for the protocol ones.
+    #[test]
+    fn a_model_reaches_every_backends_launch() {
+        let _env_lock = global_home_env_lock();
+        let dir = short_tempdir();
+        let prompt = dir.path().join("prompt.md");
+        std::fs::write(&prompt, "You are a worker.\n").unwrap();
+        let ctx = test_mcp_context(dir.path());
+        for (name, base, model) in [
+            ("claude", "claude", "claude-haiku-5-5"),
+            ("codex", "codex", "gpt-5.1-codex"),
+            (
+                "opencode",
+                "opencode --port 4444",
+                "openrouter/nvidia/x:free",
+            ),
+            ("cursor", "cursor agent --yolo", "sonnet-4"),
+            ("agy", "agy --dangerously-skip-permissions", "gemini-3-pro"),
+        ] {
+            let backend = crate::backend::by_name(name).unwrap();
+            let flag = backend.model_flag(model).unwrap();
+            assert!(flag.contains(model), "{name}: {flag}");
+            let line = build_agent_command(&format!("{base} {flag}"), &prompt, &[], &ctx);
+            // A protocol backend keeps its command in the runner's config.
+            let saved = line
+                .split("--config-file '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .map(|path| std::fs::read_to_string(path).unwrap())
+                .unwrap_or_default();
+            assert!(
+                line.contains(&flag)
+                    || saved.contains(&flag.replace('\'', "'\\''"))
+                    || saved.contains(model),
+                "{name} lost its model: {line}\n{saved}"
+            );
+            if saved.is_empty() {
+                continue;
+            }
+            let config: serde_json::Value = serde_json::from_str(&saved).unwrap();
+            let command = config["command"].as_str().unwrap();
+            assert!(command.contains(&flag), "{name}: {command}");
+        }
+        // The same names the model has in a pi launch.
+        let pi = crate::backend::by_name("pi")
+            .unwrap()
+            .model_flag("openai/gpt-4o")
+            .unwrap();
+        assert_eq!(pi, "--model 'openai/gpt-4o'");
     }
 
     #[test]

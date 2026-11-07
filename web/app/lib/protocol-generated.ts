@@ -69,6 +69,10 @@ instance: string,
  */
 lifetime: Lifetime | null,
 /**
+ * The model it was told to run, when the program named one.
+ */
+model: string | null,
+/**
  * A `per` agent's conversation windows, oldest first, each as of its
  * latest change: `invocations` (each with its `reaction`), `attempt_id`,
  * `native_session_id`, `outcome`, `cleanup_status` and the rest of the

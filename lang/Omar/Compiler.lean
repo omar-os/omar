@@ -221,6 +221,9 @@ structure Agent where
   name : String
   backend : String
   lifetime : Option Lifetime := none
+  /-- `Claude(model = "...")`: the model its worker runs, else the CLI's own
+      default. -/
+  model : Option String := none
   /-- The instance it belongs to. Every program instantiates, so this is never
       empty by the time elaboration is done. -/
   instance_ : String := ""
@@ -464,6 +467,32 @@ private def parseScalarType (what : String) (aliases : Array (String × String))
       state and parameters take built-in types, and a schema type is for ports"
   pure (type, rest)
 
+/-- A model name a worker's command line can carry unquoted: no space, quote,
+    or control character, and not mistakable for a flag. -/
+private def validModel (model : String) : Bool :=
+  !model.isEmpty && !model.startsWith "-" &&
+    model.toList.all fun c => c.isAlphanum || "._:/@+-[]".contains c
+
+/-- `Claude(model = "claude-haiku-5-5")`: what follows an agent's backend.
+    Anything but `model` is refused rather than ignored, since a misspelled
+    option would silently keep the model it meant to change. -/
+private def parseAgentOptions (agent : String) :
+    List Token -> Except String (Option String × List Token)
+  | Token.sym "(" :: Token.word "model" :: Token.sym "=" :: Token.text value :: Token.sym ")" :: rest =>
+      if !validModel value then
+        throw s!"agent '{agent}' has invalid model '{value}'; use letters, digits and . _ : / @ + - [ ] \
+          only, not starting with -"
+      else pure (some value, rest)
+  | Token.sym "(" :: Token.word "model" :: Token.sym "=" :: Token.text _ :: _ =>
+      throw s!"agent '{agent}' options must be written (model = \"name\")"
+  | Token.sym "(" :: Token.word "model" :: Token.sym "=" :: _ =>
+      throw s!"agent '{agent}' model must be a quoted name, as in (model = \"name\")"
+  | Token.sym "(" :: Token.word key :: Token.sym "=" :: _ =>
+      throw s!"agent '{agent}' has unknown option '{key}'; the only option is model"
+  | Token.sym "(" :: _ =>
+      throw s!"agent '{agent}' options must be written (model = \"name\")"
+  | rest => pure (none, rest)
+
 /-- `Codex per tag`, `Codex per 5 tasks`: what follows an agent's backend.
     `per task` and `per tag` mean one of the unit; singular and plural are
     interchangeable after any count. Anything else after `per` is refused
@@ -500,6 +529,7 @@ private partial def parseAgents (tokens : List Token) : Except String (Array Age
       let (name, tokens) ← word tokens
       let (_, tokens) ← expectSym ":" tokens
       let (backend, tokens) ← word tokens
+      let (model, tokens) ← parseAgentOptions name tokens
       let (lifetime, tokens) ← parseLifetime name tokens
       -- Refused here, before any bytecode exists, in the runtime's words: a
       -- backend that cannot promise a fresh conversation, or one omarc does
@@ -513,7 +543,11 @@ private partial def parseAgents (tokens : List Token) : Except String (Array Age
           throw s!"agent '{name}' resets its conversation ({spelled}), but backend \
             '{backend}' cannot start a fresh conversation; supported: \
             {", ".intercalate (Backends.freshConversation.map (·[0]!)).toList}"
-      let agent := { name, backend, lifetime : Agent }
+      -- Likewise a model: a backend that cannot be told one would ignore it.
+      if model.isSome && !Backends.modelSelectable.any (·.contains backend.toLower) then
+        throw s!"agent '{name}' sets a model, but backend '{backend}' cannot take one; \
+          supported: {", ".intercalate (Backends.modelSelectable.map (·[0]!)).toList}"
+      let agent := { name, backend, lifetime, model : Agent }
       match tokens with
       | Token.sym "," :: rest =>
           let (agents, tail) ← parseAgents rest
@@ -1146,7 +1180,10 @@ def instructionTexts (program : Program) : Array String :=
       | some life => [("lifetime", Json.mkObj [
           ("unit", toJson (match life.unit with | .task => "task" | .tag => "tag")),
           ("count", toJson life.count)])]
-      | none => []))
+      | none => [])
+      ++ (match agent.model with
+        | some model => [("model", toJson model)]
+        | none => []))
   let ports := program.ports.map fun port =>
     let fields := [
       ("instance", toJson port.instance_),
@@ -1207,13 +1244,15 @@ def instructionTexts (program : Program) : Array String :=
   #[begin] ++ types ++ instances ++ agents ++ ports ++ timers ++ states ++ params ++ connections ++
     reactions ++ #[commit]
 
-/-- Version 2 is version 1 with agent lifetimes. A program without one stays
-    at 1, byte for byte, so every runtime that ran it still does; a program
-    with one is refused by a runtime that would otherwise drop the `lifetime`
-    it does not know and keep the conversation the program said to throw
-    away. -/
+/-- Version 2 is version 1 with agent lifetimes, version 3 adds per-agent
+    models (and may carry lifetimes too). A program with neither stays at 1,
+    byte for byte, so every runtime that ran it still does; a program with
+    one is refused by a runtime that would otherwise drop the `lifetime` or
+    `model` it does not know and keep the conversation or model the program
+    said to change. -/
 def bytecodeVersion (program : Program) : Nat :=
-  if program.agents.any (·.lifetime.isSome) then 2 else 1
+  if program.agents.any (·.model.isSome) then 3
+  else if program.agents.any (·.lifetime.isSome) then 2 else 1
 
 private def renderBytecode (version : Nat) (team : String) (instructions : Array String) : String :=
   let rendered := String.intercalate ",\n    " instructions.toList

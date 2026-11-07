@@ -561,6 +561,34 @@ mod tests {
         .unwrap();
     }
 
+    /// Likewise a model change: the worker runs another model, so it is killed
+    /// and spawned again.
+    #[test]
+    fn a_model_change_replaces_the_agent() {
+        let agent = |model: &str| json!({"op":"spawn_agent","name":"coder","backend":"Claude","model":model});
+        let program = |model: &str| -> Bytecode {
+            let bytecode =
+                serde_json::from_value(json!({"version":3,"team":"Relay","instructions":[
+                    {"op":"begin_plan","team":"Relay"}, agent(model), {"op":"commit_plan"}
+                ]}))
+                .unwrap();
+            topology::verify(&bytecode).unwrap();
+            bytecode
+        };
+        let (from, to) = (program("claude-haiku-5-5"), program("claude-sonnet-5-5"));
+        check(
+            &from,
+            &plan(vec![
+                json!({"op":"kill_agent","name":"coder"}),
+                agent("claude-sonnet-5-5"),
+            ]),
+            &to,
+        )
+        .unwrap();
+        let error = check(&from, &plan(vec![]), &to).unwrap_err().to_string();
+        assert!(error.contains("agent 'coder'"), "{error}");
+    }
+
     /// A plan as the compiler writes one: `begin_mutation`, the changes,
     /// `commit_plan`. How plans are computed is the compiler's, and proved
     /// there; these check what the runtime does with one.

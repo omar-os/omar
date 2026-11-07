@@ -111,6 +111,13 @@ impl Backend for Opencode {
     fn takes_prompt_in_first_message(&self) -> bool {
         true
     }
+    /// `--model provider/model`; the launch also writes it to the config `model` key, which is what prompts sent over HTTP use.
+    fn model_flag(&self, model: &str) -> Option<String> {
+        Some(format!(
+            "--model {}",
+            crate::manager::shell_single_quote(model)
+        ))
+    }
     /// Spawned bare, with a port so OMAR can reach it without the input box;
     /// the prompt arrives through that channel as synthetic context.
     fn launch_command(&self, launch: &Launch<'_>) -> String {
@@ -122,7 +129,10 @@ impl Backend for Opencode {
             )
         });
         let base_command = with_opencode_port(resumed.as_deref().unwrap_or(launch.base_command));
-        let base_command = match opencode_config_env(launch.context) {
+        // Prompts OMAR posts over HTTP name no model, so they get the server's
+        // default: `--model` alone would change only the TUI's picker.
+        let model = command_model(&base_command);
+        let base_command = match opencode_config_env(launch.context, model.as_deref()) {
             Some(config) => format!(
                 "OPENCODE_CONFIG_CONTENT={} {}",
                 shell_single_quote(&config),
@@ -230,7 +240,20 @@ pub(crate) fn materialize_opencode_coordination_plugin(
     Some(format!("file://{encoded}"))
 }
 
-pub(crate) fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
+/// The value of `--model` / `-m` on an opencode command line, if any. The
+/// last one wins, as it does for opencode.
+fn command_model(command: &str) -> Option<String> {
+    let words = shlex::split(command)?;
+    words
+        .windows(2)
+        .rfind(|pair| pair[0] == "--model" || pair[0] == "-m")
+        .map(|pair| pair[1].clone())
+}
+
+pub(crate) fn opencode_config_env(
+    context: &McpLaunchContext,
+    model: Option<&str>,
+) -> Option<String> {
     let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
     // Disable every backend-native tool that overlaps an OMAR MCP tool so
@@ -268,6 +291,9 @@ pub(crate) fn opencode_config_env(context: &McpLaunchContext) -> Option<String> 
     });
     if let Some(plugin) = materialize_opencode_coordination_plugin(context) {
         config["plugin"] = serde_json::json!([plugin]);
+    }
+    if let Some(model) = model {
+        config["model"] = serde_json::json!(model);
     }
     Some(config.to_string())
 }
@@ -581,6 +607,19 @@ mod tests {
 
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn the_last_model_flag_on_the_command_line_wins() {
+        assert_eq!(
+            command_model("opencode --model a/b -m c/d").as_deref(),
+            Some("c/d")
+        );
+        assert_eq!(
+            command_model("opencode -m x --model 'y z'").as_deref(),
+            Some("y z")
+        );
+        assert_eq!(command_model("opencode"), None);
+    }
 
     #[test]
     fn a_footer_wrapped_by_a_long_path_still_reads_as_ready() {

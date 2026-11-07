@@ -472,7 +472,8 @@ SPELLED = {'claude': 'Claude', 'pi': 'Pi', 'opencode': 'OpenCode', 'codex': 'Cod
 def supported():
     """The backends omarc names as able to start a fresh conversation."""
     table = (REPO / 'lang/Omar/Backends.lean').read_text()
-    return ', '.join(re.findall(r'#\["([^"]+)"', table))
+    fresh = table.split('def freshConversation', 1)[1].split('\n]', 1)[0]
+    return ', '.join(re.findall(r'#\["([^"]+)"', fresh))
 
 
 def run(root, coder='Claude per task', env=None, program_text=PROGRAM,
