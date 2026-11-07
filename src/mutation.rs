@@ -353,7 +353,15 @@ pub fn apply(omar_dir: &Path, ea_id: u32, to: &Bytecode, source: &Path) -> Resul
             "state variable '{name}' has no value after the mutation"
         );
     }
-    let (workspaces, created) = carry_workspaces(omar_dir, ea_id, &manifest, &plan, &to_state)?;
+    let (workspaces, created) = carry_workspaces(
+        omar_dir,
+        ea_id,
+        &manifest,
+        &plan,
+        &to_state,
+        &runtime_dir,
+        std::time::Duration::from_secs(record.timeout_seconds),
+    )?;
     let result = (|| -> Result<String> {
         let (existing, _) = store.list()?;
         let new = checkpoint::Manifest {
@@ -411,12 +419,15 @@ pub fn apply(omar_dir: &Path, ea_id: u32, to: &Bytecode, source: &Path) -> Resul
 /// The resume point's files for every instance the new program keeps, and a
 /// new, empty workspace for each it adds or replaces. A removed instance's
 /// workspace is left as it is, still reachable from the checkpoints before.
+/// A new workspace gets its team's `setup`, as a fresh run's would.
 fn carry_workspaces(
     omar_dir: &Path,
     ea_id: u32,
     manifest: &checkpoint::Manifest,
     plan: &Bytecode,
     to: &VmState,
+    runtime_dir: &Path,
+    timeout: std::time::Duration,
 ) -> Result<(
     BTreeMap<String, checkpoint::ArtifactRef>,
     Vec<crate::workspace::Workspace>,
@@ -447,11 +458,27 @@ fn carry_workspaces(
             )
             .with_context(|| format!("create a workspace for instance '{instance}'"))?;
             created.push(workspace.clone());
-            let snapshot = workspace
-                .snapshots(omar_dir)?
-                .into_iter()
-                .next()
-                .context("a new workspace has no initial snapshot")?;
+            let setup = to.instances.get(&instance).and_then(|i| i.setup.as_ref());
+            if let Some(command) = setup {
+                crate::setup::run(
+                    &instance,
+                    command,
+                    &workspace.worktree(omar_dir),
+                    &workspace.temp(omar_dir),
+                    timeout,
+                    &runtime_dir.join("setup"),
+                )?;
+            }
+            // What setup wrote is part of the files a resume restores.
+            let snapshot = if setup.is_some() {
+                workspace.snapshot(omar_dir, "setup")?
+            } else {
+                workspace
+                    .snapshots(omar_dir)?
+                    .into_iter()
+                    .next()
+                    .context("a new workspace has no initial snapshot")?
+            };
             artifacts.insert(
                 instance,
                 checkpoint::ArtifactRef {

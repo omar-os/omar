@@ -974,6 +974,7 @@ mod tests {
                     InstanceState {
                         team: "Drafter".to_string(),
                         parent: String::new(),
+                        setup: None,
                     },
                 ),
                 (
@@ -981,6 +982,7 @@ mod tests {
                     InstanceState {
                         team: "Reviewer".to_string(),
                         parent: String::new(),
+                        setup: None,
                     },
                 ),
             ]),

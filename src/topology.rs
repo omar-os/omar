@@ -42,6 +42,10 @@ pub enum Instruction {
         /// The instance that declared it, empty for one `main` declared.
         #[serde(default)]
         parent: String,
+        /// The team's `setup` command, run in this instance's workspace
+        /// before any agent launches. Absent when the team declares none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        setup: Option<String>,
     },
     SpawnAgent {
         name: String,
@@ -208,6 +212,10 @@ pub struct InstanceState {
     /// that predates teams being able to instantiate teams.
     #[serde(default)]
     pub parent: String,
+    /// The team's `setup` command, run once in this instance's workspace
+    /// before any agent of the run launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,10 +677,18 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
         match instruction {
             Instruction::BeginPlan { .. } if index == 0 => {}
             Instruction::BeginPlan { .. } => bail!("duplicate begin_plan at instruction {index}"),
-            Instruction::DeclareInstance { name, team, parent } => {
+            Instruction::DeclareInstance {
+                name,
+                team,
+                parent,
+                setup,
+            } => {
                 require_identifier("instance", name)?;
                 if team.trim().is_empty() {
                     bail!("instance '{name}' names no team");
+                }
+                if setup.as_deref().is_some_and(|s| s.trim().is_empty()) {
+                    bail!("instance '{name}' has an empty setup command");
                 }
                 // A parent is declared before its children, so this also
                 // rejects a cycle: neither end could be declared first.
@@ -686,6 +702,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                         InstanceState {
                             team: team.clone(),
                             parent: parent.clone(),
+                            setup: setup.clone(),
                         },
                     )
                     .is_some()
@@ -2771,6 +2788,8 @@ fn launch(
     // Only what this run spawned. A failure must not tear down a session it
     // refused to replace.
     let mut spawned: BTreeMap<String, String> = BTreeMap::new();
+    // Codex project trust this run added; removed when the run function returns.
+    let mut trusted = crate::backend::codex::TrustedProjects::new();
     type Prepared = (
         InvocationServer,
         BTreeMap<String, Value>,
@@ -2807,6 +2826,17 @@ fn launch(
                 .collect();
             guard.save(&runtime_dir)?;
         }
+        // Before any agent launches, so what a setup writes is there when
+        // the first one starts. A resume's files are already restored.
+        if resumed_from.is_none() {
+            run_setups(
+                &state,
+                &workspaces,
+                config.omar_dir,
+                config.timeout,
+                &runtime_dir,
+            )?;
+        }
         let invocation_server = InvocationServer::start()?;
         spawn_topology_agents(
             &state,
@@ -2816,6 +2846,7 @@ fn launch(
             &config,
             &workspaces,
             &mut spawned,
+            &mut trusted,
             resumed_from.as_ref(),
         )?;
         // A resumed run's inputs were consumed at its start tag; what it
@@ -3108,6 +3139,31 @@ fn launch(
     })
 }
 
+/// Run each instance's `setup` in its workspace, one after another, before
+/// anything launches. The first failure fails the run.
+fn run_setups(
+    state: &VmState,
+    workspaces: &BTreeMap<String, crate::workspace::Workspace>,
+    omar_dir: &Path,
+    timeout: Duration,
+    runtime_dir: &Path,
+) -> Result<()> {
+    for (name, instance) in &state.instances {
+        let (Some(command), Some(workspace)) = (&instance.setup, workspaces.get(name)) else {
+            continue;
+        };
+        crate::setup::run(
+            name,
+            command,
+            &workspace.worktree(omar_dir),
+            &workspace.temp(omar_dir),
+            timeout,
+            &runtime_dir.join("setup"),
+        )?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_topology_agents(
     state: &VmState,
@@ -3117,6 +3173,7 @@ fn spawn_topology_agents(
     config: &TopologyRunConfig<'_>,
     workspaces: &BTreeMap<String, crate::workspace::Workspace>,
     spawned: &mut BTreeMap<String, String>,
+    trusted: &mut crate::backend::codex::TrustedProjects,
     resumed_from: Option<&checkpoint::Manifest>,
 ) -> Result<()> {
     // The line each agent was launched with, which is what says how it
@@ -3166,9 +3223,18 @@ fn spawn_topology_agents(
         let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
         fs::write(&prompt_file, format!("{protocol}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.{resumed}\n", temp.display()))?;
         let backend = canonical_backend(&agent.backend);
-        let base_command = crate::backend::resolve(backend)
-            .map(|backend| backend.default_command().to_string())
-            .map_err(anyhow::Error::msg)?;
+        let resolved = crate::backend::resolve(backend).map_err(anyhow::Error::msg)?;
+        let mut base_command = resolved.default_command().to_string();
+        // A workspace a setup populated may hold Codex hooks, which Codex runs
+        // only from a trusted project with trusted hooks.
+        let has_setup = state
+            .instances
+            .get(&agent.instance)
+            .is_some_and(|instance| instance.setup.is_some());
+        if has_setup && resolved.kind() == crate::backend::Kind::Codex {
+            trusted.trust(&worktree)?;
+            base_command = crate::backend::codex::trust_project_hooks(&base_command);
+        }
         let context = McpLaunchContext {
             omar_dir: config.omar_dir.to_path_buf(),
             ea_id: config.ea_id,
@@ -7403,6 +7469,67 @@ mod tests {
             }}"#
         ))
         .unwrap()
+    }
+
+    /// `setup` is an optional field of `declare_instance`: bytecode without one
+    /// round-trips unchanged, and an empty command is not a command.
+    #[test]
+    fn an_instance_setup_is_optional_and_never_empty() {
+        let with = |setup: &str| {
+            let mut bytecode = counter_bytecode("");
+            let state = format!(
+                r#"{{"op":"declare_instance","name":"c","parent":"","team":"Counter"{setup}}}"#
+            );
+            bytecode.instructions[1] = serde_json::from_str(&state).unwrap();
+            bytecode
+        };
+        let plain = with("");
+        assert!(!serde_json::to_string(&plain).unwrap().contains("setup"));
+        assert_eq!(verify(&plain).unwrap().instances["c"].setup, None);
+
+        let seeded = with(r#","setup":"sh install.sh .""#);
+        assert_eq!(
+            verify(&seeded).unwrap().instances["c"].setup.as_deref(),
+            Some("sh install.sh .")
+        );
+        let error = verify(&with(r#","setup":"  ""#)).unwrap_err().to_string();
+        assert!(error.contains("empty setup"), "{error}");
+    }
+
+    /// Setups run in instance order and the first failure ends the step, so
+    /// nothing after it has run and the caller launches nothing.
+    #[test]
+    fn a_failed_setup_stops_the_ones_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let omar_dir = dir.path();
+        let declare = |name: &str, setup: &str| {
+            format!(
+                r#"{{"op":"declare_instance","name":"{name}","parent":"","team":"T","setup":"{setup}"}}"#
+            )
+        };
+        let bytecode: Bytecode = serde_json::from_str(&format!(
+            r#"{{"version":1,"team":"T","instructions":[{{"op":"begin_plan","team":"T"}},{},{},{{"op":"commit_plan"}}]}}"#,
+            declare("a", "echo ran > ran.txt; exit 1"),
+            declare("b", "echo ran > ran.txt"),
+        ))
+        .unwrap();
+        let state = verify(&bytecode).unwrap();
+        let workspaces = crate::workspace::for_topology(omar_dir, 0, "setup-test", &state).unwrap();
+        let error = format!(
+            "{:#}",
+            run_setups(
+                &state,
+                &workspaces,
+                omar_dir,
+                Duration::from_secs(10),
+                &dir.path().join("run")
+            )
+            .unwrap_err()
+        );
+        assert!(error.contains("instance 'a' exited 1"), "{error}");
+        assert!(workspaces["a"].worktree(omar_dir).join("ran.txt").exists());
+        assert!(!workspaces["b"].worktree(omar_dir).join("ran.txt").exists());
+        assert!(dir.path().join("run/setup/a.json").exists());
     }
 
     /// Counts invocations; pauses the run from inside the first one, the way

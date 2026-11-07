@@ -332,6 +332,9 @@ structure TeamDecl where
       inside another nests the template rather than sharing it: `b.a.out` is
       not `c.a.out`. -/
   instances : Array Instance := #[]
+  /-- `setup "cmd"`: a shell command run in each instance's workspace before any
+      of its agents launch. At most one per team, and it is never empty. -/
+  setup : Option String := none
   deriving Repr
 
 /-- `a.out -> b.in after 1`. Ends are qualified by instance, so unlike a
@@ -359,6 +362,10 @@ structure InstanceDecl where
   team : String
   /-- The instance that declared it, or empty for one `main` declared. -/
   parent : String := ""
+  /-- The team's `setup` command, run once in this instance's workspace before
+      any of its agents launch. Carried on the instance, so a changed command
+      replaces the instance like a changed team does. -/
+  setup : Option String := none
   deriving Repr
 
 /-- `type Decision from "./schemas/decision.json"`, as the bytecode carries it:
@@ -577,31 +584,32 @@ private partial def parseDeclarations
     (connections : Array Connection)
     (reactions : Array Reaction)
     (instances : Array Instance)
-    (states : Array StateVar) :
+    (states : Array StateVar)
+    (setup : Option String) :
     List Token ->
       Except String
         (Array Port × Array Timer × Array Connection × Array Reaction × Array Instance ×
-          Array StateVar × List Token)
+          Array StateVar × Option String × List Token)
   | Token.sym "}" :: rest =>
-      pure (ports, timers, connections, reactions, instances, states, rest)
+      pure (ports, timers, connections, reactions, instances, states, setup, rest)
   -- `a = A();` ends with an optional semicolon; it separates declarations and
   -- means nothing else.
   | Token.sym ";" :: rest =>
-      parseDeclarations aliases reactionIndex ports timers connections reactions instances states rest
+      parseDeclarations aliases reactionIndex ports timers connections reactions instances states setup rest
   | Token.word "input" :: rest => do
       let (name, rest) ← word rest
       let (_, rest) ← expectSym ":" rest
       let ((type, spelled), rest) ← parseType aliases rest
       parseDeclarations aliases reactionIndex
         (ports.push { name, kind := .input, type, declared := declaredName type spelled })
-        timers connections reactions instances states rest
+        timers connections reactions instances states setup rest
   | Token.word "output" :: rest => do
       let (name, rest) ← word rest
       let (_, rest) ← expectSym ":" rest
       let ((type, spelled), rest) ← parseType aliases rest
       parseDeclarations aliases reactionIndex
         (ports.push { name, kind := .output, type, declared := declaredName type spelled })
-        timers connections reactions instances states rest
+        timers connections reactions instances states setup rest
   | Token.word "action" :: rest => do
       let (name, rest) ← word rest
       let (delay, rest) ← parseActionDelay rest
@@ -610,9 +618,9 @@ private partial def parseDeclarations
           let ((type, spelled), tail) ← parseType aliases tail
           parseDeclarations aliases reactionIndex
             (ports.push { name, kind := .action, type, delay, declared := declaredName type spelled })
-            timers connections reactions instances states tail
+            timers connections reactions instances states setup tail
       | _ =>
-          parseDeclarations aliases reactionIndex (ports.push { name, kind := .action, type := "signal", delay }) timers connections reactions instances states rest
+          parseDeclarations aliases reactionIndex (ports.push { name, kind := .action, type := "signal", delay }) timers connections reactions instances states setup rest
   | Token.word "timer" :: rest => do
       let (name, rest) ← word rest
       let (_, rest) ← expectSym "(" rest
@@ -620,7 +628,7 @@ private partial def parseDeclarations
       let (_, rest) ← expectSym "," rest
       let (period, rest) ← delayValue rest
       let (_, rest) ← expectSym ")" rest
-      parseDeclarations aliases reactionIndex ports (timers.push { name, offset, period }) connections reactions instances states rest
+      parseDeclarations aliases reactionIndex ports (timers.push { name, offset, period }) connections reactions instances states setup rest
   -- `state round : int = 0`: a value a code body keeps between invocations.
   | Token.word "state" :: rest => do
       let (name, rest) ← word rest
@@ -629,13 +637,20 @@ private partial def parseDeclarations
       let (_, rest) ← expectSym "=" rest
       let (initial, rest) ← literal rest
       parseDeclarations aliases reactionIndex ports timers connections reactions instances
-        (states.push { name, type, initial }) rest
+        (states.push { name, type, initial }) setup rest
+  -- `setup "cmd"`: run once in each instance's workspace before its agents
+  -- launch. One per team, and a command that says nothing is a mistake.
+  | Token.word "setup" :: Token.text command :: rest => do
+      if setup.isSome then throw "team declares more than one setup; combine the commands in one"
+      if command.trimAscii.isEmpty then throw "setup command is empty"
+      parseDeclarations aliases reactionIndex ports timers connections reactions instances states
+        (some command) rest
   | Token.word name :: Token.sym "=" :: rest => do
       let (team, rest) ← word rest
       let (_, rest) ← expectSym "(" rest
       let (args, rest) ← parseArgs #[] rest
       parseDeclarations aliases reactionIndex ports timers connections reactions
-        (instances.push { name, team, args }) states rest
+        (instances.push { name, team, args }) states setup rest
   | Token.word "task" :: rest => do
       let (agent, rest) ← word rest
       let (_, rest) ← expectSym "(" rest
@@ -661,7 +676,7 @@ private partial def parseDeclarations
         id := s!"reaction.{reactionIndex}"
         agent, triggers, effects, contract, prompt, within
       }
-      parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
+      parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states setup rest
   -- `task` asks an agent, `reaction` just runs, so a reaction names none.
   | Token.word "reaction" :: rest => do
       let (_, rest) ← expectSym "(" rest
@@ -686,7 +701,7 @@ private partial def parseDeclarations
         id := s!"reaction.{reactionIndex}"
         agent := "", triggers, effects, contract, prompt := "", body := some body, within
       }
-      parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
+      parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states setup rest
   | Token.word first :: rest => do
       -- An endpoint is either a port of this team or `instance.port` of one it
       -- instantiated. Both are one name once the instance path is prepended,
@@ -702,7 +717,7 @@ private partial def parseDeclarations
             let (value, tail) ← delayValue tail
             pure (some value, tail)
         | _ => pure (none, rest)
-      parseDeclarations aliases reactionIndex ports timers (connections.push { source, target, delay }) reactions instances states rest
+      parseDeclarations aliases reactionIndex ports timers (connections.push { source, target, delay }) reactions instances states setup rest
   | token :: _ => throw s!"unexpected token in team body: {reprStr token}"
   | [] => throw "unterminated team body"
 
@@ -724,8 +739,8 @@ private def parseTeam (aliases : Array (String × String)) : Parser TeamDecl := 
         pure (agents, rest)
     | _ => pure (#[], tokens)
   let (_, tokens) ← expectSym "{" tokens
-  let (ports, timers, connections, reactions, instances, states, tokens) ←
-    parseDeclarations aliases 0 #[] #[] #[] #[] #[] #[] tokens
+  let (ports, timers, connections, reactions, instances, states, setup, tokens) ←
+    parseDeclarations aliases 0 #[] #[] #[] #[] #[] #[] none tokens
   -- `shutdown` is the runtime's, so a team cannot declare something by that
   -- name, and reacting to it is what declares it.
   let declared := ports.map (·.name) ++ timers.map (·.name) ++ states.map (·.name)
@@ -734,7 +749,7 @@ private def parseTeam (aliases : Array (String × String)) : Parser TeamDecl := 
   let timers := if reactions.any (·.triggers.contains "shutdown") then
       timers.push { name := "shutdown", offset := 0, period := 0, shutdown := true }
     else timers
-  pure ({ name, params, agents, ports, timers, connections, reactions, instances, states }, tokens)
+  pure ({ name, params, agents, ports, timers, connections, reactions, instances, states, setup }, tokens)
 
 private partial def parseMainBody
     (instances : Array Instance)
@@ -997,7 +1012,7 @@ private partial def elaborateInstance
   let own : Elaborated :=
     { agents, ports, timers, connections, reactions, states
       params := boundParams decl inst path
-      instances := #[{ name := path, team := inst.team, parent }] }
+      instances := #[{ name := path, team := inst.team, parent, setup := decl.setup }] }
   decl.instances.foldlM
     (fun acc nested => do
       pure (acc.append (← elaborateInstance teams (depth + 1) path nested)))
@@ -1075,11 +1090,13 @@ def instructionTexts (program : Program) : Array String :=
       | none => []
     instruction "define_type" fields
   let instances := program.instances.map fun inst =>
-    instruction "declare_instance" [
+    instruction "declare_instance" ([
       ("name", toJson inst.name),
       ("parent", toJson inst.parent),
       ("team", toJson inst.team)
-    ]
+    ] ++ match inst.setup with
+      | some setup => [("setup", toJson setup)]
+      | none => [])
   let agents := program.agents.map fun agent =>
     instruction "spawn_agent" [
       ("instance", toJson agent.instance_),
