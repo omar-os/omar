@@ -271,6 +271,11 @@ impl TrustedProjects {
         // A JSON string is a valid TOML basic string.
         let key = serde_json::to_string(&directory.display().to_string())?;
         let block = format!("\n[projects.{key}]\ntrust_level = \"trusted\"\n");
+        // Agents of one instance share its workspace; a second table with the
+        // same key would make Codex reject the whole config.
+        if self.blocks.contains(&block) {
+            return Ok(());
+        }
         if let Some(parent) = config.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -408,7 +413,6 @@ pub(crate) const CODEX_NO_ATTACH_FLAGS: &[&str] = &[
     "--approve-for-me",
     "--enable",
     "--disable",
-    "--dangerously-bypass-hook-trust",
 ];
 
 /// Flags unsupported by remote TUI attachment run through native `exec` instead.
@@ -977,6 +981,8 @@ mod tests {
             "env A=1 codex --dangerously-bypass-hook-trust --x"
         );
         assert_eq!(trust_project_hooks("claude --x"), "claude --x");
+        // The TUI attaches with it; the server is what needs it.
+        assert!(!codex_refuses_to_attach(&trusted));
 
         let cmd = codex_server_command(&context, "hi", None, &trusted).unwrap();
         assert!(
@@ -998,6 +1004,9 @@ mod tests {
         std::fs::write(&config, original).unwrap();
         {
             let mut trusted = TrustedProjects::at(Some(config.clone()));
+            trusted.trust(&workspace).unwrap();
+            // A second agent in the same workspace adds no duplicate table,
+            // which would make the config unparseable.
             trusted.trust(&workspace).unwrap();
             let text = std::fs::read_to_string(&config).unwrap();
             let table = text.parse::<toml::Table>().unwrap();
