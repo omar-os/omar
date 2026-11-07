@@ -1,0 +1,15 @@
+// Model-free: the check refuses the first completion and accepts the second.
+// The stub completes again after a refusal, as an agent would after a fix.
+team CompletionCheck[worker : Stub]
+{
+    input request : string
+    output result : string
+
+    task worker(request) -> result
+    "Answer the invocation."
+    check "test -e retried || { touch retried; echo 'not yet' >&2; exit 1; }"
+}
+
+main {
+    run = CompletionCheck()
+}

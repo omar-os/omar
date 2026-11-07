@@ -420,6 +420,19 @@ export function applyDiagramEvent(
             : reaction,
         ),
       };
+    case "check_completed": {
+      // The latest run of a task's completion check, shown on its inspector.
+      const { exit_code } = event.payload as { exit_code?: unknown };
+      return {
+        ...snapshot,
+        reactions: withReaction(reactionId, {
+          check: {
+            passed: (event.payload as { outcome?: unknown }).outcome === "passed",
+            exit_code: typeof exit_code === "number" ? exit_code : null,
+          },
+        }),
+      };
+    }
     case "run_checkpointed":
       // A checkpoint is a fact about the run's history, not its picture; the
       // timeline draws it from the listing it refetches on this event.

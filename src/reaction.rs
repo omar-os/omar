@@ -163,14 +163,23 @@ pub struct Reactions {
 }
 
 /// Persists uncertainty across runner crashes; snapshots refuse outstanding markers.
-struct ReactionProcess {
-    child: Child,
+pub(crate) struct ReactionProcess {
+    pub(crate) child: Child,
     marker: Option<PathBuf>,
     cleaned: bool,
 }
 
 impl ReactionProcess {
-    fn cleanup(&mut self) -> Result<()> {
+    /// Guard a child started as its own process group, with no cleanup marker.
+    pub(crate) fn new(child: Child) -> Self {
+        Self {
+            child,
+            marker: None,
+            cleaned: false,
+        }
+    }
+
+    pub(crate) fn cleanup(&mut self) -> Result<()> {
         if self.cleaned {
             return Ok(());
         }
