@@ -5,7 +5,7 @@ Run: python3 tests/ci/codex_event_wake.py
 Uses an isolated CODEX_HOME and a loopback-only mock provider; no model calls
 or user credentials are needed. The ordinary Rust socket tests exercise OMAR's
 implementation; this optional integration check verifies the server semantics.
-It also checks what an invocation-scoped attempt relies on: the server knows
+It also checks what a `per`-lifetime attempt relies on: the server knows
 the keys that turn memories off (under --strict-config), and a new thread
 reads back, without turns, as not forked, no subagent's, holding no message,
 and created now.

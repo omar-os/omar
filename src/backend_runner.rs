@@ -262,12 +262,12 @@ async fn codex_turn(
     Ok(())
 }
 
-/// No protocol runner can show a conversation new to an invocation-scoped
+/// No protocol runner can show a conversation new to a `per`-lifetime
 /// attempt (cursor-agent's chats find earlier transcripts; the others resume
 /// one conversation), so omarc and the VM refuse such a launch. This fails
 /// closed if one gets through.
 fn fresh_start() -> Result<()> {
-    bail!("a protocol runner cannot start an invocation-scoped attempt")
+    bail!("a protocol runner cannot start a fresh conversation for a `per` lifetime")
 }
 
 pub async fn run(path: &Path) -> Result<()> {
@@ -468,7 +468,7 @@ mod protocol_tests {
         assert_eq!(reply["result"]["protocolVersion"], 1);
     }
 
-    /// A protocol runner never starts an invocation-scoped attempt.
+    /// A protocol runner never starts a `per` lifetime's attempt.
     #[test]
     fn a_protocol_runner_refuses_an_attempt() {
         assert!(fresh_start()

@@ -782,7 +782,7 @@ mod tests {
         }
     }
 
-    /// An invocation-scoped worker opens the conversation its attempt names;
+    /// A worker of a `per` lifetime opens the conversation its attempt names;
     /// every other worker opens one of Claude's choosing, as before.
     #[test]
     fn an_attempt_names_the_conversation_its_worker_opens() {

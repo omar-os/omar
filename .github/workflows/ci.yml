@@ -280,7 +280,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y tmux
           cargo build --bin omar
           python3 tests/ci/team_mutation.py
-      - name: Verify an invocation-scoped agent gets a fresh worker per invocation
+      - name: Verify a per-lifetime agent gets a fresh worker per window
         run: |
           cargo build --bin omar
           python3 tests/ci/invocation_scope.py
@@ -288,12 +288,12 @@ jobs:
         with:
           node-version: 22
       # Real pinned Pi, with a local deterministic provider: no credentials.
-      - name: Verify real Pi runs an invocation-scoped agent in a new conversation each time
+      - name: Verify real Pi runs a per-task agent in a new conversation each time
         run: |
           cargo build --bin omar
           python3 tests/ci/pi_invocation_scope.py
       # Real pinned Codex, with a local deterministic provider: no credentials.
-      - name: Verify real Codex runs an invocation-scoped agent in a new thread each time
+      - name: Verify real Codex runs a per-task agent in a new thread each time
         run: |
           npm install -g @openai/codex@0.154.0
           cargo build --bin omar

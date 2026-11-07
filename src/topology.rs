@@ -49,10 +49,10 @@ pub enum Instruction {
         backend: String,
         #[serde(default)]
         instance: String,
-        /// Absent for the default, so a program that does not opt in has the
+        /// Absent for the whole run, so a program without `per` has the
         /// bytecode it always had.
-        #[serde(default, skip_serializing_if = "AgentScope::is_agent")]
-        scope: AgentScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lifetime: Option<Lifetime>,
     },
     DefinePort {
         name: String,
@@ -196,30 +196,45 @@ pub enum PortKind {
     Action,
 }
 
-/// How long an agent's native conversation lives: `coder : Claude(scope =
-/// invocation)`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+/// What a lifetime counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentScope {
-    /// One conversation for the whole run, as every agent had before scopes.
-    #[default]
-    Agent,
-    /// A new worker and native conversation for every invocation, stopped
-    /// before that invocation's effects are released.
-    Invocation,
+pub enum LifetimeUnit {
+    /// The agent's own invocations.
+    Task,
+    /// The tags in which the agent is invoked.
+    Tag,
 }
 
-impl AgentScope {
-    pub fn is_agent(&self) -> bool {
-        *self == AgentScope::Agent
+/// How long an agent's native conversation lives: `coder : Claude per 5
+/// tasks`. An agent without one keeps a single conversation for the whole
+/// run. `per task` and `per tag` are counts of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct Lifetime {
+    pub unit: LifetimeUnit,
+    pub count: u32,
+}
+
+impl std::fmt::Display for Lifetime {
+    /// As the program spells it, with a count of one left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let unit = match self.unit {
+            LifetimeUnit::Task => "task",
+            LifetimeUnit::Tag => "tag",
+        };
+        match self.count {
+            1 => write!(f, "per {unit}"),
+            count => write!(f, "per {count} {unit}s"),
+        }
     }
 }
 
-/// The bytecode version a program with an invocation-scoped agent carries.
-/// Version 1 runtimes ignore fields they do not know, so they would read
-/// `scope` as absent and reuse the conversation; the version is what makes
-/// them refuse it instead.
-pub const SCOPED_BYTECODE: u32 = 2;
+/// The bytecode version a program with an agent lifetime carries. Version 1
+/// runtimes ignore fields they do not know, so they would read `lifetime` as
+/// absent and keep the conversation; the version is what makes them refuse it
+/// instead.
+pub const LIFETIME_BYTECODE: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentState {
@@ -228,8 +243,8 @@ pub struct AgentState {
     /// instances being carried through.
     #[serde(default)]
     pub instance: String,
-    #[serde(default, skip_serializing_if = "AgentScope::is_agent")]
-    pub scope: AgentScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<Lifetime>,
 }
 
 /// A team instantiated by `main`, and the team it came from.
@@ -659,7 +674,7 @@ pub(crate) fn resolve_build_omarc() -> PathBuf {
 }
 
 pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
-    if bytecode.version != 1 && bytecode.version != SCOPED_BYTECODE {
+    if bytecode.version != 1 && bytecode.version != LIFETIME_BYTECODE {
         bail!("unsupported bytecode version {}", bytecode.version);
     }
     if !valid_identifier(&bytecode.team) {
@@ -729,27 +744,30 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 name,
                 backend,
                 instance,
-                scope,
+                lifetime,
             } => {
                 check_instance(&state, "agent", name, instance)?;
                 require_identifier("agent", name)?;
                 if backend.trim().is_empty() {
                     bail!("agent '{name}' has an empty backend");
                 }
-                if *scope == AgentScope::Invocation {
-                    // Version 1 promises a runtime that predates scopes can
+                if let Some(lifetime) = lifetime {
+                    if lifetime.count == 0 {
+                        bail!("agent '{name}' lifetime must count at least 1");
+                    }
+                    // Version 1 promises a runtime that predates lifetimes can
                     // run it, and that runtime would keep the conversation.
-                    if bytecode.version < SCOPED_BYTECODE {
+                    if bytecode.version < LIFETIME_BYTECODE {
                         bail!(
-                            "agent '{name}' is invocation-scoped, which needs bytecode version {SCOPED_BYTECODE}"
+                            "agent '{name}' resets its conversation ({lifetime}), which needs bytecode version {LIFETIME_BYTECODE}"
                         );
                     }
                     // Checked before anything starts: a backend that cannot
-                    // promise a new conversation per invocation must not get
-                    // the chance to reuse one.
+                    // promise a fresh conversation must not get the chance to
+                    // reuse one.
                     if !crate::backend::by_name(backend).is_some_and(|b| b.fresh_conversation()) {
                         bail!(
-                            "agent '{name}' is invocation-scoped, but backend '{backend}' cannot start a fresh conversation per invocation; supported: {}",
+                            "agent '{name}' resets its conversation ({lifetime}), but backend '{backend}' cannot start a fresh conversation; supported: {}",
                             crate::backend::fresh_conversation_backends().join(", ")
                         );
                     }
@@ -771,7 +789,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                         AgentState {
                             backend: backend.clone(),
                             instance: instance.clone(),
-                            scope: *scope,
+                            lifetime: *lifetime,
                         },
                     )
                     .is_some()
@@ -1324,7 +1342,7 @@ struct InvocationRecord {
     prompt: String,
     writes: BTreeMap<String, Value>,
     completed: bool,
-    /// The key of the worker attempt an invocation-scoped agent was started
+    /// The key of the worker attempt an agent that resets its conversation was started
     /// for. Only a call carrying it may answer; `None` for every other agent.
     attempt: Option<String>,
 }
@@ -1774,7 +1792,7 @@ fn validate_invocation_owner(
     if invocation.team != team || invocation.agent != agent {
         bail!("invocation does not belong to this topology agent");
     }
-    // An invocation-scoped agent's earlier worker has the same name; only the
+    // An earlier worker of an agent with a `per` lifetime has the same name; only the
     // attempt tells it from the worker this invocation was started for.
     // The key is not echoed: the caller that lacks it must not learn it.
     if let Some(expected) = &invocation.attempt {
@@ -2059,6 +2077,8 @@ struct InvocationSpec {
     /// What the program allows this invocation, overriding the run-wide
     /// timeout. `None` means the program said nothing and the run's applies.
     within: Option<Duration>,
+    /// The tag it runs in, which an agent's `per tag` lifetime counts.
+    tag: Tag,
 }
 
 trait ReactionExecutor: Sync {
@@ -2096,7 +2116,7 @@ struct AgentReactionExecutor {
     /// no pane to deliver a prompt to — the registration is the work item, and
     /// a web client picks it up from there.
     web: BTreeSet<String>,
-    /// Invocation-scoped agents, whose workers this executor starts and
+    /// Agents with a `per` lifetime, whose workers this executor starts and
     /// stops. `None` for a program with none.
     scoped: Option<ScopedWorkers>,
 }
@@ -2105,18 +2125,21 @@ impl ReactionExecutor for AgentReactionExecutor {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
         let task_id = invocation.id;
         let rendered = render_prompt(&invocation.prompt, &invocation.trigger_values)?;
-        // Minted here, before the invocation can be answered, so only the
-        // worker started for it can answer.
-        let scoped = self
+        let windowed = self
             .scoped
             .as_ref()
             .filter(|scoped| scoped.states.contains_key(&invocation.agent));
-        let attempt = scoped.map(|scoped| manager::TopologyAttempt {
-            id: Uuid::new_v4().to_string(),
-            key: Uuid::new_v4().to_string(),
-            native_session: crate::backend::by_name(&scoped.states[&invocation.agent].backend)
-                .map_or_else(|| Uuid::new_v4().to_string(), |b| b.new_conversation_id()),
-        });
+        // One invocation of such an agent at a time: they share a
+        // conversation, and the window an invocation falls in depends on the
+        // ones before it.
+        let mut slot = windowed.map(|scoped| scoped.slot(&invocation.agent));
+        // Decided here, before the invocation can be answered, so only the
+        // worker of its window can answer.
+        let admitted = match (windowed, slot.as_mut()) {
+            (Some(scoped), Some(slot)) => Some(scoped.admit(&invocation, slot)?),
+            _ => None,
+        };
+        let attempt = admitted.as_ref().map(|(attempt, _)| attempt);
         let record = InvocationRecord {
             id: task_id,
             team: self.team.clone(),
@@ -2128,13 +2151,15 @@ impl ReactionExecutor for AgentReactionExecutor {
             prompt: rendered.clone(),
             writes: BTreeMap::new(),
             completed: false,
-            attempt: attempt.as_ref().map(|attempt| attempt.key.clone()),
+            attempt: attempt.map(|attempt| attempt.key.clone()),
         };
         let completion = self.registry.register(record)?;
         let answer = || self.answer(&invocation, &rendered, completion);
-        let result = match (scoped, &attempt) {
-            (Some(scoped), Some(attempt)) => scoped.run(&invocation, attempt, answer),
-            _ => answer(),
+        let result = match (windowed, slot.as_mut(), &admitted) {
+            (Some(scoped), Some(slot), Some((attempt, fresh))) => {
+                scoped.run(&invocation, attempt, *fresh, slot, answer)
+            }
+            _ => answer().map(|(writes, _)| writes),
         };
         self.registry.remove(&task_id);
         result
@@ -2142,13 +2167,15 @@ impl ReactionExecutor for AgentReactionExecutor {
 }
 
 impl AgentReactionExecutor {
-    /// Hand the invocation to its agent and wait for the answer.
+    /// Hand the invocation to its agent and wait for the answer. The flag is
+    /// whether the deadline expired, in which case the writes are empty and
+    /// the agent may still be working on it.
     fn answer(
         &self,
         invocation: &InvocationSpec,
         rendered: &str,
         completion: mpsc::Receiver<BTreeMap<String, Value>>,
-    ) -> Result<BTreeMap<String, Value>> {
+    ) -> Result<(BTreeMap<String, Value>, bool)> {
         let task_id = invocation.id;
         // A web agent has no pane to deliver to: nothing was spawned for it,
         // and the registration is the work item a panel asks for. What
@@ -2166,8 +2193,10 @@ impl AgentReactionExecutor {
 
         let deadline = invocation.within.unwrap_or(self.timeout);
         match completion.recv_timeout(deadline) {
-            Ok(writes) => Ok(writes),
-            Err(mpsc::RecvTimeoutError::Timeout) => expired(invocation, deadline),
+            Ok(writes) => Ok((writes, false)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                expired(invocation, deadline).map(|writes| (writes, true))
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
                 "topology invocation service stopped unexpectedly"
             )),
@@ -2175,27 +2204,35 @@ impl AgentReactionExecutor {
     }
 }
 
-/// Invocation-scoped agents: a worker, and a native conversation, for every
-/// invocation, and none in between.
+/// Agents with a `per` lifetime: a worker, and a native conversation, for each
+/// window of invocations.
 ///
-/// An attempt is one worker for one invocation. It is started, proved to have
-/// opened a new conversation — the one the attempt named, or, for a backend
-/// that mints its own id, one no earlier attempt reported — and handed the
-/// invocation. Once answered, or not, its process tree is stopped and seen
-/// gone before anything it wrote is released downstream. If
-/// any of that cannot be made sure of, the invocation fails: there is no
-/// falling back to a worker that already has a conversation.
+/// A window is one worker and one conversation, serving the invocations the
+/// agent's lifetime lets share it: `per task` serves one, `per tag` all the
+/// agent's invocations in a tag, `per 5 tasks` five. The first is started,
+/// proved to have opened a new conversation -- the one the attempt named,
+/// or, for a backend that mints its own id, one no earlier attempt reported --
+/// and handed the invocation. Later ones are handed to the same worker, and
+/// the conversation it reports must still be that one before an invocation's
+/// writes are released. The window ends lazily, when an invocation falls
+/// outside it, or at once when its count of tasks is spent, or when the run
+/// ends or an invocation in it fails: its process tree is stopped and seen
+/// gone. If any of that cannot be made sure of, the invocation fails: there is
+/// no falling back to a worker that already has a conversation.
 struct ScopedWorkers {
     states: BTreeMap<String, AgentState>,
+    /// Each agent's open window, if any. Locked for a whole invocation.
+    windows: BTreeMap<String, Mutex<Option<Window>>>,
     launcher: AgentLauncher,
     run: String,
-    /// The run's record, whose `sessions` holds an attempt's session from
+    /// The run's record, whose `sessions` holds a window's session from
     /// before its worker is launched until it is seen stopped, so a run that
     /// dies in between leaves it for `--replace` and snapshots to find, and
     /// one that does not leaves nothing to clean.
     deployment: Arc<Mutex<deploy::DeploymentRecord>>,
-    /// One JSON line per attempt as it starts, once its conversation is
-    /// checked, and as it ends.
+    /// One JSON line per window as it starts, once its conversation is
+    /// checked, after each invocation it serves, and as it ends. The last line
+    /// of an `attempt_id` is its record.
     log: PathBuf,
     /// Every conversation an attempt has reported, seeded from `log`, which
     /// outlives the process: a backend that mints its own id must never hand
@@ -2205,12 +2242,87 @@ struct ScopedWorkers {
     publisher: Option<crate::diagram::DiagramPublisher>,
 }
 
+/// One agent's open window: the worker, and what is needed to stop it and to
+/// tell whether the next invocation still belongs to it.
+struct Window {
+    agent: String,
+    attempt: manager::TopologyAttempt,
+    session: String,
+    /// Every process the worker had, captured while it runs. Identities, not
+    /// bare pids: confirming the stop must not mistake a recycled pid. With
+    /// the sessions they ran in, which a process its parent leaves behind
+    /// keeps.
+    tree: Vec<(u32, String)>,
+    sessions: BTreeSet<u32>,
+    since: std::time::SystemTime,
+    /// The conversation the worker reported when it started.
+    conversation: String,
+    used: Used,
+    failed: bool,
+    /// What `attempts.jsonl` holds for it.
+    record: Value,
+}
+
 /// What every process of an attempt's worker inherits, as `NAME=<attempt id>`.
 const ATTEMPT_MARKER: &str = "OMAR_ATTEMPT";
 /// How long a stopped worker's processes get to be seen gone.
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a started worker gets to open its conversation.
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How much of a window its invocations have used. Counts only the agent's
+/// own invocations, and the tags they run in: another agent's tags never reach
+/// it.
+#[derive(Debug, Clone, Copy)]
+struct Used {
+    tasks: u32,
+    tags: u32,
+    last_tag: Tag,
+}
+
+impl Used {
+    /// A window opened by an invocation at `tag`.
+    fn first(tag: Tag) -> Self {
+        Self {
+            tasks: 1,
+            tags: 1,
+            last_tag: tag,
+        }
+    }
+
+    /// Whether an invocation at `tag` falls outside the window. Invocations
+    /// in a tag already counted share it: a `per tag` window ends only when
+    /// the agent runs in a tag after it.
+    fn spent(&self, lifetime: Lifetime, tag: Tag) -> bool {
+        match lifetime.unit {
+            LifetimeUnit::Task => self.tasks >= lifetime.count,
+            LifetimeUnit::Tag => tag != self.last_tag && self.tags >= lifetime.count,
+        }
+    }
+
+    /// Count an invocation at `tag` that is inside the window.
+    fn take(&mut self, tag: Tag) {
+        self.tasks += 1;
+        if tag != self.last_tag {
+            self.tags += 1;
+            self.last_tag = tag;
+        }
+    }
+
+    /// Whether no later invocation can join: the tasks are all used. Tags
+    /// cannot say, since the agent may run again in the same one.
+    fn exhausted(&self, lifetime: Lifetime) -> bool {
+        lifetime.unit == LifetimeUnit::Task && self.tasks >= lifetime.count
+    }
+}
+
+fn served_invocation(invocation: &InvocationSpec) -> Value {
+    json!({
+        "invocation_id": invocation.id,
+        "reaction": invocation.reaction_id,
+        "tag": {"timestamp": invocation.tag.timestamp, "microstep": invocation.tag.microstep},
+    })
+}
 
 impl ScopedWorkers {
     fn new(
@@ -2222,7 +2334,7 @@ impl ScopedWorkers {
         let states: BTreeMap<String, AgentState> = state
             .agents
             .iter()
-            .filter(|(_, agent)| agent.scope == AgentScope::Invocation)
+            .filter(|(_, agent)| agent.lifetime.is_some())
             .map(|(name, agent)| (name.clone(), agent.clone()))
             .collect();
         let log = launcher.runtime_dir.join("attempts.jsonl");
@@ -2232,6 +2344,10 @@ impl ScopedWorkers {
             .deployment_id
             .clone();
         Ok((!states.is_empty()).then(|| Self {
+            windows: states
+                .keys()
+                .map(|name| (name.clone(), Mutex::new(None)))
+                .collect(),
             states,
             seen: Mutex::new(reported_conversations(&log)),
             log,
@@ -2258,32 +2374,161 @@ impl ScopedWorkers {
         deployment.save(&self.launcher.runtime_dir)
     }
 
+    fn slot(&self, agent: &str) -> std::sync::MutexGuard<'_, Option<Window>> {
+        self.windows[agent]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Which window `invocation` falls in: the attempt of `slot`'s open one
+    /// and `false`, or, once the open one is spent, a new attempt and `true`.
+    /// Counts only this agent's own invocations and the tags they run in. A
+    /// window that is spent is stopped here, before anything of the new one
+    /// starts.
+    fn admit(
+        &self,
+        invocation: &InvocationSpec,
+        slot: &mut Option<Window>,
+    ) -> Result<(manager::TopologyAttempt, bool)> {
+        let lifetime = self.states[&invocation.agent]
+            .lifetime
+            .context("agent has no lifetime")?;
+        if let Some(window) = slot.as_mut() {
+            if !window.used.spent(lifetime, invocation.tag) {
+                window.used.take(invocation.tag);
+                return Ok((window.attempt.clone(), false));
+            }
+            self.close(slot).with_context(|| {
+                format!(
+                    "agent '{}' invocation {}: the worker of its previous conversation was not confirmed stopped",
+                    invocation.agent, invocation.id
+                )
+            })?;
+        }
+        let backend = crate::backend::by_name(&self.states[&invocation.agent].backend)
+            .context("agent with a lifetime has no backend")?;
+        Ok((
+            manager::TopologyAttempt {
+                id: Uuid::new_v4().to_string(),
+                key: Uuid::new_v4().to_string(),
+                native_session: backend.new_conversation_id(),
+            },
+            true,
+        ))
+    }
+
+    /// Run `invocation` in its window: start the window's worker when
+    /// `fresh`, hand it `answer`, and check the worker still holds the
+    /// conversation it started with before the writes are released.
     fn run(
         &self,
         invocation: &InvocationSpec,
         attempt: &manager::TopologyAttempt,
-        answer: impl FnOnce() -> Result<BTreeMap<String, Value>>,
+        fresh: bool,
+        slot: &mut Option<Window>,
+        answer: impl FnOnce() -> Result<(BTreeMap<String, Value>, bool)>,
     ) -> Result<BTreeMap<String, Value>> {
         let agent = &self.states[&invocation.agent];
         let backend = crate::backend::by_name(&agent.backend)
-            .context("invocation-scoped agent has no backend")?;
+            .context("agent with a lifetime has no backend")?;
+        if fresh {
+            *slot = Some(self.open(invocation, attempt)?);
+        }
+        let window = slot.as_mut().context("agent has no open window")?;
+        let result = (|| -> Result<(BTreeMap<String, Value>, bool)> {
+            if !fresh {
+                self.same_conversation(window, backend)?;
+            }
+            let (writes, timed_out) = answer()?;
+            // A worker that ran out of time is busy and about to be stopped,
+            // so what it holds is no longer asked.
+            if !timed_out {
+                self.same_conversation(window, backend)?;
+            }
+            Ok((writes, timed_out))
+        })();
+        if !fresh {
+            window.record["invocations"]
+                .as_array_mut()
+                .context("window record has no invocations")?
+                .push(served_invocation(invocation));
+        }
+        let lifetime = agent.lifetime.context("agent has no lifetime")?;
+        match result {
+            Ok((writes, true)) => {
+                // The contract let it stay silent, but the worker is still on
+                // the invocation, so no later one may join its window.
+                window.failed = true;
+                self.close(slot).with_context(|| {
+                    format!(
+                        "agent '{}' invocation {}: worker attempt {} was not confirmed stopped, so its effects are withheld",
+                        invocation.agent, invocation.id, attempt.id
+                    )
+                })?;
+                Ok(writes)
+            }
+            Ok((writes, false)) => {
+                // No later invocation can join a window whose tasks are
+                // spent, so its worker is stopped before the writes are
+                // released, as the last thing it did.
+                if window.used.exhausted(lifetime) {
+                    self.close(slot).with_context(|| {
+                        format!(
+                            "agent '{}' invocation {}: worker attempt {} was not confirmed stopped, so its effects are withheld",
+                            invocation.agent, invocation.id, attempt.id
+                        )
+                    })?;
+                } else {
+                    window.record["outcome"] = json!("open");
+                    self.record(&window.record);
+                    self.publish(&window.agent, &window.record);
+                }
+                Ok(writes)
+            }
+            Err(error) => {
+                // A worker that failed an invocation is in an unknown state.
+                window.failed = true;
+                let error = error.context(format!(
+                    "agent '{}' invocation {}: worker attempt {}",
+                    invocation.agent, invocation.id, attempt.id
+                ));
+                match self.close(slot) {
+                    Ok(()) => Err(error),
+                    Err(stop) => Err(stop.context(format!(
+                        "agent '{}' invocation {}: worker attempt {} was not confirmed stopped, so its effects are withheld",
+                        invocation.agent, invocation.id, attempt.id
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Start a window's worker for `invocation`, the first it serves, and
+    /// prove its conversation new. On failure the worker is stopped.
+    fn open(
+        &self,
+        invocation: &InvocationSpec,
+        attempt: &manager::TopologyAttempt,
+    ) -> Result<Window> {
+        let agent = &self.states[&invocation.agent];
+        let backend = crate::backend::by_name(&agent.backend)
+            .context("agent with a lifetime has no backend")?;
         let client = &self.launcher.client;
         let session = client.session_for(&invocation.agent);
         let mut record = json!({
             "run": self.run,
             "logical_agent": invocation.agent,
-            "reaction": invocation.reaction_id,
-            "invocation_id": invocation.id,
             "attempt_id": attempt.id,
             "backend": agent.backend,
             "native_session_id": Value::Null,
             "verification": backend.freshness().name(),
-            "scope": "invocation",
+            "lifetime": agent.lifetime,
+            "invocations": [served_invocation(invocation)],
             "outcome": "started",
             "cleanup_status": "pending",
         });
         // Anything already in the session is some earlier worker, and taking
-        // it over would be the reuse this scope rules out.
+        // it over would be the reuse a new window rules out.
         if client.has_session(&session)? {
             record["outcome"] = json!("refused");
             record["cleanup_status"] = json!("not_started");
@@ -2304,10 +2549,6 @@ impl ScopedWorkers {
                 invocation.agent, invocation.id
             )));
         }
-        // Every process the worker had, captured while it runs. Identities,
-        // not bare pids: confirming the stop must not mistake a recycled pid.
-        // With the sessions they ran in, which a process its parent leaves
-        // behind keeps.
         let mut tree = Vec::new();
         let mut sessions = BTreeSet::new();
         // Whatever the worker reported, kept even when it is refused.
@@ -2344,41 +2585,132 @@ impl ScopedWorkers {
                 )
             }),
         });
-        let result = match started {
-            Ok(()) => answer(),
-            Err(error) => Err(error.context(format!(
-                "agent '{}' invocation {}: worker attempt {} did not start a fresh conversation",
-                invocation.agent, invocation.id, attempt.id
-            ))),
-        };
-        let stopped = self.stop(&session, attempt, (agent, since), &mut tree, &mut sessions);
-        if stopped.is_ok() {
-            if let Err(error) = self.track(&invocation.agent, None) {
-                eprintln!("warning: could not record {session} as stopped: {error:#}");
+        match started {
+            Ok(()) => {
+                // Mission Control shows the window as soon as it is proved.
+                self.publish(&invocation.agent, &record);
+                Ok(Window {
+                    agent: invocation.agent.clone(),
+                    attempt: attempt.clone(),
+                    session,
+                    tree,
+                    sessions,
+                    since,
+                    conversation: reported.unwrap_or_default(),
+                    used: Used::first(invocation.tag),
+                    failed: false,
+                    record,
+                })
+            }
+            Err(error) => {
+                let stopped =
+                    self.stop(&session, attempt, (agent, since), &mut tree, &mut sessions);
+                if stopped.is_ok() {
+                    if let Err(error) = self.track(&invocation.agent, None) {
+                        eprintln!("warning: could not record {session} as stopped: {error:#}");
+                    }
+                }
+                record["outcome"] = json!("failed");
+                record["cleanup_status"] = json!(if stopped.is_ok() {
+                    "stopped"
+                } else {
+                    "unconfirmed"
+                });
+                self.record(&record);
+                self.publish(&invocation.agent, &record);
+                let error = error.context(format!(
+                    "agent '{}' invocation {}: worker attempt {} did not start a fresh conversation",
+                    invocation.agent, invocation.id, attempt.id
+                ));
+                match stopped {
+                    Ok(()) => Err(error),
+                    Err(stop) => Err(stop.context(format!(
+                        "agent '{}' invocation {}: worker attempt {} was not confirmed stopped, so its effects are withheld",
+                        invocation.agent, invocation.id, attempt.id
+                    ))),
+                }
             }
         }
-        record["outcome"] = json!(match &result {
-            Ok(_) => "completed",
-            Err(_) => "failed",
-        });
-        record["cleanup_status"] = json!(if stopped.is_ok() {
+    }
+
+    /// Whether the window's worker still holds the conversation it started
+    /// with. A later invocation in a different conversation would have
+    /// reached something the window did not promise.
+    fn same_conversation(
+        &self,
+        window: &Window,
+        backend: &dyn crate::backend::Backend,
+    ) -> Result<()> {
+        let client = &self.launcher.client;
+        let pane_pid = client.get_pane_pid(&window.session)?;
+        let stamp = client.session_delivery(&window.session);
+        let target = crate::backend::Target {
+            name: &window.session,
+            pane_pid,
+            stamp: stamp.as_deref(),
+        };
+        match backend.conversation_id(&target) {
+            Some(native) if native == window.conversation => Ok(()),
+            Some(native) => bail!(
+                "its worker moved to conversation {native} from {}; the window's writes are refused",
+                window.conversation
+            ),
+            None => bail!(
+                "its worker no longer reports conversation {}; the window's writes are refused",
+                window.conversation
+            ),
+        }
+    }
+
+    /// End `slot`'s window: stop its worker, see its processes gone, and
+    /// record how it went.
+    fn close(&self, slot: &mut Option<Window>) -> Result<()> {
+        let Some(mut window) = slot.take() else {
+            return Ok(());
+        };
+        let agent = &self.states[&window.agent];
+        let stopped = self.stop(
+            &window.session,
+            &window.attempt,
+            (agent, window.since),
+            &mut window.tree,
+            &mut window.sessions,
+        );
+        if stopped.is_ok() {
+            if let Err(error) = self.track(&window.agent, None) {
+                eprintln!(
+                    "warning: could not record {} as stopped: {error:#}",
+                    window.session
+                );
+            }
+        }
+        window.record["outcome"] = json!(if window.failed { "failed" } else { "completed" });
+        window.record["cleanup_status"] = json!(if stopped.is_ok() {
             "stopped"
         } else {
             "unconfirmed"
         });
-        self.record(&record);
+        self.record(&window.record);
+        self.publish(&window.agent, &window.record);
+        stopped
+    }
+
+    /// Stop every open window, as the run ends.
+    fn close_all(&self) {
+        for (agent, window) in &self.windows {
+            let mut slot = window
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(error) = self.close(&mut slot) {
+                eprintln!("warning: could not stop the worker of agent '{agent}': {error:#}");
+            }
+        }
+    }
+
+    fn publish(&self, agent: &str, record: &Value) {
         if let Some(publisher) = &self.publisher {
-            publisher.agent_attempt(&invocation.agent, &record);
+            publisher.agent_attempt(agent, record);
         }
-        // Released only once the worker is gone: a worker still running could
-        // still be writing to the workspace downstream reactions read.
-        if let Err(error) = stopped {
-            return Err(error.context(format!(
-                "agent '{}' invocation {}: worker attempt {} was not confirmed stopped, so its effects are withheld",
-                invocation.agent, invocation.id, attempt.id
-            )));
-        }
-        result
     }
 
     /// Wait for the started worker to report the conversation it opened,
@@ -3243,14 +3575,12 @@ fn launch(
         fs::remove_dir_all(&obsolete_invocations)?;
     }
     let client = TmuxClient::new(crate::ea::ea_prefix(config.ea_id, config.base_prefix));
-    // An invocation-scoped agent's session is recorded only while an
-    // attempt may have one: see `ScopedWorkers::track`.
+    // A session of an agent with a lifetime is recorded only while a window
+    // may have one: see `ScopedWorkers::track`.
     let planned_sessions: BTreeMap<String, String> = state
         .agents
         .iter()
-        .filter(|(_, agent)| {
-            needs_agent_process(&agent.backend) && agent.scope != AgentScope::Invocation
-        })
+        .filter(|(_, agent)| needs_agent_process(&agent.backend) && agent.lifetime.is_none())
         .map(|(name, _)| (name.clone(), client.session_for(name)))
         .collect();
     let record = Arc::new(Mutex::new(deploy::DeploymentRecord::create(
@@ -3473,6 +3803,11 @@ fn launch(
         Some(&runtime_dir),
         Some(&checkpointer),
     );
+    // However the loop ended, no window's worker outlives it: a resume starts
+    // new conversations, as a conversation cannot be rolled back.
+    if let Some(scoped) = &executor.agents.scoped {
+        scoped.close_all();
+    }
     watcher_shutdown.store(true, Ordering::Release);
     let _ = watcher.join();
     let end = match outcome {
@@ -3643,8 +3978,8 @@ fn launch(
 const AGENT_PROTOCOL: &str = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
 
 /// What it takes to start one topology agent's worker. Kept for the whole
-/// run, because an invocation-scoped agent is started again for every
-/// invocation.
+/// run, because an agent with a `per` lifetime is started again for every
+/// window.
 #[derive(Clone)]
 struct AgentLauncher {
     client: TmuxClient,
@@ -3711,8 +4046,8 @@ impl AgentLauncher {
 
     /// Start `name`'s worker in its session and return the line it was
     /// launched with, which says how it proves readiness. `attempt` is set
-    /// for an invocation-scoped agent: the worker exists for that one
-    /// invocation and opens the native conversation the attempt names.
+    /// for an agent with a lifetime: the worker serves one window of it and
+    /// opens the native conversation the attempt names.
     fn launch(
         &self,
         name: &str,
@@ -3728,12 +4063,13 @@ impl AgentLauncher {
             .get(&agent.instance)
             .context("agent instance has no workspace")?;
         let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
-        // Nothing of an earlier invocation is put in front of it: what it
-        // knows of the run is what the workspace holds.
-        let scoped = if attempt.is_some() {
-            "\n\nThis conversation exists for one invocation and ends when you call omar_complete. Earlier invocations ran in conversations of their own, which you cannot see; whatever they left for you is in the workspace files."
-        } else {
-            ""
+        // Nothing of an earlier window is put in front of it: what it knows
+        // of the run is what the workspace holds.
+        let scoped = match (attempt, agent.lifetime) {
+            (Some(_), Some(lifetime)) => format!(
+                "\n\nYour conversation is reset {lifetime}. Invocations within it share it. After a reset, earlier conversations are gone and you cannot see them; whatever later work needs from them is in the workspace files."
+            ),
+            _ => String::new(),
         };
         fs::write(&prompt_file, format!("{AGENT_PROTOCOL}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.{}{scoped}\n", temp.display(), self.resumed))?;
         let backend = canonical_backend(&agent.backend);
@@ -3827,9 +4163,9 @@ fn spawn_topology_agents(
             client.ensure_session_not_attached(&session)?;
             crate::backend::kill_worker(client, &session, true)?;
         }
-        // An invocation-scoped agent has no worker between invocations; each
-        // invocation starts its own.
-        if agent.scope == AgentScope::Invocation {
+        // An agent with a lifetime has no worker until an invocation starts
+        // its window.
+        if agent.lifetime.is_some() {
             continue;
         }
         let command = launcher.launch(name, agent, None)?;
@@ -3919,7 +4255,7 @@ fn parse_input_value(ty: &str, value: &str) -> Result<Value> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Tag {
     timestamp: u64,
     microstep: u64,
@@ -4719,7 +5055,7 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
 
             let specs: Vec<_> = enabled
                 .iter()
-                .map(|entry| invocation_spec(state, *entry, &events, &store))
+                .map(|entry| invocation_spec(state, *entry, &events, &store, tag))
                 .collect::<Result<_>>()?;
             for spec in &specs {
                 observer.reaction_started(
@@ -4730,20 +5066,63 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
                 );
             }
             let task_ids: Vec<_> = specs.iter().map(|spec| spec.id).collect();
-            let results = thread::scope(|scope| {
-                let handles: Vec<_> = specs
-                    .into_iter()
-                    .map(|spec| scope.spawn(move || executor.invoke(spec)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|handle| {
-                        handle
-                            .join()
-                            .map_err(|_| anyhow::anyhow!("reaction executor panicked"))?
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })?;
+            // An agent with a lifetime shares a conversation between its
+            // invocations in a tag, so they run one after another in
+            // declaration order, the later one seeing what the earlier left
+            // in it; every other invocation runs beside the rest.
+            let mut sequences: Vec<Vec<(usize, InvocationSpec)>> = Vec::new();
+            for (index, spec) in specs.into_iter().enumerate() {
+                let shared = state
+                    .agents
+                    .get(&spec.agent)
+                    .is_some_and(|agent| agent.lifetime.is_some());
+                match sequences
+                    .iter_mut()
+                    .find(|run| shared && run[0].1.agent == spec.agent)
+                {
+                    Some(run) => run.push((index, spec)),
+                    None => sequences.push(vec![(index, spec)]),
+                }
+            }
+            let mut results: Vec<(usize, Result<BTreeMap<String, Value>>)> =
+                thread::scope(|scope| {
+                    let handles: Vec<_> = sequences
+                        .into_iter()
+                        .map(|run| {
+                            scope.spawn(move || {
+                                // Stops at the first failure: nothing later
+                                // in the sequence may start a worker or act
+                                // in a run that is already failing.
+                                let mut done = Vec::new();
+                                for (index, spec) in run {
+                                    let result = executor.invoke(spec);
+                                    let failed = result.is_err();
+                                    done.push((index, result));
+                                    if failed {
+                                        break;
+                                    }
+                                }
+                                done
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|handle| {
+                            handle
+                                .join()
+                                .map_err(|_| anyhow::anyhow!("reaction executor panicked"))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })?
+                .into_iter()
+                .flatten()
+                .collect();
+            results.sort_by_key(|(index, _)| *index);
+            let results = results
+                .into_iter()
+                .map(|(_, result)| result)
+                .collect::<Result<Vec<_>>>()?;
 
             // Declaration order decides who wins a port two reactions in this
             // layer both write, which is the rule the language states.
@@ -4850,6 +5229,7 @@ fn invocation_spec(
     (reaction_id, reaction): (&String, &ReactionState),
     events: &BTreeMap<String, Value>,
     store: &BTreeMap<String, Value>,
+    tag: Tag,
 ) -> Result<InvocationSpec> {
     let trigger_values = reaction
         .triggers
@@ -4895,6 +5275,7 @@ fn invocation_spec(
         contract: reaction.contract.clone(),
         prompt: reaction.prompt.clone(),
         within: reaction.within.map(Duration::from_nanos),
+        tag,
     })
 }
 
@@ -5561,6 +5942,7 @@ mod tests {
             reaction,
             &BTreeMap::from([("topic".to_string(), json!("t"))]),
             &BTreeMap::new(),
+            Tag::default(),
         )
         .unwrap();
         assert_eq!(spec.effect_names["out"], "B");
@@ -5601,6 +5983,7 @@ mod tests {
             contract: "out".into(),
             prompt: "Decide.".into(),
             within: None,
+            tag: Tag::default(),
         };
         let message = invocation_message(&spec, "Decide.").unwrap();
         let header: Vec<&str> = message
@@ -5655,6 +6038,7 @@ mod tests {
             reaction,
             &BTreeMap::from([("token".to_string(), json!("t"))]),
             &BTreeMap::new(),
+            Tag::default(),
         )
         .unwrap();
         assert!(spec.types.is_empty(), "{:?}", spec.types);
@@ -5856,7 +6240,7 @@ mod tests {
                     AgentState {
                         backend: "claude".into(),
                         instance: String::new(),
-                        scope: Default::default(),
+                        lifetime: None,
                     },
                 ),
                 (
@@ -5864,7 +6248,7 @@ mod tests {
                     AgentState {
                         backend: "codex".into(),
                         instance: String::new(),
-                        scope: Default::default(),
+                        lifetime: None,
                     },
                 ),
                 (
@@ -5872,7 +6256,7 @@ mod tests {
                     AgentState {
                         backend: "opencode".into(),
                         instance: String::new(),
-                        scope: Default::default(),
+                        lifetime: None,
                     },
                 ),
             ]),
@@ -6119,7 +6503,7 @@ mod tests {
                 name: "n1_agent".to_string(),
                 backend: "Codex".to_string(),
                 instance: String::new(),
-                scope: Default::default(),
+                lifetime: None,
             },
         );
 
@@ -6206,6 +6590,7 @@ mod tests {
             (id, reaction),
             &BTreeMap::from([("topic".to_string(), json!("x"))]),
             &BTreeMap::new(),
+            Tag::default(),
         )
         .unwrap()
     }
@@ -8728,6 +9113,7 @@ mod tests {
                 ("c.count".to_string(), json!(0)),
                 ("d.count".to_string(), json!(0)),
             ]),
+            Tag::default(),
         )
         .unwrap();
         assert_eq!(spec.state_values.keys().collect::<Vec<_>>(), ["c.count"]);
@@ -8945,6 +9331,7 @@ mod tests {
             state.reactions.get_key_value("s.reaction.0").unwrap(),
             &BTreeMap::from([("s.tick".to_string(), json!(1))]),
             &BTreeMap::new(),
+            Tag::default(),
         )
         .unwrap();
 
@@ -8989,6 +9376,7 @@ mod tests {
                 state.reactions.get_key_value("s.reaction.0").unwrap(),
                 &BTreeMap::from([("s.tick".to_string(), json!(1))]),
                 &BTreeMap::new(),
+                Tag::default(),
             )
             .unwrap();
             DispatchExecutor {
@@ -9011,12 +9399,12 @@ mod tests {
         assert!(error.contains("its body"), "{error}");
     }
 
-    /// `coder : Claude(scope = invocation)` as `omarc` emits it, at `version`.
-    fn scoped_program(version: u32, backend: &str, scope: Option<&str>) -> Bytecode {
+    /// `coder : Claude per tag` as `omarc` emits it, at `version`.
+    fn lifetime_program(version: u32, backend: &str, lifetime: Option<Value>) -> Bytecode {
         let mut agent =
             json!({"op":"spawn_agent","instance":"t","name":"t.coder","backend":backend});
-        if let Some(scope) = scope {
-            agent["scope"] = json!(scope);
+        if let Some(lifetime) = lifetime {
+            agent["lifetime"] = lifetime;
         }
         serde_json::from_value(json!({
             "version": version,
@@ -9031,71 +9419,200 @@ mod tests {
         .unwrap()
     }
 
+    fn per(unit: &str, count: u32) -> Option<Value> {
+        Some(json!({"unit": unit, "count": count}))
+    }
+
     #[test]
-    fn invocation_scope_is_carried_and_the_default_is_not_written() {
-        let state = verify(&scoped_program(2, "Claude", Some("invocation"))).unwrap();
-        assert_eq!(state.agents["t.coder"].scope, AgentScope::Invocation);
+    fn a_lifetime_is_carried_and_none_is_not_written() {
+        let program = lifetime_program(2, "Claude", per("tag", 3));
+        let state = verify(&program).unwrap();
+        let lifetime = state.agents["t.coder"].lifetime.unwrap();
+        assert_eq!(
+            lifetime,
+            Lifetime {
+                unit: LifetimeUnit::Tag,
+                count: 3
+            }
+        );
+        assert_eq!(lifetime.to_string(), "per 3 tags");
         // Round trips through the bytecode a checkpoint keeps as program.json.
-        let program = scoped_program(2, "Claude", Some("invocation"));
         let kept: Bytecode =
             serde_json::from_value(serde_json::to_value(&program).unwrap()).unwrap();
         assert_eq!(kept.instructions, program.instructions);
         assert_eq!(
-            serde_json::to_value(&kept.instructions[2]).unwrap()["scope"],
-            json!("invocation")
+            serde_json::to_value(&kept.instructions[2]).unwrap()["lifetime"],
+            json!({"unit":"tag","count":3})
         );
         assert_eq!(
-            serde_json::to_value(&state.agents["t.coder"]).unwrap()["scope"],
-            json!("invocation")
+            serde_json::to_value(&state.agents["t.coder"]).unwrap()["lifetime"],
+            json!({"unit":"tag","count":3})
         );
-        // The default leaves an agent's bytecode and state as they always were.
-        let plain = scoped_program(1, "Claude", None);
+        for (count, unit, spelled) in [
+            (1, "task", "per task"),
+            (1, "tag", "per tag"),
+            (5, "task", "per 5 tasks"),
+        ] {
+            let state = verify(&lifetime_program(2, "Stub", per(unit, count))).unwrap();
+            assert_eq!(
+                state.agents["t.coder"].lifetime.unwrap().to_string(),
+                spelled
+            );
+        }
+        // Without one the agent's bytecode and state are as they always were.
+        let plain = lifetime_program(1, "Claude", None);
         let state = verify(&plain).unwrap();
-        assert_eq!(state.agents["t.coder"].scope, AgentScope::Agent);
+        assert_eq!(state.agents["t.coder"].lifetime, None);
         assert!(serde_json::to_value(&plain.instructions[2])
             .unwrap()
-            .get("scope")
+            .get("lifetime")
             .is_none());
         assert!(serde_json::to_value(&state.agents["t.coder"])
             .unwrap()
-            .get("scope")
+            .get("lifetime")
             .is_none());
     }
 
     #[test]
-    fn invocation_scope_is_refused_where_it_could_be_dropped_or_unkept() {
-        // Version 1 is what a runtime that predates scopes reads, ignoring
-        // `scope`: such a program would keep the conversation.
-        let error = verify(&scoped_program(1, "Claude", Some("invocation")))
+    fn a_lifetime_is_refused_where_it_could_be_dropped_or_unkept() {
+        // Version 1 is what a runtime that predates lifetimes reads, ignoring
+        // `lifetime`: such a program would keep the conversation.
+        let error = verify(&lifetime_program(1, "Claude", per("tag", 1)))
             .unwrap_err()
             .to_string();
         assert!(error.contains("needs bytecode version 2"), "{error}");
-        // A backend that cannot promise a new conversation is refused before
+        // A backend that cannot promise a fresh conversation is refused before
         // anything starts, naming what can.
         for backend in ["Web", "Agy", "Antigravity", "Cursor", "Nope"] {
-            let error = verify(&scoped_program(2, backend, Some("invocation")))
+            let error = verify(&lifetime_program(2, backend, per("task", 5)))
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("cannot start a fresh conversation per invocation")
-                    && error.contains("supported: claude, codex, opencode, pi, jev, stub"),
+                error.contains(&format!(
+                    "agent 't.coder' resets its conversation (per 5 tasks), but backend '{backend}' cannot start a fresh conversation"
+                )) && error.contains("supported: claude, codex, opencode, pi, jev, stub"),
                 "{backend}: {error}"
             );
         }
         for backend in ["Claude", "Codex", "OpenCode", "Pi", "Jev", "Stub"] {
-            verify(&scoped_program(2, backend, Some("invocation"))).unwrap();
+            verify(&lifetime_program(2, backend, per("tag", 1))).unwrap();
         }
-        // A scope this runtime does not know is an error, not the default.
-        let unknown = serde_json::from_value::<Bytecode>(json!({
-            "version": 2, "team": "Scoped", "instructions": [
-                {"op":"begin_plan","team":"Scoped"},
-                {"op":"spawn_agent","name":"coder","backend":"Claude","scope":"conversation"},
-                {"op":"commit_plan"}
-            ]
-        }));
-        assert!(unknown.is_err());
+        // Never a count of nothing.
+        let error = verify(&lifetime_program(2, "Claude", per("tag", 0)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least 1"), "{error}");
+        // A lifetime this runtime does not know is an error, not the default.
+        for lifetime in [
+            json!({"unit":"week","count":1}),
+            json!({"unit":"tag"}),
+            json!({"unit":"tag","count":1,"extra":true}),
+            json!("tag"),
+        ] {
+            let unknown = serde_json::from_value::<Bytecode>(json!({
+                "version": 2, "team": "Scoped", "instructions": [
+                    {"op":"begin_plan","team":"Scoped"},
+                    {"op":"spawn_agent","name":"coder","backend":"Claude","lifetime":lifetime},
+                    {"op":"commit_plan"}
+                ]
+            }));
+            assert!(unknown.is_err(), "{lifetime}");
+        }
         // Nor does a newer version pass.
-        assert!(verify(&scoped_program(3, "Claude", Some("invocation"))).is_err());
+        assert!(verify(&lifetime_program(3, "Claude", per("tag", 1))).is_err());
+    }
+
+    /// Which window each of an agent's invocations, at `tags`, falls in: the
+    /// runtime's own rule, driven the way `admit` drives it.
+    fn windows_of(lifetime: Lifetime, tags: &[(u64, u64)]) -> Vec<usize> {
+        let tag = |(timestamp, microstep)| Tag {
+            timestamp,
+            microstep,
+        };
+        let mut windows = Vec::new();
+        let mut open: Option<(usize, Used)> = None;
+        for &at in tags {
+            let at = tag(at);
+            let window = match open {
+                Some((window, mut used)) if !used.spent(lifetime, at) => {
+                    used.take(at);
+                    open = Some((window, used));
+                    window
+                }
+                _ => {
+                    let window = windows.last().map_or(0, |last| last + 1);
+                    open = Some((window, Used::first(at)));
+                    window
+                }
+            };
+            windows.push(window);
+        }
+        windows
+    }
+
+    fn life(unit: LifetimeUnit, count: u32) -> Lifetime {
+        Lifetime { unit, count }
+    }
+
+    #[test]
+    fn per_task_gives_every_invocation_a_window_of_its_own() {
+        // Two in one tag are still two windows.
+        assert_eq!(
+            windows_of(life(LifetimeUnit::Task, 1), &[(1, 0), (1, 0), (2, 0)]),
+            [0, 1, 2]
+        );
+        assert!(Used::first(Tag::default()).exhausted(life(LifetimeUnit::Task, 1)));
+    }
+
+    #[test]
+    fn per_n_tasks_ends_a_window_after_that_many_invocations() {
+        // Three invocations, two windows.
+        assert_eq!(
+            windows_of(life(LifetimeUnit::Task, 2), &[(1, 0), (1, 0), (2, 0)]),
+            [0, 0, 1]
+        );
+        let mut used = Used::first(Tag::default());
+        assert!(!used.exhausted(life(LifetimeUnit::Task, 2)));
+        used.take(Tag::default());
+        assert!(used.exhausted(life(LifetimeUnit::Task, 2)));
+    }
+
+    #[test]
+    fn per_tag_shares_one_window_between_invocations_in_a_tag() {
+        // The same agent twice in one tag (a loop's second reaction arrives at
+        // the same tag) shares a conversation; the next tag starts another.
+        assert_eq!(
+            windows_of(
+                life(LifetimeUnit::Tag, 1),
+                &[(1, 0), (1, 0), (2, 0), (2, 0)]
+            ),
+            [0, 0, 1, 1]
+        );
+        // A tag is a timestamp and a microstep: a loop through `after 0`
+        // reaches a new tag on every pass.
+        assert_eq!(
+            windows_of(life(LifetimeUnit::Tag, 1), &[(1, 0), (1, 1), (1, 2)]),
+            [0, 1, 2]
+        );
+        // Tags cannot say a window is over: the agent may run in it again.
+        assert!(!Used::first(Tag::default()).exhausted(life(LifetimeUnit::Tag, 1)));
+    }
+
+    #[test]
+    fn per_n_tags_counts_only_the_tags_the_agent_runs_in() {
+        // Other agents' tags (here 2, 3, 4, 6, 7, 8) never reach this one, so
+        // they do not shorten its window: it runs at 1, 5 and 9.
+        assert_eq!(
+            windows_of(life(LifetimeUnit::Tag, 2), &[(1, 0), (5, 0), (9, 0)]),
+            [0, 0, 1]
+        );
+        assert_eq!(
+            windows_of(
+                life(LifetimeUnit::Tag, 2),
+                &[(1, 0), (1, 0), (2, 0), (3, 0), (3, 0), (4, 0)]
+            ),
+            [0, 0, 0, 1, 1, 1]
+        );
     }
 
     /// A conversation a backend minted is taken only when it is new: not

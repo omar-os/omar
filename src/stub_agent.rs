@@ -32,7 +32,7 @@ pub fn run(context_file: &Path) -> Result<()> {
 
     let spool =
         std::env::var_os("OMAR_EVENT_SPOOL").context("stub agent requires OMAR_EVENT_SPOOL")?;
-    // An invocation-scoped worker opens the conversation its attempt names,
+    // A worker of a `per` lifetime opens the conversation its attempt names,
     // and says so beside its spool for the runtime to check. The pid is what
     // ties the report to this worker, not an earlier one.
     let conversation = topology

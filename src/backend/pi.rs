@@ -166,7 +166,7 @@ fn launch_command(launch: &Launch<'_>) -> Result<String> {
             opens_a_session(word) || *word == "--fork" || word.starts_with("--session-id")
         })
     }) {
-        anyhow::bail!("an invocation-scoped agent's command must not pass {word}");
+        anyhow::bail!("an agent that resets its conversation (per lifetime) has a command that must not pass {word}");
     }
     let mut command = format!(
         "{} --approve{}{}",
@@ -266,6 +266,9 @@ mod tests {
     use super::*;
     #[test]
     fn pi_launch_materializes_scoped_bridge_and_resumes_only_saved_chat() {
+        // A worker's launch line reads OMAR_PERSIST_WORKER_SESSIONS, which
+        // another test sets under this lock.
+        let _lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let prompt = dir.path().join("prompt.md");
         std::fs::write(&prompt, "hello").unwrap();

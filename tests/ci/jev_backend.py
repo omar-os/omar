@@ -286,7 +286,7 @@ main JevConfigurationTest { review = Review() }
             (temp / "schemas").mkdir()
             (temp / "schemas/decision.json").write_text(json.dumps({"type":"string", "enum":["continue","stop"]}))
             (temp / "workflow.omar").write_text('''type Decision from "./schemas/decision.json"
-team Review[reviewer : Jev(scope = invocation)] {
+team Review[reviewer : Jev per task] {
     input request : string
     action mid : Decision
     output out : Decision

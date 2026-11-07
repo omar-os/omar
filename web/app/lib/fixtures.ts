@@ -23,7 +23,7 @@ export const reviewWorkflow: DiagramSnapshot = {
       name: "flow.planner",
       backend: "Codex",
       instance: "flow",
-      scope: "agent",
+      lifetime: null,
       attempts: [],
     },
     {
@@ -31,7 +31,7 @@ export const reviewWorkflow: DiagramSnapshot = {
       name: "flow.reviewer",
       backend: "Codex",
       instance: "flow",
-      scope: "agent",
+      lifetime: null,
       attempts: [],
     },
   ],

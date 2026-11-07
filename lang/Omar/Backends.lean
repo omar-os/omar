@@ -3,7 +3,7 @@
 
 namespace Omar.Backends
 
-/-- The backends an invocation-scoped agent may name, each by its aliases,
+/-- The backends an agent with a `per` lifetime may name, each by its aliases,
     its name first: those whose `fresh_conversation` is true. -/
 def freshConversation : Array (Array String) := #[
   #["claude", "claude-code", "claude_code", "claudecode"],

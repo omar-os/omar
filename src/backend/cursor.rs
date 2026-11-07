@@ -82,7 +82,7 @@ impl Backend for Cursor {
     // what an earlier chat said. The only switch,
     // `--exclude-workspace-context`, is print-mode only and rejected for some
     // accounts. A new conversation id is not a new context, so omarc refuses
-    // `Cursor(scope = invocation)`.
+    // `Cursor per tag`.
     /// Cursor takes no message from outside its protocol, so it runs under
     /// OMAR's protocol runner, which owns a durable inbox for it.
     fn launch_command(&self, launch: &Launch<'_>) -> String {

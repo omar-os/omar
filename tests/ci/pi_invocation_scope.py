@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Real Pi runs an invocation-scoped agent in a new conversation every time.
+"""Real Pi runs an agent with a `per` lifetime in a new conversation every time.
 
-`coder : Pi(scope = invocation)` is invoked twice, beside `keeper : Pi`
+`coder : Pi per task` is invoked twice, beside `keeper : Pi`
 invoked twice, under a real `omar run` with real pi (pinned, or PI_BINARY)
 and OMAR's own extension. The model is a local deterministic Responses
 server, so no credentials are needed: it answers each invocation by calling
 OMAR's tools, and records every request pi sent it, which is the whole
 conversation the model was shown.
+
+A second scenario runs two coder invocations of one tag under `per tag`, and
+checks they shared one window, one native conversation and one worker.
 
 Checked:
 - the second coder request holds nothing of the first: its sentinel is in
@@ -33,7 +36,7 @@ OMARC = Path(os.environ.get('OMARC_BIN', REPO / 'lang/.lake/build/bin/omarc')).r
 PI_VERSION = '0.85.1'
 UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 
-PROGRAM = '''team Pipe[coder : Pi(scope = invocation), keeper : Pi] {
+PROGRAM = '''team Pipe[coder : Pi per task, keeper : Pi] {
     input start : string
     action mid : string
     action kmid : string
@@ -44,6 +47,21 @@ PROGRAM = '''team Pipe[coder : Pi(scope = invocation), keeper : Pi] {
     task coder(mid) -> result "Step two. Got $(mid)."
     task keeper(start) -> kmid "Keeper one $(start)"
     task keeper(kmid) -> kept "Keeper two $(kmid)"
+}
+
+main Scoped {
+    p = Pipe()
+}
+'''
+
+# Two coder invocations in one tag: `per tag` gives them one window.
+PER_TAG = '''team Pipe[coder : Pi per tag] {
+    input start : string
+    action mid : string
+    output result : string
+
+    task coder(start) -> mid "Step one. The secret is SENTINEL-$(start)."
+    task coder(start) -> result "Step two. Got $(start)."
 }
 
 main Scoped {
@@ -139,7 +157,8 @@ def pi_command(root):
     return [subprocess.check_output(['sh', '-c', 'command -v node'], text=True).strip(), str(cli)]
 
 
-def main():
+def execute(program_text):
+    requests.clear()
     server = ThreadingHTTPServer(('127.0.0.1', 0), Responses)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     with scratch('omar-pi-scope-', BIN, 'pi-scope-test') as root:
@@ -166,7 +185,7 @@ def main():
             'export PI_OFFLINE=1\n'
             f'export PI_E2E_BASE_URL="http://127.0.0.1:{server.server_port}/v1"\n')
         program = root / 'Scoped.omar'
-        program.write_text(PROGRAM)
+        program.write_text(program_text)
         tmux = 'omar-pi-scope-' + root.name.rsplit('-', 1)[-1]
         inherited = {k: v for k, v in os.environ.items()
                      if not k.startswith(('OMAR_', 'PI_')) and k not in ('TMUX', 'TMUX_PANE')}
@@ -186,6 +205,11 @@ def main():
         finally:
             server.shutdown()
 
+    return result, attempts
+
+
+def per_task():
+    result, attempts = execute(PROGRAM)
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     # What the model was shown, per invocation.
@@ -209,7 +233,32 @@ def main():
           'the second model request held nothing of the first; keeper kept its own')
 
 
+def per_tag():
+    result, attempts = execute(PER_TAG)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    # The second invocation was handed to the same worker, in the same
+    # conversation, so it was shown the first's secret.
+    assert 'Output p.result = "leaked"' in output, output
+    shown = [json.dumps(r.get('input', [])) for r in requests]
+    second = [s for s in shown if 'Step two' in s]
+    assert second and all('SENTINEL-alpha' in s for s in second), shown
+    windows = {}
+    for a in attempts:
+        windows[a['attempt_id']] = a
+    assert len(windows) == 1, attempts
+    (window,) = windows.values()
+    assert (window['outcome'], window['cleanup_status']) == ('completed', 'stopped'), attempts
+    assert len(window['invocations']) == 2, window
+    assert {a['native_session_id'] for a in attempts if a['outcome'] != 'started'} == \
+        {window['native_session_id']}, attempts
+    assert window['native_session_id'], window
+    print(f"PASS: real pi served two coder invocations of one tag in one window and one "
+          f"conversation ({window['native_session_id']}); the second was shown the first")
+
+
 if __name__ == '__main__':
-    main()
+    per_task()
+    per_tag()
     assert_none_left('omar-pi-scope-')
     print('PASS: no session, daemon or worker of the run is still running')

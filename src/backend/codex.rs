@@ -174,10 +174,10 @@ impl Backend for Codex {
             }
         }
         // The exec runner resumes one conversation turn after turn, which is
-        // what an invocation-scoped attempt must never do.
+        // what a per-lifetime attempt must never do.
         if is_attempt(mcp_context) {
             return failed_launch(
-                "an invocation-scoped attempt needs an app-server of its own, which could not be set up",
+                "an agent that resets its conversation (per lifetime) needs an app-server of its own, which could not be set up",
             );
         }
         let rendered = materialize_prompt_file(launch.prompt_file, launch.substitutions);
@@ -237,7 +237,7 @@ fn failed_launch(why: &str) -> String {
     )
 }
 
-/// Whether this launch is an invocation-scoped attempt's.
+/// Whether this launch is a per-lifetime attempt's.
 fn is_attempt(context: &McpLaunchContext) -> bool {
     context
         .topology
@@ -1158,7 +1158,10 @@ mod tests {
         let line = build_agent_command(Codex.default_command(), &missing, &[], &attempt);
         assert!(line.starts_with("printf "), "{line}");
         assert!(line.ends_with("exit 1"), "{line}");
-        assert!(line.contains("invocation-scoped attempt"), "{line}");
+        assert!(
+            line.contains("resets its conversation (per lifetime)"),
+            "{line}"
+        );
         assert!(
             !line.contains("backend-runner") && !line.contains("--listen"),
             "{line}"

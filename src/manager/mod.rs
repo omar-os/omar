@@ -39,14 +39,14 @@ pub struct TopologyMcpContext {
     pub agent: String,
     pub endpoint: String,
     pub token: String,
-    /// Set for an invocation-scoped agent's worker, which exists for one
-    /// invocation. Its calls carry the attempt, so a worker from an earlier
+    /// Set for a worker of an agent with a `per` lifetime, which exists for
+    /// one window. Its calls carry the attempt, so a worker from an earlier
     /// attempt cannot answer for a later one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<TopologyAttempt>,
 }
 
-/// One invocation-scoped worker: the attempt OMAR started it for, and the
+/// One `per`-lifetime worker: the attempt OMAR started it for, and the
 /// native conversation it was told to open, which no earlier worker used.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TopologyAttempt {
@@ -246,7 +246,7 @@ pub(crate) fn mcp_ea_dir(context: &McpLaunchContext) -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Where an invocation-scoped attempt's launch writes its context and
+/// Where a `per`-lifetime attempt's launch writes its context and
 /// configs: its own, so a process left from an earlier attempt that rereads
 /// its paths finds nothing of a later one's. Removed once the attempt stops.
 pub(crate) fn attempt_mcp_dir(omar_dir: &Path, ea_id: EaId, attempt: &str) -> PathBuf {

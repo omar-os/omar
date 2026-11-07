@@ -84,7 +84,7 @@ pub enum DiagramEventKind {
     /// The run's clock started: the payload's `clock_origin` is the unix
     /// millisecond its logical time zero stands at.
     ClockStarted,
-    /// An invocation-scoped agent's worker attempt ended: the payload is the
+    /// A window of a `per` agent's conversation changed: the payload is the
     /// agent's id and the attempt as `DiagramAgent::attempts` holds it.
     AgentAttempt,
 }
@@ -102,13 +102,14 @@ pub struct DiagramAgent {
     pub backend: String,
     /// The container it is drawn inside.
     pub instance: String,
-    /// How long its conversation lives: the run, or one invocation.
+    /// How long its conversation lives, when it says: `per tag`. Absent for
+    /// the whole run.
     #[serde(default)]
-    pub scope: crate::topology::AgentScope,
-    /// An invocation-scoped agent's worker attempts that ended, oldest first:
-    /// `reaction`, `attempt_id`, `native_session_id`, `outcome`,
-    /// `cleanup_status` and the rest of the record the run keeps in
-    /// `attempts.jsonl`.
+    pub lifetime: Option<crate::topology::Lifetime>,
+    /// A `per` agent's conversation windows, oldest first, each as of its
+    /// latest change: `invocations` (each with its `reaction`), `attempt_id`,
+    /// `native_session_id`, `outcome`, `cleanup_status` and the rest of the
+    /// record the run keeps in `attempts.jsonl`.
     #[serde(default)]
     #[ts(type = "Record<string, unknown>[]")]
     pub attempts: Vec<Value>,
@@ -264,7 +265,7 @@ impl DiagramSnapshot {
                 name: name.clone(),
                 backend: agent.backend.clone(),
                 instance: agent.instance.clone(),
-                scope: agent.scope,
+                lifetime: agent.lifetime,
                 attempts: Vec::new(),
             })
             .collect();
@@ -485,7 +486,8 @@ impl DiagramPublisher {
 }
 
 impl DiagramPublisher {
-    /// An invocation-scoped agent's worker attempt ended.
+    /// A window of a `per` agent's conversation started, served an
+    /// invocation, or ended; the snapshot keeps the latest of each.
     pub fn agent_attempt(&self, agent: &str, attempt: &Value) {
         let id = agent_id(agent);
         self.publish_with(
@@ -494,7 +496,14 @@ impl DiagramPublisher {
             json!({ "agent": id, "attempt": attempt }),
             |snapshot| {
                 if let Some(item) = snapshot.agents.iter_mut().find(|item| item.id == id) {
-                    item.attempts.push(attempt.clone());
+                    match item
+                        .attempts
+                        .iter_mut()
+                        .find(|known| known["attempt_id"] == attempt["attempt_id"])
+                    {
+                        Some(known) => *known = attempt.clone(),
+                        None => item.attempts.push(attempt.clone()),
+                    }
                 }
             },
         );
@@ -938,7 +947,7 @@ mod tests {
                 AgentState {
                     backend: "codex".to_string(),
                     instance: String::new(),
-                    scope: Default::default(),
+                    lifetime: None,
                 },
             )]),
             ports: BTreeMap::from([
@@ -1022,7 +1031,7 @@ mod tests {
                 AgentState {
                     backend: "codex".to_string(),
                     instance: "writer".to_string(),
-                    scope: Default::default(),
+                    lifetime: None,
                 },
             )]),
             ports: BTreeMap::from([

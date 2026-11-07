@@ -189,6 +189,7 @@ button:focus-visible, select:focus-visible { outline-offset: 3px; }
 .omar-model-mark { font-size: 0.75rem; font-weight: 700; }
 .node-connection { stroke-width: 1.3; }
 .omar-reaction.selected .omar-reaction-body { stroke-width: 2; }
+.omar-reaction-lifetime { font-size: 0.6875rem; }
 .omar-edge { stroke-width: 1.4; }
 .diagram-zoom { right: 16px; bottom: 16px; padding: 4px; gap: 2px; border-radius: 9px; }
 .diagram-zoom button { border-radius: 6px; font-size: 0.875rem; }
@@ -451,3 +452,12 @@ button:focus-visible, select:focus-visible { outline-offset: 3px; }
   .diagram-legend { max-width: calc(100% - 140px); }
   .prompt-box > div { flex-wrap: wrap; gap: 8px; }
 }
+/* An agent that resets its conversation: a dashed card. Only the dashes say it;
+   the border keeps its state colour (idle, running, done, selected). Longer
+   dashes and a heavier line than the 3 3 trigger/effect wires beside it. */
+.omar-reaction-body.resets, .omar-reaction.resets .omar-reaction-body { stroke-dasharray: 7 4; stroke-width: 1.4; }
+.omar-reaction.running.resets .omar-reaction-body { stroke-width: 1.6; }
+/* Light theme only: the idle border is too pale to carry the dashes. */
+:root[data-theme="light"] .omar-reaction.idle.resets:not(.selected) .omar-reaction-body { stroke: var(--dia-node-line); stroke-width: 1.6; }
+.omar-reaction-lifetime { fill: var(--dia-node-line-soft); }
+:root[data-theme="light"] .omar-reaction-lifetime { fill: #746c80; }

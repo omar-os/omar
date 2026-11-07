@@ -159,7 +159,7 @@ impl Backend for Opencode {
             .find_map(|word| word.strip_prefix(&format!("{ATTEMPT_SESSION}=")))
         {
             let port = opencode_port(command)
-                .context("an invocation-scoped opencode agent needs a port to reach")?;
+                .context("an opencode agent that resets its conversation (per lifetime) needs a port to reach")?;
             return provision_fresh_session(port, id, PROVISION_TIMEOUT).map(Some);
         }
         match opencode_port(command) {
@@ -409,7 +409,7 @@ fn provision_fresh_session(port: u16, id: &str, timeout: Duration) -> Result<Str
     anyhow::ensure!(
         status == 200 && created == Some(id),
         "opencode did not create session {id} through /api/session (HTTP {status}, got {created:?}); \
-         invocation scope needs an opencode that has it"
+         a `per` lifetime needs an opencode that has it"
     );
     empty_session(port, id)?;
     let select = serde_json::json!({ "sessionID": id }).to_string();

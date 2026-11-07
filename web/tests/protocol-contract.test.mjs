@@ -370,6 +370,12 @@ test("an agent attempt lands on the agent it names and no other", () => {
     kind: "agent_attempt", payload: { agent: agent.id, attempt: { ...attempt, reaction: "reaction.1", attempt_id: "a2" } },
   });
   assert.deepEqual(again.agents[0].attempts.map((item) => item.reaction), ["reaction.0", "reaction.1"]);
+  // A window is published as it changes: the latest replaces the last.
+  const grown = applyDiagramEvent(again, {
+    protocol_version: 1, sequence: again.sequence + 1, team: again.team, tag: null,
+    kind: "agent_attempt", payload: { agent: agent.id, attempt: { ...attempt, outcome: "open" } },
+  });
+  assert.deepEqual(grown.agents[0].attempts.map((item) => item.outcome), ["open", "completed"]);
   for (const [index, other] of others.entries()) {
     assert.equal(next.agents[index + 1], other);
   }

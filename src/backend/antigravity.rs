@@ -59,7 +59,7 @@ impl Backend for Antigravity {
     // conversation at earlier ones' transcripts under `brain/`, and its
     // Knowledge Items and conversation search reach them too, with no switch
     // for any of it. A new conversation id is not a new context, so omarc
-    // refuses `Antigravity(scope = invocation)`.
+    // refuses `Antigravity per tag`.
     // No readiness banner is pinned: `agy` is not available in CI or local
     // discovery, so a marker would be an unverified guess.
     /// Antigravity takes no message from outside its protocol, so it runs

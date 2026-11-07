@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Real Codex runs an invocation-scoped agent in a new thread every time.
+"""Real Codex runs an agent with a `per` lifetime in a new thread every time.
 
-`coder : Codex(scope = invocation)` is invoked twice, beside `keeper : Codex`
+`coder : Codex per task` is invoked twice, beside `keeper : Codex`
 invoked twice, under a real `omar run` with the real codex (0.154.0 in CI,
 or whichever is first on PATH) and its own app-server and TUI. The model is
 a local deterministic Responses server, so no credentials are needed: it
 answers each invocation by calling OMAR's tools, and records every request
 codex sent it, which is the whole conversation the model was shown. HOME and
 CODEX_HOME are disposable; nothing of the operator's codex is read.
+
+A second scenario runs two coder invocations of one tag under `per tag`, and
+checks they shared one window, one native conversation and one worker.
 
 Checked:
 - the second coder request holds nothing of the first: its sentinel is in
@@ -34,7 +37,7 @@ BIN = Path(os.environ.get('OMAR_BIN', REPO / 'target/debug/omar')).resolve()
 OMARC = Path(os.environ.get('OMARC_BIN', REPO / 'lang/.lake/build/bin/omarc')).resolve()
 UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 
-PROGRAM = '''team Pipe[coder : Codex(scope = invocation), keeper : Codex] {
+PROGRAM = '''team Pipe[coder : Codex per task, keeper : Codex] {
     input start : string
     action mid : string
     action kmid : string
@@ -45,6 +48,21 @@ PROGRAM = '''team Pipe[coder : Codex(scope = invocation), keeper : Codex] {
     task coder(mid) -> result "Step two. Got $(mid)."
     task keeper(start) -> kmid "Keeper one $(start)"
     task keeper(kmid) -> kept "Keeper two $(kmid)"
+}
+
+main Scoped {
+    p = Pipe()
+}
+'''
+
+# Two coder invocations in one tag: `per tag` gives them one window.
+PER_TAG = '''team Pipe[coder : Codex per tag] {
+    input start : string
+    action mid : string
+    output result : string
+
+    task coder(start) -> mid "Step one. The secret is SENTINEL-$(start)."
+    task coder(start) -> result "Step two. Got $(start)."
 }
 
 main Scoped {
@@ -140,7 +158,8 @@ class Responses(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def main():
+def execute(program_text):
+    requests.clear()
     server = ThreadingHTTPServer(('127.0.0.1', 0), Responses)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     # Short: codex binds no socket path of 96 bytes or more (scratch is in /tmp).
@@ -167,7 +186,7 @@ trust_level="trusted"
         version = subprocess.run(['codex', '--version'], capture_output=True, text=True)
         print((version.stdout + version.stderr).strip())
         program = root / 'Scoped.omar'
-        program.write_text(PROGRAM)
+        program.write_text(program_text)
         tmux = 'omar-cx-scope-' + root.name.rsplit('-', 1)[-1]
         inherited = {k: v for k, v in os.environ.items()
                      if not k.startswith(('OMAR_', 'CODEX_')) and k not in ('TMUX', 'TMUX_PANE')}
@@ -188,6 +207,11 @@ trust_level="trusted"
         finally:
             server.shutdown()
 
+    return result, attempts, servers
+
+
+def per_task():
+    result, attempts, servers = execute(PROGRAM)
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     # What the model was shown, per invocation.
@@ -214,7 +238,32 @@ trust_level="trusted"
           'the second model request held nothing of the first; keeper kept its own')
 
 
+def per_tag():
+    result, attempts, servers = execute(PER_TAG)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    # The second invocation was handed to the same worker, in the same
+    # conversation, so it was shown the first's secret.
+    assert 'Output p.result = "leaked"' in output, output
+    shown = [json.dumps(r.get('input', [])) for r in requests]
+    second = [s for s in shown if 'Step two' in s]
+    assert second and all('SENTINEL-alpha' in s for s in second), shown
+    windows = {}
+    for a in attempts:
+        windows[a['attempt_id']] = a
+    assert len(windows) == 1, attempts
+    (window,) = windows.values()
+    assert (window['outcome'], window['cleanup_status']) == ('completed', 'stopped'), attempts
+    assert len(window['invocations']) == 2, window
+    assert {a['native_session_id'] for a in attempts if a['outcome'] != 'started'} == \
+        {window['native_session_id']}, attempts
+    assert window['native_session_id'], window
+    print(f"PASS: real codex served two coder invocations of one tag in one window and one "
+          f"thread ({window['native_session_id']}); the second was shown the first")
+
+
 if __name__ == '__main__':
-    main()
+    per_task()
+    per_tag()
     assert_none_left('omar-cx-scope-')
     print('PASS: no session, daemon or worker of the run is still running')

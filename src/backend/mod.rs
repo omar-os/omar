@@ -33,7 +33,7 @@ pub(crate) mod stub;
 /// reading. A timeout reports failure; it never enables terminal-input delivery.
 pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How an invocation-scoped worker's conversation is shown to be new.
+/// How a window's conversation is shown to be new.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Freshness {
     /// The launch opens the attempt's `native_session` id, and the worker
@@ -391,7 +391,7 @@ pub trait Backend: Send + Sync {
     /// before its pane is killed. Errors are ignored.
     fn forget(&self, _target: &Target<'_>) {}
 
-    /// Whether this backend can run an invocation-scoped agent: a launch whose
+    /// Whether this backend can run an agent with a `per` lifetime: a launch whose
     /// topology context names an attempt opens a new native conversation,
     /// holding nothing from an earlier one, and `conversation_id` reports it
     /// once it is open. That report is what the runtime checks before it
@@ -551,7 +551,7 @@ pub const ASSISTANT: [Kind; 6] = [
     Kind::Antigravity,
 ];
 
-/// The backends an invocation-scoped agent may name, as an error lists them.
+/// The backends an agent with a `per` lifetime may name, as an error lists them.
 pub fn fresh_conversation_backends() -> Vec<&'static str> {
     ALL.iter()
         .filter(|backend| backend.fresh_conversation())
@@ -731,7 +731,7 @@ mod tests {
     use super::*;
 
     /// `lang/Omar/Backends.lean` as it should be: omarc's copy of which
-    /// backends may run an invocation-scoped agent. Committed, not built:
+    /// backends may run an agent with a `per` lifetime. Committed, not built:
     /// `lake build` must not need cargo.
     fn lean_backends() -> String {
         let rows: Vec<String> = ALL
@@ -749,7 +749,7 @@ mod tests {
              \n\
              namespace Omar.Backends\n\
              \n\
-             /-- The backends an invocation-scoped agent may name, each by its aliases,\n    \
+             /-- The backends an agent with a `per` lifetime may name, each by its aliases,\n    \
              its name first: those whose `fresh_conversation` is true. -/\n\
              def freshConversation : Array (Array String) := #[\n{}\n]\n\
              \n\
@@ -758,8 +758,8 @@ mod tests {
         )
     }
 
-    /// The checked-in table is what the backends say, so omarc refuses an
-    /// invocation scope exactly where the runtime would.
+    /// The checked-in table is what the backends say, so omarc refuses
+    /// a `per` lifetime exactly where the runtime would.
     #[test]
     fn the_lean_backends_are_current() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("lang/Omar/Backends.lean");

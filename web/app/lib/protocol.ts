@@ -28,6 +28,7 @@ export type {
   DiagramTag,
   DiagramTimer,
   EdgeKind,
+  Lifetime,
   PortKind,
   PropertyVerdict,
   ProofProblem,
@@ -50,6 +51,7 @@ export {
 import { CHAT_ROLES, RUN_STATUSES } from "./protocol-generated.ts";
 import type {
   ChatMessage,
+  Lifetime,
   DiagramEvent,
   DiagramPort,
   DiagramSnapshot,
@@ -58,6 +60,11 @@ import type {
 } from "./protocol-generated.ts";
 
 export const DIAGRAM_PROTOCOL_VERSION = 1;
+
+/** A lifetime as the program spells it: `per tag`, `per 5 tasks`. */
+export function lifetimeLabel(lifetime: Lifetime): string {
+  return lifetime.count === 1 ? `per ${lifetime.unit}` : `per ${lifetime.count} ${lifetime.unit}s`;
+}
 
 /** Version of the `omar serve` run-admission API, distinct from the diagram protocol. */
 export const SERVE_PROTOCOL_VERSION = 1;
@@ -374,9 +381,16 @@ export function applyDiagramEvent(
   switch (event.kind) {
     case "agent_attempt": {
       const { agent, attempt } = event.payload as { agent?: unknown; attempt?: Record<string, unknown> };
+      // A window is published as it starts, serves invocations and ends:
+      // the latest of each replaces the last.
+      const upsert = (attempts: Record<string, unknown>[]) => {
+        if (!attempt) return attempts;
+        const at = attempts.findIndex((item) => item.attempt_id === attempt.attempt_id);
+        return at < 0 ? [...attempts, attempt] : attempts.map((item, index) => index === at ? attempt : item);
+      };
       return {
         ...snapshot,
-        agents: snapshot.agents.map((item) => item.id === agent ? { ...item, attempts: attempt ? [...item.attempts, attempt] : item.attempts } : item),
+        agents: snapshot.agents.map((item) => item.id === agent ? { ...item, attempts: upsert(item.attempts) } : item),
       };
     }
     case "reaction_started":

@@ -204,17 +204,23 @@ private partial def lexChars : List Char -> Except String (List Token)
 
 def lex (source : String) : Except String (List Token) := lexChars source.toList
 
-/-- How long an agent's native conversation lives. `agent`, the default, is
-    one conversation for the whole run. `invocation` starts a new one for
-    every invocation and throws it away once that invocation completes. -/
-inductive AgentScope where
-  | agent | invocation
+/-- What `per` counts: invocations of the agent, or the tags it runs in. -/
+inductive LifetimeUnit where
+  | task | tag
+  deriving Repr, BEq
+
+/-- `per 5 tasks`: how long an agent's native conversation lives, counted in
+    the agent's own invocations or in the tags in which it is invoked. An
+    agent without one keeps a single conversation for the whole run. -/
+structure Lifetime where
+  unit : LifetimeUnit
+  count : Nat
   deriving Repr, BEq
 
 structure Agent where
   name : String
   backend : String
-  scope : AgentScope := .agent
+  lifetime : Option Lifetime := none
   /-- The instance it belongs to. Every program instantiates, so this is never
       empty by the time elaboration is done. -/
   instance_ : String := ""
@@ -458,25 +464,34 @@ private def parseScalarType (what : String) (aliases : Array (String × String))
       state and parameters take built-in types, and a schema type is for ports"
   pure (type, rest)
 
-/-- `Claude(scope = invocation)`: what follows an agent's backend. The one
-    option is `scope`; anything else is refused rather than ignored, since a
-    misspelled option would silently keep the conversation it meant to drop. -/
-private def parseAgentOptions (agent : String) : Parser AgentScope
-  | Token.sym "(" :: Token.word "scope" :: Token.sym "=" :: Token.word value :: Token.sym ")" :: rest =>
-      match value with
-      | "agent" => pure (.agent, rest)
-      | "invocation" => pure (.invocation, rest)
-      | _ => throw s!"agent '{agent}' has unknown scope '{value}'; expected agent or invocation"
-  -- `scope` itself, but not closed right after its value, is malformed, not
-  -- an unknown option.
-  | Token.sym "(" :: Token.word key :: Token.sym "=" :: _ =>
-      if key == "scope" then
-        throw s!"agent '{agent}' options must be written (scope = agent) or (scope = invocation)"
-      else
-        throw s!"agent '{agent}' has unknown option '{key}'; the only option is scope"
-  | Token.sym "(" :: _ =>
-      throw s!"agent '{agent}' options must be written (scope = agent) or (scope = invocation)"
-  | rest => pure (.agent, rest)
+/-- `Codex per tag`, `Codex per 5 tasks`: what follows an agent's backend.
+    `per task` and `per tag` mean one of the unit; singular and plural are
+    interchangeable after any count. Anything else after `per` is refused
+    rather than ignored, since a misread lifetime would silently keep the
+    conversation it meant to drop. -/
+private def parseLifetime (agent : String) : Parser (Option Lifetime)
+  | Token.word "per" :: rest =>
+      let usage := s!"agent '{agent}' lifetime must be written per task, per tag, \
+        per N tasks or per N tags"
+      let unitOf (word : String) : Option LifetimeUnit :=
+        if word == "task" || word == "tasks" then some .task
+        else if word == "tag" || word == "tags" then some .tag
+        else none
+      match rest with
+      | Token.word word :: rest =>
+          match unitOf word with
+          | some unit => pure (some { unit, count := 1 }, rest)
+          | none => throw usage
+      | Token.nat count :: Token.word word :: rest =>
+          match unitOf word with
+          | some unit =>
+              if count == 0 then
+                throw s!"agent '{agent}' lifetime must count at least 1, not per 0 {word}"
+              else
+                pure (some { unit, count }, rest)
+          | none => throw usage
+      | _ => throw usage
+  | rest => pure (none, rest)
 
 private partial def parseAgents (tokens : List Token) : Except String (Array Agent × List Token) := do
   match tokens with
@@ -485,17 +500,20 @@ private partial def parseAgents (tokens : List Token) : Except String (Array Age
       let (name, tokens) ← word tokens
       let (_, tokens) ← expectSym ":" tokens
       let (backend, tokens) ← word tokens
-      let (scope, tokens) ← parseAgentOptions name tokens
+      let (lifetime, tokens) ← parseLifetime name tokens
       -- Refused here, before any bytecode exists, in the runtime's words: a
-      -- backend that cannot promise a new conversation per invocation, or one
-      -- omarc does not know, would otherwise compile and fail once deployed.
-      -- Resolved as the runtime resolves it: any case, any alias.
-      if scope == .invocation &&
-          !Backends.freshConversation.any (·.contains backend.toLower) then
-        throw s!"agent '{name}' is invocation-scoped, but backend '{backend}' cannot start \
-          a fresh conversation per invocation; supported: \
-          {", ".intercalate (Backends.freshConversation.map (·[0]!)).toList}"
-      let agent := { name, backend, scope : Agent }
+      -- backend that cannot promise a fresh conversation, or one omarc does
+      -- not know, would otherwise compile and fail once deployed. Resolved as
+      -- the runtime resolves it: any case, any alias.
+      if let some life := lifetime then
+        if !Backends.freshConversation.any (·.contains backend.toLower) then
+          let spelled := s!"per {if life.count == 1 then "" else s!"{life.count} "}\
+            {match life.unit with | .task => "task" | .tag => "tag"}\
+            {if life.count == 1 then "" else "s"}"
+          throw s!"agent '{name}' resets its conversation ({spelled}), but backend \
+            '{backend}' cannot start a fresh conversation; supported: \
+            {", ".intercalate (Backends.freshConversation.map (·[0]!)).toList}"
+      let agent := { name, backend, lifetime : Agent }
       match tokens with
       | Token.sym "," :: rest =>
           let (agents, tail) ← parseAgents rest
@@ -1124,7 +1142,11 @@ def instructionTexts (program : Program) : Array String :=
       ("instance", toJson agent.instance_),
       ("name", toJson agent.name),
       ("backend", toJson agent.backend)
-    ] ++ (if agent.scope == .invocation then [("scope", toJson "invocation")] else []))
+    ] ++ (match agent.lifetime with
+      | some life => [("lifetime", Json.mkObj [
+          ("unit", toJson (match life.unit with | .task => "task" | .tag => "tag")),
+          ("count", toJson life.count)])]
+      | none => []))
   let ports := program.ports.map fun port =>
     let fields := [
       ("instance", toJson port.instance_),
@@ -1185,13 +1207,13 @@ def instructionTexts (program : Program) : Array String :=
   #[begin] ++ types ++ instances ++ agents ++ ports ++ timers ++ states ++ params ++ connections ++
     reactions ++ #[commit]
 
-/-- Version 2 is version 1 with invocation-scoped agents. A program without
-    one stays at 1, byte for byte, so every runtime that ran it still does; a
-    program with one is refused by a runtime that would otherwise drop the
-    `scope` it does not know and keep the conversation the program said to
-    throw away. -/
+/-- Version 2 is version 1 with agent lifetimes. A program without one stays
+    at 1, byte for byte, so every runtime that ran it still does; a program
+    with one is refused by a runtime that would otherwise drop the `lifetime`
+    it does not know and keep the conversation the program said to throw
+    away. -/
 def bytecodeVersion (program : Program) : Nat :=
-  if program.agents.any (·.scope == .invocation) then 2 else 1
+  if program.agents.any (·.lifetime.isSome) then 2 else 1
 
 private def renderBytecode (version : Nat) (team : String) (instructions : Array String) : String :=
   let rendered := String.intercalate ",\n    " instructions.toList

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""An invocation-scoped agent gets a new worker and conversation every time.
+"""An agent with a `per` lifetime gets a new worker and conversation per window.
 
-`coder : Claude(scope = invocation)` is invoked twice, beside an ordinary
+`coder : Claude per task` is invoked twice, beside an ordinary
 `keeper : Claude` invoked twice. A fake `claude` on PATH stands in for the
 CLI the way an operator's own is found: it paints a banner, registers a peer
 socket under the `--session-id` it was given, logs everything it is handed,
@@ -38,9 +38,11 @@ Checked, from what the fake logged and the run recorded:
   (on macOS too, where a shell's environment is hidden);
 - each attempt's calls carry a key no record holds, from files of its own
   that are gone once it stops;
-- the model-free `Stub(scope = invocation)` does the same for real, with no
+- the model-free `Stub per task` does the same for real, with no
   fake and no credentials: two attempts, each reporting the new conversation
   its attempt named, the first stopped before the second started;
+- an invocation that expires ends its window even when its contract lets it
+  stay silent, and a failed one stops the rest of its agent's sequence;
 - a backend that cannot promise a fresh conversation (Web, and Agy, which
   hands a new conversation its earlier ones), or that omarc does not know, is
   refused by omarc itself, which writes no bytecode or plan.
@@ -112,6 +114,9 @@ def answer(text):
     write({"event": "message", "agent": topology["agent"], "session_id": session,
            "history_before": len(history), "text": text})
     history.append(text)
+    if "Hang" in text:
+        # Never answers, so the invocation's deadline expires.
+        return
     if "Step one" in text:
         Path("note.txt").write_text("note from step one")
         if os.environ.get("FAKE_LEFTOVER"):
@@ -465,12 +470,12 @@ SPELLED = {'claude': 'Claude', 'pi': 'Pi', 'opencode': 'OpenCode', 'codex': 'Cod
 
 
 def supported():
-    """The backends omarc names as able to run an invocation scope."""
+    """The backends omarc names as able to start a fresh conversation."""
     table = (REPO / 'lang/Omar/Backends.lean').read_text()
     return ', '.join(re.findall(r'#\["([^"]+)"', table))
 
 
-def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM,
+def run(root, coder='Claude per task', env=None, program_text=PROGRAM,
         backend='claude', prepare=None):
     """`prepare`, if any, is handed the private HOME before anything runs.
     OMAR stays up for another run in `root`; `scratch` takes it down."""
@@ -516,7 +521,7 @@ def run(root, coder='Claude(scope = invocation)', env=None, program_text=PROGRAM
 def on(backend):
     """`run`'s arguments for the pipeline with both agents on `backend`."""
     spelled = SPELLED[backend]
-    return {'coder': f'{spelled}(scope = invocation)', 'backend': backend,
+    return {'coder': f'{spelled} per task', 'backend': backend,
             'program_text': PROGRAM.replace('keeper : Claude', f'keeper : {spelled}')}
 
 
@@ -568,7 +573,7 @@ def fresh_worker_per_invocation(backend='claude'):
         assert {a['cleanup_status'] for a in finished} == {'stopped'}, attempts
         assert [a['native_session_id'] for a in finished] == opened, attempts
         verification = 'reported' if backend in MINTED else 'chosen'
-        assert all(a['logical_agent'] == 'p.coder' and a['scope'] == 'invocation'
+        assert all(a['logical_agent'] == 'p.coder' and a['lifetime'] == {'unit': 'task', 'count': 1}
                    and a['verification'] == verification for a in attempts), attempts
         replies = [e['reply'] for e in events if e['event'] == 'reply']
         assert all(not r.get('result', {}).get('isError') for r in replies), replies
@@ -744,7 +749,7 @@ def seed(path):
 
 def a_stub_worker_per_invocation():
     with scratch('omar-scope-', BIN, 'scope-test') as directory:
-        result, events, attempts = run(Path(directory), coder='Stub(scope = invocation)',
+        result, events, attempts = run(Path(directory), coder='Stub per task',
                                        program_text=STUB_PROGRAM)
         output = result.stdout + result.stderr
         assert result.returncode == 0, output
@@ -752,7 +757,7 @@ def a_stub_worker_per_invocation():
         assert 'Output p.kept = "stub"' in output, output
         assert events == [], events
         assert all(a['logical_agent'] == 'p.coder' and a['backend'] == 'Stub'
-                   and a['scope'] == 'invocation' and a['verification'] == 'chosen'
+                   and a['lifetime'] == {'unit': 'task', 'count': 1} and a['verification'] == 'chosen'
                    for a in attempts), attempts
 
         # Two invocations, two attempts, two conversations: each the id its
@@ -765,14 +770,137 @@ def a_stub_worker_per_invocation():
             [('completed', 'stopped')] * 2, attempts
         ids = [a['native_session_id'] for a in finished]
         assert all(ids) and ids[0] != ids[1], ids
-        assert len({a['invocation_id'] for a in finished}) == 2, attempts
+        assert len({i['invocation_id'] for a in finished for i in a['invocations']}) == 2, attempts
 
         # The first worker was seen gone before the second was started.
         first_stopped = attempts.index(finished[0])
         second_started = next(i for i, a in enumerate(attempts) if a['attempt_id'] == order[1])
         assert first_stopped < second_started, attempts
-        print('PASS: Stub(scope = invocation) ran two attempts in two conversations '
+        print('PASS: Stub per task ran two attempts in two conversations '
               f'({ids[0]}, {ids[1]}); worker 1 stopped before worker 2 started')
+
+
+# One agent invoked three times, all in the tag `start` arrives in.
+SAME_TAG = '''team Pipe[coder : {coder}] {{
+    input start : string
+    action mid : string
+    action other : string
+    output result : string
+
+    task coder(start) -> mid "One."
+    task coder(start) -> other "Two."
+    task coder(start) -> result "Three."
+}}
+
+main Scoped {{
+    p = Pipe()
+}}
+'''
+# The third is invoked by what the first wrote, a microstep later: a new tag.
+NEXT_TAG = SAME_TAG.replace('task coder(start) -> result', 'task coder(mid) -> result')
+
+
+def windows(attempts):
+    """Each window's last record, in the order the windows began."""
+    last = {}
+    for a in attempts:
+        last[a['attempt_id']] = a
+    return list(last.values())
+
+
+def a_window_serves_the_invocations_its_lifetime_lets_share(coder, program_text, served):
+    """`served`: how many invocations each window of three should serve."""
+    with scratch('omar-scope-', BIN, 'scope-test') as directory:
+        result, events, attempts = run(Path(directory), coder=coder, program_text=program_text)
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert 'Output p.result = "stub"' in output, output
+        found = windows(attempts)
+        assert [len(w['invocations']) for w in found] == served, attempts
+        assert all(w['logical_agent'] == 'p.coder' and w['backend'] == 'Stub'
+                   and w['verification'] == 'chosen' for w in found), attempts
+        assert [(w['outcome'], w['cleanup_status']) for w in found] == \
+            [('completed', 'stopped')] * len(served), attempts
+        # One conversation per window, each the id its attempt named, and no
+        # two windows share one.
+        ids = [w['native_session_id'] for w in found]
+        assert all(ids) and len(set(ids)) == len(ids), ids
+        invoked = [i['invocation_id'] for w in found for i in w['invocations']]
+        assert len(set(invoked)) == 3, attempts
+        # A window was seen gone before the next one started.
+        for before, after in zip(found, found[1:]):
+            stopped = max(i for i, a in enumerate(attempts) if a['attempt_id'] == before['attempt_id'])
+            started = min(i for i, a in enumerate(attempts) if a['attempt_id'] == after['attempt_id'])
+            assert stopped < started, attempts
+        print(f'PASS: {coder} served {served} invocations per window in {len(found)} '
+              'conversations; each window stopped before the next began')
+        return found
+
+
+def lifetimes_share_and_reset_windows():
+    # Three invocations in one tag: one window per tag, two per 2 tasks, and
+    # one each per task.
+    a_window_serves_the_invocations_its_lifetime_lets_share('Stub per tag', SAME_TAG, [3])
+    a_window_serves_the_invocations_its_lifetime_lets_share('Stub per 2 tasks', SAME_TAG, [2, 1])
+    a_window_serves_the_invocations_its_lifetime_lets_share('Stub per task', SAME_TAG, [1, 1, 1])
+    # What a reaction wrote reaches the next tag, so a new window per tag.
+    found = a_window_serves_the_invocations_its_lifetime_lets_share(
+        'Stub per tag', NEXT_TAG, [2, 1])
+    assert [i['tag']['microstep'] for i in found[0]['invocations']] == [0, 0], found
+    assert [i['tag']['microstep'] for i in found[1]['invocations']] == [1], found
+    # Two tags share a window of two.
+    a_window_serves_the_invocations_its_lifetime_lets_share('Stub per 2 tags', NEXT_TAG, [3])
+
+
+# One agent twice in a tag; the first never answers within its deadline.
+HANG = '''team Pipe[coder : {coder}] {{
+    input start : string
+    action mid : string
+    action kmid : string
+
+    task coder(start) -> {first} within(2s) "Hang."
+    task coder(start) -> kmid "Keeper one $(start)"
+}}
+
+main Scoped {{
+    p = Pipe()
+}}
+'''
+
+
+def an_expired_invocation_ends_its_window():
+    # The contract lets the first stay silent, so the run carries on, but the
+    # worker is still on it: `per 2 tasks` must not hand the second to it.
+    with scratch('omar-scope-', BIN, 'scope-test') as directory:
+        result, events, attempts = run(
+            Path(directory), coder='Claude per 2 tasks',
+            program_text=HANG.replace('{first}', 'mid?'))
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        found = windows(attempts)
+        assert len(found) == 2, attempts
+        assert [(w['outcome'], w['cleanup_status']) for w in found] == \
+            [('failed', 'stopped'), ('completed', 'stopped')], attempts
+        assert [len(w['invocations']) for w in found] == [1, 1], attempts
+        assert len({e['pid'] for e in events if e['event'] == 'message'}) == 2, events
+        print('PASS: an invocation that expired ended its window: the next one '
+              'landed in a new attempt and worker')
+
+
+def a_failure_stops_the_rest_of_the_sequence():
+    # The first requires an effect and expires, so the run fails; the second
+    # of the same agent must not start a worker or act.
+    with scratch('omar-scope-', BIN, 'scope-test') as directory:
+        result, events, attempts = run(
+            Path(directory), coder='Claude per tag',
+            program_text=HANG.replace('{first}', 'mid'))
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, output
+        assert 'did not answer within' in output, output
+        found = windows(attempts)
+        assert len(found) == 1 and found[0]['outcome'] == 'failed', attempts
+        assert not any('Keeper one' in e.get('text', '') for e in events), events
+        print('PASS: after a failed invocation the same agent started nothing more')
 
 
 def an_unsupported_backend_is_refused():
@@ -784,18 +912,19 @@ def an_unsupported_backend_is_refused():
         old.write_text(PROGRAM.format(coder='Web'))
         for backend in ['Web', 'Agy', 'Antigravity', 'Cursor', 'Nope']:
             program = root / 'Scoped.omar'
-            program.write_text(PROGRAM.format(coder=f'{backend}(scope = invocation)'))
+            program.write_text(PROGRAM.format(coder=f'{backend} per task'))
             for args in [[program], ['--diff', old, program]]:
                 out = root / 'out.json'
                 r = subprocess.run([str(OMARC), *map(str, args), str(out)],
                                    capture_output=True, text=True)
                 assert r.returncode == 1 and not out.exists(), (backend, args, r)
-                assert (f"backend '{backend}' cannot start a fresh conversation per "
-                        f'invocation; supported: {supported()}') in r.stderr, r.stderr
-        result, events, _ = run(root, coder='Web(scope = invocation)')
+                assert (f"agent 'coder' resets its conversation (per task), but backend "
+                        f"'{backend}' cannot start a fresh conversation; "
+                        f'supported: {supported()}') in r.stderr, r.stderr
+        result, events, _ = run(root, coder='Web per task')
         output = result.stdout + result.stderr
         assert result.returncode != 0, output
-        assert 'cannot start a fresh conversation per invocation' in output, output
+        assert 'cannot start a fresh conversation' in output, output
         assert events == [], events
         print('PASS: Web, Agy, Cursor and unknown backends refused by omarc, no bytecode written')
 
@@ -831,6 +960,9 @@ if __name__ == '__main__':
     a_conversation_an_earlier_run_had_fails_closed()
     leftovers_are_stopped_before_release()
     a_stub_worker_per_invocation()
+    lifetimes_share_and_reset_windows()
+    an_expired_invocation_ends_its_window()
+    a_failure_stops_the_rest_of_the_sequence()
     an_unsupported_backend_is_refused()
     assert_none_left('omar-scope-')
     print('PASS: no session, daemon or worker of any scenario is still running')

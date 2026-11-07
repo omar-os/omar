@@ -342,7 +342,7 @@ test("reaps an actual child that ignores SIGTERM", { timeout: 5000 }, async (t) 
   assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
 });
 
-// As an invocation-scoped attempt launches it: an in-memory conversation with
+// As a `per`-lifetime attempt launches it: an in-memory conversation with
 // the id OMAR chose, which the delivery socket reports.
 test("is runnable by Pi 0.85.1 with the E2E provider loaded before RPC", async (t) => {
   const agentDir = await mkdtemp(join(tmpdir(), "omar-pi-rpc-"));
