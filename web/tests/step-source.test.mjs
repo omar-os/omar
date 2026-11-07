@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { locateStep, replaceStep } from '../app/lib/step-source.ts';
 import { readConnectionPrompt, writeConnectionPrompt, validateConnection } from '../app/lib/task-connections.ts';
 import { configurationDraftKey, readConfigurationDraft, saveConfigurationDraft } from '../app/lib/configuration-draft.ts';
+import { previousIntegrations } from '../app/lib/integration-catalog.ts';
 const snapshot = JSON.parse(readFileSync(new URL('./fixtures/diagram-snapshot.v1.json', import.meta.url)));
 const program = `team ReviewFlow[planner:Codex, reviewer:Codex] {
  input request:string
@@ -46,6 +47,17 @@ test('unsupported or ambiguous source remains for the source editor', () => {
 });
 
 const api = { id: 'api-1', name: 'Content API', type: 'http', url: 'https://api.example.com/v1/items?limit=10', method: 'GET', auth: { type: 'bearer', variable: 'CONTENT_API_TOKEN' } };
+test('older applied drafts contribute only the chosen runtime’s integrations', () => {
+ const own = 'http://localhost:7340';
+ const values = new Map();
+ const storage = {get length(){return values.size}, key:i=>[...values.keys()][i], getItem:key=>values.get(key), setItem:(key,value)=>values.set(key,value)};
+ const step = locateStep(program, snapshot, snapshot.reactions[0]);
+ for (const [runtime, name] of [[own, 'Content API'], ['http://localhost:7341', 'Other account']]) {
+   const edited = replaceStep(program, step, {...step, connections:[{...api,name}]});
+   saveConfigurationDraft(storage, configurationDraftKey(runtime, 'first', 2), program, edited);
+ }
+ assert.deepEqual(previousIntegrations(storage, own + '/'), [api]);
+});
 const webhook = { id: 'hook-1', name: 'Notifications', type: 'webhook', url: 'https://example.com/hooks/team', method: 'POST', auth: { type: 'api-key', variable: 'HOOK_KEY', header: 'X-API-Key' } };
 const mcp = { id: 'mcp-1', name: 'Project tools', type: 'mcp', server: 'github' };
 

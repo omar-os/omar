@@ -7,6 +7,7 @@ import { formatDuration } from "./lib/protocol";
 import { componentName } from "./diagram/diagram-canvas";
 import { WorkflowIcon } from "./workflow-icon";
 import { TaskConnections } from "./task-connections";
+import { changedIntegrations, type IntegrationChange } from "./lib/integration-catalog";
 
 /** Details come from the compiled topology, never from prototype sample data. */
 export function StepInspector({ component, snapshot, source, editable, readOnly = false, onApply, onClose, onEdit, onAsk }: {
@@ -14,7 +15,7 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
   editable: boolean;
   /** Details only: nothing here may lead to a change. */
   readOnly?: boolean;
-  onApply: (source: string) => Promise<void>;
+  onApply: (source: string, changes: IntegrationChange[]) => Promise<void>;
   component: string;
   snapshot: DiagramSnapshot;
   onClose: () => void;
@@ -61,7 +62,7 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
 }
 
 function StepEditor({ source, step, ports, enabled, readOnly, onApply }: {
-  source: string; step: StepSource; ports: string[]; enabled: boolean; readOnly: boolean; onApply: (source: string) => Promise<void>;
+  source: string; step: StepSource; ports: string[]; enabled: boolean; readOnly: boolean; onApply: (source: string, changes: IntegrationChange[]) => Promise<void>;
 }) {
   const [backend, setBackend] = useState(step.backend);
   const [prompt, setPrompt] = useState(step.prompt);
@@ -75,7 +76,11 @@ function StepEditor({ source, step, ports, enabled, readOnly, onApply }: {
   const backends = Array.from(new Set([step.backend, "ClaudeCode", "Codex", "Cursor", "OpenCode", "Pi", "Agy", "Web"]));
   async function apply() {
     setBusy(true); setError(""); setSaved(false);
-    try { await onApply(replaceStep(source, step, { backend, prompt, triggers, contract, connections })); setSaved(true); }
+    try {
+      const program = replaceStep(source, step, { backend, prompt, triggers, contract, connections });
+      await onApply(program, changedIntegrations(step.connections, connections));
+      setSaved(true);
+    }
     catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setBusy(false); }
   }

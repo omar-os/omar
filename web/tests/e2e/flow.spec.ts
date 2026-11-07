@@ -3270,6 +3270,73 @@ test("external connections can be configured, edited and removed without changin
   expect(errors).toEqual([]);
 });
 
+test("settings list applied integrations and another workflow reuses their credential references", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const task = page.locator(".omar-reaction").first();
+  const inspector = page.getByRole("complementary", {name:"Step details"});
+  const connections = inspector.getByRole("region", {name:"Task connections"});
+  const settings = page.getByRole("dialog", {name:"Integrations", exact:true});
+  const openSettings = async () => {
+    await page.getByRole("button", {name:"Settings",exact:true}).click();
+    await page.getByRole("menuitem", {name:"Integrations",exact:true}).click();
+  };
+  await task.press("Enter");
+  await connections.getByRole("button", {name:"Add connection",exact:true}).click();
+  await connections.getByRole("button", {name:"HTTP API Read or send"}).click();
+  await connections.getByLabel("Connection name").fill("Shared content API");
+  await connections.getByLabel("Endpoint URL").fill("https://example.com/content");
+  await connections.getByLabel("Connection authentication").selectOption("bearer");
+  await connections.getByLabel("Credential environment variable").fill("CONTENT_TOKEN");
+  await connections.getByRole("button", {name:"Add to task"}).click();
+  await inspector.getByRole("button", {name:"Apply configuration"}).click();
+  await expect(inspector.getByRole("button", {name:"Apply configuration"})).toBeDisabled();
+  await openSettings();
+  await settings.getByText("Shared content API", {exact:true}).click();
+  await expect(settings).toContainText("Bearer token from CONTENT_TOKEN");
+  await settings.getByRole("button", {name:"HTTP API",exact:true}).click();
+  await settings.getByLabel("Connection name").fill("Content search");
+  await settings.getByLabel("Endpoint URL").fill("https://example.com/search");
+  await settings.getByLabel("Connection authentication").selectOption("bearer");
+  await settings.getByLabel("Reuse a saved credential").selectOption({label:"Shared content API"});
+  await expect(settings.getByLabel("Credential environment variable")).toHaveValue("CONTENT_TOKEN");
+  await settings.getByLabel("Endpoint URL").fill("https://another.example/search");
+  await expect(settings.getByLabel("Credential environment variable")).toHaveValue("");
+  await expect(settings.getByLabel("Reuse a saved credential")).toHaveCount(0);
+  await settings.getByRole("button", {name:"Cancel",exact:true}).click();
+  await settings.getByRole("button", {name:"MCP server",exact:true}).click();
+  await settings.getByLabel("Connection name").fill("Project tools");
+  await settings.getByLabel("MCP server name").fill("project");
+  await settings.getByRole("button", {name:"Save integration"}).click();
+  await expect(settings.getByText("Project tools", {exact:true})).toBeVisible();
+  await settings.getByRole("button", {name:"Close integrations"}).click();
+  await page.getByRole("button", {name:"New workflow",exact:true}).click();
+  await expect(page.locator(".omar-reaction")).toHaveCount(0);
+  await draftUntilProposed(page);
+  await task.press("Enter");
+  for (const name of ["Shared content API", "Project tools"]) {
+    await connections.getByRole("button", {name:"Add connection",exact:true}).click();
+    const picker = connections.getByLabel("Saved integrations");
+    const option = picker.getByRole("option", {name:new RegExp(name)});
+    await expect(option).toHaveCount(1);
+    await picker.selectOption(await option.getAttribute("value") ?? "");
+    await connections.getByRole("button", {name:"Use saved integration"}).click();
+  }
+  await inspector.getByRole("button", {name:"Apply configuration"}).click();
+  await expect(inspector.getByRole("button", {name:"Apply configuration"})).toBeDisabled();
+  await page.reload();
+  await task.press("Enter");
+  await expect(connections.locator(".task-connection-card")).toHaveCount(2);
+  await expect(connections).toContainText("Project tools");
+  await inspector.getByRole("button", {name:"Edit prompt & backend in source"}).click();
+  const source = page.getByRole("textbox", {name:"OMAR program",exact:true});
+  await expect(source).toContainText("CONTENT_TOKEN");
+  await openSettings();
+  await expect(settings.locator("details")).toHaveCount(2);
+  await page.setViewportSize({width:390,height:844});
+  expect(await settings.evaluate(el=>el.scrollWidth<=el.clientWidth)).toBe(true);
+});
+
 test("connection picker supports narrow screens, cancellation and empty workflow inputs", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await useFakeServe(page);

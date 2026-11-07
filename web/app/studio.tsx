@@ -12,6 +12,10 @@ import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
 import { BackendsPage } from "./backends-page";
 import { SettingsMenu } from "./settings-menu";
+import { IntegrationLibrary, useIntegrationLibrary } from "./integration-library";
+import { IntegrationsPage } from "./integrations-page";
+import type { IntegrationChange } from "./lib/integration-catalog";
+import { readConnectionPrompt } from "./lib/task-connections";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
 import { PortPanel } from "./port-panel";
@@ -140,9 +144,11 @@ export function Studio({ serveUrl = "", designAgent }: StudioProps) {
   // default chat. Otherwise its initial replay can overwrite this tab's choice.
   if (serveUrl && restoredUrl !== serveUrl) return <main className="studio-shell"><p className="workspace-loading" role="status">Opening your workflows…</p></main>;
   const scopedUrl = selected ? `${serveUrl.replace(/\/$/, "")}/chats/${encodeURIComponent(selected)}` : serveUrl;
-  return <StudioWorkspace serveUrl={scopedUrl} historyUrl={serveUrl}
+  return <IntegrationLibrary key={`${serveUrl}:${readOnly}`} runtime={serveUrl} enabled={!!serveUrl && !readOnly}>
+    <StudioWorkspace serveUrl={scopedUrl} historyUrl={serveUrl}
     designAgent={designAgent} selectedId={selected} onSelect={select}
-    readOnly={readOnly} onReadOnly={setReadOnly} />;
+    readOnly={readOnly} onReadOnly={setReadOnly} />
+  </IntegrationLibrary>;
 }
 
 function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, onSelect, readOnly, onReadOnly }: StudioProps & {
@@ -154,6 +160,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   onReadOnly: (readOnly: boolean) => void;
 }) {
   const isDemo = serveUrl.trim().length === 0;
+  const library = useIntegrationLibrary();
+  const [integrationsOpen, setIntegrationsOpen] = useState(false);
   // Requests from a previous selection must not update the retained workspace.
   const scopeRef = useRef(0);
   useEffect(() => {
@@ -884,6 +892,15 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     try {
       // The source, not the design: the operator may have edited it, and what
       // they are looking at is what they are deploying.
+      if (!isDemo && source.includes("<omar-connections")) {
+        const checked = await checkProgram(serveUrl, source, filename, { files: design.files });
+        if (!checked.ok) throw new Error((checked.errors ?? ["Could not validate integrations."]).join("\n"));
+        const settings = checked.preview?.reactions.flatMap(reaction =>
+          readConnectionPrompt(reaction.prompt ?? "").connections.map(connection => ({ connection }))) ?? [];
+        if (scope !== scopeRef.current) return;
+        await library.save(settings, true);
+        if (scope !== scopeRef.current) return;
+      }
       const record = await startRun(serveUrl, {
         program: source,
         files: design.files,
@@ -932,7 +949,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     }
   }
 
-  async function applyStepConfiguration(nextSource: string) {
+  async function applyStepConfiguration(nextSource: string, changes: IntegrationChange[]) {
     if (applyingConfiguration) throw new Error("Another configuration update is being validated.");
     const scope = scopeRef.current;
     const original = source;
@@ -943,6 +960,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       if (scope !== scopeRef.current || sourceRef.current !== original) throw new Error("The workflow changed during validation. Reopen this step and try again.");
       if (runRef.current && !isRunFinished(runRef.current.status)) throw new Error("The workflow started during validation. Apply these changes after it finishes.");
       if (!checked.ok) throw new Error((checked.errors ?? ["The configuration did not compile."]).join("\n"));
+      await library.save(changes);
+      if (scope !== scopeRef.current || sourceRef.current !== original || (runRef.current && !isRunFinished(runRef.current.status))) {
+        throw new Error("The workflow changed during save. Reopen this step and try again.");
+      }
       const draft = configurationDraftRef.current;
       if (draft) saveConfigurationDraft(localStorage, draft.key, draft.original, nextSource);
       setSource(nextSource);
@@ -1510,7 +1531,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
             <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
-            <div className="conversation-actions"><SettingsMenu onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+            <div className="conversation-actions"><SettingsMenu
+              onOpenIntegrations={daemon.state === "live" && !readOnly ? () => { library.refresh(); setIntegrationsOpen(true); } : undefined}
+              onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
           </header>
           {daemon.state === "offline" ? (
             // The one place the outage is reported: the sidebar and composer
@@ -1930,6 +1953,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       ) : null}
 
       {filesOpen && !readOnly ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); }} onClose={() => setFilesOpen(false)} /> : null}
+      {integrationsOpen && !readOnly ? <IntegrationsPage onClose={() => setIntegrationsOpen(false)} /> : null}
       {backendsOpen && !readOnly ? (
         <BackendsPage serveUrl={hydratedUrl ?? serveUrl} onClose={() => setBackendsOpen(false)} />
       ) : null}

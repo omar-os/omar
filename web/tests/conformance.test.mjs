@@ -233,6 +233,17 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     }
   });
 
+  test("a connection saved from a chat is reusable through the runtime catalog", async () => {
+    const connection = {id:"conformance-api",name:"Test API",type:"http",method:"GET",url:"https://example.com/items",auth:{type:"bearer",variable:"TEST_API_TOKEN"}};
+    for (const daemon of [real, fake]) {
+      const {active_id} = await (await fetch(`${daemon.url}/v1/chats`)).json();
+      const response = await fetch(`${daemon.url}/chats/${active_id}/v1/task-integrations`, post({changes:[{connection}]}));
+      assert.equal(response.status, 200);
+      const catalog = await (await fetch(`${daemon.url}/v1/task-integrations`)).json();
+      assert.deepEqual(catalog.connections, [connection]);
+    }
+  });
+
   test("an empty run listing has the same shape", async () => {
     const { real: r, fake: f } = await both("/v1/runs");
     assert.equal(r.status, 200);

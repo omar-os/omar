@@ -27,6 +27,8 @@ use crate::ea::EaId;
 use crate::tmux::{DeliveryOptions, TmuxClient};
 use crate::topology::{self, PortKind, TopologyRunConfig, VmState};
 
+mod task_integrations;
+
 pub const SERVE_PROTOCOL_VERSION: u32 = 1;
 
 /// The diagram server binds early in `run_topology`, so this only covers
@@ -363,6 +365,7 @@ struct Chat {
 
 /// A chat owns one EA; only the durable archive is shared between workspaces.
 struct Workspaces {
+    integration_catalog: Mutex<()>,
     history: Arc<Mutex<History>>,
     contexts: Mutex<BTreeMap<String, Arc<Context_>>>,
     settings: Settings,
@@ -894,6 +897,7 @@ impl Serve {
             shutdown: shutdown.clone(),
         });
         let workspaces = Arc::new(Workspaces {
+            integration_catalog: Mutex::new(()),
             history,
             contexts: Mutex::new(BTreeMap::from([(conversation_id, context.clone())])),
             settings: Settings {
@@ -1523,7 +1527,10 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
     };
 
-    if path == "/v1/workspaces" || path.starts_with("/v1/workspaces/") {
+    if path == "/v1/workspaces"
+        || path.starts_with("/v1/workspaces/")
+        || path == task_integrations::ROUTE
+    {
         // Workspace reads expose host files; editor launch grants shell access.
         // Reject cross-site requests, including simple POSTs, rather than only
         // withholding CORS headers after executing the operation.
@@ -1538,6 +1545,16 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         if method == "OPTIONS" {
             return write_json(&mut stream, 204, &Value::Null, origin);
+        }
+        if path == task_integrations::ROUTE {
+            let (status, body) = {
+                let _guard = workspaces
+                    .integration_catalog
+                    .lock()
+                    .expect("integration catalog poisoned");
+                task_integrations::request(&workspaces.settings.omar_dir, &method, &raw_body)
+            };
+            return write_json(&mut stream, status, &body, origin);
         }
         let response = workspace_request(&workspaces, &context, &method, &path, &raw_body);
         let (status, body) = match response {
@@ -2035,7 +2052,8 @@ fn view_refusal(method: &str, path: &str) -> Option<&'static str> {
     let route = path.split_once('?').map_or(path, |(route, _)| route);
     let panel = route.starts_with("/v1/runs/") && route.ends_with("/panel");
     let workspaces = route == "/v1/workspaces" || route.starts_with("/v1/workspaces/");
-    (method != "GET" || panel || workspaces).then_some("read-only view")
+    (method != "GET" || panel || workspaces || route == task_integrations::ROUTE)
+        .then_some("read-only view")
 }
 
 /// Forward one read to a run's diagram server, which binds loopback only, and
@@ -6781,6 +6799,8 @@ while True:
             ("POST", "/v1/agent/backend"),
             ("DELETE", "/v1/runs/r"),
             ("GET", "/v1/workspaces"),
+            ("GET", "/v1/task-integrations"),
+            ("POST", "/v1/task-integrations"),
             ("GET", "/v1/workspaces/w/preview"),
             ("GET", "/v1/runs/r/panel"),
         ] {

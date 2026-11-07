@@ -27,9 +27,11 @@ function applyTheme(theme: Theme) {
  */
 export function SettingsMenu({
   onOpenBackends,
+  onOpenIntegrations,
 }: {
   /** Opens the Backends page; absent where nothing can be connected. */
   onOpenBackends?: () => void;
+  onOpenIntegrations?: () => void;
 } = {}) {
   // Read off the document rather than storage: the layout script has already
   // applied the stored choice by the time this runs. Nothing visible depends
@@ -96,6 +98,11 @@ export function SettingsMenu({
               {theme === option ? <span aria-hidden="true">✓</span> : null}
             </button>
           ))}
+          {onOpenIntegrations ? (
+            <button type="button" role="menuitem" onClick={() => { setOpen(false); onOpenIntegrations(); }}>
+              Integrations
+            </button>
+          ) : null}
           {onOpenBackends ? (
             <>
               <span className="settings-heading">Backends</span>

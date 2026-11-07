@@ -55,6 +55,16 @@ function tokens(source: string): Token[] {
   return result;
 }
 
+export function connectionsInSource(source: string): TaskConnection[] {
+  if (!source.includes("<omar-connections")) return [];
+  let all: Token[];
+  try { all = tokens(source); } catch { return []; }
+  return all.flatMap(token => {
+    if (!token.string) return [];
+    try { return readConnectionPrompt(token.text).connections; } catch { return []; }
+  });
+}
+
 export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: DiagramReaction): StepSource | null {
   try {
     const all = tokens(source);

@@ -453,6 +453,35 @@ button:focus-visible, select:focus-visible { outline-offset: 3px; }
 }
 
 /* External services are distinct from the data that triggers a task. */
+.integrations-dialog {
+  width: min(540px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 24px;
+  overflow: auto;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--panel-2);
+}
+.integrations-dialog::backdrop { background: rgb(6 6 9 / 70%); }
+.integrations-dialog header, .integration-list summary { display: flex; align-items: center; gap: 10px; }
+.integrations-dialog header { justify-content: space-between; }
+.integrations-dialog h2, .integrations-dialog h3 { margin: 0; }
+.integrations-dialog p { margin: 12px 0; color: var(--text-2); overflow-wrap: anywhere; }
+.integrations-dialog button { padding: 7px 12px; border: 1px solid var(--line-2); border-radius: 6px; color: var(--text); background: var(--panel); }
+.integration-list { list-style: none; padding: 0; }
+.integration-list li { padding: 12px 0; border-bottom: 1px solid var(--line-2); }
+.integration-list summary { cursor: pointer; overflow-wrap: anywhere; }
+.integration-list summary span { margin-left: auto; color: var(--text-3); font-size: .8rem; }
+.integration-add { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+.integration-add h3 { width: 100%; font-size: .9rem; }
+.integration-editor .inspector-field { display: grid; gap: 5px; }
+.integration-editor .inspector-field > span:first-child, .integration-editor .connection-kind-label { color: var(--text-2); }
+.integration-editor input, .integration-editor select { width: 100%; min-width: 0; padding: 8px; color: var(--text); background: var(--panel); border: 1px solid var(--line-2); border-radius: 6px; }
+.integration-editor .step-save { background: var(--purple); color: white; }
+.reuse-integration { margin-bottom: 8px; }
+.reuse-integration select { max-width: 100%; }
 .task-connections { padding-bottom: 18px; border-bottom: 1px solid #eee9f2; }
 .task-connections-heading, .workflow-input-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #756386; }
 .task-connections-heading h4 { display: flex; align-items: center; gap: 7px; margin: 0; color: #302a39; }
