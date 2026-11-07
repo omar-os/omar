@@ -166,19 +166,7 @@ impl Backend for Codex {
     /// select the caller's normal Codex home explicitly.
     fn prepare_pane(&self, _session: &str, command: &str) -> Result<PaneSetup> {
         let mut setup = PaneSetup::interactive(command);
-        let home = std::env::var_os("CODEX_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-            .map(|home| {
-                if home.is_absolute() {
-                    Ok(home)
-                } else {
-                    std::env::current_dir().map(|cwd| cwd.join(home))
-                }
-            })
-            .transpose()?;
-        if let Some(home) = home {
+        if let Some(home) = codex_home()? {
             setup
                 .env
                 .push(("CODEX_HOME".to_string(), home.display().to_string()));
@@ -192,6 +180,141 @@ impl Backend for Codex {
             return Ok(Some(stamp));
         }
         Ok(codex_launch_socket(command).map(|socket| format!("codex:{}", socket.display())))
+    }
+}
+
+/// The operator's Codex home: `CODEX_HOME`, else `~/.codex`.
+fn codex_home() -> Result<Option<PathBuf>> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .map(|home| {
+            if home.is_absolute() {
+                Ok(home)
+            } else {
+                std::env::current_dir().map(|cwd| cwd.join(home))
+            }
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// Codex loads a project's `.codex/hooks.json` only when the project is
+/// trusted and its hooks are trusted. This is the second: it makes Codex run
+/// the hooks it finds without a persisted trust hash, for this launch only.
+/// It runs whatever the workspace's `setup` installed, which is already code
+/// the program's author chose to run, and OMAR's workers are launched with
+/// `--dangerously-bypass-approvals-and-sandbox` anyway.
+const HOOK_TRUST: &str = "--dangerously-bypass-hook-trust";
+
+/// `command` with Codex told to run its project's hooks, right after the
+/// executable: the flag belongs to the top-level `codex`, before a subcommand.
+pub(crate) fn trust_project_hooks(command: &str) -> String {
+    let Some(executable) = command
+        .split_whitespace()
+        .find(|word| detect_token(word).is_some_and(|b| b.kind() == Kind::Codex))
+    else {
+        return command.to_string();
+    };
+    if command.split_whitespace().any(|word| word == HOOK_TRUST) {
+        return command.to_string();
+    }
+    let end = command.find(executable).unwrap_or(0) + executable.len();
+    format!("{} {HOOK_TRUST}{}", &command[..end], &command[end..])
+}
+
+/// Project trust OMAR added to the operator's Codex config for a run.
+///
+/// Codex reads whether a directory is a trusted project only from the user's
+/// `config.toml`: a `-c projects.<dir>.trust_level` flag is ignored, and the
+/// app-server has no call for it. A per-run `CODEX_HOME` would have to copy or
+/// link everything Codex keeps there (auth, history, session index and
+/// databases it rewrites in place) and would fork them from the operator's.
+/// So OMAR appends one `[projects."<workspace>"]` table before launching Codex
+/// in a workspace and removes exactly that text when the run ends. A workspace
+/// path is unique per run, so no entry of the operator's is ever touched; a
+/// killed run leaves a table for a directory that no longer exists.
+pub(crate) struct TrustedProjects {
+    /// `None` when there is no Codex home to write to; trusting then fails.
+    config: Option<PathBuf>,
+    /// Whether the file existed before the first entry was appended.
+    existed: bool,
+    blocks: Vec<String>,
+}
+
+impl TrustedProjects {
+    pub(crate) fn new() -> Self {
+        let config = codex_home()
+            .ok()
+            .flatten()
+            .map(|home| home.join("config.toml"));
+        Self::at(config)
+    }
+
+    pub(crate) fn at(config: Option<PathBuf>) -> Self {
+        let existed = config.as_ref().is_some_and(|config| config.exists());
+        Self {
+            config,
+            existed,
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Mark `directory` trusted until `self` is dropped.
+    pub(crate) fn trust(&mut self, directory: &Path) -> Result<()> {
+        use std::io::Write;
+        let config = self.config.as_ref().context("cannot find the Codex home")?;
+        let directory = directory
+            .canonicalize()
+            .with_context(|| format!("cannot resolve {}", directory.display()))?;
+        // A JSON string is a valid TOML basic string.
+        let key = serde_json::to_string(&directory.display().to_string())?;
+        let block = format!("\n[projects.{key}]\ntrust_level = \"trusted\"\n");
+        // Agents of one instance share its workspace; a second table with the
+        // same key would make Codex reject the whole config.
+        if self.blocks.contains(&block) {
+            return Ok(());
+        }
+        if let Some(parent) = config.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(config)
+            .and_then(|mut file| file.write_all(block.as_bytes()))
+            .with_context(|| format!("cannot trust {} in Codex", directory.display()))?;
+        self.blocks.push(block);
+        Ok(())
+    }
+
+    fn remove(&self) -> Result<()> {
+        let Some(config) = self.config.as_ref().filter(|_| !self.blocks.is_empty()) else {
+            return Ok(());
+        };
+        let mut text = std::fs::read_to_string(config)?;
+        for block in &self.blocks {
+            text = text.replacen(block, "", 1);
+        }
+        if text.is_empty() && !self.existed {
+            return Ok(std::fs::remove_file(config)?);
+        }
+        let staged = config.with_extension("toml.omar-tmp");
+        std::fs::write(&staged, text)?;
+        std::fs::set_permissions(&staged, std::fs::metadata(config)?.permissions())?;
+        Ok(std::fs::rename(&staged, config)?)
+    }
+}
+
+impl Drop for TrustedProjects {
+    fn drop(&mut self) {
+        if let Err(error) = self.remove() {
+            eprintln!(
+                "warning: could not remove OMAR's project trust from {}: {error:#}",
+                self.config.as_deref().unwrap_or(Path::new("")).display()
+            );
+        }
     }
 }
 
@@ -290,7 +413,6 @@ pub(crate) const CODEX_NO_ATTACH_FLAGS: &[&str] = &[
     "--approve-for-me",
     "--enable",
     "--disable",
-    "--dangerously-bypass-hook-trust",
 ];
 
 /// Flags unsupported by remote TUI attachment run through native `exec` instead.
@@ -394,6 +516,15 @@ pub(crate) fn codex_server_command(
         .find(|word| detect_token(word).is_some_and(|b| b.kind() == Kind::Codex))?;
     let executable_end = tui_command.find(executable)? + executable.len();
     let server_command = &tui_command[..executable_end];
+    // The TUI is only a client; it is the server that runs hooks.
+    let hook_trust = if tui_command
+        .split_whitespace()
+        .any(|word| word == HOOK_TRUST)
+    {
+        format!(" {HOOK_TRUST}")
+    } else {
+        String::new()
+    };
     let overrides = codex_mcp_overrides(context)?;
     let id = Uuid::new_v4().simple().to_string();
     let runtime = context.omar_dir.join("codex-runtime").join(&id[..12]);
@@ -447,7 +578,7 @@ pub(crate) fn codex_server_command(
     }
     Some(format!(
         "export OMAR_CODEX_SOCKET={socket}; \
-         {server_command} app-server --listen {endpoint} {overrides}{effort} \
+         {server_command}{hook_trust} app-server --listen {endpoint} {overrides}{effort} \
          -c \"developer_instructions=$(cat {prompt_file})\" >{log} 2>&1 & \
          omar_srv=$!; omar_waited=0; \
          while [ ! -S \"$OMAR_CODEX_SOCKET\" ] && [ \"$omar_waited\" -lt 100 ] \
@@ -830,6 +961,76 @@ mod tests {
             std::fs::read_to_string(history).unwrap(),
             "persistent conversation"
         );
+    }
+
+    /// Hooks in a setup-populated workspace run only when the server is told
+    /// to trust them, and the server is the process that runs hooks.
+    #[test]
+    fn a_setup_workspace_launches_the_app_server_with_hook_trust() {
+        let dir = short_tempdir();
+        let context = test_mcp_context(dir.path());
+        let trusted = trust_project_hooks("codex --dangerously-bypass-approvals-and-sandbox");
+        assert_eq!(
+            trusted,
+            "codex --dangerously-bypass-hook-trust --dangerously-bypass-approvals-and-sandbox"
+        );
+        // Once, and right after the executable, wherever the wrapper put it.
+        assert_eq!(trust_project_hooks(&trusted), trusted);
+        assert_eq!(
+            trust_project_hooks("env A=1 codex --x"),
+            "env A=1 codex --dangerously-bypass-hook-trust --x"
+        );
+        assert_eq!(trust_project_hooks("claude --x"), "claude --x");
+        // The TUI attaches with it; the server is what needs it.
+        assert!(!codex_refuses_to_attach(&trusted));
+
+        let cmd = codex_server_command(&context, "hi", None, &trusted).unwrap();
+        assert!(
+            cmd.contains("codex --dangerously-bypass-hook-trust app-server --listen"),
+            "{cmd}"
+        );
+        let plain = codex_server_command(&context, "hi", None, "codex").unwrap();
+        assert!(!plain.contains("hook-trust"), "{plain}");
+    }
+
+    #[test]
+    fn project_trust_is_appended_and_removed_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let workspace = dir.path().join("ws \"one\"");
+        std::fs::create_dir(&workspace).unwrap();
+        // No trailing newline: the entry must not run into the last line.
+        let original = "model = \"x\"\n[projects.\"/a\"]\ntrust_level = \"trusted\"";
+        std::fs::write(&config, original).unwrap();
+        {
+            let mut trusted = TrustedProjects::at(Some(config.clone()));
+            trusted.trust(&workspace).unwrap();
+            // A second agent in the same workspace adds no duplicate table,
+            // which would make the config unparseable.
+            trusted.trust(&workspace).unwrap();
+            let text = std::fs::read_to_string(&config).unwrap();
+            let table = text.parse::<toml::Table>().unwrap();
+            let key = workspace.canonicalize().unwrap().display().to_string();
+            assert_eq!(
+                table["projects"][&key]["trust_level"].as_str(),
+                Some("trusted")
+            );
+            assert_eq!(
+                table["projects"]["/a"]["trust_level"].as_str(),
+                Some("trusted")
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+
+        // A config that did not exist is not left behind empty.
+        let absent = dir.path().join("fresh/config.toml");
+        {
+            let mut trusted = TrustedProjects::at(Some(absent.clone()));
+            trusted.trust(&workspace).unwrap();
+            assert!(absent.exists());
+        }
+        assert!(!absent.exists());
+        assert!(TrustedProjects::at(None).trust(&workspace).is_err());
     }
 
     /// Play the app-server's half of one delivery and report what it was

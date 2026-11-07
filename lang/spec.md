@@ -29,7 +29,7 @@ main        = "main", [ identifier ], "{", { instance | wiring }, "}" ;
 wiring      = qualified, "->", qualified, [ "after", delay ] ;
 
 declaration = input | output | action | timer | state | instance
-            | connection | task | reaction | ";" ;
+            | connection | task | reaction | setup | ";" ;
 input       = "input", identifier, ":", type ;
 output      = "output", identifier, ":", type ;
 action      = "action", identifier, [ "(", "delay", "=", delay, ")" ],
@@ -44,6 +44,7 @@ connection  = endpoint, "->", endpoint, [ "after", delay ] ;
 endpoint    = identifier | qualified ;
 qualified   = identifier, ".", identifier ;
 
+setup       = "setup", string ;
 task        = "task", identifier, "(", [ triggers ], ")",
               "->", effects, [ deadline ], string ;
 reaction    = "reaction", "(", [ triggers ], ")", "->", effects,
@@ -186,6 +187,18 @@ not present in an invocation, its interpolation expands to `<absent>`.
   crate and the bytecode are written to `src-gen/<program>/` beside the
   program — next to `src/` when the program is in one — and an unchanged
   program is not rebuilt.
+- `setup "cmd"` is a shell command run in each instance's workspace before any
+  agent of the run launches, so what it writes (an agent's hooks, skills,
+  config) is there when the agent starts. It runs once per instance per run,
+  with `sh -c` in the instance's worktree, in the environment a worker gets
+  (`OMAR_WORKTREE`, `OMAR_TEMP`, `TMPDIR`), bounded by the run's timeout and
+  killed with its descendants when it ends. Exit 0 continues; anything else, or
+  the timeout, fails the run before any agent launches, with the command's
+  output tail. Its output and exit are kept in the run directory's `setup/`.
+  A team has at most one, and it is not empty; combine commands with `&&`. A
+  resumed run does not rerun it, since its files are restored; an instance a
+  mutation adds or replaces does run it. For a Codex agent in such an instance
+  OMAR also trusts the workspace and its hooks, so `.codex/hooks.json` loads.
 - `shutdown` is a trigger every team has without declaring it, and no team
   may declare a name of its own by it. It fires once, at the run's last tag,
   carrying that tag's timestamp. A body calls `request_stop()` to end the run:
@@ -536,7 +549,7 @@ not accepted by the CLI.
 BEGIN_PLAN team
 
 DEFINE_TYPE name type [title] [description]
-DECLARE_INSTANCE name team parent
+DECLARE_INSTANCE name team parent [setup]
 SPAWN_AGENT name backend
 DEFINE_PORT kind name type [delay]
 DECLARE_TIMER name offset period
@@ -599,6 +612,8 @@ Reaction fields are ordered:
 op, id, agent, triggers, effects, contract, prompt, body, within
 ```
 
+`declare_instance` is `op, name, parent, team, setup`; `setup` is the team's
+command and is omitted when it declares none.
 `body` is a code reaction's Rust and is omitted for a task; `agent` is empty
 for a code reaction. `within` is nanoseconds, and is omitted when the reaction
 declares no deadline.
@@ -620,7 +635,8 @@ verifyBytecode : Bytecode -> Except VerifyError VerifiedBytecode
 ```
 
 MCP calls, event persistence, scheduling, and process observation belong to the
-Rust runtime.
+Rust runtime, and so does running a team's `setup`: it precedes the first tag
+and reads and writes no port, so it is not part of the model §8 reasons about.
 
 Important verification targets are:
 
