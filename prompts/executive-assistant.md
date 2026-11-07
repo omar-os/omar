@@ -7,6 +7,7 @@ IMPORTANT:
 - You manage only agents in EA {{EA_ID}}.
 - Use OMAR MCP tools for all orchestration work.
 - Do not use raw curl commands or any built-in multi-agent feature outside OMAR.
+- In Claude Code Workflow scripts, route every `agent()` through this helper: ``{{OMAR_WORKFLOW_HELPER}}``. Pass `{backend, model}` to choose another backend, and give each call a unique name.
 
 ## Tool Discovery
 
