@@ -310,6 +310,12 @@ def testDelayUnits : IO Unit := do
   | .error message => throw (IO.userError s!"delay then declaration: {message}")
   IO.println "delay unit tests passed"
 
+/-- One instance with an agent, a trigger and a state, for prompt cases. -/
+def notesTeam (task : String) : String :=
+  "team T[a : Codex] { input go : int output out : string
+     state notes : string = \"\" " ++ task ++ " }
+   main { t = T() }"
+
 def rejectionCases : Array (String × String × String) := #[
   -- Only zero may be unitless; every other delay says what it means.
   ("connection delay without a unit",
@@ -360,10 +366,36 @@ def rejectionCases : Array (String × String × String) := #[
     wireTeam "timer shutdown(1s, 0)", "the trigger the run's last tag fires"),
   ("a port named shutdown",
     wireTeam "input shutdown : int", "the trigger the run's last tag fires"),
+  -- A prompt reads what its invocation carries: its triggers and its team's
+  -- state. Anything else would reach the agent as `<absent>`.
+  ("a prompt reading a name that is nothing",
+    notesTeam "task a(go) -> out \"Use $(nothing)\"", "reads $(nothing)"),
+  ("a prompt reading a port that is not its trigger",
+    notesTeam "task a(go) -> out \"Use $(out)\"", "reads $(out)"),
+  ("a prompt reading a nested team's state",
+    "team Inner { state notes : string = \"\" }
+     team Outer[a : Codex] { input go : int output out : string inner = Inner()
+       task a(go) -> out \"Use $(inner.notes)\" }
+     main { o = Outer() }", "reads $(inner.notes)"),
+  ("an unterminated interpolation",
+    notesTeam "task a(go) -> out \"Use $(go\"", "unterminated"),
   ("a parameter named like a state variable",
     "team Wire(n : int) { input src : int output dst : int state n : int = 0 }
      main { w = Wire(1) }", "is also a port, timer or state")
 ]
+
+/-- A task reads its team's state as `$(notes)`, which the runtime looks up
+    qualified, like a trigger -- whatever spelling the prompt used. -/
+def testPromptReads : IO Unit := do
+  let task := "task a(go) -> out \"$(notes) and $( go /* the tick */ ) and $(go)\""
+  match lex (notesTeam task) >>= parse "T" with
+  | .ok program =>
+      match program.reactions[0]? with
+      | some reaction =>
+          assertEqual "prompt qualified" reaction.prompt "$(t.notes) and $(t.go) and $(t.go)"
+      | none => throw (IO.userError "prompt reads: no reaction")
+  | .error message => throw (IO.userError s!"prompt reads: {message}")
+  IO.println "prompt read tests passed"
 
 /-- Every type state may have has a literal to start from. -/
 def testStateLiterals : IO Unit :=
@@ -791,6 +823,7 @@ def main : IO UInt32 := do
     testCheck
     testDelayUnits
     testStateLiterals
+    testPromptReads
     testShutdown
     testCodeTerminator
     testExternalSchemas

@@ -811,6 +811,65 @@ private def ensureUnique (kind : String) (names : Array String) : Except String 
         else loop (seen.push name) rest
   loop #[] names.toList
 
+/-- The end of an interpolation's inside: the `)` that closes it, past
+    nested parentheses and comments, exactly as the runtime scans it. -/
+private partial def interpolationEnd (depth : Nat) (acc : List Char) :
+    List Char -> Option (List Char × List Char)
+  | [] => none
+  | '/' :: '/' :: rest =>
+      let (comment, rest) := rest.span (· != '\n')
+      interpolationEnd depth (acc ++ '/' :: '/' :: comment) rest
+  | '/' :: '*' :: rest =>
+      let rec skip (seen : List Char) : List Char -> List Char × List Char
+        | '*' :: '/' :: tail => (seen ++ ['*', '/'], tail)
+        | c :: tail => skip (seen ++ [c]) tail
+        | [] => (seen, [])
+      let (comment, rest) := skip [] rest
+      interpolationEnd depth (acc ++ '/' :: '*' :: comment) rest
+  | '(' :: rest => interpolationEnd (depth + 1) (acc ++ ['(']) rest
+  | ')' :: rest =>
+      if depth == 0 then some (acc, rest) else interpolationEnd (depth - 1) (acc ++ [')']) rest
+  | c :: rest => interpolationEnd depth (acc ++ [c]) rest
+
+/-- The name an interpolation reads: its first word once comments are gone,
+    the runtime's reading of `$( name /* note */ )`. -/
+private partial def interpolationName (inside : List Char) : Option String :=
+  let rec strip (acc : List Char) : List Char -> List Char
+    | '/' :: '/' :: _ => acc
+    | '/' :: '*' :: rest =>
+        let rec skip : List Char -> List Char
+          | '*' :: '/' :: tail => tail
+          | _ :: tail => skip tail
+          | [] => []
+        strip (acc ++ [' ']) (skip rest)
+    | c :: rest => strip (acc ++ [c]) rest
+    | [] => acc
+  let words := (String.ofList (strip [] inside)).split Char.isWhitespace
+  (words.toList.map (·.toString)).find? (!·.isEmpty)
+
+/-- Rewrite every `$(…)` in a prompt to `$(name')`, where `name'` is what
+    `rename` makes of the name it reads, and collect those names. The whole
+    interpolation is replaced by a value at run time, so its comments go
+    nowhere either way. -/
+private partial def rewriteInterpolations (rename : String -> String)
+    (out : String) (names : Array String) :
+    List Char -> Except String (String × Array String)
+  | '$' :: '(' :: rest =>
+      match interpolationEnd 0 [] rest with
+      | none => throw "a prompt has an unterminated $( interpolation"
+      | some (inside, rest) =>
+          match interpolationName inside with
+          | none => throw "a prompt has an empty $( ) interpolation"
+          | some name =>
+              let name := rename name
+              rewriteInterpolations rename (out ++ s!"$({name})") (names.push name) rest
+  | c :: rest => rewriteInterpolations rename (out.push c) names rest
+  | [] => pure (out, names)
+
+/-- The names a prompt interpolates, as the runtime will look them up. -/
+private def promptReads (prompt : String) : Except String (Array String) :=
+  return (← rewriteInterpolations id "" #[] prompt.toList).2
+
 private def validate (program : Program) : Except String Program := do
   let agentNames := program.agents.map (·.name)
   let portNames := program.ports.map (·.name)
@@ -868,6 +927,18 @@ private def validate (program : Program) : Except String Program := do
           (port.kind != .output || port.instance_ != reaction.instance_)) ||
         containsName timerNames trigger
       if !valid then throw s!"unknown input/action dependency '{trigger}'"
+    if reaction.body.isNone then
+      for name in ← promptReads reaction.prompt do
+        let ownState := program.states.any fun var =>
+          var.name == name && var.instance_ == reaction.instance_
+        if !containsName reaction.triggers name && !ownState then
+          -- As the source spelled them, not as instantiation qualified them.
+          let unqualify (qualified : String) :=
+            if qualified.startsWith s!"{reaction.instance_}." then
+              (qualified.drop (reaction.instance_.length + 1)).toString
+            else qualified
+          throw s!"{unqualify reaction.agent}'s task reads $({unqualify name}), which is \
+            neither one of its triggers nor a state of its team"
     for effect in reaction.effects do
       if containsName timerNames effect then
         throw s!"timer '{effect}' cannot be written to; a timer is a trigger"
@@ -903,19 +974,15 @@ private def qualifyContract (inst : String) (ports : Array Port) (contract : Str
   String.intercalate " " ((contract.splitOn " ").map fun piece =>
     if portNames.any (· == piece) then qualify inst piece else piece)
 
-/-- Likewise for `$(port)` in a prompt: the runtime looks the name up among the
-    trigger values, which are qualified.
-
-    Only the plain spelling is rewritten. `$( port )` and `$(port /* note */)`
-    are accepted by the runtime but not matched here, so inside a team that
-    `main` instantiates, write `$(port)`. -/
+/-- Likewise for `$(port)` and `$(state)` in a prompt: the runtime looks the
+    name up among the trigger values and the instance's state, which are
+    qualified. Any spelling is rewritten, `$( port /* note */ )` included. -/
 private def qualifyPrompt
     (inst : String) (ports : Array Port) (timers : Array Timer) (reads : Array String)
-    (text : String) : String :=
+    (text : String) : Except String String := do
   let named := ports.map (·.name) ++ timers.map (·.name) ++ reads
-  named.foldl
-    (fun acc name => acc.replace s!"$({name})" s!"$({qualify inst name})")
-    text
+  let rename name := if named.contains name then qualify inst name else name
+  return (← rewriteInterpolations rename "" #[] text.toList).1
 
 private def bindArguments (decl : TeamDecl) (inst : Instance) :
     Except String (Array (String × String)) := do
@@ -996,17 +1063,19 @@ private partial def elaborateInstance
     { connection with
         source := qualify path connection.source
         target := qualify path connection.target }
-  let reactions := decl.reactions.map fun reaction =>
-    { reaction with
+  let reactions ← decl.reactions.mapM fun reaction => do
+    -- A code body has no prompt to read from.
+    let prompt ← if reaction.body.isSome then pure reaction.prompt else
+      qualifyPrompt path decl.ports decl.timers
+        (reaction.triggers ++ decl.states.map (·.name)) reaction.prompt
+    pure { reaction with
         id := qualify path reaction.id
         agent := if reaction.agent.isEmpty then "" else qualify path reaction.agent
         triggers := reaction.triggers.map (qualify path)
         effects := reaction.effects.map (qualify path)
         instance_ := path
         contract := qualifyContract path decl.ports reaction.contract
-        prompt :=
-          substitute bindings
-            (qualifyPrompt path decl.ports decl.timers reaction.triggers reaction.prompt)
+        prompt := substitute bindings prompt
         -- A body names both ports and parameters by their local names, and
         -- the generated Rust binds each. Only a prompt is text to substitute
         -- into.
