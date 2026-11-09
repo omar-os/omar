@@ -218,7 +218,7 @@ invocation, its interpolation expands to `<absent>`.
   Every task of the instance reads and writes its state too, with nothing to
   declare: `$(round)` in a prompt is the value when the invocation starts —
   including what a reaction declared before it wrote at the same tag — and
-  `omar_set_port` sets it (§4.2). Since the instance's reactions run one at a
+  `omar_set_state` sets it (§4.2). Since the instance's reactions run one at a
   time, no two hold its state at once. State is the instance's own: a nested
   team's is out of reach, and data crosses instances only through ports.
 
@@ -418,6 +418,7 @@ scoped MCP tools:
 
 ```text
 omar_set_port(task_id, port, value)
+omar_set_state(task_id, name, value)
 omar_complete(task_id)
 omar_pending()
 ```
@@ -437,11 +438,16 @@ value `null`; this preserves the distinction between absence and a signal.
 
 `omar_set_port`:
 
-- only accepts ports listed in the invocation's effect contract, and the
-  state of the invocation's own instance, which no contract lists;
+- only accepts ports listed in the invocation's effect contract, and refuses
+  a state name, pointing at `omar_set_state`;
 - validates the value immediately;
 - may be called many times; and
 - uses last-writer-wins for repeated writes to the same port by that invocation.
+
+`omar_set_state` writes the state of the invocation's own instance, which no
+contract lists: any task of the instance may set any of its state. It accepts
+no port and no other instance's state, and otherwise follows the same rules:
+validated immediately, callable many times, last writer wins.
 
 Writes remain private until `omar_complete`. Completion validates the final
 port snapshot against the contract, and commits state writes with the effects;
