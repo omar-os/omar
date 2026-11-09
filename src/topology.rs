@@ -1346,6 +1346,15 @@ struct SetPortArgs {
     value: Value,
 }
 
+/// A write to the team's state, which is not a port and has its own tool so
+/// an agent never mistakes one for the other.
+#[derive(Debug, Serialize, Deserialize)]
+struct SetStateArgs {
+    task_id: u64,
+    name: String,
+    value: Value,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CompleteArgs {
     task_id: u64,
@@ -1355,6 +1364,7 @@ struct CompleteArgs {
 #[serde(tag = "op", rename_all = "snake_case")]
 enum InvocationCommand {
     SetPort(SetPortArgs),
+    SetState(SetStateArgs),
     Complete(CompleteArgs),
     /// What this agent owes right now. An agent in a pane is told; a human has
     /// to be able to ask, because a panel can be opened at any time and a
@@ -1397,21 +1407,32 @@ fn resolve_effect_port<'a>(
     allowed: &'a BTreeMap<String, String>,
     port: &str,
 ) -> Result<(&'a String, &'a String)> {
-    if let Some(entry) = allowed.get_key_value(port) {
-        return Ok(entry);
-    }
-    let mut matches = allowed
-        .iter()
-        .filter(|(name, _)| name.rsplit_once('.').is_some_and(|(_, last)| last == port));
-    if let (Some(entry), None) = (matches.next(), matches.next()) {
+    if let Some(entry) = resolve_name(allowed, port) {
         return Ok(entry);
     }
     let names: Vec<&str> = allowed.keys().map(String::as_str).collect();
     bail!(
-        "port '{}' is not an effect or state of this invocation; valid ports: {}",
+        "port '{}' is not an effect of this invocation; valid ports: {}",
         port,
         names.join(", ")
     )
+}
+
+/// `name` exactly, or the one entry whose last segment it is.
+fn resolve_name<'a>(
+    names: &'a BTreeMap<String, String>,
+    name: &str,
+) -> Option<(&'a String, &'a String)> {
+    if let Some(entry) = names.get_key_value(name) {
+        return Some(entry);
+    }
+    let mut matches = names
+        .iter()
+        .filter(|(full, _)| full.rsplit_once('.').is_some_and(|(_, last)| last == name));
+    match (matches.next(), matches.next()) {
+        (Some(entry), None) => Some(entry),
+        _ => None,
+    }
 }
 
 impl InvocationRegistry {
@@ -1475,24 +1496,50 @@ impl InvocationRegistry {
                 if invocation.record.completed {
                     bail!("invocation '{}' is already complete", invocation.record.id);
                 }
-                // An effect, or a state variable of the invocation's own
-                // instance: the compiler keeps their names apart.
-                let writable: BTreeMap<String, String> = invocation
-                    .record
-                    .allowed_effects
-                    .iter()
-                    .chain(&invocation.record.state_types)
-                    .map(|(name, ty)| (name.clone(), ty.clone()))
-                    .collect();
-                let (port, ty) = resolve_effect_port(&writable, &args.port)?;
+                if resolve_name(&invocation.record.state_types, &args.port).is_some() {
+                    bail!(
+                        "'{}' is the team's state, not a port; set it with omar_set_state",
+                        args.port
+                    );
+                }
+                let (port, ty) =
+                    resolve_effect_port(&invocation.record.allowed_effects, &args.port)?;
                 let (port, ty) = (port.clone(), ty.clone());
                 validate_value(&ty, &args.value)
                     .with_context(|| format!("invalid value for port '{}'", port))?;
-                if invocation.record.context_names.contains(&port) {
-                    check_context_size(&port, &args.value)?;
-                }
                 invocation.record.writes.insert(port.clone(), args.value);
                 Ok(json!({"status":"buffered","port":port}))
+            }
+            // Any state of the invocation's own instance: its reactions run
+            // one at a time, so no contract needs to say who may write it.
+            InvocationCommand::SetState(args) => {
+                let invocation = entries
+                    .get_mut(&args.task_id)
+                    .with_context(|| format!("unknown task_id {}", args.task_id))?;
+                validate_invocation_owner(team, agent, &invocation.record)?;
+                if invocation.record.completed {
+                    bail!("invocation '{}' is already complete", invocation.record.id);
+                }
+                let state = &invocation.record.state_types;
+                let Some((name, ty)) = resolve_name(state, &args.name) else {
+                    if state.is_empty() {
+                        bail!("this task's team declares no state");
+                    }
+                    let names: Vec<&str> = state.keys().map(String::as_str).collect();
+                    bail!(
+                        "'{}' is not a state of this task's team; its state: {}",
+                        args.name,
+                        names.join(", ")
+                    );
+                };
+                let (name, ty) = (name.clone(), ty.clone());
+                validate_value(&ty, &args.value)
+                    .with_context(|| format!("invalid value for state '{name}'"))?;
+                if invocation.record.context_names.contains(&name) {
+                    check_context_size(&name, &args.value)?;
+                }
+                invocation.record.writes.insert(name.clone(), args.value);
+                Ok(json!({"status":"buffered","state":name}))
             }
             InvocationCommand::Pending => {
                 let pending: Vec<PendingInvocation> = entries
@@ -1684,6 +1731,13 @@ pub(crate) fn mcp_set_port(context: &TopologyMcpContext, arguments: Value) -> Re
     send_invocation_command(
         context,
         InvocationCommand::SetPort(serde_json::from_value(arguments)?),
+    )
+}
+
+pub(crate) fn mcp_set_state(context: &TopologyMcpContext, arguments: Value) -> Result<Value> {
+    send_invocation_command(
+        context,
+        InvocationCommand::SetState(serde_json::from_value(arguments)?),
     )
 }
 
@@ -2138,7 +2192,7 @@ fn context_preamble(invocation: &InvocationSpec) -> String {
             ));
         }
         preamble.push_str(&format!(
-            "Before omar_complete, set `{short}` to its full updated text with omar_set_port, so the next task starts from what this one learned. Leave it alone if nothing changed.\n\n"
+            "Before omar_complete, set `{short}` to its full updated text with omar_set_state(task_id, \"{short}\", text), so the next task starts from what this one learned. Leave it alone if nothing changed.\n\n"
         ));
     }
     preamble
@@ -3294,7 +3348,7 @@ fn spawn_topology_agents(
             )
         })
         .unwrap_or_default();
-    let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
+    let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, and omar_set_state for your team's state, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
     for (name, agent) in &state.agents {
         // A web agent is not spawned. There is no command to resolve, no pane
         // to put it in, and no readiness to wait for — the agent exists as a
@@ -4418,7 +4472,7 @@ fn invocation_spec(
     }
     let types = types_for_effects(state, &effect_names);
     // Only its own instance's: a body reaches state through `self`, a task
-    // through `$(name)` and `omar_set_port`.
+    // through `$(name)` and `omar_set_state`.
     let state_types = state
         .state_vars
         .iter()
@@ -4515,7 +4569,7 @@ fn invocation_message(invocation: &InvocationSpec, rendered: &str) -> Result<Str
         .collect();
     if !state.is_empty() {
         header.push_str(&format!("state: {}\n", serde_json::to_string(&state)?));
-        state_note = " The state above is your team's, kept between its tasks: change any of it with omar_set_port the same way, if the next task should see something else.".to_string();
+        state_note = " The state above is your team's, kept between its tasks: change any of it with omar_set_state(task_id, name, value) before omar_complete, if the next task should see something else.".to_string();
     }
     Ok(format!(
         "{header}\n{described}{rendered}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. Pass the integer task_id above to both tools. For a signal effect, set its value to null.{state_note} Do not address another agent directly."
@@ -7284,21 +7338,26 @@ mod tests {
             }
             let completion = self.registry.register(record)?;
             let agent = invocation.agent.clone();
-            let set = |port: &str, value: Value| {
+            let who = agent.trim_start_matches("t.");
+            self.registry.execute(
+                "Shared",
+                &agent,
+                InvocationCommand::SetState(SetStateArgs {
+                    task_id: invocation.id,
+                    name: "notes".into(),
+                    value: json!(format!("{who} was here")),
+                }),
+            )?;
+            if invocation.trigger_values.contains_key("t.go") && who == "a" {
                 self.registry.execute(
                     "Shared",
                     &agent,
                     InvocationCommand::SetPort(SetPortArgs {
                         task_id: invocation.id,
-                        port: port.into(),
-                        value,
+                        port: "again".into(),
+                        value: json!(1),
                     }),
-                )
-            };
-            let who = agent.trim_start_matches("t.");
-            set("notes", json!(format!("{who} was here")))?;
-            if invocation.trigger_values.contains_key("t.go") && who == "a" {
-                set("again", json!(1))?;
+                )?;
             }
             self.registry.execute(
                 "Shared",
@@ -7314,7 +7373,7 @@ mod tests {
     }
 
     /// Every task of an instance reads its state in the prompt and writes it
-    /// with `omar_set_port`, no contract saying so: a later task sees it at
+    /// with `omar_set_state`, no contract saying so: a later task sees it at
     /// the same tag, the next tag sees it, and a pause and resume keep it.
     #[test]
     fn tasks_share_their_instances_state() {
@@ -7372,7 +7431,8 @@ mod tests {
         assert_eq!(settled.state_vars["t.notes"], json!("b was here"));
     }
 
-    /// A task's state write is checked like an effect's, stays private until
+    /// A task's state write goes through `omar_set_state`, never
+    /// `omar_set_port`; it is checked like an effect's, stays private until
     /// completion, and reaches only its own instance's state. The agent is
     /// told what the state holds, in its message and by `omar_pending`.
     #[test]
@@ -7390,13 +7450,24 @@ mod tests {
             ..Default::default()
         };
         let completion = registry.register(record).unwrap();
-        let set = |port: &str, value: Value| {
+        let set_port = |port: &str, value: Value| {
             registry.execute(
                 "Shared",
                 "t.a",
                 InvocationCommand::SetPort(SetPortArgs {
                     task_id: 9,
                     port: port.into(),
+                    value,
+                }),
+            )
+        };
+        let set = |name: &str, value: Value| {
+            registry.execute(
+                "Shared",
+                "t.a",
+                InvocationCommand::SetState(SetStateArgs {
+                    task_id: 9,
+                    name: name.into(),
                     value,
                 }),
             )
@@ -7409,6 +7480,16 @@ mod tests {
             pending["pending"][0]["state_types"]["t.notes"],
             json!("string")
         );
+        // State is not a port, and the refusal names the tool that sets it.
+        for name in ["notes", "t.notes"] {
+            let refused = set_port(name, json!("x")).unwrap_err();
+            assert!(
+                format!("{refused:#}").contains("omar_set_state"),
+                "{refused:#}"
+            );
+        }
+        // Nor is a port state.
+        assert!(set("out", json!("x")).is_err());
         let wrong = set("notes", json!(3)).unwrap_err();
         assert!(format!("{wrong:#}").contains("invalid value"), "{wrong:#}");
         // Another instance's state is not this invocation's to write.
@@ -7418,7 +7499,7 @@ mod tests {
             "{elsewhere:#}"
         );
         set("notes", json!("new")).unwrap();
-        set("out", json!("done")).unwrap();
+        set_port("out", json!("done")).unwrap();
         assert!(completion.try_recv().is_err(), "private until complete");
         registry
             .execute(
@@ -7455,7 +7536,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("change any of it with omar_set_port"),
+            message.contains("change any of it with omar_set_state"),
             "{message}"
         );
     }
@@ -7513,9 +7594,9 @@ mod tests {
                 self.registry.execute(
                     "Ctx",
                     &agent,
-                    InvocationCommand::SetPort(SetPortArgs {
+                    InvocationCommand::SetState(SetStateArgs {
                         task_id: invocation.id,
-                        port: "ops".into(),
+                        name: "ops".into(),
                         value: json!("Use SQLite."),
                     }),
                 )?;
@@ -7566,7 +7647,9 @@ mod tests {
         assert!(a_prompt.starts_with("Shared context `ops`"), "{a_prompt}");
         assert!(a_prompt.contains("How to keep it: List decisions, newest last.\n"));
         assert!(a_prompt.contains("It is empty so far.\n"), "{a_prompt}");
-        assert!(a_prompt.contains("set `ops` to its full updated text with omar_set_port"));
+        assert!(a_prompt.contains(
+            "set `ops` to its full updated text with omar_set_state(task_id, \"ops\", text)"
+        ));
         assert!(a_prompt.ends_with("\n\nPlan."), "{a_prompt}");
         assert_eq!(
             a["contexts"]["t.ops"],
@@ -7593,8 +7676,8 @@ mod tests {
         );
     }
 
-    /// A context write over the limit is refused with what to do about it,
-    /// whoever writes it; one at the limit is taken.
+    /// A context write over the limit is refused by `omar_set_state` with what
+    /// to do about it, whoever writes it; one at the limit is taken.
     #[test]
     fn a_context_write_over_its_limit_is_refused() {
         let registry = InvocationRegistry::default();
@@ -7613,9 +7696,9 @@ mod tests {
             registry.execute(
                 "Ctx",
                 "t.c",
-                InvocationCommand::SetPort(SetPortArgs {
+                InvocationCommand::SetState(SetStateArgs {
                     task_id: 12,
-                    port: "ops".into(),
+                    name: "ops".into(),
                     value: json!(value),
                 }),
             )
