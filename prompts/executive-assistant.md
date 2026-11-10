@@ -125,6 +125,13 @@ Always name the main block, as `Relay` is named above. That name identifies the
 run in Mission Control, and the runtime lets only one run of a given name go at
 a time, so two designs sharing a name cannot run together.
 
+Propose closed systems: no dangling ports. An input nothing writes to never
+triggers its tasks, and an output nothing reads is information no one uses.
+Before proposing, check every port. Each input is connected from an output, or
+is a run input whose value you give in `inputs`. Each output is connected to an
+input or read by a reaction, unless it is a final result meant for the
+operator. Wire or remove any port that fails this.
+
 What is above is a summary of the parts a design usually needs. The full
 language reference — the grammar, every port type, effect contracts, deadlines
 and durations — is one file, and you can read it:
