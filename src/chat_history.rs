@@ -214,18 +214,21 @@ impl History {
     }
 
     /// Stable platform/account ownership, independent of display title or UI selection.
-    pub fn messaging_chat(&mut self, key: &str, title: &str) -> Result<String> {
-        if let Some(chat) = self
+    pub fn select_messaging_chat(&mut self, key: &str, title: &str, fresh: bool) -> Result<String> {
+        let existing = self
             .conversations
             .iter()
-            .find(|c| c.messaging_key.as_deref() == Some(key))
-        {
-            return Ok(chat.id.clone());
+            .position(|chat| chat.messaging_key.as_deref() == Some(key));
+        if let Some(index) = existing.filter(|_| !fresh) {
+            return Ok(self.conversations[index].id.clone());
         }
         let mut next = self.clone();
         let mut chat = Conversation::new();
         chat.messaging_key = Some(key.into());
         chat.title = title.into();
+        if let Some(index) = existing {
+            next.conversations[index].messaging_key = None;
+        }
         let id = chat.id.clone();
         next.conversations.push(chat);
         next.save()?;
@@ -369,7 +372,9 @@ mod tests {
         let path = dir.path().join("chats.json");
         let mut history = History::load(path.clone()).unwrap();
         let active = history.active_id.clone();
-        let slack = history.messaging_chat("slack:T1", "Slack").unwrap();
+        let slack = history
+            .select_messaging_chat("slack:T1", "Slack", false)
+            .unwrap();
         history
             .conversations
             .iter_mut()
@@ -378,18 +383,44 @@ mod tests {
             .title = "Renamed by user".into();
         history.save().unwrap();
         let mut history = History::load(path.clone()).unwrap();
-        assert_eq!(history.messaging_chat("slack:T1", "Slack").unwrap(), slack);
+        assert_eq!(
+            history
+                .select_messaging_chat("slack:T1", "Slack", false)
+                .unwrap(),
+            slack
+        );
         assert_eq!(history.conversation(&slack).title, "Renamed by user");
         assert_eq!(history.active_id, active);
         assert_ne!(
-            history.messaging_chat("discord:T1", "Discord").unwrap(),
+            history
+                .select_messaging_chat("discord:T1", "Discord", false)
+                .unwrap(),
             slack
         );
-        assert_ne!(history.messaging_chat("slack:T2", "Slack").unwrap(), slack);
+        assert_ne!(
+            history
+                .select_messaging_chat("slack:T2", "Slack", false)
+                .unwrap(),
+            slack
+        );
+        let fresh = history
+            .select_messaging_chat("slack:T1", "Slack", true)
+            .unwrap();
+        assert_ne!(fresh, slack);
+        let mut history = History::load(path.clone()).unwrap();
+        assert_eq!(
+            history
+                .select_messaging_chat("slack:T1", "Slack", false)
+                .unwrap(),
+            fresh
+        );
+        assert_eq!(history.conversation(&slack).title, "Renamed by user");
         let before = history.conversations.len();
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
-        assert!(history.messaging_chat("slack:T3", "Slack").is_err());
+        assert!(history
+            .select_messaging_chat("slack:T3", "Slack", false)
+            .is_err());
         assert_eq!(history.conversations.len(), before);
     }
 

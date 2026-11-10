@@ -72,7 +72,7 @@ pub struct OmarRuntime {
     pub base: String,
     client: reqwest::Client,
     conversations: tokio::sync::Mutex<BTreeMap<String, String>>,
-    session: String,
+    discord_account: Option<String>,
 }
 impl OmarRuntime {
     pub fn new(base: String) -> Result<Self> {
@@ -80,11 +80,16 @@ impl OmarRuntime {
             base,
             client: client()?,
             conversations: tokio::sync::Mutex::new(BTreeMap::new()),
-            session: uuid::Uuid::new_v4().to_string(),
+            discord_account: None,
         })
     }
     pub async fn call(&self, path: &str, body: Option<&Value>) -> Result<Value> {
         let url = format!("{}{path}", self.base);
+    pub fn for_discord(mut self, account: String) -> Self {
+        self.discord_account = Some(account);
+        self
+    }
+
         let request = match body {
             Some(body) => self
                 .client
@@ -170,26 +175,31 @@ impl Runtime for OmarRuntime {
     }
 
     async fn converse(&self, sender: &str, text: &str) -> Result<String> {
-        // Separate users and connector lifetimes; the runtime retains its archive,
-        // but a newly opened connector never resumes yesterday's assistant.
-        let base =
-            {
-                let mut conversations = self.conversations.lock().await;
-                if let Some(base) = conversations.get(sender) {
-                    base.clone()
-                } else {
-                    let root = self.base.split("/chats/").next().unwrap_or(&self.base);
-                    let root = OmarRuntime::new(root.to_owned())?;
-                    let chat = root.call("/v1/chats/messaging", Some(&serde_json::json!({
-                    "platform":"discord", "accountId":format!("{}-{}", self.session, sender)
-                }))).await?;
-                    let id = chat["id"].as_str().context("Missing conversation ID")?;
-                    uuid::Uuid::parse_str(id)?;
-                    let base = format!("{}/chats/{id}", root.base);
-                    conversations.insert(sender.to_owned(), base.clone());
-                    base
-                }
-            };
+        let account = self
+            .discord_account
+            .as_deref()
+            .context("Missing Discord account")?;
+        let root = OmarRuntime::new(
+            self.base
+                .split("/chats/")
+                .next()
+                .unwrap_or(&self.base)
+                .to_owned(),
+        )?;
+        let fresh = text == "new chat";
+        let record = root.call("/v1/chats/messaging", Some(&serde_json::json!({
+            "platform": "discord", "accountId": format!("assistant-{account}-{sender}"), "fresh": fresh
+        }))).await?;
+        let id = record["id"].as_str().context("Missing conversation ID")?;
+        uuid::Uuid::parse_str(id)?;
+        let base = format!("{}/chats/{id}", root.base);
+        let mut conversations = self.conversations.lock().await;
+        if fresh {
+            conversations.remove(sender);
+            return Ok("Started a new chat. Your previous conversation is saved in OMAR.".into());
+        }
+        conversations.insert(sender.to_owned(), base.clone());
+        drop(conversations);
         let chat = OmarRuntime::new(base)?;
         // Do not retry a POST: a lost response can follow successful delivery.
         let accepted = chat
@@ -345,13 +355,14 @@ mod conversation_http_tests {
     use super::*;
     use std::io::{Read, Write};
     #[tokio::test]
-    async fn conversation_context_is_reused_only_for_the_same_user_and_connector() {
+    async fn conversation_context_survives_connector_restart_and_can_be_reset() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let root = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let mut creations = Vec::new();
             let mut routes = Vec::new();
-            for _ in 0..11 {
+            let mut chats = BTreeMap::new();
+            for _ in 0..16 {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -375,13 +386,13 @@ mod conversation_http_tests {
                 let mut body = vec![0; len];
                 stream.read_exact(&mut body).unwrap();
                 let value = if route.starts_with("POST /v1/chats/messaging ") {
-                    creations.push(
-                        serde_json::from_slice::<Value>(&body).unwrap()["accountId"]
-                            .as_str()
-                            .unwrap()
-                            .to_owned(),
-                    );
-                    serde_json::json!({"id":uuid::Uuid::new_v4().to_string()})
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let key = request["accountId"].as_str().unwrap().to_owned();
+                    creations.push(key.clone());
+                    if request["fresh"] == true {
+                        chats.remove(&key);
+                    }
+                    serde_json::json!({"id":chats.entry(key).or_insert_with(|| uuid::Uuid::new_v4().to_string())})
                 } else if route.starts_with("POST ") {
                     routes.push(route);
                     serde_json::json!({"sequence":10})
@@ -391,22 +402,23 @@ mod conversation_http_tests {
                 let body = value.to_string();
                 write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
             }
-            assert_eq!(creations.len(), 3);
-            assert_ne!(creations[0], creations[1]);
+            assert_eq!(creations.len(), 6);
             assert_ne!(creations[0], creations[2]);
             assert_eq!(routes[0], routes[1]);
             assert_ne!(routes[0], routes[2]);
-            assert_ne!(routes[0], routes[3]);
+            assert_eq!(routes[0], routes[3]);
+            assert_ne!(routes[0], routes[4]);
         });
-        let runtime = OmarRuntime::new(root.clone()).unwrap();
+        let runtime = OmarRuntime::new(root.clone())
+            .unwrap()
+            .for_discord("999".into());
         assert_eq!(runtime.converse("111", "hello").await.unwrap(), "hello");
         runtime.converse("111", "follow up").await.unwrap();
         runtime.converse("222", "different user").await.unwrap();
-        OmarRuntime::new(root)
-            .unwrap()
-            .converse("111", "fresh session")
-            .await
-            .unwrap();
+        let restarted = OmarRuntime::new(root).unwrap().for_discord("999".into());
+        restarted.converse("111", "after restart").await.unwrap();
+        restarted.converse("111", "new chat").await.unwrap();
+        restarted.converse("111", "fresh context").await.unwrap();
         server.join().unwrap();
     }
 }

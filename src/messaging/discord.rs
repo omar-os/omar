@@ -594,7 +594,8 @@ pub async fn run(mut config: Config) -> Result<()> {
             .context("Missing Discord Gateway URL")?,
     )?;
     super::runtime::bind_chat(&mut config).await?;
-    let runtime = OmarRuntime::new(config.runtime_url.clone())?;
+    let runtime =
+        OmarRuntime::new(config.runtime_url.clone())?.for_discord(config.account_id.clone());
     runtime.call("/v1/chat", None).await?;
     let mut channels = HashMap::new();
     // Resolve only one-to-one channels with approved recipients, never group DMs.

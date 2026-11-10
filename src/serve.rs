@@ -2670,7 +2670,7 @@ fn messaging_chat(workspaces: &Arc<Workspaces>, body: &[u8]) -> (u16, Value) {
         .history
         .lock()
         .expect("history poisoned")
-        .messaging_chat(&key, title)
+        .select_messaging_chat(&key, title, request.fresh)
     {
         Ok(id) => id,
         Err(error) => return (500, json!({"error":error.to_string()})),
@@ -2689,6 +2689,8 @@ fn select_chat(workspaces: &Arc<Workspaces>, id: Option<&str>) -> (u16, Value) {
             let Some(chat) = history.conversations.iter().find(|chat| chat.id == id) else {
                 return (404, json!({"error": "unknown chat"}));
             };
+        #[serde(default)]
+        fresh: bool,
             let omar_dir = &workspaces.settings.omar_dir;
             if chat
                 .ea_id
@@ -4957,7 +4959,7 @@ mod tests {
             .history
             .lock()
             .unwrap()
-            .messaging_chat("discord:test", "Discord")
+            .select_messaging_chat("discord:test", "Discord", false)
             .unwrap();
         server.workspaces.get(&other).unwrap();
         let connector =
