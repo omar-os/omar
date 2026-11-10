@@ -7,6 +7,8 @@ Rules for every contributor, human or agent. Agents also follow [AGENTS.md](AGEN
 OMAR's philosophy, collected so PRs need less back-and-forth. When a design question comes up, check here first; when a review settles one, add it here.
 
 - **`.omar` source is canonical; bytecode is a cache.** The source is the program of record; bytecode can always be rebuilt from it. So checkpoints keep the source and rollback restores it; editor diffs compare against the source the run executes, never bytecode; operators review `.omar` changes, not instructions.
+- **Keep the language stable.** Changes to `lang/spec.md` affect every user, tool and existing program, so don't change it arbitrarily, e.g. the production contract or the timing semantics based on logical time. Constructive changes are welcome; the PR should explain why the change is worth it.
+- **Build on proven designs.** Prefer new language features grounded in practice from successful languages (Java, Python, C++, Rust), and cite the precedent in the PR. Novel designs are welcome too when the reason is compelling.
 
 ## Repository
 
