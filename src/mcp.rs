@@ -808,6 +808,7 @@ impl OmarMcpServer {
         } else if let Some(topology) = &self.context.topology {
             match call.name.as_str() {
                 "omar_set_port" => crate::topology::mcp_set_port(topology, call.arguments),
+                "omar_set_state" => crate::topology::mcp_set_state(topology, call.arguments),
                 "omar_complete" => crate::topology::mcp_complete(topology, call.arguments),
                 "omar_pending" => crate::topology::pending_invocations(topology),
                 other => Err(anyhow!(
@@ -2952,7 +2953,7 @@ fn topology_tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "omar_set_port",
-            "Set one effect port for the active OMAR invocation. Calls are buffered until omar_complete; repeated writes to the same port use last-writer-wins semantics.",
+            "Set one effect port for the active OMAR invocation. Only the invocation's effect ports; set the team's state with omar_set_state. Calls are buffered until omar_complete; repeated writes to the same port use last-writer-wins semantics.",
             json!({
                 "type":"object",
                 "properties":{
@@ -2969,18 +2970,35 @@ fn topology_tool_definitions() -> Vec<Value> {
             }),
         ),
         tool(
-            "omar_complete",
-            "Complete the active OMAR invocation after setting its effects. The runtime validates the final effect snapshot and releases the tag barrier.",
+            "omar_set_state",
+            "Set one of your team's state variables for the active OMAR invocation. State is kept between the team's tasks and read in their prompts; any task of the team may set any of its state. Calls are buffered until omar_complete, repeated writes use last-writer-wins semantics, and nothing is kept if the invocation expires or fails.",
             json!({
                 "type":"object",
-                "properties":{"task_id":{"type":"integer","minimum":1,"description":"The exact task_id supplied in the task prompt or returned by omar_pending."}},
+                "properties":{
+                    "task_id":{"type":"integer","minimum":1,"description":"The exact task_id supplied in the task prompt or returned by omar_pending."},
+                    "name":{"type":"string","description":"The state variable, as the invocation's state line names it."},
+                    "value":{"description":"The value as a bare JSON value of the state's type: a JSON string for string, a number for int, true or false for bool."}
+                },
+                "required":["task_id","name","value"],
+                "additionalProperties":false
+            }),
+        ),
+        tool(
+            "omar_complete",
+            "Complete the active OMAR invocation after setting its effects. The runtime validates the final effect snapshot and releases the tag barrier. Every shared context in the invocation must first be set with omar_set_state or named in keep; otherwise completion is refused and the invocation stays open.",
+            json!({
+                "type":"object",
+                "properties":{
+                    "task_id":{"type":"integer","minimum":1,"description":"The exact task_id supplied in the task prompt or returned by omar_pending."},
+                    "keep":{"type":"array","items":{"type":"string"},"description":"Shared contexts this task leaves unchanged, by name. Every context in the invocation's contexts line must be set with omar_set_state or listed here."}
+                },
                 "required":["task_id"],
                 "additionalProperties":false
             }),
         ),
         tool(
             "omar_pending",
-            "List the OMAR invocations addressed to this agent and not yet completed, with the prompt, the trigger values, and the effect ports each one may set. Ask when an invocation message was missed rather than guessing what is owed.",
+            "List the OMAR invocations addressed to this agent and not yet completed, with the prompt, the trigger values, the effect ports each one may set, the team state it may read and set with omar_set_state, and the shared contexts it should keep updated. Ask when an invocation message was missed rather than guessing what is owed.",
             json!({
                 "type":"object",
                 "properties":{},
@@ -3496,7 +3514,15 @@ mod tests {
             }),
             ..test_context()
         });
-        assert_eq!(workflow, ["omar_set_port", "omar_complete", "omar_pending"]);
+        assert_eq!(
+            workflow,
+            [
+                "omar_set_port",
+                "omar_set_state",
+                "omar_complete",
+                "omar_pending"
+            ]
+        );
     }
 
     #[test]
@@ -3633,12 +3659,17 @@ mod tests {
         let bare = OmarMcpServer::new(topology.clone()).with_bare_tool_names(true);
         assert_eq!(
             listed_tools_of(&bare),
-            ["set_port", "complete", "pending"],
+            ["set_port", "set_state", "complete", "pending"],
             "bare names drop only the omar_ prefix"
         );
         assert_eq!(
             listed_tools_of(&OmarMcpServer::new(topology)),
-            ["omar_set_port", "omar_complete", "omar_pending"],
+            [
+                "omar_set_port",
+                "omar_set_state",
+                "omar_complete",
+                "omar_pending"
+            ],
             "other clients keep the documented names"
         );
         let ea = OmarMcpServer::new(McpLaunchContext {
@@ -3706,7 +3737,15 @@ mod tests {
             .into_iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, ["omar_set_port", "omar_complete", "omar_pending"]);
+        assert_eq!(
+            names,
+            [
+                "omar_set_port",
+                "omar_set_state",
+                "omar_complete",
+                "omar_pending"
+            ]
+        );
     }
 
     #[test]
