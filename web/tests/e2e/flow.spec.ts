@@ -1637,6 +1637,55 @@ test("a backend whose test prompt failed can be connected again", async ({ page 
   await expect(backends).toContainText("2 of 6 connected.");
 });
 
+test("a working sign-in is replaced from the Backends page", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(
+    /CodexConnected · ChatGPT.*Disconnect.*Replace/,
+  );
+
+  // `omar connect codex --replace`: signs in again although codex works,
+  // and is done when its terminal ends and the new sign-in answers.
+  await backends.getByRole("button", { name: "Replace Codex's sign-in" }).click();
+  const terminal = page.getByRole("dialog", {
+    name: "Terminal for Replace Codex's sign-in",
+  });
+  await expect(terminal).toContainText("codex $");
+  await page.keyboard.type("work");
+  await page.keyboard.press("Enter");
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(
+    /CodexConnected · work account/,
+  );
+  await expect(backends).toContainText("2 of 6 connected.");
+});
+
+test("a sign-in is disconnected from the Backends page once confirmed", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+
+  // The first click only asks.
+  await backends.getByRole("button", { name: "Disconnect Codex" }).click();
+  await backends.getByRole("button", { name: "Cancel" }).click();
+  await expect(backends.getByRole("button", { name: "Sign Codex out" })).toHaveCount(0);
+  await backends.getByRole("button", { name: "Disconnect Codex" }).click();
+  await backends.getByRole("button", { name: "Sign Codex out" }).click();
+
+  // `omar disconnect codex`, in a terminal that goes once it has run.
+  const terminal = page.getByRole("dialog", { name: "Terminal for Disconnect Codex" });
+  await expect(terminal).toContainText("codex $");
+  await page.keyboard.press("Enter");
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(
+    /CodexNot signed in.*Connect/,
+  );
+  await expect(backends).toContainText("1 of 6 connected.");
+});
+
 test("with no backend connected, the Backends page comes first", async ({ page }) => {
   await page.route("**/v1/agent/backends", (route) =>
     route.fulfill({

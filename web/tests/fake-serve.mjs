@@ -390,13 +390,18 @@ export async function startFakeServe({
     }
     // The daemon starts `omar connect <name>` in a session; here, pressing
     // Enter in its terminal stands for finishing the sign-in.
-    const connect = /^\/v1\/backends\/([^/]+)\/connect$/.exec(url.pathname);
+    // A replace or sign-out ends its session when done, as `omar connect
+    // --replace` and `omar disconnect` do.
+    const connect = /^\/v1\/backends\/([^/]+)\/(connect|disconnect)$/.exec(url.pathname);
     if (request.method === "POST" && connect) {
-      return readBody(request).then(() =>
-        connect[1] in backendStatus
-          ? json(response, 200, { terminal: `/v1/backends/${connect[1]}/terminal` })
-          : json(response, 404, { error: `'${connect[1]}' is not an assistant backend` }),
-      );
+      return readBody(request).then((body) => {
+        if (!(connect[1] in backendStatus)) {
+          return json(response, 404, { error: `'${connect[1]}' is not an assistant backend` });
+        }
+        signInActions[connect[1]] =
+          connect[2] === "disconnect" ? "disconnect" : JSON.parse(body || "{}").replace ? "replace" : "connect";
+        return json(response, 200, { terminal: `/v1/backends/${connect[1]}/terminal` });
+      });
     }
     // The test prompt: fails for a key typed as "bad".
     const check = /^\/v1\/backends\/([^/]+)\/check$/.exec(url.pathname);
@@ -561,9 +566,19 @@ export async function startFakeServe({
         if (signIn) {
           typed += data.toString();
           if (typed.includes("\r")) {
-            backendStatus[agent] = { status: "connected", via: "fake sign-in" };
-            rejectedKeys[agent] = typed.startsWith("bad");
+            const action = signInActions[agent];
+            if (action === "disconnect") {
+              backendStatus[agent] = { status: "signed_out" };
+            } else {
+              backendStatus[agent] = { status: "connected", via: typed.startsWith("work") ? "work account" : "fake sign-in" };
+              rejectedKeys[agent] = typed.startsWith("bad");
+            }
             typed = "";
+            if (action !== "connect") {
+              client.send(Buffer.from(data));
+              client.close(1000, "ended");
+              return;
+            }
           }
         }
         client.send(Buffer.from(data));
@@ -576,6 +591,8 @@ export async function startFakeServe({
   let backend = "codex";
   /** Backends signed in with a key the test prompt finds rejected. */
   const rejectedKeys = {};
+  /** What each backend's open terminal does: connect, replace or disconnect. */
+  const signInActions = {};
   /** Each backend's status; a sign-in in its terminal connects it. */
   const backendStatus = {
     claude: { status: "connected", via: "Claude Max" },
