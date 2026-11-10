@@ -36,7 +36,15 @@ except FileNotFoundError: faults = {}
 root = Path(faults.get("BOXES") or os.environ["FAKE_BOXES"])
 args = sys.argv[1:]
 with open(os.environ["FAKE_CALLS"], "a") as f: f.write(json.dumps(args)+"\\n")
-if args[0] == "create":
+if args[0] == "create" and faults.get("SIGNED_OUT"):
+    sys.exit("error: not signed in to Docker\\n  try: sbx login")
+if args[0] == "create" and faults.get("NO_VM"):
+    sys.exit("error: virtualization not accessible")
+if args[0] == "login":
+    # Signing in clears the fault, as real sign-in would.
+    faults.pop("SIGNED_OUT", None)
+    json.dump(faults, open(os.environ["FAKE_TOGGLES"], "w"))
+elif args[0] == "create":
     name = args[args.index("--name")+1]
     box = root / name
     if faults.get("FAIL_BEFORE_CREATE") and len(list(root.iterdir())) % 3 == 0: sys.exit(1)
@@ -47,6 +55,10 @@ elif args[0] == "exec" and args[-2:-1] == ["-c"]:
     # The runtime installs its own binary as the worker.
     box = root / next(a for a in args if a.startswith("omar-team-"))
     (box/"worker-sha").write_text(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())
+elif args[0] == "exec" and any(a.startswith("omar-check-") for a in args):
+    # A backend's test prompt, answered by the injected key.
+    if faults.get("REJECT_KEY"): sys.exit("401 invalid key")
+    print("OK")
 elif args[0] == "exec":
     name = next(a for a in args if a.startswith("omar-team-"))
     box = root / name
@@ -70,6 +82,10 @@ elif args[:2] == ["diagnose", "--json"]:
     status = "fail" if faults.get("SIGNED_OUT") else "pass"
     print(json.dumps({"checks": [{"name": "Authentication", "status": status,
                                   "message": "not signed in", "hint": "Run sbx login"}]}))
+    # Like sbx, a failed check fails the command.
+    if status == "fail": sys.exit(1)
+elif args[:2] == ["secret", "set"]:
+    pass
 elif args[:2] == ["secret", "ls"]:
     print(json.dumps({"secrets": [{"scope": "global", "type": "service", "name": n, "secret": "sk-****"}
                                   for n in faults.get("SECRETS", [])]}))
@@ -344,6 +360,32 @@ total = Some(self.count);
                 "bindings:\n  anthropic:\n    apiKey:\n      domains: [api.anthropic.com]\n")
             assert sandbox_status("claude") == {"status": "connected", "via": "anthropic key",
                                                 "login": "omar connect claude --sandbox"}
+            # `omar connect --sandbox` signs sbx in first, then reuses the
+            # stored key rather than asking for another.
+            def connect(name):
+                return subprocess.run([str(BIN), "connect", name, "--sandbox"], env=env, text=True,
+                                      stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+            def called(verb, since):
+                return [c for c in entries(since) if c[:len(verb)] == verb]
+            before = len(entries())
+            fault(SECRETS=["anthropic"], SIGNED_OUT=1)
+            connected = connect("claude")
+            assert connected.returncode == 0, connected
+            assert "✓ claude connected for sandboxes (anthropic key)" in connected.stdout, connected
+            assert called(["login"], before) and not called(["secret", "set"], before), entries()[before:]
+            # A sandbox that cannot start is not the key's fault: no new key.
+            before = len(entries())
+            fault(SECRETS=["anthropic"], NO_VM=1)
+            refused = connect("claude")
+            assert refused.returncode != 0 and "could not start a sandbox to check claude" in refused.stderr, refused
+            assert not called(["secret", "set"], before), entries()[before:]
+            # A key its test prompt rejects is replaced through sbx's prompt.
+            before = len(entries())
+            fault(SECRETS=["anthropic"], REJECT_KEY=1)
+            refused = connect("claude")
+            assert refused.returncode != 0 and "401 invalid key" in refused.stdout + refused.stderr, refused
+            assert called(["secret", "set", "anthropic"], before), entries()[before:]
+            before = len(entries())
             fault()
             # A named template is required, never silently replaced by the host.
             fault(SIGNED_OUT=1)
@@ -367,7 +409,7 @@ total = Some(self.count);
             result = omar(*plain, "--no-sandbox", session=enabled["name"])
             assert result.returncode == 0, result
             assert not creates_since(before)
-            print("PASS: per-team workers, shared file order, native backend delivery, exact mounts, protected history, cleanup, pause/resume, opt-in (--sandbox), backend keys and status, required template, enabled default kit, opt-out")
+            print("PASS: per-team workers, shared file order, native backend delivery, exact mounts, protected history, cleanup, pause/resume, opt-in (--sandbox), backend keys and status, connect signs sbx in and keeps a working key, required template, enabled default kit, opt-out")
         except BaseException:
             log = state_root / "logs" / "runtime.log"
             if log.exists():

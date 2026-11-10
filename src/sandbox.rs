@@ -119,12 +119,7 @@ fn ready(backends: &[&str]) -> Result<()> {
         .map(|backend| Ok((*backend, services(backend)?)))
         .collect::<Result<Vec<_>>>()?;
     worker_binary()?;
-    let mut cmd = command();
-    cmd.args(["diagnose", "--json"]);
-    let report: Value = serde_json::from_slice(
-        &checked(cmd, Duration::from_secs(30))
-            .context("Docker Sandboxes (sbx) is not installed or not working")?,
-    )?;
+    let report = diagnose().context("Docker Sandboxes (sbx) is not installed or not working")?;
     for check in report["checks"].as_array().into_iter().flatten() {
         let name = check["name"].as_str().unwrap_or_default();
         if check["status"] == "fail"
@@ -316,18 +311,13 @@ pub fn connect(backend: &dyn crate::backend::Backend, config: &Config) -> Result
             .is_ok_and(|s| s.success()),
         "Docker Sandboxes (sbx) is not installed: https://docs.docker.com/ai/sandboxes/"
     );
-    let mut cmd = command();
-    cmd.args(["diagnose", "--json"]);
-    let signed_out = checked(cmd, Duration::from_secs(30))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .is_some_and(|report| {
-            report["checks"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|check| check["name"] == "Authentication" && check["status"] == "fail")
-        });
+    let signed_out = diagnose().ok().is_some_and(|report| {
+        report["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|check| check["name"] == "Authentication" && check["status"] == "fail")
+    });
     if signed_out {
         println!("Signing in to Docker Sandboxes.");
         interactive(&["login"])?;
@@ -344,7 +334,8 @@ pub fn connect(backend: &dyn crate::backend::Backend, config: &Config) -> Result
     if usable(services, &stored_keys()?).is_some() {
         match check(backend) {
             Ok(()) => checked = true,
-            Err(error) => println!("{error}\nGiving sbx a new key for {name}."),
+            Err(Failed::Sandbox(error)) => bail!("{error}"),
+            Err(Failed::Prompt(error)) => println!("{error}\nGiving sbx a new key for {name}."),
         }
     }
     if !checked {
@@ -378,9 +369,13 @@ pub fn connect(backend: &dyn crate::backend::Backend, config: &Config) -> Result
         bail!("sbx holds no key {name} can use; run `omar connect {name} --sandbox` again");
     };
     if !checked {
-        check(backend).map_err(|error| {
-            anyhow::anyhow!("{error}; run `omar connect {name} --sandbox` to give sbx a new key")
-        })?;
+        match check(backend) {
+            Ok(()) => {}
+            Err(Failed::Sandbox(error)) => bail!("{error}"),
+            Err(Failed::Prompt(error)) => {
+                bail!("{error}; run `omar connect {name} --sandbox` to give sbx a new key")
+            }
+        }
     }
     println!("✓ {name} connected for sandboxes ({via})");
     Ok(())
@@ -465,13 +460,13 @@ pub fn check_connected(
 ) -> Result<(), String> {
     let template = config.template.as_deref().unwrap_or(DEFAULT_TEMPLATE);
     validate_template(template).map_err(|error| format!("{error:#}"))?;
-    check(backend, template)
+    check(backend, template).map_err(|failed| failed.to_string())
 }
 
 /// The sign-in check (`connection::check_sign_in`) run in a throwaway
 /// sandbox from `template`: the backend's CLI, as its agents will run, with
 /// the key the proxy injects.
-fn check(backend: &dyn crate::backend::Backend, template: &str) -> Result<(), String> {
+fn check(backend: &dyn crate::backend::Backend, template: &str) -> Result<(), Failed> {
     let name = backend.kind().name();
     let command_line = backend.default_command();
     let program = command_line
@@ -484,25 +479,46 @@ fn check(backend: &dyn crate::backend::Backend, template: &str) -> Result<(), St
     let sandbox = format!("omar-check-{}", uuid::Uuid::new_v4());
     let dir = std::env::temp_dir().join(&sandbox);
     let result = (|| {
-        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let start = |error: String| {
+            Failed::Sandbox(format!(
+                "could not start a sandbox to check {name}: {error}"
+            ))
+        };
+        std::fs::create_dir_all(&dir).map_err(|error| start(error.to_string()))?;
         let mut cmd = command();
         cmd.args([
             "create", "--name", &sandbox, "--skills", "off", "--pull", "missing", template,
         ])
         .arg(&dir);
-        checked(cmd, Duration::from_secs(900)).map_err(|error| format!("{error:#}"))?;
+        checked(cmd, Duration::from_secs(900)).map_err(|error| start(format!("{error:#}")))?;
         let mut cmd = command();
         cmd.args(["exec", "--workdir"])
             .arg(&dir)
             .args([&sandbox, program])
             .args(&args);
-        crate::backend::connection::run_checked(cmd)
+        crate::backend::connection::run_checked(cmd).map_err(|error| {
+            Failed::Prompt(format!("{name}'s test prompt failed in a sandbox: {error}"))
+        })
     })();
     let mut cmd = command();
     cmd.args(["rm", "--force", &sandbox]);
     let _ = checked(cmd, Duration::from_secs(60));
     let _ = std::fs::remove_dir_all(&dir);
-    result.map_err(|error| format!("{name}'s test prompt failed in a sandbox: {error}"))
+    result
+}
+
+/// Why a sandbox check failed: sbx could not start the sandbox, which no new
+/// key fixes, or the backend's test prompt failed in it, which one may.
+enum Failed {
+    Sandbox(String),
+    Prompt(String),
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Failed::Sandbox(why) | Failed::Prompt(why)) = self;
+        f.write_str(why)
+    }
 }
 
 /// Services approved for third-party kits in sbx's `credentials.yaml`: the
@@ -635,8 +651,25 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()
     Ok(())
 }
 
+/// `sbx diagnose --json`'s report. sbx exits 1 when any check fails, and
+/// the report says which, so it is read either way.
+fn diagnose() -> Result<Value> {
+    let mut cmd = command();
+    cmd.args(["diagnose", "--json"]);
+    let (_, output, errors) = run(cmd, Duration::from_secs(30))?;
+    serde_json::from_slice(&output)
+        .with_context(|| format!("sbx diagnose failed: {}", String::from_utf8_lossy(&errors)))
+}
+
 /// Bound control commands too: a stopped daemon must not hang deployment cleanup.
-fn checked(mut command: Command, timeout: Duration) -> Result<Vec<u8>> {
+fn checked(command: Command, timeout: Duration) -> Result<Vec<u8>> {
+    let (success, output, errors) = run(command, timeout)?;
+    anyhow::ensure!(success, "sbx failed: {}", String::from_utf8_lossy(&errors));
+    Ok(output)
+}
+
+/// sbx's exit status, stdout and stderr, within `timeout`.
+fn run(mut command: Command, timeout: Duration) -> Result<(bool, Vec<u8>, Vec<u8>)> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -658,15 +691,10 @@ fn checked(mut command: Command, timeout: Duration) -> Result<Vec<u8>> {
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            let bytes = errors.recv_timeout(timeout.saturating_sub(started.elapsed()))??;
-            anyhow::ensure!(
-                status.success(),
-                "sbx failed: {}",
-                String::from_utf8_lossy(&bytes)
-            );
+            let errors = errors.recv_timeout(timeout.saturating_sub(started.elapsed()))??;
             let bytes = output.recv_timeout(timeout.saturating_sub(started.elapsed()))??;
             anyhow::ensure!(bytes.len() <= 1024 * 1024, "sbx output too large");
-            return Ok(bytes);
+            return Ok((status.success(), bytes, errors));
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
