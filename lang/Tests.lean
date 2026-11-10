@@ -837,6 +837,23 @@ def testProve : IO Unit := do
   -- The mistake is reported where it is, counting from the theorem.
   assertEqual "wrong proof's line" ((verdict "wrong").map (·.problems.map (·.line) |>.contains 4)) (some true)
 
+/-- Every complete program in the EA's prompt — a fenced block with a team
+    and a `main` — compiles, so the examples it designs from cannot drift
+    from the language. -/
+def testPromptExamples : IO Unit := do
+  let prompt ← IO.FS.readFile "../prompts/executive-assistant.md"
+  let blocks := (prompt.splitOn "```").toArray.zipIdx.filterMap fun (text, index) =>
+    if index % 2 == 1 then some text else none
+  let programs := blocks.filter fun block =>
+    (block.splitOn "team ").length > 1 && (block.splitOn "main ").length > 1
+  if !programs.any (fun block => (block.splitOn "context ").length > 1) then
+    throw (IO.userError "the EA prompt has no example program with a context")
+  for program in programs do
+    match compileSource "Example" program with
+    | .ok _ => pure ()
+    | .error message => throw (IO.userError s!"EA prompt example: {message}\n{program}")
+  IO.println s!"{programs.size} EA prompt examples compile"
+
 def main : IO UInt32 := do
   try
     for test in topologyCases do
@@ -850,6 +867,7 @@ def main : IO UInt32 := do
     testStateLiterals
     testPromptReads
     testContexts
+    testPromptExamples
     testShutdown
     testCodeTerminator
     testExternalSchemas
