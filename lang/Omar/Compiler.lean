@@ -789,8 +789,16 @@ private def parseTeam (aliases : Array (String × String)) : Parser TeamDecl := 
   -- name, and reacting to it is what declares it.
   for var in states do
     for agent in var.sharedBy do
-      if !agents.any (·.name == agent) then
-        throw s!"context '{var.name}' lists '{agent}', which is not an agent of team '{name}'"
+      match agents.find? (·.name == agent) with
+      | none =>
+          throw s!"context '{var.name}' lists '{agent}', which is not an agent of team '{name}'"
+      -- A `Web` agent is answered from Mission Control's panel, which cannot
+      -- yet show a context or set or keep one, so every completion would be
+      -- refused. Matched as the runtime matches backends: case aside.
+      | some found =>
+          if found.backend.toLower == "web" then
+            throw s!"context '{var.name}' lists '{agent}', a Web agent; \
+              Mission Control can't keep a context yet"
     if var.sharedBy.toList.eraseDups.length != var.sharedBy.size then
       throw s!"context '{var.name}' lists an agent twice"
   let declared := ports.map (·.name) ++ timers.map (·.name) ++ states.map (·.name)

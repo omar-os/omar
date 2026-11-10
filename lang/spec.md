@@ -247,7 +247,9 @@ invocation, its interpolation expands to `<absent>`.
   contract names it. A write over 16 KiB is refused, with the agent told to
   condense it: it is handed whole to every task that shares it.
 
-  The listed names must be agents of the team, each once. Otherwise a context
+  The listed names must be agents of the team, each once, and none a `Web`
+  agent: Mission Control's panel cannot yet show a context or set or keep one,
+  so its every completion would be refused. Otherwise a context
   is the team's state like any other: a task of an unlisted agent may read
   `$(notes)` and set it, and a body reads `self.notes`. Changing its
   declaration in a mutation (§5.1) declares it again, empty.

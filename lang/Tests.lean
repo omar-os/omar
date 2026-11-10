@@ -406,6 +406,11 @@ def rejectionCases : Array (String × String × String) := #[
     contextTeam "context go(a)", "context 't.go' is also a port"),
   ("a context named like a state variable",
     contextTeam "context ops(a) state ops : int = 0", "duplicate state"),
+  ("a context shared with a Web agent",
+    "team T[a : Codex, panel : wEb] { input go : int output out : string
+       context constraints(a, panel)
+       task a(go) -> out \"Do $(go)\" }
+     main { t = T() }", "context 'constraints' lists 'panel', a Web agent; Mission Control can't keep a context yet"),
   ("an unterminated block string",
     contextTeam "context ops(a) \"\"\"never closed", "unterminated")
 ]
