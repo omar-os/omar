@@ -3427,7 +3427,8 @@ fn stage_program(
 struct PanelAnswer {
     task_id: u64,
     agent: String,
-    values: BTreeMap<String, Value>,
+    #[serde(flatten)]
+    answer: topology::PanelValues,
 }
 
 /// A run's panel and the team it belongs to, or the reason there is neither.
@@ -3499,14 +3500,14 @@ fn panel_answer(context: &Arc<Context_>, run_id: &str, body: &[u8]) -> (u16, Val
         &team,
         &answer.agent,
         &answer.task_id,
-        &answer.values,
+        &answer.answer,
     ) {
         Ok(()) => (
             202,
             json!({
                 "run_id": run_id,
                 "task_id": answer.task_id,
-                "sent": answer.values.keys().collect::<Vec<_>>()
+                "sent": answer.answer.values.keys().collect::<Vec<_>>()
             }),
         ),
         // The runtime's own refusal — a port outside the invocation's effects,

@@ -2985,10 +2985,13 @@ fn topology_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "omar_complete",
-            "Complete the active OMAR invocation after setting its effects. The runtime validates the final effect snapshot and releases the tag barrier.",
+            "Complete the active OMAR invocation after setting its effects. The runtime validates the final effect snapshot and releases the tag barrier. Every shared context in the invocation must first be set with omar_set_state or named in keep; otherwise completion is refused and the invocation stays open.",
             json!({
                 "type":"object",
-                "properties":{"task_id":{"type":"integer","minimum":1,"description":"The exact task_id supplied in the task prompt or returned by omar_pending."}},
+                "properties":{
+                    "task_id":{"type":"integer","minimum":1,"description":"The exact task_id supplied in the task prompt or returned by omar_pending."},
+                    "keep":{"type":"array","items":{"type":"string"},"description":"Shared contexts this task leaves unchanged, by name. Every context in the invocation's contexts line must be set with omar_set_state or listed here."}
+                },
                 "required":["task_id"],
                 "additionalProperties":false
             }),

@@ -1334,9 +1334,9 @@ struct PendingInvocation {
     state: BTreeMap<String, Value>,
     #[serde(default)]
     state_types: BTreeMap<String, String>,
-    /// The contexts its agent shares, and how each should be kept.
+    /// The contexts its agent shares: each one's directive and value.
     #[serde(default)]
-    contexts: BTreeMap<String, Option<String>>,
+    contexts: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1358,6 +1358,10 @@ struct SetStateArgs {
 #[derive(Debug, Serialize, Deserialize)]
 struct CompleteArgs {
     task_id: u64,
+    /// Contexts the agent shares and leaves as they were. Every one it shares
+    /// must be set with `omar_set_state` in this invocation or named here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    keep: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1558,7 +1562,7 @@ impl InvocationRegistry {
                         allowed_effects: entry.record.allowed_effects.clone(),
                         state: entry.record.state_values.clone(),
                         state_types: entry.record.state_types.clone(),
-                        contexts: entry.record.contexts.clone(),
+                        contexts: context_view(&entry.record.contexts, &entry.record.state_values),
                     })
                     .collect();
                 Ok(json!({ "pending": pending }))
@@ -1571,6 +1575,9 @@ impl InvocationRegistry {
                 if invocation.record.completed {
                     return Ok(json!({"status":"already_complete"}));
                 }
+                // Refused rather than failed: the invocation stays open, so
+                // the agent can set or keep what it missed in the same task.
+                check_contexts_kept(&invocation.record, &args.keep)?;
                 // State is the instance's, not the contract's: any task may
                 // leave it as it was or change it.
                 let effects: BTreeMap<_, _> = invocation
@@ -1787,6 +1794,18 @@ pub fn panel_pending(access: &PanelAccess, team: &str) -> Result<Vec<Value>> {
     Ok(waiting)
 }
 
+/// What a panel answers with: effect values, state to set, and the contexts
+/// it leaves as they were.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct PanelValues {
+    #[serde(default)]
+    pub values: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub state: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub keep: Vec<String>,
+}
+
 /// Answer one invocation: every value, then complete.
 ///
 /// The whole batch lands as one completion, so a reaction reading several of
@@ -1799,10 +1818,10 @@ pub fn panel_submit(
     team: &str,
     agent: &str,
     task_id: &u64,
-    values: &BTreeMap<String, Value>,
+    answer: &PanelValues,
 ) -> Result<()> {
     let context = panel_context(access, team, agent);
-    for (port, value) in values {
+    for (port, value) in &answer.values {
         send_invocation_command(
             &context,
             InvocationCommand::SetPort(SetPortArgs {
@@ -1812,9 +1831,24 @@ pub fn panel_submit(
             }),
         )?;
     }
+    for (name, value) in &answer.state {
+        send_invocation_command(
+            &context,
+            InvocationCommand::SetState(SetStateArgs {
+                task_id: *task_id,
+                name: name.clone(),
+                value: value.clone(),
+            }),
+        )?;
+    }
+    // Through the same completion as an agent's, so a context the web agent
+    // shares must be set above or kept here.
     send_invocation_command(
         &context,
-        InvocationCommand::Complete(CompleteArgs { task_id: *task_id }),
+        InvocationCommand::Complete(CompleteArgs {
+            task_id: *task_id,
+            keep: answer.keep.clone(),
+        }),
     )?;
     Ok(())
 }
@@ -2165,37 +2199,65 @@ fn unqualified(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
-/// What a task is handed before its prompt: each context its agent shares,
-/// how to keep it, what it holds now, and that it should leave it updated.
-/// That is the whole of a context — the reading and writing a prompt would
-/// otherwise have to ask for.
-fn context_preamble(invocation: &InvocationSpec) -> String {
-    let mut preamble = String::new();
-    for (name, directive) in &invocation.contexts {
-        let short = unqualified(name);
-        let value = invocation
-            .state_values
-            .get(name)
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        preamble.push_str(&format!(
-            "Shared context `{short}`, kept by your team between its tasks.\n"
-        ));
-        if let Some(directive) = directive {
-            preamble.push_str(&format!("How to keep it: {directive}\n"));
-        }
-        if value.is_empty() {
-            preamble.push_str("It is empty so far.\n");
-        } else {
-            preamble.push_str(&format!(
-                "It holds:\n<context name=\"{short}\">\n{value}\n</context>\n"
-            ));
-        }
-        preamble.push_str(&format!(
-            "Before omar_complete, set `{short}` to its full updated text with omar_set_state(task_id, \"{short}\", text), so the next task starts from what this one learned. Leave it alone if nothing changed.\n\n"
-        ));
+/// The contexts an agent shares, as its invocation carries them: each one's
+/// directive (`null` when the program gave none) and what it holds now.
+fn context_view(
+    contexts: &BTreeMap<String, Option<String>>,
+    state: &BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    contexts
+        .iter()
+        .map(|(name, directive)| {
+            let value = state.get(name).cloned().unwrap_or_else(|| json!(""));
+            (
+                name.clone(),
+                json!({"directive": directive, "value": value}),
+            )
+        })
+        .collect()
+}
+
+/// Whether an invocation may complete as far as its contexts go: every
+/// context its agent shares was set in it with `omar_set_state` or is named
+/// in `keep`, and `keep` names nothing else. That is the whole of the
+/// write-back a context asks for, enforced rather than requested.
+fn check_contexts_kept(record: &InvocationRecord, keep: &[String]) -> Result<()> {
+    let shared: BTreeMap<String, String> = record
+        .contexts
+        .keys()
+        .map(|name| (name.clone(), "string".to_string()))
+        .collect();
+    let mut kept = BTreeSet::new();
+    for name in keep {
+        let Some((full, _)) = resolve_name(&shared, name) else {
+            let names: Vec<&str> = record.contexts.keys().map(|n| unqualified(n)).collect();
+            if names.is_empty() {
+                bail!("keep names '{name}', but this task shares no context");
+            }
+            bail!(
+                "keep names '{name}', which is not a context this task shares; it shares: {}",
+                names.join(", ")
+            );
+        };
+        kept.insert(full.clone());
     }
-    preamble
+    let missing: Vec<&str> = record
+        .contexts
+        .keys()
+        .filter(|name| !record.writes.contains_key(*name) && !kept.contains(*name))
+        .map(|name| unqualified(name))
+        .collect();
+    if !missing.is_empty() {
+        let quoted: Vec<String> = missing.iter().map(|n| format!("\"{n}\"")).collect();
+        let named: Vec<String> = missing.iter().map(|n| format!("`{n}`")).collect();
+        bail!(
+            "not complete: set {} with omar_set_state, or keep {}: omar_complete(task_id, keep: [{}])",
+            named.join(" and "),
+            if missing.len() == 1 { "it" } else { "them" },
+            quoted.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// The registry's record of an agent invocation, its prompt rendered.
@@ -2212,11 +2274,7 @@ fn invocation_record(team: &str, invocation: &InvocationSpec) -> Result<Invocati
         state_types: invocation.state_types.clone(),
         contexts: invocation.contexts.clone(),
         context_names: invocation.context_names.clone(),
-        prompt: format!(
-            "{}{}",
-            context_preamble(invocation),
-            render_prompt(&invocation.prompt, &prompt_values(invocation))?
-        ),
+        prompt: render_prompt(&invocation.prompt, &prompt_values(invocation))?,
         writes: BTreeMap::new(),
         completed: false,
     })
@@ -4561,7 +4619,17 @@ fn invocation_message(invocation: &InvocationSpec, rendered: &str) -> Result<Str
     }
     header.push_str(&format!("contract: {}\n", invocation.contract));
     let mut state_note = String::new();
-    // A context this agent shares is already set out ahead of the prompt.
+    // A context this agent shares is set out on its own line, with how to
+    // keep it, and not repeated as state.
+    if !invocation.contexts.is_empty() {
+        header.push_str(&format!(
+            "contexts: {}\n",
+            serde_json::to_string(&context_view(
+                &invocation.contexts,
+                &invocation.state_values
+            ))?
+        ));
+    }
     let state: BTreeMap<_, _> = invocation
         .state_values
         .iter()
@@ -4571,8 +4639,13 @@ fn invocation_message(invocation: &InvocationSpec, rendered: &str) -> Result<Str
         header.push_str(&format!("state: {}\n", serde_json::to_string(&state)?));
         state_note = " The state above is your team's, kept between its tasks: change any of it with omar_set_state(task_id, name, value) before omar_complete, if the next task should see something else.".to_string();
     }
+    let context_note = if invocation.contexts.is_empty() {
+        ""
+    } else {
+        " Each context above is a note your team keeps between its tasks: before omar_complete, set it to its full updated text with omar_set_state, or pass it in omar_complete's keep list if nothing changed."
+    };
     Ok(format!(
-        "{header}\n{described}{rendered}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. Pass the integer task_id above to both tools. For a signal effect, set its value to null.{state_note} Do not address another agent directly."
+        "{header}\n{described}{rendered}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. Pass the integer task_id above to both tools. For a signal effect, set its value to null.{state_note}{context_note} Do not address another agent directly."
     ))
 }
 
@@ -7364,6 +7437,7 @@ mod tests {
                 &agent,
                 InvocationCommand::Complete(CompleteArgs {
                     task_id: invocation.id,
+                    keep: vec![],
                 }),
             )?;
             let writes = completion.try_recv()?;
@@ -7505,7 +7579,10 @@ mod tests {
             .execute(
                 "Shared",
                 "t.a",
-                InvocationCommand::Complete(CompleteArgs { task_id: 9 }),
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: 9,
+                    keep: vec![],
+                }),
             )
             .unwrap();
         let writes = completion.try_recv().unwrap();
@@ -7571,11 +7648,13 @@ mod tests {
     }
 
     /// Answers through the registry as an agent does over MCP. `a` records a
-    /// decision in the context without its prompt asking; the others only
-    /// read. Each one's pending entry and message are kept.
+    /// decision in the context; `b` first tries to complete without touching
+    /// it, then keeps it; `c` shares none. Each one's pending entry, message
+    /// and refusals are kept.
     struct ContextKeepers {
         registry: InvocationRegistry,
         seen: Mutex<Vec<(String, Value, String)>>,
+        refusals: Mutex<Vec<String>>,
     }
     impl ReactionExecutor for ContextKeepers {
         fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
@@ -7590,40 +7669,62 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((agent.clone(), pending["pending"][0].clone(), message));
-            if agent == "t.a" {
+            let complete = |keep: &[&str]| {
                 self.registry.execute(
                     "Ctx",
                     &agent,
-                    InvocationCommand::SetState(SetStateArgs {
+                    InvocationCommand::Complete(CompleteArgs {
                         task_id: invocation.id,
-                        name: "ops".into(),
-                        value: json!("Use SQLite."),
+                        keep: keep.iter().map(|k| k.to_string()).collect(),
                     }),
-                )?;
+                )
+            };
+            let refused = |result: Result<Value>| {
+                let error = result.expect_err("completion should be refused");
+                self.refusals.lock().unwrap().push(format!("{error:#}"));
+            };
+            match agent.as_str() {
+                "t.a" => {
+                    refused(complete(&[]));
+                    self.registry.execute(
+                        "Ctx",
+                        &agent,
+                        InvocationCommand::SetState(SetStateArgs {
+                            task_id: invocation.id,
+                            name: "ops".into(),
+                            value: json!("Use SQLite."),
+                        }),
+                    )?;
+                    complete(&[])?;
+                }
+                "t.b" => {
+                    refused(complete(&["style"]));
+                    complete(&["ops"])?;
+                }
+                _ => {
+                    refused(complete(&["ops"]));
+                    complete(&[])?;
+                }
             }
-            self.registry.execute(
-                "Ctx",
-                &agent,
-                InvocationCommand::Complete(CompleteArgs {
-                    task_id: invocation.id,
-                }),
-            )?;
             let writes = completion.try_recv()?;
             self.registry.remove(&invocation.id);
             Ok(writes)
         }
     }
 
-    /// A context is handed to the tasks of the agents that share it, ahead of
-    /// a prompt that never mentions it, with its directive and the ask to
-    /// update it; what one writes reaches the next. An agent that does not
-    /// share it sees it only as the team's state.
+    /// A context reaches the tasks of the agents that share it in the
+    /// invocation itself — a `contexts:` header line and `omar_pending` —
+    /// and the prompt is the program's own. Completion is refused until each
+    /// shared context is set or kept, and the invocation stays open to fix
+    /// that; what one writes reaches the next. An agent that does not share
+    /// it sees it only as the team's state, and cannot keep it.
     #[test]
     fn a_context_is_handed_to_its_agents_and_kept_by_them() {
         let state = verify(&shared_context_bytecode()).unwrap();
         let keepers = ContextKeepers {
             registry: InvocationRegistry::default(),
             seen: Mutex::new(Vec::new()),
+            refusals: Mutex::new(Vec::new()),
         };
         let end = run_event_loop_controlled(
             &state,
@@ -7643,36 +7744,54 @@ mod tests {
         let [(_, a, a_message), (_, b, b_message), (_, c, c_message)] = &seen[..] else {
             panic!("expected three invocations, got {}", seen.len());
         };
-        let a_prompt = a["prompt"].as_str().unwrap();
-        assert!(a_prompt.starts_with("Shared context `ops`"), "{a_prompt}");
-        assert!(a_prompt.contains("How to keep it: List decisions, newest last.\n"));
-        assert!(a_prompt.contains("It is empty so far.\n"), "{a_prompt}");
-        assert!(a_prompt.contains(
-            "set `ops` to its full updated text with omar_set_state(task_id, \"ops\", text)"
-        ));
-        assert!(a_prompt.ends_with("\n\nPlan."), "{a_prompt}");
+        // The prompt is exactly the program's; the context is data beside it.
+        assert_eq!(a["prompt"], json!("Plan."));
         assert_eq!(
             a["contexts"]["t.ops"],
-            json!("List decisions, newest last.")
+            json!({"directive": "List decisions, newest last.", "value": ""})
+        );
+        assert!(
+            a_message.contains(
+                "contexts: {\"t.ops\":{\"directive\":\"List decisions, newest last.\",\"value\":\"\"}}\n"
+            ),
+            "{a_message}"
+        );
+        assert!(
+            a_message.contains("before omar_complete, set it to its full updated text with omar_set_state, or pass it in omar_complete's keep list"),
+            "{a_message}"
         );
         // `b` runs after `a` at the same tag, so it starts from `a`'s note.
-        let b_prompt = b["prompt"].as_str().unwrap();
-        assert!(
-            b_prompt.contains("<context name=\"ops\">\nUse SQLite.\n</context>\n"),
-            "{b_prompt}"
-        );
-        assert!(b_prompt.ends_with("Build."), "{b_prompt}");
-        // Set out ahead of the prompt, so not repeated in the state line.
+        assert_eq!(b["prompt"], json!("Build."));
+        assert_eq!(b["contexts"]["t.ops"]["value"], json!("Use SQLite."));
+        // Set out on its own line, so not repeated as state.
         for message in [a_message, b_message] {
             assert!(!message.contains("state: "), "{message}");
         }
-        // `c` shares no context: its prompt is its own, and `ops` is just the
+        // `c` shares no context: nothing to keep, and `ops` is just the
         // team's state, which every task may read.
         assert_eq!(c["prompt"], json!("Review."));
         assert_eq!(c["contexts"], json!({}));
+        assert!(!c_message.contains("contexts: "), "{c_message}");
         assert!(
             c_message.contains("state: {\"t.ops\":\"Use SQLite.\"}\n"),
             "{c_message}"
+        );
+        let refusals = keepers.refusals.lock().unwrap();
+        assert_eq!(
+            refusals[0],
+            "not complete: set `ops` with omar_set_state, or keep it: omar_complete(task_id, keep: [\"ops\"])"
+        );
+        assert!(
+            refusals[1].contains(
+                "keep names 'style', which is not a context this task shares; it shares: ops"
+            ),
+            "{}",
+            refusals[1]
+        );
+        assert!(
+            refusals[2].contains("keep names 'ops', but this task shares no context"),
+            "{}",
+            refusals[2]
         );
     }
 
@@ -7713,7 +7832,10 @@ mod tests {
             .execute(
                 "Ctx",
                 "t.c",
-                InvocationCommand::Complete(CompleteArgs { task_id: 12 }),
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: 12,
+                    keep: vec![],
+                }),
             )
             .unwrap();
         assert_eq!(
@@ -7774,7 +7896,10 @@ mod tests {
             .execute(
                 "Desk",
                 "worker",
-                InvocationCommand::Complete(CompleteArgs { task_id: 8 })
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: 8,
+                    keep: vec![]
+                })
             )
             .is_err());
         // A real ID is not a credential: both commands still check ownership.
@@ -7784,7 +7909,10 @@ mod tests {
                 .execute(
                     team,
                     agent,
-                    InvocationCommand::Complete(CompleteArgs { task_id: 7 })
+                    InvocationCommand::Complete(CompleteArgs {
+                        task_id: 7,
+                        keep: vec![]
+                    })
                 )
                 .is_err());
         }
@@ -7802,7 +7930,10 @@ mod tests {
             .execute(
                 "Desk",
                 "worker",
-                InvocationCommand::Complete(CompleteArgs { task_id: 7 }),
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: 7,
+                    keep: vec![],
+                }),
             )
             .unwrap();
         assert_eq!(completion.try_recv().unwrap()["answer"], json!("hello"));

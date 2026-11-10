@@ -232,18 +232,20 @@ invocation, its interpolation expands to `<absent>`.
   team's is out of reach, and data crosses instances only through ports.
 - `context notes(planner, coder) """Keep decisions; drop what is resolved."""`
   declares state the listed agents keep together without their prompts saying
-  so: a `string`, starting empty. Before each task of a listed agent, the
-  runtime hands the agent the context — its name, the directive if the program
-  gave one, what it holds now — ahead of the prompt, and asks it to set the
-  full updated text with `omar_set_state` before completing. Without a
-  directive the name is the only hint, so name it for what it holds.
+  so: a `string`, starting empty. Each task of a listed agent is invoked with
+  the context — the directive if the program gave one (`null` if not), and
+  what it holds now — in the invocation itself, beside its triggers (§4.2);
+  the prompt is the program's own. The task must then either set the full
+  updated text with `omar_set_state`, or say it leaves it as it was with
+  `omar_complete(task_id, keep: ["notes"])`: completion is refused until every
+  context it shares is one or the other. Without a directive the name is the
+  only hint, so name it for what it holds.
 
   The write commits with the task, like any state write (§4.2): the next task
   that shares it starts from it, at the same tag if declared later, and a task
-  that expires leaves it as it was. Not writing leaves it unchanged; it is not
-  an effect, so no contract requires it. A write over 16 KiB is refused, with
-  the agent told to condense it: it is handed whole to every task that shares
-  it.
+  that expires or fails leaves it as it was. It is not an effect, so no
+  contract names it. A write over 16 KiB is refused, with the agent told to
+  condense it: it is handed whole to every task that shares it.
 
   The listed names must be agents of the team, each once. Otherwise a context
   is the team's state like any other: a task of an unlisted agent may read
@@ -447,7 +449,7 @@ scoped MCP tools:
 ```text
 omar_set_port(task_id, port, value)
 omar_set_state(task_id, name, value)
-omar_complete(task_id)
+omar_complete(task_id, keep?)
 omar_pending()
 ```
 
@@ -485,8 +487,19 @@ rejected.
 
 The invocation message lists the instance's state as it stands, under
 `state:`, so an agent knows what it may read and set without its prompt saying.
-A context the agent shares (§2.2) is set out ahead of the prompt instead, with
-its directive and the request to update it, and left out of `state:`.
+The contexts the agent shares (§2.2) are on their own line instead, and left
+out of `state:`:
+
+```text
+contexts: {"t.notes": {"directive": "Keep decisions.", "value": "Use SQLite."}}
+```
+
+`omar_complete` refuses an invocation that shares a context until each one has
+been set with `omar_set_state` in it, or is named in `keep`; naming anything
+else in `keep` is refused too. A refusal is the tool's error, not the run's:
+the invocation stays open, and the agent completes it once it has set or kept
+what it missed. A panel answering for a `web` agent completes through the same
+check.
 
 The topology runner owns invocation records in memory. Topology-scoped MCP
 processes send authenticated commands to the runner over a loopback connection.
@@ -501,7 +514,7 @@ the earlier value; an optional effect replaces it only when present.
 `omar_pending` lists the invocations addressed to the asking agent that are not
 yet complete, each with its prompt, trigger values, permitted effects, and its
 instance's state with each variable's type, and the contexts its agent shares
-with their directives. It is
+in the same form as the `contexts:` line. It is
 scoped to that agent, so it discloses nothing the agent's own reactions were not
 already wired to see.
 
