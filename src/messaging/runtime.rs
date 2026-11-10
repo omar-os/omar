@@ -83,13 +83,14 @@ impl OmarRuntime {
             discord_account: None,
         })
     }
-    pub async fn call(&self, path: &str, body: Option<&Value>) -> Result<Value> {
-        let url = format!("{}{path}", self.base);
+
     pub fn for_discord(mut self, account: String) -> Self {
         self.discord_account = Some(account);
         self
     }
 
+    pub async fn call(&self, path: &str, body: Option<&Value>) -> Result<Value> {
+        let url = format!("{}{path}", self.base);
         let request = match body {
             Some(body) => self
                 .client

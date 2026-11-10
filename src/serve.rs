@@ -2643,6 +2643,8 @@ fn messaging_chat(workspaces: &Arc<Workspaces>, body: &[u8]) -> (u16, Value) {
     struct Request {
         platform: String,
         account_id: String,
+        #[serde(default)]
+        fresh: bool,
     }
     let request: Request = match serde_json::from_slice(body) {
         Ok(value) => value,
@@ -2689,8 +2691,6 @@ fn select_chat(workspaces: &Arc<Workspaces>, id: Option<&str>) -> (u16, Value) {
             let Some(chat) = history.conversations.iter().find(|chat| chat.id == id) else {
                 return (404, json!({"error": "unknown chat"}));
             };
-        #[serde(default)]
-        fresh: bool,
             let omar_dir = &workspaces.settings.omar_dir;
             if chat
                 .ea_id
