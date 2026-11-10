@@ -922,6 +922,19 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 {
                     bail!("duplicate connection from '{source}' to '{target}'");
                 }
+                // A port holds one value per tag; a second incoming connection
+                // would drop one of the two. omarc rejects it; so does the
+                // runtime, for bytecode that did not come from omarc.
+                if let Some(other) = state
+                    .connections
+                    .iter()
+                    .find(|connection| connection.target == *target)
+                {
+                    bail!(
+                        "port '{target}' already has an incoming connection from '{}'; a port takes one",
+                        other.source
+                    );
+                }
                 state.connections.push(ConnectionState {
                     source: source.clone(),
                     target: target.clone(),
@@ -4987,6 +5000,28 @@ mod tests {
             .to_string();
         assert!(error.contains("writes 'decision'"), "{error}");
         assert!(error.contains("does not enforce"), "{error}");
+    }
+
+    #[test]
+    fn a_port_takes_one_incoming_connection() {
+        let mut program = body_with_enum("input", r#"["decision"]"#, r#"["memo"]"#);
+        for (at, extra) in [
+            r#"{"op":"define_port","kind":"input","name":"other","type":"string"}"#,
+            r#"{"op":"connect_ports","source":"token","target":"memo"}"#,
+            r#"{"op":"connect_ports","source":"other","target":"memo"}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            program
+                .instructions
+                .insert(6 + at, serde_json::from_str(extra).unwrap());
+        }
+        let error = verify(&program).unwrap_err().to_string();
+        assert!(
+            error.contains("port 'memo' already has an incoming connection from 'token'"),
+            "{error}"
+        );
     }
 
     #[test]
