@@ -1003,6 +1003,12 @@ private def validate (program : Program) : Except String Program := do
       | none => throw s!"connection names unknown target port '{connection.target}'"
     if source.type != target.type then
       throw s!"connection type mismatch from '{connection.source}' to '{connection.target}'"
+    -- A port holds one value per tag. Two connections into it would leave
+    -- only the last value carried, and drop the other without a word.
+    let sources := program.connections.filter (·.target == connection.target) |>.map (·.source)
+    if sources.size > 1 then
+      throw s!"port '{connection.target}' has {sources.size} incoming connections \
+        ({", ".intercalate sources.toList}); a port takes one, so give each source its own port"
   pure program
 
 /-- `instance.member`. The VM has one flat namespace, so instantiating a team

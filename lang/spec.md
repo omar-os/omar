@@ -271,7 +271,9 @@ The expression after `->` declares the ports a reaction may set:
 
 Every trigger must be an input, action, timer or `shutdown`. Every effect must be an output or
 action. A connection target must be an output or action, and its source and
-target types must match. Values must match their port types.
+target types must match. A port takes at most one incoming connection: it holds
+one value per tag, so two would drop one. Give each source its own input and
+merge them in a reaction. Values must match their port types.
 
 ### 2.4 Deadlines
 

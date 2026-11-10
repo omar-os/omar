@@ -348,6 +348,13 @@ def rejectionCases : Array (String × String × String) := #[
     nodeTeam ++ " main { a = Node(1) a.out -> b.token }", "unknown instance 'b'"),
   ("duplicate instance",
     nodeTeam ++ " main { a = Node(1) a = Node(2) }", "duplicate instance 'a'"),
+  -- A port holds one value per tag: two connections into it would keep the
+  -- last and drop the other.
+  ("two connections into one input",
+    nodeTeam ++ " main { a = Node(1) b = Node(2) c = Node(3) a.out -> c.token b.out -> c.token }",
+    "port 'c.token' has 2 incoming connections (a.out, b.out)"),
+  ("two connections into one port inside a team",
+    wireTeam "input other : int src -> dst other -> dst", "port 'w.dst' has 2 incoming connections"),
   ("no main block at all",
     nodeTeam, "no main block"),
   ("a main block that instantiates nothing",
