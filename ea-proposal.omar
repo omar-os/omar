@@ -1,0 +1,45 @@
+team ChicagoTrip[hotel : Claude, scheduler : Claude, dining : Claude]
+{
+    input brief : string
+    action booking : string
+    action schedule : string
+    output itinerary : string
+
+    context constraints(hotel, scheduler, dining) """
+        The travelers' hard constraints, one per line. It starts with:
+        hotel under $150 per night; two vegetarians; one wheelchair user (step-free access everywhere);
+        walking distance to McCormick Place. Whenever you discover a new constraint
+        (room availability, venue access, reservation limits, conference session times, etc.)
+        append it. Never drop or weaken a constraint; every agent must satisfy all of them.
+    """
+
+    task hotel(brief) -> booking """
+        You book the hotel for 6 colleagues attending a 3-day conference in Chicago.
+        Trip brief: $(brief)
+        Respect every line of the shared constraints. Pick a hotel within walking distance of McCormick Place,
+        under $150/night, with wheelchair-accessible rooms. Output the hotel name, address, room plan, nightly rate,
+        accessibility details, and any new constraints you discovered (also add them to the shared constraints).
+    """
+
+    task scheduler(booking) -> schedule """
+        You plan each of the 3 days for 6 colleagues at a conference at McCormick Place, Chicago.
+        Hotel booking: $(booking)
+        Respect every line of the shared constraints. Produce an hour-by-hour plan for Day 1, Day 2 and Day 3,
+        including step-free walking routes between the hotel and the venue and open slots for breakfast, lunch and dinner.
+        Repeat the hotel details at the top. Add any new constraints you discover (session times, accessible entrances,
+        transit limits) to the shared constraints.
+    """
+
+    task dining(schedule) -> itinerary """
+        You pick restaurants for 6 colleagues on a 3-day Chicago conference trip.
+        Day schedule (includes the hotel): $(schedule)
+        Respect every line of the shared constraints. For each meal slot, pick a wheelchair-accessible restaurant
+        within walking distance that has good vegetarian options and seats 6. Add any new constraints you discover
+        to the shared constraints. Then output the final trip plan: the hotel, the 3-day schedule with the restaurants
+        filled in, and the complete final list of constraints, noting how each one is met.
+    """
+}
+
+main ChicagoConferenceTrip {
+    trip = ChicagoTrip()
+}
