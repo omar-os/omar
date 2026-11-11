@@ -530,20 +530,24 @@ pub fn connect(
 fn sign_in(backend: &dyn crate::backend::Backend) -> Result<Option<String>> {
     use crate::backend::Kind;
     let name = backend.kind().name();
+    // `Some(None)`: signed in, but the CLI does not say how.
     let host = match crate::backend::connection::connection(backend) {
-        Connection::Connected { via } => Some(via.unwrap_or_else(|| "a sign-in".to_owned())),
+        Connection::Connected { via } => Some(via),
         _ => None,
     };
     match (&host, backend.kind()) {
-        (Some(via), Kind::Codex) => {
+        (Some(Some(via)), Kind::Codex) => {
             println!("{name} is signed in here with {via}; sandboxes need a sign-in of their own.")
         }
-        (Some(via), _) if via.contains("key") => {
+        (Some(Some(via)), _) if via.contains("key") => {
             println!("OMAR cannot read the key {name} signs in with here; give sandboxes one.")
         }
-        (Some(via), _) => println!(
+        (Some(Some(via)), _) => println!(
             "{name} is signed in here with {via}, which sandboxes cannot use; they need an API key."
         ),
+        (Some(None), _) => {
+            println!("{name}'s sign-in here is not an API key OMAR can reuse; sandboxes need one.")
+        }
         (None, _) => println!("{name} has no API key on this machine for sandboxes to reuse."),
     }
     let chatgpt = backend.kind() == Kind::Codex && {
@@ -581,7 +585,7 @@ fn sign_in(backend: &dyn crate::backend::Backend) -> Result<Option<String>> {
     };
     println!("{note}");
     interactive(args)?;
-    Ok(host)
+    Ok(host.map(|via| via.unwrap_or_else(|| "its sign-in".to_owned())))
 }
 
 /// `omar disconnect <backend> --sandbox`: remove the key sbx gives its
