@@ -20,6 +20,8 @@ jobs:
           fetch-depth: 0
       - name: Test the rules check
         run: python3 tests/ci/repo_rules.py
+      - name: Test the nightly failure report
+        run: python3 tests/ci/report_nightly_failure.py
       # CONTRIBUTING.md rules 1 and 2: no added docs, no binary files.
       - name: Check this change
         run: .github/scripts/check-repo-rules.sh "${{ github.event.pull_request.base.sha || github.event.before }}"
@@ -139,6 +141,7 @@ jobs:
         run: |
           cargo build -p omar
           python3 tests/ci/independent_sessions.py
+          python3 tests/ci/workspace_restore.py
           python3 tests/ci/ea_deletion.py
           python3 tests/ci/team_workspaces.py
           python3 tests/ci/team_checkpoints.py

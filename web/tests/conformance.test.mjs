@@ -155,7 +155,16 @@ async function startRealServe() {
     stateDir,
     sessionPrefix,
     async close() {
-      child.kill();
+      // On SIGTERM the daemon parks its runs and updates its records, all in
+      // the session directory; removing that before it exits races those
+      // writes (ENOTEMPTY).
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((done) => child.once("exit", done));
+        child.kill();
+        const forced = setTimeout(() => child.kill("SIGKILL"), 30_000);
+        await exited;
+        clearTimeout(forced);
+      }
       // A failed or finished run leaves its agent sessions behind, so the
       // harness clears its own namespace rather than accumulating panes.
       await new Promise((done) => {
