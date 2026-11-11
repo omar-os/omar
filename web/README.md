@@ -172,7 +172,7 @@ or tmux.
 
 `omar open` (or `omar up --web` without a name) reopens the remembered workspace,
 starting the same runtime if it stopped. Use
-`omar up --name NAME` to explicitly create a separate workspace. The current
+`omar up -s NAME` to explicitly create a separate workspace. The current
 conversation, source, companion files, inputs, and display names persist locally.
 A workflow editor shows **Saving…** until its draft is durable. Conflicting edits
 from another tab are rejected; the unsaved version stays in the browser for recovery.

@@ -1576,7 +1576,7 @@ fn strip_target_args(args: impl Iterator<Item = String>) -> Vec<String> {
     stripped
 }
 /// Opening the product reuses its workspace. Creating a separate runtime
-/// remains explicit through `up --name` (or `up` without --web).
+/// remains explicit through `up -s NAME` (or `up` without --web).
 fn open_workspace(cli: &Cli, print_url: bool) -> Result<()> {
     let sessions = discover()?;
     let default_file = home_root().join("default-session.json");
@@ -1653,7 +1653,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         Some(Commands::SessionDaemon { directory }) => daemon(directory).await,
         None => Err(anyhow::anyhow!("a command is required; see omar --help")),
         Some(Commands::Open { print_url }) => open_workspace(cli, *print_url),
-        Some(Commands::Up(options)) if options.web && options.name.is_none() && options.workdir.is_none() && options.port == UpOptions::default().port && options.view_address == UpOptions::default().view_address && !options.no_ea && !options.tui && options.startup_timeout == UpOptions::default().startup_timeout && cli.config.is_none() && cli.agent.is_none() && !cli.spawn_metrics => open_workspace(cli, cli.json),
+        Some(Commands::Up(options)) if options.web && options.name.is_none() && cli.session.is_none() && options.workdir.is_none() && options.port == UpOptions::default().port && options.view_address == UpOptions::default().view_address && !options.no_ea && !options.tui && options.startup_timeout == UpOptions::default().startup_timeout && cli.config.is_none() && cli.agent.is_none() && !cli.spawn_metrics => open_workspace(cli, cli.json),
         Some(Commands::Up(options)) => launch(cli, options.clone(), false).and_then(|(s, previous)| {
             print_started(&s, previous.as_ref(), cli.json)?;
             if options.web { crate::open_browser(&s.url); }
