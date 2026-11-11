@@ -131,6 +131,14 @@ class BackendStatus(unittest.TestCase):
         self.assertIn("omar connect codex", rows["codex"])
         self.assertIn("not installed", rows["cursor"])
 
+    def test_a_long_status_keeps_its_column(self):
+        codex = Path(self.env["PATH"]) / "codex"
+        codex.write_text('#!/bin/sh\n[ "$1" = --version ] && exit 0\n'
+            '[ "$1 $2" = "login status" ] && { echo \'something new\' >&2; exit 0; }\nexit 0\n')
+        header, row = self.omar("codex").splitlines()
+        self.assertEqual(row.index("omar connect codex"), header.index("NEXT"))
+        self.assertIn("knows  omar connect codex", row)
+
     def test_with_nothing_connected_the_table_says_how_to_start(self):
         (Path(self.env["PATH"]) / "claude").unlink()
         self.assertEqual(self.omar(), "No backend is connected. Use `omar connect` to add one.\n")
@@ -299,14 +307,25 @@ mkdir -p {pi.parent} && cp {package} {pi}""")
             return os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
         return until, fd, exit_code
 
-    def codex(self, signed_in):
+    def codex(self, signed_in_as=None):
+        """A codex that keeps its sign-in where codex does, and, as codex
+        does, deletes it as its login starts. The login stops there when
+        `abandon` exists, else signs in as `next` (default "new"); a sign-in
+        as "broken" fails the test prompt. Returns the operator's sign-in."""
         self.stand_in("codex", f"""
-[ "$1 $2" = "login status" ] && {{ [ -f {signed_in} ] && echo 'Logged in using ChatGPT' >&2 && exit 0; echo 'Not logged in' >&2; exit 1; }}
-[ "$*" = "login --device-auth" ] && touch {signed_in}
-[ "$*" = "logout" ] && rm {signed_in}""")
+auth="${{CODEX_HOME:-$HOME/.codex}}/auth.json"
+[ "$1 $2" = "login status" ] && {{ [ -f "$auth" ] && echo 'Logged in using ChatGPT' >&2 && exit 0; echo 'Not logged in' >&2; exit 1; }}
+[ "$*" = "login --device-auth" ] && {{ rm -f "$auth"; [ -f {self.root}/abandon ] && exit 1; mkdir -p "$(dirname "$auth")"; cp {self.root}/next "$auth" 2>/dev/null || echo new > "$auth"; }}
+[ "$*" = "logout" ] && rm "$auth"
+[ "$1" = exec ] && [ "$(cat "$auth")" = broken ] && {{ echo '401 Unauthorized' >&2; exit 1; }}""")
+        auth = self.home / ".codex/auth.json"
+        if signed_in_as:
+            auth.parent.mkdir(parents=True, exist_ok=True)
+            auth.write_text(signed_in_as + "\n")
+        return auth
 
     def test_the_picker_connects_with_arrow_keys(self):
-        self.codex(self.root / "codex-signed-in")
+        self.codex()
         until, fd, exit_code = self.picker()
         # claude is first; one step down is codex.
         until("enter connect")
@@ -320,25 +339,45 @@ mkdir -p {pi.parent} && cp {package} {pi}""")
         self.assertIn("Connecting codex", screen)
 
     def test_a_working_sign_in_is_replaced_or_disconnected_on_request(self):
-        signed_in = self.root / "codex-signed-in"
-        signed_in.touch()
-        sign_ins = self.root / "sign-ins"
-        self.stand_in("codex", f"""
-[ "$1 $2" = "login status" ] && {{ [ -f {signed_in} ] && echo 'Logged in using ChatGPT' >&2 && exit 0; echo 'Not logged in' >&2; exit 1; }}
-[ "$*" = "login --device-auth" ] && touch {signed_in} && echo x >> {sign_ins}
-[ "$*" = "logout" ] && rm {signed_in}""")
+        auth = self.codex(signed_in_as="old")
+        staging = self.home / ".omar/sign-in/codex"
         out = self.omar("connect", "codex", "--replace").stdout
+        self.assertIn("Your current codex sign-in stays until the new one works.", out)
         self.assertIn("✓ codex connected (ChatGPT)", out)
-        self.assertEqual(sign_ins.read_text(), "x\n")
+        self.assertEqual(auth.read_text(), "new\n")
+        self.assertFalse(staging.exists())
         self.assertIn("✓ codex disconnected", self.omar("disconnect", "codex").stdout)
-        self.assertFalse(signed_in.exists())
+        self.assertFalse(auth.exists())
+        result = self.omar("disconnect", "jev", ok=False)
+        self.assertIn("topology-only", result.stderr)
+
+    def test_a_replace_that_does_not_finish_keeps_the_old_sign_in(self):
+        # codex deletes its sign-in as its login starts; the replace signs in
+        # aside, so neither an abandoned login nor a new sign-in that fails
+        # its test prompt touches the old one.
+        auth = self.codex(signed_in_as="old")
+        (self.root / "abandon").touch()
+        result = self.omar("connect", "codex", "--replace", ok=False)
+        self.assertIn("codex is still not signed in", result.stderr)
+        self.assertEqual(auth.read_text(), "old\n")
+        (self.root / "abandon").unlink()
+        (self.root / "next").write_text("broken\n")
+        result = self.omar("connect", "codex", "--replace", ok=False)
+        self.assertIn("its test prompt failed: 401 Unauthorized", result.stderr)
+        self.assertEqual(auth.read_text(), "old\n")
+        self.assertFalse((self.home / ".omar/sign-in/codex").exists())
+        # A codex home set by the operator is the one replaced.
+        (self.root / "next").unlink()
+        custom = self.root / "custom-codex"
+        self.env["CODEX_HOME"] = str(custom)
+        self.omar("connect", "codex", "--replace")
+        self.assertEqual((custom / "auth.json").read_text(), "new\n")
+        self.assertEqual(auth.read_text(), "old\n")
         result = self.omar("disconnect", "jev", ok=False)
         self.assertIn("topology-only", result.stderr)
 
     def test_the_picker_replaces_a_working_sign_in_after_asking(self):
-        signed_in = self.root / "codex-signed-in"
-        signed_in.touch()
-        self.codex(signed_in)
+        auth = self.codex(signed_in_as="old")
         until, fd, exit_code = self.picker()
         until("enter connect")
         # enter on a connected backend asks first; anything but y keeps it.
@@ -349,15 +388,14 @@ mkdir -p {pi.parent} && cp {package} {pi}""")
         os.write(fd, b"y")
         until("Replacing codex's sign-in")
         until("✓ codex connected (ChatGPT)")
+        self.assertEqual(auth.read_text(), "new\n")
         until("enter connect", 2)
         os.write(fd, b"q")
         until("Done")
         self.assertEqual(exit_code(), 0)
 
     def test_the_picker_disconnects_after_asking(self):
-        signed_in = self.root / "codex-signed-in"
-        signed_in.touch()
-        self.codex(signed_in)
+        signed_in = self.codex(signed_in_as="old")
         until, fd, exit_code = self.picker()
         until("enter connect")
         # d asks first; anything but y leaves codex signed in.

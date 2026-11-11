@@ -13,7 +13,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::Stylize;
 use crossterm::{cursor, terminal, QueueableCommand};
 
-use super::{connection, Backend, Connection};
+use super::{connection, Backend, Connection, SignInHome};
 
 /// Connect `backend` on this machine; `replace` signs in again even when
 /// its sign-in works.
@@ -271,6 +271,13 @@ fn connect(backend: &dyn Backend, replace: bool) -> Result<()> {
             Err(error) => println!("{error}\nSigning {name} in again."),
         }
     }
+    // Lives until the end, so the status and check below see the new home.
+    let staged = match backend.sign_in_home() {
+        Some(home) if replace && status != Connection::SignedOut => {
+            Some(Staged::begin(home, name)?)
+        }
+        _ => None,
+    };
     if !checked {
         let login = backend
             .login(headless())
@@ -295,6 +302,9 @@ fn connect(backend: &dyn Backend, replace: bool) -> Result<()> {
                     anyhow::anyhow!("{error}; run `omar connect {name}` to sign in again")
                 })?;
             }
+            if let Some(staged) = &staged {
+                staged.keep(name)?;
+            }
             println!(
                 "✓ {name} connected{}",
                 via.map(|v| format!(" ({v})")).unwrap_or_default()
@@ -314,6 +324,68 @@ fn connect(backend: &dyn Backend, replace: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A replace signing in under a fresh home, for a CLI whose login drops the
+/// old sign-in as it starts: the old one stays until [`Staged::keep`]. The
+/// CLI finds the fresh home through its environment variable, set for this
+/// process and every command it starts until dropped.
+struct Staged {
+    home: SignInHome,
+    fresh: PathBuf,
+    previous: Option<OsString>,
+}
+
+impl Staged {
+    fn begin(home: SignInHome, name: &str) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let fresh = crate::sessions::state_root().join("sign-in").join(name);
+        // Left by a replace that was killed.
+        let _ = std::fs::remove_dir_all(&fresh);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&fresh)
+            .with_context(|| format!("cannot make {}", fresh.display()))?;
+        let previous = std::env::var_os(home.var);
+        std::env::set_var(home.var, &fresh);
+        println!("Your current {name} sign-in stays until the new one works.");
+        Ok(Staged {
+            home,
+            fresh,
+            previous,
+        })
+    }
+
+    /// Put the new sign-in in place of the old one.
+    fn keep(&self, name: &str) -> Result<()> {
+        for file in self.home.files {
+            ensure!(
+                self.fresh.join(file).is_file(),
+                "{name} signed in, but not into {file}, so OMAR cannot move it; your earlier sign-in is unchanged"
+            );
+        }
+        std::fs::create_dir_all(&self.home.dir)?;
+        for file in self.home.files {
+            // Copied beside the old file, then renamed over it in one step.
+            let next = self.home.dir.join(format!("{file}.omar-new"));
+            std::fs::copy(self.fresh.join(file), &next)
+                .with_context(|| format!("cannot write {}", next.display()))?;
+            std::fs::rename(&next, self.home.dir.join(file))
+                .with_context(|| format!("cannot replace {file} in {}", self.home.dir.display()))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.home.var, value),
+            None => std::env::remove_var(self.home.var),
+        }
+        let _ = std::fs::remove_dir_all(&self.fresh);
+    }
 }
 
 /// `connection::check_sign_in`, said as it happens; the error names the

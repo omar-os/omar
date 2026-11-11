@@ -1706,8 +1706,15 @@ fn report_backends(
     let mut out = String::new();
     if !shown.is_empty() {
         let next = shown.iter().any(|row| !next_of(row).is_empty());
+        // As wide as the longest status, which can be a CLI's own words.
+        let width = shown
+            .iter()
+            .map(|(_, status)| connection::label(status).chars().count() + 2)
+            .max()
+            .unwrap_or(0)
+            .max(28);
         let header = format!(
-            "{:<10}{:<28}{}",
+            "{:<10}{:<width$}{}",
             "BACKEND",
             "STATUS",
             if next { "NEXT" } else { "" }
@@ -1717,7 +1724,7 @@ fn report_backends(
         for row in &shown {
             let (backend, status) = row;
             let line = format!(
-                "{:<10}{:<28}{}",
+                "{:<10}{:<width$}{}",
                 backend.kind().name(),
                 connection::label(status),
                 next_of(row)
