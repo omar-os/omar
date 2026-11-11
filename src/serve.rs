@@ -1877,11 +1877,27 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         ("GET", "/v1/agent/backends") => (200, backend_connections()),
         ("POST", "/v1/agent/backend") => switch_backend(&context, &read_body(content_length)?),
         ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/connect") => {
-            let _ = read_body(content_length)?;
+            let body = read_body(content_length)?;
+            let replace = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|body| body["replace"].as_bool())
+                .unwrap_or(false);
             let name = rest
                 .trim_start_matches(CONNECT_PREFIX)
                 .trim_end_matches("/connect");
-            start_connect(&context, name)
+            start_connect(
+                &context,
+                name,
+                "connect",
+                if replace { "--replace" } else { "" },
+            )
+        }
+        ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/disconnect") => {
+            let _ = read_body(content_length)?;
+            let name = rest
+                .trim_start_matches(CONNECT_PREFIX)
+                .trim_end_matches("/disconnect");
+            start_connect(&context, name, "disconnect", "")
         }
         ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/check") => {
             let _ = read_body(content_length)?;
@@ -2255,10 +2271,21 @@ fn relay_terminal(
         }
 
         // Screen output travelling back.
+        let ended = attachment.ended();
         while let Some(bytes) = attachment.read(Duration::from_millis(1)) {
             if socket.send(Message::Binary(bytes)).is_err() {
                 return Ok(());
             }
+        }
+        // The session is gone, with all it drew sent: say so, so a page
+        // waiting on a sign-in knows it finished.
+        if ended {
+            let _ = socket.close(Some(tungstenite::protocol::CloseFrame {
+                code: tungstenite::protocol::frame::coding::CloseCode::Normal,
+                reason: "ended".into(),
+            }));
+            let _ = socket.flush();
+            break;
         }
         if socket.flush().is_err() {
             break;
@@ -2378,10 +2405,11 @@ fn connect_session(context: &Context_, backend: &dyn crate::backend::Backend) ->
     )
 }
 
-/// Run `omar connect <backend>` (install, then the CLI's own sign-in) in a
-/// session Mission Control attaches a terminal to. One already running is
-/// reused, so a second click shows the same sign-in.
-fn start_connect(context: &Context_, name: &str) -> (u16, Value) {
+/// Run `omar connect <backend>` (install, then the CLI's own sign-in), with
+/// `--replace` to sign in again, or `omar disconnect <backend>`, in a session
+/// Mission Control attaches a terminal to. One already running is reused, so
+/// a second click shows the same sign-in.
+fn start_connect(context: &Context_, name: &str, verb: &str, flags: &str) -> (u16, Value) {
     let Some(backend) = connectable(name) else {
         return (
             404,
@@ -2397,20 +2425,44 @@ fn start_connect(context: &Context_, name: &str) -> (u16, Value) {
     // A failed connect leaves its message on screen until a key is pressed;
     // a successful one ends the session, and the page sees it connected.
     let command = format!(
-        "{} connect {name} || {{ printf '\\nPress Enter to close.'; read _; }}",
+        "{} {verb} {name} {flags} || {{ printf '\\nPress Enter to close.'; read _; }}",
         crate::manager::shell_single_quote(&omar.display().to_string())
     );
-    let started = match client.has_session(&session) {
-        Ok(true) => Ok(()),
-        _ => client.new_session(&session, &command, None),
-    };
-    match started {
+    match sign_in_session(
+        &client,
+        &session,
+        format!("{verb} {flags}").trim(),
+        &command,
+    ) {
         Ok(()) => (
             200,
             json!({"session": session, "terminal": format!("{CONNECT_PREFIX}{name}{TERMINAL_SUFFIX}")}),
         ),
         Err(error) => (502, json!({"error": format!("{error:#}")})),
     }
+}
+
+/// Names, in a sign-in session's environment, what it was started to do.
+const SIGN_IN_ACTION_VAR: &str = "OMAR_SIGN_IN_ACTION";
+
+/// Start `command` in `session`, or leave the one there running: reopening
+/// the page reattaches to a sign-in under way. One started for another
+/// action, say a replace closed midway before a disconnect, is ended first;
+/// its terminal would otherwise stand in for the new one.
+fn sign_in_session(client: &TmuxClient, session: &str, action: &str, command: &str) -> Result<()> {
+    if client.has_session(session).unwrap_or(false) {
+        if client.session_env(session, SIGN_IN_ACTION_VAR).as_deref() == Some(action) {
+            return Ok(());
+        }
+        client.kill_session_tree(session)?;
+    }
+    client.new_session_with_backend_env(
+        session,
+        command,
+        None,
+        None,
+        &[(SIGN_IN_ACTION_VAR.to_string(), action.to_string())],
+    )
 }
 
 /// Whether `name`'s sign-in works, by its CLI answering a test prompt: what
@@ -7019,6 +7071,13 @@ while True:
                 Some("{}"),
             );
             assert!(unchecked.starts_with("HTTP/1.1 404"), "{name}: {unchecked}");
+            let kept = request(
+                server.address(),
+                "POST",
+                &format!("/v1/backends/{name}/disconnect"),
+                Some("{}"),
+            );
+            assert!(kept.starts_with("HTTP/1.1 404"), "{name}: {kept}");
         }
         assert!(connectable("codex").is_some());
         assert!(connectable("pi").is_some());
@@ -7545,6 +7604,92 @@ while True:
         tmux(&["kill-session", "-t", &format!("={session}")]);
         assert_eq!(size["cols"], json!(90));
         assert_eq!(size["rows"], json!(expected_rows));
+    }
+
+    #[test]
+    fn a_terminal_says_when_its_session_ends() {
+        // A sign-in's session ends when its command does; the page waiting on
+        // it learns so from the close, not by polling.
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let prefix = crate::ea::ea_prefix(0, &Config::default().dashboard.session_prefix);
+        let session = format!("{prefix}wsended");
+        let tmux = |args: &[&str]| {
+            let _ = crate::tmux::tmux_command().args(args).output();
+        };
+        tmux(&["kill-session", "-t", &format!("={session}")]);
+        tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            &session,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sh",
+        ]);
+
+        let server = test_server();
+        let url = format!("ws://{}/v1/agents/wsended/terminal", server.address());
+        let (mut socket, _) = tungstenite::connect(&url).expect("terminal connects");
+        socket.read().expect("size frame");
+        if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_ref() {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+        }
+        tmux(&["kill-session", "-t", &format!("={session}")]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let close = loop {
+            assert!(
+                Instant::now() < deadline,
+                "no close after the session ended"
+            );
+            match socket.read() {
+                Ok(tungstenite::Message::Close(frame)) => break frame,
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("socket failed before closing: {error}"),
+            }
+        };
+        let close = close.expect("a close frame says why");
+        assert_eq!(
+            close.code,
+            tungstenite::protocol::frame::coding::CloseCode::Normal
+        );
+        assert_eq!(close.reason, "ended");
+    }
+
+    #[test]
+    fn a_sign_in_session_is_reused_only_for_the_same_action() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let prefix = crate::ea::ea_prefix(0, &Config::default().dashboard.session_prefix);
+        let client = TmuxClient::new(prefix.clone());
+        let session = format!("{prefix}signinaction");
+        let _ = client.kill_session(&session);
+        let pid = || client.get_pane_pid(&session).unwrap();
+
+        sign_in_session(&client, &session, "connect --replace", "sleep 30").unwrap();
+        let replacing = pid();
+        // The page reopened: the same sign-in, still under way.
+        sign_in_session(&client, &session, "connect --replace", "sleep 30").unwrap();
+        assert_eq!(pid(), replacing);
+        // Closed midway, then a disconnect: that one runs instead.
+        sign_in_session(&client, &session, "disconnect", "sleep 30").unwrap();
+        let disconnecting = pid();
+        assert_ne!(disconnecting, replacing);
+        assert_eq!(
+            client.session_env(&session, SIGN_IN_ACTION_VAR).as_deref(),
+            Some("disconnect")
+        );
+        let _ = client.kill_session(&session);
     }
 
     #[test]

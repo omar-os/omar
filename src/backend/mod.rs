@@ -7,7 +7,7 @@
 //! entry in [`ALL`].
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -208,6 +208,15 @@ pub struct Login {
     pub note: Option<&'static str>,
 }
 
+/// Where a CLI keeps its sign-in, for one whose login drops the old sign-in
+/// as soon as it starts: a replace signs in under a fresh home named by `var`
+/// first, and moves only `files` into `dir` once the new sign-in works.
+pub struct SignInHome {
+    pub var: &'static str,
+    pub dir: PathBuf,
+    pub files: &'static [&'static str],
+}
+
 pub struct TopologyInvocation<'a> {
     pub effects: &'a BTreeMap<String, String>,
     pub triggers: &'a BTreeMap<String, Value>,
@@ -260,6 +269,10 @@ pub trait Backend: Send + Sync {
     }
     /// How the connect picker has the CLI sign itself out.
     fn logout(&self) -> Option<Login> {
+        None
+    }
+    /// Set when the CLI's login signs it out before the new sign-in is made.
+    fn sign_in_home(&self) -> Option<SignInHome> {
         None
     }
     /// The CLI's own headless run of `connection::CHECK_PROMPT` as `program`,

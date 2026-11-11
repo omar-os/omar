@@ -53,10 +53,27 @@ export function connectTerminalUrl(serveUrl: string, backend: string): string {
 export async function startConnect(
   serveUrl: string,
   backend: string,
+  replace = false,
 ): Promise<void> {
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(
     `${base}/v1/backends/${encodeURIComponent(backend)}/connect`,
+    { method: "POST", body: JSON.stringify({ replace }) },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+}
+
+/**
+ * Starts `omar disconnect <backend>`, the CLI's own sign-out, in the same
+ * terminal a sign-in uses.
+ */
+export async function startDisconnect(
+  serveUrl: string,
+  backend: string,
+): Promise<void> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/backends/${encodeURIComponent(backend)}/disconnect`,
     { method: "POST", body: "{}" },
   );
   if (!response.ok) throw new Error(await readError(response));
