@@ -2,7 +2,7 @@
 //!
 //! The runtime directory is the ownership boundary. Projects below are UUID
 //! contexts explicitly linked to EAs, not the EA-local tasks.md project numbers.
-//! MCP can propose; the operator interface confirms. These are application
+//! Agent writes can be held for review by the operator. These are application
 //! rules, not isolation from processes with the same UID and unrestricted shell.
 
 use anyhow::{bail, ensure, Context, Result};

@@ -58,7 +58,7 @@ pub struct ManagerRuntimeOptions {
 }
 
 // Embed prompt files at compile time so they work regardless of CWD.
-const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
+pub(crate) const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
 const PROMPT_AGENT: &str = include_str!("../../prompts/agent.md");
 
 // Backend-native wake/reminder tools bypass OMAR's durable, EA-scoped scheduler.

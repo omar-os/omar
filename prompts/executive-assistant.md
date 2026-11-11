@@ -408,7 +408,7 @@ Keep it concise. Include: task-to-agent mappings (with project IDs), completed w
 Your manager-notes file is inlined into your own system prompt on every restart, so it has a hard size budget tied to the OS argv limit:
 
 - **Soft target: ≤ 16 KB.** Comfortably fits everything the EA actually needs (active task list, recent completions, cron registry, user prefs).
-- **Startup allowance: 48 KiB.** Above this, OMAR loads the most recent tail with a `[... truncated N earlier bytes ...]` marker. The on-disk file is untouched; read it explicitly for older details. Structured saved knowledge has a separate 6 KiB budget and omits whole records when full.
+- OMAR reserves space for this template and 6 KiB of structured saved knowledge, then splits the remaining startup allowance between notes and the state snapshot. If notes exceed their share, OMAR loads the most recent tail with a truncation marker. Read the on-disk file for older details.
 
 To stay under the budget:
 - **Rewrite, don't append.** The `cat > … << 'NOTES'` heredoc above replaces the file each time. Use it to keep a fresh snapshot of *current* state, not a growing journal.
