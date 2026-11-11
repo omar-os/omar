@@ -106,6 +106,8 @@ export type AgentBackends = {
   available: string[];
   /** Whether a run that says nothing runs its teams in sandboxes. */
   sandboxDefault: boolean;
+  /** Whether Docker Sandboxes is installed, so there is a sandbox to offer. */
+  sandboxInstalled: boolean;
 };
 
 export async function fetchBackends(serveUrl: string): Promise<AgentBackends> {
@@ -113,12 +115,13 @@ export async function fetchBackends(serveUrl: string): Promise<AgentBackends> {
   const response = await fetch(`${base}/v1/agent`);
   if (!response.ok) throw new Error(await readError(response));
   const body = (await response.json()) as Partial<AgentBackends> & {
-    sandbox?: { default?: unknown };
+    sandbox?: { default?: unknown; installed?: unknown };
   };
   return {
     backend: typeof body.backend === "string" ? body.backend : null,
     available: Array.isArray(body.available) ? body.available : [],
     sandboxDefault: body.sandbox?.default === true,
+    sandboxInstalled: body.sandbox?.installed === true,
   };
 }
 

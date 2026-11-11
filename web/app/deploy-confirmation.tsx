@@ -59,10 +59,17 @@ export function DeployConfirmation({ serveUrl, team, disabled, retry = false, ma
   // operator ticks it first.
   const [sandbox, setSandbox] = useState<boolean | null>(null);
   const [sandboxDefault, setSandboxDefault] = useState(false);
+  // Offered only where sbx is installed, or where the config already turns
+  // sandboxes on and the operator needs a way to turn them off.
+  const [sandboxOffered, setSandboxOffered] = useState(false);
   useEffect(() => {
     let cancelled = false;
     fetchBackends(serveUrl)
-      .then((backends) => { if (!cancelled) setSandboxDefault(backends.sandboxDefault); })
+      .then((backends) => {
+        if (cancelled) return;
+        setSandboxDefault(backends.sandboxDefault);
+        setSandboxOffered(backends.sandboxInstalled || backends.sandboxDefault);
+      })
       .catch(() => {});
     return () => { cancelled = true; };
   }, [serveUrl]);
@@ -169,7 +176,7 @@ export function DeployConfirmation({ serveUrl, team, disabled, retry = false, ma
         ) : null}
         {!checkpointing ? <p className="deploy-hint">Only Pause and a manual checkpoint will capture the run; enable to capture on a cadence.</p> : null}
       </fieldset>
-      <fieldset className="deploy-options">
+      {sandboxOffered ? <fieldset className="deploy-options">
         <legend>Isolation</legend>
         <label className="deploy-check">
           <input type="checkbox" checked={sandboxed} onChange={(event) => setSandbox(event.target.checked)} />
@@ -180,7 +187,7 @@ export function DeployConfirmation({ serveUrl, team, disabled, retry = false, ma
             ? "Each team instance runs in its own microVM that sees only its workspace. Every agent backend in the team must be connected for sandboxes (Settings → Connect backends…)."
             : "Agents run on this machine, with your files and sign-ins."}
         </p>
-      </fieldset>
+      </fieldset> : null}
       <div className="deploy-confirmation-actions">
         <button ref={cancel} type="button" className="secondary-button" onClick={onCancel}>Cancel</button>
         <button

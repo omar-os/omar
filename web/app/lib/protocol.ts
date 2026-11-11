@@ -434,6 +434,17 @@ export function applyDiagramEvent(
       const origin = (event.payload as { clock_origin?: unknown }).clock_origin;
       return typeof origin === "number" ? { ...snapshot, clock_origin: origin } : snapshot;
     }
+    case "sandbox_started": {
+      // The team instance's Docker Sandbox is up; the box says it runs there.
+      const { instance, sandbox } = event.payload as { instance?: unknown; sandbox?: unknown };
+      if (typeof sandbox !== "string") return snapshot;
+      return {
+        ...snapshot,
+        instances: (snapshot.instances ?? []).map((each) =>
+          each.id === instance ? { ...each, sandbox } : each,
+        ),
+      };
+    }
     case "run_paused":
       // A pause lands at a tag boundary, where nothing is in flight: whatever
       // was painted as running has finished, and the run waits for a resume.

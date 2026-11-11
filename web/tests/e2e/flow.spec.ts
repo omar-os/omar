@@ -1629,6 +1629,39 @@ test("the confirmation opts a run into sandboxes", async ({ page }) => {
   const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
   const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
   expect(options).toMatchObject({ sandbox: true, no_sandbox: false });
+  // Each team's box says it runs in a sandbox, and which one.
+  const team = page.locator(".omar-team.sandboxed").first();
+  await expect(team).toBeVisible();
+  await expect(team.locator(".omar-team-sandbox")).toHaveCount(1);
+  await expect(team.locator(".omar-team-kind")).toContainText("sandbox");
+  await expect(team).toHaveAttribute("data-sandbox", /^omar-team-/);
+  await expect(page.getByLabel("Diagram legend")).toContainText("sandbox");
+});
+
+test("a run on the host draws no sandbox", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  await expect(page.locator(".omar-team").first()).toBeVisible();
+  await expect(page.locator(".omar-team.sandboxed")).toHaveCount(0);
+  await expect(page.getByLabel("Diagram legend")).not.toContainText("sandbox");
+});
+
+test("without Docker Sandboxes the confirmation offers none", async ({ page }) => {
+  await useFakeServe(page);
+  await page.route("**/v1/agent", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    await route.fulfill({ response, json: { ...body, sandbox: { default: false, installed: false } } });
+  });
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  await expect(dialog.getByRole("button", { name: "Confirm deploy" })).toBeVisible();
+  await expect(dialog.getByRole("checkbox", { name: "Run each team in a Docker Sandbox" })).toHaveCount(0);
 });
 
 test("a sign-in whose test prompt fails keeps its terminal open until one works", async ({

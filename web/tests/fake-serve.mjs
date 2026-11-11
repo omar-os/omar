@@ -381,7 +381,7 @@ export async function startFakeServe({
       return json(response, 200, {
         backend,
         available: ["claude", "codex", "cursor", "opencode", "agy"],
-        sandbox: { default: sandboxDefault },
+        sandbox: { default: sandboxDefault, installed: true },
       });
     }
     if (request.method === "GET" && url.pathname === "/v1/agent/backends") {
@@ -1074,6 +1074,14 @@ export async function startFakeServe({
     const wait = () => new Promise((resolve) => setTimeout(resolve, stepMs));
     await wait();
     publish(entry, "run_started", {});
+    // A sandboxed run's teams each come up in a sandbox named the way the
+    // runtime names them, after the instance's workspace.
+    if (entry.options.sandbox) {
+      for (const instance of entry.snapshot.instances ?? []) {
+        instance.sandbox = `omar-team-${entry.record.run_id.slice(0, 8)}-${instance.name}`;
+        publish(entry, "sandbox_started", { instance: instance.id, sandbox: instance.sandbox });
+      }
+    }
     startClock(entry);
 
     // A pause lands at a tag boundary: nothing in flight, a checkpoint

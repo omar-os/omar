@@ -404,6 +404,16 @@ fn usable(services: &[&str], keys: &Keys) -> Option<String> {
     })
 }
 
+/// Whether Docker Sandboxes (sbx) is here at all.
+pub fn installed() -> bool {
+    command()
+        .arg("version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Whether each backend can reach its models from a sandbox, as sbx's own
 /// store says: the counterpart of the host sign-in `omar backends` shows.
 pub fn connections(backends: &[&dyn crate::backend::Backend]) -> Vec<Connection> {
@@ -452,11 +462,7 @@ pub fn connect(
     let services = services(name)?;
     anyhow::ensure!(!services.is_empty(), "{name} needs no key in sandboxes");
     anyhow::ensure!(
-        command()
-            .arg("version")
-            .stdout(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success()),
+        installed(),
         "Docker Sandboxes (sbx) is not installed: https://docs.docker.com/ai/sandboxes/"
     );
     let signed_out = diagnose().ok().is_some_and(|report| {

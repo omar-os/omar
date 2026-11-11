@@ -3343,6 +3343,7 @@ fn launch(
                     resumed_from: resumed_from.clone(),
                 };
                 worker.request(serde_json::to_value(init)?, Duration::from_secs(180))?;
+                observer.sandbox_started(instance, &name);
                 workers.insert(instance.clone(), worker);
             }
         } else {

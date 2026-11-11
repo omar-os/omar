@@ -2343,8 +2343,11 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
             .map(crate::backend::Kind::name),
         "available": crate::backend::assistant_names(),
         // What a run that says nothing does, so Mission Control's deploy
-        // dialog starts from it.
-        "sandbox": {"default": context.sandbox.on_by_default()},
+        // dialog starts from it, and whether sbx is here to offer at all.
+        "sandbox": {
+            "default": context.sandbox.on_by_default(),
+            "installed": crate::sandbox::installed(),
+        },
     })
 }
 
