@@ -63,6 +63,7 @@ export async function startFakeServe({
 
   /** @type {Map<string, {record: object, snapshot: object, subscribers: Set<import("node:http").ServerResponse>, sequence: number}>} */
   const runs = new Map();
+  const integrations = new Map();
 
   const handle = async (request, response) => {
     const url = new URL(request.url, `http://${request.headers.host}`);
@@ -77,6 +78,22 @@ export async function startFakeServe({
     }
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, { status: "ok", protocol_version: 1, access: "full" });
+    }
+    if (url.pathname === "/v1/task-integrations") {
+      if (request.method === "POST") {
+        const batch = JSON.parse(await readBody(request));
+        const next = new Map(integrations);
+        for (const {connection, before} of batch.changes) {
+          const existing = next.get(connection.id);
+          if (existing && batch.importOnly) continue;
+          if (existing && JSON.stringify(existing) !== JSON.stringify(connection) && JSON.stringify(existing) !== JSON.stringify(before)) {
+            return json(response, 409, {error:"This saved integration changed."});
+          }
+          next.set(connection.id, connection);
+        }
+        for (const [id, entry] of next) integrations.set(id, entry);
+      }
+      return json(response, 200, {connections:[...integrations.values()]});
     }
     // Serve relays each run's diagram server, which only its own host can reach.
     const relay = /^\/v1\/runs\/([^/]+)\/diagram(\/v1\/(?:diagram|events))$/.exec(url.pathname);
@@ -535,7 +552,7 @@ export async function startFakeServe({
       return json(response, 200, { status: "ok", protocol_version: 1, access: "view" });
     }
     const refused = (request.method !== "GET" && request.method !== "OPTIONS") ||
-      path.startsWith("/v1/workspaces") || /^\/v1\/runs\/[^/]+\/panel$/.test(path);
+      path === "/v1/task-integrations" || path.startsWith("/v1/workspaces") || /^\/v1\/runs\/[^/]+\/panel$/.test(path);
     if (refused) return json(response, 403, { error: "read-only view" });
     return handle(request, response);
   });

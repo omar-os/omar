@@ -1,4 +1,5 @@
 import type { DiagramReaction, DiagramSnapshot } from "./protocol";
+import { readConnectionPrompt, writeConnectionPrompt, type TaskConnection } from "./task-connections.ts";
 
 type Token = { text: string; start: number; end: number; string: boolean };
 type Span = { start: number; end: number };
@@ -6,6 +7,7 @@ export type StepSource = {
   team: string;
   backend: string;
   prompt: string;
+  connections: TaskConnection[];
   triggers: string[];
   contract: string;
   backendSpan: Span;
@@ -53,6 +55,16 @@ function tokens(source: string): Token[] {
   return result;
 }
 
+export function connectionsInSource(source: string): TaskConnection[] {
+  if (!source.includes("<omar-connections")) return [];
+  let all: Token[];
+  try { all = tokens(source); } catch { return []; }
+  return all.flatMap(token => {
+    if (!token.string) return [];
+    try { return readConnectionPrompt(token.text).connections; } catch { return []; }
+  });
+}
+
 export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: DiagramReaction): StepSource | null {
   try {
     const all = tokens(source);
@@ -86,7 +98,7 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
     const triggersSpan = { start: all[position + 2].end, end: all[close].start };
     const contractSpan = { start: all[close + 2].start, end: all[contractEnd - 1].end };
     return {
-      team, backend: backend.text, prompt: all[body].text,
+      team, backend: backend.text, ...readConnectionPrompt(all[body].text),
       triggers: source.slice(triggersSpan.start, triggersSpan.end).split(",").map((s) => s.trim()).filter(Boolean),
       contract: source.slice(contractSpan.start, contractSpan.end),
       backendSpan: backend, promptSpan: all[body], triggersSpan, contractSpan,
@@ -94,11 +106,12 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
   } catch { return null; }
 }
 
-export function replaceStep(source: string, step: StepSource, changes: { backend: string; prompt: string; triggers: string[]; contract: string }): string {
+export function replaceStep(source: string, step: StepSource, changes: { backend: string; prompt: string; triggers: string[]; contract: string; connections?: TaskConnection[] }): string {
   if (!/^[A-Za-z_][A-Za-z_0-9]*$/.test(changes.backend)) throw new Error("Choose a supported execution backend.");
+  const prompt = writeConnectionPrompt(changes.prompt, changes.connections ?? step.connections);
   const replacements = [
     { ...step.backendSpan, value: changes.backend },
-    { ...step.promptSpan, value: `"${changes.prompt.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` },
+    { ...step.promptSpan, value: `"${prompt.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` },
     { ...step.triggersSpan, value: changes.triggers.join(", ") },
     { ...step.contractSpan, value: changes.contract },
   ].sort((a, b) => b.start - a.start);

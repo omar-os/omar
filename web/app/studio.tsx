@@ -12,6 +12,10 @@ import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
 import { BackendsPage } from "./backends-page";
 import { SettingsMenu } from "./settings-menu";
+import { IntegrationLibrary, useIntegrationLibrary } from "./integration-library";
+import { IntegrationsPage } from "./integrations-page";
+import type { IntegrationChange } from "./lib/integration-catalog";
+import { readConnectionPrompt } from "./lib/task-connections";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
 import { PortPanel } from "./port-panel";
@@ -21,6 +25,7 @@ import { Resizer } from "./resizer";
 import { useWorkflowNames } from "./lib/workflow-names";
 import { WorkflowIcon } from "./workflow-icon";
 import { StepInspector } from "./step-inspector";
+import { configurationDraftKey, readConfigurationDraft } from "./lib/configuration-draft";
 import { Waiting } from "./waiting";
 import {
   eaDesignAgent,
@@ -145,9 +150,11 @@ export function Studio({ serveUrl = "", designAgent }: StudioProps) {
   // default chat. Otherwise its initial replay can overwrite this tab's choice.
   if (serveUrl && restoredUrl !== serveUrl) return <main className="studio-shell"><p className="workspace-loading" role="status">Opening your workflows…</p></main>;
   const scopedUrl = selected ? `${serveUrl.replace(/\/$/, "")}/chats/${encodeURIComponent(selected)}` : serveUrl;
-  return <StudioWorkspace serveUrl={scopedUrl} historyUrl={serveUrl}
+  return <IntegrationLibrary key={`${serveUrl}:${readOnly}`} runtime={serveUrl} enabled={!!serveUrl && !readOnly}>
+    <StudioWorkspace serveUrl={scopedUrl} historyUrl={serveUrl}
     designAgent={designAgent} selectedId={selected} onSelect={select}
-    readOnly={readOnly} onReadOnly={setReadOnly} />;
+    readOnly={readOnly} onReadOnly={setReadOnly} />
+  </IntegrationLibrary>;
 }
 
 function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, onSelect, readOnly, onReadOnly }: StudioProps & {
@@ -159,6 +166,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   onReadOnly: (readOnly: boolean) => void;
 }) {
   const isDemo = serveUrl.trim().length === 0;
+  const library = useIntegrationLibrary();
+  const [integrationsOpen, setIntegrationsOpen] = useState(false);
   const draftStore = useMemo(() => new WorkflowDraftStore(serveUrl, readOnly), [serveUrl, readOnly]);
   const saveStatus = useSyncExternalStore(draftStore.subscribe, draftStore.snapshot, () => "Saved");
   const proposalSequenceRef = useRef(0);
@@ -183,6 +192,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [sourceErrors, setSourceErrors] = useState<string[]>([]);
   const [checking, setChecking] = useState(false);
   const [applyingConfiguration, setApplyingConfiguration] = useState(false);
+  const configurationDraftRef = useRef<{ key: string; original: string } | null>(null);
   // What applying the edited source to the run would change, while the
   // operator decides; and whether an applied change is still landing.
   const [mutationPlan, setMutationPlan] = useState<{ fromAssistant: boolean } | null>(null);
@@ -484,6 +494,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     setSnapshot(null);
     setSource("");
     setApplyingConfiguration(false);
+    configurationDraftRef.current = null;
     setFilename("program.omar");
     setSourceErrors([]);
     setSelection([]);
@@ -776,7 +787,11 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       }
       setConfirming(false);
       setDesign(message.design);
-      setSource(message.design.program);
+      const draftKey = configurationDraftKey(historyUrl, conversationIdRef.current ?? "demo", message.sequence);
+      configurationDraftRef.current = { key: draftKey, original: message.design.program };
+      let draftProgram = message.design.program;
+      try { draftProgram = readConfigurationDraft(localStorage, draftKey, draftProgram); } catch { /* Site storage may be unavailable. */ }
+      setSource(draftProgram);
       setSourceErrors([]);
       setFilename(`${message.design.preview.team}.omar`);
       // Show the proposed topology, not whatever was on screen before.
@@ -902,6 +917,15 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       if (!isDemo) await draftStore.flush();
       // The source, not the design: the operator may have edited it, and what
       // they are looking at is what they are deploying.
+      if (!isDemo && source.includes("<omar-connections")) {
+        const checked = await checkProgram(serveUrl, source, filename, { files: design.files });
+        if (!checked.ok) throw new Error((checked.errors ?? ["Could not validate integrations."]).join("\n"));
+        const settings = checked.preview?.reactions.flatMap(reaction =>
+          readConnectionPrompt(reaction.prompt ?? "").connections.map(connection => ({ connection }))) ?? [];
+        if (scope !== scopeRef.current) return;
+        await library.save(settings, true);
+        if (scope !== scopeRef.current) return;
+      }
       const record = await startRun(serveUrl, {
         program: source,
         files: design.files,
@@ -964,7 +988,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
   }
 
-  async function applyStepConfiguration(nextSource: string) {
+  async function applyStepConfiguration(nextSource: string, changes: IntegrationChange[]) {
     if (applyingConfiguration) throw new Error("Another configuration update is being validated.");
     const scope = scopeRef.current;
     const original = source;
@@ -975,6 +999,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       if (scope !== scopeRef.current || sourceRef.current !== original) throw new Error("The workflow changed during validation. Reopen this step and try again.");
       if (runRef.current && !isRunFinished(runRef.current.status)) throw new Error("The workflow started during validation. Apply these changes after it finishes.");
       if (!checked.ok) throw new Error((checked.errors ?? ["The configuration did not compile."]).join("\n"));
+      await library.save(changes);
+      if (scope !== scopeRef.current || sourceRef.current !== original || (runRef.current && !isRunFinished(runRef.current.status))) {
+        throw new Error("The workflow changed during save. Reopen this step and try again.");
+      }
       setSource(nextSource);
       setSourceErrors([]);
       if (checked.preview && !runRef.current) setSnapshot(checked.preview);
@@ -1161,6 +1189,11 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   }
 
   function discardDesign() {
+    const draft = configurationDraftRef.current;
+    if (draft) {
+      try { localStorage.removeItem(draft.key); } catch { /* Discard still clears the view when storage is unavailable. */ }
+    }
+    configurationDraftRef.current = null;
     disconnectRef.current?.();
     disconnectRef.current = null;
     setTab("source");
@@ -1466,6 +1499,21 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     </button>
   );
 
+  const sidebarVisible = isDemo ? !historyDrawer : historyVisible;
+  const canManageSettings = daemon.state === "live" && !readOnly;
+  const settingsMenu = (
+    <SettingsMenu
+      onOpenIntegrations={canManageSettings ? () => {
+        library.refresh();
+        setIntegrationsOpen(true);
+      } : undefined}
+      onOpenBackends={canManageSettings ? () => {
+        setDrawerOpen(false);
+        setBackendsOpen(true);
+      } : undefined}
+    />
+  );
+
   function askAboutStep(request: string) {
     setPrompt(request);
     if (builderWidth === 0) setBuilder(DEFAULT_BUILDER);
@@ -1482,13 +1530,14 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       </div>
 
       <div className="studio-content">
-        {isDemo ? <aside className="chat-history demo-history" aria-label="Workflow navigation"><header><div className="brand-lockup"><OmarLogo /><strong>OMAR</strong></div></header><div className="sidebar-heading"><div><span className="eyebrow">WORKSPACE</span><h2>Workflows</h2></div><span className="workflow-count">1</span></div><div className="history-label">DEMO WORKFLOW</div><ul><li><button type="button" aria-current="true" onClick={() => composerRef.current?.focus()}><span className="workflow-name">Review workflow <WorkflowIcon name="chevron" size={14} /></span><span className="workflow-description">Plan, review, and refine a release</span><span className="workflow-meta"><small className="workflow-status status-draft"><i />Demo</small></span></button></li></ul></aside> : null}
+        {isDemo ? <aside className="chat-history demo-history" aria-label="Workflow navigation"><header><div className="brand-lockup"><OmarLogo /><strong>OMAR</strong></div></header><div className="sidebar-heading"><div><span className="eyebrow">WORKSPACE</span><h2>Workflows</h2></div><span className="workflow-count">1</span></div><div className="history-label">DEMO WORKFLOW</div><ul><li><button type="button" aria-current="true" onClick={() => composerRef.current?.focus()}><span className="workflow-name">Review workflow <WorkflowIcon name="chevron" size={14} /></span><span className="workflow-description">Plan, review, and refine a release</span><span className="workflow-meta"><small className="workflow-status status-draft"><i />Demo</small></span></button></li></ul>{sidebarVisible && settingsMenu}</aside> : null}
         {!isDemo && (!historyDrawer || drawerOpen) ? (
           <ChatHistory
             serveUrl={historyUrl}
             activeId={selectedId ?? conversationId}
             onSwitchingChange={setSelectingChat}
             readOnly={readOnly}
+            settings={settingsMenu}
             offline={daemon.state === "offline"}
             mobile={historyDrawer}
             revision={`${historyRevision}:${messages.length}`}
@@ -1537,7 +1586,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
             <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
-            <div className="conversation-actions"><SettingsMenu onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+            <div className="conversation-actions">{!sidebarVisible && settingsMenu}{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
           </header>
           {daemon.state === "offline" ? (
             // The one place the outage is reported: the sidebar and composer
@@ -1961,6 +2010,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       ) : null}
 
       {filesOpen && !readOnly ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); stageDraft(workflow.program, filename, design ? { ...design, ...workflow } : null); }} onClose={() => setFilesOpen(false)} /> : null}
+      {integrationsOpen && !readOnly ? <IntegrationsPage onClose={() => setIntegrationsOpen(false)} /> : null}
       {backendsOpen && !readOnly ? (
         <BackendsPage serveUrl={hydratedUrl ?? serveUrl} onClose={() => setBackendsOpen(false)} />
       ) : null}

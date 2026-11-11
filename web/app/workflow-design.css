@@ -452,6 +452,77 @@ button:focus-visible, select:focus-visible { outline-offset: 3px; }
   .prompt-box > div { flex-wrap: wrap; gap: 8px; }
 }
 
+/* External services are distinct from the data that triggers a task. */
+.integrations-dialog {
+  width: min(540px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 24px;
+  overflow: auto;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--panel-2);
+}
+.integrations-dialog::backdrop { background: rgb(6 6 9 / 70%); }
+.integrations-dialog header, .integration-list summary { display: flex; align-items: center; gap: 10px; }
+.integrations-dialog header { justify-content: space-between; }
+.integrations-dialog h2, .integrations-dialog h3 { margin: 0; }
+.integrations-dialog p { margin: 12px 0; color: var(--text-2); overflow-wrap: anywhere; }
+.integrations-dialog button { padding: 7px 12px; border: 1px solid var(--line-2); border-radius: 6px; color: var(--text); background: var(--panel); }
+.integration-list { list-style: none; padding: 0; }
+.integration-list li { padding: 12px 0; border-bottom: 1px solid var(--line-2); }
+.integration-list summary { cursor: pointer; overflow-wrap: anywhere; }
+.integration-list summary span { margin-left: auto; color: var(--text-3); font-size: .8rem; }
+.integration-add { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+.integration-add h3 { width: 100%; font-size: .9rem; }
+.integration-editor .inspector-field { display: grid; gap: 5px; }
+.integration-editor .inspector-field > span:first-child, .integration-editor .connection-kind-label { color: var(--text-2); }
+.integration-editor input, .integration-editor select { width: 100%; min-width: 0; padding: 8px; color: var(--text); background: var(--panel); border: 1px solid var(--line-2); border-radius: 6px; }
+.integration-editor .step-save { background: var(--purple); color: white; }
+.reuse-integration { margin-bottom: 8px; }
+.reuse-integration select { max-width: 100%; }
+.task-connections { padding-bottom: 18px; border-bottom: 1px solid #eee9f2; }
+.task-connections-heading, .workflow-input-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #756386; }
+.task-connections-heading h4 { display: flex; align-items: center; gap: 7px; margin: 0; color: #302a39; }
+.task-connections-heading h4 span, .workflow-input-heading small { display: grid; min-width: 20px; height: 20px; padding: 0 5px; place-items: center; border-radius: 5px; color: #805ac0; background: #f1eafa; font-size: 10px; }
+.task-connections-empty { display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 19px 10px; border: 1px dashed #ddd3e9; border-radius: 9px; color: #8b73a4; background: #fcfaff; text-align: center; }
+.task-connections-empty strong { color: #5a4d68; font-size: 11px; }
+.task-connections-empty span { color: #887b93; font-size: 10px; line-height: 1.5; }
+.connection-add-button { gap: 7px; min-height: 36px; font-weight: 600; }
+.task-connection-list { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.task-connection-card { display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: start; gap: 8px; padding: 11px; border: 1px solid #e6dfed; border-radius: 9px; background: #fdfcfe; }
+.task-connection-icon, .connection-type-option i { display: grid; width: 30px; height: 30px; flex-shrink: 0; place-items: center; border-radius: 7px; color: #8055b5; background: #f0e9fa; }
+.task-connection-info { display: flex; min-width: 0; flex-direction: column; gap: 5px; }
+.task-connection-info strong { color: #40334e; font-size: 11px; overflow-wrap: anywhere; }
+.task-connection-info small { color: #85728e; font-size: 9px; }
+.task-connection-info > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #7b7284; font: 9px/1.5 ui-monospace, monospace; }
+.task-connection-actions { display: flex; grid-column: 2; justify-content: flex-end; gap: 8px; }
+.task-connection-actions button, .connection-setup-heading button { display: flex; align-items: center; border: 0; padding: 4px; border-radius: 4px; color: #8055b5; background: transparent; font: inherit; font-size: 10px; }
+.task-connection-actions button:hover, .connection-setup-heading button:hover { background: #f0e9fa; }
+.connection-setup { margin-top: 10px; padding: 12px; border: 1px solid #ddceee; border-radius: 10px; background: #fbf8ff; }
+.connection-setup-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #554265; font-size: 11px; }
+.connection-type-list { display: flex; flex-direction: column; gap: 7px; margin-top: 12px; }
+.connection-type-option { display: flex; width: 100%; align-items: center; gap: 8px; padding: 10px 8px; border: 1px solid #e9e1f0; border-radius: 8px; color: #6f5685; background: #fff; text-align: left; }
+.connection-type-option:hover { border-color: #b296d6; background: #faf6ff; }
+.connection-type-option > span { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 5px; }
+.connection-type-option strong { color: #493653; font-size: 11px; }
+.connection-type-option small { color: #8a7a93; font-size: 10px; line-height: 1.5; }
+.connection-type-option > svg { flex-shrink: 0; }
+.connection-back { padding: 12px 0; border: 0; color: #8055b5; background: transparent; font: inherit; font-size: 10px; }
+.connection-kind-label { display: flex; align-items: center; gap: 6px; margin-top: 10px; color: #8055b5; font-size: 11px; font-weight: 600; }
+.connection-form .inspector-field { margin-top: 14px; }
+.connection-form .inspector-field > span:first-child { color: #756386; }
+.connection-form-actions { display: grid; grid-template-columns: .7fr 1fr; gap: 8px; margin-top: 14px; }
+.connection-form-actions .step-ask, .connection-form-actions .step-save { margin: 0; }
+.connection-empty-inputs { margin: 0; color: #85728e; font-size: 11px; line-height: 1.6; }
+.workflow-input-heading { margin-top: 20px; color: #5a4d68; font-size: 11px; }
+.workflow-input-list { display: flex; flex-direction: column; gap: 7px; }
+.workflow-input-list .step-input-row { padding: 8px 9px; border: 1px solid #e8e2ed; border-radius: 7px; color: #756386; background: #faf9fc; }
+.workflow-input-list .step-input-row > span { flex: 1; min-width: 0; }
+.workflow-input-list .step-input-row > svg { flex-shrink: 0; }
+.workflow-input-list .step-input-row button { display: grid; place-items: center; padding: 4px; }
+
 /* History actions are siblings of the selection button, including on touch. */
 .history-view-actions { display: flex; align-items: center; gap: 4px; }
 .chat-history .history-archive-toggle { display: grid; place-items: center; padding: 8px; color: var(--muted); border: 0; background: transparent; box-shadow: none; }

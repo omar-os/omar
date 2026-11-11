@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { forgetWorkflowCache, saveWorkflowName, useWorkflowNames } from "./lib/workflow-names";
 import { WorkflowIcon } from "./workflow-icon";
 import { WorkflowSortMenu, type WorkflowSort } from "./workflow-sort-menu";
@@ -33,7 +33,7 @@ export function SidebarIcon({ direction }: { direction: "open" | "close" }) {
   );
 }
 
-export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, readOnly = false, offline = false, onClose, onSelect, onSwitchingChange }: {
+export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, readOnly = false, offline = false, settings, onClose, onSelect, onSwitchingChange }: {
   serveUrl: string;
   activeId: string;
   mobile: boolean;
@@ -44,6 +44,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
   /** The runtime is down, which the studio already says: keep the last list,
       dimmed, rather than a second error. It reloads once the runtime is back. */
   offline?: boolean;
+  settings: ReactNode;
   onClose: () => void;
   onSelect: (conversation: ConversationSummary) => void;
   onSwitchingChange: (switching: boolean) => void;
@@ -245,6 +246,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
       ))}
     </ul>
     {loading ? <p role="status">Loading workflows…</p> : visible.length === 0 && !error ? <p>{showArchive ? "No archived workflows." : "No workflows found."}</p> : null}
+    {settings}
   </>;
   return mobile ? (
     <dialog id="chat-history" ref={dialogRef} className="chat-history history-drawer" aria-label="Chat history" onCancel={onClose} onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>

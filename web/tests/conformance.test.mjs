@@ -28,6 +28,7 @@ import test, { after, before, describe } from "node:test";
 // Node's global WebSocket cannot set an Origin, which is the whole point here.
 import WebSocket from "ws";
 
+import { readConnectionPrompt } from "../app/lib/task-connections.ts";
 import { startFakeServe } from "./fake-serve.mjs";
 
 // The runtime is a sibling directory now, not a sibling checkout: these are
@@ -242,6 +243,17 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     }
   });
 
+  test("a connection saved from a chat is reusable through the runtime catalog", async () => {
+    const connection = {id:"conformance-api",name:"Test API",type:"http",method:"GET",url:"https://example.com/items",auth:{type:"bearer",variable:"TEST_API_TOKEN"}};
+    for (const daemon of [real, fake]) {
+      const {active_id} = await (await fetch(`${daemon.url}/v1/chats`)).json();
+      const response = await fetch(`${daemon.url}/chats/${active_id}/v1/task-integrations`, post({changes:[{connection}]}));
+      assert.equal(response.status, 200);
+      const catalog = await (await fetch(`${daemon.url}/v1/task-integrations`)).json();
+      assert.deepEqual(catalog.connections, [connection]);
+    }
+  });
+
   test("an empty run listing has the same shape", async () => {
     const { real: r, fake: f } = await both("/v1/runs");
     assert.equal(r.status, 200);
@@ -415,6 +427,54 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
       assert.ok(ids.has(edge.source), `edge ${edge.id} source resolves`);
       assert.ok(ids.has(edge.target), `edge ${edge.id} target resolves`);
     }
+  });
+
+  test("a proposed workflow binds Settings integrations to the requested task before review", async () => {
+    const { serve: { token } } = JSON.parse(
+      await readFile(join(real.stateDir, "mcp/ea-0/context.json"), "utf8"),
+    );
+    const api = (route, body) => fetch(real.url + route, post(body));
+    const http = {
+      id: "draft-api", name: "Library API", type: "http", method: "GET",
+      url: "https://example.test/items",
+      auth: { type: "api-key", header: "X-Library-Key", variable: "LIBRARY_KEY" },
+    };
+    const mcp = { id: "draft-index", name: "Library index", type: "mcp", server: "project-index" };
+    const hook = {
+      id: "draft-hook", name: "Library updates", type: "webhook", method: "POST",
+      url: "https://example.test/hook", auth: { type: "none" },
+    };
+    const saved = [http, hook, mcp];
+    const changes = saved.map(connection => ({ connection }));
+    assert.equal((await api("/v1/task-integrations", { changes })).status, 200);
+    const search = "/v1/agent/integrations";
+    assert.equal((await api(search, { query: "Library", token: "" })).status, 403);
+    const matches = await (await api(search, { token, query: "LiBraRy" })).json();
+    assert.deepEqual(matches.integrations, saved.map(({ id, name, type }) => ({ id, name, type })));
+    assert.equal(matches.more, false);
+
+    const program = STUB_FLOW.replace("Draft something about $(topic).", "Read $(topic).[[integrations:read]]");
+    const propose = (bindings, source = program) => api("/v1/agent/proposals", {
+      token, program: source, task_integrations: bindings, summary: "Use library", inputs: { "flow.topic": "news" },
+    });
+    const before = (await (await fetch(real.url + "/v1/chat")).json()).messages.length;
+    for (const bindings of [{}, { read: ["no-such-id"] }, { read: [http.id, http.id] }, { wrong: [http.id] }]) {
+      assert.equal((await propose(bindings)).status, 400);
+    }
+    const inComment = program.replace("[[integrations:read]]", "") + '\n// [[integrations:read]]"';
+    assert.equal((await propose({ read: [http.id] }, inComment)).status, 400);
+    assert.equal((await (await fetch(real.url + "/v1/chat")).json()).messages.length, before);
+
+    const response = await propose({ read: [http.id, mcp.id] });
+    assert.equal(response.status, 202, await response.text());
+    const { design } = (await (await fetch(real.url + "/v1/chat")).json()).messages.at(-1);
+    const [reader, editor] = design.preview.reactions;
+    assert.deepEqual(readConnectionPrompt(reader.prompt).connections, [http, mcp]);
+    assert.deepEqual(readConnectionPrompt(editor.prompt).connections, []);
+    assert.doesNotMatch(design.program, /\[\[integrations:|draft-hook/);
+    assert.match(design.program, /LIBRARY_KEY/);
+    const catalog = await (await fetch(real.url + "/v1/task-integrations")).json();
+    assert.deepEqual(catalog.connections.filter(entry => entry.id.startsWith("draft-")), saved);
   });
 
   test("a run that cannot start reports failure through the registry", async () => {
