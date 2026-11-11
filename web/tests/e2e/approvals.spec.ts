@@ -115,3 +115,21 @@ test("mobile review stays readable and multiple pending requests remain reachabl
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
+
+test("100 pending approvals share a count and can be searched inside one dialog", async ({page}) => {
+  const requests = Array.from({length:100}, (_, i) => request({
+    request_id:"request-"+i, agent_id:"agent::"+i, agent_name:"Worker "+i, tool_name:"Command execution",
+  }));
+  fake.setApprovals(feed(requests));
+  await open(page);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.getByRole("button",{name:"100 approvals needed"}).click();
+  const panel=page.getByRole("dialog",{name:"Approval required"});
+  const find=panel.getByLabel("Find a request");
+  await find.fill("Worker 99");
+  await expect(panel.getByRole("navigation").getByRole("button")).toHaveCount(1);
+  await panel.getByRole("button",{name:"Review request: Worker 99 · Command execution"}).click();
+  await expect(panel.locator("header")).toContainText("Worker 99");
+  await expect(panel.getByRole("button",{name:"Open agent terminal"})).toBeInViewport();
+  await expect(page.getByRole("dialog")).toHaveCount(1);
+});

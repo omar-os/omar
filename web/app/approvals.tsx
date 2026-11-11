@@ -60,6 +60,11 @@ export function ApprovalPanel({ request, feed, onClose, onTerminal, onReview }: 
   onReview: (request: PendingApproval) => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const [query, setQuery] = useState("");
+  const others = feed.snapshot.requests.filter(r => r.request_id !== request.request_id);
+  const searchable = others.length > 8;
+  const search = searchable ? query.trim().toLowerCase() : "";
+  const matches = others.filter(r => [r.agent_name, r.tool_name, r.summary].some(value => value.toLowerCase().includes(search)));
   const pending = feed.snapshot.requests.some((r) => r.request_id === request.request_id);
   const result = feed.snapshot.recent.find((r) => r.request.request_id === request.request_id);
   const monitor = feed.snapshot.monitors.find((m) => m.agent_id === request.agent_id && m.run_id === request.run_id);
@@ -80,7 +85,11 @@ export function ApprovalPanel({ request, feed, onClose, onTerminal, onReview }: 
         {request.command ? <><dt>Command</dt><dd><pre>{request.command}</pre></dd></> : null}
         {request.cwd ? <><dt>Working directory</dt><dd>{request.cwd}</dd></> : null}
       </dl>
-      {feed.snapshot.requests.length > 1 ? <nav aria-label="Other approval requests">{feed.snapshot.requests.filter((r) => r.request_id !== request.request_id).map((r) => <button className="approval-badge" key={r.request_id} onClick={() => onReview(r)}>Review request: {r.agent_name} · {r.tool_name}</button>)}</nav> : null}
+      {others.length > 0 && <nav aria-label="Other approval requests">
+        {searchable && <label>Find a request<input type="search" value={query} onChange={e => setQuery(e.target.value)} /></label>}
+        <div className="approval-queue">{matches.map(r => <button type="button" className="approval-badge" key={r.request_id} onClick={() => onReview(r)}>Review request: {r.agent_name} · {r.tool_name}</button>)}</div>
+        {matches.length === 0 && <p>No matching requests.</p>}
+      </nav>}
       <p className="approval-help">Review and respond in this agent’s terminal. Opening it does not approve or dismiss the request.</p>
       <button type="button" className="primary" onClick={onTerminal}>Open agent terminal</button>
     </dialog>

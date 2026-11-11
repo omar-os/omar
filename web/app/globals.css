@@ -1065,6 +1065,8 @@ h2 {
 .approval-panel pre { white-space: pre-wrap; margin: 0; padding: 12px; background: #f2ece4; border-radius: 6px; font-size: 12px; }
 .approval-waiting { color: #87420a; font-size: 13px; }
 .approval-summary { font-size: 16px; line-height: 1.5; overflow-wrap: anywhere; }
+.approval-queue { max-height: min(12rem, 25dvh); overflow-y: auto; overscroll-behavior: contain; }
+.approval-panel nav input { display: block; width: 100%; padding: .4rem; border: 1px solid currentColor; border-radius: .3rem; }
 .approval-help, .approval-connection { margin-top: 16px; font-size: 13px; line-height: 1.5; }
 .approval-connection { border-left: 3px solid #a55a1e; padding-left: 10px; }
 .approval-panel .primary { width: 100%; margin-top: 16px; border: 1px solid #6650a3; border-radius: 7px; padding: 10px 14px; background: #7154b9; color: white; font-size: 14px; cursor: pointer; }

@@ -15,7 +15,6 @@ use std::thread;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(750);
-const CAPTURE_LINES: i32 = 50;
 const ACTIVE_PROMPT_TAIL_LINES: usize = 18;
 
 #[derive(Clone, Copy)]
@@ -56,10 +55,10 @@ impl ApprovalObserver for TerminalObserver {
         let client = TmuxClient::new("");
         let mut tracker = Tracker::default();
         while sink.active() {
-            match client.capture_pane_plain(&self.session, CAPTURE_LINES) {
+            match client.visible_pane(&self.session) {
                 Ok(pane) => {
                     sink.connection(ApprovalConnection::Connected);
-                    tracker.reconcile(&sink, detect(self.backend, &pane));
+                    tracker.reconcile(&sink, detect(self.backend, pane.trim_end()));
                 }
                 Err(_) => sink.connection(ApprovalConnection::Disconnected),
             }
