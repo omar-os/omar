@@ -2308,17 +2308,41 @@ fn start_connect(context: &Context_, name: &str, verb: &str, flags: &str) -> (u1
         "{} {verb} {name} {flags} || {{ printf '\\nPress Enter to close.'; read _; }}",
         crate::manager::shell_single_quote(&omar.display().to_string())
     );
-    let started = match client.has_session(&session) {
-        Ok(true) => Ok(()),
-        _ => client.new_session(&session, &command, None),
-    };
-    match started {
+    match sign_in_session(
+        &client,
+        &session,
+        format!("{verb} {flags}").trim(),
+        &command,
+    ) {
         Ok(()) => (
             200,
             json!({"session": session, "terminal": format!("{CONNECT_PREFIX}{name}{TERMINAL_SUFFIX}")}),
         ),
         Err(error) => (502, json!({"error": format!("{error:#}")})),
     }
+}
+
+/// Names, in a sign-in session's environment, what it was started to do.
+const SIGN_IN_ACTION_VAR: &str = "OMAR_SIGN_IN_ACTION";
+
+/// Start `command` in `session`, or leave the one there running: reopening
+/// the page reattaches to a sign-in under way. One started for another
+/// action, say a replace closed midway before a disconnect, is ended first;
+/// its terminal would otherwise stand in for the new one.
+fn sign_in_session(client: &TmuxClient, session: &str, action: &str, command: &str) -> Result<()> {
+    if client.has_session(session).unwrap_or(false) {
+        if client.session_env(session, SIGN_IN_ACTION_VAR).as_deref() == Some(action) {
+            return Ok(());
+        }
+        client.kill_session_tree(session)?;
+    }
+    client.new_session_with_backend_env(
+        session,
+        command,
+        None,
+        None,
+        &[(SIGN_IN_ACTION_VAR.to_string(), action.to_string())],
+    )
 }
 
 /// Whether `name`'s sign-in works, by its CLI answering a test prompt: what
@@ -7077,6 +7101,34 @@ while True:
             tungstenite::protocol::frame::coding::CloseCode::Normal
         );
         assert_eq!(close.reason, "ended");
+    }
+
+    #[test]
+    fn a_sign_in_session_is_reused_only_for_the_same_action() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let prefix = crate::ea::ea_prefix(0, &Config::default().dashboard.session_prefix);
+        let client = TmuxClient::new(prefix.clone());
+        let session = format!("{prefix}signinaction");
+        let _ = client.kill_session(&session);
+        let pid = || client.get_pane_pid(&session).unwrap();
+
+        sign_in_session(&client, &session, "connect --replace", "sleep 30").unwrap();
+        let replacing = pid();
+        // The page reopened: the same sign-in, still under way.
+        sign_in_session(&client, &session, "connect --replace", "sleep 30").unwrap();
+        assert_eq!(pid(), replacing);
+        // Closed midway, then a disconnect: that one runs instead.
+        sign_in_session(&client, &session, "disconnect", "sleep 30").unwrap();
+        let disconnecting = pid();
+        assert_ne!(disconnecting, replacing);
+        assert_eq!(
+            client.session_env(&session, SIGN_IN_ACTION_VAR).as_deref(),
+            Some("disconnect")
+        );
+        let _ = client.kill_session(&session);
     }
 
     #[test]
