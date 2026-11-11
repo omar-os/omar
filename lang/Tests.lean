@@ -692,6 +692,58 @@ def testSchemaTypeResolution : IO Unit := do
     | .ok _ => throw (IO.userError "accepted unknown, incompatible, or inline schema type")
   IO.println "schema type resolution tests passed"
 
+def testTaskMetadata : IO Unit := do
+  let source := "team Tasks[writer : Codex] {
+    input request : string
+    action draft : string
+    output result : string
+    // @title Draft campaign script
+    // @desc Turn the brief into a script for review.
+    task writer(request) -> draft within(30s)
+      \"Draft $(request)\"
+    // @title Save approved script
+    // @desc Copy the script to the output.
+    reaction(draft) -> result
+      {= result = draft; =}
+  }
+  team Wrapper { nested = Tasks() }
+  main NamedTasks { first = Tasks() second = Wrapper() }"
+  match lex source >>= parse "ignored" with
+  | .error message => throw (IO.userError s!"task metadata: {message}")
+  | .ok program => do
+      assertEqual "metadata reaches nested instances" program.reactions.size 4
+      for reaction in program.reactions do
+        assertEqual "task has description" reaction.description.isSome true
+        assertEqual "identity remains generated" (mentions reaction.id "reaction.") true
+        if reaction.body.isNone then
+          assertEqual "title trimmed" (reaction.title.getD "") "Draft campaign script"
+          assertEqual "prompt is not task copy" (mentions reaction.prompt "Draft $(") true
+          assertEqual "deadline preserved" (reaction.within.getD 0) 30000000000
+        else
+          assertEqual "code task title" (reaction.title.getD "") "Save approved script"
+      let bytecode := compile program
+      assertEqual "bytecode has task title" (mentions bytecode "\"title\": \"Draft campaign script\"") true
+      let legacy := String.intercalate "\n" <|
+        (source.splitOn "\n").filter fun line => !(line.trimAscii.toString.startsWith "//")
+      match lex legacy >>= parse "ignored" with
+      | .error message => throw (IO.userError message)
+      | .ok old =>
+          assertEqual "metadata leaves execution bytecode unchanged"
+            (compile { program with reactions := program.reactions.map fun r =>
+              { r with title := none, description := none } }) (compile old)
+  let annotatedProgram := fun doc => "team T[a : Codex] { input x : string output y : string\n" ++
+    doc ++ "\ntask a(x) -> y \"Go\" } main { t = T() }"
+  for annotation in ["// @title", "// @unknown X", "// @desc X\n// @desc Y"] do
+    match compileSource "InvalidTask" (annotatedProgram annotation) with
+    | .ok _ => throw (IO.userError s!"invalid task metadata accepted: {annotation}")
+    | .error _ => pure ()
+  for (tag, field, value) in [("// @title Title", "title", "Title"),
+      ("// @desc Take $(x)\n// literally", "description", "Take $(x) literally")] do
+    match compileSource "Documented" (annotatedProgram tag) with
+    | .error e => throw (IO.userError e)
+    | .ok result => assertEqual "single literal field" (mentions result
+        (s!"\"{field}\": \"{value}\"")) true
+
 /-- The plan `omarc --diff` writes, as one string per instruction. -/
 def mutationPlan (old new : String) (newName : String := "Relay") : Except String (Array String) := do
   let plan ← compileDiffSourcesWithSchemas "Relay" old #[] newName new #[]
@@ -872,6 +924,8 @@ def main : IO UInt32 := do
     testCodeTerminator
     testExternalSchemas
     testSchemaTypeResolution
+
+    testTaskMetadata
     testMutation
     testContracts
     testModels

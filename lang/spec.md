@@ -179,6 +179,14 @@ not accepted in `main`.
   or port `b` is present. If both are present at the same tag, the task is
   invoked once with both values.
 
+A contiguous block of line comments immediately above a task or reaction may
+contain `// @title <text>` and `// @desc <text>`. Each is independently
+optional, including in assistant proposals. Subsequent comment lines continue
+a description until another tag or the end of the block. Values are literal,
+trimmed, nonempty, and limited to 80 and 1200 characters respectively.
+Unknown and duplicate tags are errors. An unattached annotation emits a warning.
+The diagram reads the resulting bytecode fields `title` and `description`.
+
 The task's prompt is delivered to the agent. `$(name)` interpolates a trigger
 value or a state of the task's own team, and may reference nothing else: the
 compiler rejects any other name. If a declared trigger is not present in an

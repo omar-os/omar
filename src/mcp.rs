@@ -2787,7 +2787,7 @@ fn ea_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "omar_propose_design",
-            "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares. While a workflow is running or paused, a program that keeps its `main` name is a change to that run, which the operator applies live.",
+            "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares. While a workflow is running or paused, a program that keeps its `main` name is a change to that run, which the operator applies live. Prefer optional // @title and // @desc comments directly above the task or reaction to explain its work and result.",
             json!({
                 "type":"object",
                 "properties":{

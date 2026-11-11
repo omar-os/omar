@@ -16,6 +16,7 @@ inductive Token where
   /-- A `{= ... =}` body, captured as raw source. Rust is lexed by rustc, not
       here, so nothing inside is interpreted. -/
   | code : String -> Token
+  | annotation : Option String -> Option String -> Token
   | sym : String -> Token
   deriving Repr, BEq
 
@@ -184,11 +185,53 @@ private partial def readCharLiteral (acc : List Char) :
 
 end
 
+/-- Read consecutive line comments, retaining the boundary after the block. -/
+private partial def commentBlock (rest : List Char) (lines : Array String := #[]) :
+    Array String × List Char := Id.run do
+  let (line, tail) := takeWhile (· != '\n') rest
+  let lines := lines.push (String.ofList line).trimAscii.toString
+  let (_, next) := takeWhile (fun c => c == ' ' || c == '\t' || c == '\r') (tail.drop 1)
+  match next with
+  | '/' :: '/' :: more => return commentBlock more lines
+  | _ => return (lines, next)
+
+private def annotationFields (lines : Array String) : Except String (Option String × Option String) := do
+  let mut title : Option String := none
+  let mut description : Option String := none
+  let mut continuing := false
+  for line in lines do
+    if line.startsWith "@" then
+      let (tag, rest) := takeWhile (fun c => !c.isWhitespace) line.toList
+      let value := (String.ofList rest).trimAscii.toString
+      continuing := false
+      match String.ofList tag with
+      | "@title" =>
+        if title.isSome || value.isEmpty || value.length > 80 then
+          throw "expected one @title with 1–80 characters"
+        title := some value
+      | "@desc" =>
+        if description.isSome then throw "duplicate @desc"
+        description := some value
+        continuing := true
+      | other => throw s!"unknown documentation tag '{other}'"
+    else if continuing then
+      description := some ((description.getD "" ++ " " ++ line).trimAscii.toString)
+  if let some value := description then
+    if value.isEmpty || value.length > 1200 then throw "expected 1–1200 characters in @desc"
+  return (title, description)
+
 private partial def lexChars : List Char -> Except String (List Token)
   | [] => pure []
-  | '/' :: '/' :: rest =>
-      let (_, tail) := takeWhile (fun c => c != '\n') rest
-      lexChars tail
+  | '/' :: '/' :: rest => do
+      let (lines, tail) := commentBlock rest
+      let (title, description) ← annotationFields lines
+      let tokens ← lexChars tail
+      if title.isNone && description.isNone then return tokens
+      let (keyword, _) := takeWhile isWordRest tail
+      if ["task", "reaction"].contains (String.ofList keyword) then
+        return Token.annotation title description :: tokens
+      dbg_trace "warning: documentation annotation is not followed by a task or reaction"
+      return tokens
   | '/' :: '*' :: rest => do
       lexChars (← skipBlockComment 1 rest)
   | '-' :: '>' :: rest => do
@@ -290,6 +333,9 @@ structure Reaction where
   effects : Array String
   contract : String
   prompt : String
+  /-- Display metadata, separate from the execution identity and prompt. -/
+  title : Option String := none
+  description : Option String := none
   /-- A Rust body, when the reaction is code rather than a prompt. The two are
       exclusive: whichever the source gave, the other is empty. -/
   body : Option String := none
@@ -519,6 +565,7 @@ private def kindName : PortKind -> String
   | .action => "action"
 
 private def tokenSource : Token -> String
+  | .annotation _ _ => "<annotation>"
   | .word value => value
   | .nat value => toString value
   | .duration value => s!"{value}ns"
@@ -625,11 +672,14 @@ private partial def parseDeclarations
     (connections : Array Connection)
     (reactions : Array Reaction)
     (instances : Array Instance)
-    (states : Array StateVar) :
-    List Token ->
+    (states : Array StateVar) (tokens : List Token) :
       Except String
         (Array Port × Array Timer × Array Connection × Array Reaction × Array Instance ×
-          Array StateVar × List Token)
+          Array StateVar × List Token) := do
+  let (title, description, tokens) := match tokens with
+    | Token.annotation title description :: rest => (title, description, rest)
+    | _ => (none, none, tokens)
+  match tokens with
   | Token.sym "}" :: rest =>
       pure (ports, timers, connections, reactions, instances, states, rest)
   -- `a = A();` ends with an optional semicolon; it separates declarations and
@@ -718,7 +768,7 @@ private partial def parseDeclarations
       let contract := String.intercalate " " (contractTokens.map tokenSource)
       let reaction := {
         id := s!"reaction.{reactionIndex}"
-        agent, triggers, effects, contract, prompt, within
+        agent, triggers, effects, contract, prompt, within, title, description
       }
       parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
   -- `task` asks an agent, `reaction` just runs, so a reaction names none.
@@ -743,7 +793,8 @@ private partial def parseDeclarations
       let contract := String.intercalate " " (contractTokens.map tokenSource)
       let reaction := {
         id := s!"reaction.{reactionIndex}"
-        agent := "", triggers, effects, contract, prompt := "", body := some body, within
+        agent := "", triggers, effects, contract, prompt := "", body := some body, within,
+        title, description
       }
       parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
   | Token.word first :: rest => do
@@ -1290,7 +1341,8 @@ def instructionTexts (program : Program) : Array String :=
       ("effects", jsonStringArray reaction.effects),
       ("contract", toJson reaction.contract),
       ("prompt", toJson reaction.prompt)
-    ] ++ (match reaction.body with
+    ] ++ reaction.title.toList.map (fun t => ("title", toJson t)) ++
+      reaction.description.toList.map (fun d => ("description", toJson d)) ++ (match reaction.body with
       | some body => [("body", toJson body)]
       | none => []) ++ match reaction.within with
       | some within => [("within", toJson within)]
