@@ -54,10 +54,27 @@ export function connectTerminalUrl(serveUrl: string, backend: string): string {
 export async function startConnect(
   serveUrl: string,
   backend: string,
+  replace = false,
 ): Promise<void> {
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(
     `${base}/v1/backends/${encodeURIComponent(backend)}/connect`,
+    { method: "POST", body: JSON.stringify({ replace }) },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+}
+
+/**
+ * Starts `omar disconnect <backend>`, the CLI's own sign-out, in the same
+ * terminal a sign-in uses.
+ */
+export async function startDisconnect(
+  serveUrl: string,
+  backend: string,
+): Promise<void> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/backends/${encodeURIComponent(backend)}/disconnect`,
     { method: "POST", body: "{}" },
   );
   if (!response.ok) throw new Error(await readError(response));
@@ -785,6 +802,7 @@ export async function fetchConversations(
 ): Promise<{
   active_id: string;
   conversations: ConversationSummary[];
+  removed_ids?: string[];
 }> {
   const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/chats`, {
     signal,
@@ -807,4 +825,26 @@ export async function selectConversation(
   });
   if (!response.ok) throw new Error(await readError(response));
   return response.json();
+}
+
+export async function fetchArchivedConversations(serveUrl: string, signal?: AbortSignal): Promise<ConversationSummary[]> {
+  const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/chats/archived`, { signal });
+  if (!response.ok) throw new Error(await readError(response));
+  return (await response.json()).conversations;
+}
+
+export async function setConversationArchived(serveUrl: string, id: string, archived: boolean): Promise<Awaited<ReturnType<typeof fetchConversations>>> {
+  const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/chats/${encodeURIComponent(id)}/${archived ? "archive" : "restore"}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+  });
+  if (!response.ok) throw new Error(await readError(response));
+  return response.json();
+}
+
+/** Called only after the operator confirms the named archived workflow. */
+export async function deleteConversation(serveUrl: string, id: string): Promise<void> {
+  const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/chats/${encodeURIComponent(id)}/delete`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm: true }),
+  });
+  if (!response.ok) throw new Error(await readError(response));
 }

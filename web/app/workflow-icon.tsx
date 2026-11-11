@@ -13,7 +13,10 @@ type IconName =
   | "search"
   | "send"
   | "sparkles"
-  | "workflow";
+  | "workflow"
+  | "trash"
+  | "archive"
+  | "back";
 
 export function WorkflowIcon({ name, size = 18 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, ReactNode> = {
@@ -29,6 +32,9 @@ export function WorkflowIcon({ name, size = 18 }: { name: IconName; size?: numbe
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></>,
     send: <><path d="m21 3-7 18-4-7-7-4 18-7Z" /><path d="m10 14 4-4" /></>,
     sparkles: <><path d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2L12 3Z" /><path d="m18 14 .7 2.3L21 17l-2.3.7L18 20l-.7-2.3L15 17l2.3-.7L18 14Z" /></>,
+    archive: <><rect x="3" y="3" width="18" height="5" rx="1" /><path d="M5 8v12h14V8M10 12h4" /></>,
+    back: <path d="M19 12H5m5-5-5 5 5 5" />,
+    trash: <><path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6M14 11v6" /></>,
     workflow: <><rect x="3" y="4" width="7" height="6" rx="2" /><rect x="14" y="14" width="7" height="6" rx="2" /><path d="M10 7h4a3 3 0 0 1 3 3v4M7 10v2a5 5 0 0 0 5 5h2" /></>,
   };
 

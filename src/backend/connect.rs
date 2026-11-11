@@ -13,15 +13,17 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::Stylize;
 use crossterm::{cursor, terminal, QueueableCommand};
 
-use super::{connection, Backend, Connection};
+use super::{connection, Backend, Connection, SignInHome};
 
-/// Connect `backend` on this machine.
-pub fn host(backend: &dyn Backend) -> Result<()> {
-    connect(backend)
+/// Connect `backend` on this machine; `replace` signs in again even when
+/// its sign-in works.
+pub fn host(backend: &dyn Backend, replace: bool) -> Result<()> {
+    connect(backend, replace)
 }
 
-/// `omar connect` on a terminal: pick a backend with the arrow keys, connect
-/// or disconnect it, and come back to the list for the next one.
+/// `omar connect` on a terminal: pick a backend with the arrow keys, connect,
+/// replace or disconnect its sign-in, and come back to the list for the next
+/// one.
 pub fn wizard() -> Result<()> {
     let mut selected = 0;
     loop {
@@ -32,9 +34,9 @@ pub fn wizard() -> Result<()> {
         stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
         let outcome = match pick(&statuses, selected)? {
             Choice::Quit => return Ok(()),
-            Choice::Connect(index) => {
+            Choice::Connect(index, replace) => {
                 selected = index;
-                connect(statuses[index].0)
+                connect(statuses[index].0, replace)
             }
             Choice::Disconnect(index) => {
                 selected = index;
@@ -69,9 +71,17 @@ impl Drop for RawMode {
 }
 
 enum Choice {
-    Connect(usize),
+    /// Connect; `true` replaces a sign-in it already has.
+    Connect(usize, bool),
     Disconnect(usize),
     Quit,
+}
+
+/// What the picker asks before acting on a connected backend.
+#[derive(Clone, Copy, PartialEq)]
+enum Ask {
+    Replace,
+    SignOut,
 }
 
 /// What to do next. Drawn inline, so what each sign-in prints stays in the
@@ -80,7 +90,7 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
     let _raw = RawMode::enable()?;
     let mut stdout = std::io::stdout();
     let mut selected = selected.min(statuses.len().saturating_sub(1));
-    let mut confirming = false;
+    let mut confirming = None;
     // How wide each drawn line was; a resize redraws.
     let mut drawn: Vec<usize> = Vec::new();
     loop {
@@ -97,13 +107,17 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        // Only `y` answers the sign-out question; any other key drops it.
-        let answering = std::mem::take(&mut confirming);
+        // Only `y` answers a question; any other key drops it.
+        let answering = confirming.take();
+        let connected = matches!(statuses[selected].1, Connection::Connected { .. });
         let choice = match key.code {
-            KeyCode::Char('y') if answering => Choice::Disconnect(selected),
-            _ if answering => continue,
+            KeyCode::Char('y') if answering == Some(Ask::Replace) => {
+                Choice::Connect(selected, true)
+            }
+            KeyCode::Char('y') if answering == Some(Ask::SignOut) => Choice::Disconnect(selected),
+            _ if answering.is_some() => continue,
             KeyCode::Char('d') => {
-                confirming = matches!(statuses[selected].1, Connection::Connected { .. });
+                confirming = connected.then_some(Ask::SignOut);
                 continue;
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -114,7 +128,12 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
                 selected = (selected + 1) % statuses.len();
                 continue;
             }
-            KeyCode::Enter => Choice::Connect(selected),
+            // A working sign-in is only replaced once asked.
+            KeyCode::Enter if connected => {
+                confirming = Some(Ask::Replace);
+                continue;
+            }
+            KeyCode::Enter => Choice::Connect(selected, false),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Choice::Quit,
             KeyCode::Esc | KeyCode::Char('q') => Choice::Quit,
             _ => continue,
@@ -122,7 +141,12 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
         // Leave one line behind saying what was picked.
         up_over(&mut stdout, &drawn)?;
         let summary = match choice {
-            Choice::Connect(index) => format!("Connecting {}", statuses[index].0.kind().name()),
+            Choice::Connect(index, false) => {
+                format!("Connecting {}", statuses[index].0.kind().name())
+            }
+            Choice::Connect(index, true) => {
+                format!("Replacing {}'s sign-in", statuses[index].0.kind().name())
+            }
             Choice::Disconnect(index) => {
                 format!("Disconnecting {}", statuses[index].0.kind().name())
             }
@@ -170,9 +194,13 @@ fn visible_width(line: &str) -> usize {
     width
 }
 
-/// The picker's lines, `selected` marked; `confirming` asks before signing
-/// it out.
-fn menu(statuses: &[(&dyn Backend, Connection)], selected: usize, confirming: bool) -> Vec<String> {
+/// The picker's lines, `selected` marked; `confirming` asks before replacing
+/// or signing out its sign-in.
+fn menu(
+    statuses: &[(&dyn Backend, Connection)],
+    selected: usize,
+    confirming: Option<Ask>,
+) -> Vec<String> {
     let mut lines = vec![format!(
         "{} Connect an agent backend  {}",
         "◆".cyan(),
@@ -191,11 +219,11 @@ fn menu(statuses: &[(&dyn Backend, Connection)], selected: usize, confirming: bo
             format!("{} {} {}{label}", "│".cyan(), "○".dim(), name.dim())
         });
     }
-    lines.push(if confirming {
-        let name = statuses[selected].0.kind().name();
-        format!("{} Sign {name} out? {}", "└".cyan(), "y / n".dim())
-    } else {
-        format!("{}", "└".cyan())
+    let name = statuses[selected].0.kind().name();
+    lines.push(match confirming {
+        Some(Ask::Replace) => format!("{} Replace {name}'s sign-in? {}", "└".cyan(), "y / n".dim()),
+        Some(Ask::SignOut) => format!("{} Sign {name} out? {}", "└".cyan(), "y / n".dim()),
+        None => format!("{}", "└".cyan()),
     });
     lines
 }
@@ -219,7 +247,7 @@ fn shell_path() -> OsString {
 }
 
 /// Install `backend` if needed and sign it in.
-fn connect(backend: &dyn Backend) -> Result<()> {
+fn connect(backend: &dyn Backend, replace: bool) -> Result<()> {
     let name = backend.kind().name();
     let mut status = connection::connection(backend);
     if status == Connection::NotInstalled {
@@ -237,12 +265,19 @@ fn connect(backend: &dyn Backend) -> Result<()> {
     // Stored is not working: a rejected key still reads as connected, and
     // signing in again is how it is replaced.
     let mut checked = false;
-    if matches!(status, Connection::Connected { .. }) {
+    if matches!(status, Connection::Connected { .. }) && !replace {
         match check(backend) {
             Ok(()) => checked = true,
             Err(error) => println!("{error}\nSigning {name} in again."),
         }
     }
+    // Lives until the end, so the status and check below see the new home.
+    let staged = match backend.sign_in_home() {
+        Some(home) if replace && status != Connection::SignedOut => {
+            Some(Staged::begin(home, name)?)
+        }
+        _ => None,
+    };
     if !checked {
         let login = backend
             .login(headless())
@@ -267,10 +302,16 @@ fn connect(backend: &dyn Backend) -> Result<()> {
                     anyhow::anyhow!("{error}; run `omar connect {name}` to sign in again")
                 })?;
             }
+            if let Some(staged) = &staged {
+                staged.keep(name)?;
+            }
             println!(
                 "✓ {name} connected{}",
                 via.map(|v| format!(" ({v})")).unwrap_or_default()
             );
+            if checked {
+                println!("To sign in another way: omar connect {name} --replace");
+            }
         }
         Connection::Unknown { reason } => {
             bail!("could not confirm {name} is signed in{failed}: {reason}")
@@ -283,6 +324,68 @@ fn connect(backend: &dyn Backend) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A replace signing in under a fresh home, for a CLI whose login drops the
+/// old sign-in as it starts: the old one stays until [`Staged::keep`]. The
+/// CLI finds the fresh home through its environment variable, set for this
+/// process and every command it starts until dropped.
+struct Staged {
+    home: SignInHome,
+    fresh: PathBuf,
+    previous: Option<OsString>,
+}
+
+impl Staged {
+    fn begin(home: SignInHome, name: &str) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let fresh = crate::sessions::state_root().join("sign-in").join(name);
+        // Left by a replace that was killed.
+        let _ = std::fs::remove_dir_all(&fresh);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&fresh)
+            .with_context(|| format!("cannot make {}", fresh.display()))?;
+        let previous = std::env::var_os(home.var);
+        std::env::set_var(home.var, &fresh);
+        println!("Your current {name} sign-in stays until the new one works.");
+        Ok(Staged {
+            home,
+            fresh,
+            previous,
+        })
+    }
+
+    /// Put the new sign-in in place of the old one.
+    fn keep(&self, name: &str) -> Result<()> {
+        for file in self.home.files {
+            ensure!(
+                self.fresh.join(file).is_file(),
+                "{name} signed in, but not into {file}, so OMAR cannot move it; your earlier sign-in is unchanged"
+            );
+        }
+        std::fs::create_dir_all(&self.home.dir)?;
+        for file in self.home.files {
+            // Copied beside the old file, then renamed over it in one step.
+            let next = self.home.dir.join(format!("{file}.omar-new"));
+            std::fs::copy(self.fresh.join(file), &next)
+                .with_context(|| format!("cannot write {}", next.display()))?;
+            std::fs::rename(&next, self.home.dir.join(file))
+                .with_context(|| format!("cannot replace {file} in {}", self.home.dir.display()))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.home.var, value),
+            None => std::env::remove_var(self.home.var),
+        }
+        let _ = std::fs::remove_dir_all(&self.fresh);
+    }
 }
 
 /// `connection::check_sign_in`, said as it happens; the error names the
@@ -299,7 +402,7 @@ fn check(backend: &dyn Backend) -> Result<(), String> {
 }
 
 /// Have `backend`'s CLI sign itself out, then check that it took.
-fn disconnect(backend: &dyn Backend) -> Result<()> {
+pub fn disconnect(backend: &dyn Backend) -> Result<()> {
     let name = backend.kind().name();
     let logout = backend
         .logout()
@@ -461,7 +564,7 @@ mod tests {
             .iter()
             .map(|kind| (crate::backend::of(*kind), Connection::SignedOut))
             .collect();
-        menu(&statuses, 0, false)
+        menu(&statuses, 0, None)
             .iter()
             .map(|line| visible_width(line))
             .collect()
