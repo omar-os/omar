@@ -35,6 +35,7 @@ use crate::properties::{ProofProblem, PropertyVerdict};
 use crate::serve::{
     ChatMessage, ChatRole, MutationRecord, MutationStatus, ProposedDesign, RunRecord, RunStatus,
 };
+use crate::team::{Role, Visibility};
 use crate::topology::PortKind;
 
 /// Where the generated file lives, relative to the repository root.
@@ -80,6 +81,18 @@ fn vocabulary<T: serde::Serialize>(
 
 fn vocabularies() -> Vec<Vocabulary> {
     vec![
+        vocabulary(
+            "VISIBILITIES",
+            "Visibility",
+            "Who may see a chat and its workflows: its owner, the team, or anyone on the view port.",
+            &[Visibility::Private, Visibility::Team, Visibility::Public],
+        ),
+        vocabulary(
+            "ROLES",
+            "Role",
+            "A team member's role in one session.",
+            &[Role::Member, Role::Admin],
+        ),
         vocabulary(
             "RUN_STATUSES",
             "RunStatus",

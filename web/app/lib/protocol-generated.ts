@@ -4,6 +4,14 @@
 // file makes the client disagree with the daemon, which is the failure the
 // generator exists to make impossible.
 
+/** Who may see a chat and its workflows: its owner, the team, or anyone on the view port. */
+export const VISIBILITIES = ["private", "team", "public"] as const;
+export type Visibility = (typeof VISIBILITIES)[number];
+
+/** A team member's role in one session. */
+export const ROLES = ["member", "admin"] as const;
+export type Role = (typeof ROLES)[number];
+
 /** Every status `omar serve` can report a run in. */
 export const RUN_STATUSES = ["starting", "running", "stopping", "completed", "stopped", "pausing", "paused", "failed"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
@@ -177,9 +185,13 @@ proposal_sequence: number, };
 
 export type WorkflowState = { revision: number, name: string | null, draft: WorkflowDraft | null, };
 
-export type Conversation = { id: string, title: string, ea_id: number | null, created_at: number, updated_at: number, messages: Array<ChatMessage>, workspace: WorkflowState, };
+export type Conversation = { id: string, title: string, ea_id: number | null,
+/**
+ * The team member who started it; none for the session's operator.
+ */
+owner: string | null, visibility: Visibility, created_at: number, updated_at: number, messages: Array<ChatMessage>, workspace: WorkflowState, };
 
-export type ConversationSummary = { id: string, title: string, created_at: number, updated_at: number, message_count: number, ea_id: number | null, workflow_name: string | null, busy: boolean, run: RunRecord | null, };
+export type ConversationSummary = { id: string, title: string, created_at: number, updated_at: number, message_count: number, ea_id: number | null, workflow_name: string | null, owner: string | null, visibility: Visibility, busy: boolean, run: RunRecord | null, };
 
 export type MutationRecord = { status: MutationStatus,
 /**

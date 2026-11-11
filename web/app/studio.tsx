@@ -39,8 +39,12 @@ import {
   type DiagramSnapshot,
   type PendingInvocation,
   type ProposedDesign,
+  type Role,
   type RunRecord,
+  type Visibility,
 } from "./lib/protocol";
+import { setVisibility } from "./lib/team-client";
+import { TeamPage } from "./team-page";
 import type { TimelineStep } from "./lib/runtime-client";
 import {
   answerPanel,
@@ -110,9 +114,19 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-type StudioProps = { serveUrl?: string; designAgent?: DesignAgent };
+/** Signed in through `omar gateway`: who this is, in which session. */
+export type TeamContext = {
+  user: string;
+  role: Role;
+  session: string;
+  onSwitch: () => void;
+  onSignOut: () => void;
+  onChangePassword: () => void;
+};
 
-export function Studio({ serveUrl = "", designAgent }: StudioProps) {
+type StudioProps = { serveUrl?: string; designAgent?: DesignAgent; team?: TeamContext };
+
+export function Studio({ serveUrl = "", designAgent, team }: StudioProps) {
   const [selected, setSelected] = useState<string | null>(null);
   const [restoredUrl, setRestoredUrl] = useState<string | null>(null);
   // Known before the workspace renders, so a view port never flashes controls.
@@ -147,10 +161,10 @@ export function Studio({ serveUrl = "", designAgent }: StudioProps) {
   const scopedUrl = selected ? `${serveUrl.replace(/\/$/, "")}/chats/${encodeURIComponent(selected)}` : serveUrl;
   return <StudioWorkspace serveUrl={scopedUrl} historyUrl={serveUrl}
     designAgent={designAgent} selectedId={selected} onSelect={select}
-    readOnly={readOnly} onReadOnly={setReadOnly} />;
+    readOnly={readOnly} onReadOnly={setReadOnly} team={team} />;
 }
 
-function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, onSelect, readOnly, onReadOnly }: StudioProps & {
+function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, onSelect, readOnly: viewOnly, onReadOnly, team }: StudioProps & {
   historyUrl: string;
   selectedId: string | null;
   onSelect: (conversation: ConversationSummary) => void;
@@ -159,6 +173,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   onReadOnly: (readOnly: boolean) => void;
 }) {
   const isDemo = serveUrl.trim().length === 0;
+  const [sharing, setSharing] = useState<{ owner: string | null; visibility: Visibility } | null>(null);
+  // Another member's chat is shown as the view port shows it: watched, not changed.
+  const othersChat = team !== undefined && sharing?.owner !== team.user;
+  const readOnly = viewOnly || othersChat;
+  // Backends are this machine's sign-ins: on a team, an admin's to connect.
+  const canConnect = !readOnly && (team === undefined || team.role === "admin");
+  const [teamOpen, setTeamOpen] = useState(false);
   const draftStore = useMemo(() => new WorkflowDraftStore(serveUrl, readOnly), [serveUrl, readOnly]);
   const saveStatus = useSyncExternalStore(draftStore.subscribe, draftStore.snapshot, () => "Saved");
   const proposalSequenceRef = useRef(0);
@@ -466,6 +487,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const restoreConversation = useCallback((conversation: ConversationSummary) => {
     setHistoryRevision((current) => current + 1);
     setConversationTitle(conversation.workflow_name || (conversation.message_count ? conversation.title : "What should the team do?"));
+    setSharing({ owner: conversation.owner ?? null, visibility: conversation.visibility ?? "private" });
     if (conversationIdRef.current === conversation.id) return;
     conversationIdRef.current = conversation.id;
     proposalSequenceRef.current = 0;
@@ -1194,7 +1216,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   // With no backend signed in there is nothing for the assistant to run on,
   // so the Backends page comes first. Asked once per runtime.
   useEffect(() => {
-    if (!canRun || readOnly || isDemo) return;
+    if (!canRun || !canConnect || isDemo) return;
     let cancelled = false;
     fetchBackendStatus(serveUrl)
       .then((list) => {
@@ -1204,7 +1226,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     return () => {
       cancelled = true;
     };
-  }, [canRun, readOnly, isDemo, serveUrl]);
+  }, [canRun, canConnect, isDemo, serveUrl]);
   const retrying = run !== null && isRunFinished(run.status);
   const canConfirm = !readOnly && design !== null && ["review", "finished", "failed"].includes(phase);
   const failedRun = run?.status === "failed";
@@ -1488,7 +1510,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             serveUrl={historyUrl}
             activeId={selectedId ?? conversationId}
             onSwitchingChange={setSelectingChat}
-            readOnly={readOnly}
+            readOnly={viewOnly}
+            team={team?.user}
             offline={daemon.state === "offline"}
             mobile={historyDrawer}
             revision={`${historyRevision}:${messages.length}`}
@@ -1537,7 +1560,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
             <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
-            <div className="conversation-actions"><SettingsMenu onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+            <div className="conversation-actions">{team && sharing ? (othersChat ? <span className="sharing-badge" title="Shared with you: read-only">{sharing.owner ?? "operator"}&apos;s · read-only</span> : <label className="visibility-select"><span className="visually-hidden">Who can see this workflow</span><select aria-label="Who can see this workflow" value={sharing.visibility} onChange={(event) => { const next = event.target.value as Visibility; void setVisibility(serveUrl, next).then((summary) => setSharing({ owner: summary.owner ?? null, visibility: summary.visibility })).catch(() => {}); }}><option value="private">Private</option><option value="team">Team</option><option value="public">Public</option></select></label>) : null}<SettingsMenu onOpenBackends={daemon.state === "live" && canConnect ? () => setBackendsOpen(true) : undefined} account={team ? { user: team.user, session: team.session, onOpenTeam: team.role === "admin" ? () => setTeamOpen(true) : undefined, onSwitch: team.onSwitch, onChangePassword: team.onChangePassword, onSignOut: team.onSignOut } : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
           </header>
           {daemon.state === "offline" ? (
             // The one place the outage is reported: the sidebar and composer
@@ -1640,7 +1663,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
                     key={conversationId}
                     serveUrl={hydratedUrl ?? serveUrl}
                     live={daemon.state === "live"}
-                    onConnectMore={readOnly ? undefined : () => setBackendsOpen(true)}
+                    onConnectMore={canConnect ? () => setBackendsOpen(true) : undefined}
                   />
                 )}
                 {!isDemo ? assistantTerminal : null}
@@ -1961,7 +1984,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       ) : null}
 
       {filesOpen && !readOnly ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); stageDraft(workflow.program, filename, design ? { ...design, ...workflow } : null); }} onClose={() => setFilesOpen(false)} /> : null}
-      {backendsOpen && !readOnly ? (
+      {teamOpen && team ? <TeamPage serveUrl={historyUrl} user={team.user} onClose={() => setTeamOpen(false)} /> : null}
+      {backendsOpen && canConnect ? (
         <BackendsPage serveUrl={hydratedUrl ?? serveUrl} onClose={() => setBackendsOpen(false)} />
       ) : null}
       {terminalAgent ? (

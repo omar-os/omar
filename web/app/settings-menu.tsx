@@ -25,11 +25,24 @@ function applyTheme(theme: Theme) {
  * applied before paint by a script in the layout, so a light page does not
  * flash dark while React loads.
  */
+/** Signed in through `omar gateway`. */
+export type Account = {
+  user: string;
+  session: string;
+  /** Opens the Team page; session admins only. */
+  onOpenTeam?: () => void;
+  onSwitch: () => void;
+  onChangePassword: () => void;
+  onSignOut: () => void;
+};
+
 export function SettingsMenu({
   onOpenBackends,
+  account,
 }: {
   /** Opens the Backends page; absent where nothing can be connected. */
   onOpenBackends?: () => void;
+  account?: Account;
 } = {}) {
   // Read off the document rather than storage: the layout script has already
   // applied the stored choice by the time this runs. Nothing visible depends
@@ -109,6 +122,31 @@ export function SettingsMenu({
               >
                 Connect backends…
               </button>
+            </>
+          ) : null}
+          {account ? (
+            <>
+              <span className="settings-heading">{account.user} · {account.session}</span>
+              {[
+                account.onOpenTeam ? (["Team…", account.onOpenTeam] as const) : null,
+                ["Switch workspace", account.onSwitch] as const,
+                ["Change password", account.onChangePassword] as const,
+                ["Sign out", account.onSignOut] as const,
+              ]
+                .filter((item) => item !== null)
+                .map(([label, action]) => (
+                  <button
+                    key={label}
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setOpen(false);
+                      action();
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
             </>
           ) : null}
         </div>

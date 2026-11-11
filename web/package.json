@@ -14,7 +14,8 @@
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "test:e2e": "playwright test",
     "test:conformance": "node --test tests/conformance.test.mjs",
-    "test:serve-ui": "node --test tests/serve-ui.test.mjs"
+    "test:serve-ui": "node --test tests/serve-ui.test.mjs",
+    "test:team-ui": "node --test tests/team-ui.test.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "6.11.1",

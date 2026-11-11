@@ -3267,3 +3267,201 @@ p.connection-error { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; 
   color: var(--text-3);
   font-size: 0.6875rem;
 }
+
+/* Signing in through `omar gateway`: one card, centred, before anything else. */
+.team-gate {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: var(--ink);
+  color: var(--text-2);
+}
+
+.team-card {
+  width: min(420px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 24px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--panel-2);
+}
+
+.team-card h1 {
+  font-size: 1.35rem;
+  color: var(--text);
+}
+
+.team-form {
+  display: grid;
+  gap: 12px;
+}
+
+.team-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--text-2);
+}
+
+.team-form input,
+.team-inline input,
+.team-inline select,
+.team-members select,
+.visibility-select select {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+.team-form button[type="submit"],
+.team-inline button[type="submit"] {
+  height: 34px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--purple);
+  color: white;
+  font: inherit;
+}
+
+.team-form button:disabled,
+.team-inline button:disabled {
+  opacity: 0.5;
+}
+
+.team-note {
+  color: var(--text-3);
+  font-size: 0.9rem;
+}
+
+.team-error {
+  color: #e0777f;
+}
+
+.team-workspaces {
+  display: grid;
+  gap: 6px;
+  list-style: none;
+  padding: 0;
+}
+
+.team-workspaces a {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.team-workspaces a:hover {
+  border-color: var(--purple);
+}
+
+.team-workspaces small {
+  color: var(--text-3);
+}
+
+.team-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.team-actions button {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+}
+
+.team-panel h3 {
+  margin: 16px 0 4px;
+  color: var(--text);
+  font-size: 1rem;
+}
+
+.team-members {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 10px;
+}
+
+.team-members th,
+.team-members td {
+  padding: 7px 4px;
+  border-top: 1px solid var(--line-2);
+  text-align: left;
+  font-weight: normal;
+}
+
+.team-members th {
+  color: var(--text-3);
+  font-size: 0.82rem;
+}
+
+.team-inline {
+  display: flex;
+  gap: 8px;
+}
+
+.team-inline input,
+.team-inline select {
+  flex: 1;
+  min-width: 0;
+}
+
+/* "My workflows" / "All workflows", above the list. */
+.workflow-scope {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+  padding: 2px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+}
+
+.chat-history .workflow-scope button {
+  flex: 1;
+  height: 30px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 0.875rem;
+  white-space: nowrap;
+}
+
+.chat-history .workflow-scope button[aria-selected="true"] {
+  background: var(--purple-soft);
+  color: var(--accent-text);
+}
+
+.workflow-owner {
+  color: var(--text-3);
+}
+
+.sharing-badge {
+  padding: 2px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  color: var(--text-3);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.visibility-select select {
+  height: 28px;
+  font-size: 0.9rem;
+}
