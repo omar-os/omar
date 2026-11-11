@@ -176,15 +176,11 @@ pub fn load_memory_from(state_dir: &Path) -> String {
 /// `Argument list too long`, leaving the user with `can't find session`. We
 /// keep the most recent bytes (tail) since recency matters most for resume
 /// context and prepend a truncation marker so the agent knows.
-// 56 KB per piece × 2 (memory + notes) = 112 KB of dynamic content, plus
-// the EA prompt template (~5 KB) and framing ≈ 117 KB worst case. That
-// leaves ~11 KB headroom under the 128 KB MAX_ARG_STRLEN limit for the
-// surrounding shell expansion (`developer_instructions='''…'''`,
-// `--system-prompt "…"`, etc.) used by codex / agy / opencode
-// managers and by every worker spawn. The EA prompt teaches managers to keep notes
-// well under this hard cap (soft target 16 KB), so truncation should be
-// a rare safety backstop rather than a routine occurrence.
-const PROMPT_CONTEXT_BYTE_CAP: usize = 56 * 1024;
+// Reserve 8 KiB for headings, truncation markers, placeholder expansion, and
+// backend arguments. Split the remaining space between the snapshot and notes
+// after accounting for the embedded template and structured knowledge.
+const PROMPT_CONTEXT_BYTE_CAP: usize =
+    (120 * 1024 - crate::manager::PROMPT_EA.len() - crate::knowledge::CONTEXT_BYTES) / 2;
 
 fn truncate_for_prompt(content: String) -> String {
     if content.len() <= PROMPT_CONTEXT_BYTE_CAP {

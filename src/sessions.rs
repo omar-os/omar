@@ -1091,6 +1091,17 @@ fn handle_operation(
     let target = ea::resolve_ea_selector(&session.directory, Some(ea))?;
     let _admission = crate::ea_lifecycle::Admission::acquire(&session.directory, target.id)?;
     match op {
+        "memory" => {
+            crate::knowledge::authenticated(
+                &session.directory,
+                operation["key"].as_str().unwrap_or(""),
+            )?;
+            crate::knowledge::operator(
+                &session.directory,
+                target.id,
+                serde_json::from_value(operation["request"].clone())?,
+            )
+        }
         "manager_start" => server.session_start_manager(target.id),
         "start" => server.session_start(target.id, operation["request"].clone()),
         "runs" => Ok(json!(server.session_runs(
@@ -1707,6 +1718,8 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             for (name, value) in state["state"].as_object().into_iter().flatten() { println!("State {name} = {value}"); }
             Ok(())
         })(),
+        Some(Commands::Memory) => target(cli).and_then(|s| crate::memory_wizard::run(&s.directory, |key, request|
+            rpc(&s, json!({"op":"memory","ea":ea_selector(cli),"key":key,"request":request}), Duration::from_secs(10)))) ,
         Some(Commands::Runs { all_eas }) => target(cli).and_then(|s|rpc(&s,json!({"op":"runs","ea":ea_selector(cli),"all_eas":all_eas}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Status { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"status","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Stop { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"stop","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
