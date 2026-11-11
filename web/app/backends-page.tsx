@@ -238,22 +238,25 @@ export function BackendsPage({
                     {describe(status, rejected[status.name])}
                   </small>
                   {sandbox ? (
-                    <small className="backend-sandbox">{sandbox}</small>
+                    <small className="backend-sandbox">
+                      {sandbox}
+                      {status.sandbox?.status !== "connected" ? (
+                        <>
+                          {" · "}
+                          <button
+                            type="button"
+                            className="link-button"
+                            aria-label={`Set up ${backendLabel(status.name)} for sandboxes`}
+                            onClick={() => void connect(status.name, "sandbox")}
+                          >
+                            Set up
+                          </button>
+                        </>
+                      ) : null}
+                    </small>
                   ) : null}
                 </span>
                 <span className="backend-actions">
-                  {sandbox &&
-                  status.sandbox?.status !== "connected" &&
-                  confirming !== status.name ? (
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      aria-label={`Set up ${backendLabel(status.name)} for sandboxes`}
-                      onClick={() => void connect(status.name, "sandbox")}
-                    >
-                      Sandbox
-                    </button>
-                  ) : null}
                   {confirming === status.name ? (
                     <>
                       <button
