@@ -1753,19 +1753,13 @@ fn report_backends(
                 || matches!(sandbox, Connection::Connected { .. })
         })
         .collect();
-    let next_of = |((backend, status), sandbox): &(
-        &(&dyn crate::backend::Backend, Connection),
-        &Connection,
-    )| {
-        let name = backend.kind().name();
-        match (status, sandbox) {
-            (Connection::Connected { .. }, Connection::SignedOut) if sandboxed => {
-                format!("omar connect {name} --sandbox")
+    let next_of =
+        |((backend, status), _): &(&(&dyn crate::backend::Backend, Connection), &Connection)| {
+            match status {
+                Connection::Connected { .. } => String::new(),
+                _ => format!("omar connect {}", backend.kind().name()),
             }
-            (Connection::Connected { .. }, _) => String::new(),
-            _ => format!("omar connect {name}"),
-        }
-    };
+        };
     let status_of =
         |((_, status), sandbox): &(&(&dyn crate::backend::Backend, Connection), &Connection)| {
             format!(
@@ -1808,6 +1802,25 @@ fn report_backends(
         out += "No backend is connected. Use `omar connect` to add one.\n";
     } else if shown.len() < statuses.len() {
         out += "\nUse `omar connect` to add more backends.\n";
+    }
+    // Signed in here, but not for sandboxes: one line, not a column of hints.
+    let unsandboxed: Vec<_> = shown
+        .iter()
+        .filter(|((_, status), sandbox)| {
+            sandboxed
+                && matches!(status, Connection::Connected { .. })
+                && **sandbox == Connection::SignedOut
+        })
+        .map(|((backend, _), _)| backend.kind().name())
+        .collect();
+    if !unsandboxed.is_empty() {
+        if shown.len() == statuses.len() {
+            out.push('\n');
+        }
+        out += &format!(
+            "Not connected for sandboxes: {}. Use `omar connect <backend> --sandbox`.\n",
+            unsandboxed.join(", ")
+        );
     }
     if !lines.is_empty() {
         out.push('\n');
@@ -2530,6 +2543,36 @@ fn workflow_guard_denial(input: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sandbox_sign_in_is_a_note_on_the_backends_status() {
+        use crate::backend::{of, Connection, Kind};
+        let statuses = [
+            (of(Kind::Claude), Connection::connected("Claude Max")),
+            (of(Kind::Codex), Connection::connected("ChatGPT")),
+            (of(Kind::Cursor), Connection::SignedOut),
+        ];
+        let sandboxes = [
+            Connection::SignedOut,
+            Connection::connected("ChatGPT"),
+            Connection::SignedOut,
+        ];
+        assert_eq!(
+            report_backends(&statuses, &sandboxes, &[], false, false),
+            "BACKEND   STATUS\n\
+             claude    ✓ Claude Max\n\
+             codex     ✓ ChatGPT · sandboxes: ChatGPT\n\
+             \nUse `omar connect` to add more backends.\n\
+             Not connected for sandboxes: claude. Use `omar connect <backend> --sandbox`.\n"
+        );
+        // Without sbx, sandboxes are not mentioned at all.
+        let none = [const { Connection::NotInstalled }; 3];
+        assert_eq!(
+            report_backends(&statuses, &none, &[], false, false),
+            "BACKEND   STATUS\nclaude    ✓ Claude Max\ncodex     ✓ ChatGPT\n\n\
+             Use `omar connect` to add more backends.\n"
+        );
+    }
 
     #[test]
     fn workflow_guard_denies_only_unrouted_agent_calls() {
