@@ -228,22 +228,13 @@ pub fn assistants() -> Vec<(&'static dyn Backend, Connection)> {
 }
 
 /// [`assistants`], and beside each, whether its agents can run in sandboxes
-/// (`crate::sandbox::connections`), asked at the same time.
+/// (`crate::sandbox::connections`). Asked after the CLIs, not beside them:
+/// sbx is heavy enough to push a CLI's `--version` past its probe timeout.
 pub fn assistants_and_sandboxes() -> (Vec<(&'static dyn Backend, Connection)>, Vec<Connection>) {
-    std::thread::scope(|scope| {
-        let sandboxes = scope.spawn(|| {
-            let backends: Vec<_> = super::ASSISTANT
-                .iter()
-                .map(|kind| super::of(*kind))
-                .collect();
-            crate::sandbox::connections(&backends)
-        });
-        let statuses = assistants();
-        let sandboxes = sandboxes.join().unwrap_or_else(|_| {
-            vec![Connection::unknown("sandbox status check panicked"); statuses.len()]
-        });
-        (statuses, sandboxes)
-    })
+    let statuses = assistants();
+    let backends: Vec<_> = statuses.iter().map(|(backend, _)| *backend).collect();
+    let sandboxes = crate::sandbox::connections(&backends);
+    (statuses, sandboxes)
 }
 
 /// How the CLI shows a connection.
