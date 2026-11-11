@@ -88,6 +88,29 @@ export async function setVisibility(serveUrl: string, visibility: Visibility): P
   return (await post(`${normalizeRuntimeUrl(serveUrl)}/v1/chat/visibility`, { visibility })) as ConversationSummary;
 }
 
+/** A member with Mission Control open, and the chat they have open if its
+    owner shares it. */
+export type Online = { user: string; chat: ConversationSummary | null };
+
+export type Presence = { online: Online[]; room_seq: number };
+
+/** Check in as here, on `chat`; answers who else is. Call well within 30s. */
+export async function checkIn(serveUrl: string, chat: string | null): Promise<Presence> {
+  return (await post(`${normalizeRuntimeUrl(serveUrl)}/v1/team/presence`, { chat })) as Presence;
+}
+
+export type RoomMessage = { seq: number; user: string; text: string; at: number };
+
+export async function fetchRoom(serveUrl: string, after: number): Promise<RoomMessage[]> {
+  const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/team/room?after=${after}`);
+  if (!response.ok) throw new Error(await readError(response));
+  return ((await response.json()) as { messages: RoomMessage[] }).messages;
+}
+
+export async function say(serveUrl: string, text: string): Promise<RoomMessage> {
+  return (await post(`${normalizeRuntimeUrl(serveUrl)}/v1/team/room`, { text })) as RoomMessage;
+}
+
 async function post(url: string, body: unknown): Promise<unknown> {
   const response = await fetch(url, {
     method: "POST",

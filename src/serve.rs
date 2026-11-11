@@ -372,6 +372,9 @@ struct Workspaces {
     selection: Mutex<()>,
     editors: Mutex<crate::editor::Editors>,
     presence: Mutex<Presence>,
+    /// Members with Mission Control open: when each last checked in, and the
+    /// chat they had open.
+    online: Mutex<BTreeMap<String, (Instant, Option<String>)>>,
     launch_ea: AtomicBool,
     shutdown: Arc<AtomicBool>,
 }
@@ -927,6 +930,7 @@ impl Serve {
             selection: Mutex::new(()),
             editors: Mutex::new(crate::editor::Editors::default()),
             presence: Mutex::new(Presence::default()),
+            online: Mutex::new(BTreeMap::new()),
             launch_ea: AtomicBool::new(false),
             shutdown,
         });
@@ -3070,9 +3074,12 @@ fn accounts_home(session_dir: &Path) -> PathBuf {
     }
 }
 
+/// How long a member stays online after Mission Control last checked in.
+const ONLINE_FOR: Duration = Duration::from_secs(30);
+
 /// `/v1/team`: who is asking, and for admins (and the operator) the members
 /// with their chat and live workflow counts, never their content, plus the
-/// session's provider keys, masked.
+/// session's provider keys, masked. Also who is online, and the team room.
 fn team_request(
     workspaces: &Workspaces,
     access: Access,
@@ -3094,7 +3101,60 @@ fn team_request(
             .as_str()
             .map(str::to_string)
     };
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let result = match (method, path) {
+        // Every open Mission Control checks in, naming the chat it shows, and
+        // learns who else is here. A chat is named to others only once its
+        // owner shares it.
+        ("POST", "/v1/team/presence") => {
+            let mut online = workspaces.online.lock().expect("online poisoned");
+            let now = Instant::now();
+            if let Some(member) = member {
+                online.insert(member.user.clone(), (now, field("chat")));
+            }
+            online.retain(|_, (seen, _)| now.duration_since(*seen) < ONLINE_FOR);
+            let members = team::members(session).unwrap_or_default();
+            let (_, chats, _) = workspaces.summaries();
+            let here: Vec<Value> = online
+                .iter()
+                .filter(|(user, _)| members.contains_key(*user))
+                .map(|(user, (_, chat))| {
+                    let shared = chat.as_ref().and_then(|id| {
+                        chats.iter().find(|chat| {
+                            &chat.id == id && chat.visibility != team::Visibility::Private
+                        })
+                    });
+                    json!({"user": user, "chat": shared})
+                })
+                .collect();
+            return (
+                200,
+                json!({"online": here, "room_seq": team::room_seq(session)}),
+            );
+        }
+        ("GET", "/v1/team/room") => {
+            let after = query
+                .split('&')
+                .find_map(|field| field.strip_prefix("after="))
+                .and_then(|after| after.parse().ok())
+                .unwrap_or(0);
+            return match team::room(session, after) {
+                Ok(messages) => (200, json!({"messages": messages})),
+                Err(error) => (500, json!({"error": error.to_string()})),
+            };
+        }
+        ("POST", "/v1/team/room") => {
+            let Some(member) = member else {
+                return (
+                    403,
+                    json!({"error": "sign in through omar gateway to talk in the room"}),
+                );
+            };
+            return match team::post(session, &member.user, &field("text").unwrap_or_default()) {
+                Ok(message) => (200, json!(message)),
+                Err(error) => (400, json!({"error": error.to_string()})),
+            };
+        }
         ("GET", "/v1/team") => {
             let mut answer = json!({
                 "user": member.map(|member| member.user.clone()),
@@ -8151,6 +8211,88 @@ while True:
             .iter()
             .map(|chat| chat["id"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[test]
+    fn members_see_who_is_online_where_they_may_and_share_a_room() {
+        let home = tempfile::tempdir().unwrap();
+        let session = home.path().join("sessions/demo");
+        std::fs::create_dir_all(&session).unwrap();
+        let accounts = crate::accounts::Accounts::at(home.path());
+        for user in ["alice", "bob"] {
+            accounts.add(user).unwrap();
+        }
+        crate::team::add_member(&session, home.path(), "alice", crate::team::Role::Admin).unwrap();
+        crate::team::add_member(&session, home.path(), "bob", crate::team::Role::Member).unwrap();
+        let mut config = Config::default();
+        config.dashboard.session_prefix = format!("team-{}-", Uuid::new_v4());
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, &session, 0).unwrap();
+        let address = server.address();
+        let view = server.start_viewer("127.0.0.1:0".parse().unwrap()).unwrap();
+
+        let (_, chat) = request_as(address, "alice", "POST", "/v1/chats", Some("{}"));
+        let a = chat["id"].as_str().unwrap().to_string();
+        let check_in = |user, chat: &str| {
+            let body = format!(r#"{{"chat":"{chat}"}}"#);
+            request_as(address, user, "POST", "/v1/team/presence", Some(&body))
+        };
+        let (status, here) = check_in("alice", &a);
+        assert_eq!(status, 200, "{here}");
+        let (_, here) = check_in("bob", "");
+        let online = |here: &Value| -> Vec<(String, Option<String>)> {
+            here["online"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    let chat = entry["chat"]["id"].as_str().map(str::to_string);
+                    (entry["user"].as_str().unwrap().to_string(), chat)
+                })
+                .collect()
+        };
+        // Alice's chat is private, so bob sees her here but not where.
+        assert_eq!(
+            online(&here),
+            vec![("alice".into(), None), ("bob".into(), None)]
+        );
+        let body = r#"{"visibility":"team"}"#;
+        let path = format!("/chats/{a}/v1/chat/visibility");
+        assert_eq!(
+            request_as(address, "alice", "POST", &path, Some(body)).0,
+            200
+        );
+        let (_, here) = check_in("bob", "");
+        assert_eq!(online(&here)[0], ("alice".into(), Some(a.clone())));
+        assert_eq!(here["room_seq"], 0);
+
+        let say = |user, text: &str| {
+            let body = json!({ "text": text }).to_string();
+            request_as(address, user, "POST", "/v1/team/room", Some(&body))
+        };
+        assert_eq!(say("alice", "standup in 5").0, 200);
+        assert_eq!(say("bob", "  ").0, 400);
+        let (_, message) = say("bob", "on my way");
+        assert_eq!(message["seq"], 2);
+        let (_, here) = check_in("alice", &a);
+        assert_eq!(here["room_seq"], 2);
+        let (_, room) = request_as(address, "alice", "GET", "/v1/team/room?after=1", None);
+        let texts: Vec<_> = room["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| (m["user"].as_str().unwrap(), m["text"].as_str().unwrap()))
+            .collect();
+        assert_eq!(texts, vec![("bob", "on my way")]);
+
+        // The public view port sees neither.
+        assert_eq!(
+            request_as(view, "alice", "GET", "/v1/team/room", None).0,
+            403
+        );
+        assert_eq!(
+            request_as(view, "alice", "POST", "/v1/team/presence", Some("{}")).0,
+            403
+        );
     }
 
     #[test]

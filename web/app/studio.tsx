@@ -45,6 +45,7 @@ import {
 } from "./lib/protocol";
 import { setVisibility } from "./lib/team-client";
 import { TeamPage } from "./team-page";
+import { PresenceAvatars, TeamRoom, useTeamPresence, viewersByChat } from "./team-presence";
 import type { TimelineStep } from "./lib/runtime-client";
 import {
   answerPanel,
@@ -180,6 +181,11 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   // Backends are this machine's sign-ins: on a team, an admin's to connect.
   const canConnect = !readOnly && (team === undefined || team.role === "admin");
   const [teamOpen, setTeamOpen] = useState(false);
+  const presence = useTeamPresence(historyUrl, selectedId, team?.user);
+  const [roomOpen, setRoomOpen] = useState(false);
+  const toggleRoom = () => { presence.markRead(); setRoomOpen((open) => !open); };
+  // What arrives while the room is open is read; closing it records that.
+  const unread = roomOpen ? 0 : presence.unread;
   const draftStore = useMemo(() => new WorkflowDraftStore(serveUrl, readOnly), [serveUrl, readOnly]);
   const saveStatus = useSyncExternalStore(draftStore.subscribe, draftStore.snapshot, () => "Saved");
   const proposalSequenceRef = useRef(0);
@@ -1512,6 +1518,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             onSwitchingChange={setSelectingChat}
             readOnly={viewOnly}
             team={team?.user}
+            viewers={team ? viewersByChat(presence.online, team.user) : undefined}
             offline={daemon.state === "offline"}
             mobile={historyDrawer}
             revision={`${historyRevision}:${messages.length}`}
@@ -1560,7 +1567,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
             <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
-            <div className="conversation-actions">{team && sharing ? (othersChat ? <span className="sharing-badge" title="Shared with you: read-only">{sharing.owner ?? "operator"}&apos;s · read-only</span> : <label className="visibility-select"><span className="visually-hidden">Who can see this workflow</span><select aria-label="Who can see this workflow" value={sharing.visibility} onChange={(event) => { const next = event.target.value as Visibility; void setVisibility(serveUrl, next).then((summary) => setSharing({ owner: summary.owner ?? null, visibility: summary.visibility })).catch(() => {}); }}><option value="private">Private</option><option value="team">Team</option><option value="public">Public</option></select></label>) : null}<SettingsMenu onOpenBackends={daemon.state === "live" && canConnect ? () => setBackendsOpen(true) : undefined} account={team ? { user: team.user, session: team.session, onOpenTeam: team.role === "admin" ? () => setTeamOpen(true) : undefined, onSwitch: team.onSwitch, onChangePassword: team.onChangePassword, onSignOut: team.onSignOut } : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+            <div className="conversation-actions">{team ? <><PresenceAvatars online={presence.online} user={team.user} current={selectedId} onOpen={onSelect} /><button type="button" className="room-button" aria-pressed={roomOpen} aria-label={unread ? `Team chat, ${unread} unread` : "Team chat"} title="Talk with everyone in this session" onClick={toggleRoom}><WorkflowIcon name="chat" size={16} /><span>Team chat</span>{unread ? <b className="room-unread">{unread > 99 ? "99+" : unread}</b> : null}</button></> : null}{team && sharing ? (othersChat ? <span className="sharing-badge" title="Shared with you: read-only">{sharing.owner ?? "operator"}&apos;s · read-only</span> : <label className="visibility-select"><span className="visually-hidden">Who can see this workflow</span><select aria-label="Who can see this workflow" value={sharing.visibility} onChange={(event) => { const next = event.target.value as Visibility; void setVisibility(serveUrl, next).then((summary) => setSharing({ owner: summary.owner ?? null, visibility: summary.visibility })).catch(() => {}); }}><option value="private">Private</option><option value="team">Team</option><option value="public">Public</option></select></label>) : null}<SettingsMenu onOpenBackends={daemon.state === "live" && canConnect ? () => setBackendsOpen(true) : undefined} account={team ? { user: team.user, session: team.session, onOpenTeam: team.role === "admin" ? () => setTeamOpen(true) : undefined, onSwitch: team.onSwitch, onChangePassword: team.onChangePassword, onSignOut: team.onSignOut } : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
           </header>
           {daemon.state === "offline" ? (
             // The one place the outage is reported: the sidebar and composer
@@ -1984,6 +1991,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       ) : null}
 
       {filesOpen && !readOnly ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); stageDraft(workflow.program, filename, design ? { ...design, ...workflow } : null); }} onClose={() => setFilesOpen(false)} /> : null}
+      {roomOpen && team ? <TeamRoom serveUrl={historyUrl} session={team.session} user={team.user} presence={presence} onClose={toggleRoom} /> : null}
       {teamOpen && team ? <TeamPage serveUrl={historyUrl} user={team.user} onClose={() => setTeamOpen(false)} /> : null}
       {backendsOpen && canConnect ? (
         <BackendsPage serveUrl={hydratedUrl ?? serveUrl} onClose={() => setBackendsOpen(false)} />

@@ -2,7 +2,7 @@
  * `omar gateway` in a browser: two members of one session sign in with the
  * temporary passwords `omar user add` printed, must choose their own, and
  * then see their own workflows, what the other shares, and (for the admin)
- * the team's counts. Real `omar up`, real gateway, real Mission Control.
+ * the team's counts; who else is online and where, and the team room. Real `omar up`, real gateway, real Mission Control.
  *
  * Needs a runtime built with the bundle in it:
  *   (cd web && npm run build:spa)
@@ -112,7 +112,7 @@ describe("omar gateway", { skip: AVAILABLE ? false : "no bundled runtime" }, () 
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("members see their own workflows, what others share, and admins the counts", async () => {
+  test("members see their own workflows, what others share, admins the counts, and who is online", async () => {
     // Nothing behind the gateway answers before signing in.
     assert.equal((await fetch(`${ORIGIN}/s/demo/v1/chats`)).status, 401);
 
@@ -164,5 +164,39 @@ describe("omar gateway", { skip: AVAILABLE ? false : "no bundled runtime" }, () 
     await bob.getByRole("button", { name: "Settings" }).click();
     assert.equal(await bob.getByRole("menuitem", { name: "Team…" }).count(), 0);
     assert.equal(await bob.getByRole("menuitem", { name: "Sign out" }).count(), 1);
+    await bob.keyboard.press("Escape");
+    await alice.getByRole("dialog", { name: "Team" }).getByRole("button", { name: "Close" }).click();
+
+    // Online: bob has alice's shared workflow open, so she sees him there,
+    // and he sees her on it; following her opens it.
+    const online = (page) => page.getByRole("group", { name: "Online now" });
+    await online(alice).getByRole("button", { name: /^bob, viewing “/ }).waitFor({ timeout: 15_000 });
+    await online(bob).getByRole("button", { name: /^alice, viewing “/ }).waitFor({ timeout: 15_000 });
+    await shot(alice, "7-online");
+
+    // On his own private workflow, bob is only online: where stays his.
+    await rows.first().getByRole("button").first().click();
+    await bob.getByLabel("Who can see this workflow").waitFor();
+    await online(alice).getByRole("button", { name: "bob, online" }).waitFor({ timeout: 15_000 });
+
+    // The team room: bob writes, alice is told and reads it, and answers.
+    await bob.getByRole("button", { name: "Team chat" }).click();
+    const bobRoom = bob.getByRole("complementary", { name: "Team room" });
+    await bobRoom.getByLabel("Message the team").fill("standup in 5?");
+    await bobRoom.getByLabel("Message the team").press("Enter");
+    await bobRoom.getByText("standup in 5?").waitFor();
+    await alice.getByRole("button", { name: "Team chat, 1 unread" }).waitFor({ timeout: 15_000 });
+    await alice.getByRole("button", { name: /Team chat/ }).click();
+    const aliceRoom = alice.getByRole("complementary", { name: "Team room" });
+    await aliceRoom.getByText("standup in 5?").waitFor();
+    await aliceRoom.getByLabel("Message the team").fill("yes, joining");
+    await aliceRoom.getByRole("button", { name: "Send" }).click();
+    await bobRoom.getByText("yes, joining").waitFor({ timeout: 15_000 });
+    await shot(bob, "8-team-room");
+    // Read as it arrived, since bob's room was open.
+    assert.equal(await bob.getByRole("button", { name: /unread/ }).count(), 0);
+    assert.equal(await alice.getByRole("button", { name: /unread/ }).count(), 0);
+    // A recording loses its last moment when the browser closes.
+    if (VIDEO) await bob.waitForTimeout(2000);
   });
 });

@@ -3465,3 +3465,216 @@ p.connection-error { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; 
   height: 28px;
   font-size: 0.9rem;
 }
+
+/* Who else is here, as in a shared document. */
+.presence {
+  display: flex;
+  align-items: center;
+}
+
+.presence-member {
+  padding: 0;
+  margin-left: -6px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  cursor: pointer;
+}
+
+.presence-member:first-child {
+  margin-left: 0;
+}
+
+.presence-member:disabled {
+  cursor: default;
+}
+
+.presence-avatar {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border: 2px solid var(--panel);
+  border-radius: 999px;
+  background: hsl(var(--avatar-hue) 55% 48%);
+  color: white;
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.presence-avatar.small {
+  width: 20px;
+  height: 20px;
+  border-width: 1px;
+  font-size: 0.65rem;
+}
+
+/* On the chat this tab has open. */
+.presence-avatar.here {
+  box-shadow: 0 0 0 2px var(--purple);
+}
+
+.workflow-viewers {
+  display: inline-flex;
+}
+
+.workflow-viewers .presence-avatar + .presence-avatar {
+  margin-left: -5px;
+}
+
+.room-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 0.875rem;
+  white-space: nowrap;
+}
+
+.room-button[aria-pressed="true"] {
+  background: var(--purple-soft);
+  color: var(--accent-text);
+}
+
+.room-unread {
+  min-width: 18px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: var(--purple);
+  color: white;
+  font-size: 0.72rem;
+}
+
+.team-room {
+  position: fixed;
+  top: 64px;
+  right: 16px;
+  bottom: 16px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  width: min(360px, calc(100vw - 32px));
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+}
+
+.team-room header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line-2);
+}
+
+.team-room h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 1rem;
+}
+
+.team-room header small {
+  color: var(--text-3);
+}
+
+.team-room header button {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+}
+
+.team-room-messages {
+  flex: 1;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  margin: 0;
+  padding: 14px 16px;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.team-room-messages li {
+  display: flex;
+  gap: 8px;
+}
+
+.team-room-messages p {
+  margin: 2px 0 0;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.team-room-meta {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  color: var(--text-2);
+  font-size: 0.85rem;
+}
+
+.team-room-meta time {
+  color: var(--text-3);
+  font-size: 0.75rem;
+}
+
+.team-room-empty {
+  color: var(--text-3);
+}
+
+.team-room .team-error {
+  margin: 0 16px;
+}
+
+.team-room-composer {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line-2);
+}
+
+.team-room-composer textarea {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  resize: none;
+}
+
+.team-room-composer button {
+  padding: 0 14px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--purple);
+  color: white;
+  font: inherit;
+}
+
+.team-room-composer button:disabled {
+  opacity: 0.5;
+}
+
+@media (max-width: 900px) {
+  .room-button span {
+    display: none;
+  }
+}
