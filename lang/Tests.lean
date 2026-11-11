@@ -597,11 +597,13 @@ def testTaskMetadata : IO Unit := do
     input request : string
     action draft : string
     output result : string
+    // @title Draft campaign script
+    // @desc Turn the brief into a script for review.
     task writer(request) -> draft within(30s)
-      display(\" Draft campaign script \", \" Turn the brief into a script for review. \")
       \"Draft $(request)\"
+    // @title Save approved script
+    // @desc Copy the script to the output.
     reaction(draft) -> result
-      display(\"Save approved script\", \"Copy the script to the output.\")
       {= result = draft; =}
   }
   team Wrapper { nested = Tasks() }
@@ -621,22 +623,27 @@ def testTaskMetadata : IO Unit := do
           assertEqual "code task title" (reaction.title.getD "") "Save approved script"
       let bytecode := compile program
       assertEqual "bytecode has task title" (mentions bytecode "\"title\": \"Draft campaign script\"") true
-      let legacy := source.replace
-        "display(\" Draft campaign script \", \" Turn the brief into a script for review. \")" ""
-        |>.replace "display(\"Save approved script\", \"Copy the script to the output.\")" ""
+      let legacy := String.intercalate "\n" <|
+        (source.splitOn "\n").filter fun line => !(line.trimAscii.toString.startsWith "//")
       match lex legacy >>= parse "ignored" with
       | .error message => throw (IO.userError message)
       | .ok old =>
           assertEqual "metadata leaves execution bytecode unchanged"
             (compile { program with reactions := program.reactions.map fun r =>
               { r with title := none, description := none } }) (compile old)
-  for annotation in ["display(\" \", \"Description\")", "display(\"Title\", \" \")",
-      "display(\"Title\")"] do
-    let invalid := "team T[a : Codex] { input x : string output y : string task a(x) -> y " ++
-      annotation ++ " \"Go\" } main { t = T() }"
-    match compileSource "InvalidTask" invalid with
+  let annotatedProgram := fun doc => "team T[a : Codex] { input x : string output y : string\n" ++
+    doc ++ "\ntask a(x) -> y \"Go\" } main { t = T() }"
+  for annotation in ["// @title", "// @unknown X", "// @desc X\n// @desc Y"] do
+    match compileSource "InvalidTask" (annotatedProgram annotation) with
     | .ok _ => throw (IO.userError s!"invalid task metadata accepted: {annotation}")
     | .error _ => pure ()
+  for (tag, field, value) in [("// @title Title", "title", "Title"),
+      ("// @desc Take $(x)\n// literally", "description", "Take $(x) literally")] do
+    match compileSource "Documented" (annotatedProgram tag) with
+    | .error e => throw (IO.userError e)
+    | .ok result => assertEqual "single literal field" (mentions result
+        (s!"\"{field}\": \"{value}\"")) true
+
 /-- The plan `omarc --diff` writes, as one string per instruction. -/
 def mutationPlan (old new : String) (newName : String := "Relay") : Except String (Array String) := do
   let plan ← compileDiffSourcesWithSchemas "Relay" old #[] newName new #[]

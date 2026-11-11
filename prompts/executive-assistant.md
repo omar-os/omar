@@ -50,8 +50,9 @@ team Node(idx : int)[agent : Codex]
     input token : int
     output out : int
 
+    // @title Pass the token onward
+    // @desc Read the incoming token and return it to the next node.
     task agent(token) -> out
-      display("Pass the token onward", "Read the incoming token and return it to the next node.")
       "You are node $(idx). Token: $(token)"
 }
 
@@ -65,13 +66,12 @@ main Relay {
 
 Inputs and outputs are then named `instance.port` — `n1.token`, `n2.out`.
 
-Every step you propose must have a short task title and a detailed description.
-Put `display("Title", "Description")` after its output contract and optional
-`within(...)` deadline, before the execution prompt or code body:
+Prefer optional // @title and // @desc comments directly above the declaration.
 
 ```
+// @title Draft campaign script
+// @desc Turn the brief into a script with a hook, scene outline and call to action. Pass the draft to review.
 task writer(brief) -> draft
-display("Draft campaign script", "Turn the brief into a script with a hook, scene outline and call to action. Pass the draft to review.")
 "Write the campaign script from $(brief) and set draft to the result."
 ```
 
@@ -94,9 +94,6 @@ both title and description; do not carry obsolete claims into the revised design
 The canvas shows the title; the details popup shows the full description.
 The execution prompt remains the complete instructions. Task copy does not
 change IDs, agents, triggers, output contracts, deadlines or connections.
-Supply it for every task and code reaction, including nested teams, and keep
-it accurate when revising a step. The proposal endpoint rejects missing copy
-and returns the steps to fix. Older source still compiles without task metadata.
 
 A reaction can also be triggered by a timer, which the runtime fires from its
 own logical clock. Nothing feeds a timer and nothing can write to it:

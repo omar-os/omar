@@ -16,6 +16,7 @@ inductive Token where
   /-- A `{= ... =}` body, captured as raw source. Rust is lexed by rustc, not
       here, so nothing inside is interpreted. -/
   | code : String -> Token
+  | annotation : Option String -> Option String -> Token
   | sym : String -> Token
   deriving Repr, BEq
 
@@ -156,11 +157,53 @@ private partial def readCharLiteral (acc : List Char) :
 
 end
 
+/-- Read consecutive line comments, retaining the boundary after the block. -/
+private partial def commentBlock (rest : List Char) (lines : Array String := #[]) :
+    Array String × List Char := Id.run do
+  let (line, tail) := takeWhile (· != '\n') rest
+  let lines := lines.push (String.ofList line).trimAscii.toString
+  let (_, next) := takeWhile (fun c => c == ' ' || c == '\t' || c == '\r') (tail.drop 1)
+  match next with
+  | '/' :: '/' :: more => return commentBlock more lines
+  | _ => return (lines, next)
+
+private def annotationFields (lines : Array String) : Except String (Option String × Option String) := do
+  let mut title : Option String := none
+  let mut description : Option String := none
+  let mut continuing := false
+  for line in lines do
+    if line.startsWith "@" then
+      let (tag, rest) := takeWhile (fun c => !c.isWhitespace) line.toList
+      let value := (String.ofList rest).trimAscii.toString
+      continuing := false
+      match String.ofList tag with
+      | "@title" =>
+        if title.isSome || value.isEmpty || value.length > 80 then
+          throw "expected one @title with 1–80 characters"
+        title := some value
+      | "@desc" =>
+        if description.isSome then throw "duplicate @desc"
+        description := some value
+        continuing := true
+      | other => throw s!"unknown documentation tag '{other}'"
+    else if continuing then
+      description := some ((description.getD "" ++ " " ++ line).trimAscii.toString)
+  if let some value := description then
+    if value.isEmpty || value.length > 1200 then throw "expected 1–1200 characters in @desc"
+  return (title, description)
+
 private partial def lexChars : List Char -> Except String (List Token)
   | [] => pure []
-  | '/' :: '/' :: rest =>
-      let (_, tail) := takeWhile (fun c => c != '\n') rest
-      lexChars tail
+  | '/' :: '/' :: rest => do
+      let (lines, tail) := commentBlock rest
+      let (title, description) ← annotationFields lines
+      let tokens ← lexChars tail
+      if title.isNone && description.isNone then return tokens
+      let (keyword, _) := takeWhile isWordRest tail
+      if ["task", "reaction"].contains (String.ofList keyword) then
+        return Token.annotation title description :: tokens
+      dbg_trace "warning: documentation annotation is not followed by a task or reaction"
+      return tokens
   | '/' :: '*' :: rest => do
       lexChars (← skipBlockComment 1 rest)
   | '-' :: '>' :: rest => do
@@ -486,6 +529,7 @@ private def kindName : PortKind -> String
   | .action => "action"
 
 private def tokenSource : Token -> String
+  | .annotation _ _ => "<annotation>"
   | .word value => value
   | .nat value => toString value
   | .duration value => s!"{value}ns"
@@ -528,24 +572,7 @@ private partial def takeContract (acc : List Token) : List Token -> Except Strin
   | tokens@(Token.text _ :: _) => pure (acc.reverse, tokens)
   | tokens@(Token.code _ :: _) => pure (acc.reverse, tokens)
   | tokens@(Token.word "within" :: _) => pure (acc.reverse, tokens)
-  | tokens@(Token.word "display" :: Token.sym "(" :: _) => pure (acc.reverse, tokens)
   | token :: rest => takeContract (token :: acc) rest
-
-/-- Optional task copy. Older source remains valid; new assistant proposals
-    require it on every reaction before they can be published. -/
-private def taskMetadata : Parser (Option String × Option String)
-  | Token.word "display" :: Token.sym "(" :: Token.text title :: Token.sym "," ::
-      Token.text description :: Token.sym ")" :: rest => do
-      let title := title.trimAscii.toString
-      let description := description.trimAscii.toString
-      if title.isEmpty || title.length > 80 then
-        throw "task title must contain 1–80 characters"
-      if description.isEmpty || description.length > 1200 then
-        throw "task description must contain 1–1200 characters"
-      pure ((some title, some description), rest)
-  | Token.word "display" :: Token.sym "(" :: _ =>
-      throw "expected display(\"Short action title\", \"What this step does and produces.\")"
-  | tokens => pure ((none, none), tokens)
 
 /-- `port`, or `instance.port` written as one dotted name. -/
 private def qualifiedTail (head : String) : Parser String
@@ -597,11 +624,14 @@ private partial def parseDeclarations
     (connections : Array Connection)
     (reactions : Array Reaction)
     (instances : Array Instance)
-    (states : Array StateVar) :
-    List Token ->
+    (states : Array StateVar) (tokens : List Token) :
       Except String
         (Array Port × Array Timer × Array Connection × Array Reaction × Array Instance ×
-          Array StateVar × List Token)
+          Array StateVar × List Token) := do
+  let (title, description, tokens) := match tokens with
+    | Token.annotation title description :: rest => (title, description, rest)
+    | _ => (none, none, tokens)
+  match tokens with
   | Token.sym "}" :: rest =>
       pure (ports, timers, connections, reactions, instances, states, rest)
   -- `a = A();` ends with an optional semicolon; it separates declarations and
@@ -672,7 +702,6 @@ private partial def parseDeclarations
             let (_, tail) ← expectSym ")" tail
             pure (some value, tail)
         | _ => pure (none, rest)
-      let ((title, description), rest) ← taskMetadata rest
       let (prompt, rest) ← match rest with
         | Token.text prompt :: tail => pure (prompt, tail)
         | _ => throw "expected the task's prompt string after the production contract"
@@ -698,7 +727,6 @@ private partial def parseDeclarations
             let (_, tail) ← expectSym ")" tail
             pure (some value, tail)
         | _ => pure (none, rest)
-      let ((title, description), rest) ← taskMetadata rest
       let (body, rest) ← match rest with
         | Token.code body :: tail => pure (body, tail)
         | _ => throw "expected code block after production contract"
@@ -1159,9 +1187,8 @@ def instructionTexts (program : Program) : Array String :=
       ("effects", jsonStringArray reaction.effects),
       ("contract", toJson reaction.contract),
       ("prompt", toJson reaction.prompt)
-    ] ++ (match reaction.title, reaction.description with
-      | some title, some description => [("title", toJson title), ("description", toJson description)]
-      | _, _ => []) ++ (match reaction.body with
+    ] ++ reaction.title.toList.map (fun t => ("title", toJson t)) ++
+      reaction.description.toList.map (fun d => ("description", toJson d)) ++ (match reaction.body with
       | some body => [("body", toJson body)]
       | none => []) ++ match reaction.within with
       | some within => [("within", toJson within)]

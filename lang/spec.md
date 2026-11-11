@@ -45,10 +45,9 @@ endpoint    = identifier | qualified ;
 qualified   = identifier, ".", identifier ;
 
 task        = "task", identifier, "(", [ triggers ], ")",
-              "->", effects, [ deadline ], [ display ], string ;
+              "->", effects, [ deadline ], string ;
 reaction    = "reaction", "(", [ triggers ], ")", "->", effects,
-              [ deadline ], [ display ], code-body ;
-display     = "display", "(", string, ",", string, ")" ;
+              [ deadline ], code-body ;
 code-body   = "{=", rust, "=}" ;
 deadline    = "within", "(", duration, ")" ;
 delay       = duration | "0" ;
@@ -171,14 +170,13 @@ not accepted in `main`.
   or port `b` is present. If both are present at the same tag, the task is
   invoked once with both values.
 
-Optional `display("Title", "Description")` provides display copy, not execution
-instructions. It follows the optional deadline and precedes the prompt or code
-body. Both strings must be nonempty after trimming; titles allow up to 80
-characters and descriptions up to 1200. Task strings are literal text. They
-do not affect reaction IDs, ordering, agents, ports, contracts or execution.
-Bytecode and diagram snapshots carry them as `title` and `description`.
-Older source can omit them; Mission Control assistant proposals require them
-on every reaction so newly generated workflows explain their tasks.
+A contiguous block of line comments immediately above a task or reaction may
+contain `// @title <text>` and `// @desc <text>`. Each is independently
+optional, including in assistant proposals. Subsequent comment lines continue
+a description until another tag or the end of the block. Values are literal,
+trimmed, nonempty, and limited to 80 and 1200 characters respectively.
+Unknown and duplicate tags are errors. An unattached annotation emits a warning.
+The diagram reads the resulting bytecode fields `title` and `description`.
 
 The task's prompt is delivered to the agent. `$(name)` interpolates a trigger
 value and may only reference that task's triggers. If a declared trigger is

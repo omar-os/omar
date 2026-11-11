@@ -385,19 +385,16 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     const token = context.serve?.token;
     assert.equal(typeof token, "string", "serve wrote its token into the context");
 
-    const rejected = await fetch(`${real.url}/v1/agent/proposals`, {
-      ...post({ token, program: UNRESOLVABLE, summary: "conformance", inputs: {} }),
+    const plain = await fetch(`${real.url}/v1/agent/proposals`, {
+      ...post({ token, program: UNRESOLVABLE, summary: "plain", inputs: {} }),
     });
-    assert.equal(rejected.status, 400);
-    assert.match((await rejected.json()).error, /Missing or invalid task metadata: only\.reaction\.0/);
-    const before = await (await fetch(`${real.url}/v1/chat`)).json();
-    assert.ok(!before.messages.some((message) => message.design), "invalid copy was not published");
+    assert.equal(plain.status, 202);
 
     const title = "Echo the supplied value";
     const description = "Copy the supplied go input into the done output.";
     const program = UNRESOLVABLE.replace(
       "task worker(go) -> done",
-      `task worker(go) -> done display(${JSON.stringify(title)}, ${JSON.stringify(description)})`,
+      `// @title ${title}\n// @desc ${description}\ntask worker(go) -> done`,
     );
     const response = await fetch(`${real.url}/v1/agent/proposals`, {
       ...post({ token, program, summary: "conformance", inputs: {} }),
@@ -406,7 +403,7 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     assert.equal(response.status, 202, `proposal rejected: ${responseBody}`);
 
     const { messages } = await (await fetch(`${real.url}/v1/chat`)).json();
-    const proposal = messages.find((message) => message.design);
+    const proposal = messages.findLast((message) => message.design);
     assert.ok(proposal, "the proposal reached the conversation");
 
     // Everything the renderer resolves against, produced by the real compiler.

@@ -1,23 +1,26 @@
 team Analyst[agent : Claude] {
     input brief : string
     output proposal : string
+    // @title Draft a trade proposal
+    // @desc Turn the supplied brief into a trade proposal for risk review.
     task agent(brief) -> proposal
-        display("Draft a trade proposal", "Turn the supplied brief into a trade proposal for risk review.")
         "Propose a trade for $(brief)."
 }
 team Risk[agent : Claude] {
     input proposal : string
     output approved : string
     output rejected : string
+    // @title Review the trade risk
+    // @desc Evaluate the proposed trade and return an approval or rejection.
     task agent(proposal) -> (approved | rejected)
-        display("Review the trade risk", "Evaluate the proposed trade and return an approval or rejection.")
         "Approve or reject $(proposal)."
 }
 team Executor[agent : Codex] {
     input order : string
     output receipt : string
+    // @title Execute the approved order
+    // @desc Execute the approved order and return its receipt.
     task agent(order) -> receipt
-        display("Execute the approved order", "Execute the approved order and return its receipt.")
         "Execute $(order)."
 }
 main Desk {
