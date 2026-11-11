@@ -1440,7 +1440,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
     };
 
-    if path == "/v1/workspaces" || path.starts_with("/v1/workspaces/") {
+    if path == "/v1/memory" || path == "/v1/workspaces" || path.starts_with("/v1/workspaces/") {
         // Workspace reads expose host files; editor launch grants shell access.
         // Reject cross-site requests, including simple POSTs, rather than only
         // withholding CORS headers after executing the operation.
@@ -1455,6 +1455,47 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         if method == "OPTIONS" {
             return write_json(&mut stream, 204, &Value::Null, origin);
+        }
+        if path == "/v1/memory" {
+            if access != Access::Full || method != "POST" {
+                return write_json(
+                    &mut stream,
+                    403,
+                    &json!({"error":"full operator access required"}),
+                    origin,
+                );
+            }
+            let Ok(body) = serde_json::from_slice::<Value>(&raw_body) else {
+                return write_json(
+                    &mut stream,
+                    400,
+                    &json!({"error":"invalid memory request"}),
+                    origin,
+                );
+            };
+            if crate::knowledge::authenticated(
+                &context.omar_dir,
+                body["key"].as_str().unwrap_or(""),
+            )
+            .is_err()
+            {
+                return write_json(
+                    &mut stream,
+                    403,
+                    &json!({"error":"operator key required"}),
+                    origin,
+                );
+            }
+            let result = serde_json::from_value(body["request"].clone())
+                .map_err(anyhow::Error::from)
+                .and_then(|action| {
+                    crate::knowledge::operator(&context.omar_dir, context.ea_id, action)
+                });
+            let (status, value) = match result {
+                Ok(value) => (200, value),
+                Err(error) => (400, json!({"error":error.to_string()})),
+            };
+            return write_json(&mut stream, status, &value, origin);
         }
         let response = workspace_request(&workspaces, &context, &method, &path, &raw_body);
         let (status, body) = match response {

@@ -15,6 +15,7 @@ mod knowledge;
 mod manager;
 mod mcp;
 mod memory;
+mod memory_wizard;
 mod metrics;
 mod mutation;
 mod panic_hook;
@@ -167,11 +168,8 @@ enum Commands {
         #[command(subcommand)]
         action: sessions::EaAction,
     },
-    /// Manage scoped saved knowledge in the selected runtime
-    Memory {
-        #[command(subcommand)]
-        action: knowledge::Action,
-    },
+    /// Open the interactive saved-memory manager for the selected assistant
+    Memory,
     #[command(hide = true)]
     SessionDaemon { directory: PathBuf },
     #[command(hide = true)]
@@ -523,7 +521,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Rm
             | Commands::Run(_)
             | Commands::Runs { .. }
-            | Commands::Memory { .. }
+            | Commands::Memory
             | Commands::Pause { .. }
             | Commands::Resume { .. }
             | Commands::Mutate { .. }

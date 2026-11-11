@@ -2907,3 +2907,14 @@ p.connection-error { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; 
 .artifact-tabs [role="tab"]:hover { color: var(--text, #eee); }
 .artifact-tabs [role="tab"]:focus-visible { outline: 2px solid var(--accent, #8b5cf6); outline-offset: 3px; }
 .workflow-editor-controls { align-items: center; }
+
+.memory-manager { margin: auto; width: min(35rem, 95vw); max-height: 85vh; overflow: auto; padding: 1.25rem; background: var(--surface, Canvas); color: var(--text, CanvasText); border: 1px solid currentColor; border-radius: 12px; }
+.memory-manager::backdrop { background: #0008; }
+.memory-manager header { display: flex; justify-content: space-between; align-items: center; }
+.memory-manager fieldset { border: 0; padding: 0; }
+.memory-manager fieldset, .memory-manager form, .memory-manager article { display: grid; gap: .65rem; margin-block: .75rem; }
+.memory-manager article { border-top: 1px solid currentColor; padding-top: .75rem; overflow-wrap: anywhere; }
+.memory-manager h2, .memory-manager h3, .memory-manager p { margin: 0; }
+.memory-manager label > :is(input:not([type=checkbox]),textarea,select) { display: block; width: 100%; }
+.memory-manager :is(input,textarea,select,button) { padding: .35rem .55rem; border: 1px solid currentColor; border-radius: .3rem; }
+.memory-manager button { width: fit-content; margin-right: .25rem; }

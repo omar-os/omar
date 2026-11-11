@@ -6,10 +6,10 @@
 //! rules, not isolation from processes with the same UID and unrestricted shell.
 
 use anyhow::{bail, ensure, Context, Result};
-use clap::{Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 use uuid::Uuid;
@@ -18,7 +18,7 @@ pub const CONTEXT_BYTES: usize = 6 * 1024;
 const MAX_STORE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeName {
     Ea,
@@ -26,7 +26,7 @@ pub enum ScopeName {
     User,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Preference,
@@ -88,6 +88,10 @@ impl Record {
 struct Store {
     schema_version: u32,
     generation: u64,
+    #[serde(default)]
+    operator_key_hash: Option<String>,
+    #[serde(default)]
+    review_required: BTreeSet<u32>,
     projects: BTreeMap<String, String>,
     links: BTreeMap<u32, String>,
     records: BTreeMap<String, Record>,
@@ -98,6 +102,8 @@ impl Default for Store {
         Self {
             schema_version: 1,
             generation: 0,
+            review_required: BTreeSet::new(),
+            operator_key_hash: None,
             projects: BTreeMap::new(),
             links: BTreeMap::new(),
             records: BTreeMap::new(),
@@ -231,28 +237,22 @@ fn check_text(text: &str, source: &str, expires: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, clap::Args)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Save {
     /// EA-private by default; user means all EAs in this runtime only
-    #[arg(long, value_enum, default_value = "ea")]
     scope: ScopeName,
     /// Stable key within scope; identical retries return the current record
-    #[arg(long)]
     key: String,
-    #[arg(long, value_enum)]
     kind: Kind,
-    #[arg(long)]
     text: String,
     /// Source reference or operator explanation; not a verification claim
-    #[arg(long)]
     source: String,
     /// Unix time in milliseconds; omitted means no automatic expiry
-    #[arg(long)]
     expires_at_ms: Option<u64>,
 }
 
-fn save(root: &Path, ea: u32, input: Save, confirmed: bool) -> Result<Value> {
+fn save(root: &Path, ea: u32, input: Save, from_operator: bool) -> Result<Value> {
     check_text(&input.text, &input.source, input.expires_at_ms)?;
     ensure!(
         !input.key.trim().is_empty() && input.key.len() <= 128,
@@ -276,7 +276,7 @@ fn save(root: &Path, ea: u32, input: Save, confirmed: bool) -> Result<Value> {
             );
             // An agent cannot use a duplicate key to inspect another EA's candidate.
             ensure!(
-                confirmed || current.status == Status::Confirmed || record.proposed_by_ea == ea,
+                from_operator || current.status == Status::Confirmed || record.proposed_by_ea == ea,
                 "memory key unavailable"
             );
             ensure!(
@@ -287,7 +287,7 @@ fn save(root: &Path, ea: u32, input: Save, confirmed: bool) -> Result<Value> {
                 "key already exists; inspect and edit with its current revision"
             );
             ensure!(
-                !confirmed || current.status == Status::Confirmed,
+                !from_operator || current.status == Status::Confirmed,
                 "candidate exists; confirm its exact revision"
             );
             return Ok(record.view());
@@ -304,14 +304,14 @@ fn save(root: &Path, ea: u32, input: Save, confirmed: bool) -> Result<Value> {
                 revision: 1,
                 text: input.text,
                 source: input.source,
-                author: if confirmed {
+                author: if from_operator {
                     "operator".into()
                 } else {
                     format!("ea:{ea}")
                 },
                 updated_at_ms: now,
                 expires_at_ms: input.expires_at_ms,
-                status: if confirmed {
+                status: if from_operator || !store.review_required.contains(&ea) {
                     Status::Confirmed
                 } else {
                     Status::Candidate
@@ -344,52 +344,40 @@ fn editable<'a>(store: &'a mut Store, ea: u32, id: &str, expected: u64) -> Resul
 /// Operator commands travel through the selected runtime's existing IPC route.
 /// No `confirmed`, caller identity, filesystem root or arbitrary scope ID is
 /// accepted from an agent's memory tool arguments.
-#[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
+    /// Require human review of future writes from this assistant
+    Review { enabled: bool },
     /// Save an operator-confirmed item; source and stable key are required
     Save(Save),
     /// List accessible records, including candidates and forgotten tombstones
     List {
-        #[arg(long, default_value_t = 0)]
         #[serde(default)]
         offset: usize,
     },
     /// Inspect a record and a page of its revision history
     Get {
         id: String,
-        #[arg(long, default_value_t = 0)]
         #[serde(default)]
         offset: usize,
     },
     /// Replace text/source with a revision check; retains confirmation state
     Edit {
         id: String,
-        #[arg(long)]
         revision: u64,
-        #[arg(long)]
         text: String,
-        #[arg(long)]
         source: String,
         /// New expiry; omission clears the previous expiry
-        #[arg(long)]
         expires_at_ms: Option<u64>,
     },
     /// Accept the exact candidate revision for future recall
-    Confirm {
-        id: String,
-        #[arg(long)]
-        revision: u64,
-    },
+    Confirm { id: String, revision: u64 },
     /// Erase text/source in every revision; retain a tombstone to block retries
-    Forget {
-        id: String,
-        #[arg(long)]
-        revision: u64,
-    },
+    Forget { id: String, revision: u64 },
     /// Recall complete confirmed records within a fixed 6 KiB JSON budget
     Recall {
-        #[arg(long, default_value = "")]
+        #[serde(default)]
         query: String,
     },
     /// Create a shared context; does not reuse tasks.md project numbers
@@ -402,8 +390,38 @@ pub enum Action {
     ProjectUnlink,
 }
 
+/// Pair once from the local operator wizard. Only a digest is persisted and no
+/// HTTP, agent tool or IPC operation issues credentials.
+pub fn pair_operator(root: &Path) -> Result<Option<String>> {
+    transaction(root, |store| {
+        if store.operator_key_hash.is_some() {
+            return Ok(None);
+        }
+        let key = Uuid::new_v4().to_string();
+        store.operator_key_hash = Some(format!("{:x}", Sha256::digest(key.as_bytes())));
+        Ok(Some(key))
+    })
+}
+
+pub fn authenticated(root: &Path, key: &str) -> Result<()> {
+    let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
+    ensure!(
+        read(root)?.operator_key_hash.as_ref() == Some(&digest),
+        "operator key required"
+    );
+    Ok(())
+}
+
 pub fn operator(root: &Path, ea: u32, action: Action) -> Result<Value> {
     match action {
+        Action::Review { enabled } => transaction(root, |store| {
+            if enabled {
+                store.review_required.insert(ea);
+            } else {
+                store.review_required.remove(&ea);
+            }
+            Ok(json!({"review_required": enabled}))
+        }),
         Action::Save(input) => save(root, ea, input, true),
         Action::List { offset } => {
             let store = read(root)?;
@@ -420,7 +438,7 @@ pub fn operator(root: &Path, ea: u32, action: Action) -> Result<Value> {
                 .collect();
             let next = offset.saturating_add(page.len());
             Ok(
-                json!({"generation":store.generation,"records":page,"next_offset":(next < records.len()).then_some(next)}),
+                json!({"generation":store.generation,"review_required":store.review_required.contains(&ea),"records":page,"next_offset":(next < records.len()).then_some(next)}),
             )
         }
         Action::Get { id, offset } => {
@@ -630,6 +648,7 @@ pub fn delete_ea(root: &Path, ea: u32) -> Result<()> {
     }
     transaction(root, |store| {
         store.links.remove(&ea);
+        store.review_required.remove(&ea);
         store.records.retain(|_, r| {
             r.scope != Scope::Ea(ea)
                 && !(r.proposed_by_ea == ea && r.current().status == Status::Candidate)
@@ -728,6 +747,16 @@ mod tests {
             forged[field] = json!("operator");
             assert!(agent_call(root.path(), 1, "memory_propose", forged).is_err());
         }
+        let auto = agent_call(
+            root.path(),
+            2,
+            "memory_propose",
+            serde_json::to_value(input(ScopeName::Ea, "default")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(auto["value"]["status"], "confirmed");
+        assert_eq!(auto["value"]["author"], "ea:2");
+        operator(root.path(), 1, Action::Review { enabled: true }).unwrap();
         let candidate = agent_call(root.path(), 1, "memory_propose", args.clone()).unwrap();
         assert_eq!(candidate["value"]["author"], "ea:1");
         assert_eq!(recall(root.path(), 1, "").unwrap()["records"], json!([]));
@@ -752,10 +781,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(accepted["value"]["revision"], 2);
-        assert_eq!(
-            recall(root.path(), 2, "").unwrap()["records"],
-            json!([accepted])
-        );
+        assert!(recall(root.path(), 2, "").unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .contains(&accepted));
         let mut changed = input(ScopeName::Project, "format");
         changed.text = "Use two sections".into();
         assert!(save(root.path(), 1, changed, false).is_err());
@@ -1007,6 +1036,7 @@ mod tests {
     #[test]
     fn deleting_ea_removes_private_content_and_candidates_but_retains_confirmed_shared_knowledge() {
         let root = tempfile::tempdir().unwrap();
+        operator(root.path(), 1, Action::Review { enabled: true }).unwrap();
         project(root.path(), &[1, 2]);
         save(root.path(), 1, input(ScopeName::Ea, "private"), true).unwrap();
         save(
