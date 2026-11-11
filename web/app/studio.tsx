@@ -8,6 +8,7 @@ import { Artifacts } from "./artifacts";
 import { DeployConfirmation, type DeployOptions } from "./deploy-confirmation";
 import { defaultRunTimeout, describeRunFailure } from "./lib/run-feedback";
 import { AgentTerminal } from "./agent-terminal";
+import { ApprovalBadge, ApprovalPanel, useApprovals } from "./approvals";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
 import { BackendsPage } from "./backends-page";
@@ -39,6 +40,7 @@ import {
   type PendingInvocation,
   type ProposedDesign,
   type RunRecord,
+  type PendingApproval,
 } from "./lib/protocol";
 import type { TimelineStep } from "./lib/runtime-client";
 import {
@@ -249,6 +251,20 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
+  const approvalFeed = useApprovals(serveUrl);
+  const [reviewingApproval, setReviewingApproval] = useState<PendingApproval | null>(null);
+  const approvals = approvalFeed.snapshot.requests;
+  const assistantApproval = approvals.find((r) => r.agent_id === "assistant");
+  const runApprovals = approvals.filter((r) => r.run_id === run?.run_id);
+  const approvalConnectionLost = !approvalFeed.connected || approvalFeed.snapshot.monitors.some((m) => m.state === "disconnected" && approvals.some((r) => r.agent_id === m.agent_id && r.run_id === m.run_id));
+  function reviewApproval(request: PendingApproval) {
+    setReviewingApproval(request);
+    if (request.agent_id === "assistant") setBuilderWidth((width) => width || DEFAULT_BUILDER);
+    else {
+      const reaction = snapshot?.reactions.find((r) => r.agent === request.agent_id && (!request.invocation_id || r.invocation_id === request.invocation_id));
+      if (reaction && request.run_id === run?.run_id) setSelection([reaction.id.replace(/^.*?::/, "")]);
+    }
+  }
   const [backendsOpen, setBackendsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -485,6 +501,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     setQuote("");
     setError("");
     setTerminalAgent(null);
+    setReviewingApproval(null);
     setPanelAgent(null);
     setSteps([]);
     setStepIndex(0);
@@ -1439,6 +1456,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         </span>
         <span className="connection" data-phase={phase}>{phase}</span>
       </div>
+          {approvals.length > 0 ? (
+            <button type="button" className="approval-count" onClick={() => reviewApproval(approvals[0])}>
+              <i aria-hidden="true" />{approvals.length} approval{approvals.length === 1 ? "" : "s"} needed
+              {approvalConnectionLost ? " · Connection lost" : ""}
+            </button>
+          ) : null}
 
       <div className="studio-content">
         {isDemo ? <aside className="chat-history demo-history" aria-label="Workflow navigation"><header><div className="brand-lockup"><OmarLogo /><strong>OMAR</strong></div></header><div className="sidebar-heading"><div><span className="eyebrow">WORKSPACE</span><h2>Workflows</h2></div><span className="workflow-count">1</span></div><div className="history-label">DEMO WORKFLOW</div><ul><li><button type="button" aria-current="true" onClick={() => composerRef.current?.focus()}><span className="workflow-name">Review workflow <WorkflowIcon name="chevron" size={14} /></span><span className="workflow-description">Plan, review, and refine a release</span><span className="workflow-meta"><small className="workflow-status status-draft"><i />Demo</small></span></button></li></ul></aside> : null}
@@ -1493,6 +1516,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             .join(" ")}
         >
           <h1 className="visually-hidden">{workflowNames[conversationId]?.name ?? conversationTitle}</h1>
+          {assistantApproval ? <ApprovalBadge request={assistantApproval} lost={!approvalFeed.connected || approvalFeed.snapshot.monitors.some((m) => m.agent_id === "assistant" && m.state === "disconnected")} onReview={() => reviewApproval(assistantApproval)} /> : null}
+          {!assistantApproval && !readOnly && approvalFeed.snapshot.monitors.some((m) => m.agent_id === "assistant" && m.state === "unsupported") ? <p className="approval-help">Approval status unavailable for this session. <button type="button" className="waiting-inspect" onClick={() => setTerminalAgent(ASSISTANT)}>Open agent terminal</button></p> : null}
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
             <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
@@ -1521,7 +1546,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             {messages.map((message) => (
               <ChatMessageView key={message.sequence} message={message} />
             ))}
-            {assistantBusy ? <Waiting /> : null}
+            {assistantBusy && !assistantApproval ? <Waiting /> : null}
             {phase === "spawning" ? <Waiting label="Starting the run" /> : null}
           </div>
           {readOnly ? null : <QuoteSelection threadRef={threadRef} onQuote={(text) => { setQuote(text); composerRef.current?.focus(); }} />}
@@ -1712,6 +1737,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <div className="topology-body">
           <DiagramCanvas
             snapshot={snapshot}
+            approvals={runApprovals}
+            onReviewApproval={reviewApproval}
+            focusApproval={reviewingApproval?.run_id === run?.run_id ? reviewingApproval : null}
             selection={selection}
             onToggleComponent={toggleComponent}
             onInspectComponent={(component) => setInspected((current) => current === component ? null : component)}
@@ -1914,6 +1942,11 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           onClose={() => setPanelAgent(null)}
         />
       ) : null}
+
+      {reviewingApproval ? <ApprovalPanel request={reviewingApproval} feed={approvalFeed} onReview={reviewApproval} onClose={() => setReviewingApproval(null)} onTerminal={() => {
+        setTerminalAgent(reviewingApproval.agent_id === "assistant" ? ASSISTANT : reviewingApproval.agent_name);
+        setReviewingApproval(null);
+      }} /> : null}
 
       {filesOpen && !readOnly ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); }} onClose={() => setFilesOpen(false)} /> : null}
       {backendsOpen && !readOnly ? (

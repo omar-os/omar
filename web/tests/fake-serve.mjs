@@ -51,6 +51,7 @@ export async function startFakeServe({
   snapshot: snapshotFile = "diagram-snapshot.v1.json",
   /** The geometry a terminal announces, as the daemon reports the agent's. */
   terminal: terminalSize = { cols: 96, rows: 28 },
+  autoAdvance = true,
   terminalReflow = false,
   /** Fail a parked Web step without making tests wait for a real deadline. */
   webFailure = /** @type {string | null} */ (null),
@@ -63,6 +64,9 @@ export async function startFakeServe({
 
   /** @type {Map<string, {record: object, snapshot: object, subscribers: Set<import("node:http").ServerResponse>, sequence: number}>} */
   const runs = new Map();
+  let approvals = { sequence: 0, requests: [], monitors: [], recent: [] };
+  const approvalSubscribers = new Set();
+  let approvalFeedAvailable = true;
 
   const handle = async (request, response) => {
     const url = new URL(request.url, `http://${request.headers.host}`);
@@ -73,6 +77,15 @@ export async function startFakeServe({
 
     if (request.method === "OPTIONS") {
       response.writeHead(204, CORS).end();
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/v1/approvals") return json(response, 200, approvals);
+    if (request.method === "GET" && url.pathname === "/v1/approvals/events") {
+      if (!approvalFeedAvailable) return json(response, 503, { error: "disconnected" });
+      response.writeHead(200, { ...CORS, "content-type": "text/event-stream", "cache-control": "no-cache" });
+      response.write(`event: approvals\ndata: ${JSON.stringify(approvals)}\n\n`);
+      approvalSubscribers.add(response);
+      response.on("close", () => approvalSubscribers.delete(response));
       return;
     }
     if (request.method === "GET" && url.pathname === "/health") {
@@ -859,6 +872,12 @@ export async function startFakeServe({
     const address = `${host}:${server.address().port}`;
     const snapshot = structuredClone(golden);
     snapshot.status = "running";
+    if (!autoAdvance) {
+      for (const [index, reaction] of snapshot.reactions.slice(0, 2).entries()) {
+        reaction.status = "running";
+        reaction.invocation_id = `inv-${index}`;
+      }
+    }
     const requested = request.inputs?.["flow.request"];
     for (const port of snapshot.ports) {
       if (port.name === "flow.request" && typeof requested === "string") {
@@ -927,7 +946,7 @@ export async function startFakeServe({
     // The real diagram server does not replay history, and a real run lasts far
     // longer than a subscriber takes to attach. Only start driving once someone
     // is listening, so the test can never lose the race and hang.
-    if (!entry.driving) {
+    if (!entry.driving && autoAdvance) {
       entry.driving = true;
       void driveRun(entry);
     }
@@ -1078,6 +1097,14 @@ export async function startFakeServe({
       return viewTerminalFrames;
     },
     agentToken,
+    setApprovals(next) {
+      approvals = { ...next, sequence: approvals.sequence + 1 };
+      for (const subscriber of approvalSubscribers) subscriber.write(`event: approvals\ndata: ${JSON.stringify(approvals)}\n\n`);
+    },
+    disconnectApprovals(disconnected = true) {
+      approvalFeedAvailable = !disconnected;
+      for (const subscriber of approvalSubscribers) subscriber.end();
+    },
     async close() {
       for (const client of terminals.clients) client.terminate();
       terminals.close();
@@ -1087,6 +1114,7 @@ export async function startFakeServe({
         await new Promise((resolve) => entry.diagramServer.close(resolve));
       }
       for (const chat of chats.values()) for (const subscriber of chat.subscribers) subscriber.end();
+      for (const subscriber of approvalSubscribers) subscriber.end();
       // Pooled keep-alive sockets would otherwise hold `close` open until they
       // idle out, adding seconds to every test.
       server.closeAllConnections();

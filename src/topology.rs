@@ -2302,11 +2302,17 @@ struct AgentReactionExecutor {
     /// no pane to deliver a prompt to — the registration is the work item, and
     /// a web client picks it up from there.
     web: BTreeSet<String>,
+    approvals: Option<crate::approvals::ApprovalRun>,
 }
 
 impl ReactionExecutor for AgentReactionExecutor {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
         let task_id = invocation.id;
+        let invocation_id = invocation.id.to_string();
+        let _approval_invocation = self
+            .approvals
+            .as_ref()
+            .map(|run| run.invocation(&invocation.agent, &invocation_id));
         let record = invocation_record(&self.team, &invocation)?;
         let rendered = record.prompt.clone();
         let completion = self.registry.register(record)?;
@@ -2460,6 +2466,7 @@ pub struct TopologyRunConfig<'a> {
     /// this the daemon cannot answer on a client's behalf, and a web-backed
     /// reaction would always sit until its deadline.
     pub panel_ready: Option<mpsc::Sender<PanelAccess>>,
+    pub approvals: Option<crate::approvals::ApprovalRun>,
     /// How often the run checkpoints on its own; `None` is the default hour.
     pub checkpoint_policy: Option<checkpoint::Policy>,
     /// Keep the instances' workspaces when the run ends; otherwise they go
@@ -3154,6 +3161,7 @@ fn launch(
             registry: invocation_server.registry.clone(),
             timeout: config.timeout,
             web,
+            approvals: config.approvals.clone(),
         },
     };
     let checkpointer = match RunCheckpointer::new(
@@ -3483,6 +3491,9 @@ fn spawn_topology_agents(
                 ("TMPDIR".into(), temp.to_string_lossy().into_owned()),
             ],
         )?;
+        if let Some(approvals) = &config.approvals {
+            approvals.watch(&session, name, &command, canonical_backend(&agent.backend));
+        }
         spawned.insert(name.clone(), session);
         launched.insert(name.clone(), command);
     }
@@ -6202,6 +6213,7 @@ mod tests {
             registry: server.registry.clone(),
             timeout: Duration::from_secs(10),
             web: BTreeSet::from(["panel".to_string()]),
+            approvals: None,
         };
         let context = TopologyMcpContext {
             team: state.team.clone(),
