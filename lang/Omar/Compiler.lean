@@ -256,6 +256,9 @@ structure Port where
       `list<Decision>` where `type` is the expanded refinement. The VM checks
       `type`; this is how the agent is told the name the program used. -/
   declared : Option String := none
+  /-- `physical action`: scheduled only from outside the run, tagged at its
+      arrival (spec §4.4). Always an action. -/
+  physical : Bool := false
   deriving Repr
 
 /-- `timer t(offset, period)`.
@@ -650,6 +653,20 @@ private partial def parseDeclarations
       parseDeclarations aliases reactionIndex
         (ports.push { name, kind := .output, type, declared := declaredName type spelled })
         timers connections reactions instances states rest
+  | Token.word "physical" :: Token.word "action" :: rest => do
+      let (name, rest) ← word rest
+      let (delay, rest) ← parseActionDelay rest
+      match rest with
+      | Token.sym ":" :: tail =>
+          let ((type, spelled), tail) ← parseType aliases tail
+          parseDeclarations aliases reactionIndex
+            (ports.push { name, kind := .action, type, delay, declared := declaredName type spelled,
+                          physical := true })
+            timers connections reactions instances states tail
+      | _ =>
+          parseDeclarations aliases reactionIndex
+            (ports.push { name, kind := .action, type := "signal", delay, physical := true })
+            timers connections reactions instances states rest
   | Token.word "action" :: rest => do
       let (name, rest) ← word rest
       let (delay, rest) ← parseActionDelay rest
@@ -1002,6 +1019,8 @@ private def validate (program : Program) : Except String Program := do
       let valid := program.ports.any fun port =>
         port.name == effect && port.kind != .input
       if !valid then throw s!"unknown output/action production '{effect}'"
+      if program.ports.any (fun port => port.name == effect && port.physical) then
+        throw s!"physical action '{effect}' is scheduled from outside the run; a reaction cannot write it"
   for connection in program.connections do
     let source ← match program.ports.find? (·.name == connection.source) with
       | some port => pure port
@@ -1011,6 +1030,8 @@ private def validate (program : Program) : Except String Program := do
       | none => throw s!"connection names unknown target port '{connection.target}'"
     if source.type != target.type then
       throw s!"connection type mismatch from '{connection.source}' to '{connection.target}'"
+    if target.physical then
+      throw s!"physical action '{connection.target}' is scheduled from outside the run; a connection cannot write it"
     -- A port holds one value per tag. Two connections into it would leave
     -- only the last value carried, and drop the other without a word.
     let sources := program.connections.filter (·.target == connection.target) |>.map (·.source)
@@ -1248,7 +1269,7 @@ def instructionTexts (program : Program) : Array String :=
       | none => []) ++ match port.delay with
       | some delay => [("delay", toJson delay)]
       | none => []
-    instruction "define_port" fields
+    instruction "define_port" (fields ++ if port.physical then [("physical", toJson true)] else [])
   let timers := program.timers.map fun timer =>
     instruction "declare_timer" ([
       ("instance", toJson timer.instance_),

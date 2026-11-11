@@ -62,6 +62,10 @@ pub enum Instruction {
         delay: Option<u64>,
         #[serde(default)]
         instance: String,
+        /// `physical action`: only the outside schedules it, through
+        /// [`Inbox::accept`], and its tag is its arrival (spec §4.4).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        physical: bool,
     },
     /// `type Decision from "./schemas/decision.json"`: a name for a type the
     /// program imported. Ports carry the expanded type, so this changes
@@ -231,6 +235,8 @@ pub struct PortState {
     pub delay: Option<u64>,
     #[serde(default)]
     pub instance: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub physical: bool,
 }
 
 /// A named type the program imported, kept so an agent can be told the name
@@ -746,6 +752,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 declared,
                 delay,
                 instance,
+                physical,
             } => {
                 require_identifier("port", name)?;
                 check_instance(&state, "port", name, instance)?;
@@ -769,6 +776,9 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 if delay.is_some() && *kind != PortKind::Action {
                     bail!("only action ports may declare a fixed delay");
                 }
+                if *physical && *kind != PortKind::Action {
+                    bail!("port '{name}' is physical but not an action");
+                }
                 if state
                     .ports
                     .insert(
@@ -779,6 +789,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                             declared: declared.clone(),
                             delay: *delay,
                             instance: instance.clone(),
+                            physical: *physical,
                         },
                     )
                     .is_some()
@@ -954,6 +965,9 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 {
                     bail!("duplicate connection from '{source}' to '{target}'");
                 }
+                if target_port.physical {
+                    bail!("physical action '{target}' is scheduled from outside the run; a connection cannot write it");
+                }
                 // A port holds one value per tag; a second incoming connection
                 // would drop one of the two. omarc rejects it; so does the
                 // runtime, for bytecode that did not come from omarc.
@@ -1018,6 +1032,9 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                     })?;
                     if port.kind == PortKind::Input {
                         bail!("reaction '{id}' cannot affect input '{effect}'");
+                    }
+                    if port.physical {
+                        bail!("physical action '{effect}' is scheduled from outside the run; a reaction cannot write it");
                     }
                 }
                 if state
@@ -2468,6 +2485,9 @@ pub struct TopologyRunConfig<'a> {
     /// The program file, recorded in checkpoints so a resume can place
     /// generated code beside it. `None` for a program that arrived over HTTP.
     pub program_path: Option<&'a Path>,
+    /// Where events for the program's physical actions arrive. `None` runs
+    /// it deaf to the outside, ending when its queue empties.
+    pub inbox: Option<Arc<Inbox>>,
 }
 
 /// Where a run's invocations are answered, and the secret that authorises it.
@@ -3215,7 +3235,7 @@ fn launch(
         Some(saved) => LoopStart::Resume(saved),
         None => LoopStart::Fresh(inputs),
     };
-    let outcome = run_event_loop_controlled(
+    let outcome = run_event_loop_with_inbox(
         &state,
         start,
         &executor,
@@ -3223,6 +3243,7 @@ fn launch(
         config.pace,
         Some(&runtime_dir),
         Some(&checkpointer),
+        config.inbox.as_deref(),
     );
     watcher_shutdown.store(true, Ordering::Release);
     let _ = watcher.join();
@@ -3617,6 +3638,169 @@ impl Tag {
             });
         }
         Ok(self)
+    }
+}
+
+/// Where events for a run's physical actions arrive from outside (spec §4.4).
+///
+/// Shared by the run loop and whoever accepts events (`omar serve`). A tag is
+/// assigned here, under the same lock the loop holds when it starts a tag, so
+/// an accepted event always lands after every tag already started: the loop
+/// either drained it before choosing, or it was tagged after.
+#[derive(Default)]
+pub struct Inbox {
+    inner: Mutex<InboxState>,
+    arrived: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct InboxState {
+    /// Set while a loop runs and accepts; `None` before it starts, after it
+    /// ends, and from the moment a pause or stop is decided.
+    open: Option<OpenInbox>,
+    /// Accepted and tagged, not yet in the loop's queue.
+    pending: Vec<(Tag, String, Value)>,
+    /// The latest tag started or assigned. Kept across a pause, so a resumed
+    /// run cannot hand out a tag the paused one already used.
+    floor: Option<Tag>,
+}
+
+struct OpenInbox {
+    /// Each physical action: its type and fixed delay.
+    ports: BTreeMap<String, (String, u64)>,
+    /// The loop's logical clock: `origin.elapsed() + base` is now.
+    origin: Instant,
+    base: Duration,
+}
+
+/// Why an event was not accepted.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The run is not executing: not started yet, paused, stopping or over.
+    NotRunning,
+    /// No physical action of that name in the run.
+    UnknownPort,
+    /// The value does not have the port's type.
+    Invalid(String),
+}
+
+impl Inbox {
+    /// Tag an event at its arrival, `(now + delay, 0)`, or the microstep after
+    /// the latest tag started or assigned when that is not later. Returns the
+    /// tag as `(timestamp, microstep)`.
+    pub fn accept(&self, port: &str, value: Value) -> std::result::Result<(u64, u64), Refusal> {
+        let mut inner = self.inner.lock().expect("inbox poisoned");
+        let open = inner.open.as_ref().ok_or(Refusal::NotRunning)?;
+        let (ty, delay) = open.ports.get(port).ok_or(Refusal::UnknownPort)?;
+        validate_value(ty, &value).map_err(|error| Refusal::Invalid(format!("{error:#}")))?;
+        let now = (open.origin.elapsed() + open.base).as_nanos() as u64;
+        let mut tag = Tag {
+            timestamp: now.saturating_add(*delay),
+            microstep: 0,
+        };
+        if let Some(floor) = inner.floor.filter(|floor| tag <= *floor) {
+            tag = Tag {
+                timestamp: floor.timestamp,
+                microstep: floor.microstep.saturating_add(1),
+            };
+        }
+        inner.floor = Some(tag);
+        inner.pending.push((tag, port.to_string(), value));
+        drop(inner);
+        self.arrived.notify_all();
+        Ok((tag.timestamp, tag.microstep))
+    }
+
+    /// [`Inbox::accept`] for a value written as `omar run --input` reads one:
+    /// by the port's type, so a `string` takes the text as it is.
+    pub fn accept_text(&self, port: &str, text: &str) -> std::result::Result<(u64, u64), Refusal> {
+        let ty = {
+            let inner = self.inner.lock().expect("inbox poisoned");
+            let open = inner.open.as_ref().ok_or(Refusal::NotRunning)?;
+            open.ports.get(port).ok_or(Refusal::UnknownPort)?.0.clone()
+        };
+        let value =
+            parse_input_value(&ty, text).map_err(|error| Refusal::Invalid(format!("{error:#}")))?;
+        self.accept(port, value)
+    }
+
+    fn open(&self, state: &VmState, origin: Instant, base: Duration, completed: Option<Tag>) {
+        let ports = state
+            .ports
+            .iter()
+            .filter(|(_, port)| port.physical)
+            .map(|(name, port)| (name.clone(), (port.ty.clone(), port.delay.unwrap_or(0))))
+            .collect();
+        let mut inner = self.inner.lock().expect("inbox poisoned");
+        inner.floor = inner.floor.max(completed);
+        inner.open = Some(OpenInbox {
+            ports,
+            origin,
+            base,
+        });
+    }
+
+    /// Stop accepting, keeping the clock so accepting can resume.
+    fn set_accepting(&self, accepting: bool, state: &VmState, origin: Instant, base: Duration) {
+        if accepting {
+            if self.inner.lock().expect("inbox poisoned").open.is_none() {
+                self.open(state, origin, base, None);
+            }
+        } else {
+            self.close();
+        }
+    }
+
+    fn close(&self) {
+        self.inner.lock().expect("inbox poisoned").open = None;
+    }
+
+    /// Move what was accepted into the queue. True if anything moved.
+    fn drain(&self, queue: &mut BTreeMap<Tag, BTreeMap<String, Value>>) -> bool {
+        let mut inner = self.inner.lock().expect("inbox poisoned");
+        let moved = !inner.pending.is_empty();
+        for (tag, port, value) in inner.pending.drain(..) {
+            queue.entry(tag).or_default().insert(port, value);
+        }
+        moved
+    }
+
+    /// Commit to running `tag` next: drain first, and refuse if an event
+    /// drained now comes before it. From here every event tags after `tag`.
+    fn start(&self, queue: &mut BTreeMap<Tag, BTreeMap<String, Value>>, tag: Tag) -> bool {
+        let mut inner = self.inner.lock().expect("inbox poisoned");
+        for (tag, port, value) in inner.pending.drain(..) {
+            queue.entry(tag).or_default().insert(port, value);
+        }
+        if queue.first_key_value().map(|(first, _)| *first) != Some(tag) {
+            return false;
+        }
+        inner.floor = inner.floor.max(Some(tag));
+        true
+    }
+
+    /// The queue as a checkpoint should see it: accepted events included.
+    fn queued(&self, queue: &BTreeMap<Tag, BTreeMap<String, Value>>) -> Vec<QueuedTag> {
+        let inner = self.inner.lock().expect("inbox poisoned");
+        if inner.pending.is_empty() {
+            return queued(queue);
+        }
+        let mut queue = queue.clone();
+        for (tag, port, value) in &inner.pending {
+            queue
+                .entry(*tag)
+                .or_default()
+                .insert(port.clone(), value.clone());
+        }
+        queued(&queue)
+    }
+
+    /// Sleep until an event arrives or `timeout` passes.
+    fn wait(&self, timeout: Duration) {
+        let inner = self.inner.lock().expect("inbox poisoned");
+        if inner.pending.is_empty() {
+            let _ = self.arrived.wait_timeout(inner, timeout);
+        }
     }
 }
 
@@ -4017,8 +4201,16 @@ fn settle_boundary(
     checkpointer: Option<&dyn Checkpointer>,
     observer: &dyn TopologyObserver,
     snapshot: &dyn Fn() -> ExecutionState,
+    inbox: Option<&Inbox>,
 ) -> Result<Boundary> {
     let request = deployment_dir.and_then(deploy::pending_request);
+    // A stop or pause refuses events from the moment it is decided, so none
+    // is accepted after the snapshot that the pause hands back.
+    if matches!(request, Some(ControlOp::Stop | ControlOp::Pause)) {
+        if let Some(inbox) = inbox {
+            inbox.close();
+        }
+    }
     let mut trigger = match request {
         Some(ControlOp::Stop) => return Ok(Boundary::Stop),
         Some(ControlOp::Pause) => Some(Trigger::Pause),
@@ -4081,6 +4273,9 @@ fn settle_boundary(
             match deployment_dir.and_then(deploy::pending_request) {
                 Some(ControlOp::Stop) => return Ok(Boundary::Stop),
                 Some(ControlOp::Pause) => {
+                    if let Some(inbox) = inbox {
+                        inbox.close();
+                    }
                     trigger = Trigger::Pause;
                     break;
                 }
@@ -4156,6 +4351,7 @@ fn run_event_loop_observed<E: ReactionExecutor>(
     )
 }
 
+#[cfg(test)]
 fn run_event_loop_controlled<E: ReactionExecutor>(
     state: &VmState,
     start: LoopStart,
@@ -4164,6 +4360,43 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
     pace: Pace,
     deployment_dir: Option<&Path>,
     checkpointer: Option<&dyn Checkpointer>,
+) -> Result<LoopEnd> {
+    run_event_loop_with_inbox(
+        state,
+        start,
+        executor,
+        observer,
+        pace,
+        deployment_dir,
+        checkpointer,
+        None,
+    )
+}
+
+/// Closes the inbox however the loop returns.
+struct InboxGuard<'a>(Option<&'a Inbox>);
+
+impl Drop for InboxGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(inbox) = self.0 {
+            inbox.close();
+        }
+    }
+}
+
+/// The event loop, accepting events for physical actions through `inbox`.
+/// With one, a run whose program declares a physical action does not end
+/// when its queue empties: it waits for the outside until stopped.
+#[allow(clippy::too_many_arguments)]
+fn run_event_loop_with_inbox<E: ReactionExecutor>(
+    state: &VmState,
+    start: LoopStart,
+    executor: &E,
+    observer: &dyn TopologyObserver,
+    pace: Pace,
+    deployment_dir: Option<&Path>,
+    checkpointer: Option<&dyn Checkpointer>,
+    inbox: Option<&Inbox>,
 ) -> Result<LoopEnd> {
     // When this process joined the run's logical clock. A resumed run has
     // already spent `base_elapsed` on that clock, so time is measured from
@@ -4222,6 +4455,24 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
         }
     };
     let elapsed = || origin.elapsed() + base_elapsed;
+    let _closes = InboxGuard(inbox);
+    if let Some(inbox) = inbox {
+        inbox.open(
+            state,
+            origin,
+            base_elapsed,
+            completed.map(|(timestamp, microstep)| Tag {
+                timestamp,
+                microstep,
+            }),
+        );
+    }
+    // Only a run that can hear from outside waits on an empty queue.
+    let awaits_events = inbox.is_some() && state.ports.values().any(|port| port.physical);
+    let snapshot_queue = |queue: &BTreeMap<Tag, BTreeMap<String, Value>>| match inbox {
+        Some(inbox) => inbox.queued(queue),
+        None => queued(queue),
+    };
     // Where logical time zero stands on the wall clock, for anything that
     // counts down to a tag: agents are up, so from here the clock is real.
     observer
@@ -4244,7 +4495,10 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
     // The queue holds only the `shutdown` tag: the run ends once it is over.
     let mut shutting_down = false;
 
-    loop {
+    'run: loop {
+        if let Some(inbox) = inbox {
+            inbox.drain(&mut queue);
+        }
         // A tag boundary: nothing is in flight, so this is where an
         // operator's stop ends the run without abandoning any invocation's
         // contract, and where a checkpoint describes the run exactly. The
@@ -4254,7 +4508,7 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
             let snapshot = || ExecutionState {
                 version: checkpoint::FORMAT,
                 completed_tag: completed,
-                queue: queued(&queue),
+                queue: snapshot_queue(&queue),
                 outputs: outputs.clone(),
                 state_vars: store.clone(),
                 elapsed_ns: elapsed().as_nanos() as u64,
@@ -4264,11 +4518,17 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
             if shutting_down {
                 Boundary::Continue
             } else {
-                settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
+                settle_boundary(deployment_dir, checkpointer, observer, &snapshot, inbox)?
             }
         };
         match settled {
-            Boundary::Continue => {}
+            Boundary::Continue => {
+                // A pause that did not happen (its capture failed, then a
+                // retry was asked for) leaves the run accepting again.
+                if let Some(inbox) = inbox.filter(|_| !shutting_down) {
+                    inbox.set_accepting(true, state, origin, base_elapsed);
+                }
+            }
             Boundary::Stop => {
                 return Ok(LoopEnd::Stopped(Settled {
                     outputs,
@@ -4278,6 +4538,14 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
             Boundary::Pause(state) => return Ok(LoopEnd::Paused(state)),
         }
         let Some((&tag, next_events)) = queue.first_key_value() else {
+            // Waiting on the outside: a beat at a time, so a stop or pause
+            // at this boundary is still honoured promptly.
+            if awaits_events && !shutting_down {
+                if let Some(inbox) = inbox {
+                    inbox.wait(Duration::from_millis(250));
+                }
+                continue;
+            }
             // Nothing left to happen is an end too, and `shutdown` hears of it.
             if shutting_down || !arm_shutdown(state, &mut queue, completed)? {
                 break;
@@ -4309,12 +4577,12 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
                     let snapshot = || ExecutionState {
                         version: checkpoint::FORMAT,
                         completed_tag: completed,
-                        queue: queued(&queue),
+                        queue: snapshot_queue(&queue),
                         outputs: outputs.clone(),
                         state_vars: store.clone(),
                         elapsed_ns: elapsed().as_nanos() as u64,
                     };
-                    settle_boundary(deployment_dir, checkpointer, observer, &snapshot)?
+                    settle_boundary(deployment_dir, checkpointer, observer, &snapshot, inbox)?
                 };
                 match settled {
                     Boundary::Continue => {}
@@ -4326,7 +4594,22 @@ fn run_event_loop_controlled<E: ReactionExecutor>(
                     }
                     Boundary::Pause(state) => return Ok(LoopEnd::Paused(state)),
                 }
-                thread::sleep(remaining.min(Duration::from_millis(250)));
+                // An event may arrive for an earlier moment than the one
+                // awaited; then that one runs first.
+                match inbox {
+                    Some(inbox) => {
+                        inbox.wait(remaining.min(Duration::from_millis(250)));
+                        if inbox.drain(&mut queue) {
+                            continue 'run;
+                        }
+                    }
+                    None => thread::sleep(remaining.min(Duration::from_millis(250))),
+                }
+            }
+        }
+        if let Some(inbox) = inbox {
+            if !inbox.start(&mut queue, tag) {
+                continue 'run;
             }
         }
         let Some((tag, events)) = queue.pop_first() else {
@@ -5199,6 +5482,216 @@ mod tests {
         assert!(error.contains("does not enforce"), "{error}");
     }
 
+    /// `w.ping` is physical; one reaction copies it to `w.seen`. `extra` adds
+    /// instructions before the commit.
+    fn physical_bytecode(extra: &str) -> Bytecode {
+        serde_json::from_str(&format!(
+            r#"{{
+              "version": 1,
+              "team": "W",
+              "instructions": [
+                {{"op":"begin_plan","team":"W"}},
+                {{"op":"declare_instance","name":"w","parent":"","team":"W"}},
+                {{"op":"define_port","instance":"w","kind":"action","name":"w.ping","type":"int","physical":true}},
+                {{"op":"define_port","instance":"w","kind":"output","name":"w.seen","type":"int"}},
+                {extra}
+                {{"op":"install_reaction","instance":"w","id":"w.reaction.0","agent":"",
+                  "triggers":["w.ping"],"effects":["w.seen"],
+                  "contract":"w.seen ?","prompt":"","body":"unused"}},
+                {{"op":"commit_plan"}}
+              ]
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    /// Records each invocation's trigger values, in the order they ran.
+    #[derive(Default)]
+    struct Echo {
+        seen: Mutex<Vec<BTreeMap<String, Value>>>,
+    }
+    impl ReactionExecutor for Echo {
+        fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+            let ping = invocation.trigger_values.get("w.ping").cloned();
+            self.seen.lock().unwrap().push(invocation.trigger_values);
+            Ok(ping
+                .into_iter()
+                .map(|value| ("w.seen".to_string(), value))
+                .collect())
+        }
+    }
+
+    #[test]
+    fn a_physical_event_is_tagged_at_arrival_and_never_before_a_started_tag() {
+        let state = verify(&physical_bytecode("")).unwrap();
+        let inbox = Inbox::default();
+        assert_eq!(inbox.accept("w.ping", json!(1)), Err(Refusal::NotRunning));
+        // A resumed run whose last completed tag is (10s, 0).
+        let ten = 10_000_000_000;
+        inbox.open(
+            &state,
+            Instant::now(),
+            Duration::ZERO,
+            Some(Tag {
+                timestamp: ten,
+                microstep: 0,
+            }),
+        );
+        assert_eq!(inbox.accept("w.ping", json!(1)), Ok((ten, 1)));
+        assert_eq!(inbox.accept("w.ping", json!(2)), Ok((ten, 2)));
+        assert_eq!(inbox.accept("w.seen", json!(3)), Err(Refusal::UnknownPort));
+        assert!(matches!(
+            inbox.accept("w.ping", json!("three")),
+            Err(Refusal::Invalid(_))
+        ));
+        // Text is read by the port's type, as `--input` is.
+        assert_eq!(inbox.accept_text("w.ping", "3"), Ok((ten, 3)));
+        assert!(matches!(
+            inbox.accept_text("w.ping", "three"),
+            Err(Refusal::Invalid(_))
+        ));
+        // A checkpoint sees what was accepted, before the loop drained it.
+        let queued = inbox.queued(&BTreeMap::new());
+        assert_eq!(queued.len(), 3);
+        assert_eq!(queued[2].events["w.ping"], json!(3));
+        // Closed for a pause, and reopened: the floor stays, so no tag repeats.
+        inbox.close();
+        assert_eq!(inbox.accept("w.ping", json!(4)), Err(Refusal::NotRunning));
+        inbox.set_accepting(true, &state, Instant::now(), Duration::ZERO);
+        assert_eq!(inbox.accept("w.ping", json!(4)), Ok((ten, 4)));
+        // Past the floor, an event takes its own arrival time.
+        inbox.close();
+        inbox.open(&state, Instant::now(), Duration::from_secs(20), None);
+        let (timestamp, microstep) = inbox.accept("w.ping", json!(5)).unwrap();
+        assert!(timestamp >= 20_000_000_000 && microstep == 0);
+    }
+
+    #[test]
+    fn a_run_with_a_physical_action_handles_events_in_order_and_waits_until_stopped() {
+        let state = verify(&physical_bytecode("")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = Arc::new(Inbox::default());
+        let echo = Echo::default();
+        thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                run_event_loop_with_inbox(
+                    &state,
+                    LoopStart::Fresh(BTreeMap::new()),
+                    &echo,
+                    &NoopTopologyObserver,
+                    Pace::RealTime,
+                    Some(dir.path()),
+                    None,
+                    Some(&inbox),
+                )
+            });
+            // The loop opens the inbox once its clock starts.
+            let first = loop {
+                match inbox.accept("w.ping", json!(1)) {
+                    Err(Refusal::NotRunning) if !run.is_finished() => {
+                        thread::sleep(Duration::from_millis(5))
+                    }
+                    accepted => break accepted.expect("the run accepts events"),
+                }
+            };
+            let second = inbox.accept("w.ping", json!(2)).unwrap();
+            let third = inbox.accept("w.ping", json!(3)).unwrap();
+            assert!(
+                first < second && second < third,
+                "{first:?} {second:?} {third:?}"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while echo.seen.lock().unwrap().len() < 3 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            // An empty queue is not the end: the run waits for the outside.
+            thread::sleep(Duration::from_millis(400));
+            assert!(
+                !run.is_finished(),
+                "a run with a physical action ended on its own"
+            );
+            let pings: Vec<_> = echo
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|values| values["w.ping"].clone())
+                .collect();
+            assert_eq!(pings, [json!(1), json!(2), json!(3)]);
+            deploy::request(dir.path(), ControlOp::Stop).unwrap();
+            let LoopEnd::Stopped(settled) = run.join().unwrap().unwrap() else {
+                panic!("a stop ends the run as stopped");
+            };
+            assert_eq!(settled.outputs["w.seen"], json!(3));
+        });
+        assert_eq!(inbox.accept("w.ping", json!(4)), Err(Refusal::NotRunning));
+    }
+
+    #[test]
+    fn an_event_arriving_before_an_awaited_tag_runs_first() {
+        // A one-shot timer at one second also triggers the reaction; an event
+        // accepted at once is due long before it, so it runs first.
+        let mut bytecode = physical_bytecode(
+            r#"{"op":"declare_timer","instance":"w","name":"w.tick","offset":1000000000,"period":0},"#,
+        );
+        for instruction in &mut bytecode.instructions {
+            if let Instruction::InstallReaction { triggers, .. } = instruction {
+                triggers.push("w.tick".into());
+            }
+        }
+        let state = verify(&bytecode).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = Arc::new(Inbox::default());
+        let echo = Echo::default();
+        thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                run_event_loop_with_inbox(
+                    &state,
+                    LoopStart::Fresh(BTreeMap::new()),
+                    &echo,
+                    &NoopTopologyObserver,
+                    Pace::RealTime,
+                    Some(dir.path()),
+                    None,
+                    Some(&inbox),
+                )
+            });
+            while inbox.accept("w.ping", json!(7)) == Err(Refusal::NotRunning) {
+                assert!(!run.is_finished(), "the run ended before accepting");
+                thread::sleep(Duration::from_millis(5));
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while echo.seen.lock().unwrap().len() < 2 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            deploy::request(dir.path(), ControlOp::Stop).unwrap();
+            run.join().unwrap().unwrap();
+        });
+        let seen = echo.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].get("w.ping"), Some(&json!(7)));
+        assert!(seen[1].contains_key("w.tick"));
+    }
+
+    #[test]
+    fn only_the_outside_writes_a_physical_action() {
+        let written = physical_bytecode(
+            r#"{"op":"install_reaction","instance":"w","id":"w.reaction.1","agent":"",
+                "triggers":["w.ping"],"effects":["w.ping"],"contract":"w.ping ?","prompt":"","body":"unused"},"#,
+        );
+        let error = verify(&written).unwrap_err().to_string();
+        assert!(error.contains("a reaction cannot write it"), "{error}");
+        let connected =
+            physical_bytecode(r#"{"op":"connect_ports","source":"w.seen","target":"w.ping"},"#);
+        let error = verify(&connected).unwrap_err().to_string();
+        assert!(error.contains("a connection cannot write it"), "{error}");
+        let input = physical_bytecode(
+            r#"{"op":"define_port","instance":"w","kind":"input","name":"w.other","type":"int","physical":true},"#,
+        );
+        let error = verify(&input).unwrap_err().to_string();
+        assert!(error.contains("physical but not an action"), "{error}");
+    }
+
     #[test]
     fn a_port_takes_one_incoming_connection() {
         let mut program = body_with_enum("input", r#"["decision"]"#, r#"["memo"]"#);
@@ -5631,6 +6124,7 @@ mod tests {
                     declared: None,
                     delay: None,
                     instance: String::new(),
+                    physical: false,
                 },
             );
         }

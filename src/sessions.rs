@@ -1121,6 +1121,15 @@ fn handle_operation(
             target.id,
             operation["run"].as_str().context("run id required")?,
         ),
+        "schedule" => server.session_schedule(
+            target.id,
+            operation["run"].as_str().context("run id required")?,
+            operation["action"]
+                .as_str()
+                .context("physical action required")?,
+            operation["value"].clone(),
+            operation["text"].as_str().map(String::from),
+        ),
         "resume" => server.session_resume(
             target.id,
             operation["run"].as_str().context("run id required")?,
@@ -1770,6 +1779,20 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         Some(Commands::Runs { all_eas }) => target(cli).and_then(|s|rpc(&s,json!({"op":"runs","ea":ea_selector(cli),"all_eas":all_eas}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Status { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"status","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Stop { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"stop","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
+        Some(Commands::Schedule { deployment, action, value }) => target(cli).and_then(|s| {
+            // Read by the action's type, as `--input` is; omitted is a signal.
+            rpc(&s, json!({"op":"schedule","ea":ea_selector(cli),"run":deployment,"action":action,"text":value}), Duration::from_secs(5))
+        }).and_then(print_value),
+        Some(Commands::GithubWebhook { deployment, action, listen, secret_file }) => target(cli).and_then(|s| {
+            let secret = fs::read_to_string(secret_file)
+                .with_context(|| format!("read webhook secret {}", secret_file.display()))?;
+            let secret = secret.trim().as_bytes().to_vec();
+            anyhow::ensure!(!secret.is_empty(), "webhook secret {} is empty", secret_file.display());
+            let (ea, run, action) = (ea_selector(cli), deployment.clone(), action.clone());
+            crate::github_webhook::listen(*listen, secret, std::sync::Arc::new(move |value| {
+                rpc(&s, json!({"op":"schedule","ea":ea,"run":run,"action":action,"value":value}), Duration::from_secs(5))
+            }))
+        }),
         Some(Commands::Pause { deployment, wait }) => target(cli).and_then(|s| {
             let ea = ea_selector(cli);
             let mut state = rpc(&s,json!({"op":"pause","ea":ea,"run":deployment}),Duration::from_secs(5))?;

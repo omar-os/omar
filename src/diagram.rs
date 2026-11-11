@@ -917,6 +917,7 @@ mod tests {
                         declared: None,
                         delay: None,
                         instance: String::new(),
+                        physical: false,
                     },
                 ),
                 (
@@ -927,6 +928,7 @@ mod tests {
                         declared: None,
                         delay: None,
                         instance: String::new(),
+                        physical: false,
                     },
                 ),
             ]),
@@ -960,6 +962,7 @@ mod tests {
             declared: None,
             delay: None,
             instance: instance.to_string(),
+            physical: false,
         };
         VmState {
             version: 1,

@@ -11,6 +11,7 @@ mod diagram;
 mod ea;
 mod ea_lifecycle;
 mod event;
+mod github_webhook;
 mod manager;
 mod mcp;
 mod memory;
@@ -218,6 +219,28 @@ enum Commands {
     Stop {
         /// Deployment (team) name
         deployment: String,
+    },
+    /// Send an event to a running topology's physical action; it is tagged at its arrival
+    Schedule {
+        /// Run id (or team name)
+        deployment: String,
+        /// The physical action, by its full name, e.g. `intake.pr_event`
+        action: String,
+        /// The value, read by the action's type as `--input` is: a `string` takes the text as is. Omit for a signal
+        value: Option<String>,
+    },
+    /// Receive GitHub webhooks and schedule each signed delivery on a run's physical action
+    GithubWebhook {
+        /// Run id (or team name)
+        deployment: String,
+        /// The physical action (a `string`) each delivery's summary goes to
+        action: String,
+        /// Where to listen. Only this listener faces GitHub; `omar serve` stays loopback
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        listen: std::net::SocketAddr,
+        /// File holding the webhook's secret, as set on GitHub
+        #[arg(long)]
+        secret_file: std::path::PathBuf,
     },
 
     /// Show a deployment's lifecycle state
@@ -588,6 +611,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Rm
             | Commands::Run(_)
             | Commands::Runs { .. }
+            | Commands::Schedule { .. }
+            | Commands::GithubWebhook { .. }
             | Commands::Pause { .. }
             | Commands::Resume { .. }
             | Commands::Mutate { .. }
@@ -841,6 +866,8 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
             "runs",
             "status",
             "stop",
+            "schedule",
+            "github-webhook",
             "pause",
             "resume",
             "mutate",

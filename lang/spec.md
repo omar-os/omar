@@ -32,8 +32,8 @@ declaration = input | output | action | timer | state | context | instance
             | connection | task | reaction | ";" ;
 input       = "input", identifier, ":", type ;
 output      = "output", identifier, ":", type ;
-action      = "action", identifier, [ "(", "delay", "=", delay, ")" ],
-              [ ":", type ] ;
+action      = [ "physical" ], "action", identifier,
+              [ "(", "delay", "=", delay, ")" ], [ ":", type ] ;
 timer       = "timer", identifier, "(", delay, ",", delay, ")" ;
 state       = "state", identifier, ":", type, "=", literal ;
 context     = "context", identifier, "(", identifier, { ",", identifier }, ")",
@@ -167,6 +167,8 @@ not accepted in `main`.
 - An action without a type is a signal carrying no value.
 - `action a(delay=2ms) : int` gives `a` a fixed logical delay of two
   milliseconds.
+- `physical action a : string` is an action only the outside writes, tagged
+  when its event arrives (§4.4).
 - `a -> b` copies each value present on `a` to `b` at the same tag. A plain
   connection costs nothing, so a reaction reading `b` sees the value in the tag
   it was written.
@@ -552,6 +554,105 @@ slow agent, and the runtime does not distinguish them:
 An operator's decision is therefore recorded dataflow rather than a side effect
 on the run: it flows through the same completion path as a model's, so a run
 with a person in it can be replayed by supplying the recorded writes.
+
+### 4.4 Physical actions
+
+Without one, a run hears from outside only through the inputs it starts with
+and the answers of agents it asked. A physical action lets the outside push
+events into a run already going, as in Lingua Franca: one long-running program
+sees every event, in tag order, with its state across them.
+
+- **Only the outside writes it.** A reaction may trigger on a physical action,
+  but neither a reaction nor a connection may write one; the compiler and the
+  runtime's verifier reject both. So every event on it came from outside, and
+  was tagged one way.
+- **Its tag is its arrival.** An event accepted at `P`, the run's logical clock
+  then (nanoseconds since the run began, paused time excluded), gets tag
+  `(P + D, 0)`, `D` being its `delay` (default 0). If that is not later than
+  every tag the runtime has started or assigned, it gets the next microstep
+  after the latest one instead. Tags therefore follow arrival order, and an
+  event never lands on or before a tag already started. An event due before
+  a tag the runtime is waiting for runs first.
+- **Ways in.** `POST /v1/runs/<run_id>/actions/<port>` with `{"value": ...}`;
+  `omar schedule RUN PORT [VALUE]`, which reads `VALUE` by the port's type as
+  `--input` does; and `omar github-webhook` (below). Each value is checked
+  against the port's type. `202` returns the assigned tag. A view port refuses
+  it like any write. A run not executing (starting, paused, stopping, over)
+  answers `409`, and the sender retries.
+- **It keeps the run alive.** A run with a physical action does not end when
+  its queue empties; it waits for the outside until `omar stop`.
+- **An accepted event is run state.** It is in the queue a checkpoint captures,
+  so pause, resume and rollback keep it, and a resumed run tags after every tag
+  the paused one used. A pause or stop refuses events from the moment it is
+  decided, so none is accepted after the checkpoint it takes. A crash loses
+  events accepted since the last checkpoint, as it loses any progress since.
+- **`--fast`** keeps the same rule. Logical time runs ahead of the wall clock
+  there, so most events take the microstep after the latest tag.
+- **Not modelled yet.** The Lean model (§8) has no event from outside, so it
+  would prove too much about a physical action; `omarc` refuses to model or
+  check properties of a program that has one.
+
+`omar github-webhook RUN PORT --listen ADDR --secret-file FILE` is a listener
+of its own, so `omar serve`'s full-access port stays loopback. It verifies each
+delivery's `X-Hub-Signature-256` against the secret, answers GitHub's `ping`,
+and schedules on `PORT` (a `string`) a JSON summary: `event`, `delivery`,
+`action`, `repo`, `pr`, `sha`, `sender`, each present when the payload has it.
+A delivery the run refuses is answered `503`, which GitHub records.
+
+Example: reviewing every PR in one run. GitHub sends each webhook once, lost
+if nothing is listening, so a timer re-reads the open PRs and catches up on
+what was missed. The poll is an agent task, so its answer is recorded like any
+other write.
+
+```text
+team Intake[poller : Codex] {
+    physical action pr_event : string      // {"pr": 42, "sha": "..."}
+    timer reconcile(5min, 5min)
+    action open_prs : string
+    output review : string
+    state seen : string = "{}"              // pr -> newest sha already queued
+
+    task poller(reconcile) -> open_prs within(2min)
+    "Run `gh pr list --json number,headRefOid` and set open_prs to its output."
+
+    reaction(pr_event, open_prs) -> review? {=
+        // Queue each (pr, sha) not in `seen`; record it there.
+    =}
+}
+```
+
+### 4.5 Sparse synchronous execution (direction, not implemented)
+
+§4.0 executes one tag at a time across the whole program: tag `t + 1` starts
+only once every reaction at `t` has finished. That is simple and deterministic,
+but a ten-minute review at `t` holds up every team, including ones handling
+events at later tags that do not depend on it.
+
+The direction is to keep the logical semantics exactly and drop the global
+barrier:
+
+- **Each team instance advances its own tag.** The one constraint is that each
+  instance sees its inputs in tag order, and what it reads at `t` is exactly
+  what the barrier execution would deliver at `t`. Outputs, and the order they
+  merge downstream, are then identical to §4.0; only when work physically
+  starts and ends differs.
+- **Logical execution time gives the slack.** A team states how long its work
+  takes logically, with an action or connection delay: an output produced for
+  tag `t` lands at `t + D`. Downstream then knows nothing from that team can
+  arrive before `t + D`, and may process earlier tags without waiting.
+- **Independent work overlaps.** An instance may start tag `t2` while `t1` is
+  still running when nothing `t2`'s reactions read (ports, state) can be
+  written by `t1`'s unfinished reactions. Two reviews triggered at different
+  tags then run concurrently, and their results still merge in tag order.
+
+An instance may process tag `t` once every upstream source's earliest possible
+next event is at or after `t`: the source's own tag plus the least delay on
+the path, and for a physical action, wall time plus its `delay`. This is the
+safe-to-advance rule of Lingua Franca's decentralized coordination, with
+Giotto's logical execution time and Edwards's Sparse Synchronous Model as
+precedents. Open questions: how state dependencies between tags are declared
+or inferred, what a cancelled (superseded) invocation means, and how
+checkpoints cut a run whose instances are at different tags. Tracked in #409.
 
 ## 5. Topology lifecycle
 
