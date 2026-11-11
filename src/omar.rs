@@ -122,6 +122,11 @@ struct Cli {
 enum Commands {
     #[command(hide = true)]
     SandboxWorker,
+    /// Reopen the default workspace, starting its runtime only when needed
+    Open {
+        #[arg(long)]
+        print_url: bool,
+    },
     /// Create a new independent background runtime, or restart a stopped one by name on this build
     Up(sessions::UpOptions),
     /// List independently addressable runtime sessions
@@ -237,7 +242,7 @@ enum Commands {
     /// Configure tmux for optimal omar experience
     SetupTmux,
 
-    /// Show which agent backends are installed and signed in
+    /// Show the connected agent backends, or the named ones
     Backends {
         /// Print JSON instead of a table
         #[arg(long)]
@@ -255,12 +260,24 @@ enum Commands {
     Connect {
         /// claude, codex, cursor, opencode, pi or agy; omit to pick from a list
         backend: Option<String>,
-        /// Connect it for sandboxed teams instead (`omar run --sandbox`): give
-        /// Docker Sandboxes a key its agents use from inside a sandbox, then
-        /// check it with a test prompt in one. Subscriptions other than
-        /// ChatGPT's cannot cross into a sandbox, so most backends need an
-        /// API key here.
+        /// Sign in again even if its sign-in works, to switch to another
+        /// account or kind of sign-in
         #[arg(long, requires = "backend")]
+        replace: bool,
+        /// Connect it for sandboxed teams instead (`omar run --sandbox`):
+        /// reuse its API key from this machine, or give Docker Sandboxes one,
+        /// then check it with a test prompt in a sandbox. Subscriptions other
+        /// than ChatGPT's cannot cross into a sandbox.
+        #[arg(long, requires = "backend")]
+        sandbox: bool,
+    },
+
+    /// Sign an agent backend out
+    Disconnect {
+        /// claude, codex, cursor, opencode, pi or agy
+        backend: String,
+        /// Remove its sandbox sign-in instead, the key Docker Sandboxes holds
+        #[arg(long)]
         sandbox: bool,
     },
 
@@ -272,6 +289,12 @@ enum Commands {
         format: String,
         #[arg(long)]
         event: Option<String>,
+    },
+
+    /// Claude Code hooks, wired into every Claude EA's launch settings by Omar.
+    ClaudeHook {
+        #[command(subcommand)]
+        hook: ClaudeHookKind,
     },
 
     /// Run a protocol-backed agent with a durable side-channel inbox.
@@ -295,6 +318,14 @@ enum Commands {
         /// rebuilds the names OMAR's prompts use, instead of `omar_omar_...`.
         #[arg(long)]
         bare_tool_names: bool,
+        /// Let spawn_agent and get_task take `wait_s` and hold their reply
+        /// until the task finishes. For an orchestrator's stand-in only:
+        /// OMAR-launched agents never pass it, so they cannot block. Only
+        /// add_project, spawn_agent and get_task are exposed. If the client
+        /// exits mid-hold, the workers keep running and a retried spawn_agent
+        /// with the same name reattaches; a cancelled call cancels the task.
+        #[arg(long)]
+        hold: bool,
     },
 
     /// Pause a running topology: checkpoint at the next tag boundary, then
@@ -371,6 +402,14 @@ enum Commands {
         #[arg(long)]
         ui: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ClaudeHookKind {
+    /// PreToolUse: deny Workflow scripts whose agents bypass the omar stand-in.
+    /// The reason it prints is the helper to route every agent() through;
+    /// `// omar:allow-native` opts a script out.
+    WorkflowGuard,
 }
 
 #[derive(Subcommand)]
@@ -554,7 +593,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     let omar_dir = omar_dir();
     match cli.command {
         Some(
-            Commands::Up(_)
+            Commands::Open { .. }
+            | Commands::Up(_)
             | Commands::Ls
             | Commands::Info
             | Commands::Attach { .. }
@@ -671,18 +711,22 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         }
         Some(Commands::Connect {
             backend: Some(name),
+            replace,
             sandbox,
         }) => {
-            let backend = crate::backend::resolve(&name).map_err(anyhow::Error::msg)?;
-            anyhow::ensure!(
-                crate::backend::ASSISTANT.contains(&backend.kind()),
-                "{} is not an agent backend to connect",
-                backend.kind().name()
-            );
+            let backend = assistant_backend(&name)?;
             if sandbox {
-                crate::sandbox::connect(backend, &config.sandbox)
+                crate::sandbox::connect(backend, &config.sandbox, replace)
             } else {
-                crate::backend::connect::host(backend)
+                crate::backend::connect::host(backend, replace)
+            }
+        }
+        Some(Commands::Disconnect { backend, sandbox }) => {
+            let backend = assistant_backend(&backend)?;
+            if sandbox {
+                crate::sandbox::disconnect(backend)
+            } else {
+                crate::backend::connect::disconnect(backend)
             }
         }
         Some(Commands::Ea {
@@ -727,12 +771,31 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             format,
             event,
         }) => supervision::run_hook(&context_file, &format, event.as_deref()),
+        Some(Commands::ClaudeHook {
+            hook: ClaudeHookKind::WorkflowGuard,
+        }) => {
+            use std::io::Read;
+            let mut raw = String::new();
+            io::stdin().take(1_048_576).read_to_string(&mut raw)?;
+            let input = serde_json::from_str(&raw).unwrap_or_default();
+            if let Some(reason) = workflow_guard_denial(&input) {
+                println!(
+                    "{}",
+                    serde_json::json!({"hookSpecificOutput":{
+                    "hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":reason}})
+                );
+            }
+            Ok(())
+        }
         Some(Commands::McpServer {
             context_file,
             bare_tool_names,
+            hold,
         }) => match context_file {
-            Some(path) => mcp::run_server_from_context_file(PathBuf::from(path), bare_tool_names),
-            None => mcp::run_server_with_default_context(bare_tool_names),
+            Some(path) => {
+                mcp::run_server_from_context_file(PathBuf::from(path), bare_tool_names, hold)
+            }
+            None => mcp::run_server_with_default_context(bare_tool_names, hold),
         },
         Some(Commands::SandboxWorker) => unreachable!(),
         Some(Commands::Checkpoint { action }) => {
@@ -795,7 +858,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
 /// `omar --help` lists commands by what they are for. The last section is
 /// what OMAR launches inside agent panes and hooks; a person never types it.
 const HELP_SECTIONS: &[(&str, &[&str])] = &[
-    ("Backends", &["connect", "backends"]),
+    ("Backends", &["connect", "disconnect", "backends"]),
     (
         "Sessions",
         &["up", "ls", "info", "attach", "logs", "down", "rm", "serve"],
@@ -822,11 +885,18 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
     ("Setup", &["setup-tmux", "help"]),
     (
         "For agents (launched by OMAR, not typed)",
-        &["agent-hook", "hook-drain", "backend-runner", "mcp-server"],
+        &[
+            "agent-hook",
+            "hook-drain",
+            "claude-hook",
+            "backend-runner",
+            "mcp-server",
+        ],
     ),
 ];
 
-/// Each backend's status, under the Backends commands in help.
+/// The connected backends, under the Backends commands in help; `omar
+/// connect` lists the rest.
 fn backends_help() -> String {
     use crate::backend::{connection, Connection};
     let mut out = String::new();
@@ -834,11 +904,15 @@ fn backends_help() -> String {
         let name = backend.kind().name();
         let next = match status {
             Connection::Connected { .. } => String::new(),
-            _ => format!("omar connect {name}"),
+            Connection::SignedOut | Connection::NotInstalled => continue,
+            Connection::Unknown { .. } => format!("omar connect {name}"),
         };
         let row = format!("    {name:<10}{:<26}{next}", connection::label(&status));
         out += row.trim_end();
         out.push('\n');
+    }
+    if out.is_empty() {
+        out += "    No backend is connected yet.\n";
     }
     out
 }
@@ -1034,7 +1108,7 @@ fn kill_agent(
     }
     let _ = client.ensure_session_not_attached(&full_name)?;
 
-    client.kill_session(&full_name)?;
+    backend::kill_worker(client, &full_name, false)?;
     let _ = scheduler.cancel_by_receiver_and_ea(name, ea_id);
     println!("Killed agent: {}", name);
     Ok(())
@@ -1527,10 +1601,21 @@ fn sync_tmux_setup_warning(app: &mut app::App) {
 }
 
 /// Interactive tmux configuration setup.
+/// The agent backend `name` names, for `omar connect` and `omar disconnect`.
+fn assistant_backend(name: &str) -> Result<&'static dyn crate::backend::Backend> {
+    let backend = crate::backend::resolve(name).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        crate::backend::ASSISTANT.contains(&backend.kind()),
+        "{} is not an agent backend to connect",
+        backend.kind().name()
+    );
+    Ok(backend)
+}
+
 /// Every assistant backend's sign-in, as a table or as JSON.
 fn backends_report(json: bool) -> String {
     let (statuses, sandboxes) = crate::backend::connection::assistants_and_sandboxes();
-    report_backends(&statuses, &sandboxes, &[], json)
+    report_backends(&statuses, &sandboxes, &[], json, true)
 }
 
 /// `omar backends`: the report for the named backends (all when none), and
@@ -1599,7 +1684,10 @@ fn check_backends(json: bool, check: bool, names: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
-    print!("{}", report_backends(&statuses, &sandboxes, &checks, json));
+    print!(
+        "{}",
+        report_backends(&statuses, &sandboxes, &checks, json, !names.is_empty())
+    );
     let failed = checks
         .iter()
         .flatten()
@@ -1617,6 +1705,7 @@ fn report_backends(
     sandboxes: &[crate::backend::Connection],
     checks: &[Option<Result<(), String>>],
     json: bool,
+    all: bool,
 ) -> String {
     use crate::backend::{connection, Connection};
     let check_of = |index: usize| checks.get(index).and_then(Option::as_ref);
@@ -1649,33 +1738,76 @@ fn report_backends(
             None => {}
         }
     }
-    // Sandboxes are opt-in: without sbx, the table is as it always was.
+    // The table lists what is connected, so it stays short however many
+    // backends OMAR supports; `omar connect` lists the rest. An unreadable
+    // status may be a working sign-in, so it is listed too, as is a sandbox
+    // sign-in. Without sbx, sandboxes are not mentioned at all.
     let sandboxed = sandboxes.iter().any(|s| *s != Connection::NotInstalled);
-    let mut out = if sandboxed {
-        format!("{:<10}{:<28}{:<20}NEXT\n", "BACKEND", "STATUS", "SANDBOX")
-    } else {
-        format!("{:<10}{:<28}NEXT\n", "BACKEND", "STATUS")
-    };
-    for ((backend, status), sandbox) in statuses.iter().zip(sandboxes) {
+    let none = Connection::NotInstalled;
+    let shown: Vec<_> = statuses
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (row, sandboxes.get(index).unwrap_or(&none)))
+        .filter(|((_, status), sandbox)| {
+            all || !matches!(status, Connection::SignedOut | Connection::NotInstalled)
+                || matches!(sandbox, Connection::Connected { .. })
+        })
+        .collect();
+    let next_of = |((backend, status), sandbox): &(
+        &(&dyn crate::backend::Backend, Connection),
+        &Connection,
+    )| {
         let name = backend.kind().name();
-        let next = match status {
-            Connection::Connected { .. } => String::new(),
+        match (status, sandbox) {
+            (Connection::Connected { .. }, Connection::SignedOut) if sandboxed => {
+                format!("omar connect {name} --sandbox")
+            }
+            (Connection::Connected { .. }, _) => String::new(),
             _ => format!("omar connect {name}"),
-        };
-        let row = if sandboxed {
-            let sandbox = match sandbox {
-                Connection::SignedOut => "not connected".to_string(),
-                other => connection::label(other),
-            };
+        }
+    };
+    let status_of =
+        |((_, status), sandbox): &(&(&dyn crate::backend::Backend, Connection), &Connection)| {
             format!(
-                "{name:<10}{:<28}{sandbox:<20}{next}",
-                connection::label(status)
+                "{}{}",
+                connection::label(status),
+                connection::sandbox_note(sandbox, false)
             )
-        } else {
-            format!("{name:<10}{:<28}{next}", connection::label(status))
         };
-        out += row.trim_end();
+    let mut out = String::new();
+    if !shown.is_empty() {
+        let next = shown.iter().any(|row| !next_of(row).is_empty());
+        // As wide as the longest status, which can be a CLI's own words.
+        let width = shown
+            .iter()
+            .map(|row| status_of(row).chars().count() + 2)
+            .max()
+            .unwrap_or(0)
+            .max(28);
+        let header = format!(
+            "{:<10}{:<width$}{}",
+            "BACKEND",
+            "STATUS",
+            if next { "NEXT" } else { "" }
+        );
+        out += header.trim_end();
         out.push('\n');
+        for row in &shown {
+            let ((backend, _), _) = row;
+            let line = format!(
+                "{:<10}{:<width$}{}",
+                backend.kind().name(),
+                status_of(row),
+                next_of(row)
+            );
+            out += line.trim_end();
+            out.push('\n');
+        }
+    }
+    if shown.is_empty() {
+        out += "No backend is connected. Use `omar connect` to add one.\n";
+    } else if shown.len() < statuses.len() {
+        out += "\nUse `omar connect` to add more backends.\n";
     }
     if !lines.is_empty() {
         out.push('\n');
@@ -2361,9 +2493,66 @@ async fn run_dashboard(config: Config, session: sessions::Session) -> Result<()>
     Ok(())
 }
 
+/// Why a Claude Code `Workflow` call must not run: one of its `agent()` calls
+/// would start a native subagent that Omar cannot see. Every call must carry
+/// `agentType: 'omar'` in its own argument list, unless the script opts out
+/// with `omar:allow-native`.
+fn workflow_guard_denial(input: &serde_json::Value) -> Option<String> {
+    static ROUTED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let script = input["tool_input"]["script"].as_str()?;
+    if input["tool_name"] != "Workflow" || script.contains("omar:allow-native") {
+        return None;
+    }
+    let routed =
+        ROUTED.get_or_init(|| regex::Regex::new(r#"agentType\s*:\s*['"`]omar['"`]"#).unwrap());
+    script
+        .match_indices("agent(")
+        .any(|(at, call)| {
+            let args = &script[at + call.len()..];
+            let mut depth = 1;
+            let end = args
+                .char_indices()
+                .find(|&(_, c)| {
+                    depth += (c == '(') as i32 - (c == ')') as i32;
+                    depth == 0
+                })
+                .map_or(args.len(), |(end, _)| end);
+            !routed.is_match(&args[..end])
+        })
+        .then(|| {
+            format!(
+                "Route every agent() through this helper: {} - or add // omar:allow-native.",
+                manager::OMAR_WORKFLOW_HELPER
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_guard_denies_only_unrouted_agent_calls() {
+        let call = |tool: &str, script: &str| {
+            workflow_guard_denial(
+                &serde_json::json!({"tool_name":tool,"tool_input":{"script":script}}),
+            )
+        };
+        assert!(call("Workflow", "await agent('hi')").is_some());
+        assert!(call("Workflow", "agent(p, {agentType: 'omar'})").is_none());
+        assert!(call("Workflow", "agent(p, {agentType: \"omar\"})").is_none());
+        assert!(call("Workflow", "// omar:allow-native\nagent(p)").is_none());
+        assert!(call("Workflow", "agent(p, {agentType:'omar'})").is_none());
+        assert!(call("Workflow", "agent(p, { agentType :`omar` })").is_none());
+        assert!(call("Workflow", "await sleep(1)").is_none());
+        // Every call is checked on its own: a helper does not vouch for a raw call.
+        let helper = manager::OMAR_WORKFLOW_HELPER;
+        assert!(call("Workflow", &format!("{helper}\nawait omar('a', 'b')")).is_none());
+        let reason = call("Workflow", &format!("{helper}\nawait agent('raw')")).unwrap();
+        assert!(reason.contains(helper));
+        assert!(call("Workflow", "agent(a, {agentType: 'omar'}); agent(b)").is_some());
+        assert!(call("Bash", "agent(p)").is_none());
+    }
 
     /// Regression: `extended-keys always` forces tmux to emit modify-other-keys
     /// sequences to every client, including omar's dashboard, which doesn't

@@ -68,7 +68,7 @@ export async function startFakeServe({
     const url = new URL(request.url, `http://${request.headers.host}`);
     const scoped = /^\/chats\/([^/]+)(\/.*)$/.exec(url.pathname);
     const chat = scoped ? chats.get(scoped[1]) : activeChat;
-    if (!chat) return json(response, 404, { error: "unknown chat" });
+    if (!chat || chat.removed) return json(response, 404, { error: "unknown chat" });
     if (scoped) url.pathname = scoped[2];
 
     if (request.method === "OPTIONS") {
@@ -396,14 +396,24 @@ export async function startFakeServe({
     }
     // The daemon starts `omar connect <name>` in a session; here, pressing
     // Enter in its terminal stands for finishing the sign-in.
-    const connect = /^\/v1\/backends\/([^/]+)\/connect$/.exec(url.pathname);
+    // A replace or sign-out ends its session when done, as `omar connect
+    // --replace` and `omar disconnect` do.
+    const connect = /^\/v1\/backends\/([^/]+)\/(connect|disconnect)$/.exec(url.pathname);
     if (request.method === "POST" && connect) {
       return readBody(request).then((body) => {
         if (!(connect[1] in backendStatus)) {
           return json(response, 404, { error: `'${connect[1]}' is not an assistant backend` });
         }
         // `--sandbox`: Enter in the terminal stores a key for sandboxes instead.
-        sandboxSignIns[connect[1]] = JSON.parse(body || "{}").sandbox === true;
+        const request = JSON.parse(body || "{}");
+        signInActions[connect[1]] =
+          connect[2] === "disconnect"
+            ? "disconnect"
+            : request.sandbox
+              ? "sandbox"
+              : request.replace
+                ? "replace"
+                : "connect";
         return json(response, 200, { terminal: `/v1/backends/${connect[1]}/terminal` });
       });
     }
@@ -464,15 +474,53 @@ export async function startFakeServe({
         return json(response, 202, { status: "delivered" });
       });
     }
+    if (url.pathname === "/v1/workflow") {
+      if (request.method === "GET") return json(response, 200, chat.workspace);
+      if (request.method === "POST") {
+        const update = JSON.parse(await readBody(request));
+        const edits = update.draft != null || update.clear_draft === true;
+        if (edits && update.revision !== chat.workspace.revision) return json(response, 409, { error: "This workflow changed in another tab. Reload before saving; your local edits have been kept." });
+        const sequence = chat.messages.filter(message => message.design).at(-1)?.sequence ?? 0;
+        if (update.draft && update.draft.proposal_sequence !== sequence) return json(response, 409, { error: "A newer proposal is available. Reload before saving your edits." });
+        if (update.name != null) chat.workspace.name = update.name.trim();
+        if (update.draft != null) chat.workspace.draft = update.draft;
+        if (update.clear_draft) chat.workspace.draft = null;
+        if (edits) chat.workspace.revision++;
+        chat.updated_at = Date.now();
+        return json(response, 200, chat.workspace);
+      }
+    }
     // Operator/EA conversation.
-    if (request.method === "GET" && url.pathname === "/v1/chats") {
-      return json(response, 200, { active_id: activeChat.id, conversations: [...chats.values()].map(chatSummary).sort((a, b) => b.updated_at - a.updated_at) });
+    if (request.method === "GET" && url.pathname === "/v1/chats") return json(response, 200, historyListing());
+    if (request.method === "GET" && ["/v1/chats/removed", "/v1/chats/archived"].includes(url.pathname)) return json(response, 200, {conversations:[...chats.values()].filter(chat => chat.removed && !chat.deleted).map(chatSummary)});
+    if (request.method === "POST" && /^\/v1\/chats\/[^/]+\/(remove|archive|restore|delete)$/.test(url.pathname)) {
+      const body = JSON.parse(await readBody(request));
+      const target = chats.get(url.pathname.split("/")[3]);
+      if (!target || target.deleted) return json(response, 404, {error:"unknown chat"});
+      if (url.pathname.endsWith("/delete")) {
+        if (body.confirm !== true) return json(response, 400, {error:"Confirm permanent deletion."});
+        if (!target.removed) return json(response, 409, {error:"Archive this workflow before deleting it."});
+        target.deleted = true;
+        target.title = "";
+        target.messages = [];
+        target.workspace = {revision:0,name:null,draft:null};
+        return json(response, 200, historyListing());
+      }
+      const removed = !url.pathname.endsWith("/restore");
+      if (removed && (target.busy || ["starting","running","stopping","pausing","paused"].includes(target.run?.status))) return json(response, 409, {error:"Stop this workflow before archiving it."});
+      target.removed = removed;
+      if (!removed) target.updated_at = Date.now();
+      if (activeChat.removed) {
+        activeChat = [...chats.values()].filter(chat => !chat.removed).sort((a,b) => b.updated_at-a.updated_at)[0] || newChat();
+        chats.set(activeChat.id, activeChat);
+      }
+      return json(response, 200, historyListing());
     }
     if (request.method === "POST" && (url.pathname === "/v1/chats" || /^\/v1\/chats\/[^/]+\/activate$/.test(url.pathname))) {
       await readBody(request);
       const id = url.pathname === "/v1/chats" ? null : url.pathname.split("/")[3];
       const next = id ? chats.get(id) : newChat();
-      if (!next) return json(response, 404, { error: "unknown chat" });
+      if (!next || next.removed) return json(response, 404, { error: "unknown chat" });
       activeChat = next;
       chats.set(next.id, next);
       return json(response, 200, chatSummary(next));
@@ -570,13 +618,21 @@ export async function startFakeServe({
         if (signIn) {
           typed += data.toString();
           if (typed.includes("\r")) {
-            if (sandboxSignIns[agent]) {
-              sandboxStatus[agent] = { status: "connected", via: "fake key" };
+            const action = signInActions[agent];
+            if (action === "disconnect") {
+              backendStatus[agent] = { status: "signed_out" };
+            } else if (action === "sandbox") {
+              sandboxStatus[agent] = { status: "connected", via: "anthropic key" };
             } else {
-              backendStatus[agent] = { status: "connected", via: "fake sign-in" };
+              backendStatus[agent] = { status: "connected", via: typed.startsWith("work") ? "work account" : "fake sign-in" };
               rejectedKeys[agent] = typed.startsWith("bad");
             }
             typed = "";
+            if (action !== "connect") {
+              client.send(Buffer.from(data));
+              client.close(1000, "ended");
+              return;
+            }
           }
         }
         client.send(Buffer.from(data));
@@ -589,7 +645,7 @@ export async function startFakeServe({
   let backend = "codex";
   /** Whether a run that says nothing runs in sandboxes (`[sandbox] enabled`). */
   const sandboxDefault = process.env.FAKE_SANDBOX_DEFAULT === "1";
-  /** Each backend's key for sandboxes, and which sign-in each terminal runs. */
+  /** Each backend's key for sandboxes. */
   const sandboxStatus = {
     claude: { status: "signed_out" },
     codex: { status: "connected", via: "ChatGPT" },
@@ -598,9 +654,10 @@ export async function startFakeServe({
     pi: { status: "signed_out" },
     agy: { status: "signed_out" },
   };
-  const sandboxSignIns = {};
   /** Backends signed in with a key the test prompt finds rejected. */
   const rejectedKeys = {};
+  /** What each backend's open terminal does: connect, replace, disconnect or sandbox. */
+  const signInActions = {};
   /** Each backend's status; a sign-in in its terminal connects it. */
   const backendStatus = {
     claude: { status: "connected", via: "Claude Max" },
@@ -611,13 +668,14 @@ export async function startFakeServe({
     agy: { status: "not_installed" },
   };
   function newChat() {
-    return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map() };
+    return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map(), workspace: { revision: 0, name: null, draft: null } };
   }
   let activeChat = newChat();
   const chats = new Map([[activeChat.id, activeChat]]);
   function chatSummary(value = activeChat) {
-    return { id: value.id, title: value.title, created_at: value.created_at, updated_at: value.updated_at, message_count: value.messages.length, ea_id: [...chats.keys()].indexOf(value.id), busy: value.busy, run: value.run ?? null };
+    return { id: value.id, title: value.title, created_at: value.created_at, updated_at: Math.max(value.updated_at, (value.run?.started_at ?? 0) * 1000, value.run?.activity_at ?? 0), workflow_name: value.workspace.name, message_count: value.messages.length, ea_id: [...chats.keys()].indexOf(value.id), busy: value.busy, run: value.run ?? null };
   }
+  function historyListing() { return { active_id: activeChat.id, conversations: [...chats.values()].filter(chat => !chat.removed).map(chatSummary).sort((a, b) => b.updated_at - a.updated_at), removed_ids: [...chats.values()].filter(chat => chat.removed).map(chat => chat.id) }; }
   const agentToken = randomUUID();
 
   function publishChat(role, text, design, progress = false, selection = [], chat = activeChat) {

@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
-use super::{connection, Connection, Login};
+use super::{connection, Connection, Login, SignInHome};
 use super::{detect, detect_token, Backend, Kind, Launch};
 use super::{managed, NotReady, PaneSetup, WRITE_TIMEOUT};
 use crate::manager::{
@@ -83,6 +83,15 @@ impl Backend for Codex {
             note: None,
         })
     }
+    /// `codex login` deletes `auth.json` as it starts, so an abandoned
+    /// replace would leave Codex signed out.
+    fn sign_in_home(&self) -> Option<SignInHome> {
+        Some(SignInHome {
+            var: "CODEX_HOME",
+            dir: codex_home().ok()??,
+            files: &["auth.json"],
+        })
+    }
     /// The check runs in an empty directory, which is no git repository.
     fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
         Some(vec![
@@ -94,6 +103,16 @@ impl Backend for Codex {
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         let socket = from_stamp(target.stamp?)?;
         CodexSession::open(&socket).ok()?.only_thread().ok()
+    }
+    fn forget(&self, target: &super::Target<'_>) {
+        let Some(socket) = target.stamp.and_then(from_stamp) else {
+            return;
+        };
+        let _ = (|| {
+            let mut session = CodexSession::open(&socket)?;
+            let thread = session.only_thread()?;
+            session.call("thread/delete", serde_json::json!({ "threadId": thread }))
+        })();
     }
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["OpenAI Codex"]
@@ -156,19 +175,7 @@ impl Backend for Codex {
     /// select the caller's normal Codex home explicitly.
     fn prepare_pane(&self, _session: &str, command: &str) -> Result<PaneSetup> {
         let mut setup = PaneSetup::interactive(command);
-        let home = std::env::var_os("CODEX_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-            .map(|home| {
-                if home.is_absolute() {
-                    Ok(home)
-                } else {
-                    std::env::current_dir().map(|cwd| cwd.join(home))
-                }
-            })
-            .transpose()?;
-        if let Some(home) = home {
+        if let Some(home) = codex_home()? {
             setup
                 .env
                 .push(("CODEX_HOME".to_string(), home.display().to_string()));
@@ -637,6 +644,22 @@ pub(crate) fn only_thread(listed: &serde_json::Value) -> Option<String> {
 }
 
 /// `codex login status` answers in a sentence, on stderr.
+/// The operator's Codex home: `CODEX_HOME`, or Codex's default.
+pub(crate) fn codex_home() -> std::io::Result<Option<PathBuf>> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .map(|home| {
+            if home.is_absolute() {
+                Ok(home)
+            } else {
+                std::env::current_dir().map(|cwd| cwd.join(home))
+            }
+        })
+        .transpose()
+}
+
 fn login_status(text: &str) -> Connection {
     if text.contains("Not logged in") {
         return Connection::SignedOut;
@@ -647,6 +670,13 @@ fn login_status(text: &str) -> Connection {
     {
         Some(via) if via.starts_with("an API key") => Connection::connected("API key"),
         Some(via) => Connection::connected(via.trim()),
+        // Codex 0.167 and later, for a key it has not tried yet.
+        None if text
+            .lines()
+            .any(|line| line.trim().starts_with("API key configured")) =>
+        {
+            Connection::connected("API key")
+        }
         None => Connection::unknown("`codex login status` gave no answer OMAR knows"),
     }
 }
@@ -662,6 +692,12 @@ mod tests {
         );
         assert_eq!(
             login_status("Logged in using an API key - sk-proj-***ABCD"),
+            Connection::connected("API key")
+        );
+        assert_eq!(
+            login_status(
+                "API key configured - sk-dummy***gn-in\nAuthentication is checked when you send a request.\n"
+            ),
             Connection::connected("API key")
         );
         assert_eq!(
@@ -888,6 +924,10 @@ mod tests {
                     &request,
                     serde_json::json!({ "data": threads, "nextCursor": null }),
                 ),
+                "thread/delete" => {
+                    answer(&mut socket, &request, serde_json::json!({}));
+                    return asked;
+                }
                 "turn/start" => {
                     // Notifications can interleave with the acknowledgement,
                     // including completion of a previously active turn.
@@ -962,6 +1002,24 @@ mod tests {
         );
         // Every request is JSON-RPC; a notification carries no id.
         assert_eq!(asked[1].get("id"), None);
+    }
+
+    #[test]
+    fn forgetting_a_worker_deletes_its_one_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("forget.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || fake_app_server(listener, vec!["thread-1"]));
+        let stamp = format!("codex:{}", socket.display());
+        Codex.forget(&super::super::Target {
+            name: "pane",
+            pane_pid: 0,
+            stamp: Some(&stamp),
+        });
+        let last: serde_json::Value =
+            serde_json::from_str(server.join().unwrap().last().unwrap()).unwrap();
+        assert_eq!(last["method"], "thread/delete");
+        assert_eq!(last["params"], serde_json::json!({"threadId": "thread-1"}));
     }
 
     #[test]

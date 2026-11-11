@@ -30,10 +30,7 @@ impl Backend for Pi {
     /// store (names only), then the keys most people sign in with. The one
     /// place OMAR opens a credential file.
     fn connection(&self, _program: &str) -> Connection {
-        let dir = std::env::var_os("PI_CODING_AGENT_DIR")
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".pi").join("agent")));
-        let store = match dir {
+        let store = match agent_dir() {
             Some(dir) => std::fs::read_to_string(dir.join("auth.json")),
             None => Err(std::io::ErrorKind::NotFound.into()),
         };
@@ -139,8 +136,13 @@ fn launch_command(launch: &Launch<'_>) -> Result<String> {
     let binary = omar_server_exe().context("OMAR executable")?;
     let (_, end) = super::executable(launch.base_command).context("Pi executable")?;
     let mut command = format!(
-        "{} --approve{}",
+        "{} --approve{}{}",
         &launch.base_command[..end],
+        if super::ephemeral_worker(context) {
+            " --no-session"
+        } else {
+            ""
+        },
         &launch.base_command[end..]
     );
     if !shlex::split(launch.base_command)
@@ -181,6 +183,13 @@ fn store_connection(store: std::io::Result<String>, env: Option<String>) -> Conn
         (Ok(_), None) => Connection::SignedOut,
         (Err(reason), None) => Connection::unknown(reason),
     }
+}
+
+/// Where pi keeps its `auth.json`.
+pub(crate) fn agent_dir() -> Option<PathBuf> {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".pi").join("agent")))
 }
 
 /// `auth.json` maps each provider signed in through `/login` to its credential.
@@ -272,6 +281,8 @@ mod tests {
         context.agent_name = Some("worker".into());
         let worker = crate::manager::build_agent_command("pi", &prompt, &[], &context);
         assert!(!worker.contains("--session"));
+        assert!(worker.contains("pi --approve --no-session"), "{worker}");
+        assert!(!command.contains("--no-session"));
         assert_ne!(launch_socket(&command), launch_socket(&worker));
         context.agent_name = None;
         std::fs::remove_file(session).unwrap();

@@ -257,6 +257,20 @@ pub fn label(connection: &Connection) -> String {
     }
 }
 
+/// How a backend stands for sandboxes, said after its host sign-in. Its
+/// sandbox sign-in is its own, in sbx's store: the host's when that is an API
+/// key, but a subscription other than ChatGPT cannot cross into a sandbox.
+/// `missing` also says when it has none.
+pub fn sandbox_note(sandbox: &Connection, missing: bool) -> String {
+    match sandbox {
+        Connection::Connected { via: Some(via) } => format!(" · sandboxes: {via}"),
+        Connection::Connected { via: None } => " · sandboxes too".to_string(),
+        Connection::SignedOut if missing => " · sandboxes: not connected".to_string(),
+        Connection::Unknown { reason } => format!(" · sandboxes: ? {reason}"),
+        _ => String::new(),
+    }
+}
+
 /// One backend as the CLI, MCP and Mission Control report it.
 pub fn describe(backend: &dyn Backend, connection: &Connection) -> serde_json::Value {
     let mut value = serde_json::to_value(connection).expect("a connection serializes");

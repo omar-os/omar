@@ -85,9 +85,23 @@ elif args[:2] == ["diagnose", "--json"]:
     # Like sbx, a failed check fails the command.
     if status == "fail": sys.exit(1)
 elif args[:2] == ["secret", "set"]:
-    pass
+    # Like sbx: the key from stdin (a terminal's prompt is not faked), and
+    # never over one already stored.
+    service = args[2]
+    secrets, stored = faults.setdefault("SECRETS", []), faults.setdefault("STORED", {})
+    if service in secrets: sys.exit(f"{service} secret already exists. Overwrite? (y/N) Cancelled")
+    secrets.append(service)
+    stored[service] = "oauth" if "--oauth" in args else sys.stdin.read()
+    json.dump(faults, open(os.environ["FAKE_TOGGLES"], "w"))
+elif args[:2] == ["secret", "rm"]:
+    if args[2] not in faults.get("SECRETS", []): sys.exit(f"no {args[2]} secret")
+    faults["SECRETS"].remove(args[2])
+    faults.get("STORED", {}).pop(args[2], None)
+    json.dump(faults, open(os.environ["FAKE_TOGGLES"], "w"))
 elif args[:2] == ["secret", "ls"]:
-    print(json.dumps({"secrets": [{"scope": "global", "type": "service", "name": n, "secret": "sk-****"}
+    stored = faults.get("STORED", {})
+    print(json.dumps({"secrets": [{"scope": "global", "type": "service", "name": n,
+                                   "secret": "oauth-token" if stored.get(n) == "oauth" else "sk-****"}
                                   for n in faults.get("SECRETS", [])]}))
 elif args == ["version"]:
     print("sbx version fake")
@@ -159,8 +173,12 @@ total = Some(self.count);
                   {"op": "declare_instance", "name": "c", "team": "Writer", "parent": ""},
                   {"op": "spawn_agent", "instance": "c", "name": "c.agent", "backend": "claude"},
                   {"op": "commit_plan"}]
+        codex = [{"op": "begin_plan", "team": "SandboxCodex"},
+                 {"op": "declare_instance", "name": "c", "team": "Writer", "parent": ""},
+                 {"op": "spawn_agent", "instance": "c", "name": "c.agent", "backend": "codex"},
+                 {"op": "commit_plan"}]
         for name, team, plan in [("program", "SandboxTeams", instructions), ("ticker", "SandboxTicker", ticker),
-                                 ("claude", "SandboxClaude", claude)]:
+                                 ("claude", "SandboxClaude", claude), ("codex", "SandboxCodex", codex)]:
             (root / (name + ".json")).write_text(json.dumps(dict(version=1, team=team, instructions=plan)))
             (source / (name + ".omar")).write_text("// Compiler-fixture input\n")
         program, ticker_program = source / "program.omar", source / "ticker.omar"
@@ -174,8 +192,15 @@ total = Some(self.count);
                    FAKE_BOXES=str(boxes), FAKE_CALLS=str(calls), FAKE_TOGGLES=str(toggles),
                    CARGO_HOME=os.environ.get("CARGO_HOME", str(Path.home()/".cargo")),
                    RUSTUP_HOME=os.environ.get("RUSTUP_HOME", str(Path.home()/".rustup")))
-        for key in ("TMUX", "TMUX_PANE", "OMAR_TMUX_SERVER", "OMAR_SESSION_ID", "OMAR_STATE_DIR", "OMAR_HOME", "OMAR_EA_ID", "XDG_CONFIG_HOME"):
+        for key in ("TMUX", "TMUX_PANE", "OMAR_TMUX_SERVER", "OMAR_SESSION_ID", "OMAR_STATE_DIR", "OMAR_HOME", "OMAR_EA_ID", "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME", "CODEX_HOME", "PI_CODING_AGENT_DIR", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CURSOR_API_KEY",
+                    "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
             env.pop(key, None)
+        # Host CLIs whose sign-in the test sets: never the developer's own.
+        def host_cli(name, status):
+            path = shims / name
+            path.write_text("#!/bin/sh\n[ \"$1\" = --version ] && exit 0\n" + status + "\nexec sleep 300\n")
+            path.chmod(0o700)
         runtime = json.loads(subprocess.run([str(BIN), "up", "--no-ea", "--name", "sandboxes", "--json"], cwd=source,
                                             env=env, text=True, capture_output=True, timeout=90, check=True).stdout)
         state_root = Path(runtime["directory"])
@@ -362,9 +387,12 @@ total = Some(self.count);
                                                 "login": "omar connect claude --sandbox"}
             # `omar connect --sandbox` signs sbx in first, then reuses the
             # stored key rather than asking for another.
-            def connect(name):
-                return subprocess.run([str(BIN), "connect", name, "--sandbox"], env=env, text=True,
+            def connect(name, *flags, **extra):
+                return subprocess.run([str(BIN), "connect", name, "--sandbox", *flags], env={**env, **extra}, text=True,
                                       stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+            def stored():
+                return json.loads(toggles.read_text()).get("STORED", {})
+            credentials = home / ".config" / "sbx" / "credentials.yaml"
             def called(verb, since):
                 return [c for c in entries(since) if c[:len(verb)] == verb]
             before = len(entries())
@@ -385,6 +413,51 @@ total = Some(self.count);
             refused = connect("claude")
             assert refused.returncode != 0 and "401 invalid key" in refused.stdout + refused.stderr, refused
             assert called(["secret", "set", "anthropic"], before), entries()[before:]
+            # An API key the host signs in with is reused, through sbx's
+            # stdin, never its command line.
+            fault()
+            reused = connect("claude", ANTHROPIC_API_KEY="sk-host")
+            assert reused.returncode == 0, reused
+            assert "Using claude's API key from this machine ($ANTHROPIC_API_KEY) for sandboxes." in reused.stdout, reused
+            assert stored() == {"anthropic": "sk-host"} and not any("sk-host" in c for c in entries())
+            assert sandbox_status("claude")["via"] == "anthropic key"
+            # Disconnecting removes sbx's key and the kit's approval to use it.
+            out = subprocess.run([str(BIN), "disconnect", "claude", "--sandbox"], env=env, text=True,
+                                 capture_output=True, timeout=60)
+            assert "✓ claude disconnected from sandboxes (sbx's anthropic key removed)" in out.stdout, out
+            assert stored() == {} and "anthropic" not in credentials.read_text()
+            assert sandbox_status("claude")["status"] == "signed_out"
+            # A subscription cannot cross into a sandbox: said, then a key of
+            # the sandboxes' own is asked for, so the backend has two sign-ins.
+            host_cli("claude", '[ "$1 $2" = "auth status" ] && echo \'{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}\' && exit 0')
+            before = len(entries())
+            two = connect("claude")
+            assert two.returncode == 0, two
+            assert "claude is signed in here with Claude Max, which sandboxes cannot use; they need an API key." in two.stdout, two
+            assert called(["secret", "set", "anthropic"], before), entries()[before:]
+            assert "claude now has two sign-ins: Claude Max on this machine, anthropic key in sandboxes." in two.stdout, two
+            (shims / "claude").unlink()
+            # Codex's ChatGPT can be signed in afresh for sandboxes.
+            host_cli("codex", '[ "$1 $2" = "login status" ] && echo "Logged in using ChatGPT" && exit 0')
+            before = len(entries())
+            chatgpt = connect("codex")
+            assert chatgpt.returncode == 0, chatgpt
+            assert "codex is signed in here with ChatGPT; sandboxes need a sign-in of their own." in chatgpt.stdout, chatgpt
+            assert called(["secret", "set", "openai", "--oauth"], before), entries()[before:]
+            assert sandbox_status("codex")["via"] == "ChatGPT"
+            # A run reuses the host's API key on its way, and says so.
+            fault()
+            credentials.write_text("bindings:\n")
+            (home / ".codex").mkdir(exist_ok=True)
+            (home / ".codex" / "auth.json").write_text('{"OPENAI_API_KEY": "sk-codex"}')
+            host_cli("codex", '[ "$1 $2" = "login status" ] && echo "Logged in using an API key - sk-***" && exit 0')
+            started = omar("run", str(source / "codex.omar"), "--sandbox")
+            assert started.returncode == 0, started
+            assert "Using codex's API key from this machine (codex's API key sign-in) for sandboxes." in started.stderr, started
+            assert stored() == {"openai": "sk-codex"}
+            ok("stop", json.loads(started.stdout)["run_id"])
+            (home / ".codex" / "auth.json").unlink()
+            (shims / "codex").unlink()
             before = len(entries())
             fault()
             # A named template is required, never silently replaced by the host.
@@ -409,7 +482,7 @@ total = Some(self.count);
             result = omar(*plain, "--no-sandbox", session=enabled["name"])
             assert result.returncode == 0, result
             assert not creates_since(before)
-            print("PASS: per-team workers, shared file order, native backend delivery, exact mounts, protected history, cleanup, pause/resume, opt-in (--sandbox), backend keys and status, connect signs sbx in and keeps a working key, required template, enabled default kit, opt-out")
+            print("PASS: per-team workers, shared file order, native backend delivery, exact mounts, protected history, cleanup, pause/resume, opt-in (--sandbox), backend keys and status, connect signs sbx in and keeps a working key, reuses a host API key, keeps a subscription beside a sandbox key, disconnects, required template, enabled default kit, opt-out")
         except BaseException:
             log = state_root / "logs" / "runtime.log"
             if log.exists():

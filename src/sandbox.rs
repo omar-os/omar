@@ -58,26 +58,27 @@ pub fn validate_template(template: &str) -> Result<()> {
 /// The template a run's teams execute in, or `None` for the host. Sandboxes
 /// are opt-in: the run asking (`sandbox`, or naming a template), a configured
 /// template, or `enabled = true` requires them, and an unready host is an
-/// error. `disabled` (the run's `--no-sandbox`) wins.
+/// error. `disabled` (the run's `--no-sandbox`) wins. Beside it, what
+/// getting ready did, for the operator to be told.
 pub fn select(
     sandbox: bool,
     requested: Option<&str>,
     disabled: bool,
     config: &Config,
     backends: &[&str],
-) -> Result<Option<String>> {
+) -> Result<(Option<String>, Vec<String>)> {
     let asked = sandbox || requested.is_some();
     let configured = config.enabled != Some(false)
         && (config.template.is_some() || config.enabled == Some(true));
     if disabled || !(asked || configured) {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     }
     let template = requested
         .or(config.template.as_deref())
         .unwrap_or(DEFAULT_TEMPLATE);
     validate_template(template)?;
-    ready(backends)?;
-    Ok(Some(template.to_owned()))
+    let notes = ready(backends)?;
+    Ok((Some(template.to_owned()), notes))
 }
 
 /// Services whose key, in sbx's store and approved for kits, lets a backend
@@ -112,8 +113,10 @@ fn services(backend: &str) -> Result<&'static [&'static str]> {
 
 /// Docker Sandboxes can run these backends here: sbx installed, signed in,
 /// virtualization usable, a worker binary to install, and a key for each
-/// backend connected for sandboxes (`omar connect <backend> --sandbox`).
-fn ready(backends: &[&str]) -> Result<()> {
+/// backend connected for sandboxes (`omar connect <backend> --sandbox`). A
+/// backend that signs in here with an API key is connected with it on the
+/// way; what that did is returned, to be said.
+fn ready(backends: &[&str]) -> Result<Vec<String>> {
     let needs = backends
         .iter()
         .map(|backend| Ok((*backend, services(backend)?)))
@@ -135,16 +138,25 @@ fn ready(backends: &[&str]) -> Result<()> {
             );
         }
     }
+    let mut notes = Vec::new();
     if needs.iter().all(|(_, services)| services.is_empty()) {
-        return Ok(());
+        return Ok(notes);
     }
-    let keys = stored_keys()?;
+    let mut keys = stored_keys()?;
     for (backend, services) in needs {
-        if !services.is_empty() && usable(services, &keys).is_none() {
-            bail!("{}", not_connected(backend));
+        if services.is_empty() || usable(services, &keys).is_some() {
+            continue;
         }
+        let found = crate::backend::by_name(backend).and_then(|b| host_key(b).map(|key| (b, key)));
+        let Some((found, key)) = found else {
+            bail!("{}", not_connected(backend));
+        };
+        store(key.service, &key.key)?;
+        bind(services)?;
+        keys = stored_keys()?;
+        notes.push(reusing(found.kind().name(), &key));
     }
-    Ok(())
+    Ok(notes)
 }
 
 /// Why a backend's agents cannot start in a sandbox, and what fixes it.
@@ -171,6 +183,8 @@ struct Key {
     service: &'static str,
     api_key: &'static [&'static str],
     oauth: &'static [&'static str],
+    /// Where the host's CLIs read this key from the environment.
+    env: &'static [&'static str],
 }
 
 const KEYS: &[Key] = &[
@@ -178,43 +192,171 @@ const KEYS: &[Key] = &[
         service: "anthropic",
         api_key: &["api.anthropic.com"],
         oauth: &[],
+        env: &["ANTHROPIC_API_KEY"],
     },
     Key {
         service: "openai",
         api_key: &["api.openai.com"],
         oauth: &["auth.openai.com", "chatgpt.com"],
+        env: &["OPENAI_API_KEY"],
     },
     Key {
         service: "cursor",
         api_key: &["api2.cursor.sh", "api3.cursor.sh", "repo42.cursor.sh"],
         oauth: &[],
+        env: &["CURSOR_API_KEY"],
     },
     Key {
         service: "google",
         api_key: &["generativelanguage.googleapis.com"],
         oauth: &[],
+        env: &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     },
     Key {
         service: "openrouter",
         api_key: &["openrouter.ai"],
         oauth: &[],
+        env: &["OPENROUTER_API_KEY"],
     },
     Key {
         service: "xai",
         api_key: &["api.x.ai"],
         oauth: &[],
+        env: &["XAI_API_KEY"],
     },
     Key {
         service: "mistral",
         api_key: &["api.mistral.ai"],
         oauth: &[],
+        env: &["MISTRAL_API_KEY"],
     },
     Key {
         service: "groq",
         api_key: &["api.groq.com"],
         oauth: &[],
+        env: &["GROQ_API_KEY"],
     },
 ];
+
+/// An API key the host's sign-in already has, which a sandbox can use as it
+/// is: the sbx service it goes under, the key, and where it was found.
+struct HostKey {
+    service: &'static str,
+    key: String,
+    from: String,
+}
+
+/// The API key `backend` signs in with on this machine, if it signs in with
+/// one: from the environment, which every CLI puts first, else from the
+/// CLI's own store. A subscription is no key; it cannot cross into a
+/// sandbox, though Codex's ChatGPT can be signed in there afresh.
+fn host_key(backend: &dyn crate::backend::Backend) -> Option<HostKey> {
+    use crate::backend::Kind;
+    let name = backend.kind().name();
+    let services = services(name).ok()?;
+    let entry = |service: &str| KEYS.iter().find(|key| key.service == service);
+    for service in services {
+        for var in entry(service).map_or(&[][..], |key| key.env) {
+            if let Some(key) = std::env::var(var).ok().filter(|key| !key.trim().is_empty()) {
+                return Some(HostKey {
+                    service: entry(service)?.service,
+                    key,
+                    from: format!("${var}"),
+                });
+            }
+        }
+    }
+    let read = |path: PathBuf| -> Option<Value> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    };
+    match backend.kind() {
+        Kind::Codex => {
+            let auth = read(crate::backend::codex::codex_home().ok()??.join("auth.json"))?;
+            let key = auth["OPENAI_API_KEY"]
+                .as_str()
+                .filter(|key| !key.is_empty())?;
+            Some(HostKey {
+                service: "openai",
+                key: key.to_owned(),
+                from: "codex's API key sign-in".to_owned(),
+            })
+        }
+        // A provider each keeps beside its OAuth sign-ins: pi's `api_key`
+        // and opencode's `api` entries.
+        Kind::Pi | Kind::Opencode => {
+            let path = if backend.kind() == Kind::Pi {
+                crate::backend::pi::agent_dir()?.join("auth.json")
+            } else {
+                std::env::var_os("XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))?
+                    .join("opencode")
+                    .join("auth.json")
+            };
+            let auth = read(path)?;
+            services.iter().find_map(|service| {
+                let stored = &auth[*service];
+                matches!(stored["type"].as_str(), Some("api_key" | "api")).then_some(())?;
+                let key = stored["key"].as_str().filter(|key| !key.is_empty())?;
+                Some(HostKey {
+                    service: entry(service)?.service,
+                    key: key.to_owned(),
+                    from: format!("{name}'s {service} key"),
+                })
+            })
+        }
+        _ => None,
+    }
+}
+
+/// What reusing a host key is called, said as it happens.
+fn reusing(name: &str, key: &HostKey) -> String {
+    format!(
+        "Using {name}'s API key from this machine ({}) for sandboxes.",
+        key.from
+    )
+}
+
+/// Give sbx `key` for `service` through its stdin, so it is never on a
+/// command line. sbx asks before replacing one, so a stored one goes first,
+/// and with it the kit's approval, which was for that kind of key.
+fn store(service: &str, key: &str) -> Result<()> {
+    if stored_keys()?
+        .stored
+        .iter()
+        .any(|(name, _)| name == service)
+    {
+        remove(service)?;
+    }
+    let mut child = command()
+        .args(["secret", "set", service])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("start sbx")?;
+    child
+        .stdin
+        .take()
+        .context("sbx's stdin")?
+        .write_all(key.as_bytes())?;
+    let output = child.wait_with_output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`sbx secret set {service}` {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+/// Remove sbx's key for `service`, and OMAR's kit's approval to use it.
+fn remove(service: &str) -> Result<()> {
+    let mut cmd = command();
+    cmd.args(["secret", "rm", service, "-f"]);
+    checked(cmd, Duration::from_secs(30))?;
+    unbind(service)
+}
 
 /// What sbx holds: each stored service, `true` when it is an OAuth sign-in,
 /// and which services `credentials.yaml` approves.
@@ -297,9 +439,15 @@ pub fn connections(backends: &[&dyn crate::backend::Backend]) -> Vec<Connection>
 /// `omar connect <backend> --sandbox`: give sbx a key the backend's agents
 /// use from a sandbox, approve OMAR's kit to use it, and prove it works the
 /// way a host sign-in is proved, by a test prompt, here inside a throwaway
-/// sandbox. The key goes into sbx's store through sbx's own prompt; OMAR
-/// never sees it.
-pub fn connect(backend: &dyn crate::backend::Backend, config: &Config) -> Result<()> {
+/// sandbox. A key that already works is kept unless `replace`. The host's
+/// own API key is reused; a subscription cannot be, so sbx's own prompt asks
+/// for a key (or, for Codex, a ChatGPT sign-in of the sandboxes' own), which
+/// OMAR never sees.
+pub fn connect(
+    backend: &dyn crate::backend::Backend,
+    config: &Config,
+    replace: bool,
+) -> Result<()> {
     let name = backend.kind().name();
     let services = services(name)?;
     anyhow::ensure!(!services.is_empty(), "{name} needs no key in sandboxes");
@@ -331,38 +479,27 @@ pub fn connect(backend: &dyn crate::backend::Backend, config: &Config) -> Result
     // A key stored with sbx directly, not yet approved for OMAR's kit.
     bind(services)?;
     let mut checked = false;
-    if usable(services, &stored_keys()?).is_some() {
+    if !replace && usable(services, &stored_keys()?).is_some() {
         match check(backend) {
             Ok(()) => checked = true,
             Err(Failed::Sandbox(error)) => bail!("{error}"),
             Err(Failed::Prompt(error)) => println!("{error}\nGiving sbx a new key for {name}."),
         }
     }
+    // Set when the host signs in another way, so it keeps two sign-ins.
+    let mut host = None;
     if !checked {
-        let (args, note): (&[&str], &str) = match backend.kind() {
-            crate::backend::Kind::Claude => (
-                &["secret", "set", "anthropic"],
-                "Paste an Anthropic API key (console.anthropic.com). A Claude subscription cannot be used in sandboxes.",
-            ),
-            crate::backend::Kind::Codex => (
-                &["secret", "set", "openai", "--oauth"],
-                "Sign in with ChatGPT. Over SSH, forward port 1455 (ssh -L 1455:localhost:1455) or curl the callback URL on this machine.",
-            ),
-            crate::backend::Kind::Cursor => (
-                &["secret", "set", "cursor"],
-                "Paste a Cursor API key (cursor.com/dashboard → Integrations).",
-            ),
-            crate::backend::Kind::Antigravity => (
-                &["secret", "set", "google"],
-                "Paste a Gemini API key (aistudio.google.com/apikey).",
-            ),
-            _ => (
-                &["secret", "set"],
-                "Pick a model provider and paste its API key.",
-            ),
-        };
-        println!("{note}");
-        interactive(args)?;
+        match host_key(backend) {
+            Some(key) => {
+                println!("{}", reusing(name, &key));
+                store(key.service, &key.key)?;
+            }
+            None => host = sign_in(backend)?,
+        }
+        // The new key may be of another kind than the approval it replaces.
+        for service in services {
+            unbind(service)?;
+        }
         bind(services)?;
     }
     let Some(via) = usable(services, &stored_keys()?) else {
@@ -373,11 +510,109 @@ pub fn connect(backend: &dyn crate::backend::Backend, config: &Config) -> Result
             Ok(()) => {}
             Err(Failed::Sandbox(error)) => bail!("{error}"),
             Err(Failed::Prompt(error)) => {
-                bail!("{error}; run `omar connect {name} --sandbox` to give sbx a new key")
+                bail!(
+                    "{error}; run `omar connect {name} --sandbox --replace` to give sbx a new key"
+                )
             }
         }
     }
     println!("✓ {name} connected for sandboxes ({via})");
+    if let Some(host) = host {
+        println!("{name} now has two sign-ins: {host} on this machine, {via} in sandboxes.");
+    } else if checked {
+        println!("To give sandboxes another key: omar connect {name} --sandbox --replace");
+    }
+    Ok(())
+}
+
+/// Ask for a sandbox sign-in through sbx's own prompt, after saying why the
+/// host's cannot be reused; the host's sign-in, when it has one.
+fn sign_in(backend: &dyn crate::backend::Backend) -> Result<Option<String>> {
+    use crate::backend::Kind;
+    let name = backend.kind().name();
+    let host = match crate::backend::connection::connection(backend) {
+        Connection::Connected { via } => Some(via.unwrap_or_else(|| "a sign-in".to_owned())),
+        _ => None,
+    };
+    match (&host, backend.kind()) {
+        (Some(via), Kind::Codex) => {
+            println!("{name} is signed in here with {via}; sandboxes need a sign-in of their own.")
+        }
+        (Some(via), _) if via.contains("key") => {
+            println!("OMAR cannot read the key {name} signs in with here; give sandboxes one.")
+        }
+        (Some(via), _) => println!(
+            "{name} is signed in here with {via}, which sandboxes cannot use; they need an API key."
+        ),
+        (None, _) => println!("{name} has no API key on this machine for sandboxes to reuse."),
+    }
+    let chatgpt = backend.kind() == Kind::Codex && {
+        print!("Sign in with ChatGPT for sandboxes, or paste an OpenAI API key? [C/k] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        !answer.trim().eq_ignore_ascii_case("k")
+    };
+    let (args, note): (&[&str], &str) = match backend.kind() {
+        Kind::Claude => (
+            &["secret", "set", "anthropic"],
+            "Paste an Anthropic API key (console.anthropic.com).",
+        ),
+        Kind::Codex if chatgpt => (
+            &["secret", "set", "openai", "--oauth"],
+            "Sign in with ChatGPT. Over SSH, forward port 1455 (ssh -L 1455:localhost:1455) or curl the callback URL on this machine.",
+        ),
+        Kind::Codex => (
+            &["secret", "set", "openai"],
+            "Paste an OpenAI API key (platform.openai.com/api-keys).",
+        ),
+        Kind::Cursor => (
+            &["secret", "set", "cursor"],
+            "Paste a Cursor API key (cursor.com/dashboard → Integrations).",
+        ),
+        Kind::Antigravity => (
+            &["secret", "set", "google"],
+            "Paste a Gemini API key (aistudio.google.com/apikey).",
+        ),
+        _ => (
+            &["secret", "set"],
+            "Pick a model provider and paste its API key.",
+        ),
+    };
+    println!("{note}");
+    interactive(args)?;
+    Ok(host)
+}
+
+/// `omar disconnect <backend> --sandbox`: remove the key sbx gives its
+/// agents, and the kit's approval to use it. Backends that shared that key
+/// lose it too, and are named.
+pub fn disconnect(backend: &dyn crate::backend::Backend) -> Result<()> {
+    let name = backend.kind().name();
+    let services = services(name)?;
+    let keys = stored_keys()?;
+    let Some(service) = services.iter().find(|service| {
+        keys.stored.iter().any(|(stored, _)| stored == *service)
+            && keys.bound.iter().any(|bound| bound == *service)
+    }) else {
+        bail!("{name} is not connected for sandboxes");
+    };
+    let assistants: Vec<_> = crate::backend::ASSISTANT
+        .iter()
+        .map(|kind| crate::backend::of(*kind))
+        .collect();
+    let before = connections(&assistants);
+    remove(service)?;
+    println!("✓ {name} disconnected from sandboxes (sbx's {service} key removed)");
+    for ((other, was), now) in assistants.iter().zip(before).zip(connections(&assistants)) {
+        let other = other.kind().name();
+        if other != name
+            && matches!(was, Connection::Connected { .. })
+            && !matches!(now, Connection::Connected { .. })
+        {
+            println!("{other} used that key too; it is no longer connected for sandboxes.");
+        }
+    }
     Ok(())
 }
 
@@ -434,6 +669,47 @@ fn bind(services: &[&str]) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
+/// Withdraw OMAR's kit's approval to use the stored key for `service`.
+fn unbind(service: &str) -> Result<()> {
+    let Some(path) = credentials_path() else {
+        return Ok(());
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let kept = without_binding(&text, service);
+    if kept != text {
+        std::fs::write(&path, kept).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// `text` without `service`'s entry in its `bindings:` map: its line and the
+/// lines indented under it.
+fn without_binding(text: &str, service: &str) -> String {
+    let mut out = String::new();
+    let mut in_bindings = false;
+    let mut skipping: Option<usize> = None;
+    for line in text.lines() {
+        let indent = line.len() - line.trim_start().len();
+        if let Some(depth) = skipping {
+            if line.trim().is_empty() || indent > depth {
+                continue;
+            }
+            skipping = None;
+        }
+        if indent == 0 && !line.trim().is_empty() {
+            in_bindings = line.trim_end() == "bindings:";
+        } else if in_bindings && line.trim_start().trim_end() == format!("{service}:") {
+            skipping = Some(indent);
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// `text` with `entries` added at the top of its `bindings:` map.
 fn with_bindings(text: &str, entries: &str) -> String {
     let mut out = String::new();
@@ -451,16 +727,6 @@ fn with_bindings(text: &str, entries: &str) -> String {
         out.push_str(entries);
     }
     out
-}
-
-/// [`check`] from `config`'s template, for Mission Control.
-pub fn check_connected(
-    backend: &dyn crate::backend::Backend,
-    config: &Config,
-) -> Result<(), String> {
-    let template = config.template.as_deref().unwrap_or(DEFAULT_TEMPLATE);
-    validate_template(template).map_err(|error| format!("{error:#}"))?;
-    check(backend, template).map_err(|failed| failed.to_string())
 }
 
 /// The sign-in check (`connection::check_sign_in`) run in a throwaway
@@ -984,6 +1250,17 @@ mod tests {
     }
 
     #[test]
+    fn withdrawing_a_key_removes_only_its_binding() {
+        let text = "# mine\nbindings:\n  anthropic:\n    apiKey:\n      domains: [api.anthropic.com]\n  openai:\n    oauth:\n      domains: [chatgpt.com]\nother:\n  anthropic: kept\n";
+        let kept = without_binding(text, "anthropic");
+        assert_eq!(parse_bindings(&kept), ["openai"]);
+        assert!(kept.starts_with("# mine\nbindings:\n  openai:\n"), "{kept}");
+        // Only under `bindings:`.
+        assert!(kept.ends_with("other:\n  anthropic: kept\n"), "{kept}");
+        assert_eq!(without_binding(&kept, "groq"), kept);
+    }
+
+    #[test]
     fn approved_hosts_are_the_ones_the_kit_sends_each_key_to() {
         let kit = include_str!("../sandbox/omar-sandbox/omar-sandbox.yaml");
         for key in KEYS {
@@ -1014,15 +1291,24 @@ mod tests {
         };
         assert_eq!(
             select(false, None, false, &Config::default(), &["claude"]).unwrap(),
-            None
+            (None, Vec::new())
         );
-        assert_eq!(select(false, None, false, &off, &["claude"]).unwrap(), None);
+        assert_eq!(
+            select(false, None, false, &off, &["claude"]).unwrap(),
+            (None, Vec::new())
+        );
         let on = Config {
             enabled: Some(true),
             ..Config::default()
         };
-        assert_eq!(select(false, None, true, &on, &["claude"]).unwrap(), None);
-        assert_eq!(select(true, None, true, &on, &["claude"]).unwrap(), None);
+        assert_eq!(
+            select(false, None, true, &on, &["claude"]).unwrap(),
+            (None, Vec::new())
+        );
+        assert_eq!(
+            select(true, None, true, &on, &["claude"]).unwrap(),
+            (None, Vec::new())
+        );
         // Asked for: an unknown backend is refused before sbx is consulted,
         // even where the config turns sandboxes off.
         assert!(select(true, None, false, &off, &["no-such-backend"]).is_err());

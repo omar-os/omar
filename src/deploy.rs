@@ -468,7 +468,7 @@ impl SessionHost for TmuxClient {
     }
 
     fn kill(&self, session: &str) -> Result<()> {
-        self.kill_session_tree(session)
+        crate::backend::kill_worker(self, session, true)
     }
 }
 
