@@ -40,14 +40,27 @@ def readProgram (localImports : Bool) (input : String) :
       throw (IO.userError s!"schema type '{name}' from '{schemaPath}': {error}")
   pure (programName, source, schemas)
 
+/-- The model's semantics (Reactor.lean) has no event from outside the run, so
+    it would take a physical action to be never present and prove too much. -/
+def unmodelled (input : String) (program : Omar.Program) : Except String Unit :=
+  match program.ports.find? (·.physical) with
+  | some port => .error s!"{input}: physical action '{port.name}' is not in the Lean model yet; \
+      properties of a program with one cannot be checked"
+  | none => .ok ()
+
 def writeModel (localImports : Bool) (input output : String) : IO UInt32 := do
   try
     let (programName, source, schemas) ← readProgram localImports input
     match elaborateSourceWithSchemas programName source schemas with
     | .ok program =>
-        IO.FS.writeFile output (Omar.Model.render (Omar.Model.ofProgram program))
-        IO.println s!"modelled {input} -> {output}"
-        pure 0
+        match unmodelled input program with
+        | .error message =>
+            IO.eprintln message
+            pure 1
+        | .ok () =>
+            IO.FS.writeFile output (Omar.Model.render (Omar.Model.ofProgram program))
+            IO.println s!"modelled {input} -> {output}"
+            pure 0
     | .error message =>
         IO.eprintln s!"{input}: {message}"
         pure 1
@@ -61,6 +74,7 @@ def proveProperties (localImports : Bool) (input properties output : String) : I
     let program ← match elaborateSourceWithSchemas programName source schemas with
       | .ok program => pure program
       | .error message => throw (IO.userError s!"{input}: {message}")
+    if let .error message := unmodelled input program then throw (IO.userError message)
     let requested ← match Lean.Json.parse (← IO.FS.readFile properties) >>=
         Lean.fromJson? (α := Omar.Prove.Request) with
       | .ok requested => pure requested

@@ -295,6 +295,22 @@ def testDelayUnits : IO Unit := do
         (program.connections.any (·.delay == none)) true
   | .error message => throw (IO.userError s!"plain connection: {message}")
 
+  -- A physical action is an action the outside schedules: a reaction may
+  -- trigger on it, and the bytecode marks it so the runtime accepts events.
+  match lex (wireTeam "physical action ping(delay=5ms) : int reaction(ping) -> dst {= dst = ping; =}")
+      >>= parse "Wire" with
+  | .ok program => do
+      assertEqual "a physical action is an action"
+        (program.ports.any fun port => port.name == "w.ping" && port.kind == .action
+          && port.physical && port.delay == some 5000000) true
+      assertEqual "an ordinary action is not physical"
+        (program.ports.any fun port => port.name == "w.dst" && port.physical) false
+  | .error message => throw (IO.userError s!"physical action: {message}")
+  match compileSource "Wire" (wireTeam "physical action ping : int reaction(ping) -> dst {= dst = ping; =}") with
+  | .ok bytecode =>
+      assertEqual "bytecode marks a physical action" (mentions bytecode "\"physical\": true") true
+  | .error message => throw (IO.userError s!"physical bytecode: {message}")
+
   match lex (wireTeam "src -> dst after 0 timer t(0, 10ns)") >>= parse "Wire" with
   | .ok program => do
       assertEqual "timer offset" (program.timers.any (·.offset == 0)) true
@@ -346,6 +362,13 @@ def rejectionCases : Array (String × String × String) := #[
     nodeTeam ++ " main { a = Node(\"one\") }", "passes string to parameter"),
   ("unknown instance in a connection",
     nodeTeam ++ " main { a = Node(1) a.out -> b.token }", "unknown instance 'b'"),
+  -- Only the outside schedules a physical action, so its tag is its arrival.
+  ("a reaction writing a physical action",
+    wireTeam "physical action ping : int reaction(src) -> ping {= ping = src; =}",
+    "physical action 'w.ping' is scheduled from outside the run; a reaction cannot write it"),
+  ("a connection into a physical action",
+    wireTeam "physical action ping : int src -> ping",
+    "physical action 'w.ping' is scheduled from outside the run; a connection cannot write it"),
   ("duplicate instance",
     nodeTeam ++ " main { a = Node(1) a = Node(2) }", "duplicate instance 'a'"),
   -- A port holds one value per tag: two connections into it would keep the

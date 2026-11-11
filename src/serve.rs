@@ -213,6 +213,7 @@ fn default_timeout_seconds() -> u64 {
 
 type Runs = Arc<Mutex<BTreeMap<String, RunRecord>>>;
 type Panels = Arc<Mutex<BTreeMap<String, topology::PanelAccess>>>;
+type Inboxes = Arc<Mutex<BTreeMap<String, Arc<topology::Inbox>>>>;
 
 /// Who spoke. Two parties, and a client draws them differently, so this is a
 /// vocabulary rather than free text.
@@ -399,6 +400,10 @@ struct Context_ {
     /// whose program has no `Web` agent, which is what makes the panel routes
     /// 404 rather than offer an empty panel.
     panels: Panels,
+    /// Where each live run accepts events for its physical actions. Present
+    /// for every run while its thread is alive; the inbox itself says
+    /// whether it is accepting right now.
+    inboxes: Inboxes,
     /// Mutations waiting for their run to pause: the new program, compiled,
     /// and the directory its source is staged in.
     mutations: Mutex<BTreeMap<String, (topology::Bytecode, PathBuf)>>,
@@ -546,6 +551,7 @@ impl Serve {
                     context.agent_token.lock().unwrap().clear();
                     context.chat.lock().unwrap().subscribers.clear();
                     context.panels.lock().unwrap().clear();
+                    context.inboxes.lock().unwrap().clear();
                 }
                 Ok(())
             },
@@ -675,6 +681,52 @@ impl Serve {
         let (context, id) = &matches[0];
         let (status, value) = stop_run(context, id);
         anyhow::ensure!(status < 400, "{}", value["error"]);
+        Ok(value)
+    }
+
+    /// An event for a run's physical action, from the CLI or a webhook.
+    pub(crate) fn session_schedule(
+        &self,
+        ea: EaId,
+        selector: &str,
+        port: &str,
+        value: Value,
+        text: Option<String>,
+    ) -> Result<Value> {
+        let contexts = self
+            .workspaces
+            .contexts
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut matches = Vec::new();
+        for context in contexts {
+            if context.ea_id != ea {
+                continue;
+            }
+            for run in context.runs.lock().unwrap().values() {
+                if run.run_id == selector || (run.team == selector && run.status.holds_team()) {
+                    matches.push((context.clone(), run.run_id.clone()));
+                }
+            }
+        }
+        anyhow::ensure!(
+            matches.len() == 1,
+            "run '{selector}' is missing or ambiguous; use its run id"
+        );
+        let (context, id) = &matches[0];
+        let event = match text {
+            Some(text) => Scheduled::Text(text),
+            None => Scheduled::Value(value),
+        };
+        let (status, value) = schedule_event(context, id, port, event);
+        anyhow::ensure!(
+            status < 400,
+            "{}",
+            value["error"].as_str().unwrap_or("refused")
+        );
         Ok(value)
     }
 
@@ -894,6 +946,7 @@ impl Serve {
             health_idle_warning: config.health.idle_warning,
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
+            inboxes: Inboxes::default(),
             mutations: Mutex::default(),
             chat: Arc::new(Mutex::new(Chat {
                 latest_run: latest_parked,
@@ -2052,6 +2105,18 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
                 stop_run(&context, &id)
             }
         }
+        ("POST", rest) if rest.starts_with("/v1/runs/") && rest.contains("/actions/") => {
+            let (id, port) = rest
+                .trim_start_matches("/v1/runs/")
+                .split_once("/actions/")
+                .expect("route has /actions/");
+            let (id, port) = (id.to_string(), port.to_string());
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "event too large"}))
+            } else {
+                schedule_physical(&context, &id, &port, &read_body(content_length)?)
+            }
+        }
         ("POST", rest) if rest.starts_with("/v1/runs/") && rest.ends_with("/panel") => {
             let id = rest
                 .trim_start_matches("/v1/runs/")
@@ -2702,6 +2767,7 @@ impl Workspaces {
             health_idle_warning: self.settings.health_idle_warning,
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
+            inboxes: Inboxes::default(),
             mutations: Mutex::default(),
             chat: Arc::new(Mutex::new(Chat {
                 latest_run: latest_parked,
@@ -3933,6 +3999,7 @@ fn spawn_run_thread(
         .as_deref()
         .and_then(|period| crate::checkpoint::parse_policy(period).ok());
     let keep_workspaces = request.keep_workspaces;
+    let inbox = register_inbox(&context, &run_id);
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let outcome = topology::run_topology(
@@ -3953,6 +4020,7 @@ fn spawn_run_thread(
                 checkpoint_policy,
                 keep_workspaces,
                 program_path: Some(&program_path),
+                inbox: Some(inbox),
             },
         );
         finish_run(&context, &run_id, outcome);
@@ -4911,6 +4979,93 @@ fn run_program(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     }
 }
 
+/// A fresh inbox for a run that is about to start or resume. The run's loop
+/// opens it once its clock starts; until then events are refused.
+fn register_inbox(context: &Arc<Context_>, run_id: &str) -> Arc<topology::Inbox> {
+    let inbox = Arc::new(topology::Inbox::default());
+    context
+        .inboxes
+        .lock()
+        .expect("serve inboxes poisoned")
+        .insert(run_id.to_string(), inbox.clone());
+    inbox
+}
+
+/// `POST /v1/runs/<id>/actions/<port>`: an event for a physical action, tagged
+/// at its arrival (spec §4.4). The body is `{"value": ...}`.
+fn schedule_physical(
+    context: &Arc<Context_>,
+    run_id: &str,
+    port: &str,
+    body: &[u8],
+) -> (u16, Value) {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Event {
+        #[serde(default)]
+        value: Value,
+    }
+    let event: Event = match serde_json::from_slice(body) {
+        Ok(event) => event,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    schedule_value(context, run_id, port, event.value)
+}
+
+/// What an event carries: a JSON value (HTTP), or text read by the port's
+/// type (the CLI, as `--input` is read).
+enum Scheduled {
+    Value(Value),
+    Text(String),
+}
+
+fn schedule_value(context: &Arc<Context_>, run_id: &str, port: &str, value: Value) -> (u16, Value) {
+    schedule_event(context, run_id, port, Scheduled::Value(value))
+}
+
+fn schedule_event(
+    context: &Arc<Context_>,
+    run_id: &str,
+    port: &str,
+    event: Scheduled,
+) -> (u16, Value) {
+    let inbox = context
+        .inboxes
+        .lock()
+        .expect("serve inboxes poisoned")
+        .get(run_id)
+        .cloned();
+    let Some(inbox) = inbox else {
+        return match context
+            .runs
+            .lock()
+            .expect("serve runs poisoned")
+            .contains_key(run_id)
+        {
+            true => (409, json!({"error": "run is not running"})),
+            false => (404, json!({"error": "unknown run"})),
+        };
+    };
+    let accepted = match event {
+        Scheduled::Value(value) => inbox.accept(port, value),
+        Scheduled::Text(text) => inbox.accept_text(port, &text),
+    };
+    match accepted {
+        Ok((timestamp, microstep)) => (
+            202,
+            json!({"run_id": run_id, "port": port, "tag": {"timestamp": timestamp, "microstep": microstep}}),
+        ),
+        Err(topology::Refusal::NotRunning) => {
+            (409, json!({"error": "run is not accepting events now"}))
+        }
+        Err(topology::Refusal::UnknownPort) => (
+            404,
+            json!({"error": format!("'{port}' is not a physical action of this run")}),
+        ),
+        Err(topology::Refusal::Invalid(error)) => (400, json!({"error": error})),
+    }
+}
+
 /// What the daemon records once a run's loop returns, however it returned.
 fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::RunOutcome>) {
     // The run is over, so its invocation service is gone with it. Leaving
@@ -4919,6 +5074,11 @@ fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::R
         .panels
         .lock()
         .expect("serve panels poisoned")
+        .remove(run_id);
+    context
+        .inboxes
+        .lock()
+        .expect("serve inboxes poisoned")
         .remove(run_id);
     let mut runs = context.runs.lock().expect("serve runs poisoned");
     if let Some(record) = runs.get_mut(run_id) {
@@ -4975,6 +5135,7 @@ fn spawn_resume_thread(
     let context = context.clone();
     let run_id = run_id.to_string();
     let team = team.to_string();
+    let inbox = register_inbox(&context, &run_id);
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let generated = topology::generated_dir(&program_path);
@@ -4995,6 +5156,7 @@ fn spawn_resume_thread(
                 checkpoint_policy: None,
                 keep_workspaces: false,
                 program_path: Some(&program_path),
+                inbox: Some(inbox),
             },
             &team,
         );
@@ -5325,6 +5487,7 @@ mod tests {
                         declared: None,
                         delay: None,
                         instance: String::new(),
+                        physical: false,
                     },
                 ),
                 (
@@ -5335,6 +5498,7 @@ mod tests {
                         declared: None,
                         delay: None,
                         instance: String::new(),
+                        physical: false,
                     },
                 ),
                 (
@@ -5345,6 +5509,7 @@ mod tests {
                         declared: None,
                         delay: None,
                         instance: String::new(),
+                        physical: false,
                     },
                 ),
             ]),
