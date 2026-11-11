@@ -2,6 +2,7 @@
 //! through one `--settings`, and OMAR's tools over MCP.
 use std::path::{Path, PathBuf};
 
+use super::{connection, Connection, Login};
 use super::{delivery_failed, NotReady, PaneSetup, Target, WRITE_TIMEOUT};
 use super::{detect, detect_token, Backend, Kind, Launch};
 use crate::manager::{
@@ -71,6 +72,38 @@ impl Backend for Claude {
     fn default_command(&self) -> &'static str {
         "claude --dangerously-skip-permissions"
     }
+    fn connection(&self, program: &str) -> Connection {
+        match connection::run(program, &["auth", "status"]) {
+            Some(output) => auth_status(&output.stdout),
+            None => Connection::unknown("`claude auth status` did not answer"),
+        }
+    }
+    fn install_command(&self) -> Option<&'static str> {
+        Some("curl -fsSL https://claude.ai/install.sh | bash")
+    }
+    /// Without a browser it prints a link and takes the code back pasted.
+    fn login(&self, _headless: bool) -> Option<Login> {
+        Some(Login {
+            args: &["auth", "login"],
+            note: None,
+        })
+    }
+    fn credential_vars(&self) -> &'static [&'static str] {
+        &[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ]
+    }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: &["auth", "logout"],
+            note: None,
+        })
+    }
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
+        Some(vec!["-p", connection::CHECK_PROMPT])
+    }
     fn conversation_id(&self, target: &Target<'_>) -> Option<String> {
         let directory = claude_sessions_dir()?;
         std::iter::once(target.pane_pid)
@@ -97,19 +130,31 @@ impl Backend for Claude {
     }
     fn launch_command(&self, launch: &Launch<'_>) -> String {
         let base_command = with_coordination_hooks(launch.base_command, launch.context);
-        match materialize_claude_mcp_config(launch.context) {
+        let command = match materialize_claude_mcp_config(launch.context) {
             Some(mcp_config) => format!(
                 "{} --append-system-prompt \"{}\" --mcp-config {} --disallowedTools {}",
                 base_command,
                 launch.shell_expr,
                 shell_single_quote(&mcp_config.display().to_string()),
-                shell_single_quote(&backend_native_disallowed_tools_csv()),
+                // Only workers lose Workflow; the EA runs ultracode workflows.
+                shell_single_quote(&format!(
+                    "{},Workflow",
+                    backend_native_disallowed_tools_csv()
+                )),
             ),
             None => format!(
                 "{} --append-system-prompt \"{}\"",
                 base_command, launch.shell_expr
             ),
-        }
+        };
+        // With no Claude Code transcript a worker stays out of the Claude app
+        // sidebar.
+        let skip_history = if super::ephemeral_worker(launch.context) {
+            "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1 "
+        } else {
+            ""
+        };
+        format!("{skip_history}{command}")
     }
     /// The prompt goes in by file, so it never touches argv and is unbounded;
     /// the placeholders are resolved on disk since nothing pipes it through
@@ -149,11 +194,12 @@ impl Backend for Claude {
         let base_command = launch_base.as_str();
         let launch = match materialize_claude_mcp_config(context) {
             Some(mcp_config) => format!(
-                "{} --append-system-prompt-file {} --mcp-config {} --disallowedTools {}",
+                "{} --append-system-prompt-file {} --mcp-config {} --disallowedTools {}{}",
                 base_command,
                 shell_single_quote(&prompt_file.display().to_string()),
                 shell_single_quote(&mcp_config.display().to_string()),
                 shell_single_quote(&backend_native_disallowed_tools_csv()),
+                omar_agent_flag(context).unwrap_or_default(),
             ),
             None => format!(
                 "{} --append-system-prompt-file {}",
@@ -233,6 +279,34 @@ pub fn ensure_claude_inbound_settings(command: &str) -> String {
     )
 }
 
+/// ` --agents '<json>'`: the `omar` agent a Workflow `agent()` is routed to. It
+/// holds its own `--hold` MCP server, named `omar-hold` so it cannot collide
+/// with the EA's `omar` server. `mcpServers` is set here because Claude Code
+/// ignores it in plugin agents. The workflow guard hook (see
+/// `with_coordination_hooks`) denies scripts that skip this agent. Workers
+/// run ephemeral: Omar clears their session history at teardown.
+fn omar_agent_flag(context: &McpLaunchContext) -> Option<String> {
+    let prompt = include_str!("../../prompts/claude-workflow-agent.md");
+    let tools: Vec<_> = crate::mcp::HOLD_TOOLS
+        .iter()
+        .map(|tool| format!("mcp__omar-hold__{tool}"))
+        .collect();
+    let agents = serde_json::json!({"omar": {
+        "description": "Runs one workflow agent as an Omar-managed worker; route every Workflow agent() here.",
+        "prompt": prompt,
+        "model": "haiku",
+        "tools": tools,
+        "mcpServers": [{"omar-hold": {
+            "command": omar_server_exe()?,
+            "args": ["mcp-server", "--context-file", materialize_mcp_context_file(context)?, "--hold"],
+        }}],
+    }});
+    Some(format!(
+        " --agents {}",
+        shell_single_quote(&agents.to_string())
+    ))
+}
+
 /// Keep caller-supplied settings intact. The durable scheduler and MCP
 /// projections still supervise sessions whose custom settings own their hooks.
 pub(crate) fn with_coordination_hooks(command: &str, context: &McpLaunchContext) -> String {
@@ -249,14 +323,16 @@ pub(crate) fn with_coordination_hooks(command: &str, context: &McpLaunchContext)
     let Some(exe) = omar_server_exe() else {
         return command.to_owned();
     };
+    let exe = shell_single_quote(&exe.display().to_string());
     let hook = format!(
-        "{} agent-hook --context-file {}",
-        shell_single_quote(&exe.display().to_string()),
+        "{exe} agent-hook --context-file {}",
         shell_single_quote(&context_file.display().to_string())
     );
+    let guard = format!("{exe} claude-hook workflow-guard");
     let handler = serde_json::json!([{"hooks":[{"type":"command","command":hook,"timeout":5}]}]);
     let settings = serde_json::json!({"crossSessionInbound":"accept","hooks":{
-        "SessionStart":handler,"UserPromptSubmit":handler,"Stop":handler
+        "SessionStart":handler,"UserPromptSubmit":handler,"Stop":handler,
+        "PreToolUse":[{"matcher":"Workflow","hooks":[{"type":"command","command":guard,"timeout":5}]}]
     }});
     format!(
         "{command} --settings {}",
@@ -463,8 +539,60 @@ pub(crate) fn child_pids(parent: u32) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// `claude auth status` prints JSON, and exits 1 when signed out.
+fn auth_status(stdout: &str) -> Connection {
+    let Ok(status) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return Connection::unknown("`claude auth status` needs a newer Claude Code");
+    };
+    if status["loggedIn"] != true {
+        return Connection::SignedOut;
+    }
+    let via = match (
+        status["authMethod"].as_str(),
+        status["subscriptionType"].as_str(),
+    ) {
+        (Some("claude.ai"), Some(plan)) => {
+            let mut plan = plan.chars();
+            let first = plan.next().map(|c| c.to_uppercase().collect::<String>());
+            format!("Claude {}{}", first.unwrap_or_default(), plan.as_str())
+        }
+        (Some("api_key"), _) => match status["apiKeySource"].as_str() {
+            Some(source) => format!("API key ({source})"),
+            None => "API key".to_string(),
+        },
+        (Some(method), _) => method.to_string(),
+        (None, _) => return Connection::Connected { via: None },
+    };
+    Connection::connected(via)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auth_status_names_the_plan_or_the_key_it_signed_in_with() {
+        use super::{auth_status, Connection};
+        assert_eq!(
+            auth_status(
+                r#"{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}"#
+            ),
+            Connection::connected("Claude Max")
+        );
+        assert_eq!(
+            auth_status(
+                r#"{"loggedIn": true, "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"}"#
+            ),
+            Connection::connected("API key (ANTHROPIC_API_KEY)")
+        );
+        assert_eq!(
+            auth_status(r#"{"loggedIn": false, "authMethod": "none"}"#),
+            Connection::SignedOut
+        );
+        assert!(matches!(
+            auth_status("error: unknown command 'auth'"),
+            Connection::Unknown { .. }
+        ));
+    }
+
     #[test]
     fn startup_trust_gate_handles_both_option_orders_and_current_selection() {
         use super::Backend;
@@ -522,6 +650,57 @@ mod tests {
     use crate::manager::TopologyMcpContext;
     use std::io::Read;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn only_the_ea_runs_workflows_and_routes_agents_to_a_held_omar_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = crate::manager::tests::test_mcp_context(dir.path());
+        let prompt = dir.path().join("prompt.md");
+        let ea = Claude
+            .ea_launch_command("claude", &prompt, "hi", &context)
+            .unwrap();
+        let denied = |line: &str| {
+            line.split("--disallowedTools '")
+                .nth(1)
+                .unwrap()
+                .split('\'')
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(!denied(&ea).contains("Workflow"), "{ea}");
+        let words = shlex::split(&ea).unwrap();
+        let agents = words.iter().position(|w| w == "--agents").unwrap() + 1;
+        let agent: serde_json::Value = serde_json::from_str(&words[agents]).unwrap();
+        let agent = &agent["omar"];
+        let body = agent["prompt"].as_str().unwrap();
+        assert!(body.starts_with("You never do the task yourself"), "{body}");
+        assert_eq!(agent["model"], "haiku");
+        let server = &agent["mcpServers"][0]["omar-hold"];
+        assert_eq!(server["args"][0], "mcp-server");
+        assert_eq!(server["args"][3], "--hold");
+        for tool in agent["tools"].as_array().unwrap() {
+            assert!(tool.as_str().unwrap().starts_with("mcp__omar-hold__"));
+        }
+        assert!(ea.contains("claude-hook workflow-guard"));
+
+        context.agent_name = Some("worker".into());
+        let launch = |context: &McpLaunchContext| {
+            Claude.launch_command(&Launch {
+                base_command: "claude",
+                prompt_file: &prompt,
+                substitutions: &[],
+                shell_expr: "$(cat p)",
+                context,
+            })
+        };
+        let worker = launch(&context);
+        assert!(denied(&worker).contains("Workflow"), "{worker}");
+        assert!(!worker.contains("--agents"));
+        assert!(worker.starts_with("CLAUDE_CODE_SKIP_PROMPT_HISTORY=1 claude"));
+        context.agent_name = None;
+        assert!(launch(&context).starts_with("claude"));
+    }
 
     #[test]
     fn a_claude_launch_line_is_told_to_accept_peer_messages_once() {

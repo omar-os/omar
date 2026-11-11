@@ -31,6 +31,7 @@ use crate::diagram::{
     DiagramPort, DiagramReaction, DiagramSnapshot, DiagramStatus, DiagramTag, DiagramTimer,
     EdgeKind, ReactionStatus,
 };
+use crate::properties::{ProofProblem, PropertyVerdict};
 use crate::serve::{
     ChatMessage, ChatRole, MutationRecord, MutationStatus, ProposedDesign, RunRecord, RunStatus,
 };
@@ -202,6 +203,8 @@ pub fn generate() -> String {
         DiagramEdge::decl(&config),
         DiagramSnapshot::decl(&config),
         DiagramEvent::decl(&config),
+        ProofProblem::decl(&config),
+        PropertyVerdict::decl(&config),
         ProposedDesign::decl(&config),
         ChatMessage::decl(&config),
         Conversation::decl(&config),

@@ -45,6 +45,8 @@ enum Access {
 }
 const TERMINAL_PREFIX: &str = "/v1/agents/";
 const TERMINAL_SUFFIX: &str = "/terminal";
+/// A backend's sign-in terminal: `/v1/backends/<name>/terminal`.
+const CONNECT_PREFIX: &str = "/v1/backends/";
 /// How long the relay waits on each side before checking the other.
 const TERMINAL_POLL: Duration = Duration::from_millis(25);
 /// A selection names diagram components, and a diagram the operator can click
@@ -294,6 +296,14 @@ pub struct ProposedDesign {
     /// The compiled topology, so the operator sees what they are approving
     /// before any run exists.
     pub preview: crate::diagram::DiagramSnapshot,
+    /// Lean declarations the properties share.
+    #[serde(default)]
+    #[ts(optional, type = "string")]
+    pub lemmas: String,
+    /// What the assistant claims of the program, as Lean judged it.
+    #[serde(default)]
+    #[ts(optional, type = "Array<PropertyVerdict>")]
+    pub properties: Vec<crate::properties::PropertyVerdict>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,6 +323,24 @@ struct AgentProposal {
     summary: String,
     #[serde(default)]
     inputs: BTreeMap<String, Value>,
+    #[serde(default)]
+    lemmas: String,
+    #[serde(default)]
+    properties: Vec<crate::properties::Property>,
+}
+
+/// Properties to check against a program, from the assistant (with its
+/// token) or the operator.
+#[derive(Debug, Deserialize)]
+struct PropertyCheck {
+    #[serde(default)]
+    token: String,
+    program: String,
+    #[serde(default)]
+    files: BTreeMap<String, String>,
+    #[serde(default)]
+    lemmas: String,
+    properties: Vec<crate::properties::Property>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1186,6 +1214,58 @@ fn workspace_request(
         }
         return Ok(json!({"workspace": ws}));
     }
+    // A program's proved properties as Lean files, to open in the editor and
+    // work on interactively. Only Lean's own files go in; nothing here runs.
+    if method == "POST" && path == "/v1/workspaces/properties" {
+        #[derive(Deserialize)]
+        struct ProofFile {
+            name: String,
+            source: String,
+        }
+        #[derive(Deserialize)]
+        struct ProofWorkspace {
+            properties: Vec<ProofFile>,
+        }
+        let request: ProofWorkspace = serde_json::from_slice(body)?;
+        anyhow::ensure!(!request.properties.is_empty(), "no properties to open");
+        for file in &request.properties {
+            anyhow::ensure!(
+                !file.name.is_empty()
+                    && file
+                        .name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "'{}' is not a property name",
+                file.name
+            );
+        }
+        let key = format!("properties:{}", crate::checkpoint::sha256(body));
+        if let Some(ws) = crate::workspace::list(root, context.ea_id)?
+            .into_iter()
+            .find(|ws| ws.deployment_id == key)
+        {
+            return Ok(json!({"workspace": ws}));
+        }
+        let ws =
+            crate::workspace::Workspace::create(root, context.ea_id, &key, "Properties", None)?;
+        let result = (|| -> Result<()> {
+            let tree = ws.worktree(root);
+            fs::write(
+                tree.join("lean-toolchain"),
+                crate::properties::LEAN_TOOLCHAIN,
+            )?;
+            for file in &request.properties {
+                fs::write(tree.join(format!("{}.lean", file.name)), &file.source)?;
+            }
+            ws.snapshot(root, "Properties as proved")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = ws.remove(root);
+            return Err(error);
+        }
+        return Ok(json!({"workspace": ws}));
+    }
     let rest = path
         .strip_prefix("/v1/workspaces/")
         .context("unknown workspace route")?;
@@ -1372,7 +1452,10 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             return write_json(&mut stream, 403, &json!({"error": reason}), None);
         }
     }
-    let context = if path == "/v1/agent/reply" || path == "/v1/agent/proposals" {
+    let context = if path == "/v1/agent/reply"
+        || path == "/v1/agent/proposals"
+        || path == "/v1/agent/properties"
+    {
         let body: Value = match serde_json::from_slice(&raw_body) {
             Ok(body) => body,
             Err(error) => {
@@ -1524,6 +1607,33 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             crate::ea::ea_prefix(context.ea_id, &context.session_prefix),
             crate::tmux::flatten_agent_name(&agent)
         );
+        drop(admission);
+        return attach_terminal(
+            stream,
+            &session,
+            websocket_key.as_deref(),
+            origin_header.as_deref(),
+            terminal_query,
+            access,
+        );
+    }
+    // A backend's sign-in, started by `POST /v1/backends/<name>/connect`.
+    if method == "GET"
+        && terminal_path.starts_with(CONNECT_PREFIX)
+        && terminal_path.ends_with(TERMINAL_SUFFIX)
+    {
+        let name = terminal_path
+            .trim_start_matches(CONNECT_PREFIX)
+            .trim_end_matches(TERMINAL_SUFFIX);
+        let Some(backend) = connectable(name) else {
+            return write_json(
+                &mut stream,
+                404,
+                &json!({"error": format!("'{name}' is not an assistant backend")}),
+                origin_header.as_deref(),
+            );
+        };
+        let session = connect_session(&context, backend);
         drop(admission);
         return attach_terminal(
             stream,
@@ -1700,7 +1810,22 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             select_chat(&workspaces, Some(id))
         }
         ("GET", "/v1/agent") => (200, describe_agent(&context)),
+        ("GET", "/v1/agent/backends") => (200, backend_connections()),
         ("POST", "/v1/agent/backend") => switch_backend(&context, &read_body(content_length)?),
+        ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/connect") => {
+            let _ = read_body(content_length)?;
+            let name = rest
+                .trim_start_matches(CONNECT_PREFIX)
+                .trim_end_matches("/connect");
+            start_connect(&context, name)
+        }
+        ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/check") => {
+            let _ = read_body(content_length)?;
+            let name = rest
+                .trim_start_matches(CONNECT_PREFIX)
+                .trim_end_matches("/check");
+            check_backend(name)
+        }
         // EA-only, authenticated with the token handed to its MCP sidecar.
         ("POST", "/v1/agent/reply") => agent_reply(&context, &read_body(content_length)?),
         ("POST", "/v1/agent/proposals") => {
@@ -1708,6 +1833,17 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
                 (413, json!({"error": "program too large"}))
             } else {
                 agent_proposal(&context, &read_body(content_length)?)
+            }
+        }
+        ("POST", "/v1/agent/properties") | ("POST", "/v1/properties/check") => {
+            if content_length > MAX_BODY_BYTES {
+                (413, json!({"error": "program too large"}))
+            } else {
+                check_properties(
+                    &context,
+                    &read_body(content_length)?,
+                    path == "/v1/agent/properties",
+                )
             }
         }
         ("POST", "/v1/programs/check") => {
@@ -2086,16 +2222,23 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
     })
 }
 
+/// Whether each backend is installed and signed in. Asked on demand: the
+/// answer comes from each CLI and takes up to a few seconds.
+fn backend_connections() -> Value {
+    use crate::backend::connection;
+    let backends: Vec<Value> = connection::assistants()
+        .into_iter()
+        .map(|(backend, status)| connection::describe(backend, &status))
+        .collect();
+    json!({ "backends": backends })
+}
+
 /// Relaunch the assistant on a different backend.
 ///
 /// A backend is chosen when the process starts, so changing it means a new
 /// process. Each backend resumes its own saved conversation when available;
 /// the durable OMAR transcript supplies context across backend changes.
 fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
-    let _operation = context
-        .chat_operation
-        .lock()
-        .expect("chat operation poisoned");
     #[derive(Deserialize)]
     struct Request {
         backend: String,
@@ -2114,6 +2257,16 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": format!("'{}' is not an assistant backend", request.backend)}),
         );
     }
+    // Asked before the running assistant is touched, and before the chat
+    // lock: a status check can take seconds.
+    let status = crate::backend::connection::connection(backend);
+    if let Some(reason) = unusable(backend, &status) {
+        return (409, json!({"error": reason, "status": status}));
+    }
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     let command = backend.default_command().to_string();
 
     match relaunch_ea(context, &command) {
@@ -2127,6 +2280,94 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         }
         Err(error) => (502, json!({"error": format!("{error:#}")})),
     }
+}
+
+/// An assistant backend by name; anything else has no sign-in to run here.
+fn connectable(name: &str) -> Option<&'static dyn crate::backend::Backend> {
+    crate::backend::by_name(name)
+        .filter(|backend| crate::backend::ASSISTANT.contains(&backend.kind()))
+}
+
+/// The tmux session a backend's sign-in runs in. Named apart from agents
+/// (`<base><ea>-<agent>`) and the assistant (`<base>ea-<ea>`).
+fn connect_session(context: &Context_, backend: &dyn crate::backend::Backend) -> String {
+    format!(
+        "{}connect-{}-{}",
+        context.session_prefix,
+        context.ea_id,
+        backend.kind().name()
+    )
+}
+
+/// Run `omar connect <backend>` (install, then the CLI's own sign-in) in a
+/// session Mission Control attaches a terminal to. One already running is
+/// reused, so a second click shows the same sign-in.
+fn start_connect(context: &Context_, name: &str) -> (u16, Value) {
+    let Some(backend) = connectable(name) else {
+        return (
+            404,
+            json!({"error": format!("'{name}' is not an assistant backend")}),
+        );
+    };
+    let Some(omar) = crate::manager::omar_server_exe() else {
+        return (500, json!({"error": "cannot find the omar executable"}));
+    };
+    let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
+    let session = connect_session(context, backend);
+    let name = backend.kind().name();
+    // A failed connect leaves its message on screen until a key is pressed;
+    // a successful one ends the session, and the page sees it connected.
+    let command = format!(
+        "{} connect {name} || {{ printf '\\nPress Enter to close.'; read _; }}",
+        crate::manager::shell_single_quote(&omar.display().to_string())
+    );
+    let started = match client.has_session(&session) {
+        Ok(true) => Ok(()),
+        _ => client.new_session(&session, &command, None),
+    };
+    match started {
+        Ok(()) => (
+            200,
+            json!({"session": session, "terminal": format!("{CONNECT_PREFIX}{name}{TERMINAL_SUFFIX}")}),
+        ),
+        Err(error) => (502, json!({"error": format!("{error:#}")})),
+    }
+}
+
+/// Whether `name`'s sign-in works, by its CLI answering a test prompt: what
+/// Mission Control asks before calling a sign-in done. 422 carries the CLI's
+/// own reason.
+fn check_backend(name: &str) -> (u16, Value) {
+    let Some(backend) = connectable(name) else {
+        return (
+            404,
+            json!({"error": format!("'{name}' is not an assistant backend")}),
+        );
+    };
+    match crate::backend::connection::check_sign_in(backend) {
+        Ok(()) => (200, json!({"ok": true})),
+        Err(error) => (
+            422,
+            json!({"error": format!("{} is signed in, but its test prompt failed: {error}", backend.kind().name())}),
+        ),
+    }
+}
+
+/// Why the assistant cannot move to `backend`, if it cannot: launching one that
+/// is missing or signed out would stop the working assistant for one that hangs.
+/// An unreadable status is let through, as Mission Control does.
+fn unusable(
+    backend: &dyn crate::backend::Backend,
+    status: &crate::backend::connection::Connection,
+) -> Option<String> {
+    use crate::backend::connection::Connection;
+    let name = backend.kind().name();
+    let state = match status {
+        Connection::NotInstalled => "not installed",
+        Connection::SignedOut => "not signed in",
+        Connection::Connected { .. } | Connection::Unknown { .. } => return None,
+    };
+    Some(format!("{name} is {state}; run `omar connect {name}`"))
 }
 
 fn assistant_command(root: &Path, ea_id: EaId, fallback: &str) -> String {
@@ -2692,6 +2933,21 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
+    // Proved here rather than taken on trust: the operator is shown Lean's
+    // verdict on this program, whatever the assistant believed.
+    let properties = if proposal.properties.is_empty() {
+        Vec::new()
+    } else {
+        match prove_properties(
+            &proposal.program,
+            &proposal.files,
+            &proposal.lemmas,
+            &proposal.properties,
+        ) {
+            Ok(verdicts) => verdicts,
+            Err(error) => return (400, json!({"error": error})),
+        }
+    };
     if let Err(error) = context.publish(
         ChatRole::Assistant,
         proposal.summary,
@@ -2701,11 +2957,52 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             files: proposal.files,
             inputs: proposal.inputs,
             preview: crate::diagram::DiagramSnapshot::from_vm_state(&state),
+            lemmas: proposal.lemmas,
+            properties,
         }),
     ) {
         return (500, json!({"error": format!("{error:#}")}));
     }
     (202, json!({"status": "proposed"}))
+}
+
+/// Lean's verdict on each property of `program`.
+fn prove_properties(
+    program: &str,
+    files: &BTreeMap<String, String>,
+    lemmas: &str,
+    properties: &[crate::properties::Property],
+) -> std::result::Result<Vec<crate::properties::PropertyVerdict>, String> {
+    let staged = stage_program(program, None, files).map_err(|(_, problem)| {
+        problem["errors"][0]
+            .as_str()
+            .or(problem["error"].as_str())
+            .unwrap_or("the program could not be staged")
+            .to_string()
+    })?;
+    let outcome = crate::properties::prove(&staged.path, lemmas, properties);
+    staged.finish(outcome)
+}
+
+/// Check properties without proposing anything: how the assistant works a
+/// proof out, and how the operator re-checks after editing the program.
+fn check_properties(context: &Arc<Context_>, body: &[u8], agent: bool) -> (u16, Value) {
+    let request: PropertyCheck = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
+    };
+    if agent && request.token != *context.agent_token.lock().expect("agent token poisoned") {
+        return (403, json!({"error": "forbidden"}));
+    }
+    match prove_properties(
+        &request.program,
+        &request.files,
+        &request.lemmas,
+        &request.properties,
+    ) {
+        Ok(verdicts) => (200, json!({"verdicts": verdicts})),
+        Err(error) => (400, json!({"error": error})),
+    }
 }
 
 fn compile_preview(program: &str, files: &BTreeMap<String, String>) -> Result<VmState> {
@@ -3171,7 +3468,8 @@ fn stage_program(
 struct PanelAnswer {
     task_id: u64,
     agent: String,
-    values: BTreeMap<String, Value>,
+    #[serde(flatten)]
+    answer: topology::PanelValues,
 }
 
 /// A run's panel and the team it belongs to, or the reason there is neither.
@@ -3243,14 +3541,14 @@ fn panel_answer(context: &Arc<Context_>, run_id: &str, body: &[u8]) -> (u16, Val
         &team,
         &answer.agent,
         &answer.task_id,
-        &answer.values,
+        &answer.answer,
     ) {
         Ok(()) => (
             202,
             json!({
                 "run_id": run_id,
                 "task_id": answer.task_id,
-                "sent": answer.values.keys().collect::<Vec<_>>()
+                "sent": answer.answer.values.keys().collect::<Vec<_>>()
             }),
         ),
         // The runtime's own refusal — a port outside the invocation's effects,
@@ -5425,6 +5723,8 @@ while True:
                 "../web/tests/fixtures/diagram-snapshot.v1.json"
             ))
             .unwrap(),
+            lemmas: String::new(),
+            properties: Vec::new(),
         };
         first
             .context
@@ -6179,6 +6479,46 @@ while True:
         );
         assert!(stub.starts_with("HTTP/1.1 400"), "{stub}");
         assert!(stub.contains("not an assistant backend"), "{stub}");
+    }
+
+    #[test]
+    fn only_an_assistant_backend_has_a_sign_in_to_start() {
+        let server = test_server();
+        for name in ["notabackend", "stub", "jev"] {
+            let refused = request(
+                server.address(),
+                "POST",
+                &format!("/v1/backends/{name}/connect"),
+                Some("{}"),
+            );
+            assert!(refused.starts_with("HTTP/1.1 404"), "{name}: {refused}");
+            assert!(refused.contains("not an assistant backend"), "{refused}");
+            let unchecked = request(
+                server.address(),
+                "POST",
+                &format!("/v1/backends/{name}/check"),
+                Some("{}"),
+            );
+            assert!(unchecked.starts_with("HTTP/1.1 404"), "{name}: {unchecked}");
+        }
+        assert!(connectable("codex").is_some());
+        assert!(connectable("pi").is_some());
+    }
+
+    #[test]
+    fn a_backend_that_cannot_start_is_refused_with_how_to_connect_it() {
+        use crate::backend::connection::Connection;
+        let cursor = crate::backend::by_name("cursor").unwrap();
+        assert_eq!(
+            unusable(cursor, &Connection::SignedOut).as_deref(),
+            Some("cursor is not signed in; run `omar connect cursor`")
+        );
+        assert_eq!(
+            unusable(cursor, &Connection::NotInstalled).as_deref(),
+            Some("cursor is not installed; run `omar connect cursor`")
+        );
+        assert_eq!(unusable(cursor, &Connection::connected("me")), None);
+        assert_eq!(unusable(cursor, &Connection::unknown("timed out")), None);
     }
 
     #[test]

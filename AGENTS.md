@@ -1,5 +1,5 @@
 <!-- High-level principles from https://github.com/multica-ai/andrej-karpathy-skills/blob/main/CLAUDE.md -->
-# AGENT.md
+# AGENTS.md
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
@@ -67,4 +67,9 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## OMAR-Specific Development Guidelines
 
+@CONTRIBUTING.md
+
 Follow [CONTRIBUTING.md](CONTRIBUTING.md). It holds the project's rules for humans and agents alike.
+
+Agents only:
+- Never edit the top-level `README.md`. It is public facing, and every change to it needs a human's approval. Propose the wording in the PR description or to the operator instead.

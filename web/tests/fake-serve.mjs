@@ -24,6 +24,15 @@ const CORS = {
   "access-control-allow-headers": "content-type",
 };
 
+/**
+ * What `omarc --prove` made of three properties of PROPOSED_PROGRAM: two
+ * proved, and one that does not hold (a run cut short leaves a plan
+ * unreviewed). Produced by the real compiler, not written by hand.
+ */
+const PROPERTY_VERDICTS = JSON.parse(
+  await readFile(new URL("./fixtures/review-flow-properties.json", import.meta.url), "utf8"),
+);
+
 /** Marker a test can put in a program to exercise the compile-failure path. */
 const INVALID_MARKER = "!!invalid!!";
 
@@ -301,6 +310,37 @@ export async function startFakeServe({
       const entry = chat.runs.get(url.pathname.slice("/v1/runs/".length, -"/options".length));
       return entry ? json(response, 200, entry.options) : json(response, 404, { error: "unknown run" });
     }
+    if (request.method === "POST" && url.pathname === "/v1/properties/check") {
+      // Lean's verdicts do not depend on anything the fake can change, so a
+      // re-check answers with them; what a test checks is that it was asked.
+      return readBody(request).then((body) => {
+        const asked = JSON.parse(body);
+        chat.propertyChecks = (chat.propertyChecks ?? 0) + 1;
+        const verdicts = asked.properties.map((property) =>
+          structuredClone(PROPERTY_VERDICTS.find((verdict) => verdict.name === property.name)) ?? {
+            ...property, proved: false, theorem: "", source: "", mentions: [],
+            problems: [{ line: 0, column: 0, message: "unknown to the fake" }],
+          });
+        return json(response, 200, { verdicts });
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/v1/workspaces/properties") {
+      return readBody(request).then((body) => {
+        chat.proofWorkspace = JSON.parse(body);
+        return json(response, 200, { workspace: { id: "proofs" } });
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/v1/workspaces/proofs/editor") {
+      return json(response, 200, { url: `http://${request.headers.host}/fake-editor/proofs` });
+    }
+    if (request.method === "GET" && url.pathname === "/v1/proofs") {
+      // Test-only: what the client asked of the proof surface.
+      return json(response, 200, { checks: chat.propertyChecks ?? 0, workspace: chat.proofWorkspace ?? null });
+    }
+    if (request.method === "GET" && url.pathname === "/fake-editor/proofs") {
+      response.writeHead(200, { "content-type": "text/html" }).end("<title>Proofs</title><h1>Proof editor</h1>");
+      return;
+    }
     if (url.pathname.startsWith("/v1/workspaces/")) {
       // Enough of the workspace surface for the viewer to open on a run.
       const [id, action = ""] = url.pathname.slice("/v1/workspaces/".length).split("/");
@@ -342,6 +382,32 @@ export async function startFakeServe({
         backend,
         available: ["claude", "codex", "cursor", "opencode", "agy"],
       });
+    }
+    if (request.method === "GET" && url.pathname === "/v1/agent/backends") {
+      return json(response, 200, {
+        backends: Object.entries(backendStatus).map(([name, status]) => ({ name, ...status, login: `omar connect ${name}` })),
+      });
+    }
+    // The daemon starts `omar connect <name>` in a session; here, pressing
+    // Enter in its terminal stands for finishing the sign-in.
+    const connect = /^\/v1\/backends\/([^/]+)\/connect$/.exec(url.pathname);
+    if (request.method === "POST" && connect) {
+      return readBody(request).then(() =>
+        connect[1] in backendStatus
+          ? json(response, 200, { terminal: `/v1/backends/${connect[1]}/terminal` })
+          : json(response, 404, { error: `'${connect[1]}' is not an assistant backend` }),
+      );
+    }
+    // The test prompt: fails for a key typed as "bad".
+    const check = /^\/v1\/backends\/([^/]+)\/check$/.exec(url.pathname);
+    if (request.method === "POST" && check) {
+      return readBody(request).then(() =>
+        !(check[1] in backendStatus)
+          ? json(response, 404, { error: `'${check[1]}' is not an assistant backend` })
+          : rejectedKeys[check[1]]
+            ? json(response, 422, { error: `${check[1]} is signed in, but its test prompt failed: 401 Invalid API Key` })
+            : json(response, 200, { ok: true }),
+      );
     }
     if (request.method === "POST" && url.pathname === "/v1/agent/backend") {
       return readBody(request).then((body) => {
@@ -443,9 +509,10 @@ export async function startFakeServe({
     // The assistant has a route of its own: its tmux session is not named
     // like an agent's, so no agent name reaches it.
     const assistant = url.pathname === "/v1/agent/terminal";
+    const signIn = /^\/v1\/backends\/([^/]+)\/terminal$/.exec(url.pathname);
     const match = assistant
       ? ["", "the assistant"]
-      : /^\/v1\/agents\/(.+)\/terminal$/.exec(url.pathname);
+      : signIn ?? /^\/v1\/agents\/(.+)\/terminal$/.exec(url.pathname);
     // CORS never reaches a WebSocket, so the daemon refuses foreign origins at
     // the handshake and the fake has to behave the same way.
     const origin = request.headers.origin;
@@ -473,6 +540,7 @@ export async function startFakeServe({
       if (terminalReflow) client.send(Buffer.from("\x1b[?1049h"));
       draw();
       if (!terminalReflow) client.send(Buffer.from(`${agent} $ `));
+      let typed = "";
       client.on("message", (data, isBinary) => {
         // A view port discards keystrokes and resizes alike.
         if (view) {
@@ -488,6 +556,16 @@ export async function startFakeServe({
           draw();
           return;
         }
+        // What is typed before Enter stands for the key: "bad" signs in
+        // with one its vendor rejects, which only the test prompt finds.
+        if (signIn) {
+          typed += data.toString();
+          if (typed.includes("\r")) {
+            backendStatus[agent] = { status: "connected", via: "fake sign-in" };
+            rejectedKeys[agent] = typed.startsWith("bad");
+            typed = "";
+          }
+        }
         client.send(Buffer.from(data));
       });
     });
@@ -496,6 +574,17 @@ export async function startFakeServe({
   viewServer?.on("upgrade", upgrade(true));
 
   let backend = "codex";
+  /** Backends signed in with a key the test prompt finds rejected. */
+  const rejectedKeys = {};
+  /** Each backend's status; a sign-in in its terminal connects it. */
+  const backendStatus = {
+    claude: { status: "connected", via: "Claude Max" },
+    codex: { status: "connected", via: "ChatGPT" },
+    cursor: { status: "signed_out" },
+    opencode: { status: "unknown", reason: "no answer" },
+    pi: { status: "not_installed" },
+    agy: { status: "not_installed" },
+  };
   function newChat() {
     return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map() };
   }
@@ -620,6 +709,10 @@ export async function startFakeServe({
           program: PROPOSED_PROGRAM,
           inputs: { "flow.request": chat.messages[0]?.text ?? "" },
           preview,
+          // Asked for safety, the real EA proves properties of what it proposes.
+          ...(chat.messages.some((m) => m.role === "operator" && /\bsafe|\bprove/i.test(m.text))
+            ? { lemmas: "", properties: structuredClone(PROPERTY_VERDICTS) }
+            : {}),
         },
       );
       // Real assistants comment straight after proposing. That must not look

@@ -154,7 +154,16 @@ async function startRealServe() {
     stateDir,
     sessionPrefix,
     async close() {
-      child.kill();
+      // On SIGTERM the daemon parks its runs and updates its records, all in
+      // the session directory; removing that before it exits races those
+      // writes (ENOTEMPTY).
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((done) => child.once("exit", done));
+        child.kill();
+        const forced = setTimeout(() => child.kill("SIGKILL"), 30_000);
+        await exited;
+        clearTimeout(forced);
+      }
       // A failed or finished run leaves its agent sessions behind, so the
       // harness clears its own namespace rather than accumulating panes.
       await new Promise((done) => {
@@ -214,6 +223,23 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     assert.equal(f.body.status, r.body.status);
     // A daemon that predates view ports does not say which port this is.
     if ("access" in r.body) assert.equal(f.body.access, r.body.access);
+  });
+
+  test("backend sign-in status has the same shape", async () => {
+    const { real: r, fake: f } = await both("/v1/agent/backends");
+    assert.equal(r.status, 200);
+    assert.equal(f.status, r.status);
+    const statuses = ["connected", "signed_out", "not_installed", "unknown"];
+    for (const body of [r.body, f.body]) {
+      assert.deepEqual(
+        body.backends.map((b) => b.name),
+        ["claude", "codex", "cursor", "opencode", "pi", "agy"],
+      );
+      for (const backend of body.backends) {
+        assert.ok(statuses.includes(backend.status), backend.status);
+        assert.equal(typeof backend.login, "string");
+      }
+    }
   });
 
   test("an empty run listing has the same shape", async () => {

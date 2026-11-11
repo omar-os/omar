@@ -1463,12 +1463,12 @@ test("the composer says which assistant is answering, and can change it", async 
   await trigger.click();
   const menu = page.getByRole("menu");
   await expect(menu).toBeVisible();
+  // Only connected backends are offered, each with how it is signed in;
+  // the rest are a click away on the Backends page.
   await expect(menu.getByRole("menuitem")).toHaveText([
-    "Claude Code",
-    "Codex✓",
-    "Cursor",
-    "opencode",
-    "agy",
+    "Claude CodeClaude Max",
+    "CodexChatGPT✓",
+    "Connect more backends…",
   ]);
 
   // It opens upward: it lives at the bottom of the composer.
@@ -1477,13 +1477,205 @@ test("the composer says which assistant is answering, and can change it", async 
   expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(triggerBox.y + 1);
 
   // Choosing another restarts the assistant, so it asks first.
-  await menu.getByRole("menuitem", { name: "Claude Code" }).click();
+  await menu.getByRole("menuitem", { name: /Claude Code/ }).click();
   await expect(page.locator(".backend-confirm")).toContainText(
     "session is lost",
   );
   await page.getByRole("button", { name: "Restart" }).click();
 
   await expect(page.getByRole("button", { name: /Claude Code/ })).toBeVisible();
+});
+
+test("no backend can be chosen before its status is known", async ({ page }) => {
+  await useFakeServe(page);
+  let answer: () => void = () => {};
+  const held = new Promise<void>((resolve) => (answer = resolve));
+  await page.route("**/v1/agent/backends", async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  const menu = page.getByRole("menu");
+  // Still asking: a signed-out one must not slip through.
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeDisabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();
+
+  answer();
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeEnabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeHidden();
+});
+
+test("a backend the runtime finds signed out is refused with how to sign in", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  // Signed out since the menu last asked; the runtime checks again.
+  await page.route("**/v1/agent/backend", (route) =>
+    route.fulfill({
+      status: 409,
+      json: { error: "claude is not signed in; run `omar connect claude`" },
+    }),
+  );
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menu").getByRole("menuitem", { name: /Claude Code/ }).click();
+  await page.getByRole("button", { name: "Restart" }).click();
+
+  await expect(page.locator(".backend-error")).toHaveText(
+    "claude is not signed in; run `omar connect claude`",
+  );
+  await expect(page.getByRole("button", { name: /Codex/ })).toBeVisible();
+});
+
+test("a failed status check blocks switching until a retry answers", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({ status: 500, json: { error: "boom" } }),
+  );
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  const menu = page.getByRole("menu");
+  // Only a missing endpoint means an older runtime; a failure is not one.
+  await expect(menu.getByRole("alert")).toContainText("Couldn't check backends");
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeDisabled();
+
+  await page.unroute("**/v1/agent/backends");
+  await menu.getByRole("button", { name: "Retry" }).click();
+  await expect(menu.getByRole("alert")).toBeHidden();
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeEnabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeHidden();
+});
+
+test("a backend is connected from the Backends page, in a terminal that closes once it is", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await expect(backends).toContainText("2 of 6 connected.");
+  await expect(backends.getByRole("listitem")).toHaveText([
+    /Claude CodeConnected · Claude Max/,
+    /CodexConnected · ChatGPT/,
+    /CursorNot signed in.*Connect/,
+    /opencodeUnknown · no answer.*Connect/,
+    /piNot installed.*Connect/,
+    /agyNot installed.*Connect/,
+  ]);
+
+  // The same `omar connect cursor` as on the command line, in a terminal.
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+  await page.keyboard.press("Enter");
+
+  // Once cursor reports connected, the terminal goes on its own.
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorConnected · fake sign-in/,
+  );
+  await expect(backends).toContainText("3 of 6 connected.");
+
+  await backends.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await expect(page.getByRole("menuitem", { name: /Cursor/ })).toBeEnabled();
+});
+
+test("a sign-in whose test prompt fails keeps its terminal open until one works", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+
+  // Signed in with a key its vendor rejects: status says connected, the
+  // test prompt says otherwise, and the terminal stays for another try.
+  await page.keyboard.type("bad");
+  await page.keyboard.press("Enter");
+  const alert = terminal.getByRole("alert");
+  await expect(alert).toContainText(
+    "cursor is signed in, but its test prompt failed: 401 Invalid API Key",
+    { timeout: 10_000 },
+  );
+  await expect(terminal).toBeVisible();
+
+  // Signed in again, with a key that works.
+  await page.keyboard.type("good");
+  await page.keyboard.press("Enter");
+  await alert.getByRole("button", { name: "Check again" }).click();
+  await expect(terminal).toBeHidden();
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorConnected · fake sign-in/,
+  );
+  await expect(backends).toContainText("3 of 6 connected.");
+});
+
+test("a backend whose test prompt failed can be connected again", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+  await page.keyboard.type("bad");
+  await page.keyboard.press("Enter");
+  await expect(terminal.getByRole("alert")).toBeVisible({ timeout: 10_000 });
+  await terminal.getByRole("button", { name: "Close" }).click();
+
+  // It reads as connected, but is not counted, and offers Connect again.
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorSigned in, but its test prompt failed.*Connect/,
+  );
+  await expect(backends).toContainText("2 of 6 connected.");
+});
+
+test("with no backend connected, the Backends page comes first", async ({ page }) => {
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({
+      json: {
+        backends: ["claude", "codex", "cursor", "opencode", "pi", "agy"].map((name) => ({
+          name,
+          status: "not_installed",
+          login: `omar connect ${name}`,
+        })),
+      },
+    }),
+  );
+  await useFakeServe(page);
+
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await expect(backends).toContainText(
+    "No backend is connected yet. Connect one to start the assistant.",
+  );
+  await expect(backends.getByRole("button", { name: /^Connect / })).toHaveCount(6);
+});
+
+test("settings open the Backends page", async ({ page }) => {
+  await useFakeServe(page);
+  await expect(page.getByRole("dialog", { name: "Backends" })).toBeHidden();
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("menuitem", { name: "Connect backends…" }).click();
+  await expect(page.getByRole("dialog", { name: "Backends" })).toContainText("2 of 6 connected.");
+});
+
+test("a runtime without backend status still switches", async ({ page }) => {
+  await useFakeServe(page);
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({ status: 404, json: { error: "Not found" } }),
+  );
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menu").getByRole("menuitem", { name: /Cursor/ }).click();
+  await page.getByRole("button", { name: "Restart" }).click();
+  await expect(page.getByRole("button", { name: /Cursor/ })).toBeVisible();
 });
 
 test("a chevron names the backend behind its agent", async ({ page }) => {
@@ -2919,4 +3111,72 @@ test("workflow tabs support keyboard navigation and saved VS Code edits reach de
   const deployment = page.waitForRequest((r) => r.url().endsWith("/v1/runs") && r.method() === "POST");
   await deploy(page);
   expect((await deployment).postDataJSON().files).toEqual(savedFiles);
+});
+
+test("a design's safety properties show their Lean proofs and single out what they are about", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByLabel("Describe a workflow").fill("Review the release plan, and prove it is safe");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.locator(".messages")).toContainText("Which agent should own");
+  await page.getByLabel("Describe a workflow").fill("The planner");
+  await page.getByLabel("Draft workflow").click();
+  await expect(page.getByRole("group", { name: "Deploy design" })).toBeVisible();
+
+  // Lean's verdicts arrive with the design: two proved, one not.
+  await page.getByRole("button", { name: "Show the source pane" }).click();
+  const tab = page.getByRole("tab", { name: /Properties/ });
+  await expect(tab).toContainText("2/3");
+  await tab.click();
+  const panel = page.getByRole("tabpanel", { name: "Formal properties" });
+  await expect(panel).toContainText("2 of 3 proved by Lean");
+  const items = panel.locator(".property");
+  await expect(items).toHaveCount(3);
+  await expect(items.nth(0).locator(".property-status")).toHaveText("Proved");
+  await expect(items.nth(2).locator(".property-status")).toHaveText("Not proved");
+
+  // Nothing is singled out until a property is chosen.
+  await expect(page.locator(".off-focus")).toHaveCount(0);
+  await items.nth(0).locator(".property-summary").click();
+  const proof = items.nth(0).getByLabel("Lean proof");
+  await expect(proof).toContainText("theorem critique_comes_from_reviewer");
+  await expect(proof.locator(".omar-tok-keyword").first()).toHaveText("theorem");
+  await expect(proof.locator(".omar-tok-string").first()).toHaveText('"flow.critique"');
+  // It is about the critique and the reviewer that writes it; the planner's
+  // two reactions and the other ports step back.
+  await expect(page.locator(".omar-reaction.in-focus")).toHaveCount(1);
+  await expect(page.locator(".omar-reaction.off-focus")).toHaveCount(2);
+  await expect(page.locator(".omar-action-group.in-focus")).toHaveCount(1);
+  await expect(page.locator(".omar-team.in-focus")).toHaveCount(1);
+
+  // One that does not hold says where Lean stopped.
+  await items.nth(2).locator(".property-summary").click();
+  await expect(items.nth(2).getByLabel("What Lean objected to")).toContainText("unsolved goals");
+  await expect(items.nth(2).locator(".lean-line.has-problem").first()).toBeVisible();
+  await items.nth(2).locator(".property-summary").click();
+  await expect(page.locator(".off-focus")).toHaveCount(0);
+
+  // An edited program is not what Lean checked; checking again is one click.
+  await page.getByRole("tab", { name: "Source" }).click();
+  const editor = page.getByLabel("OMAR program");
+  await editor.locator(".cm-line", { hasText: "Find risks and omissions" }).click();
+  await editor.press("End");
+  await editor.pressSequentially(" Note any gaps.");
+  await tab.click();
+  await expect(panel.getByRole("status")).toContainText("The source has changed");
+  await panel.getByRole("button", { name: "Check again" }).click();
+  await expect(panel.getByRole("status")).toHaveCount(0);
+  const asked = await (await fetch(`${FAKE_SERVE_URL}/v1/proofs`)).json();
+  expect(asked.checks).toBe(1);
+
+  // The proofs open in Web VS Code, one Lean file a property.
+  const popup = page.waitForEvent("popup");
+  await panel.getByRole("button", { name: "Open in Web VS Code" }).click();
+  const opened = await popup;
+  await expect(opened).toHaveURL(/\/fake-editor\/proofs$/);
+  const workspace = (await (await fetch(`${FAKE_SERVE_URL}/v1/proofs`)).json()).workspace;
+  expect(workspace.properties.map((file: { name: string }) => file.name)).toEqual([
+    "critique_comes_from_reviewer", "answer_only_after_critique", "plan_always_reviewed",
+  ]);
+  expect(workspace.properties[0].source).toContain("def topology : Omar.Reactor.Topology");
+  await opened.close();
 });

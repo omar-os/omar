@@ -103,7 +103,7 @@ def main():
                 assert "OMAR_NATIVE_CONTEXT_PROOF" in json.dumps(requests), "native system transform did not inject context"
                 offered = sorted({t["function"]["name"] for r in requests for t in r.get("tools", [])
                                   if t.get("type") == "function" and "omar" in t["function"]["name"]})
-                assert offered == ["omar_complete", "omar_pending", "omar_set_port"], \
+                assert offered == ["omar_complete", "omar_pending", "omar_set_port", "omar_set_state"], \
                     f"OpenCode offered OMAR's tools as {offered}; prompts say omar_set_port"
                 print("PASS: native plugin injects system context; installed OpenCode noReply stays idle; prompt_async returns 204 and starts local inference; "
                       f"MCP tools offered as {offered}", flush=True)
