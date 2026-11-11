@@ -30,7 +30,7 @@ export function IntegrationsPage({ onClose }: { onClose: () => void }) {
   }, []);
   return <dialog ref={dialog} className="integrations-dialog" aria-labelledby="integrations-title" onCancel={onClose}>
     <header><h2 id="integrations-title">Integrations</h2><button type="button" onClick={onClose} aria-label="Close integrations">Close</button></header>
-    <p>Connections saved here or applied to a workflow are available to other workflows in this runtime.</p>
+    <p>Save a connection here, then ask for it by name when creating a workflow. You can also choose it from Saved integrations when editing a task.</p>
     {library.error ? <div role="alert">{library.error} <button type="button" onClick={library.refresh}>Retry</button></div> : null}
     {!form ? <>
       {library.entries.length ? <ul className="integration-list">{library.entries.map(entry => {

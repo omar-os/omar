@@ -319,6 +319,8 @@ struct AgentReply {
 #[derive(Debug, Deserialize)]
 struct AgentProposal {
     token: String,
+    #[serde(default)]
+    task_integrations: task_integrations::Bindings,
     program: String,
     #[serde(default)]
     files: BTreeMap<String, String>,
@@ -1459,6 +1461,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
     let context = if path == "/v1/agent/reply"
         || path == "/v1/agent/proposals"
         || path == "/v1/agent/properties"
+        || path == "/v1/agent/integrations"
     {
         let body: Value = match serde_json::from_slice(&raw_body) {
             Ok(body) => body,
@@ -1475,7 +1478,9 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         let found = contexts
             .values()
             .find(|context| {
-                body.get("token").and_then(Value::as_str)
+                body.get("token")
+                    .and_then(Value::as_str)
+                    .filter(|token| !token.is_empty())
                     == Some(context.agent_token.lock().expect("token poisoned").as_str())
             })
             .cloned();
@@ -1804,6 +1809,9 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         // EA-only, authenticated with the token handed to its MCP sidecar.
         ("POST", "/v1/agent/reply") => agent_reply(&context, &read_body(content_length)?),
+        ("POST", "/v1/agent/integrations") => {
+            task_integrations::search(&context.omar_dir, &read_body(content_length)?)
+        }
         ("POST", "/v1/agent/proposals") => {
             if content_length > MAX_BODY_BYTES {
                 (413, json!({"error": "program too large"}))
@@ -2798,6 +2806,9 @@ fn mission_control_envelope(text: &str, selection: &[String], live: Option<&Live
          OMAR program. Include companion files in `files`, keyed by their relative paths \
          (for example schemas/decision.json), so imported types compile. The entry \
          source is program.omar. The operator approves and runs it; you do not.\n\n\
+         For an external integration, search Settings with `omar_find_integrations`. Use the saved ID \
+         on the task that needs it via `omar_propose_design`'s `task_integrations`. If the intended \
+         connection is ambiguous, ask the operator. Never request a secret value.\n\n\
          {live}{selected}{text}",
         live = live.map(ToString::to_string).unwrap_or_default(),
     )
@@ -2906,9 +2917,14 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     // Compile before publishing. The operator never sees an unbuildable
     // program, and the EA gets the compiler's diagnostic back as its tool
     // result, so it can correct the program itself.
-    let state = match compile_preview(&proposal.program, &proposal.files) {
-        Ok(state) => state,
-        Err(error) => return (400, json!({"error": format!("{error:#}")})),
+    let (program, state) = match task_integrations::compile_design(
+        &context.omar_dir,
+        proposal.program,
+        &proposal.files,
+        &proposal.task_integrations,
+    ) {
+        Ok(compiled) => compiled,
+        Err(error) => return (400, json!({"error":format!("{error:#}")})),
     };
     // Proved here rather than taken on trust: the operator is shown Lean's
     // verdict on this program, whatever the assistant believed.
@@ -2916,7 +2932,7 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Vec::new()
     } else {
         match prove_properties(
-            &proposal.program,
+            &program,
             &proposal.files,
             &proposal.lemmas,
             &proposal.properties,
@@ -2930,7 +2946,7 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         proposal.summary,
         false,
         Some(ProposedDesign {
-            program: proposal.program,
+            program,
             files: proposal.files,
             inputs: proposal.inputs,
             preview: crate::diagram::DiagramSnapshot::from_vm_state(&state),

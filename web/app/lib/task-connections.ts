@@ -1,3 +1,5 @@
+import GUIDANCE from "./connection-guidance.json" with { type: "json" };
+
 export type ConnectionAuth =
   | { type: "none" }
   | { type: "bearer"; variable: string }
@@ -45,7 +47,6 @@ export function validateConnection(connection: TaskConnection, others: TaskConne
 
 const START = '\n\n<omar-connections version="1">\n';
 const END = "\n</omar-connections>";
-const GUIDANCE = "These connections are available for this task. Use them only as needed for the task prompt. HTTP and webhook requests are made by the execution agent using its network tools; they are not workflow triggers. Resolve authentication from the named environment variable in the agent's environment, never print its value, and report a missing credential or failed request instead of inventing a result. For bearer authentication use the Authorization header with the Bearer scheme; for api-key authentication use the configured header. An MCP connection refers to a server already installed in the execution agent; use its tools and report if unavailable. Saving these settings does not test connectivity or install an MCP server.";
 
 /** The connection block travels with the real execution prompt, so exporting,
  * compiling and running the workflow all use the same connection settings. */

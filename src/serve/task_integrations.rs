@@ -1,8 +1,13 @@
 //! The operator's saved connection settings are shared by chats in this runtime.
 //! Credential fields describe an environment binding; the catalog never looks it up.
+use anyhow::{anyhow, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, fs, io, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
+    path::Path,
+};
 
 pub(super) const ROUTE: &str = "/v1/task-integrations";
 
@@ -42,6 +47,14 @@ impl Connection {
     fn id(&self) -> &str {
         match self {
             Self::Http { id, .. } | Self::Webhook { id, .. } | Self::Mcp { id, .. } => id,
+        }
+    }
+
+    fn summary(&self) -> (&str, &str) {
+        match self {
+            Self::Http { name, .. } => (name, "http"),
+            Self::Webhook { name, .. } => (name, "webhook"),
+            Self::Mcp { name, .. } => (name, "mcp"),
         }
     }
 
@@ -127,25 +140,158 @@ struct Batch {
     import_only: bool,
 }
 
-pub(super) fn request(dir: &Path, method: &str, raw: &[u8]) -> (u16, Value) {
-    let path = dir.join("task-integrations.json");
-    let mut entries: BTreeMap<String, Connection> = match fs::read(&path) {
-        Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(entries) => entries,
-            Err(_) => {
-                return (
-                    500,
-                    json!({"error":"Saved integrations could not be read."}),
-                )
-            }
-        },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
-        Err(_) => {
-            return (
-                500,
-                json!({"error":"Saved integrations could not be read."}),
-            )
+fn load(dir: &Path) -> Result<BTreeMap<String, Connection>> {
+    match fs::read(dir.join("task-integrations.json")) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Discovery shares only the names, kinds and stable IDs needed to design a task.
+pub(super) fn search(dir: &Path, body: &[u8]) -> (u16, Value) {
+    #[derive(Deserialize)]
+    struct Search {
+        query: String,
+    }
+    let Ok(Search { query }) = serde_json::from_slice(body) else {
+        return (
+            400,
+            json!({"error":"Supply an integration name or an empty search."}),
+        );
+    };
+    let Ok(entries) = load(dir) else {
+        return (
+            500,
+            json!({"error":"Saved integrations could not be read."}),
+        );
+    };
+    let query = query.trim().to_lowercase();
+    let mut matches = entries.values().filter_map(|entry| {
+        let (name, kind) = entry.summary();
+        (name.to_lowercase().contains(&query)
+            || entry.id().eq_ignore_ascii_case(&query)
+            || kind == query)
+            .then(|| json!({"id":entry.id(), "name":name, "type":kind}))
+    });
+    let integrations: Vec<_> = matches.by_ref().take(50).collect();
+    (
+        200,
+        json!({"integrations":integrations, "more":matches.next().is_some()}),
+    )
+}
+
+const MARKER: &str = "[[integrations:";
+pub(super) type Bindings = BTreeMap<String, Vec<String>>;
+
+/// Expand only a unique marker at the end of a real, compiled agent task.
+/// Ordinary task text and string interpolation stay in the original source.
+pub(super) fn compile_design(
+    dir: &Path,
+    source: String,
+    files: &BTreeMap<String, String>,
+    bindings: &Bindings,
+) -> Result<(String, crate::topology::VmState)> {
+    let state = super::compile_preview(&source, files)?;
+    let mut slots = BTreeSet::new();
+    for task in state.reactions.values() {
+        // Previously bound tasks already carry their reviewed snapshot. A
+        // display name or URL inside it is never a new binding instruction.
+        let prompt = task
+            .prompt
+            .split("\n\n<omar-connections")
+            .next()
+            .unwrap_or_default()
+            .trim_end();
+        if let Some((_, suffix)) = prompt.split_once(MARKER) {
+            let slot = suffix
+                .strip_suffix("]]")
+                .context("Place the integration marker at the end of the task prompt.")?;
+            slots.insert(slot);
         }
+    }
+    if slots.is_empty() && bindings.is_empty() {
+        return Ok((source, state));
+    }
+    ensure!(
+        slots
+            .iter()
+            .copied()
+            .eq(bindings.keys().map(String::as_str)),
+        "Each task integration marker needs a matching task_integrations binding."
+    );
+    ensure!(
+        bindings.len() <= 128,
+        "Too many integration bindings in one design."
+    );
+    let entries = load(dir).context("Could not read saved integrations")?;
+    let guidance: &str =
+        serde_json::from_str(include_str!("../../web/app/lib/connection-guidance.json"))?;
+    let mut edits = Vec::new();
+    let mut size = source.len();
+    for (slot, ids) in bindings {
+        ensure!(
+            !slot.is_empty()
+                && slot.len() <= 80
+                && slot.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            "Use a short alphanumeric integration slot name."
+        );
+        let marker = format!("{MARKER}{slot}]]");
+        let mut positions = source.match_indices(&marker);
+        let (start, _) = positions
+            .next()
+            .ok_or_else(|| anyhow!("Missing task marker {marker}"))?;
+        let tail = &source[start + marker.len()..];
+        let after = tail.trim_start();
+        ensure!(
+            positions.next().is_none() && after.starts_with('"'),
+            "Place {marker} exactly once at the end of a task prompt."
+        );
+        let length = marker.len() + tail.len() - after.len();
+        ensure!(
+            !ids.is_empty(),
+            "Choose at least one saved integration for {slot}."
+        );
+        let mut names = BTreeSet::new();
+        let mut selected = Vec::new();
+        for id in ids {
+            let entry = entries.get(id).ok_or_else(|| {
+                anyhow!("Unknown saved integration ID '{id}'. Search Settings again.")
+            })?;
+            ensure!(
+                entry.valid() && names.insert(entry.summary().0.trim().to_lowercase()),
+                "Invalid or duplicate integration for task {slot}."
+            );
+            selected.push(entry);
+        }
+        let metadata = json!({"connections":selected, "instructions":guidance});
+        let block = format!(
+            "\n\n<omar-connections version=\"1\">\n{}\n</omar-connections>",
+            serde_json::to_string_pretty(&metadata)?
+        );
+        let escaped = block.replace('\\', r"\\").replace('"', r#"\""#);
+        size = size - length + escaped.len();
+        ensure!(
+            size <= super::MAX_BODY_BYTES,
+            "Design with saved integrations exceeds the program size limit."
+        );
+        edits.push((start, length, escaped));
+    }
+    edits.sort_unstable_by_key(|edit| std::cmp::Reverse(edit.0));
+    let mut result = source;
+    for (start, len, replacement) in edits {
+        result.replace_range(start..start + len, &replacement);
+    }
+    let state = super::compile_preview(&result, files)?;
+    Ok((result, state))
+}
+
+pub(super) fn request(dir: &Path, method: &str, raw: &[u8]) -> (u16, Value) {
+    let Ok(mut entries) = load(dir) else {
+        return (
+            500,
+            json!({"error":"Saved integrations could not be read."}),
+        );
     };
     if method == "POST" {
         let Ok(batch) = serde_json::from_slice::<Batch>(raw) else {
@@ -185,7 +331,9 @@ pub(super) fn request(dir: &Path, method: &str, raw: &[u8]) -> (u16, Value) {
                     json!({"error":"The saved integrations catalog is full."}),
                 );
             }
-            if crate::manager::write_private_file(&path, &bytes).is_err() {
+            if crate::manager::write_private_file(&dir.join("task-integrations.json"), &bytes)
+                .is_err()
+            {
                 return (
                     500,
                     json!({"error":"Could not save integrations in this runtime."}),

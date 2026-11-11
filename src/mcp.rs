@@ -820,15 +820,16 @@ impl OmarMcpServer {
             match call.name.as_str() {
                 // Refused rather than merely unlisted, so an agent that learned
                 // the names elsewhere still cannot reach the operator.
-                "omar_reply" | "omar_propose_design" | "omar_check_properties" => {
-                    match &self.context.serve {
-                        Some(serve) => serve_tool_call(serve, &call.name, call.arguments),
-                        None => Err(anyhow!(
-                            "Tool '{}' is only available to the executive assistant",
-                            call.name
-                        )),
-                    }
-                }
+                "omar_reply"
+                | "omar_propose_design"
+                | "omar_check_properties"
+                | "omar_find_integrations" => match &self.context.serve {
+                    Some(serve) => serve_tool_call(serve, &call.name, call.arguments),
+                    None => Err(anyhow!(
+                        "Tool '{}' is only available to the executive assistant",
+                        call.name
+                    )),
+                },
                 "coordination_state" => crate::supervision::context_page(
                     &self.context.omar_dir,
                     self.ea_id(),
@@ -2785,6 +2786,11 @@ fn ea_tool_definitions() -> Vec<Value> {
             }),
         ),
         tool(
+            "omar_find_integrations",
+            "Find integrations saved in this runtime's Settings before designing tasks that use an external service. Search by name or kind (http, webhook, mcp); an empty query lists up to 50. If more is true narrow the query. Ask the operator when multiple entries could fit. Pass selected IDs in omar_propose_design.task_integrations.",
+            json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}),
+        ),
+        tool(
             "omar_propose_design",
             "Submit an OMAR program to the operator for approval. Does not run anything: the operator reviews the program in Mission Control and starts the run themselves. Include every input the program declares. While a workflow is running or paused, a program that keeps its `main` name is a change to that run, which the operator applies live.",
             json!({
@@ -2792,6 +2798,7 @@ fn ea_tool_definitions() -> Vec<Value> {
                 "properties":{
                     "program":{"type":"string","description":"Complete .omar source (program.omar)"},
                     "files":{"type":"object","additionalProperties":{"type":"string"},"description":"Companion files keyed by relative path, e.g. schemas/decision.json. Include every imported schema."},
+                    "task_integrations":{"type":"object","additionalProperties":{"type":"array","items":{"type":"string"}},"description":"For each task using a saved integration, end its prompt string with [[integrations:SLOT]] and map SLOT here to the IDs returned by omar_find_integrations. Give each task a unique alphanumeric slot. Example: task reader(item) -> title \"Read $(item).[[integrations:read]]\" with {\"read\":[\"saved-id\"]}. The runtime inserts the saved configuration into the reviewed program. Preserve existing connection blocks on edits."},
                     "summary":{"type":"string","description":"One or two sentences on what it does"},
                     "inputs":{"type":"object","description":"Values for the program's declared input ports"},
                     "lemmas":{"type":"string","description":"Lean declarations the properties share"},
@@ -2918,6 +2925,7 @@ fn serve_tool_call(
         "omar_reply" => "/v1/agent/reply",
         "omar_propose_design" => "/v1/agent/proposals",
         "omar_check_properties" => "/v1/agent/properties",
+        "omar_find_integrations" => "/v1/agent/integrations",
         other => bail!("unknown serve tool '{other}'"),
     };
     // Arguments come from a model, so the shape is not guaranteed. Indexing a
@@ -2941,11 +2949,13 @@ fn serve_tool_call(
         &Value::Object(body),
         std::time::Duration::from_secs(330),
     )?;
-    Ok(if name == "omar_check_properties" {
-        answer
-    } else {
-        json!({"status":"delivered"})
-    })
+    Ok(
+        if matches!(name, "omar_check_properties" | "omar_find_integrations") {
+            answer
+        } else {
+            json!({"status":"delivered"})
+        },
+    )
 }
 
 fn topology_tool_definitions() -> Vec<Value> {
@@ -3540,7 +3550,12 @@ mod tests {
             },
         ] {
             let server = OmarMcpServer::new(context);
-            for name in ["omar_reply", "omar_propose_design", "omar_check_properties"] {
+            for name in [
+                "omar_reply",
+                "omar_propose_design",
+                "omar_check_properties",
+                "omar_find_integrations",
+            ] {
                 let result = server.call_tool(ToolCallRequest {
                     name: name.to_string(),
                     arguments: json!({"text": "hello", "program": "team T() {}", "summary": "s"}),
