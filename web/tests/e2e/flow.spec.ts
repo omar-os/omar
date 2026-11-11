@@ -1658,6 +1658,40 @@ test("with no backend connected, the Backends page comes first", async ({ page }
   await expect(backends.getByRole("button", { name: /^Connect / })).toHaveCount(6);
 });
 
+test("Settings stays reachable from the workflow sidebar, folded layout and mobile drawer", async ({ page }) => {
+  await useFakeServe(page);
+  const sidebar = page.getByRole("complementary", { name: "Chat history" });
+  const trigger = sidebar.getByRole("button", { name: "Settings" });
+  await expect(trigger.getByText("Settings")).toBeVisible();
+  await trigger.press("Enter");
+  const integrations = page.getByRole("menuitem", { name: "Integrations" });
+  await expect(integrations).toBeFocused();
+  await integrations.press("Escape");
+  await expect(trigger).toBeFocused();
+
+  await page.getByRole("separator", { name: "the workflow list" }).hover();
+  await page.getByRole("button", { name: "Hide the workflow list" }).click();
+  await page.getByRole("button", { name: "Settings" }).click();
+  await integrations.click();
+  const catalog = page.getByRole("dialog", { name: "Integrations" });
+  await expect(catalog).toBeVisible();
+  await catalog.getByRole("button", { name: "Close integrations" }).click();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const openDrawer = page.getByRole("button", { name: "Open chat history" });
+  await openDrawer.click();
+  const drawer = page.getByRole("dialog", { name: "Chat history" });
+  const mobileSettings = drawer.getByRole("button", { name: "Settings" });
+  await expect(mobileSettings.getByText("Settings")).toBeInViewport();
+  await mobileSettings.click();
+  await drawer.getByRole("menuitem", { name: "Integrations" }).click();
+  await expect(catalog.getByRole("button", { name: "Close integrations" })).toBeFocused();
+  await catalog.getByRole("button", { name: "Close integrations" }).click();
+  await expect(mobileSettings).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(openDrawer).toBeFocused();
+});
+
 test("settings open the Backends page", async ({ page }) => {
   await useFakeServe(page);
   await expect(page.getByRole("dialog", { name: "Backends" })).toBeHidden();
@@ -3278,7 +3312,7 @@ test("settings list applied integrations and another workflow reuses their crede
   const connections = inspector.getByRole("region", {name:"Task connections"});
   const settings = page.getByRole("dialog", {name:"Integrations", exact:true});
   const openSettings = async () => {
-    await page.getByRole("button", {name:"Settings",exact:true}).click();
+    await page.getByRole("complementary", {name:"Chat history"}).getByRole("button", {name:"Settings",exact:true}).click();
     await page.getByRole("menuitem", {name:"Integrations",exact:true}).click();
   };
   await task.press("Enter");

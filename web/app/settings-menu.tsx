@@ -18,7 +18,7 @@ function applyTheme(theme: Theme) {
 }
 
 /**
- * Settings for this browser, which today means the theme.
+ * Browser theme and available runtime settings.
  *
  * Dark is the default and the server render, so the attribute is only ever
  * added for light. The choice outlives the page through local storage and is
@@ -43,10 +43,12 @@ export function SettingsMenu({
       : "dark",
   );
   const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!open) return;
+    rootRef.current?.querySelector<HTMLButtonElement>('[role="menu"] button')?.focus();
     const dismiss = (event: MouseEvent) => {
       if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
     };
@@ -54,16 +56,24 @@ export function SettingsMenu({
     return () => window.removeEventListener("mousedown", dismiss);
   }, [open]);
 
+  function close() {
+    setOpen(false);
+    triggerRef.current?.focus();
+  }
+
   function choose(next: Theme) {
     applyTheme(next);
     setTheme(next);
-    setOpen(false);
+    close();
   }
 
   return (
-    <div className="settings-menu" ref={rootRef}>
+    <div className="settings-menu" ref={rootRef} onBlur={(event) => {
+      if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+    }}>
       <button
         type="button"
+        ref={triggerRef}
         className="settings-trigger"
         aria-haspopup="menu"
         aria-expanded={open}
@@ -71,19 +81,29 @@ export function SettingsMenu({
         title="Settings"
         onClick={() => setOpen((was) => !was)}
       >
-        <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
-          <circle cx="10" cy="10" r="3" fill="none" stroke="currentColor" strokeWidth="1.6" />
-          <path
-            d="M10 2.5v2.2M10 15.3v2.2M2.5 10h2.2M15.3 10h2.2M4.7 4.7l1.6 1.6M13.7 13.7l1.6 1.6M4.7 15.3l1.6-1.6M13.7 6.3l1.6-1.6"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.6"
-            strokeLinecap="round"
-          />
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" aria-hidden="true">
+          <path d="m9.5 4 .6-2h3.8l.6 2 2 .9 1.9-.5 1.9 3.2-1.5 1.6.2 2.8 1.4 1.6-1.9 3.3-2-.5-2 1-.6 2.6h-3.8l-.6-2.6-2-1-2 .5-1.9-3.3L5 12l.2-2.8-1.5-1.6 1.9-3.2 1.9.5Z" transform="translate(0 1)" />
+          <circle cx="12" cy="12" r="3" />
         </svg>
+        <span>Settings</span>
       </button>
       {open ? (
-        <div className="settings-options" role="menu" aria-label="Settings">
+        <div className="settings-options" role="menu" aria-label="Settings" onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            close();
+          } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            const items = Array.from(event.currentTarget.querySelectorAll("button"));
+            const index = items.indexOf(document.activeElement as HTMLButtonElement);
+            items[(index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
+          }
+        }}>
+          {onOpenIntegrations ? (
+            <button type="button" role="menuitem" onClick={() => { close(); onOpenIntegrations(); }}>
+              Integrations
+            </button>
+          ) : null}
           <span className="settings-heading">Theme</span>
           {(["light", "dark"] as const).map((option) => (
             <button
@@ -98,11 +118,6 @@ export function SettingsMenu({
               {theme === option ? <span aria-hidden="true">✓</span> : null}
             </button>
           ))}
-          {onOpenIntegrations ? (
-            <button type="button" role="menuitem" onClick={() => { setOpen(false); onOpenIntegrations(); }}>
-              Integrations
-            </button>
-          ) : null}
           {onOpenBackends ? (
             <>
               <span className="settings-heading">Backends</span>
@@ -110,7 +125,7 @@ export function SettingsMenu({
                 type="button"
                 role="menuitem"
                 onClick={() => {
-                  setOpen(false);
+                  close();
                   onOpenBackends();
                 }}
               >

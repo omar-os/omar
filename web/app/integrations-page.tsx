@@ -21,8 +21,12 @@ export function IntegrationsPage({ onClose }: { onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const element = dialog.current;
+    const opener = document.activeElement as HTMLElement | null;
     element?.showModal();
-    return () => element?.close();
+    return () => {
+      element?.close();
+      opener?.focus();
+    };
   }, []);
   return <dialog ref={dialog} className="integrations-dialog" aria-labelledby="integrations-title" onCancel={onClose}>
     <header><h2 id="integrations-title">Integrations</h2><button type="button" onClick={onClose} aria-label="Close integrations">Close</button></header>
