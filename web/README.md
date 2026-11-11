@@ -188,12 +188,6 @@ Antigravity. Switching the assistant or restarting supplies both the saved trans
 and current workflow edits to the selected backend. Imported draft-only workflows
 are preserved even when they have no chat messages.
 
-`Open OMAR.command` uses an installed OMAR executable, an explicit `OMAR_BIN`, or
-an adjacent source build. It contains no username, assistant directory, or worktree
-path. Install `omar` and `omarc` together so the compiler is found beside the runtime.
-The locally installed copy can live in `~/.omar/bin`; no assistant installation is
-needed merely to open and view saved work.
-
 This restores data created in OMAR. Standalone provider app histories and separate
 explicitly named OMAR workspaces retain their own boundaries; changing an assistant
 does not silently merge unrelated conversations or start an existing campaign.
