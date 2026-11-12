@@ -342,10 +342,9 @@ fn omar_agent_flag(context: &McpLaunchContext) -> Option<String> {
 /// Keep caller-supplied settings intact. The durable scheduler and MCP
 /// projections still supervise sessions whose custom settings own their hooks.
 pub(crate) fn with_coordination_hooks(command: &str, context: &McpLaunchContext) -> String {
-    if context.topology.is_some()
-        || command
-            .split_whitespace()
-            .any(|t| t == "--settings" || t.starts_with("--settings="))
+    if command
+        .split_whitespace()
+        .any(|t| t == "--settings" || t.starts_with("--settings="))
     {
         return command.to_owned();
     }
@@ -362,10 +361,16 @@ pub(crate) fn with_coordination_hooks(command: &str, context: &McpLaunchContext)
     );
     let guard = format!("{exe} claude-hook workflow-guard");
     let handler = serde_json::json!([{"hooks":[{"type":"command","command":hook,"timeout":5}]}]);
-    let settings = serde_json::json!({"crossSessionInbound":"accept","hooks":{
+    let mut settings = serde_json::json!({"crossSessionInbound":"accept","hooks":{
         "SessionStart":handler,"UserPromptSubmit":handler,"Stop":handler,
         "PreToolUse":[{"matcher":"Workflow","hooks":[{"type":"command","command":guard,"timeout":5}]}]
     }});
+    if context.topology.is_some() {
+        settings["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("PreToolUse");
+    }
     format!(
         "{command} --settings {}",
         shell_single_quote(&settings.to_string())
@@ -836,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn coordination_hooks_preserve_explicit_settings_and_skip_topology() {
+    fn coordination_hooks_preserve_settings_and_observe_topology_turns() {
         let dir = tempfile::tempdir().unwrap();
         let context = test_mcp_context(dir.path());
         let custom = "claude --settings '/tmp/my settings.json'";
@@ -854,7 +859,9 @@ mod tests {
             token: "t".into(),
             attempt: None,
         });
-        assert_eq!(with_coordination_hooks("claude", &topology), "claude");
+        let hooked = with_coordination_hooks("claude", &topology);
+        assert!(hooked.contains("Stop"));
+        assert!(!hooked.contains("workflow-guard"));
     }
 
     #[test]

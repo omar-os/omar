@@ -15,6 +15,18 @@ use std::time::Duration;
 pub struct Opencode;
 
 impl Backend for Opencode {
+    fn ended_turn(
+        &self,
+        target: &super::Target<'_>,
+        hook_file: &std::path::Path,
+    ) -> Option<String> {
+        let (_, session) = from_stamp(target.stamp?)?;
+        let path = hook_file.with_extension(format!("{session}.json"));
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        (value["idle"] == true)
+            .then(|| value["turn"].as_str().map(str::to_owned))
+            .flatten()
+    }
     fn kind(&self) -> Kind {
         Kind::Opencode
     }
@@ -202,17 +214,20 @@ pub(crate) fn with_opencode_port(base_command: &str) -> String {
 pub(crate) fn materialize_opencode_coordination_plugin(
     context: &McpLaunchContext,
 ) -> Option<String> {
-    if context.topology.is_some() {
-        return None;
-    }
     let exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
-    let path = mcp_ea_dir(context)?
-        .join(actor_file(context.agent_name.as_deref(), "coordination").replace(".json", ".mjs"));
+    let path = if context.topology.is_some() {
+        context_file.with_extension("coordination.mjs")
+    } else {
+        mcp_ea_dir(context)?.join(
+            actor_file(context.agent_name.as_deref(), "coordination").replace(".json", ".mjs"),
+        )
+    };
     let body = format!(
-        "const exe = {};\nconst contextFile = {};\n{}",
+        "const exe = {};\nconst contextFile = {};\nconst topology = {};\n{}",
         serde_json::to_string(&exe).ok()?,
         serde_json::to_string(&context_file).ok()?,
+        context.topology.is_some(),
         include_str!("opencode/plugin.mjs")
     );
     write_private_file(&path, body.as_bytes()).ok()?;
@@ -826,6 +841,14 @@ mod tests {
         assert!(opencode_port(&line).is_some(), "{line}");
         assert!(Opencode.new_conversation_id().starts_with("ses_"));
         context.topology.as_mut().unwrap().attempt = None;
+        let first = materialize_opencode_coordination_plugin(&context).unwrap();
+        context.topology.as_mut().unwrap().agent = "t.other".into();
+        let second = materialize_opencode_coordination_plugin(&context).unwrap();
+        assert_ne!(
+            first, second,
+            "workers must not overwrite one another's event context"
+        );
+        context.topology.as_mut().unwrap().agent = "t.coder".into();
         let line = Opencode.launch_command(&Launch {
             base_command: "opencode",
             prompt_file: std::path::Path::new("/tmp/system.md"),

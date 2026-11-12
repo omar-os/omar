@@ -28,6 +28,7 @@ pub fn run(context_file: &Path) -> Result<()> {
     let context: McpLaunchContext = serde_json::from_str(&raw).context("invalid MCP context")?;
     let topology = context
         .topology
+        .as_ref()
         .context("stub agent requires a topology context")?;
 
     let spool =
@@ -61,8 +62,25 @@ pub fn run(context_file: &Path) -> Result<()> {
     }
     std::io::stdout().flush().ok();
 
+    let mut pending = BTreeMap::new();
+    let mut stops = std::env::var("OMAR_STUB_STOP_TURNS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
     loop {
         for message in crate::backend::spool::drain_spool(Path::new(&spool)) {
+            crate::supervision::backend_hook_response(
+                &context,
+                &json!({"hook_event_name":"Busy"}),
+                "stub",
+            )?;
+            if message.starts_with("OMAR REMINDER") && !pending.is_empty() {
+                if stops == 0 {
+                    answer(topology, &pending)?;
+                } else {
+                    stops -= 1;
+                }
+            }
             let mut lines = message.lines();
             while let Some(line) = lines.next() {
                 if !line.contains(INVOCATION) {
@@ -77,10 +95,23 @@ pub fn run(context_file: &Path) -> Result<()> {
                         fields.insert(key.trim().to_string(), value.trim().to_string());
                     }
                 }
-                if let Err(error) = answer(&topology, &fields) {
+                pending = fields;
+                if stops > 0 {
+                    stops -= 1;
+                    continue;
+                }
+                if let Ok(delay) = std::env::var("OMAR_STUB_WORK_MILLIS") {
+                    std::thread::sleep(Duration::from_millis(delay.parse()?));
+                }
+                if let Err(error) = answer(topology, &pending) {
                     eprintln!("stub agent could not answer: {error:#}");
                 }
             }
+            crate::supervision::backend_hook_response(
+                &context,
+                &json!({"hook_event_name":"Stop"}),
+                "stub",
+            )?;
         }
         std::thread::sleep(Duration::from_millis(25));
     }

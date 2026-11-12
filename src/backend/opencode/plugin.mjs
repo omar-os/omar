@@ -2,6 +2,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 const run = promisify(execFile);
+let turnSnapshots = Promise.resolve();
 async function snapshot(event) {
   const { stdout } = await run(exe, ["agent-hook", "--context-file", contextFile,
     "--format", "opencode", "--event", event], { timeout: 5000, maxBuffer: 256 * 1024 });
@@ -18,6 +19,15 @@ export const OmarCoordination = async () => ({
   },
   event: async ({ event }) => {
     // The host owns wake delivery and retries; do not start a recursive prompt.
-    if (event.type === "session.idle") await snapshot("Stop");
+    let signal;
+    if (event.type === "session.idle") signal = topology ? `Stop:${event.properties.sessionID}` : "Stop";
+    if (topology && event.type === "session.status" && event.properties.status.type !== "idle") {
+      signal = `Busy:${event.properties.sessionID}`;
+    }
+    if (signal) {
+      // Native callbacks overlap; their hook processes must write in event order.
+      turnSnapshots = turnSnapshots.catch(() => {}).then(() => snapshot(signal));
+      await turnSnapshots;
+    }
   },
 });

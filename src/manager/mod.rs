@@ -349,6 +349,20 @@ pub(crate) fn materialize_shared_mcp_context_file(context: &McpLaunchContext) ->
     Some(path)
 }
 
+pub(crate) fn topology_turn_file(
+    omar_dir: &Path,
+    ea_id: EaId,
+    team: &str,
+    agent: &str,
+    attempt: Option<&str>,
+) -> PathBuf {
+    let dir = match attempt {
+        Some(id) => attempt_mcp_dir(omar_dir, ea_id, id),
+        None => omar_dir.join("mcp").join(format!("ea-{ea_id}")),
+    };
+    dir.join(format!("context-topology-{team}-{agent}.turn.json"))
+}
+
 pub(crate) fn materialize_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
     let dir = mcp_ea_dir(context)?;
     let path = match &context.topology {

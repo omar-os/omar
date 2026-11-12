@@ -14,6 +14,12 @@ use anyhow::{Context, Result};
 pub struct Pi;
 
 impl Backend for Pi {
+    fn ended_turn(&self, target: &Target<'_>, _hook_file: &std::path::Path) -> Option<String> {
+        let socket = target.stamp?.strip_prefix("pi:")?;
+        request(socket, serde_json::json!({"turn": true})).ok()?["ended"]
+            .as_str()
+            .map(str::to_owned)
+    }
     fn kind(&self) -> Kind {
         Kind::Pi
     }

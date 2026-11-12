@@ -2,7 +2,7 @@ import net from "node:net";
 import { chmod, unlink } from "node:fs/promises";
 
 // One private socket per launch. It is published only after MCP discovery.
-export async function startDelivery(path, pi, ctx) {
+export async function startDelivery(path, pi, ctx, turn = {}) {
   if (!path) return undefined;
   const clients = new Set();
   const server = net.createServer((socket) => {
@@ -19,13 +19,16 @@ export async function startDelivery(path, pi, ctx) {
       socket.removeAllListeners("data");
       try {
         const message = JSON.parse(input.slice(0, input.indexOf("\n")));
-        if (message.session === true) {
+        if (message.turn === true) {
+          socket.end(JSON.stringify({ ended: turn.idle ? turn.id : null }) + "\n");
+        } else if (message.session === true) {
           // The file `--session` reopens, and the id, which is all a
           // `--no-session` conversation has.
           socket.end(JSON.stringify({ session: ctx.sessionManager.getSessionFile() ?? null,
             id: ctx.sessionManager.getSessionId() }) + "\n");
         } else {
           if (typeof message.text !== "string" || !message.text) throw new Error("missing text");
+          turn.idle = false;
           pi.sendMessage({ customType: "omar_event", content: message.text, display: true },
             { triggerTurn: true, deliverAs: "followUp" });
           socket.end('{"accepted":true}\n');

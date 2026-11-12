@@ -305,6 +305,7 @@ jobs:
         run: |
           npm install -g opencode-ai@1.18.31
           python3 tests/ci/worker_restart.py
+          python3 tests/ci/worker_remind.py
 
       - name: Verify safety properties are proved through serve
         run: |

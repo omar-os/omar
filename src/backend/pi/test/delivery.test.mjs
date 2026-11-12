@@ -59,7 +59,16 @@ test("failed tool discovery never publishes delivery; retry and shutdown manage 
     await handlers.session_start({}, {});
     await assert.rejects(stat(path));
     await handlers.session_start({}, {});
+    assert.deepEqual(await request(path, { turn: true }), { ended: null });
+    await handlers.agent_end();
+    const first = (await request(path, { turn: true })).ended;
+    assert.equal(typeof first, "string");
+    await handlers.agent_start();
+    assert.deepEqual(await request(path, { turn: true }), { ended: null });
+    await handlers.agent_end();
+    assert.notEqual((await request(path, { turn: true })).ended, first);
     assert.deepEqual(await request(path, { text: "ready" }), { accepted: true });
+    assert.deepEqual(await request(path, { turn: true }), { ended: null });
     await handlers.session_shutdown();
     await assert.rejects(stat(path));
     assert.equal(closed, 2);

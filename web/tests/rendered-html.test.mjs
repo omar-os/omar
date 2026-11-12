@@ -146,6 +146,15 @@ test("restarted tasks have readable attempt rows in order and concise badge text
   const fresh = restartRows([record("fresh", 9, 2, "open", { lifetime: { count: 1, unit: "task" } })], "b.reaction.0");
   assert.match(fresh[0].summary, /retry 2 of 2 · new conversation · in progress/);
   assert.deepEqual(restartRows([], "b.reaction.0"), []);
+  const reminded = restartRows([record("reminded", 10, 0, "completed", {
+    reminders: [{ task_id: 10, reaction: "b.reaction.0" }],
+  })], "b.reaction.0");
+  assert.equal(reminded[0].summary, "Attempt 1 · completed · reminded to finish");
+  const later = record("shared-window", 11, 0, "open", {
+    reminders: [{ task_id: 10, reaction: "b.reaction.0" }],
+  });
+  later.invocations.unshift({ reaction: "b.reaction.0", invocation_id: 10 });
+  assert.equal(restartRows([later], "b.reaction.0")[0].reminded, false);
 });
 
 test("the inspector and diagram render the restart rows and badge with id tooltips", async () => {

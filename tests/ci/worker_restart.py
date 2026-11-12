@@ -44,6 +44,7 @@ class Provider(BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers.get('content-length', '0'))))
         self.server.requests.append(request)
+        scenario = getattr(self.server, 'scenario', None)
         chat = 'messages' in request
         items = request.get('messages' if chat else 'input', [])
         text = json.dumps(items)
@@ -54,7 +55,10 @@ class Provider(BaseHTTPRequestHandler):
             task = int(tasks[-1])
             last = items[-1] if items else {}
             done = last.get('tool_call_id' if chat else 'call_id', '')
-            if done.startswith('call_set'):
+            reminded = re.search(r'OMAR REMINDER.{0,20}task_id: ' + str(task) + r'\D', text)
+            if scenario == 'ignore' or (scenario == 'complete' and not reminded):
+                calls = []
+            elif done.startswith('call_set'):
                 if task not in self.server.killed and len(self.server.killed) < self.server.deaths:
                     self.server.killed.add(task)
                     self.server.kill.set()
@@ -67,8 +71,11 @@ class Provider(BaseHTTPRequestHandler):
             elif done.startswith('call_complete'):
                 calls = []
             else:
+                if scenario == 'working' and task not in self.server.waited:
+                    self.server.waited.add(task)
+                    time.sleep(6)
                 calls = [('call_set', 'omar_set_port', {'task_id': task, 'port': 'result',
-                           'value': 'recovered' if 'This is retry' in text else 'discard-me'})]
+                           'value': 'recovered' if scenario or 'This is retry' in text else 'discard-me'})]
         n = len(self.server.requests)
         if chat:
             names = {bare: t['function']['name'] for t in request.get('tools', [])
@@ -124,8 +131,13 @@ class Provider(BaseHTTPRequestHandler):
 FAKE_ANSWER = r'''
 def answer(text):
     import time
+    scenario = os.environ.get("REMIND_SCENARIO")
+    if scenario:
+        write({"event": "prompt", "text": text})
+        if scenario == "working": time.sleep(6)
+        elif scenario == "ignore" or "OMAR REMINDER" not in text: return
     task = int(re.findall(r"task_id: (\d+)", text)[-1])
-    call("omar_set_port", {"task_id": task, "port": "result", "value": "recovered" if "This is retry" in text else "discard-me"})
+    call("omar_set_port", {"task_id": task, "port": "result", "value": "recovered" if scenario or "This is retry" in text else "discard-me"})
     count = Path(os.environ["RESTART_COUNT"])
     attempt = int(count.read_text()) + 1 if count.exists() else 1
     count.write_text(str(attempt))
@@ -133,6 +145,21 @@ def answer(text):
         Path(os.environ["RESTART_READY"]).touch()
         while True: time.sleep(.1)
     call("omar_complete", {"task_id": task})
+'''
+
+FAKE_ANSWER += r'''
+_answer = answer
+def answer(text):
+    import shlex
+    def hook(event):
+        if flag("--settings"):
+            for entry in json.loads(flag("--settings")).get("hooks", {}).get(event, []):
+                for handler in entry["hooks"]:
+                    subprocess.run(shlex.split(handler["command"]), input=json.dumps({"hook_event_name": event}),
+                                   text=True, stdout=subprocess.DEVNULL, check=True)
+    hook("UserPromptSubmit")
+    _answer(text)
+    hook("Stop")
 '''
 
 FAKE_MANAGED = COMMON + r'''
@@ -194,9 +221,8 @@ def live_environment(root):
 
 
 def preflight(root, env, backend, phase='preflight'):
-    if backend == 'Claude':
-        raise AssertionError('log in to claude first; Claude live checks are disabled until then')
     commands = {
+        'Claude': ['claude', '-p', '--no-session-persistence', '--tools', '', 'Reply with exactly: OK'],
         'Codex': ['codex', 'exec', '--skip-git-repo-check', 'Reply with exactly: OK'],
         'Cursor': ['cursor-agent', 'status', '--format', 'json'],
         'Agy': ['agy', 'models'],
@@ -271,6 +297,12 @@ def configure(root, home, env, backend, server, live):
         configure_live(root, env, backend)
         return
     profile = []
+    if getattr(server, 'scenario', None):
+        env['REMIND_SCENARIO'] = server.scenario
+        if backend == 'Stub':
+            env['OMAR_STUB_STOP_TURNS'] = '0' if server.scenario == 'working' else '1' if server.scenario == 'complete' else '100'
+            env['OMAR_STUB_WORK_MILLIS'] = '6000' if server.scenario == 'working' else '0'
+            profile += [f'export {name}={env[name]}' for name in ['OMAR_STUB_STOP_TURNS', 'OMAR_STUB_WORK_MILLIS']]
     if backend in ['Claude', 'Cursor', 'Agy']:
         shims = home / 'shims'
         shims.mkdir()
@@ -335,9 +367,10 @@ trust_level="trusted"
     (home / '.profile').write_text('\n'.join(profile) + '\n')
 
 
-def execute(backend, per=False, deaths=1, live=False):
+def execute(backend, per=False, deaths=1, live=False, scenario=None):
     server = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     server.requests, server.killed, server.deaths = [], set(), deaths
+    server.scenario, server.waited = scenario, set()
     server.kill, server.release = threading.Event(), threading.Event()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
@@ -354,6 +387,9 @@ def execute(backend, per=False, deaths=1, live=False):
             marker = root / 'ready'
             prompt = ('First execute this exact shell command: touch .restart-ready; sleep 8. '
                       'Then set result to recovered and complete. Answer one word.') if live else 'Return one word.'
+            if live and scenario:
+                prompt = ('First reply exactly Ready? and end your turn waiting for confirmation. '
+                          'Do not call any tools in that first turn. On a later message, set result to recovered and complete.')
             program = root / 'Restart.omar'
             program.write_text(PROGRAM.replace('BACKEND', backend).replace('LIFETIME', ' per task' if per else '').replace('PROMPT', prompt))
             up = subprocess.run([str(BIN), 'up', '-s', 'restart-test', '--no-ea'],
@@ -361,6 +397,7 @@ def execute(backend, per=False, deaths=1, live=False):
             assert up.returncode == 0, up.stdout + up.stderr
             launch = json.loads((state / 'sessions/restart-test/launch.json').read_text())
             env['OMAR_TMUX_SERVER'] = launch['session']['tmux_server']
+            began = time.monotonic()
             process = subprocess.Popen([str(BIN), 'run', '-s', 'restart-test', str(program),
                                         '--input', 'p.start=go', '--timeout-seconds', '180' if live else '90', '--replace', '--fg'],
                                        env=env, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -413,14 +450,16 @@ def execute(backend, per=False, deaths=1, live=False):
                     errors.append(error)
 
             killer = threading.Thread(target=kill_workers, daemon=True)
-            killer.start()
+            if not scenario:
+                killer.start()
             try:
                 stdout, stderr = process.communicate(timeout=300 if live else 240)
             except subprocess.TimeoutExpired:
                 process.kill()
                 stdout, stderr = process.communicate()
                 raise AssertionError('run timed out: ' + stdout + stderr)
-            killer.join(timeout=2)
+            if not scenario:
+                killer.join(timeout=2)
             output = stdout + stderr
             attempts = {}
             started_attempts = []
@@ -436,6 +475,26 @@ def execute(backend, per=False, deaths=1, live=False):
             if not live and backend == 'Agy':
                 assert not (home / '.gemini/config').exists(), 'workflow MCP must be session-scoped'
             assert not errors, f'{errors}\n{detail}'
+            if scenario:
+                reminders = [r for a in records for r in a.get('reminders', [])]
+                assert all(len(a.get('reminders', [])) <= 1 for a in records), detail
+                if scenario == 'ignore':
+                    assert len(records) == 3 and len(reminders) == 3, detail
+                    assert process.returncode != 0, detail
+                    assert 'after 2 retries' in output and 'stopped without finishing after a reminder' in output, detail
+                    assert all(a['death_reason'] == 'stopped without finishing after a reminder' for a in records), detail
+                    assert all(a['cleanup_status'] == 'stopped' for a in records), detail
+                    assert len({r['task_id'] for r in reminders}) == 3, detail
+                    outcome = 'one reminder per attempt, failed after 2 retries'
+                else:
+                    assert process.returncode == 0 and 'Output p.result = ' in output, detail
+                    assert (not records if scenario == 'working' and not per else len(records) == 1 and records[0]['retry'] == 0), detail
+                    assert len(reminders) == (0 if scenario == 'working' else 1), detail
+                    if scenario == 'working':
+                        assert time.monotonic() - began >= 6, 'working fixture did not stay active'
+                    outcome = 'still working, no reminder' if scenario == 'working' else 'one reminder, completed'
+                print(f'PASS: {backend}{" per task" if per else ""} {"live" if live else "local provider"}: {outcome}', flush=True)
+                return
             assert len(killed) == deaths, detail
             assert len([a for a in records if a['outcome'] == 'died']) == deaths, detail
             assert len(records) == min(deaths + 1, 3), detail
@@ -535,13 +594,6 @@ def verify_live_isolation():
                     raise RuntimeError('intentional workflow failure')
             except RuntimeError as error:
                 assert str(error) == 'intentional workflow failure'
-            with patch('subprocess.Popen', side_effect=AssertionError('Claude must not run')):
-                try:
-                    preflight(fixture, inherited, 'Claude')
-                except AssertionError as error:
-                    assert 'log in to claude first' in str(error)
-                else:
-                    raise AssertionError('Claude preflight must require operator login')
             assert not root.exists()
             assert (native / 'checks').read_text().splitlines() == ['check', 'check']
             (shims / 'codex').write_text('#!/bin/sh\nexit 1\n')
@@ -561,11 +613,17 @@ def main():
     args = parser.parse_args()
     if not args.live:
         verify_live_isolation()
-    backends = [args.backend] if args.backend else (['Codex', 'Cursor', 'Agy', 'OpenCode', 'Pi'] if args.live else ['Claude', 'Cursor', 'Agy', 'Codex', 'Pi', 'OpenCode', 'Stub', 'Jev'])
+    backends = [args.backend] if args.backend else (['Claude', 'Codex', 'Cursor', 'Agy', 'OpenCode', 'Pi'] if args.live else ['Claude', 'Cursor', 'Agy', 'Codex', 'Pi', 'OpenCode', 'Stub', 'Jev'])
     failed = []
-    if args.live and not args.backend:
-        print('SKIP: Claude live: log in to claude first', flush=True)
     for backend in backends:
+        if args.live and backend == 'Claude':
+            with tempfile.TemporaryDirectory(prefix='omar-preflight-', dir='/tmp') as directory:
+                root = Path(directory)
+                try:
+                    preflight(root, live_environment(root), backend)
+                except AssertionError as error:
+                    print(f'SKIP: Claude live: {error}', flush=True)
+                    continue
         if backend == 'Jev':
             execute_jev(2)
             execute_jev(3)

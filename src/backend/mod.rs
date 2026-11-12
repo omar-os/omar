@@ -247,7 +247,25 @@ pub struct TopologyInvocation<'a> {
     pub retries: u32,
 }
 
+pub(crate) trait TurnMonitor: Send {
+    fn ended_turn(&mut self) -> Option<String>;
+}
+
 pub trait Backend: Send + Sync {
+    fn turn_monitor(&self, _target: &Target<'_>) -> Option<Box<dyn TurnMonitor>> {
+        None
+    }
+    /// A native turn boundary, only while idle. Unknown or busy returns none.
+    fn ended_turn(&self, target: &Target<'_>, hook_file: &Path) -> Option<String> {
+        if target.stamp.and_then(managed::from_stamp).is_some() {
+            return managed::ended_turn(target);
+        }
+        let value: Value = serde_json::from_slice(&std::fs::read(hook_file).ok()?).ok()?;
+        (value["idle"] == true)
+            .then(|| value["turn"].as_str().map(str::to_owned))
+            .flatten()
+    }
+
     fn retryable_topology_error(&self, _error: &anyhow::Error) -> bool {
         false
     }

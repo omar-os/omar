@@ -30,6 +30,8 @@ struct Message {
 struct Inbox {
     session: Option<String>,
     pending: VecDeque<Message>,
+    #[serde(default)]
+    completed: Option<String>,
 }
 struct Queue {
     path: PathBuf,
@@ -454,6 +456,7 @@ pub async fn run(path: &Path) -> Result<()> {
             println!("\n[OMAR turn complete: {}]", message.id);
             let mut state = queue.state.lock().await;
             state.pending.pop_front();
+            state.completed = Some(message.id);
             save(&queue.path, &state)?;
         }
     }.await;

@@ -17,6 +17,42 @@ use std::path::{Path, PathBuf};
 pub struct Codex;
 
 impl Backend for Codex {
+    fn turn_monitor(&self, target: &super::Target<'_>) -> Option<Box<dyn super::TurnMonitor>> {
+        let mut session = CodexSession::open(&from_stamp(target.stamp?)?).ok()?;
+        let thread = session.only_thread().ok()?;
+        let state = session
+            .call(
+                // Resume subscribes this connection to the loaded thread's events.
+                "thread/resume",
+                serde_json::json!({"threadId":thread}),
+            )
+            .ok()?;
+        let ended = completed_turn(&state);
+        session
+            .socket
+            .get_mut()
+            .set_read_timeout(Some(std::time::Duration::from_millis(1)))
+            .ok()?;
+        Some(Box::new(CodexTurnMonitor {
+            session,
+            thread,
+            ended,
+        }))
+    }
+    fn ended_turn(&self, target: &super::Target<'_>, _hook_file: &Path) -> Option<String> {
+        if target.stamp.and_then(managed::from_stamp).is_some() {
+            return managed::ended_turn(target);
+        }
+        let mut session = CodexSession::open(&from_stamp(target.stamp?)?).ok()?;
+        let thread = session.only_thread().ok()?;
+        let value = session
+            .call(
+                "thread/read",
+                serde_json::json!({"threadId":thread,"includeTurns":true}),
+            )
+            .ok()?;
+        completed_turn(&value)
+    }
     fn has_startup_gates(&self) -> bool {
         true
     }
@@ -589,6 +625,68 @@ pub fn codex_socket_path(home: &Path) -> PathBuf {
 pub(crate) struct CodexSession {
     socket: tungstenite::WebSocket<UnixStream>,
     next_id: u64,
+}
+
+fn completed_turn(value: &serde_json::Value) -> Option<String> {
+    let thread = &value["thread"];
+    if thread["status"]["type"] != "idle" {
+        return None;
+    }
+    let turn = thread["turns"].as_array()?.last()?;
+    (turn["status"] == "completed")
+        .then(|| turn["id"].as_str().map(str::to_owned))
+        .flatten()
+}
+
+struct CodexTurnMonitor {
+    session: CodexSession,
+    thread: String,
+    ended: Option<String>,
+}
+
+impl super::TurnMonitor for CodexTurnMonitor {
+    fn ended_turn(&mut self) -> Option<String> {
+        loop {
+            match self.session.socket.read() {
+                Ok(tungstenite::Message::Text(body)) => {
+                    let Ok(event) = serde_json::from_str::<serde_json::Value>(&body) else {
+                        continue;
+                    };
+                    if event["params"]["threadId"] != self.thread {
+                        continue;
+                    }
+                    match event["method"].as_str() {
+                        Some("turn/started") => self.ended = None,
+                        Some("turn/completed")
+                            if event["params"]["turn"]["status"] == "completed" =>
+                        {
+                            self.ended = event["params"]["turn"]["id"].as_str().map(str::to_owned);
+                        }
+                        Some("thread/status/changed")
+                            if event["params"]["status"]["type"] != "idle" =>
+                        {
+                            self.ended = None
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break
+                }
+                Err(_) => {
+                    self.ended = None;
+                    break;
+                }
+            }
+        }
+        self.ended.clone()
+    }
 }
 
 impl CodexSession {
