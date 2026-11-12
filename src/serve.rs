@@ -5522,6 +5522,28 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("web-News-"));
         assert!(view_refusal("GET", "/v1/workflows").is_some());
+        server
+            .context
+            .history
+            .lock()
+            .unwrap()
+            .set_removed(&id, true)
+            .unwrap();
+        assert_eq!(approved_workflows(&server.workspaces), json!([]));
+        server
+            .context
+            .history
+            .lock()
+            .unwrap()
+            .set_removed(&id, false)
+            .unwrap();
+        assert_eq!(
+            approved_workflows(&server.workspaces)
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
