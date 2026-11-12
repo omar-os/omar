@@ -162,17 +162,7 @@ impl Runtime for OmarRuntime {
     async fn approved(&self) -> Result<Vec<ApprovedWorkflow>> {
         let root = self.base.split("/chats/").next().unwrap_or(&self.base);
         let runtime = OmarRuntime::new(root.to_owned())?;
-        match runtime.call("/v1/workflows", None).await {
-            Ok(value) => Ok(serde_json::from_value(value)?),
-            Err(error)
-                if error
-                    .downcast_ref::<RuntimeError>()
-                    .is_some_and(|e| e.status == 404) =>
-            {
-                Ok(Vec::new())
-            }
-            Err(error) => Err(error),
-        }
+        Ok(serde_json::from_value(runtime.call("/v1/workflows", None).await?)?)
     }
 
     async fn converse(&self, sender: &str, text: &str) -> Result<String> {

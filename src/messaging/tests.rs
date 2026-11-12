@@ -10,8 +10,7 @@ use tokio::sync::Notify;
 pub(super) fn fixture() -> Config {
     let c: Config = serde_json::from_value(json!({
         "runtimeUrl":"http://127.0.0.1:8000/chats/test", "platform":"mock", "accountId":"account",
-        "allowedUsers":["user"], "allowedConversations":["room"], "command":"demo", "outputPort":"run.result",
-        "programPath":"demo.omar"
+        "allowedUsers":["user"], "allowedConversations":["room"]
     })).unwrap();
 
     c

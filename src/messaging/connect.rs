@@ -107,6 +107,7 @@ async fn setup(platform: &str, path: &Path) -> Result<Config> {
             config.platform == platform && config.auto_chat && config.runtime_url == RUNTIME_URL,
             "Saved connect setup must use {RUNTIME_URL} with autoChat enabled"
         );
+        credential_store::save(path, &serde_json::to_value(&config)?)?;
         return Ok(config);
     }
     let cwd = std::env::current_dir()?;

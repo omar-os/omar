@@ -1,9 +1,9 @@
 use anyhow::{ensure, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
     pub runtime_url: String,
