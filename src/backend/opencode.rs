@@ -15,6 +15,19 @@ use std::time::{Duration, Instant};
 pub struct Opencode;
 
 impl Backend for Opencode {
+    fn out_of_credit(
+        &self,
+        target: &super::Target<'_>,
+        hook_file: &std::path::Path,
+    ) -> Option<super::OutOfCredit> {
+        let (_, session) = from_stamp(target.stamp?)?;
+        let value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(hook_file.with_extension(format!("{session}.json"))).ok()?,
+        )
+        .ok()?;
+        serde_json::from_value(value["credit_error"].clone()).ok()
+    }
+
     fn usage_limit(
         &self,
         target: &super::Target<'_>,
@@ -29,6 +42,47 @@ impl Backend for Opencode {
             value.to_string(),
             serde_json::from_value(value["usage_limit"].clone()).ok()?,
         ))
+    }
+    fn blocked_input(
+        &self,
+        target: &super::Target<'_>,
+        _hook_file: &std::path::Path,
+    ) -> Option<String> {
+        pending_input(target).map(|(id, _)| id)
+    }
+    fn answer_input(
+        &self,
+        target: &super::Target<'_>,
+        _hook_file: &std::path::Path,
+        id: &str,
+        text: &str,
+    ) -> Result<bool> {
+        let Some((current, request)) = pending_input(target).filter(|(current, _)| current == id)
+        else {
+            return Ok(false);
+        };
+        let (port, _) = from_stamp(target.stamp.context("OpenCode has no stamp")?)
+            .context("invalid OpenCode stamp")?;
+        let (kind, id) = current.split_once(':').context("invalid input id")?;
+        let body = if kind == "question" {
+            serde_json::json!({"answers":request["questions"].as_array().context("question omitted questions")?.iter().map(|_| vec![text]).collect::<Vec<_>>()})
+        } else {
+            serde_json::json!({"reply":"reject","message":text})
+        };
+        let (status, _) = http_json(
+            port,
+            "POST",
+            &format!("/{kind}/{id}/reply"),
+            Some(&body.to_string()),
+        )?;
+        if status == 404 {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            (200..300).contains(&status),
+            "OpenCode rejected question response (HTTP {status})"
+        );
+        Ok(true)
     }
     fn ended_turn(
         &self,
@@ -206,6 +260,29 @@ impl Backend for Opencode {
             None => Ok(None),
         }
     }
+}
+
+fn pending_input(target: &super::Target<'_>) -> Option<(String, serde_json::Value)> {
+    let (port, session) = from_stamp(target.stamp?)?;
+    for kind in ["question", "permission"] {
+        let Ok((200, body)) = http_json(port, "GET", &format!("/{kind}"), None) else {
+            continue;
+        };
+        let Ok(requests) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        if let Some(request) = requests
+            .as_array()?
+            .iter()
+            .find(|request| request["sessionID"] == session)
+        {
+            return Some((
+                format!("{kind}:{}", request["id"].as_str()?),
+                request.clone(),
+            ));
+        }
+    }
+    None
 }
 
 /// Give opencode a port so OMAR can reach it without the input box.
@@ -426,7 +503,10 @@ fn provision_fresh_session(port: u16, id: &str, timeout: Duration) -> Result<Str
         Ok(())
     };
     loop {
-        match http_json_until(port, "GET", &format!("/session/{id}"), None, deadline) {
+        // A boot-time GET can remain unanswered even after newer connections
+        // work. Reconnect read-only probes; never replay the creation POST.
+        let probe_deadline = deadline.min(Instant::now() + HTTP_TIMEOUT);
+        match http_json_until(port, "GET", &format!("/session/{id}"), None, probe_deadline) {
             Ok((404, _)) => break,
             Ok((200, _)) => anyhow::bail!("opencode already has a session {id}"),
             // A server still booting is not yet an answer.
@@ -704,6 +784,36 @@ mod tests {
     use std::io::Read;
 
     #[test]
+    fn a_complete_response_does_not_wait_for_the_server_to_close() {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                stream.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+        let reply = http_json(port, "GET", "/session/id", None);
+        server.join().unwrap();
+        assert_eq!(reply.unwrap(), (200, "{}".into()));
+    }
+
+    #[test]
     fn a_footer_wrapped_by_a_long_path_still_reads_as_ready() {
         let screen = "  ┃  Build · GPT-5.6 Terra Fast OpenAI\n\
             \x20  /tmp/omar/sessions/cosmic- tab      ctrl+p\n\
@@ -777,17 +887,20 @@ mod tests {
     fn scripted(
         script: Vec<(u16, &'static str)>,
     ) -> (u16, std::thread::JoinHandle<Vec<(String, String)>>) {
-        scripted_with_creation_delay(script, Duration::ZERO)
+        scripted_startup(script, Duration::ZERO, false)
     }
 
-    fn scripted_with_creation_delay(
+    fn scripted_startup(
         script: Vec<(u16, &'static str)>,
         delay: Duration,
+        stalled_probe: bool,
     ) -> (u16, std::thread::JoinHandle<Vec<(String, String)>>) {
         use std::io::{BufRead, BufReader};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
+            // Accept a probe but never answer it; later connections work.
+            let _stalled = stalled_probe.then(|| listener.accept().unwrap().0);
             let mut seen = Vec::new();
             for (status, body) in script {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -828,6 +941,47 @@ mod tests {
             seen
         });
         (port, server)
+    }
+
+    #[test]
+    fn user_input_is_scoped_to_its_session_and_permissions_are_declined() {
+        for kind in ["question", "permission"] {
+            let request = r#"[{"id":"other","sessionID":"ses_other","questions":[{}]}, {"id":"own","sessionID":"ses_own","questions":[{},{}]}]"#;
+            let mut script = Vec::new();
+            for _ in 0..2 {
+                if kind == "permission" {
+                    script.push((200, r#"[{"id":"other","sessionID":"ses_other"}]"#));
+                }
+                script.push((200, request));
+            }
+            script.push((200, "true"));
+            let (port, server) = scripted(script);
+            let stamp = format!("opencode:{port}:ses_own");
+            let target = super::super::Target {
+                name: "worker",
+                pane_pid: 0,
+                stamp: Some(&stamp),
+            };
+            let path = std::path::Path::new("unused");
+            let id = Opencode.blocked_input(&target, path).unwrap();
+            assert_eq!(id, format!("{kind}:own"));
+            assert!(Opencode
+                .answer_input(&target, path, &id, "OMAR REMINDER")
+                .unwrap());
+            let seen = server.join().unwrap();
+            let (route, body) = seen.last().unwrap();
+            assert_eq!(route, &format!("POST /{kind}/own/reply HTTP/1.1"));
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            if kind == "question" {
+                assert_eq!(
+                    body["answers"],
+                    serde_json::json!([["OMAR REMINDER"], ["OMAR REMINDER"]])
+                );
+            } else {
+                assert_eq!(body["reply"], "reject");
+                assert_eq!(body["message"], "OMAR REMINDER");
+            }
+        }
     }
 
     #[test]
@@ -907,8 +1061,34 @@ mod tests {
     }
 
     #[test]
+    fn startup_reconnects_an_unanswered_probe_without_replaying_creation() {
+        let (port, server) = scripted_startup(
+            vec![
+                (404, "{}"),
+                (200, r#"{"data":{"id":"ses_new"}}"#),
+                (200, r#"{"id":"ses_new"}"#),
+                (200, "[]"),
+                (200, "true"),
+            ],
+            Duration::ZERO,
+            true,
+        );
+        let result = provision_fresh_session(port, "ses_new", Duration::from_secs(15));
+        assert_eq!(result.unwrap(), format!("opencode:{port}:ses_new"));
+        let requests = server.join().unwrap();
+        assert!(requests[0].0.starts_with("GET /session/ses_new "));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(line, _)| line.starts_with("POST /api/session "))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn startup_keeps_partial_responses_and_never_replays_session_creation_after_a_read_timeout() {
-        let (port, server) = scripted_with_creation_delay(
+        let (port, server) = scripted_startup(
             vec![
                 (404, "{}"),
                 (200, r#"{"data":{"id":"ses_slow"}}"#),
@@ -917,6 +1097,7 @@ mod tests {
                 (200, "true"),
             ],
             HTTP_TIMEOUT + Duration::from_secs(1),
+            false,
         );
         let result = provision_fresh_session(port, "ses_slow", Duration::from_secs(15)).unwrap();
         assert_eq!(result, format!("opencode:{port}:ses_slow"));

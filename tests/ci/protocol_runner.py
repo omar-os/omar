@@ -24,7 +24,7 @@ for line in sys.stdin:
     message = json.loads(line)
     with (root / 'requests.jsonl').open('a') as log:
         log.write(json.dumps(message) + '\n')
-    if backend == 'cursor':
+    if backend == 'cursor' or 'acp' in sys.argv[3:]:
         method = message.get('method')
         if method == 'session/prompt':
             while (root / 'hold').exists(): time.sleep(.02)

@@ -24,13 +24,29 @@ class Provider(workers.Provider):
     def do_POST(self):
         if self.server.reset is None:
             self.server.reset = int(time.time()) + WAIT
-        if time.time() < self.server.reset:
+        credit = getattr(self.server, "credit", None)
+        if credit or time.time() < self.server.reset:
             request = json.loads(self.rfile.read(int(self.headers.get('content-length', '0'))))
             self.server.limited.append(request)
-            body = json.dumps({'error': {'type': 'usage_limit_reached',
+            error = credit['error'] if credit else {'type': 'usage_limit_reached',
                 'code': 'usage_limit_reached', 'message': 'Usage limit reached',
-                'plan_type': 'plus', 'resets_at': self.server.reset}}).encode()
-            self.send_response(429)
+                'plan_type': 'plus', 'resets_at': self.server.reset}
+            if credit and credit.get('responses'):
+                # Codex's quota_exceeded.rs fixture uses this native Responses error.
+                # Generic HTTP 429 bodies are discarded by Codex 0.154 itself.
+                chunks = [
+                    {'type': 'response.created', 'response': {'id': 'credit', 'status': 'in_progress', 'output': []}},
+                    {'type': 'response.failed', 'response': {'id': 'credit', 'status': 'failed', 'error': error}},
+                ]
+                body = ''.join(f'data: {json.dumps(chunk)}\n\n' for chunk in chunks).encode()
+                self.send_response(200)
+                self.send_header('content-type', 'text/event-stream')
+                self.send_header('content-length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = json.dumps({'error': error}).encode()
+            self.send_response(credit['status'] if credit else 429)
             self.send_header('content-type', 'application/json')
             self.send_header('retry-after', str(max(1, self.server.reset - int(time.time()))))
             self.send_header('x-codex-primary-used-percent', '100')
@@ -51,6 +67,13 @@ def answer(text):
     import time, shlex
     from datetime import datetime
     write({"event":"prompt", "text":text, "time":time.time()})
+    credit = os.environ.get("LIMIT_CREDIT_ERROR")
+    if credit:
+        error = json.loads(credit)
+        if flag("--mcp-config"):
+            print("\x1b[2J\x1b[HAPI Error: " + error["message"], flush=True)
+            return
+        return {"code":-32603,"message":error["message"],"data":error}
     task = int(re.findall(r"task_id: (\d+)", text)[-1])
     if limit_reset is None: limit_reset = int(time.time()) + 16
     if not limited or (not flag("--mcp-config") and time.time() < limit_reset):
@@ -79,12 +102,15 @@ def answer(text):
 '''
 
 MANAGED = workers.FAKE_MANAGED.replace(workers.FAKE_ANSWER, ANSWER).replace(
-    'answer(request["params"]["prompt"][0]["text"])\n            result = {"stopReason": "end_turn"}',
-    '''error = answer(request["params"]["prompt"][0]["text"])
-            if error:
-                print(json.dumps({"jsonrpc":"2.0","id":request["id"],"error":error}), flush=True)
-                continue
-            result = {"stopReason":"end_turn"}''')
+    '                answer(text)\n                result = {"stopReason": "end_turn"}',
+    '\n'.join([
+        '                error = answer(text)',
+        '                if error:',
+        '                    print(json.dumps({"jsonrpc":"2.0","id":request["id"],"error":error}), flush=True)',
+        '                    continue',
+        '                result = {"stopReason":"end_turn"}',
+    ]))
+assert 'error = answer(text)' in MANAGED
 
 
 def check_records(state, output, result):
@@ -105,9 +131,21 @@ def check_records(state, output, result):
     return waits
 
 
-def execute(backend, unknown=False, timeout=False):
+def check_credit(state, output, result, elapsed):
+    lines = [json.loads(line) for path in state.rglob('attempts.jsonl') for line in path.read_text().splitlines()]
+    detail = output + '\n' + json.dumps(lines)
+    assert result != 0 and 'out of credit:' in output, detail
+    assert len({a['attempt_id'] for a in lines}) == 1, detail
+    assert all(a.get('retry', 0) == 0 and not a.get('reminders') and not a.get('usage_waits') for a in lines), detail
+    assert lines[-1]['outcome'] == 'failed', detail
+    assert 'out of credit:' in (lines[-1].get('failure_reason') or lines[-1].get('death_reason', '')), detail
+    assert elapsed < WAIT, f'credit failure took {elapsed:.1f}s, expected less than {WAIT}s\n{detail}'
+
+
+def execute(backend, unknown=False, timeout=False, credit=None):
     server = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     server.requests, server.limited, server.reset = [], [], None
+    server.credit = credit
     server.killed, server.deaths = set(), 0
     server.scenario, server.waited = None, set()
     server.kill, server.release = threading.Event(), threading.Event()
@@ -115,6 +153,8 @@ def execute(backend, unknown=False, timeout=False):
     try:
         with scratch('omar-limit-', workers.BIN, 'limit-test') as root:
             home, env = workers.isolated_environment(root)
+            if credit:
+                env['LIMIT_CREDIT_ERROR'] = json.dumps(credit['error'])
             answer = ANSWER
             managed = MANAGED
             if unknown:
@@ -128,7 +168,7 @@ def execute(backend, unknown=False, timeout=False):
                     out.write('export OMAR_STUB_USAGE_WAIT_MILLIS=16000\n')
             program = root / 'Limit.omar'
             program.write_text(workers.PROGRAM.replace('BACKENDLIFETIME', backend).replace(
-                '-> result "PROMPT"', f'-> result within({WITHIN}s) "Return one word."'))
+                '-> result "PROMPT"', f'-> result within({30 if credit else WITHIN}s) "Return one word."'))
             up = subprocess.run([str(workers.BIN), 'up', '-s', 'limit-test', '--no-ea'], env=env, cwd=root, capture_output=True, text=True, timeout=90)
             assert up.returncode == 0, up.stdout + up.stderr
             launch = json.loads((home / '.omar/sessions/limit-test/launch.json').read_text())
@@ -153,6 +193,10 @@ def execute(backend, unknown=False, timeout=False):
                 raise AssertionError('run timed out: ' + stdout + stderr + '\n' + '\n'.join(screens[-2:]))
             monitor.join(timeout=2)
             output = stdout + stderr
+            if credit:
+                check_credit(home / '.omar', output + '\nLast screen:\n' + '\n'.join(screens[-2:]), process.returncode, time.monotonic() - began)
+                print(f'PASS: {backend} credit exhaustion: failed fast, no wait/reminder/restart', flush=True)
+                return
             if timeout:
                 assert process.returncode != 0 and 'run-wide timeout' in output, output
                 records = [json.loads(line) for path in home.rglob('attempts.jsonl') for line in path.read_text().splitlines()]
@@ -174,7 +218,7 @@ def execute(backend, unknown=False, timeout=False):
         server.server_close()
 
 
-def execute_jev():
+def execute_jev(credit_status=None):
     class JevProvider(workers.BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
@@ -184,8 +228,8 @@ def execute_jev():
             first = self.server.reset is None
             if first:
                 self.server.reset = int(time.time()) + WAIT
-            status = 429 if time.time() < self.server.reset else 200
-            response = {'error': {'type': 'rate_limit'}} if status == 429 else {'model': 'jev-test', 'answers': {
+            status = credit_status or (429 if time.time() < self.server.reset else 200)
+            response = {'error': {'type': 'insufficient_quota', 'message': 'insufficient credits'}} if credit_status else {'error': {'type': 'rate_limit'}} if status == 429 else {'model': 'jev-test', 'answers': {
                 'decision': {'type': 'choice', 'choice': 'ok', 'confidence': .99, 'probabilities': {'ok': .99, 'no': .01}},
                 'sufficient_context': {'type': 'noul', 'noul': .99}}}
             body = json.dumps(response).encode()
@@ -219,8 +263,13 @@ def execute_jev():
                 '}\nmain Restart { p = Work() }\n')
             up = subprocess.run([str(workers.BIN), 'up', '-s', 'limit-test', '--no-ea'], env=env, cwd=root, capture_output=True, text=True, timeout=90)
             assert up.returncode == 0, up.stdout + up.stderr
+            began = time.monotonic()
             result = subprocess.run([str(workers.BIN), 'run', '-s', 'limit-test', str(program), '--input', 'p.start=go',
                 '--timeout-seconds', '30', '--fg'], env=env, cwd=root, capture_output=True, text=True, timeout=60)
+            if credit_status:
+                check_credit(home / '.omar', result.stdout + result.stderr, result.returncode, time.monotonic() - began)
+                print(f'PASS: Jev HTTP {credit_status} insufficient_quota: failed fast, no wait/reminder/retry', flush=True)
+                return
             check_records(home / '.omar', result.stdout + result.stderr, result.returncode)
             print('PASS: Jev mock HTTP 429 + Retry-After: waited past within, no retry, same task completed', flush=True)
     finally:
@@ -230,16 +279,39 @@ def execute_jev():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--credit-only', action='store_true')
     parser.add_argument('--backend', choices=['Claude', 'Cursor', 'Agy', 'Codex', 'Pi', 'OpenCode', 'Stub', 'Jev'])
     args = parser.parse_args()
-    for backend in [args.backend] if args.backend else ['Claude', 'Cursor', 'Agy', 'Codex', 'Pi', 'OpenCode', 'Stub', 'Jev']:
+    backends = [args.backend] if args.backend else ['Claude', 'Cursor', 'Agy', 'Codex', 'Pi', 'OpenCode', 'Stub', 'Jev']
+    if not args.credit_only:
+        for backend in backends:
+            if backend == 'Jev':
+                execute_jev()
+            else:
+                execute(backend)
+        if not args.backend:
+            execute('Cursor', unknown=True)
+            execute('Cursor', unknown=True, timeout=True)
+    for backend in backends:
+        if backend == 'Stub':
+            continue
         if backend == 'Jev':
-            execute_jev()
-        else:
-            execute(backend)
-    if not args.backend:
-        execute('Cursor', unknown=True)
-        execute('Cursor', unknown=True, timeout=True)
+            execute_jev(402)
+            execute_jev(429)
+            continue
+        credit = {'status': 429, 'error': {'type': 'insufficient_quota', 'code': 'insufficient_quota',
+            'message': 'You exceeded your current quota, please check your plan and billing details.'}}
+        if backend == 'Codex':
+            credit['responses'] = True
+        if backend == 'Claude':
+            credit['error']['message'] = 'Credit balance is too low'
+        elif backend in ['Cursor', 'Agy']:
+            credit['error']['message'] = 'Your spending limit has been reached'
+        elif backend == 'OpenCode':
+            credit = {'status': 402, 'error': {'code': 'insufficient_credits', 'message': 'insufficient credits'}}
+        elif backend == 'Pi':
+            credit['error']['message'] = 'out of credits'
+        execute(backend, credit=credit)
 
 
 if __name__ == '__main__':

@@ -34,6 +34,12 @@ struct Inbox {
     completed: Option<String>,
     #[serde(default)]
     usage_limit: Option<crate::backend::UsageLimit>,
+    #[serde(default)]
+    credit_error: Option<crate::backend::OutOfCredit>,
+    #[serde(default)]
+    input: Option<String>,
+    #[serde(default)]
+    input_answer: Option<String>,
 }
 struct Queue {
     path: PathBuf,
@@ -86,6 +92,9 @@ struct Engine {
     output: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     next_id: u64,
     allow_permissions: bool,
+    queue: Arc<Queue>,
+    topology: bool,
+    reminder_cancelled: bool,
 }
 
 fn protocol_line(mut line: &str) -> &str {
@@ -145,6 +154,9 @@ impl Engine {
             let msg = self.next().await?;
             if msg["id"] == id && msg.get("method").is_none() {
                 if let Some(error) = msg.get("error") {
+                    if let Some(credit) = crate::backend::OutOfCredit::from_error(error) {
+                        return Err(credit.into());
+                    }
                     if let Some(limit) = crate::backend::UsageLimit::from_error(error) {
                         return Err(limit.into());
                     }
@@ -152,7 +164,58 @@ impl Engine {
                 }
                 return Ok(msg["result"].clone());
             }
-            if msg["method"] == "session/request_permission" {
+            if self.topology
+                && method == "session/prompt"
+                && (msg["method"] == "elicitation/create"
+                    || msg["method"] == "cursor/ask_question"
+                    || msg["method"] == "session/request_permission"
+                        && (!self.allow_permissions
+                            || !msg["params"]["options"].as_array().is_some_and(|options| {
+                                options.iter().any(|o| o["kind"] == "allow_once")
+                                    && !options
+                                        .iter()
+                                        .any(|o| o["optionId"] == "__ask_question_skip__")
+                            })))
+            {
+                let cursor_question = msg["method"] == "cursor/ask_question";
+                let key = uuid::Uuid::new_v4().to_string();
+                {
+                    let mut state = self.queue.state.lock().await;
+                    anyhow::ensure!(
+                        cursor_question
+                            || msg["params"]["sessionId"].as_str() == state.session.as_deref(),
+                        "input request belongs to another session"
+                    );
+                    state.input = Some(key);
+                    state.input_answer = None;
+                    save(&self.queue.path, &state)?;
+                }
+                let reminder = loop {
+                    let changed = self.queue.changed.notified();
+                    let mut state = self.queue.state.lock().await;
+                    if let Some(text) = state.input_answer.take() {
+                        state.input = None;
+                        save(&self.queue.path, &state)?;
+                        break text;
+                    }
+                    drop(state);
+                    changed.await;
+                };
+                let result = if cursor_question {
+                    json!({"outcome":{"outcome":"skipped","reason":reminder}})
+                } else if msg["method"] == "elicitation/create" {
+                    json!({"action":"decline"})
+                } else {
+                    json!({"outcome":{"outcome":"cancelled"}})
+                };
+                self.write(json!({"jsonrpc":"2.0","id":msg["id"],"result":result}))
+                    .await?;
+                if !cursor_question {
+                    self.queue.push(reminder, false).await?;
+                    self.write(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":msg["params"]["sessionId"]}})).await?;
+                    self.reminder_cancelled = true;
+                }
+            } else if msg["method"] == "session/request_permission" {
                 let chosen = msg["params"]["options"]
                     .as_array()
                     .and_then(|options| options.iter().find(|o| o["kind"] == "allow_once"))
@@ -195,6 +258,17 @@ async fn accept_messages(listener: tokio::net::UnixListener, queue: Arc<Queue>) 
                 );
                 let request: Value = serde_json::from_str(&line)?;
                 let text = request["text"].as_str().context("text is required")?;
+                if let Some(id) = request["answer_input"].as_str() {
+                    let mut state = queue.state.lock().await;
+                    let answered =
+                        state.input.as_deref() == Some(id) && state.input_answer.is_none();
+                    if answered {
+                        state.input_answer = Some(text.to_owned());
+                        save(&queue.path, &state)?;
+                        queue.changed.notify_one();
+                    }
+                    return Ok(json!({"answered":answered}));
+                }
                 let id = queue.push(text.to_owned(), false).await?;
                 Ok(json!({"accepted":id}))
             }
@@ -221,7 +295,13 @@ async fn codex_turn(
     let resume = previous
         .map(|session| format!(" resume {}", crate::manager::shell_single_quote(&session)))
         .unwrap_or_default();
-    let command = format!("exec env {} --json{resume} -", config.command);
+    // Exec JSON omits async question metadata and cannot accept an answer.
+    let questions = if context.topology.is_some() {
+        " -c tools.experimental_request_user_input.enabled=false"
+    } else {
+        ""
+    };
+    let command = format!("exec env {}{questions} --json{resume} -", config.command);
     let mut child = tokio::process::Command::new("sh")
         .args(["-c", &command])
         .env("OMAR_MCP_CONTEXT_FILE", &config.context_file)
@@ -260,6 +340,9 @@ async fn codex_turn(
             }
             Some("turn.completed") => completed = true,
             Some("turn.failed" | "error") => {
+                if let Some(credit) = crate::backend::OutOfCredit::from_error(&event) {
+                    return Err(credit.into());
+                }
                 if let Some(limit) = crate::backend::UsageLimit::from_error(&event) {
                     return Err(limit.into());
                 }
@@ -308,7 +391,7 @@ pub async fn run(path: &Path) -> Result<()> {
     if attempt {
         fresh_start()?;
     }
-    let inbox: Inbox = match std::fs::read(&inbox_path) {
+    let mut inbox: Inbox = match std::fs::read(&inbox_path) {
         Ok(bytes) => serde_json::from_slice(&bytes).context("invalid protocol inbox; preserved")?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Inbox {
             session: config.initial_session.clone(),
@@ -316,6 +399,8 @@ pub async fn run(path: &Path) -> Result<()> {
         },
         Err(e) => return Err(e.into()),
     };
+    inbox.input = None;
+    inbox.input_answer = None;
     let queue = Arc::new(Queue {
         path: inbox_path,
         state: Mutex::new(inbox),
@@ -367,13 +452,16 @@ pub async fn run(path: &Path) -> Result<()> {
                         "--yolo" | "--force" | "-f" | "--dangerously-skip-permissions"
                     )
                 }),
+                queue: queue.clone(),
+                topology: context.topology.is_some(),
+                reminder_cancelled: false,
             }
         })
     };
     if acp {
         let engine = engine.as_mut().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(45), async {
-            engine.rpc("initialize", json!({"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"omar","version":env!("CARGO_PKG_VERSION")}})).await?;
+            engine.rpc("initialize", json!({"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false,"elicitation":context.topology.as_ref().map(|_| json!({"form":{},"url":{}}))},"clientInfo":{"name":"omar","version":env!("CARGO_PKG_VERSION")}})).await?;
             if config.backend == "cursor" {
                 engine.rpc("authenticate", json!({"methodId":"cursor_login"})).await?;
             }
@@ -445,7 +533,8 @@ pub async fn run(path: &Path) -> Result<()> {
                 let engine = engine.as_mut().unwrap();
                 let session = queue.state.lock().await.session.clone().context("missing ACP session")?;
                 let result = engine.rpc("session/prompt", json!({"sessionId":session,"prompt":[{"type":"text","text":prompt}]})).await?;
-                anyhow::ensure!(result["stopReason"] != "cancelled", "ACP cancelled the turn; message remains pending");
+                anyhow::ensure!(result["stopReason"] != "cancelled" || engine.reminder_cancelled, "ACP cancelled the turn; message remains pending");
+                engine.reminder_cancelled = false;
             } else {
                 let engine = engine.as_mut().unwrap();
                 engine.write(json!({"event":"user","message":{"content":prompt}})).await?;
@@ -460,6 +549,7 @@ pub async fn run(path: &Path) -> Result<()> {
                     }
                     if let Some(text) = event["step_update"]["text_delta"].as_str() { print!("{text}"); std::io::Write::flush(&mut std::io::stdout())?; }
                     if event["event"] == "result" {
+                        if let Some(credit) = crate::backend::OutOfCredit::from_error(&event["result"]) { return Err(credit.into()); }
                         anyhow::ensure!(event["result"]["status"] == "SUCCESS", "Antigravity turn failed: {}", event["result"]);
                         break;
                     }
@@ -467,7 +557,9 @@ pub async fn run(path: &Path) -> Result<()> {
             }
             Ok(())
             }.await;
+            let mut credit_error = None;
             let limit = match turn_result {
+                Err(error) if error.is::<crate::backend::OutOfCredit>() => { credit_error = Some(error.downcast::<crate::backend::OutOfCredit>().unwrap()); None },
                 Ok(()) => None,
                 Err(error) => match error.downcast::<crate::backend::UsageLimit>() {
                     Ok(limit) => Some(limit),
@@ -476,6 +568,7 @@ pub async fn run(path: &Path) -> Result<()> {
             };
             println!("\n[OMAR turn complete: {}]", message.id);
             let mut state = queue.state.lock().await;
+            state.credit_error = credit_error;
             state.usage_limit = limit;
             state.pending.pop_front();
             state.completed = Some(message.id);

@@ -81,3 +81,28 @@ pub(crate) fn ended_turn(target: &super::Target<'_>) -> Option<String> {
     }
     value["completed"].as_str().map(str::to_owned)
 }
+
+pub(crate) fn blocked_input(target: &super::Target<'_>) -> Option<String> {
+    let socket = from_stamp(target.stamp?)?;
+    let path = std::fs::read_to_string(socket.parent()?.join("inbox-path")).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    value["input"].as_str().map(str::to_owned)
+}
+
+pub(crate) fn answer_input(target: &super::Target<'_>, id: &str, text: &str) -> Result<bool> {
+    use std::io::BufRead;
+    let socket = from_stamp(target.stamp.unwrap_or_default())
+        .ok_or(super::NotReady("runner socket missing"))?;
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    stream.set_read_timeout(Some(WRITE_TIMEOUT))?;
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({"answer_input":id,"text":text})
+    )?;
+    let mut reply = String::new();
+    std::io::BufReader::new(stream).read_line(&mut reply)?;
+    let reply: serde_json::Value = serde_json::from_str(&reply)?;
+    Ok(reply["answered"] == true)
+}

@@ -2620,7 +2620,11 @@ impl AgentReactionExecutor {
                 self.client
                     .finish_backend_startup(&window.session, WORKER_START_TIMEOUT)?;
                 self.watch_worker(window, None)?;
-                turns.seen = window.ended_turn(&self.client);
+                let ended = window.ended_turn(&self.client);
+                turns.seen = window
+                    .blocked_input(&self.client)
+                    .map(|id| format!("input:{id}"))
+                    .or(ended);
             }
             let mut message = invocation_message(invocation, rendered)?;
             if retries > 0 {
@@ -2708,12 +2712,17 @@ impl AgentReactionExecutor {
     fn watch_worker(
         &self,
         window: &mut Window,
-        task: Option<(&InvocationSpec, &mut TaskTurnWatch, &mut TaskClock)>,
+        mut task: Option<(&InvocationSpec, &mut TaskTurnWatch, &mut TaskClock)>,
     ) -> Result<()> {
         // This decision precedes both process-death and stopped-turn recovery.
         // A limited worker must never be interrupted, restarted, or reminded.
+        // Keep the native conversation before protocol probes can race a death.
+        window.observe_conversation(&self.client);
         let ended = window.ended_turn(&self.client);
-        if let Some((invocation, turns, clock)) = task {
+        if let Some(credit) = window.out_of_credit(&self.client) {
+            return Err(credit.into());
+        }
+        if let Some((invocation, turns, clock)) = task.as_mut() {
             if !self.registry.answered(&invocation.id) {
                 if let Some((identity, limit)) = window.usage_limit(&self.client) {
                     if turns.limit_seen.as_ref() != Some(&identity) {
@@ -2815,40 +2824,6 @@ impl AgentReactionExecutor {
                     return Ok(());
                 }
             }
-            if !self.registry.answered(&invocation.id) && turns.stopped(ended, Instant::now()) {
-                if turns.reminded {
-                    return Err(WorkerDied {
-                        reason: "stopped without finishing after a reminder".into(),
-                        conversation: window.conversation.clone(),
-                    }
-                    .into());
-                }
-                let message = format!(
-                    "OMAR REMINDER\ntask_id: {}\nYour task is still open. Required output contract: {}. Outputs: {}. Finish the task, set its required outputs with omar_set_port, and call omar_complete with this task_id. No questions will be answered. Continue now.",
-                    invocation.id, invocation.contract, serde_json::to_string(&invocation.effect_names)?,
-                );
-                self.client.deliver_prompt_until(
-                    &window.session,
-                    &message,
-                    &DeliveryOptions::default(),
-                    &|| self.registry.answered(&invocation.id),
-                )?;
-                turns.seen = turns.idle.take().map(|(id, _)| id);
-                turns.reminded = true;
-                window.record["outcome"] = json!("open");
-                let logical_id = window.record["invocations"]
-                    .as_array()
-                    .and_then(|items| items.last())
-                    .map(|item| item["invocation_id"].clone());
-                let reminders = window
-                    .record
-                    .as_object_mut()
-                    .unwrap()
-                    .entry("reminders")
-                    .or_insert_with(|| json!([]));
-                reminders.as_array_mut().unwrap().push(json!({ "task_id": invocation.id, "reaction": invocation.reaction_id, "invocation_id": logical_id, "timestamp": chrono::Utc::now().to_rfc3339() }));
-                self.publish_wait(window);
-            }
         }
         let tree = if self.client.has_session(&window.session)? {
             self.client
@@ -2875,7 +2850,58 @@ impl AgentReactionExecutor {
         window.tree.extend(tree);
         window.tree.sort_unstable();
         window.tree.dedup();
-        window.observe_conversation(&self.client);
+        if let Some((invocation, turns, _)) = task {
+            let input = window.blocked_input(&self.client);
+            let stopped = input.as_ref().map(|id| format!("input:{id}")).or(ended);
+            if !self.registry.answered(&invocation.id) && turns.stopped(stopped, Instant::now()) {
+                if turns.reminded {
+                    return Err(WorkerDied {
+                        reason: "stopped without finishing after a reminder".into(),
+                        conversation: window.conversation.clone(),
+                    }
+                    .into());
+                }
+                let message = format!(
+                    "OMAR REMINDER\ntask_id: {}\nYour task is still open. Required output contract: {}. Outputs: {}. Finish the task, set its required outputs with omar_set_port, and call omar_complete with this task_id. No questions will be answered. Continue now.",
+                    invocation.id, invocation.contract, serde_json::to_string(&invocation.effect_names)?,
+                );
+                if let Some(id) = &input {
+                    if !window.answer_input(&self.client, id, &message)? {
+                        return Ok(());
+                    }
+                } else {
+                    self.client.deliver_prompt_until(
+                        &window.session,
+                        &message,
+                        &DeliveryOptions::default(),
+                        &|| self.registry.answered(&invocation.id),
+                    )?;
+                }
+                turns.seen = turns.idle.take().map(|(id, _)| id);
+                turns.reminded = true;
+                window.record["outcome"] = json!("open");
+                let logical_id = window.record["invocations"]
+                    .as_array()
+                    .and_then(|items| items.last())
+                    .map(|item| item["invocation_id"].clone());
+                let reminders = window
+                    .record
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("reminders")
+                    .or_insert_with(|| json!([]));
+                reminders.as_array_mut().unwrap().push(json!({
+                    "task_id": invocation.id, "reaction": invocation.reaction_id,
+                    "invocation_id": logical_id,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "reason": if input.is_some() { "asked the user a question" } else { "stopped without finishing" },
+                }));
+                if let Some(workers) = &self.scoped {
+                    workers.record(&window.record);
+                    workers.publish(&window.agent, &window.record);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -2965,6 +2991,83 @@ struct Window {
 }
 
 impl Window {
+    fn out_of_credit(&mut self, client: &TmuxClient) -> Option<crate::backend::OutOfCredit> {
+        if let Some(credit) = self
+            .turn_monitor
+            .as_mut()
+            .and_then(|monitor| monitor.out_of_credit())
+        {
+            return Some(credit);
+        }
+        let backend = crate::backend::by_name(self.record["backend"].as_str()?)?;
+        if backend.kind() == crate::backend::Kind::Claude {
+            let screen = client.capture_pane_plain(&self.session, 0).ok()?;
+            // Match Claude's error notice, not a task discussing billing.
+            if !screen.lines().any(|line| {
+                let line = line
+                    .trim_start_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase();
+                line.starts_with("api error:")
+                    || line.starts_with("error:")
+                    || line.starts_with("credit balance is too low")
+            }) {
+                return None;
+            }
+            return crate::backend::OutOfCredit::from_error(&json!(screen
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")));
+        }
+        let stamp = client.session_delivery(&self.session);
+        backend.out_of_credit(
+            &crate::backend::Target {
+                name: &self.session,
+                pane_pid: client.get_pane_pid(&self.session).ok()?,
+                stamp: stamp.as_deref(),
+            },
+            &self.turn_file,
+        )
+    }
+
+    fn blocked_input(&self, client: &TmuxClient) -> Option<String> {
+        if let Some(monitor) = &self.turn_monitor {
+            return monitor.blocked_input();
+        }
+        let backend = crate::backend::by_name(self.record["backend"].as_str()?)?;
+        let stamp = client.session_delivery(&self.session);
+        backend.blocked_input(
+            &crate::backend::Target {
+                name: &self.session,
+                pane_pid: client.get_pane_pid(&self.session).ok()?,
+                stamp: stamp.as_deref(),
+            },
+            &self.turn_file,
+        )
+    }
+
+    fn answer_input(&mut self, client: &TmuxClient, id: &str, text: &str) -> Result<bool> {
+        if let Some(monitor) = &mut self.turn_monitor {
+            return monitor.answer_input(id, text);
+        }
+        let backend = crate::backend::by_name(
+            self.record["backend"]
+                .as_str()
+                .context("worker has no backend")?,
+        )
+        .context("unknown worker backend")?;
+        let stamp = client.session_delivery(&self.session);
+        backend.answer_input(
+            &crate::backend::Target {
+                name: &self.session,
+                pane_pid: client.get_pane_pid(&self.session)?,
+                stamp: stamp.as_deref(),
+            },
+            &self.turn_file,
+            id,
+            text,
+        )
+    }
+
     fn usage_limit(&mut self, client: &TmuxClient) -> Option<(String, crate::backend::UsageLimit)> {
         if let Some(limit) = self
             .turn_monitor
@@ -3302,6 +3405,9 @@ impl ScopedWorkers {
             Err(error) => {
                 // A worker that failed an invocation is in an unknown state.
                 window.failed = true;
+                if let Some(credit) = error.downcast_ref::<crate::backend::OutOfCredit>() {
+                    window.record["failure_reason"] = json!(credit.to_string());
+                }
                 if let Some(death) = error.downcast_ref::<WorkerDied>() {
                     window.record["outcome"] = json!("died");
                     window.record["death_reason"] = json!(death.reason);
@@ -3762,6 +3868,7 @@ fn unscoped_without_restart(record: &Value) -> bool {
         && record["outcome"] != "died"
         && record["reminders"].as_array().is_none_or(Vec::is_empty)
         && record["usage_waits"].as_array().is_none_or(Vec::is_empty)
+        && record["failure_reason"].is_null()
 }
 
 /// Every conversation an attempt recorded in `log`, in this run or an earlier
@@ -11520,6 +11627,28 @@ mod tests {
             scoped: None,
         };
         let error = executor.watch_worker(&mut window, None).unwrap_err();
+        assert_eq!(error.to_string(), "worker process exited");
+        struct BlockedWorker;
+        impl crate::backend::TurnMonitor for BlockedWorker {
+            fn ended_turn(&mut self) -> Option<String> {
+                None
+            }
+            fn blocked_input(&self) -> Option<String> {
+                Some("question".into())
+            }
+            fn answer_input(&mut self, _: &str, _: &str) -> Result<bool> {
+                panic!("a dead worker must be restarted before answering its question")
+            }
+        }
+        window.turn_monitor = Some(Box::new(BlockedWorker));
+        let mut turns = TaskTurnWatch {
+            idle: Some(("input:question".into(), Instant::now() - TURN_GRACE * 2)),
+            ..Default::default()
+        };
+        let mut clock = TaskClock::new();
+        let error = executor
+            .watch_worker(&mut window, Some((&invocation, &mut turns, &mut clock)))
+            .unwrap_err();
         assert_eq!(error.to_string(), "worker process exited");
         executor.scoped = Some(workers);
         let error = executor.watch_worker(&mut window, None).unwrap_err();

@@ -366,10 +366,9 @@ pub(crate) fn with_coordination_hooks(command: &str, context: &McpLaunchContext)
         "PreToolUse":[{"matcher":"Workflow","hooks":[{"type":"command","command":guard,"timeout":5}]}]
     }});
     if context.topology.is_some() {
-        settings["hooks"]
-            .as_object_mut()
-            .unwrap()
-            .remove("PreToolUse");
+        settings["hooks"]["PreToolUse"] = serde_json::json!([{"matcher":"AskUserQuestion|ExitPlanMode", "hooks":[{"type":"command","command":hook,"timeout":600}]}]);
+        settings["hooks"]["PermissionRequest"] =
+            serde_json::json!([{"hooks":[{"type":"command","command":hook,"timeout":600}]}]);
     }
     format!(
         "{command} --settings {}",

@@ -147,7 +147,7 @@ test("restarted tasks have readable attempt rows in order and concise badge text
   assert.match(fresh[0].summary, /retry 2 of 2 · new conversation · in progress/);
   assert.deepEqual(restartRows([], "b.reaction.0"), []);
   const reminded = restartRows([record("reminded", 10, 0, "completed", {
-    reminders: [{ task_id: 10, reaction: "b.reaction.0" }],
+    reminders: [{ task_id: 10, reaction: "b.reaction.0", reason: "asked the user a question" }],
   })], "b.reaction.0");
   assert.equal(reminded[0].summary, "Attempt 1 · completed · reminded to finish");
   const later = record("shared-window", 11, 0, "open", {

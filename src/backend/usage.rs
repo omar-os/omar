@@ -11,6 +11,76 @@ pub struct UsageLimit {
     pub resets_at: Option<i64>,
 }
 
+/// Billing failures have no automatic reset, even if the provider uses HTTP 429.
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
+#[error("out of credit: {0}")]
+pub struct OutOfCredit(pub String);
+
+impl OutOfCredit {
+    pub fn from_error(value: &Value) -> Option<Self> {
+        let text = value.to_string().to_lowercase().replace('_', " ");
+        if !contains_status(value, 402)
+            && ![
+                "insufficient quota",
+                "insufficient credits",
+                "insufficient credit",
+                "out of credits",
+                "out of credit",
+                "not enough credit",
+                "requires more credits",
+                "insufficient balance",
+                "credit balance is too low",
+                "credit balance too low",
+                "credits exhausted",
+                "credit balance exhausted",
+                "spend cap",
+                "spending cap",
+                "spend limit",
+                "spending limit",
+                "billing error",
+                "billing hard limit",
+                "billing not active",
+                "billing required",
+                "billing disabled",
+                "billing details",
+                "billing limit",
+                "check your plan and billing",
+                "\"code\":\"billing\"",
+                "\"type\":\"billing\"",
+                "payment required",
+                "usage-based spending limit",
+            ]
+            .iter()
+            .any(|signal| text.contains(signal))
+        {
+            return None;
+        }
+        Some(Self(
+            provider_message(value).unwrap_or_else(|| "HTTP 402 payment required".into()),
+        ))
+    }
+}
+
+// Keep the provider's reason, not an entire response containing request data.
+fn provider_message(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|value| provider_message(&value))
+            .or_else(|| Some(text.clone())),
+        Value::Object(fields) => {
+            for key in ["error", "message", "errorMessage", "responseBody", "data"] {
+                if let Some(message) = fields.get(key).and_then(provider_message) {
+                    return Some(message);
+                }
+            }
+            fields.values().find_map(provider_message)
+        }
+        Value::Array(items) => items.iter().find_map(provider_message),
+        _ => None,
+    }
+}
+
 impl UsageLimit {
     pub fn delay(&self, fallback: Duration) -> Duration {
         self.resets_at
@@ -22,6 +92,9 @@ impl UsageLimit {
     }
 
     pub fn from_error(value: &Value) -> Option<Self> {
+        if OutOfCredit::from_error(value).is_some() {
+            return None;
+        }
         let text = value.to_string().to_lowercase();
         if ![
             "usage_limit_reached",
@@ -33,7 +106,6 @@ impl UsageLimit {
             "too many requests",
             "resource_exhausted",
             "quota exceeded",
-            "insufficient_quota",
             "quota_exceeded",
             "exhausted your capacity",
             "you've hit your limit",
@@ -188,6 +260,33 @@ fn text_reset(text: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn credit_exhaustion_never_waits_even_with_429_and_retry_metadata() {
+        for error in [
+            json!({"statusCode":429,"error":{"code":"insufficient_quota","message":"out of credits"},"resets_at":1900000000,"retry-after":"60"}),
+            json!({"status":402,"error":{"message":"insufficient credits"}}),
+            json!("Credit balance is too low"),
+            json!({"error":{"message":"Your spending limit was reached"}}),
+            json!({"error":{"code":"monthly_spend_cap"}}),
+            json!({"error":{"code":"credit_balance_too_low"}}),
+            json!({"errorMessage":"429 {\"error\":{\"type\":\"billing_error\",\"message\":\"Check billing\"}}"}),
+        ] {
+            assert!(OutOfCredit::from_error(&error).is_some(), "{error}");
+            assert!(UsageLimit::from_error(&error).is_none(), "{error}");
+        }
+        assert!(OutOfCredit::from_error(
+            &json!({"error":{"type":"rate_limit_exceeded","message":"Too many requests"}})
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_billing_tier_is_not_a_billing_failure() {
+        let error = json!({"error":{"type":"rate_limit_exceeded","message":"Too many requests for this billing tier"},"resets_at":1900000000});
+        assert!(OutOfCredit::from_error(&error).is_none());
+        assert!(UsageLimit::from_error(&error).is_some());
+    }
+
     #[test]
     fn retry_metadata_and_claude_wall_time_are_recognized() {
         let before = Utc::now().timestamp();

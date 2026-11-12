@@ -30,12 +30,12 @@ impl OnError {
     }
 }
 
-// Messages are controlled by the adapter, never copied from provider bodies,
-// curl stderr, request headers, or credentials.
+// Transport messages are controlled by the adapter. Billing errors retain only
+// the provider message, never request headers or curl stderr.
 #[derive(Debug)]
 struct Failure {
     kind: &'static str,
-    message: &'static str,
+    message: String,
     http_status: Option<u16>,
     resets_at: Option<i64>,
 }
@@ -44,7 +44,7 @@ impl Failure {
     fn new(kind: &'static str, message: &'static str) -> Self {
         Self {
             kind,
-            message,
+            message: message.into(),
             http_status: None,
             resets_at: None,
         }
@@ -166,6 +166,9 @@ fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>
     });
     let (choice, mut response) = match result {
         Ok(answer) => answer,
+        Err(error) if error.kind == "out_of_credit" => {
+            return Err(super::OutOfCredit(error.message).into())
+        }
         Err(error) if error.kind == "rate_limit" => {
             return Err(super::UsageLimit {
                 resets_at: error.resets_at,
@@ -338,6 +341,17 @@ fn decode_http(bytes: &[u8]) -> std::result::Result<Value, Failure> {
         ("", response)
     };
     if !(200..300).contains(&status) {
+        let error: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        if let Some(credit) =
+            super::OutOfCredit::from_error(&json!({"status":status,"error":error}))
+        {
+            return Err(Failure {
+                kind: "out_of_credit",
+                message: credit.0,
+                http_status: Some(status),
+                resets_at: None,
+            });
+        }
         let (kind, message) = match status {
             401 | 403 => ("authentication", "Jev rejected the API credentials"),
             429 => ("rate_limit", "Jev rate limit exceeded"),
@@ -346,7 +360,7 @@ fn decode_http(bytes: &[u8]) -> std::result::Result<Value, Failure> {
         };
         return Err(Failure {
             kind,
-            message,
+            message: message.into(),
             http_status: Some(status),
             resets_at: headers
                 .lines()

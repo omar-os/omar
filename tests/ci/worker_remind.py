@@ -38,8 +38,16 @@ await Promise.all([
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--live', action='store_true')
+    parser.add_argument('--questions', action='store_true', help='Run blocking user-input recovery scenarios')
+    parser.add_argument('--async-questions', action='store_true', help='Run Codex 0.167 async questions through its real TUI and serve')
     parser.add_argument('--backend', choices=['Claude', 'Cursor', 'Agy', 'Codex', 'Pi', 'OpenCode', 'Stub'])
     args = parser.parse_args()
+    if args.async_questions:
+        assert not args.live, 'the deterministic async scenario uses a local model catalog'
+        execute('Codex', deaths=0, scenario='question_async')
+        execute('Codex', per=True, deaths=0, scenario='question_async_ignore')
+        execute('Codex', deaths=0, scenario='question_async_ignore')
+        return
     if not args.live:
         verify_opencode_event_order()
     backends = [args.backend] if args.backend else ['Claude', 'Cursor', 'Agy', 'Codex', 'Pi', 'OpenCode', 'Stub']
@@ -56,12 +64,31 @@ def main():
                     print(f'SKIP: Claude live: {error}', flush=True)
                     continue
         try:
+            if args.questions:
+                if backend == 'Stub': continue
+                execute(backend, deaths=0, live=args.live, scenario='question')
+                if not args.live:
+                    execute(backend, per=backend == 'Codex', deaths=0, scenario='question_ignore')
+                    if backend in ['Claude', 'Cursor', 'Agy', 'OpenCode']: execute(backend, deaths=0, scenario='question_permission')
+                    if backend in ['Cursor', 'Agy']: execute(backend, deaths=0, scenario='permission')
+                    if backend == 'Cursor':
+                        execute(backend, deaths=0, scenario='question_elicitation')
+                        execute(backend, deaths=0, scenario='question_fallback')
+                continue
             execute(backend, deaths=0, live=args.live, scenario='complete')
             if not args.live:
                 execute(backend, deaths=0, scenario='ignore')
                 execute(backend, deaths=0, scenario='working')
                 if backend in ['Claude', 'Codex', 'Pi', 'OpenCode', 'Stub']:
                     execute(backend, per=True, deaths=0, scenario='complete')
+                if backend != 'Stub':
+                    execute(backend, deaths=0, scenario='question')
+                    execute(backend, per=backend == 'Codex', deaths=0, scenario='question_ignore')
+                    if backend in ['Claude', 'Cursor', 'Agy', 'OpenCode']: execute(backend, deaths=0, scenario='question_permission')
+                    if backend in ['Cursor', 'Agy']: execute(backend, deaths=0, scenario='permission')
+                    if backend == 'Cursor':
+                        execute(backend, deaths=0, scenario='question_elicitation')
+                        execute(backend, deaths=0, scenario='question_fallback')
         except Exception as error:
             if not args.live:
                 raise

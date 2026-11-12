@@ -14,6 +14,16 @@ use anyhow::{Context, Result};
 pub struct Pi;
 
 impl Backend for Pi {
+    fn out_of_credit(
+        &self,
+        target: &Target<'_>,
+        _hook_file: &std::path::Path,
+    ) -> Option<super::OutOfCredit> {
+        let socket = target.stamp?.strip_prefix("pi:")?;
+        let value = request(socket, serde_json::json!({"turn": true})).ok()?;
+        super::OutOfCredit::from_error(&value["error"])
+    }
+
     fn usage_limit(
         &self,
         target: &Target<'_>,
@@ -25,6 +35,28 @@ impl Backend for Pi {
             value["limit_id"].as_str()?.into(),
             super::UsageLimit::from_error(&value["error"])?,
         ))
+    }
+    fn blocked_input(&self, target: &Target<'_>, _hook_file: &std::path::Path) -> Option<String> {
+        let socket = target.stamp?.strip_prefix("pi:")?;
+        request(socket, serde_json::json!({"input":true})).ok()?["blocked"]
+            .as_str()
+            .map(str::to_owned)
+    }
+    fn answer_input(
+        &self,
+        target: &Target<'_>,
+        _hook_file: &std::path::Path,
+        id: &str,
+        text: &str,
+    ) -> Result<bool> {
+        let socket = target
+            .stamp
+            .and_then(|stamp| stamp.strip_prefix("pi:"))
+            .context("Pi has no socket")?;
+        Ok(
+            request(socket, serde_json::json!({"answer_input":id,"text":text}))?["answered"]
+                == true,
+        )
     }
     fn ended_turn(&self, target: &Target<'_>, _hook_file: &std::path::Path) -> Option<String> {
         let socket = target.stamp?.strip_prefix("pi:")?;
@@ -207,9 +239,9 @@ fn launch_command(launch: &Launch<'_>) -> Result<String> {
         }
     }
     Ok(format!(
-        "OMAR_BINARY={} OMAR_DIR={} OMAR_EA_ID={} OMAR_MCP_CONTEXT_FILE={} OMAR_PI_SOCKET={} {} -e {} --system-prompt \"{}\"",
+        "OMAR_BINARY={} OMAR_DIR={} OMAR_EA_ID={} OMAR_MCP_CONTEXT_FILE={} OMAR_PI_SOCKET={} OMAR_PI_TOPOLOGY={} {} -e {} --system-prompt \"{}\"",
         shell_single_quote(&binary.display().to_string()), shell_single_quote(&context.omar_dir.display().to_string()), context.ea_id,
-        shell_single_quote(&context_file.display().to_string()), shell_single_quote(&socket.display().to_string()), command,
+        shell_single_quote(&context_file.display().to_string()), shell_single_quote(&socket.display().to_string()), u8::from(context.topology.is_some()), command,
         shell_single_quote(&dir.join("index.js").display().to_string()), launch.shell_expr
     ))
 }

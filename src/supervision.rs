@@ -434,6 +434,43 @@ pub fn backend_hook_response(
         } else {
             (session, "")
         };
+        if event == "PermissionRequest"
+            || (event == "PreToolUse"
+                && matches!(
+                    input["tool_name"].as_str(),
+                    Some("AskUserQuestion" | "ExitPlanMode")
+                ))
+        {
+            let path = crate::manager::topology_turn_file(
+                &context.omar_dir,
+                context.ea_id,
+                &topology.team,
+                &topology.agent,
+                topology.attempt.as_ref().map(|attempt| attempt.id.as_str()),
+            );
+            let id = uuid::Uuid::new_v4().to_string();
+            crate::manager::write_private_file(
+                &path,
+                &serde_json::to_vec(&json!({"input":id,"idle":false}))?,
+            )?;
+            loop {
+                if let Ok(raw) = fs::read(path.with_extension("answer.json")) {
+                    let answer: Value = serde_json::from_slice(&raw)?;
+                    if answer["id"] == id {
+                        let _ = fs::remove_file(path.with_extension("answer.json"));
+                        if event == "PermissionRequest" {
+                            return Ok(
+                                json!({"hookSpecificOutput":{"hookEventName":event,"decision":{"behavior":"deny","message":answer["text"]}}}),
+                            );
+                        }
+                        return Ok(
+                            json!({"hookSpecificOutput":{"hookEventName":event,"permissionDecision":"deny","permissionDecisionReason":answer["text"]}}),
+                        );
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
         if matches!(event, "Stop" | "UserPromptSubmit" | "Busy" | "UsageLimit") {
             let mut path = crate::manager::topology_turn_file(
                 &context.omar_dir,
@@ -456,14 +493,19 @@ pub fn backend_hook_response(
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_else(|| json!({}));
+            if event != "UsageLimit" {
+                state["input"] = Value::Null;
+            }
             state["idle"] = json!(event == "Stop");
             state["turn"] = json!(uuid::Uuid::new_v4().to_string());
             if event == "UsageLimit" {
                 let error: Value =
                     serde_json::from_str(error).unwrap_or_else(|_| input["error"].clone());
+                state["credit_error"] = json!(crate::backend::OutOfCredit::from_error(&error));
                 state["usage_limit"] = json!(crate::backend::UsageLimit::from_error(&error));
             } else if event != "Stop" {
                 state["usage_limit"] = Value::Null;
+                state["credit_error"] = Value::Null;
             }
             crate::manager::write_private_file(&path, &serde_json::to_vec(&state)?)?;
         }
