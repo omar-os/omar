@@ -11208,7 +11208,7 @@ mod tests {
         let error = executor.watch_worker(&mut window, None).unwrap_err();
         assert_eq!(error.to_string(), "worker process exited");
         executor.scoped = Some(workers);
-        let error = executor.watch_worker(&mut window).unwrap_err();
+        let error = executor.watch_worker(&mut window, None).unwrap_err();
         assert_eq!(error.to_string(), "runtime is shutting down");
         assert!(error.downcast_ref::<WorkerDied>().is_none());
     }
