@@ -97,6 +97,7 @@ def answer(text):
             print("\x1b[2J\x1b[HContinuing task", flush=True)
         else:
             return {"code":-32603,"message":"Usage limit reached", "data":{"type":"usage_limit_reached", "resets_at":reset}}
+    if os.environ.get("REMIND_SCENARIO") == "working": time.sleep(6)
     call("omar_set_port", {"task_id":task,"port":"result","value":"recovered"})
     call("omar_complete", {"task_id":task})
 '''
@@ -113,11 +114,11 @@ MANAGED = workers.FAKE_MANAGED.replace(workers.FAKE_ANSWER, ANSWER).replace(
 assert 'error = answer(text)' in MANAGED
 
 
-def check_records(state, output, result):
+def check_records(state, output, result, port='result'):
     lines = [json.loads(line) for path in state.rglob('attempts.jsonl') for line in path.read_text().splitlines()]
     attempts = {item['attempt_id']: item for item in lines}
     detail = output + '\n' + json.dumps(lines)
-    assert result == 0 and 'Output p.result = ' in output, detail
+    assert result == 0 and f'Output p.{port} = ' in output, detail
     assert len(attempts) == 1, detail
     attempt = next(iter(attempts.values()))
     assert attempt.get('retry', 0) == 0 and not attempt.get('reminders'), detail
@@ -142,12 +143,12 @@ def check_credit(state, output, result, elapsed):
     assert elapsed < WAIT, f'credit failure took {elapsed:.1f}s, expected less than {WAIT}s\n{detail}'
 
 
-def execute(backend, unknown=False, timeout=False, credit=None):
+def execute(backend, unknown=False, timeout=False, credit=None, slow=False):
     server = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     server.requests, server.limited, server.reset = [], [], None
     server.credit = credit
     server.killed, server.deaths = set(), 0
-    server.scenario, server.waited = None, set()
+    server.scenario, server.waited = 'working' if slow else None, set()
     server.kill, server.release = threading.Event(), threading.Event()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
@@ -167,8 +168,10 @@ def execute(backend, unknown=False, timeout=False, credit=None):
                 with (home / '.profile').open('a') as out:
                     out.write('export OMAR_STUB_USAGE_WAIT_MILLIS=16000\n')
             program = root / 'Limit.omar'
+            # Exercise the demo's effect name too: the provider must not hardcode result.
+            port = 'patch' if slow and backend in ['Codex', 'Pi', 'OpenCode'] else 'result'
             program.write_text(workers.PROGRAM.replace('BACKENDLIFETIME', backend).replace(
-                '-> result "PROMPT"', f'-> result within({30 if credit else WITHIN}s) "Return one word."'))
+                '-> result "PROMPT"', f'-> result within({30 if credit else WITHIN}s) "Return one word."').replace('result', port))
             up = subprocess.run([str(workers.BIN), 'up', '-s', 'limit-test', '--no-ea'], env=env, cwd=root, capture_output=True, text=True, timeout=90)
             assert up.returncode == 0, up.stdout + up.stderr
             launch = json.loads((home / '.omar/sessions/limit-test/launch.json').read_text())
@@ -204,14 +207,16 @@ def execute(backend, unknown=False, timeout=False, credit=None):
                 assert records[-1]['usage_waits'][-1].get('ended_at'), records
                 print(f'PASS: {backend}: unknown reset bounded by run-wide timeout', flush=True)
                 return
-            waits = check_records(home / '.omar', output + f'\nRun took {time.monotonic()-began:.1f}s\nLast screen:\n' + '\n'.join(screens[-2:]) + '\nProvider requests: ' + json.dumps([{'items':r.get('input', r.get('messages'))[-2:]} for r in server.requests]) + '\nLimited requests: ' + str(len(server.limited)), process.returncode)
+            waits = check_records(home / '.omar', output + f'\nRun took {time.monotonic()-began:.1f}s\nLast screen:\n' + '\n'.join(screens[-2:]) + '\nProvider requests: ' + json.dumps([{'items':r.get('input', r.get('messages'))[-2:]} for r in server.requests]) + '\nLimited requests: ' + str(len(server.limited)), process.returncode, port)
             if backend == 'Claude':
                 log = [json.loads(line) for line in (root / 'fake.jsonl').read_text().splitlines()]
                 assert len([e for e in log if e['event'] == 'prompt']) == 1 and not any(e['event'] == 'key' for e in log), log
             if backend == 'Codex':
                 assert any(re.search(r"usage limit|usage-limit", screen, re.I) for screen in screens), '\n'.join(screens)
                 assert all(w['resets_at'] for w in waits), waits
-            print(f'PASS: {backend}{" unknown reset" if unknown else ""}: waited past within, no reminder/restart, same task completed' + ('; automatic continue, no input' if backend == 'Claude' else ''), flush=True)
+            if slow:
+                assert time.monotonic() - began >= WAIT + 5, 'post-limit model did not stay active for 6s'
+            print(f'PASS: {backend}{" slow model" if slow else " unknown reset" if unknown else ""}: waited past within, no reminder/restart, same task completed' + ('; automatic continue, no input' if backend == 'Claude' else ''), flush=True)
     finally:
         server.release.set()
         server.shutdown()
@@ -289,6 +294,8 @@ def main():
                 execute_jev()
             else:
                 execute(backend)
+                if backend != 'Stub':
+                    execute(backend, slow=True)
         if not args.backend:
             execute('Cursor', unknown=True)
             execute('Cursor', unknown=True, timeout=True)

@@ -63,7 +63,7 @@ class Provider(BaseHTTPRequestHandler):
             done = last.get('tool_call_id' if chat else 'call_id', '')
             reminded = re.search(r'OMAR REMINDER.{0,20}task_id: ' + str(task) + r'\D', text)
             asynchronous = scenario and scenario.startswith('question_async')
-            port = re.findall(r'contract: ([\w.]+)', text)[-1].rstrip('.') if asynchronous else 'result'
+            port = re.findall(r'contract: ([\w.]+)', text)[-1].rstrip('.')
             researcher = asynchronous and port.endswith('.notes')
             if asynchronous and not researcher and 'request_user_input_async' not in names:
                 calls = []
