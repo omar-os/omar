@@ -28,6 +28,8 @@ class Provider(workers.Provider):
         if credit or time.time() < self.server.reset:
             request = json.loads(self.rfile.read(int(self.headers.get('content-length', '0'))))
             self.server.limited.append(request)
+            # Credit checks time OMAR from here, not from a CLI's slow startup.
+            self.server.first_error = getattr(self.server, 'first_error', None) or time.monotonic()
             error = credit['error'] if credit else {'type': 'usage_limit_reached',
                 'code': 'usage_limit_reached', 'message': 'Usage limit reached',
                 'plan_type': 'plus', 'resets_at': self.server.reset}
@@ -140,7 +142,7 @@ def check_credit(state, output, result, elapsed):
     assert all(a.get('retry', 0) == 0 and not a.get('reminders') and not a.get('usage_waits') for a in lines), detail
     assert lines[-1]['outcome'] == 'failed', detail
     assert 'out of credit:' in (lines[-1].get('failure_reason') or lines[-1].get('death_reason', '')), detail
-    assert elapsed < WAIT, f'credit failure took {elapsed:.1f}s, expected less than {WAIT}s\n{detail}'
+    assert elapsed < WAIT, f'credit failure took {elapsed:.1f}s after the credit error, expected less than {WAIT}s\n{detail}'
 
 
 def execute(backend, unknown=False, timeout=False, credit=None, slow=False):
@@ -197,7 +199,8 @@ def execute(backend, unknown=False, timeout=False, credit=None, slow=False):
             monitor.join(timeout=2)
             output = stdout + stderr
             if credit:
-                check_credit(home / '.omar', output + '\nLast screen:\n' + '\n'.join(screens[-2:]), process.returncode, time.monotonic() - began)
+                check_credit(home / '.omar', output + '\nLast screen:\n' + '\n'.join(screens[-2:]), process.returncode,
+                             time.monotonic() - (getattr(server, 'first_error', None) or began))
                 print(f'PASS: {backend} credit exhaustion: failed fast, no wait/reminder/restart', flush=True)
                 return
             if timeout:
