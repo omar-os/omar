@@ -396,7 +396,10 @@ fn provision_fresh_session(port: u16, id: &str, timeout: Duration) -> Result<Str
         Ok(())
     };
     loop {
-        match http_json_until(port, "GET", &format!("/session/{id}"), None, deadline) {
+        // A boot-time GET can remain unanswered even after newer connections
+        // work. Reconnect read-only probes; never replay the creation POST.
+        let probe_deadline = deadline.min(Instant::now() + HTTP_TIMEOUT);
+        match http_json_until(port, "GET", &format!("/session/{id}"), None, probe_deadline) {
             Ok((404, _)) => break,
             Ok((200, _)) => anyhow::bail!("opencode already has a session {id}"),
             // A server still booting is not yet an answer.
@@ -747,17 +750,20 @@ mod tests {
     fn scripted(
         script: Vec<(u16, &'static str)>,
     ) -> (u16, std::thread::JoinHandle<Vec<(String, String)>>) {
-        scripted_with_creation_delay(script, Duration::ZERO)
+        scripted_startup(script, Duration::ZERO, false)
     }
 
-    fn scripted_with_creation_delay(
+    fn scripted_startup(
         script: Vec<(u16, &'static str)>,
         delay: Duration,
+        stalled_probe: bool,
     ) -> (u16, std::thread::JoinHandle<Vec<(String, String)>>) {
         use std::io::{BufRead, BufReader};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
+            // Accept a probe but never answer it; later connections work.
+            let _stalled = stalled_probe.then(|| listener.accept().unwrap().0);
             let mut seen = Vec::new();
             for (status, body) in script {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -877,8 +883,34 @@ mod tests {
     }
 
     #[test]
+    fn startup_reconnects_an_unanswered_probe_without_replaying_creation() {
+        let (port, server) = scripted_startup(
+            vec![
+                (404, "{}"),
+                (200, r#"{"data":{"id":"ses_new"}}"#),
+                (200, r#"{"id":"ses_new"}"#),
+                (200, "[]"),
+                (200, "true"),
+            ],
+            Duration::ZERO,
+            true,
+        );
+        let result = provision_fresh_session(port, "ses_new", Duration::from_secs(15));
+        assert_eq!(result.unwrap(), format!("opencode:{port}:ses_new"));
+        let requests = server.join().unwrap();
+        assert!(requests[0].0.starts_with("GET /session/ses_new "));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(line, _)| line.starts_with("POST /api/session "))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn startup_keeps_partial_responses_and_never_replays_session_creation_after_a_read_timeout() {
-        let (port, server) = scripted_with_creation_delay(
+        let (port, server) = scripted_startup(
             vec![
                 (404, "{}"),
                 (200, r#"{"data":{"id":"ses_slow"}}"#),
@@ -887,6 +919,7 @@ mod tests {
                 (200, "true"),
             ],
             HTTP_TIMEOUT + Duration::from_secs(1),
+            false,
         );
         let result = provision_fresh_session(port, "ses_slow", Duration::from_secs(15)).unwrap();
         assert_eq!(result, format!("opencode:{port}:ses_slow"));
