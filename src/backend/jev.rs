@@ -166,10 +166,12 @@ fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>
     });
     let (choice, mut response) = match result {
         Ok(answer) => answer,
-        Err(error) if error.kind == "out_of_credit" => {
+        // OMAR_JEV_ON_ERROR=defer is the operator's answer to provider errors;
+        // only the default `fail` policy waits out limits or fails on credit.
+        Err(error) if on_error == OnError::Fail && error.kind == "out_of_credit" => {
             return Err(super::OutOfCredit(error.message).into())
         }
-        Err(error) if error.kind == "rate_limit" => {
+        Err(error) if on_error == OnError::Fail && error.kind == "rate_limit" => {
             return Err(super::UsageLimit {
                 resets_at: error.resets_at,
             }
