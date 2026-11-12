@@ -111,8 +111,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install tmux
-        run: .github/scripts/install-packages.sh tmux
+      - name: Install tmux and graph preview fonts
+        run: .github/scripts/install-packages.sh tmux fonts-dejavu-core
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -137,10 +137,15 @@ jobs:
           lake-package-directory: lang
           test: false
 
+      - name: Test Rust messaging core and Slack adapter (no credentials)
+        run: 'cargo test --locked --bin omar messaging::'
+
       - name: Verify legacy supervision through MCP and tmux
         run: |
           cargo build -p omar
           python3 tests/ci/independent_sessions.py
+          python3 tests/ci/slack_workflow.py
+          python3 tests/ci/slack_credentials.py
           python3 tests/ci/workspace_restore.py
           python3 tests/ci/ea_deletion.py
           python3 tests/ci/team_workspaces.py
@@ -155,7 +160,8 @@ jobs:
           python3 tests/ci/backend_status.py
 
       - name: Run tests that shell out to cargo
-        run: cargo test --bin omar -- --ignored --test-threads=1
+        run: |
+          cargo test --bin omar -- --ignored --test-threads=1
 
   codex-shared-history:
     name: Codex Shared History

@@ -28,3 +28,6 @@ junk/
 # A sketch of language features that do not exist yet (parameterised teams, a
 # `main` block). CI compiles every program in this directory, so tracking it
 # breaks the build. Ignored so it cannot be swept in again by `git add -A`.
+
+# Local Discord routing contains operator-specific IDs and runtime addresses.
+/integrations/discord/config*.local.json

@@ -1,5 +1,6 @@
 //! Durable Mission Control conversations and workflows, independent of the assistant backend.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,19 @@ use crate::serve::{ChatMessage, ChatRole};
 pub struct Conversation {
     pub id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(skip)]
+    pub messaging_key: Option<String>,
+    /// Source bundles explicitly approved by running a proposed design. Drafts
+    /// stay in messages; messaging never treats a proposal as permission to run.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(skip)]
+    pub approved_workflows: BTreeMap<String, serde_json::Value>,
+    /// Consumed before execution: a lost approval response must not start a
+    /// second run, including after a runtime restart.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[ts(skip)]
+    pub consumed_proposals: BTreeSet<u64>,
     #[serde(default)]
     pub ea_id: Option<crate::ea::EaId>,
     pub created_at: u64,
@@ -89,6 +103,9 @@ impl Conversation {
         Self {
             id: Uuid::new_v4().to_string(),
             title: "New chat".into(),
+            messaging_key: None,
+            approved_workflows: BTreeMap::new(),
+            consumed_proposals: BTreeSet::new(),
             ea_id: None,
             created_at: now(),
             updated_at: now(),
@@ -446,6 +463,63 @@ impl History {
         Ok(id)
     }
 
+    /// Stable platform/account ownership, independent of display title or UI selection.
+    pub fn select_messaging_chat(&mut self, key: &str, title: &str, fresh: bool) -> Result<String> {
+        let existing = self
+            .conversations
+            .iter()
+            .position(|chat| chat.messaging_key.as_deref() == Some(key));
+        if let Some(index) = existing.filter(|_| !fresh) {
+            return Ok(self.conversations[index].id.clone());
+        }
+        let mut next = self.clone();
+        let mut chat = Conversation::new();
+        chat.messaging_key = Some(key.into());
+        chat.title = title.into();
+        if let Some(index) = existing {
+            next.conversations[index].messaging_key = None;
+        }
+        let id = chat.id.clone();
+        next.conversations.push(chat);
+        next.save()?;
+        *self = next;
+        Ok(id)
+    }
+
+    pub fn consume_proposal(&mut self, id: &str, sequence: u64) -> Result<()> {
+        let mut next = self.clone();
+        let chat = next
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == id)
+            .context("unknown chat")?;
+        anyhow::ensure!(
+            chat.consumed_proposals.insert(sequence),
+            "This proposal has already been submitted"
+        );
+        next.save()?;
+        *self = next;
+        Ok(())
+    }
+
+    pub fn approve_workflow(
+        &mut self,
+        id: &str,
+        team: &str,
+        request: serde_json::Value,
+    ) -> Result<()> {
+        let mut next = self.clone();
+        let chat = next
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == id)
+            .context("unknown conversation")?;
+        chat.approved_workflows.insert(team.into(), request);
+        next.save()?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn select(&mut self, id: Option<&str>) -> Result<()> {
         let mut next = self.clone();
         match id {
@@ -549,6 +623,87 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messaging_identity_survives_rename_restart_and_failed_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chats.json");
+        let mut history = History::load(path.clone()).unwrap();
+        let active = history.active_id.clone();
+        let slack = history
+            .select_messaging_chat("slack:T1", "Slack", false)
+            .unwrap();
+        history
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == slack)
+            .unwrap()
+            .title = "Renamed by user".into();
+        history.save().unwrap();
+        let mut history = History::load(path.clone()).unwrap();
+        assert_eq!(
+            history
+                .select_messaging_chat("slack:T1", "Slack", false)
+                .unwrap(),
+            slack
+        );
+        assert_eq!(history.conversation(&slack).title, "Renamed by user");
+        assert_eq!(history.active_id, active);
+        assert_ne!(
+            history
+                .select_messaging_chat("discord:T1", "Discord", false)
+                .unwrap(),
+            slack
+        );
+        assert_ne!(
+            history
+                .select_messaging_chat("slack:T2", "Slack", false)
+                .unwrap(),
+            slack
+        );
+        let fresh = history
+            .select_messaging_chat("slack:T1", "Slack", true)
+            .unwrap();
+        assert_ne!(fresh, slack);
+        let mut history = History::load(path.clone()).unwrap();
+        assert_eq!(
+            history
+                .select_messaging_chat("slack:T1", "Slack", false)
+                .unwrap(),
+            fresh
+        );
+        assert_eq!(history.conversation(&slack).title, "Renamed by user");
+        let before = history.conversations.len();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(history
+            .select_messaging_chat("slack:T3", "Slack", false)
+            .is_err());
+        assert_eq!(history.conversations.len(), before);
+    }
+
+    #[test]
+    fn approved_workflows_survive_restart_and_failed_updates_preserve_the_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chats.json");
+        let mut history = History::load(path.clone()).unwrap();
+        let id = history.active_id.clone();
+        let bundle = serde_json::json!({"program":"approved source", "files":{"schemas/a.json":"schema"}, "inputs":{"request":"value"}});
+        history
+            .approve_workflow(&id, "News", bundle.clone())
+            .unwrap();
+        let restarted = History::load(path.clone()).unwrap();
+        assert_eq!(
+            restarted.conversation(&id).approved_workflows["News"],
+            bundle
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(history
+            .approve_workflow(&id, "News", serde_json::json!({"program":"replacement"}))
+            .is_err());
+        assert_eq!(history.conversation(&id).approved_workflows["News"], bundle);
+    }
 
     fn message(text: &str) -> ChatMessage {
         ChatMessage {
