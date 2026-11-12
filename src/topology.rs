@@ -2765,12 +2765,15 @@ struct ScopedWorkers {
     states: BTreeMap<String, AgentState>,
     /// Each agent's open window, if any. Locked for a whole invocation.
     windows: BTreeMap<String, Mutex<Option<Window>>>,
+    /// Confirmed stops, separate from unscoped agents' retained session history.
+    stopped: Mutex<BTreeSet<String>>,
     launcher: AgentLauncher,
     run: String,
-    /// The run's record, whose `sessions` holds a window's session from
+    /// The run's record, whose `sessions` holds a `per` window's session from
     /// before its worker is launched until it is seen stopped, so a run that
     /// dies in between leaves it for `--replace` and snapshots to find, and
-    /// one that does not leaves nothing to clean.
+    /// one that does not leaves nothing to clean. Unscoped session names
+    /// remain in the record as history after a confirmed stop.
     deployment: Arc<Mutex<deploy::DeploymentRecord>>,
     /// One JSON line per window as it starts, once its conversation is
     /// checked, after each invocation it serves, and as it ends. The last line
@@ -2967,6 +2970,7 @@ impl ScopedWorkers {
                 .map(|name| (name.clone(), Mutex::new(None)))
                 .collect(),
             states,
+            stopped: Mutex::new(BTreeSet::new()),
             seen: Mutex::new(reported_conversations(&log)),
             log,
             launcher,
@@ -2979,6 +2983,9 @@ impl ScopedWorkers {
     /// Record `agent`'s session as one the run must clean up, or, with
     /// `None`, as gone.
     fn track(&self, agent: &str, session: Option<&str>) -> Result<()> {
+        if session.is_some() {
+            self.stopped.lock().unwrap().remove(agent);
+        }
         let mut deployment = self
             .deployment
             .lock()
@@ -2990,6 +2997,24 @@ impl ScopedWorkers {
             None => deployment.sessions.remove(agent),
         };
         deployment.save(&self.launcher.runtime_dir)
+    }
+
+    fn record_stop(&self, agent: &str) -> Result<()> {
+        if self.states[agent].lifetime.is_some() {
+            self.track(agent, None)
+        } else {
+            self.stopped.lock().unwrap().insert(agent.to_owned());
+            Ok(())
+        }
+    }
+
+    fn cleanup_sessions(&self, sessions: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let stopped = self.stopped.lock().unwrap();
+        sessions
+            .iter()
+            .filter(|(agent, _)| !stopped.contains(*agent))
+            .map(|(agent, session)| (agent.clone(), session.clone()))
+            .collect()
     }
 
     fn slot(&self, agent: &str) -> std::sync::MutexGuard<'_, Option<Window>> {
@@ -3306,7 +3331,7 @@ impl ScopedWorkers {
                     false,
                 );
                 if stopped.is_ok() {
-                    if let Err(error) = self.track(&invocation.agent, None) {
+                    if let Err(error) = self.record_stop(&invocation.agent) {
                         eprintln!("warning: could not record {session} as stopped: {error:#}");
                     }
                 }
@@ -3384,7 +3409,7 @@ impl ScopedWorkers {
             agent.lifetime.is_none() && window.record["outcome"] == "died",
         );
         if stopped.is_ok() {
-            if let Err(error) = self.track(&window.agent, None) {
+            if let Err(error) = self.record_stop(&window.agent) {
                 eprintln!(
                     "warning: could not record {} as stopped: {error:#}",
                     window.session
@@ -3455,7 +3480,7 @@ impl ScopedWorkers {
                         &attempt.native_session,
                         &native,
                         &self.seen,
-                        || backend.prove_fresh(&target, &native, since),
+                        || backend.prove_fresh(&target, &native, since, deadline),
                     );
                     *reported = Some(native);
                     return verified;
@@ -4580,6 +4605,10 @@ fn launch(
                 .lock()
                 .map(|guard| guard.sessions.clone())
                 .unwrap_or_default();
+            let sessions = executor.agents.scoped.as_ref().map_or_else(
+                || sessions.clone(),
+                |workers| workers.cleanup_sessions(&sessions),
+            );
             fail_deployment(&record, &runtime_dir, &sessions, &error);
             return Err(error);
         }
@@ -4590,6 +4619,10 @@ fn launch(
         .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
         .sessions
         .clone();
+    let sessions = executor.agents.scoped.as_ref().map_or_else(
+        || sessions.clone(),
+        |workers| workers.cleanup_sessions(&sessions),
+    );
     if let LoopEnd::Paused(paused) = end {
         // The checkpoint is already published. What remains is to leave
         // nothing running: agents are torn down, and the record says the
@@ -11183,6 +11216,7 @@ mod tests {
         let workers = ScopedWorkers {
             states: BTreeMap::from([("coder".into(), agent)]),
             windows: BTreeMap::new(),
+            stopped: Mutex::new(BTreeSet::new()),
             launcher: AgentLauncher {
                 client: client.clone(),
                 team: "test".into(),
@@ -11194,7 +11228,7 @@ mod tests {
                 shutdown: Arc::new(AtomicBool::new(false)),
                 endpoint: "".into(),
                 token: "".into(),
-                workspaces: BTreeMap::new(),
+                workspaces: BTreeMap::from([("".into(), (dir.path().into(), dir.path().into()))]),
                 resumed: "".into(),
             },
             run: "test".into(),
@@ -11262,6 +11296,17 @@ mod tests {
         let error = executor.watch_worker(&mut window, None).unwrap_err();
         assert_eq!(error.to_string(), "runtime is shutting down");
         assert!(error.downcast_ref::<WorkerDied>().is_none());
+        let workers = executor.scoped.as_ref().unwrap();
+        let mut slot = Some(window);
+        workers.close(&mut slot).unwrap();
+        assert_eq!(
+            workers.deployment.lock().unwrap().sessions.get("coder"),
+            Some(&session)
+        );
+        let sessions = workers.deployment.lock().unwrap().sessions.clone();
+        assert!(workers.cleanup_sessions(&sessions).is_empty());
+        workers.track("coder", Some(&session)).unwrap();
+        assert_eq!(workers.cleanup_sessions(&sessions), sessions);
     }
 
     #[test]

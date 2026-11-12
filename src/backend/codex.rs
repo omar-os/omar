@@ -184,6 +184,7 @@ impl Backend for Codex {
         target: &super::Target<'_>,
         id: &str,
         since: std::time::SystemTime,
+        _deadline: std::time::Instant,
     ) -> Result<()> {
         let socket = target
             .stamp
@@ -1542,7 +1543,18 @@ mod tests {
         ] {
             let listener = UnixListener::bind(&socket).unwrap();
             let server = std::thread::spawn(move || fake_app_server(listener, threads));
-            assert_eq!(Codex.prove_fresh(&target, id, since).is_ok(), ok, "{id}");
+            assert_eq!(
+                Codex
+                    .prove_fresh(
+                        &target,
+                        id,
+                        since,
+                        std::time::Instant::now() + Duration::from_secs(60)
+                    )
+                    .is_ok(),
+                ok,
+                "{id}"
+            );
             let asked: Vec<serde_json::Value> = server
                 .join()
                 .unwrap()
@@ -1561,7 +1573,12 @@ mod tests {
             std::fs::remove_file(&socket).unwrap();
         }
         assert!(Codex
-            .prove_fresh(&target, "thread-1", since + Duration::from_secs(1))
+            .prove_fresh(
+                &target,
+                "thread-1",
+                since + Duration::from_secs(1),
+                std::time::Instant::now() + Duration::from_secs(60)
+            )
             .is_err());
     }
 
