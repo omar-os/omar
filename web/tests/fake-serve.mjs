@@ -45,6 +45,7 @@ const PROPOSED_PROGRAM = await readFile(
 export async function startFakeServe({
   stepMs = 120,
   liveChatReplayDelayMs = 0,
+  usageLimitMs = 0,
   host = "127.0.0.1",
   port = 0,
   /** Which captured topology to replay; see tests/fixtures. */
@@ -1089,6 +1090,16 @@ export async function startFakeServe({
       reaction.invocation_id = `inv-${index}`;
       publish(entry, "reaction_started", { reaction: reaction.id }, tag);
       await wait();
+
+      if (usageLimitMs && index === 0) {
+        const attempt = { attempt_id: "usage-wait", retry: 0, outcome: "open", invocations: [{ reaction: reaction.name, invocation_id: reaction.invocation_id }], usage_waits: [{ reaction: reaction.name, task_id: reaction.invocation_id, started_at: new Date().toISOString(), resets_at: Math.ceil((Date.now() + usageLimitMs) / 1000) }] };
+        const agent = entry.snapshot.agents.find((item) => item.id === reaction.agent);
+        agent.attempts = [attempt];
+        publish(entry, "agent_attempt", { agent: reaction.agent, attempt }, tag);
+        await new Promise((resolve) => setTimeout(resolve, usageLimitMs));
+        attempt.usage_waits[0].ended_at = new Date().toISOString();
+        publish(entry, "agent_attempt", { agent: reaction.agent, attempt }, tag);
+      }
 
       // A web-backed reaction parks until a client answers it, which is the
       // whole point of the backend. Driving straight past would let the run

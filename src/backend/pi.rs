@@ -14,6 +14,18 @@ use anyhow::{Context, Result};
 pub struct Pi;
 
 impl Backend for Pi {
+    fn usage_limit(
+        &self,
+        target: &Target<'_>,
+        _hook_file: &std::path::Path,
+    ) -> Option<(String, super::UsageLimit)> {
+        let socket = target.stamp?.strip_prefix("pi:")?;
+        let value = request(socket, serde_json::json!({"turn": true})).ok()?;
+        Some((
+            value["limit_id"].as_str()?.into(),
+            super::UsageLimit::from_error(&value["error"])?,
+        ))
+    }
     fn ended_turn(&self, target: &Target<'_>, _hook_file: &std::path::Path) -> Option<String> {
         let socket = target.stamp?.strip_prefix("pi:")?;
         request(socket, serde_json::json!({"turn": true})).ok()?["ended"]

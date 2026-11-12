@@ -28,6 +28,8 @@ pub(crate) mod opencode;
 pub(crate) mod pi;
 pub(crate) mod spool;
 pub(crate) mod stub;
+pub(crate) mod usage;
+pub use usage::UsageLimit;
 
 /// How long to wait on a socket that has accepted the connection but is not
 /// reading. A timeout reports failure; it never enables terminal-input delivery.
@@ -249,9 +251,26 @@ pub struct TopologyInvocation<'a> {
 
 pub(crate) trait TurnMonitor: Send {
     fn ended_turn(&mut self) -> Option<String>;
+    fn usage_limit(&mut self) -> Option<UsageLimit> {
+        None
+    }
 }
 
 pub trait Backend: Send + Sync {
+    /// Latest native error, with an identity so a stale notice cannot re-enter a wait.
+    fn usage_limit(&self, target: &Target<'_>, hook_file: &Path) -> Option<(String, UsageLimit)> {
+        let value: Value = if let Some(socket) = target.stamp.and_then(managed::from_stamp) {
+            let path = std::fs::read_to_string(socket.parent()?.join("inbox-path")).ok()?;
+            serde_json::from_slice(&std::fs::read(path).ok()?).ok()?
+        } else {
+            serde_json::from_slice(&std::fs::read(hook_file).ok()?).ok()?
+        };
+        Some((
+            value.to_string(),
+            serde_json::from_value(value["usage_limit"].clone()).ok()?,
+        ))
+    }
+
     fn turn_monitor(&self, _target: &Target<'_>) -> Option<Box<dyn TurnMonitor>> {
         None
     }

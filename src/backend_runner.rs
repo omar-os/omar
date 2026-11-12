@@ -32,6 +32,8 @@ struct Inbox {
     pending: VecDeque<Message>,
     #[serde(default)]
     completed: Option<String>,
+    #[serde(default)]
+    usage_limit: Option<crate::backend::UsageLimit>,
 }
 struct Queue {
     path: PathBuf,
@@ -63,6 +65,7 @@ impl Queue {
             }
         }
         let id = uuid::Uuid::new_v4().to_string();
+        state.usage_limit = None;
         state.pending.push_back(Message {
             id: id.clone(),
             text,
@@ -142,6 +145,9 @@ impl Engine {
             let msg = self.next().await?;
             if msg["id"] == id && msg.get("method").is_none() {
                 if let Some(error) = msg.get("error") {
+                    if let Some(limit) = crate::backend::UsageLimit::from_error(error) {
+                        return Err(limit.into());
+                    }
                     bail!("{method}: {error}");
                 }
                 return Ok(msg["result"].clone());
@@ -253,7 +259,12 @@ async fn codex_turn(
                 }
             }
             Some("turn.completed") => completed = true,
-            Some("turn.failed" | "error") => bail!("Codex exec turn failed: {event}"),
+            Some("turn.failed" | "error") => {
+                if let Some(limit) = crate::backend::UsageLimit::from_error(&event) {
+                    return Err(limit.into());
+                }
+                bail!("Codex exec turn failed: {event}")
+            }
             _ => {}
         }
     }
@@ -427,6 +438,7 @@ pub async fn run(path: &Path) -> Result<()> {
             // Queued events may contain an older ownership snapshot. Finish with
             // the state read immediately before this native turn.
             let prompt = format!("{instructions}\n\n[{origin}; message {}]\n{}\n\n{live}", message.id, message.text);
+            let turn_result: Result<()> = async {
             if config.backend == "codex" {
                 codex_turn(&config, &context, &queue, &prompt).await?;
             } else if acp {
@@ -453,8 +465,18 @@ pub async fn run(path: &Path) -> Result<()> {
                     }
                 }
             }
+            Ok(())
+            }.await;
+            let limit = match turn_result {
+                Ok(()) => None,
+                Err(error) => match error.downcast::<crate::backend::UsageLimit>() {
+                    Ok(limit) => Some(limit),
+                    Err(error) => return Err(error),
+                },
+            };
             println!("\n[OMAR turn complete: {}]", message.id);
             let mut state = queue.state.lock().await;
+            state.usage_limit = limit;
             state.pending.pop_front();
             state.completed = Some(message.id);
             save(&queue.path, &state)?;

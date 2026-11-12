@@ -15,7 +15,12 @@ export default function omarPiExtension(pi, { createClient = () => new OmarMcpCl
   let client;
   let closeDelivery;
   const turn = { idle: false };
-  pi.on("agent_start", async () => { turn.idle = false; });
+  pi.on("agent_start", async () => { turn.idle = false; turn.error = undefined; });
+  pi.on("message_end", async (event) => {
+    if (event.message?.role === "assistant" && event.message.stopReason === "error") {
+      turn.error = event.message.errorMessage; turn.limitId = randomUUID();
+    }
+  });
   pi.on("agent_end", async () => { turn.id = randomUUID(); turn.idle = true; });
 
   const discover = async (ctx) => {

@@ -20,6 +20,10 @@ export function restartRows(attempts: Record<string, unknown>[], reaction: strin
     if (reminded) {
       parts.push("reminded to finish");
     }
+    const waits = item.usage_waits as { reaction: string; resets_at?: number; ended_at?: string }[] | undefined;
+    const waiting = waits?.findLast((wait) => wait.reaction === reaction && !wait.ended_at);
+    if (waiting) parts.push(usageWaitText(waiting));
+    else if (waits?.length) parts.push("waited for usage limit");
     const reason = String(item.death_reason ?? "").replace(/^tmux pane exited or process tree gone.*$/, "worker process exited");
     const session = String(item.native_session_id ?? "");
     const timestamp = item.started_at ?? item.timestamp;
@@ -31,4 +35,13 @@ export function restartRows(attempts: Record<string, unknown>[], reaction: strin
       session, time: date && Number.isFinite(date.valueOf()) ? date.toISOString() : null,
     };
   });
+}
+
+export function usageWait(attempts: Record<string, unknown>[], reaction: string) {
+  const waits = attempts.flatMap((attempt) => (attempt.usage_waits as { reaction: string; resets_at?: number; ended_at?: string }[] | undefined) ?? []);
+  return waits.findLast((wait) => wait.reaction === reaction && !wait.ended_at);
+}
+
+export function usageWaitText(wait: { resets_at?: number }) {
+  return wait.resets_at ? `waiting for usage limit until ${new Date(wait.resets_at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })}` : "waiting for usage limit; checking periodically";
 }

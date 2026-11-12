@@ -20,7 +20,7 @@ export async function startDelivery(path, pi, ctx, turn = {}) {
       try {
         const message = JSON.parse(input.slice(0, input.indexOf("\n")));
         if (message.turn === true) {
-          socket.end(JSON.stringify({ ended: turn.idle ? turn.id : null }) + "\n");
+          socket.end(JSON.stringify({ ended: turn.idle && (ctx.isIdle?.() ?? true) ? turn.id : null, error: turn.error, limit_id: turn.limitId }) + "\n");
         } else if (message.session === true) {
           // The file `--session` reopens, and the id, which is all a
           // `--no-session` conversation has.

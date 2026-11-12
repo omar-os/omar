@@ -2409,6 +2409,7 @@ struct AgentReactionExecutor {
     team: String,
     registry: InvocationRegistry,
     timeout: Duration,
+    run_started: Instant,
     /// Agents on the `web` backend. Nothing was spawned for them, so there is
     /// no pane to deliver a prompt to — the registration is the work item, and
     /// a web client picks it up from there.
@@ -2426,6 +2427,44 @@ struct TaskTurnWatch {
     seen: Option<String>,
     idle: Option<(String, Instant)>,
     reminded: bool,
+    waiting: Option<UsageWait>,
+    limit_seen: Option<String>,
+    backoff: Option<Duration>,
+}
+
+struct UsageWait {
+    until: Instant,
+    backoff: Duration,
+    automatic: bool,
+}
+
+struct TaskClock {
+    started: Instant,
+    paused: Duration,
+    waiting: Option<Instant>,
+}
+impl TaskClock {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            paused: Duration::ZERO,
+            waiting: None,
+        }
+    }
+    fn elapsed(&self) -> Duration {
+        self.waiting
+            .unwrap_or_else(Instant::now)
+            .duration_since(self.started)
+            .saturating_sub(self.paused)
+    }
+    fn pause(&mut self) {
+        self.waiting.get_or_insert_with(Instant::now);
+    }
+    fn resume(&mut self) {
+        if let Some(since) = self.waiting.take() {
+            self.paused += since.elapsed();
+        }
+    }
 }
 
 impl TaskTurnWatch {
@@ -2489,7 +2528,7 @@ impl ReactionExecutor for AgentReactionExecutor {
             (Some(workers), Some(slot)) => Some(workers.admit(&invocation, slot)?),
             _ => None,
         };
-        let started = Instant::now();
+        let mut clock = TaskClock::new();
         let deadline = invocation.within.unwrap_or(self.timeout);
         let mut delivered = invocation.clone();
         for retries in 0..=MAX_TASK_RETRIES {
@@ -2508,7 +2547,7 @@ impl ReactionExecutor for AgentReactionExecutor {
                             &rendered,
                             completion,
                             Some(window),
-                            deadline.saturating_sub(started.elapsed()),
+                            (deadline, &mut clock),
                             retries,
                         )
                     })
@@ -2519,7 +2558,7 @@ impl ReactionExecutor for AgentReactionExecutor {
                         &rendered,
                         completion,
                         None,
-                        deadline.saturating_sub(started.elapsed()),
+                        (deadline, &mut clock),
                         retries,
                     )
                     .map(|(writes, _)| writes),
@@ -2535,7 +2574,7 @@ impl ReactionExecutor for AgentReactionExecutor {
                 return result;
             };
             retry_task(&invocation, retries, death)?;
-            if started.elapsed() >= deadline {
+            if clock.elapsed() >= deadline {
                 return expired(&invocation, deadline);
             }
             let workers = workers.context("dead worker has no launcher")?;
@@ -2571,13 +2610,15 @@ impl AgentReactionExecutor {
         rendered: &str,
         completion: mpsc::Receiver<BTreeMap<String, Value>>,
         mut window: Option<&mut Window>,
-        deadline: Duration,
+        budget: (Duration, &mut TaskClock),
         retries: u32,
     ) -> Result<(BTreeMap<String, Value>, bool)> {
-        let started = Instant::now();
+        let (deadline, clock) = budget;
         let mut turns = TaskTurnWatch::default();
         if !self.web.contains(&invocation.agent) {
             if let Some(window) = window.as_deref_mut() {
+                self.client
+                    .finish_backend_startup(&window.session, WORKER_START_TIMEOUT)?;
                 self.watch_worker(window, None)?;
                 turns.seen = window.ended_turn(&self.client);
             }
@@ -2608,27 +2649,58 @@ impl AgentReactionExecutor {
             }
         }
         loop {
-            let remaining = deadline.saturating_sub(started.elapsed());
+            anyhow::ensure!(
+                self.run_started.elapsed() < self.timeout,
+                "run-wide timeout exceeded while waiting for agent '{}': {}s",
+                invocation.agent,
+                self.timeout.as_secs()
+            );
+            let remaining = deadline.saturating_sub(clock.elapsed());
             match completion.recv_timeout(remaining.min(WORKER_POLL)) {
-                Ok(writes) => return Ok((writes, false)),
+                Ok(writes) => {
+                    if let Some(window) = window.as_deref_mut() {
+                        self.end_usage_wait(window, clock);
+                    }
+                    return Ok((writes, false));
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     bail!("topology invocation service stopped unexpectedly")
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if let Some(window) = window.as_deref_mut() {
-                let status = self.watch_worker(window, Some((invocation, &mut turns)));
+                let status = self.watch_worker(window, Some((invocation, &mut turns, clock)));
                 // Completion can race the process observation. A worker that
                 // completed before exiting has already answered this task.
                 if let Ok(writes) = completion.try_recv() {
+                    self.end_usage_wait(window, clock);
                     return Ok((writes, false));
                 }
                 status?;
             }
-            if started.elapsed() >= deadline {
+            if clock.elapsed() >= deadline {
                 return expired(invocation, invocation.within.unwrap_or(self.timeout))
                     .map(|writes| (writes, true));
             }
+        }
+    }
+
+    fn end_usage_wait(&self, window: &mut Window, clock: &mut TaskClock) {
+        clock.resume();
+        if let Some(wait) = window.record["usage_waits"]
+            .as_array_mut()
+            .and_then(|v| v.last_mut())
+            .filter(|v| v["ended_at"].is_null())
+        {
+            wait["ended_at"] = json!(chrono::Utc::now().to_rfc3339());
+            self.publish_wait(window);
+        }
+    }
+
+    fn publish_wait(&self, window: &Window) {
+        if let Some(workers) = &self.scoped {
+            workers.record(&window.record);
+            workers.publish(&window.agent, &window.record);
         }
     }
 
@@ -2636,39 +2708,114 @@ impl AgentReactionExecutor {
     fn watch_worker(
         &self,
         window: &mut Window,
-        task: Option<(&InvocationSpec, &mut TaskTurnWatch)>,
+        task: Option<(&InvocationSpec, &mut TaskTurnWatch, &mut TaskClock)>,
     ) -> Result<()> {
-        let tree = if self.client.has_session(&window.session)? {
-            self.client
-                .session_process_tree(&window.session)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        if tree.is_empty() {
-            anyhow::ensure!(
-                !self
-                    .scoped
-                    .as_ref()
-                    .is_some_and(|workers| workers.launcher.shutdown.load(Ordering::Acquire)),
-                "runtime is shutting down"
-            );
-            return Err(WorkerDied {
-                reason: "worker process exited".into(),
-                conversation: window.conversation.clone(),
+        // This decision precedes both process-death and stopped-turn recovery.
+        // A limited worker must never be interrupted, restarted, or reminded.
+        let ended = window.ended_turn(&self.client);
+        if let Some((invocation, turns, clock)) = task {
+            if !self.registry.answered(&invocation.id) {
+                if let Some((identity, limit)) = window.usage_limit(&self.client) {
+                    if turns.limit_seen.as_ref() != Some(&identity) {
+                        turns.limit_seen = Some(identity);
+                        if turns.waiting.is_none() {
+                            clock.pause();
+                            let backoff = turns.backoff.unwrap_or(Duration::from_secs(5));
+                            if limit.resets_at.is_none() {
+                                turns.backoff = Some((backoff * 2).min(Duration::from_secs(300)));
+                            }
+                            turns.waiting = Some(UsageWait {
+                                until: Instant::now() + limit.delay(backoff),
+                                backoff,
+                                automatic: window.record["backend"]
+                                    .as_str()
+                                    .and_then(crate::backend::by_name)
+                                    .is_some_and(|backend| {
+                                        backend.kind() == crate::backend::Kind::Claude
+                                    }),
+                            });
+                            let waits = window
+                                .record
+                                .as_object_mut()
+                                .unwrap()
+                                .entry("usage_waits")
+                                .or_insert_with(|| json!([]));
+                            waits.as_array_mut().unwrap().push(json!({
+                                "task_id": invocation.id, "reaction": invocation.reaction_id,
+                                "started_at": chrono::Utc::now().to_rfc3339(), "resets_at": limit.resets_at,
+                            }));
+                            self.publish_wait(window);
+                        }
+                    }
+                } else if turns.waiting.is_none() {
+                    turns.limit_seen = None;
+                }
+                if let Some(wait) = turns.waiting.as_mut() {
+                    turns.idle = None;
+                    if Instant::now() < wait.until {
+                        return Ok(());
+                    }
+                    if window.record["backend"]
+                        .as_str()
+                        .and_then(crate::backend::by_name)
+                        .is_some_and(|backend| {
+                            matches!(
+                                backend.kind(),
+                                crate::backend::Kind::Pi | crate::backend::Kind::Opencode
+                            )
+                        })
+                        && ended.is_none()
+                    {
+                        let status = self.watch_worker(window, None);
+                        if status.is_err() {
+                            self.end_usage_wait(window, clock);
+                        }
+                        status?;
+                        return Ok(());
+                    }
+                    let unknown = window.record["usage_waits"]
+                        .as_array()
+                        .and_then(|v| v.last())
+                        .is_some_and(|v| v["resets_at"].is_null());
+                    if wait.automatic && unknown {
+                        // Claude owns automatic continuation; never send keys or prompts.
+                        let screen = self
+                            .client
+                            .capture_pane_plain(&window.session, 0)
+                            .unwrap_or_default();
+                        if crate::backend::UsageLimit::from_error(&json!(screen)).is_some() {
+                            wait.backoff = (wait.backoff * 2).min(Duration::from_secs(300));
+                            wait.until = Instant::now() + wait.backoff;
+                            return Ok(());
+                        }
+                    } else if !wait.automatic {
+                        let message = format!("OMAR CONTINUE\ntask_id: {}\nThe usage limit may have reset. Continue the same task, set its required outputs, and call omar_complete with this task_id.", invocation.id);
+                        let delivery = self.client.deliver_prompt_until(
+                            &window.session,
+                            &message,
+                            &DeliveryOptions::default(),
+                            &|| self.registry.answered(&invocation.id),
+                        );
+                        if delivery.is_err() {
+                            self.end_usage_wait(window, clock);
+                            self.watch_worker(window, None)?;
+                        }
+                        delivery?;
+                    }
+                    turns.seen = ended.clone();
+                    turns.waiting = None;
+                    clock.resume();
+                    if let Some(wait) = window.record["usage_waits"]
+                        .as_array_mut()
+                        .and_then(|v| v.last_mut())
+                    {
+                        wait["ended_at"] = json!(chrono::Utc::now().to_rfc3339());
+                    }
+                    self.publish_wait(window);
+                    return Ok(());
+                }
             }
-            .into());
-        }
-        window.sessions.extend(crate::process::sessions(&tree));
-        window.tree.extend(tree);
-        window.tree.sort_unstable();
-        window.tree.dedup();
-        window.observe_conversation(&self.client);
-        if let Some((invocation, turns)) = task {
-            // Usage-limit waiting can veto recovery here alongside completion.
-            if !self.registry.answered(&invocation.id)
-                && turns.stopped(window.ended_turn(&self.client), Instant::now())
-            {
+            if !self.registry.answered(&invocation.id) && turns.stopped(ended, Instant::now()) {
                 if turns.reminded {
                     return Err(WorkerDied {
                         reason: "stopped without finishing after a reminder".into(),
@@ -2699,17 +2846,36 @@ impl AgentReactionExecutor {
                     .unwrap()
                     .entry("reminders")
                     .or_insert_with(|| json!([]));
-                reminders.as_array_mut().unwrap().push(json!({
-                    "task_id": invocation.id, "reaction": invocation.reaction_id,
-                    "invocation_id": logical_id,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                }));
-                if let Some(workers) = &self.scoped {
-                    workers.record(&window.record);
-                    workers.publish(&window.agent, &window.record);
-                }
+                reminders.as_array_mut().unwrap().push(json!({ "task_id": invocation.id, "reaction": invocation.reaction_id, "invocation_id": logical_id, "timestamp": chrono::Utc::now().to_rfc3339() }));
+                self.publish_wait(window);
             }
         }
+        let tree = if self.client.has_session(&window.session)? {
+            self.client
+                .session_process_tree(&window.session)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if tree.is_empty() {
+            anyhow::ensure!(
+                !self
+                    .scoped
+                    .as_ref()
+                    .is_some_and(|workers| workers.launcher.shutdown.load(Ordering::Acquire)),
+                "runtime is shutting down"
+            );
+            return Err(WorkerDied {
+                reason: "worker process exited".into(),
+                conversation: window.conversation.clone(),
+            }
+            .into());
+        }
+        window.sessions.extend(crate::process::sessions(&tree));
+        window.tree.extend(tree);
+        window.tree.sort_unstable();
+        window.tree.dedup();
+        window.observe_conversation(&self.client);
         Ok(())
     }
 }
@@ -2796,6 +2962,41 @@ struct Window {
 }
 
 impl Window {
+    fn usage_limit(&mut self, client: &TmuxClient) -> Option<(String, crate::backend::UsageLimit)> {
+        if let Some(limit) = self
+            .turn_monitor
+            .as_mut()
+            .and_then(|monitor| monitor.usage_limit())
+        {
+            return Some((Uuid::new_v4().to_string(), limit));
+        }
+        let backend = crate::backend::by_name(self.record["backend"].as_str()?)?;
+        if backend.kind() == crate::backend::Kind::Claude {
+            let screen = client
+                .capture_pane_plain(&self.session, 0)
+                .ok()?
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            // Read only the live screen, never old scrollback.
+            if !screen.contains("Continuing automatically") {
+                return None;
+            }
+            let limit = crate::backend::UsageLimit::from_error(&json!(screen))?;
+            // Progress below a stale notice must not start the same wait again.
+            return Some((format!("claude:{:?}", limit.resets_at), limit));
+        }
+        let stamp = client.session_delivery(&self.session);
+        backend.usage_limit(
+            &crate::backend::Target {
+                name: &self.session,
+                pane_pid: client.get_pane_pid(&self.session).ok()?,
+                stamp: stamp.as_deref(),
+            },
+            &self.turn_file,
+        )
+    }
+
     fn ended_turn(&mut self, client: &TmuxClient) -> Option<String> {
         let backend = crate::backend::by_name(self.record["backend"].as_str()?)?;
         let stamp = client.session_delivery(&self.session);
@@ -3343,6 +3544,13 @@ impl ScopedWorkers {
         if window.record["outcome"] != "died" {
             window.record["outcome"] = json!(if window.failed { "failed" } else { "completed" });
         }
+        if let Some(wait) = window.record["usage_waits"]
+            .as_array_mut()
+            .and_then(|v| v.last_mut())
+            .filter(|v| v["ended_at"].is_null())
+        {
+            wait["ended_at"] = json!(chrono::Utc::now().to_rfc3339());
+        }
         window.record["cleanup_status"] = json!(if stopped.is_ok() {
             "stopped"
         } else {
@@ -3528,6 +3736,7 @@ fn unscoped_without_restart(record: &Value) -> bool {
         && record["retry"] == 0
         && record["outcome"] != "died"
         && record["reminders"].as_array().is_none_or(Vec::is_empty)
+        && record["usage_waits"].as_array().is_none_or(Vec::is_empty)
 }
 
 /// Every conversation an attempt recorded in `log`, in this run or an earlier
@@ -3617,6 +3826,7 @@ struct DispatchExecutor<'a, E: ReactionExecutor> {
     code: Option<crate::reaction::Reactions>,
     /// The run-wide timeout, which bounds a body that set no deadline.
     timeout: Duration,
+    run_started: Instant,
     agents: E,
     workspace_dirs: BTreeMap<String, (PathBuf, PathBuf)>,
 }
@@ -3631,8 +3841,9 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
             .filter(|backend| backend.topology_only())
         {
             let rendered = render_prompt(&invocation.prompt, &prompt_values(&invocation))?;
-            let started = Instant::now();
+            let mut clock = TaskClock::new();
             let budget = invocation.within.unwrap_or(self.timeout);
+            let mut backoff = Duration::from_secs(5);
             let mut writes = None;
             for retries in 0..=MAX_TASK_RETRIES {
                 let mut attempt = json!({
@@ -3641,13 +3852,64 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
                     "conversation_mode": "fresh HTTP invocation",
                 });
                 self.agents.record_attempt(&invocation, attempt.clone());
-                match backend.invoke_topology(&crate::backend::TopologyInvocation {
-                    effects: &invocation.allowed_effects,
-                    triggers: &invocation.trigger_values,
-                    instructions: &rendered,
-                    timeout: budget.saturating_sub(started.elapsed()),
-                    retries,
-                }) {
+                let result = loop {
+                    anyhow::ensure!(
+                        self.run_started.elapsed() < self.timeout,
+                        "run-wide timeout exceeded while waiting for usage limit"
+                    );
+                    let result = backend.invoke_topology(&crate::backend::TopologyInvocation {
+                        effects: &invocation.allowed_effects,
+                        triggers: &invocation.trigger_values,
+                        instructions: &rendered,
+                        timeout: budget
+                            .saturating_sub(clock.elapsed())
+                            .min(self.timeout.saturating_sub(self.run_started.elapsed())),
+                        retries,
+                    });
+                    let limit = result
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.downcast_ref::<crate::backend::UsageLimit>());
+                    let Some(limit) = limit else {
+                        break result;
+                    };
+                    clock.pause();
+                    let wait = json!({ "task_id": invocation.id, "reaction": invocation.reaction_id, "started_at": chrono::Utc::now().to_rfc3339(), "resets_at": limit.resets_at });
+                    attempt
+                        .as_object_mut()
+                        .unwrap()
+                        .entry("usage_waits")
+                        .or_insert_with(|| json!([]))
+                        .as_array_mut()
+                        .unwrap()
+                        .push(wait);
+                    self.agents.record_attempt(&invocation, attempt.clone());
+                    let until = Instant::now() + limit.delay(backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(300));
+                    while Instant::now() < until {
+                        if self.run_started.elapsed() >= self.timeout {
+                            attempt["usage_waits"]
+                                .as_array_mut()
+                                .unwrap()
+                                .last_mut()
+                                .unwrap()["ended_at"] = json!(chrono::Utc::now().to_rfc3339());
+                            attempt["outcome"] = json!("failed");
+                            self.agents.record_attempt(&invocation, attempt.clone());
+                            bail!("run-wide timeout exceeded while waiting for usage limit");
+                        }
+                        thread::sleep(
+                            WORKER_POLL.min(until.saturating_duration_since(Instant::now())),
+                        );
+                    }
+                    clock.resume();
+                    attempt["usage_waits"]
+                        .as_array_mut()
+                        .unwrap()
+                        .last_mut()
+                        .unwrap()["ended_at"] = json!(chrono::Utc::now().to_rfc3339());
+                    self.agents.record_attempt(&invocation, attempt.clone());
+                };
+                match result {
                     Ok(answer) => {
                         attempt["outcome"] = json!("completed");
                         self.agents.record_attempt(&invocation, attempt);
@@ -3659,8 +3921,7 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
                         attempt["outcome"] = json!(if retryable { "died" } else { "failed" });
                         attempt["death_reason"] = json!(error.to_string());
                         self.agents.record_attempt(&invocation, attempt);
-                        if !retryable || retries == MAX_TASK_RETRIES || started.elapsed() >= budget
-                        {
+                        if !retryable || retries == MAX_TASK_RETRIES || clock.elapsed() >= budget {
                             return Err(error.context(format!(
                                 "agent '{}' task {} ({}): HTTP invocation failed after {retries} retries",
                                 invocation.agent, invocation.id, invocation.reaction_id
@@ -4432,11 +4693,13 @@ fn launch(
         state: &state,
         code: reactions,
         timeout: config.timeout,
+        run_started: Instant::now(),
         agents: AgentReactionExecutor {
             client,
             team: state.team.clone(),
             registry: invocation_server.registry.clone(),
             timeout: config.timeout,
+            run_started: Instant::now(),
             web,
             scoped: ScopedWorkers::new(
                 &state,
@@ -7394,6 +7657,18 @@ mod tests {
     }
 
     #[test]
+    fn usage_waits_pause_only_the_task_clock() {
+        let mut clock = TaskClock::new();
+        clock.started -= Duration::from_secs(20);
+        clock.waiting = Some(clock.started + Duration::from_secs(3));
+        assert_eq!(clock.elapsed(), Duration::from_secs(3));
+        let wall_elapsed = clock.started.elapsed();
+        clock.resume();
+        assert!(clock.elapsed() < Duration::from_secs(4));
+        assert!(wall_elapsed >= Duration::from_secs(20));
+    }
+
+    #[test]
     fn silence_completes_the_tag_when_the_contract_permits_it() {
         let spec = deadline_spec("memo ?", Some(1));
         assert_eq!(
@@ -7639,6 +7914,7 @@ mod tests {
             team: state.team.clone(),
             registry: server.registry.clone(),
             timeout: Duration::from_secs(10),
+            run_started: Instant::now(),
             web: BTreeSet::from(["panel".to_string()]),
             scoped: None,
         };
@@ -10509,6 +10785,7 @@ mod tests {
                 state: &state,
                 code: Some(code),
                 timeout: Duration::from_secs(30),
+                run_started: Instant::now(),
                 agents: Unused,
             };
             run_event_loop(&state, BTreeMap::new(), &executor)
@@ -10658,6 +10935,7 @@ mod tests {
             state: &state,
             code: Some(code),
             timeout: Duration::from_secs(30),
+            run_started: Instant::now(),
             agents: Unused,
         }
         .invoke(spec);
@@ -10701,6 +10979,7 @@ mod tests {
                 state: &state,
                 code: Some(code),
                 timeout: Duration::from_secs(30),
+                run_started: Instant::now(),
                 agents: Unused,
             }
             .invoke(spec)
@@ -11202,6 +11481,7 @@ mod tests {
             team: "test".into(),
             registry: InvocationRegistry::default(),
             timeout: Duration::from_secs(60),
+            run_started: Instant::now(),
             web: BTreeSet::new(),
             scoped: None,
         };

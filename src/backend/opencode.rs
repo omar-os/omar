@@ -15,6 +15,21 @@ use std::time::Duration;
 pub struct Opencode;
 
 impl Backend for Opencode {
+    fn usage_limit(
+        &self,
+        target: &super::Target<'_>,
+        hook_file: &std::path::Path,
+    ) -> Option<(String, super::UsageLimit)> {
+        let (_, session) = from_stamp(target.stamp?)?;
+        let value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(hook_file.with_extension(format!("{session}.json"))).ok()?,
+        )
+        .ok()?;
+        Some((
+            value.to_string(),
+            serde_json::from_value(value["usage_limit"].clone()).ok()?,
+        ))
+    }
     fn ended_turn(
         &self,
         target: &super::Target<'_>,

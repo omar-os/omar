@@ -3344,3 +3344,20 @@ test("a design's safety properties show their Lean proofs and single out what th
   expect(workspace.properties[0].source).toContain("def topology : Omar.Reactor.Topology");
   await opened.close();
 });
+
+
+test("a usage limit appears on the card and inspector until reset", async ({ page }) => {
+  await fake.close();
+  fake = (await startFakeServe({ stepMs: 120, port: FAKE_SERVE_PORT, usageLimitMs: 6000 })) as FakeServe;
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+  const badge = page.locator(".omar-restart-badge");
+  await expect(badge).toHaveText("usage limit");
+  const card = page.locator(".omar-reaction").filter({ has: badge });
+  await expect(card.locator(".omar-reaction-description")).toHaveText(/^waiting for usage limit until \d\d:\d\d$/);
+  await card.press("Enter");
+  await expect(page.getByRole("status").filter({ hasText: "waiting for usage limit until" })).toBeVisible();
+  await expect(badge).toHaveCount(0, { timeout: 15000 });
+  await expect(page.locator(".step-attempts")).toContainText("waited for usage limit");
+});

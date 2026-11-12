@@ -37,6 +37,7 @@ struct Failure {
     kind: &'static str,
     message: &'static str,
     http_status: Option<u16>,
+    resets_at: Option<i64>,
 }
 
 impl Failure {
@@ -45,6 +46,7 @@ impl Failure {
             kind,
             message,
             http_status: None,
+            resets_at: None,
         }
     }
     fn evidence(&self) -> Value {
@@ -164,6 +166,12 @@ fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>
     });
     let (choice, mut response) = match result {
         Ok(answer) => answer,
+        Err(error) if error.kind == "rate_limit" => {
+            return Err(super::UsageLimit {
+                resets_at: error.resets_at,
+            }
+            .into())
+        }
         Err(error)
             if *retries < crate::topology::MAX_TASK_RETRIES
                 && matches!(error.kind, "transport" | "service") =>
@@ -217,6 +225,7 @@ fn evaluate(request: &Value, timeout: Duration) -> std::result::Result<Value, Fa
             "5",
             "--max-time",
             &budget.as_secs_f64().to_string(),
+            "--include",
             "--write-out",
             "\n%{http_code}",
             "--config",
@@ -320,6 +329,14 @@ fn decode_http(bytes: &[u8]) -> std::result::Result<Value, Failure> {
         .ok()
         .and_then(|text| text.parse().ok())
         .ok_or_else(|| Failure::new("transport", "HTTP status was not reported"))?;
+    let response = &bytes[..split];
+    let (headers, body) = if response.starts_with(b"HTTP/") {
+        let text = std::str::from_utf8(response).unwrap_or("");
+        text.rsplit_once("\r\n\r\n")
+            .map_or(("", response), |(headers, body)| (headers, body.as_bytes()))
+    } else {
+        ("", response)
+    };
     if !(200..300).contains(&status) {
         let (kind, message) = match status {
             401 | 403 => ("authentication", "Jev rejected the API credentials"),
@@ -331,9 +348,17 @@ fn decode_http(bytes: &[u8]) -> std::result::Result<Value, Failure> {
             kind,
             message,
             http_status: Some(status),
+            resets_at: headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .and_then(|(_, value)| {
+                    super::UsageLimit::from_error(&json!({"status":429,"retry-after":value.trim()}))
+                })
+                .and_then(|limit| limit.resets_at),
         });
     }
-    serde_json::from_slice(&bytes[..split])
+    serde_json::from_slice(body)
         .map_err(|_| Failure::new("invalid_response", "Jev response is not valid JSON"))
 }
 

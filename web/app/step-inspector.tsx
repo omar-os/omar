@@ -6,7 +6,7 @@ import type { DiagramSnapshot } from "./lib/protocol";
 import { formatDuration, lifetimeLabel } from "./lib/protocol";
 import { componentName } from "./diagram/diagram-canvas";
 import { WorkflowIcon } from "./workflow-icon";
-import { restartRows, restartText } from "./lib/attempts";
+import { restartRows, restartText, usageWait, usageWaitText } from "./lib/attempts";
 
 /** Details come from the compiled topology, never from prototype sample data. */
 export function StepInspector({ component, snapshot, source, editable, readOnly = false, onApply, onClose, onEdit, onAsk }: {
@@ -28,6 +28,7 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
   const attempts = agent?.attempts ?? [];
   const configuration = useMemo(() => reaction ? locateStep(source, snapshot, reaction) : null, [source, snapshot, reaction]);
   const attemptRows = agent && reaction ? restartRows(attempts, reaction.name) : [];
+  const waiting = reaction ? usageWait(attempts, reaction.name) : undefined;
   const reminded = attemptRows.some((attempt) => attempt.reminded);
   const name = reaction ? (/(?:^|\.)reaction\.\d+$/.test(reaction.name) ? agent?.name ?? reaction.name : reaction.name) : port?.name ?? timer?.name ?? component;
   const label = (id: string) => snapshot.ports.find((item) => item.id === id)?.name ?? (snapshot.timers ?? []).find((item) => item.id === id)?.name ?? componentName(id);
@@ -47,7 +48,8 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
         <div className="inspector-field"><span>Receives</span>{connectionNames(reaction.triggers)}</div>
         <div className="inspector-field"><span>Produces</span>{connectionNames(reaction.effects)}</div>
         </> : null}
-        {agent && (agent.lifetime || attempts.length > 0) ? <div className="inspector-field"><span>Conversation</span><strong>{agent.lifetime ? `New ${lifetimeLabel(agent.lifetime)}` : "Run conversation"}</strong>{reaction.restarts || reminded ? <>
+        {waiting ? <p role="status" className="step-restart-heading">{usageWaitText(waiting)}</p> : null}
+        {agent && (agent.lifetime || attempts.length > 0) ? <div className="inspector-field"><span>Conversation</span><strong>{agent.lifetime ? `New ${lifetimeLabel(agent.lifetime)}` : "Run conversation"}</strong>{reaction.restarts || reminded || waiting || attemptRows.some((row) => row.summary.includes("usage limit")) ? <>
           {reaction.restarts ? <strong className="step-restart-heading">{restartText(reaction.restarts).headline}</strong> : null}
           <ol className="step-attempts">{attemptRows.map((attempt) => <li key={attempt.id} title={`Attempt ${attempt.id}`}>
             <p>{attempt.summary}</p>

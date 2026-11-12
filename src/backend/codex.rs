@@ -20,13 +20,23 @@ impl Backend for Codex {
     fn turn_monitor(&self, target: &super::Target<'_>) -> Option<Box<dyn super::TurnMonitor>> {
         let mut session = CodexSession::open(&from_stamp(target.stamp?)?).ok()?;
         let thread = session.only_thread().ok()?;
-        let state = session
-            .call(
-                // Resume subscribes this connection to the loaded thread's events.
-                "thread/resume",
-                serde_json::json!({"threadId":thread}),
-            )
-            .ok()?;
+        // Metadata-only resume subscribes before composing history cursors.
+        // Codex 0.154/0.167 can reject that final cursor on a new local thread;
+        // the subscription is already live, so keep this connection in that case.
+        let state = match session.call(
+            "thread/resume",
+            serde_json::json!({"threadId":thread, "excludeTurns":true}),
+        ) {
+            Ok(state) => state,
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("list_turns is not supported yet") =>
+            {
+                serde_json::json!({})
+            }
+            Err(_) => return None,
+        };
         let ended = completed_turn(&state);
         session
             .socket
@@ -37,6 +47,8 @@ impl Backend for Codex {
             session,
             thread,
             ended,
+            limit: None,
+            reset: None,
         }))
     }
     fn ended_turn(&self, target: &super::Target<'_>, _hook_file: &Path) -> Option<String> {
@@ -648,9 +660,14 @@ struct CodexTurnMonitor {
     session: CodexSession,
     thread: String,
     ended: Option<String>,
+    limit: Option<super::UsageLimit>,
+    reset: Option<i64>,
 }
 
 impl super::TurnMonitor for CodexTurnMonitor {
+    fn usage_limit(&mut self) -> Option<super::UsageLimit> {
+        self.limit.take()
+    }
     fn ended_turn(&mut self) -> Option<String> {
         loop {
             match self.session.socket.read() {
@@ -658,13 +675,41 @@ impl super::TurnMonitor for CodexTurnMonitor {
                     let Ok(event) = serde_json::from_str::<serde_json::Value>(&body) else {
                         continue;
                     };
+                    if event["method"] == "account/rateLimits/updated" {
+                        let limits = &event["params"]["rateLimits"];
+                        self.reset = ["primary", "secondary"]
+                            .iter()
+                            .filter_map(|key| {
+                                let window = &limits[key];
+                                (window["usedPercent"].as_f64()? >= 100.0)
+                                    .then(|| window["resetsAt"].as_i64())
+                                    .flatten()
+                            })
+                            .max();
+                    }
                     if event["params"]["threadId"] != self.thread {
                         continue;
+                    }
+                    if matches!(event["method"].as_str(), Some("error" | "turn/completed")) {
+                        let error = if event["method"] == "error" {
+                            &event["params"]["error"]
+                        } else {
+                            &event["params"]["turn"]["error"]
+                        };
+                        if let Some(mut limit) = super::UsageLimit::from_error(error) {
+                            // App-server versions that expose only the formatted error
+                            // retain the precise reset in their rate-limit notification.
+                            limit.resets_at = self.reset.or(limit.resets_at);
+                            self.limit = Some(limit);
+                        }
                     }
                     match event["method"].as_str() {
                         Some("turn/started") => self.ended = None,
                         Some("turn/completed")
-                            if event["params"]["turn"]["status"] == "completed" =>
+                            if matches!(
+                                event["params"]["turn"]["status"].as_str(),
+                                Some("completed" | "failed")
+                            ) =>
                         {
                             self.ended = event["params"]["turn"]["id"].as_str().map(str::to_owned);
                         }
