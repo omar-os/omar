@@ -237,7 +237,7 @@ export function Timeline({
                   <span className="timeline-preview-note">
                     A resume continues from here.
                   </span>
-                ) : (
+                ) : onRollBack ? (
                   <>
                     <button
                       type="button"
@@ -248,7 +248,7 @@ export function Timeline({
                           ? "Moves the resume point here; later checkpoints stay on disk and external effects are not undone"
                           : rollBackHint
                       }
-                      onClick={() => onRollBack?.(detail.id)}
+                      onClick={() => onRollBack(detail.id)}
                     >
                       Roll back to this checkpoint
                     </button>
@@ -256,7 +256,7 @@ export function Timeline({
                       <span className="timeline-preview-note">{rollBackHint}</span>
                     ) : null}
                   </>
-                )}
+                ) : null}
               </div>
             </>
           ) : (

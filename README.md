@@ -84,7 +84,7 @@ cd omar && make install
 #### Step 1: Launch Mission Control
 
 ```bash
-$ omar up --name dev
+$ omar up -s dev
 $ omar attach -s dev --web
 ```
 
@@ -110,7 +110,9 @@ This example requires both Claude Code and Codex to be installed and configured.
 
 | Command | What it does |
 |---------|--------------|
-| `omar up --name dev` | Start a background session, or restart the stopped session named `dev`. |
+| `omar up -s dev` | Start a background session, or restart the stopped session named `dev`. |
+| `omar up --port 34223` | Pick the session's port. Always on 127.0.0.1; reach it remotely through an SSH tunnel. Kept across restarts. |
+| `omar up --view-address 0.0.0.0:8080` | Also serve a read-only Mission Control: conversations, live diagram, terminals; no writes, no credential. IP picks who can watch: `127.0.0.1` this machine, one of its IPs (e.g. `10.0.1.5`) whoever reaches that IP, `0.0.0.0` every interface. |
 | `omar attach -s dev --web` | Open Mission Control for that session. Use `--tui` for the terminal UI. |
 | `omar down -s dev` | Stop the session and keep its state. |
 | `omar rm -s dev` | Remove the session and its state, stopping it first if running. |
@@ -130,6 +132,9 @@ $ omar up --tui
 
 Or attach to a running session with `omar attach -s <session> --tui`. `z`
 detaches and the runtime keeps every workload running; `Q` stops the session.
+`D` asks for confirmation, then deletes the selected EA and its agents. The
+runtime and other EAs keep running; the final EA cannot be deleted. Detach
+terminals attached to that EA's agents before confirming deletion.
 
 Go [here](#supported-agent-backends) to see how to launch with specific agent backends.
 
@@ -250,7 +255,7 @@ harness tests hidden input, permissions, cancellation and logout with fake token
 | [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy up` |
 | [Pi](https://pi.dev) | `omar -a pi up` |
 
-Each `omar -a <backend> up` starts a new independent session. Add `--name dev`
+Each `omar -a <backend> up` starts a new independent session. Add `-s dev`
 to name it, and `--web` or `--tui` to open a client immediately.
 
 ## License

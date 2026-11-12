@@ -920,7 +920,7 @@ impl App {
             self.scheduler
                 .cancel_by_receiver_and_ea(&short_name, self.active_ea);
 
-            self.client.kill_session(&name)?;
+            crate::backend::kill_worker(&self.client, &name, false)?;
             memory::remove_agent_parent_in(&state_dir, &name);
             self.status_message = Some(format!("Killed agent: {}", name));
             self.refresh()?;
@@ -1282,11 +1282,32 @@ impl App {
     /// Delete the specified EA: kill all its tmux sessions, remove state, unregister.
     /// Blocked if it is the last EA. Switches to the lowest remaining EA when active.
     pub fn delete_ea(&mut self, ea_id: EaId) -> Result<()> {
-        if self.session.is_some() {
-            // The daemon holds this EA's context and runs; deleting it
-            // underneath the daemon would corrupt them.
-            self.set_status("EA deletion is not available while attached; the runtime owns EAs");
+        if let Some(session) = self.session.as_ref() {
+            let session_name = session.name.clone();
+            let value = crate::sessions::rpc(
+                session,
+                serde_json::json!({"op":"delete_ea", "ea":ea_id.to_string()}),
+                std::time::Duration::from_secs(90),
+            );
             self.pending_confirm = None;
+            self.registered_eas = ea::load_registry(&self.omar_dir);
+            if !self.registered_eas.iter().any(|ea| ea.id == self.active_ea) {
+                let survivor = self
+                    .registered_eas
+                    .iter()
+                    .map(|ea| ea.id)
+                    .min()
+                    .ok_or_else(|| anyhow::anyhow!("runtime deleted the final EA"))?;
+                self.switch_ea(survivor)?;
+            }
+            let value = value.map_err(|error| {
+                anyhow::anyhow!(
+                "EA deletion incomplete: {error:#}. Inspect omar logs -s {session_name}; retry D if this EA is still listed, or restart the session to finish cleanup.")
+            })?;
+            self.set_status(format!(
+                "Deleted EA {} ({} agents, {} events)",
+                ea_id, value["agents_killed"], value["events_cancelled"]
+            ));
             return Ok(());
         }
         if self.registered_eas.len() <= 1 {
@@ -1328,7 +1349,11 @@ impl App {
 
         // Transactional delete: cleanup must succeed before registry mutation.
         for session_name in &sessions_to_delete {
-            ea_client.kill_session(session_name)?;
+            if *session_name == manager_session {
+                ea_client.kill_session(session_name)?;
+            } else {
+                crate::backend::kill_worker(&ea_client, session_name, false)?;
+            }
         }
 
         // Remove state directory

@@ -24,7 +24,7 @@ const bytecode = {version:1, team:'Artifacts', instructions:[
 await writeFile(compiler, `#!${process.execPath}\nrequire('fs').writeFileSync(process.argv.at(-1), ${JSON.stringify(JSON.stringify(bytecode))});\n`, {mode:0o700});
 const program = join(root,'artifacts.omar'); await writeFile(program,'// Compiler fixture\n');
 const env = {...process.env,HOME:home,OMARC_BIN:compiler,CARGO_HOME:process.env.CARGO_HOME||join(homedir(),'.cargo'),RUSTUP_HOME:process.env.RUSTUP_HOME||join(homedir(),'.rustup')};
-const runtime = spawn(binary,['serve','--name','editor-smoke','--address','127.0.0.1:0','--no-ea'],{cwd:source,env});
+const runtime = spawn(binary,['serve','-s','editor-smoke','--port','0','--no-ea'],{cwd:source,env});
 let logs='',base;
 runtime.stdout.on('data',c=>{logs+=c;base=/URL:\s+(http:\/\/[^\s]+)/.exec(logs)?.[1];});
 runtime.stderr.on('data',c=>{logs+=c;});
@@ -53,7 +53,13 @@ try {
   const context=await browser.newContext({viewport:{width:1440,height:1000}});
   context.setDefaultTimeout(30000);
   console.log('Runtime:',base);
-  const page=await context.newPage();await page.goto(base);
+  const page=await context.newPage();
+  await page.goto(base);
+  // With no agent CLI connected, Mission Control opens on the Backends page
+  // once status answers (each probe is capped at 5 s); it covers the page
+  // until closed.
+  const backends=page.getByRole('dialog',{name:'Backends'});
+  if(await backends.waitFor({timeout:15000}).then(()=>true,()=>false)) await backends.getByRole('button',{name:'Close',exact:true}).click();
   await page.getByRole('button',{name:'Files & versions',exact:true}).click();
   await page.getByRole('button',{name:'· report.md',exact:true}).click();
   await page.getByLabel('File preview').getByText('Created by the topology.',{exact:false}).waitFor();

@@ -28,6 +28,10 @@ cd lang
 lake exe omarc ../tests/topology/src/HR.omar /tmp/HR.bytecode.json
 # mutation plan: the diff that turns old into new, as bytecode
 lake exe omarc --diff old.omar new.omar /tmp/diff.json
+# the program's model for proofs, and Lean's verdict on properties of it
+lake exe omarc --lean ../tests/verification/Desk.omar /tmp/Desk.lean
+lake exe omarc --prove ../tests/verification/Desk.omar \
+  ../tests/verification/desk-properties.json /tmp/verdicts.json
 ```
 
 The runtime starts topology-scoped agents, delivers enabled prompts at each
@@ -40,7 +44,7 @@ logical tag, waits at the global tag barrier, and prints the final outputs.
 programs arrive. `omar serve` outlives individual runs and admits them:
 
 ```sh
-omar serve --address 127.0.0.1:7340
+omar serve --port 7340
 ```
 
 ```

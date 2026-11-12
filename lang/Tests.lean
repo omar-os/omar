@@ -1,5 +1,8 @@
 import Omar.Compiler
 import Omar.Mutation
+import Omar.Prove
+-- Not used here, but every property file imports it, so it must be built.
+import Omar.Verify
 
 open Lean
 open Omar
@@ -307,6 +310,12 @@ def testDelayUnits : IO Unit := do
   | .error message => throw (IO.userError s!"delay then declaration: {message}")
   IO.println "delay unit tests passed"
 
+/-- One instance with an agent, a trigger and a state, for prompt cases. -/
+def notesTeam (task : String) : String :=
+  "team T[a : Codex] { input go : int output out : string
+     state notes : string = \"\" " ++ task ++ " }
+   main { t = T() }"
+
 def rejectionCases : Array (String × String × String) := #[
   -- Only zero may be unitless; every other delay says what it means.
   ("connection delay without a unit",
@@ -333,6 +342,13 @@ def rejectionCases : Array (String × String × String) := #[
     nodeTeam ++ " main { a = Node(1) a.out -> b.token }", "unknown instance 'b'"),
   ("duplicate instance",
     nodeTeam ++ " main { a = Node(1) a = Node(2) }", "duplicate instance 'a'"),
+  -- A port holds one value per tag: two connections into it would keep the
+  -- last and drop the other.
+  ("two connections into one input",
+    nodeTeam ++ " main { a = Node(1) b = Node(2) c = Node(3) a.out -> c.token b.out -> c.token }",
+    "port 'c.token' has 2 incoming connections (a.out, b.out)"),
+  ("two connections into one port inside a team",
+    wireTeam "input other : int src -> dst other -> dst", "port 'w.dst' has 2 incoming connections"),
   ("no main block at all",
     nodeTeam, "no main block"),
   ("a main block that instantiates nothing",
@@ -357,10 +373,36 @@ def rejectionCases : Array (String × String × String) := #[
     wireTeam "timer shutdown(1s, 0)", "the trigger the run's last tag fires"),
   ("a port named shutdown",
     wireTeam "input shutdown : int", "the trigger the run's last tag fires"),
+  -- A prompt reads what its invocation carries: its triggers and its team's
+  -- state. Anything else would reach the agent as `<absent>`.
+  ("a prompt reading a name that is nothing",
+    notesTeam "task a(go) -> out \"Use $(nothing)\"", "reads $(nothing)"),
+  ("a prompt reading a port that is not its trigger",
+    notesTeam "task a(go) -> out \"Use $(out)\"", "reads $(out)"),
+  ("a prompt reading a nested team's state",
+    "team Inner { state notes : string = \"\" }
+     team Outer[a : Codex] { input go : int output out : string inner = Inner()
+       task a(go) -> out \"Use $(inner.notes)\" }
+     main { o = Outer() }", "reads $(inner.notes)"),
+  ("an unterminated interpolation",
+    notesTeam "task a(go) -> out \"Use $(go\"", "unterminated"),
   ("a parameter named like a state variable",
     "team Wire(n : int) { input src : int output dst : int state n : int = 0 }
      main { w = Wire(1) }", "is also a port, timer or state")
 ]
+
+/-- A task reads its team's state as `$(notes)`, which the runtime looks up
+    qualified, like a trigger -- whatever spelling the prompt used. -/
+def testPromptReads : IO Unit := do
+  let task := "task a(go) -> out \"$(notes) and $( go /* the tick */ ) and $(go)\""
+  match lex (notesTeam task) >>= parse "T" with
+  | .ok program =>
+      match program.reactions[0]? with
+      | some reaction =>
+          assertEqual "prompt qualified" reaction.prompt "$(t.notes) and $(t.go) and $(t.go)"
+      | none => throw (IO.userError "prompt reads: no reaction")
+  | .error message => throw (IO.userError s!"prompt reads: {message}")
+  IO.println "prompt read tests passed"
 
 /-- Every type state may have has a literal to start from. -/
 def testStateLiterals : IO Unit :=
@@ -648,6 +690,92 @@ def testMutation : IO Unit := do
   let _ := @Omar.Mutation.compiled_plan_sound
   IO.println "mutation tests passed"
 
+
+/-- Contracts are read the way the runtime reads them (`parse_contract`). -/
+def testContracts : IO Unit := do
+  let show_ (text : String) : String :=
+    reprStr (Omar.Model.contract text)
+  assertEqual "single" (show_ "a.x")
+    (reprStr [({ alternatives := [{ port := "a.x" }] } : Omar.Reactor.Clause)])
+  assertEqual "alternatives, optional" (show_ "( a.x | a.y ) ?")
+    (reprStr [({ alternatives := [{ port := "a.x" }, { port := "a.y" }], optional := true }
+      : Omar.Reactor.Clause)])
+  assertEqual "groups and a constant" (show_ "a.x , ( a.ok = false | a.why ) ?")
+    (reprStr [({ alternatives := [{ port := "a.x" }] } : Omar.Reactor.Clause),
+      { alternatives := [{ port := "a.ok", constant := some "false" }, { port := "a.why" }],
+        optional := true }])
+  assertEqual "no effects" (show_ "") "[]"
+
+/-- What is checked is Lean's to decide; this runs Lean, as `omarc` does. -/
+def runLean (file : System.FilePath) (source : String) : IO (UInt32 × String) := do
+  IO.FS.writeFile file source
+  let (lean, args, library) ← Omar.Prove.leanCommand
+  let output ← IO.Process.output {
+    cmd := lean, args := args ++ #[file.toString], env := #[("LEAN_PATH", some library)] }
+  pure (output.exitCode, output.stdout ++ output.stderr)
+
+/-- Every program in the topology suite has a model Lean accepts, and runs. -/
+def testModels : IO Unit := do
+  let mut source := "import Omar.Reactor\nopen Omar.Reactor\n\n"
+  for (test, index) in topologyCases.zipIdx do
+    let text ← IO.FS.readFile s!"../tests/topology/src/{test.file}"
+    let program ← match elaborateSourceWithSchemas test.team text #[] with
+      | .ok program => pure program
+      | .error message => throw (IO.userError s!"{test.file}: {message}")
+    source := source ++ s!"namespace Case{index}\n" ++
+      Omar.Model.render (Omar.Model.ofProgram program) ++
+      s!"\nexample : ∃ e, Valid topology e := valid_exists _\nend Case{index}\n\n"
+  let (code, output) ← runLean ".lake/models-test.lean" source
+  if code != 0 then throw (IO.userError s!"models do not check:\n{output}")
+
+/-- The trading desk's properties are proved, and a proof that assumes
+    rather than proves, or a statement about something other than the
+    program's runs, is not accepted. -/
+def testProve : IO Unit := do
+  let source ← IO.FS.readFile "../tests/verification/Desk.omar"
+  let program ← match elaborateSourceWithSchemas "Desk" source #[] with
+    | .ok program => pure program
+    | .error message => throw (IO.userError message)
+  let request ← match Json.parse (← IO.FS.readFile "../tests/verification/desk-properties.json")
+      >>= fromJson? (α := Omar.Prove.Request) with
+    | .ok request => pure request
+    | .error message => throw (IO.userError message)
+  -- Lemmas are optional in a request.
+  match Json.parse "{\"properties\": []}" >>= fromJson? (α := Omar.Prove.Request) with
+  | .ok bare => assertEqual "no lemmas" bare.lemmas ""
+  | .error message => throw (IO.userError s!"a request without lemmas: {message}")
+  let extra : Array Omar.Prove.Property := #[
+    { name := "cheat", statement := "False", proof := "sorry" },
+    { name := "runs", statement := "True", proof := "by\n  trivial\n#eval IO.println \"ran\"" },
+    { name := "elsewhere", statement := "True", proof := "trivial" },
+    { name := "misspelled", statement := "∀ g, e.present g \"x.ordr\" = none → True",
+      proof := "by\n  intro _ _\n  trivial" },
+    { name := "wrong", statement := "∀ g, ¬ e.invoked g \"x.reaction.0\"",
+      proof := "by\n  intro g h\n  simp at h" }]
+  let model := Omar.Model.render (Omar.Model.ofProgram program)
+  let verdicts ← Omar.Prove.check model
+    { request with properties := request.properties ++ extra } ".lake/prove-test"
+  let verdict (name : String) := verdicts.find? (·.name == name)
+  for name in ["orders_are_approved", "rejected_not_executed"] do
+    let some v := verdict name | throw (IO.userError s!"no verdict for {name}")
+    if !v.proved then throw (IO.userError s!"{name} not proved: {reprStr (v.problems.map (·.message))}")
+  assertEqual "mentions" (verdict "orders_are_approved" |>.map (·.mentions)) (some #["x.order", "r.approved"])
+  for name in ["cheat", "wrong", "runs"] do
+    if (verdict name).any (·.proved) then throw (IO.userError s!"{name} was accepted")
+  assertEqual "sorry is refused unread" ((verdict "cheat").map (·.problems.map (·.line))) (some #[0])
+  -- Checking a proof must not run code it carries.
+  assertEqual "#eval is refused unread" ((verdict "runs").map (·.problems.map (·.line))) (some #[0])
+  -- `True` is proved, but it is not a property of the program.
+  let some elsewhere := verdict "elsewhere" | throw (IO.userError "no verdict for elsewhere")
+  if elsewhere.proved || !elsewhere.problems.any (mentions ·.message "nothing about the run") then
+    throw (IO.userError "a statement about nothing in particular was accepted")
+  -- Nor is one about a port the program does not have.
+  let some misspelled := verdict "misspelled" | throw (IO.userError "no verdict for misspelled")
+  if misspelled.proved || !misspelled.problems.any (mentions ·.message "has no [x.ordr]") then
+    throw (IO.userError s!"a statement about a missing port was accepted: {reprStr (misspelled.problems.map (·.message))}")
+  -- The mistake is reported where it is, counting from the theorem.
+  assertEqual "wrong proof's line" ((verdict "wrong").map (·.problems.map (·.line) |>.contains 4)) (some true)
+
 def main : IO UInt32 := do
   try
     for test in topologyCases do
@@ -659,11 +787,15 @@ def main : IO UInt32 := do
     testWithin
     testDelayUnits
     testStateLiterals
+    testPromptReads
     testShutdown
     testCodeTerminator
     testExternalSchemas
     testSchemaTypeResolution
     testMutation
+    testContracts
+    testModels
+    testProve
     IO.println "compiler rejection tests passed"
     pure 0
   catch error =>

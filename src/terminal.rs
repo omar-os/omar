@@ -176,6 +176,16 @@ impl Attachment {
     /// Start the PTY at the viewer's measured geometry, before tmux emits its
     /// first redraw. The optional size is in client cells, including status.
     pub fn open_session_sized(session: &str, dimensions: Option<(u16, u16)>) -> Result<Self> {
+        Self::open(session, dimensions, false)
+    }
+
+    /// Attach as a read-only tmux client at the window's own size, for a
+    /// viewer that may watch but must not type into or reshape the session.
+    pub fn open_session_read_only(session: &str) -> Result<Self> {
+        Self::open(session, None, true)
+    }
+
+    fn open(session: &str, dimensions: Option<(u16, u16)>, read_only: bool) -> Result<Self> {
         if let Some((cols, rows)) = dimensions {
             validate_dimensions(cols, rows)?;
         }
@@ -231,6 +241,9 @@ impl Attachment {
             command.args(["-T", "RGB"]);
         }
         command.args(["attach-session", "-t", target]);
+        if read_only {
+            command.arg("-r");
+        }
         // A nested tmux would refuse to attach.
         command.env_remove("TMUX");
         // tmux refuses to attach without a terminal it recognises, and the
