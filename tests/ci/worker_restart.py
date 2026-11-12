@@ -312,6 +312,7 @@ trust_level="trusted"
         profile += [f'export PATH="{shims}:$PATH"', f'export PI_CODING_AGENT_DIR="{agent}"',
                     'export PI_OFFLINE=1', f'export PI_E2E_BASE_URL="http://127.0.0.1:{server.server_port}/v1"']
     elif backend == 'OpenCode':
+        profile.append(f'export PATH={shlex.quote(env["PATH"])}')
         config = home / '.config/opencode'
         config.mkdir(parents=True)
         (config / 'opencode.json').write_text(json.dumps({

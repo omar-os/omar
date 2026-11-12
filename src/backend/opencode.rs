@@ -400,7 +400,7 @@ fn provision_fresh_session(port: u16, id: &str, timeout: Duration) -> Result<Str
             Ok((404, _)) => break,
             Ok((200, _)) => anyhow::bail!("opencode already has a session {id}"),
             // A server still booting is not yet an answer.
-            _ => wait()?,
+            _ => wait().context("waiting for opencode session API")?,
         }
     }
     let body = serde_json::json!({ "id": id }).to_string();
@@ -418,7 +418,7 @@ fn provision_fresh_session(port: u16, id: &str, timeout: Duration) -> Result<Str
         http_json_until(port, "POST", "/tui/select-session", Some(&select), deadline),
         Ok((200, _))
     ) {
-        wait()?;
+        wait().context("waiting for opencode TUI session selection")?;
     }
     Ok(format!("opencode:{port}:{id}"))
 }
@@ -526,10 +526,33 @@ fn http_json_until(
             break;
         }
         response.extend_from_slice(&buffer[..read]);
+        // Some opencode routes keep the socket open despite Connection: close.
+        // A Content-Length body is complete without waiting for EOF.
+        if response_complete(&response) {
+            break;
+        }
     }
     let response = String::from_utf8_lossy(&response).into_owned();
     let (status, body) = split_response(&response).context("parse opencode response")?;
     Ok((status, body))
+}
+
+fn response_complete(response: &[u8]) -> bool {
+    let Some(end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(headers) = std::str::from_utf8(&response[..end]) else {
+        return false;
+    };
+    headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .is_some_and(|length| response.len() - end - 4 >= length)
 }
 
 // A blocking socket timeout is WouldBlock on Linux and TimedOut elsewhere.
@@ -775,6 +798,82 @@ mod tests {
             seen
         });
         (port, server)
+    }
+
+    #[test]
+    fn startup_accepts_complete_responses_without_waiting_for_connection_close() {
+        use std::io::{BufRead, BufReader, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut connections = Vec::new();
+            let mut requests = Vec::new();
+            for (status, body) in [
+                (404, "{}"),
+                (200, r#"{"data":{"id":"ses_new"}}"#),
+                (200, r#"{"id":"ses_new"}"#),
+                (200, "[]"),
+                (200, "true"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = header.strip_prefix("Content-Length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                requests.push(first);
+                connections.push(stream);
+            }
+            // The client must finish while every response socket remains open.
+            let _ = wait.recv();
+            requests
+        });
+        let result = provision_fresh_session(port, "ses_new", Duration::from_secs(2));
+        release.send(()).unwrap();
+        assert_eq!(result.unwrap(), format!("opencode:{port}:ses_new"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.starts_with("POST /api/session "))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn response_framing_requires_complete_headers_and_the_declared_byte_length() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{",
+            b"HTTP/1.1 200 OK\r\n\r\n{}",
+        ] {
+            assert!(!response_complete(response));
+        }
+        assert!(response_complete(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}"
+        ));
+        assert!(response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        ));
     }
 
     #[test]
