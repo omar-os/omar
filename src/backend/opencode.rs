@@ -10,7 +10,7 @@ use crate::manager::{
 };
 use anyhow::{Context, Result};
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct Opencode;
 
@@ -113,13 +113,14 @@ impl Backend for Opencode {
         target: &super::Target<'_>,
         id: &str,
         _since: std::time::SystemTime,
+        deadline: Instant,
     ) -> Result<()> {
         let (port, _) = target
             .stamp
             .and_then(from_stamp)
             .context("no opencode delivery channel")?;
         served_by_worker(port, target.pane_pid)?;
-        empty_session(port, id)
+        empty_session(port, id, deadline)
     }
     fn forget(&self, target: &super::Target<'_>) {
         if let Some((port, session)) = target.stamp.and_then(from_stamp) {
@@ -327,7 +328,7 @@ pub(crate) fn deliver_over_http(port: u16, session: &str, text: &str) -> Result<
     Ok(())
 }
 
-/// Loopback HTTP is either immediate or wedged; nothing in between.
+/// Bound each blocking operation; startup can wait through several timeouts.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to keep waiting for a freshly launched backend to open its port.
@@ -425,15 +426,15 @@ fn provision_fresh_session(port: u16, id: &str, timeout: Duration) -> Result<Str
         Ok(())
     };
     loop {
-        match http_json(port, "GET", &format!("/session/{id}"), None) {
+        match http_json_until(port, "GET", &format!("/session/{id}"), None, deadline) {
             Ok((404, _)) => break,
             Ok((200, _)) => anyhow::bail!("opencode already has a session {id}"),
             // A server still booting is not yet an answer.
-            _ => wait()?,
+            _ => wait().context("waiting for opencode session API")?,
         }
     }
     let body = serde_json::json!({ "id": id }).to_string();
-    let (status, created) = http_json(port, "POST", "/api/session", Some(&body))?;
+    let (status, created) = http_json_until(port, "POST", "/api/session", Some(&body), deadline)?;
     let created: Option<serde_json::Value> = serde_json::from_str(&created).ok();
     let created = created.as_ref().and_then(|v| v["data"]["id"].as_str());
     anyhow::ensure!(
@@ -441,13 +442,13 @@ fn provision_fresh_session(port: u16, id: &str, timeout: Duration) -> Result<Str
         "opencode did not create session {id} through /api/session (HTTP {status}, got {created:?}); \
          a `per` lifetime needs an opencode that has it"
     );
-    empty_session(port, id)?;
+    empty_session(port, id, deadline)?;
     let select = serde_json::json!({ "sessionID": id }).to_string();
     while !matches!(
-        http_json(port, "POST", "/tui/select-session", Some(&select)),
+        http_json_until(port, "POST", "/tui/select-session", Some(&select), deadline),
         Ok((200, _))
     ) {
-        wait()?;
+        wait().context("waiting for opencode TUI session selection")?;
     }
     Ok(format!("opencode:{port}:{id}"))
 }
@@ -470,14 +471,21 @@ fn served_by_worker(port: u16, pane_pid: u32) -> Result<()> {
 }
 
 /// The server has session `id`, and it holds no message.
-fn empty_session(port: u16, id: &str) -> Result<()> {
-    let (status, session) = http_json(port, "GET", &format!("/session/{id}"), None)?;
+fn empty_session(port: u16, id: &str, deadline: Instant) -> Result<()> {
+    let (status, session) =
+        http_json_until(port, "GET", &format!("/session/{id}"), None, deadline)?;
     let session: Option<serde_json::Value> = serde_json::from_str(&session).ok();
     anyhow::ensure!(
         status == 200 && session.as_ref().and_then(|v| v["id"].as_str()) == Some(id),
         "opencode does not have session {id} (HTTP {status})"
     );
-    let (status, messages) = http_json(port, "GET", &format!("/session/{id}/message"), None)?;
+    let (status, messages) = http_json_until(
+        port,
+        "GET",
+        &format!("/session/{id}/message"),
+        None,
+        deadline,
+    )?;
     let messages: Option<Vec<serde_json::Value>> = serde_json::from_str(&messages).ok();
     match messages {
         Some(messages) if status == 200 && messages.is_empty() => Ok(()),
@@ -499,10 +507,21 @@ pub(crate) fn http_json(
     path: &str,
     body: Option<&str>,
 ) -> Result<(u16, String)> {
-    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
-        .with_context(|| format!("connect to 127.0.0.1:{}", port))?;
-    stream.set_read_timeout(Some(HTTP_TIMEOUT))?;
-    stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
+    http_json_until(port, method, path, body, Instant::now() + HTTP_TIMEOUT)
+}
+
+fn http_json_until(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    deadline: Instant,
+) -> Result<(u16, String)> {
+    let address = ([127, 0, 0, 1], port).into();
+    let mut stream = retry_io_until(deadline, |timeout| {
+        std::net::TcpStream::connect_timeout(&address, timeout)
+    })
+    .with_context(|| format!("connect to 127.0.0.1:{port}"))?;
 
     let body = body.unwrap_or("");
     let request = format!(
@@ -514,14 +533,86 @@ pub(crate) fn http_json(
         body.len(),
         body
     );
-    stream.write_all(request.as_bytes())?;
-    stream.flush()?;
+    let mut pending = request.as_bytes();
+    while !pending.is_empty() {
+        let written = retry_io_until(deadline, |timeout| {
+            stream.set_write_timeout(Some(timeout))?;
+            stream.write(pending)
+        })
+        .with_context(|| format!("{method} {path}: write opencode request"))?;
+        anyhow::ensure!(written > 0, "opencode closed while writing {method} {path}");
+        pending = &pending[written..];
+    }
 
     let mut response = Vec::new();
-    std::io::Read::read_to_end(&mut stream, &mut response)?;
+    let mut buffer = [0; 8192];
+    loop {
+        let read = retry_io_until(deadline, |timeout| {
+            stream.set_read_timeout(Some(timeout))?;
+            std::io::Read::read(&mut stream, &mut buffer)
+        })
+        .with_context(|| format!("{method} {path}: read opencode response"))?;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..read]);
+        // Some opencode routes keep the socket open despite Connection: close.
+        // A Content-Length body is complete without waiting for EOF.
+        if response_complete(&response) {
+            break;
+        }
+    }
     let response = String::from_utf8_lossy(&response).into_owned();
     let (status, body) = split_response(&response).context("parse opencode response")?;
     Ok((status, body))
+}
+
+fn response_complete(response: &[u8]) -> bool {
+    let Some(end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(headers) = std::str::from_utf8(&response[..end]) else {
+        return false;
+    };
+    headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .is_some_and(|length| response.len() - end - 4 >= length)
+}
+
+// A blocking socket timeout is WouldBlock on Linux and TimedOut elsewhere.
+// Keep the connection and partial bytes; never replay a session-creation POST.
+fn retry_io_until<T>(
+    deadline: Instant,
+    mut operation: impl FnMut(Duration) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "opencode request deadline expired",
+            ));
+        }
+        match operation(remaining.min(HTTP_TIMEOUT)) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Split an HTTP/1.x response into its status code and body.
@@ -686,6 +777,13 @@ mod tests {
     fn scripted(
         script: Vec<(u16, &'static str)>,
     ) -> (u16, std::thread::JoinHandle<Vec<(String, String)>>) {
+        scripted_with_creation_delay(script, Duration::ZERO)
+    }
+
+    fn scripted_with_creation_delay(
+        script: Vec<(u16, &'static str)>,
+        delay: Duration,
+    ) -> (u16, std::thread::JoinHandle<Vec<(String, String)>>) {
         use std::io::{BufRead, BufReader};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -711,10 +809,17 @@ mod tests {
                 reader.read_exact(&mut request_body).unwrap();
                 write!(
                     stream,
-                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 )
                 .unwrap();
+                let (first_half, second_half) = body.as_bytes().split_at(body.len() / 2);
+                stream.write_all(first_half).unwrap();
+                stream.flush().unwrap();
+                if first.starts_with("POST /api/session ") && !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                stream.write_all(second_half).unwrap();
                 seen.push((
                     first.trim_end().to_string(),
                     String::from_utf8(request_body).unwrap(),
@@ -723,6 +828,162 @@ mod tests {
             seen
         });
         (port, server)
+    }
+
+    #[test]
+    fn startup_accepts_complete_responses_without_waiting_for_connection_close() {
+        use std::io::{BufRead, BufReader, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut connections = Vec::new();
+            let mut requests = Vec::new();
+            for (status, body) in [
+                (404, "{}"),
+                (200, r#"{"data":{"id":"ses_new"}}"#),
+                (200, r#"{"id":"ses_new"}"#),
+                (200, "[]"),
+                (200, "true"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = header.strip_prefix("Content-Length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                requests.push(first);
+                connections.push(stream);
+            }
+            // The client must finish while every response socket remains open.
+            let _ = wait.recv();
+            requests
+        });
+        let result = provision_fresh_session(port, "ses_new", Duration::from_secs(2));
+        release.send(()).unwrap();
+        assert_eq!(result.unwrap(), format!("opencode:{port}:ses_new"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.starts_with("POST /api/session "))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn response_framing_requires_complete_headers_and_the_declared_byte_length() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{",
+            b"HTTP/1.1 200 OK\r\n\r\n{}",
+        ] {
+            assert!(!response_complete(response));
+        }
+        assert!(response_complete(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}"
+        ));
+        assert!(response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn startup_keeps_partial_responses_and_never_replays_session_creation_after_a_read_timeout() {
+        let (port, server) = scripted_with_creation_delay(
+            vec![
+                (404, "{}"),
+                (200, r#"{"data":{"id":"ses_slow"}}"#),
+                (200, r#"{"id":"ses_slow"}"#),
+                (200, "[]"),
+                (200, "true"),
+            ],
+            HTTP_TIMEOUT + Duration::from_secs(1),
+        );
+        let result = provision_fresh_session(port, "ses_slow", Duration::from_secs(15)).unwrap();
+        assert_eq!(result, format!("opencode:{port}:ses_slow"));
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(line, _)| line.starts_with("POST /api/session "))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn startup_retries_transient_io_but_keeps_its_deadline_and_permanent_errors() {
+        use std::io::{Error, ErrorKind};
+        let mut errors = [
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+        ]
+        .into_iter();
+        assert_eq!(
+            retry_io_until(Instant::now() + Duration::from_secs(1), |_| {
+                match errors.next() {
+                    Some(kind) => Err(Error::from(kind)),
+                    None => Ok(42),
+                }
+            })
+            .unwrap(),
+            42
+        );
+        let error =
+            retry_io_until::<()>(Instant::now(), |_| panic!("deadline expired")).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        let error = retry_io_until::<()>(Instant::now() + Duration::from_secs(1), |_| {
+            Err(Error::from(ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn an_unresponsive_startup_socket_cannot_extend_the_start_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = wait.recv();
+        });
+        let started = Instant::now();
+        let error = http_json_until(
+            port,
+            "GET",
+            "/session/slow",
+            None,
+            started + Duration::from_millis(50),
+        )
+        .unwrap_err();
+        release.send(()).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// An attempt's session is created with the id it was given, once the
@@ -808,6 +1069,7 @@ mod tests {
                 },
                 "ses_new",
                 std::time::SystemTime::now(),
+                Instant::now() + Duration::from_secs(60),
             )
         };
         let mut other = std::process::Command::new("sleep")

@@ -475,12 +475,13 @@ pub trait Backend: Send + Sync {
     /// Any proof beyond the id itself that the conversation `id`, which the
     /// worker in `target` reported, is new: checked after the id passes, and
     /// before anything is delivered. `since` is when the attempt began, before
-    /// its worker was launched. An error refuses the attempt.
+    /// its worker was launched; `deadline` bounds startup probes. An error refuses the attempt.
     fn prove_fresh(
         &self,
         _target: &Target<'_>,
         _id: &str,
         _since: std::time::SystemTime,
+        _deadline: std::time::Instant,
     ) -> Result<()> {
         Ok(())
     }
