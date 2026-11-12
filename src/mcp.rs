@@ -3506,6 +3506,7 @@ mod tests {
         // Workflow agents are restricted to the port protocol.
         let workflow = listed_tools(McpLaunchContext {
             topology: Some(crate::manager::TopologyMcpContext {
+                resume: None,
                 team: "T".to_string(),
                 agent: "a".to_string(),
                 endpoint: "127.0.0.1:1".to_string(),
@@ -3558,6 +3559,7 @@ mod tests {
             test_context(),
             McpLaunchContext {
                 topology: Some(crate::manager::TopologyMcpContext {
+                    resume: None,
                     team: "T".to_string(),
                     agent: "a".to_string(),
                     endpoint: "127.0.0.1:1".to_string(),
@@ -3648,6 +3650,7 @@ mod tests {
         // `omar_` prefix yields `omar_set_port`, the name every prompt uses.
         let topology = McpLaunchContext {
             topology: Some(crate::manager::TopologyMcpContext {
+                resume: None,
                 team: "T".to_string(),
                 agent: "a".to_string(),
                 endpoint: "127.0.0.1:1".to_string(),

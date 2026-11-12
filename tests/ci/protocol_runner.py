@@ -128,6 +128,7 @@ def main():
                     assert any(p.get('method') == 'session/load' and p['params']['sessionId'] == 'native-session' for p in requests())
                 if backend == 'agy':
                     launches = [json.loads(line) for line in (root / 'launches.jsonl').read_text().splitlines()]
+                    assert '-p=' in launches[-1], 'Antigravity needs explicit print mode to read stream input'
                     assert launches[-1][-4:] == ['--input-format', 'stream-json', '--output-format', 'stream-json']
                     assert launches[-1][launches[-1].index('--conversation') + 1] == 'native-session'
                 assert json.loads(inbox.read_text())['session'] == 'native-session'

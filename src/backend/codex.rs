@@ -1136,6 +1136,7 @@ mod tests {
         std::fs::write(&prompt, "be helpful").unwrap();
         let mut attempt = test_mcp_context(dir.path());
         attempt.topology = Some(crate::manager::TopologyMcpContext {
+            resume: None,
             team: "Scoped".into(),
             agent: "t.coder".into(),
             endpoint: "localhost:1".into(),

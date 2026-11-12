@@ -69,7 +69,7 @@ instance: string,
  */
 lifetime: Lifetime | null,
 /**
- * A `per` agent's conversation windows, oldest first, each as of its
+ * Conversation windows and worker retries, oldest first, each as of its
  * latest change: `invocations` (each with its `reaction`), `attempt_id`,
  * `native_session_id`, `outcome`, `cleanup_status` and the rest of the
  * record the run keeps in `attempts.jsonl`.
@@ -84,7 +84,11 @@ export type DiagramTimer = { id: string, name: string, offset: number,
  */
 period: number, last_tag: DiagramTag | null, instance: string, };
 
-export type DiagramReaction = { id: string, name: string, agent: string, order: number, triggers: Array<string>, effects: Array<string>, contract: string, status: ReactionStatus, invocation_id: string | null, instance: string,
+export type DiagramReaction = { id: string, name: string, agent: string, order: number, triggers: Array<string>, effects: Array<string>, contract: string, status: ReactionStatus, invocation_id: string | null,
+/**
+ * Restarts of the task currently shown on this step.
+ */
+restarts?: number, instance: string,
 /**
  * Nanoseconds this reaction gave itself, or `None` for one bounded only by
  * the run. Carried so a client can draw the bound rather than leaving the

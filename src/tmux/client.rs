@@ -512,7 +512,17 @@ impl TmuxClient {
                     acted_at = Instant::now();
                     answered_gate = self.startup_state(session, "@omar_startup_answered");
                 }
-            } else if backend.startup_finished(&screen, pane_pid) {
+            } else if backend.startup_finished(&screen, pane_pid)
+                || self.session_delivery(session).is_some_and(|stamp| {
+                    backend
+                        .conversation_id(&crate::backend::Target {
+                            name: session,
+                            pane_pid,
+                            stamp: Some(&stamp),
+                        })
+                        .is_some()
+                })
+            {
                 self.run(&[
                     "set-option",
                     "-u",

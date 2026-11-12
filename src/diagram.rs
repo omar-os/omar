@@ -106,7 +106,7 @@ pub struct DiagramAgent {
     /// the whole run.
     #[serde(default)]
     pub lifetime: Option<crate::topology::Lifetime>,
-    /// A `per` agent's conversation windows, oldest first, each as of its
+    /// Conversation windows and worker retries, oldest first, each as of its
     /// latest change: `invocations` (each with its `reaction`), `attempt_id`,
     /// `native_session_id`, `outcome`, `cleanup_status` and the rest of the
     /// record the run keeps in `attempts.jsonl`.
@@ -177,6 +177,10 @@ pub struct DiagramReaction {
     pub contract: String,
     pub status: ReactionStatus,
     pub invocation_id: Option<String>,
+    /// Restarts of the task currently shown on this step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub restarts: Option<u32>,
     pub instance: String,
     /// Nanoseconds this reaction gave itself, or `None` for one bounded only by
     /// the run. Carried so a client can draw the bound rather than leaving the
@@ -318,6 +322,7 @@ impl DiagramSnapshot {
                 contract: reaction.contract.clone(),
                 status: ReactionStatus::Idle,
                 invocation_id: None,
+                restarts: None,
                 instance: reaction.instance.clone(),
                 within: reaction.within,
                 prompt: (!reaction.prompt.is_empty()).then(|| reaction.prompt.clone()),
@@ -495,6 +500,17 @@ impl DiagramPublisher {
             None,
             json!({ "agent": id, "attempt": attempt }),
             |snapshot| {
+                if let Some(retry) = attempt["retry"].as_u64().filter(|retry| *retry > 0) {
+                    for reaction in &mut snapshot.reactions {
+                        let task = &attempt["invocations"][0];
+                        if task["reaction"] == reaction.name
+                            && task["invocation_id"].as_u64().map(|id| id.to_string())
+                                == reaction.invocation_id
+                        {
+                            reaction.restarts = Some(retry as u32);
+                        }
+                    }
+                }
                 if let Some(item) = snapshot.agents.iter_mut().find(|item| item.id == id) {
                     match item
                         .attempts
@@ -578,6 +594,7 @@ impl TopologyObserver for DiagramPublisher {
                 .find(|item| item.name == reaction)
             {
                 item.status = ReactionStatus::Running;
+                item.restarts = None;
                 item.invocation_id = Some(invocation_id.to_string());
             }
         };
