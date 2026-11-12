@@ -2,7 +2,6 @@
   "allowedUsers": [
     "YOUR_DISCORD_USER_ID"
   ],
-  "workflowCatalog": "../slack/config.workflows.local.json",
   "accountId": "BOT_USER_ID",
   "runtimeUrl": "http://127.0.0.1:45073/chats/CHAT-ID",
   "platform": "discord"

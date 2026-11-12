@@ -167,60 +167,43 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
             self.review_action(&message).await;
             return;
         }
-        let configured = message
-            .command
-            .strip_prefix("run ")
-            .and_then(|name| c.select(name));
-        // Fetch at command time: a web approval is visible without reconnecting.
-        let approved = if message.command == "list"
-            || (configured.is_none() && message.command.starts_with("run "))
-        {
+        let approved = if message.command == "list" || message.command.starts_with("run ") {
             match self.runtime.approved().await {
                 Ok(entries) => entries,
                 Err(_) => {
-                    self.reply(d, "Could not load approved workflows from OMAR. No run started; try again when the runtime is available.".into(), None).await;
+                    self.reply(d, "Could not load saved workflows from OMAR. Try again when the runtime is available.".into(), None).await;
                     return;
                 }
             }
         } else {
             Vec::new()
         };
-        let selected = configured.or_else(|| {
-            approved
-                .iter()
-                .find(|w| message.command.strip_prefix("run ") == Some(w.name.as_str()))
-                .map(|w| config::Selected {
-                    request: &w.request,
-                    output_port: &w.output_port,
-                    timeout_seconds: w.timeout_seconds,
-                })
-        });
+        let selected = approved
+            .iter()
+            .find(|workflow| message.command.strip_prefix("run ") == Some(workflow.name.as_str()))
+            .map(|workflow| config::Selected {
+                request: &workflow.request,
+                output_port: &workflow.output_port,
+                timeout_seconds: workflow.timeout_seconds,
+            });
         let response = {
             let mut state = self.state.lock().unwrap();
             if message.command == "list" {
-                let mut listing = c.listing();
+                let mut listing = String::from("Saved workflows:");
                 for workflow in &approved {
-                    if c.select(&workflow.name).is_none() {
-                        listing.push_str(&format!(
-                            "\n- {} — Approved in Mission Control",
-                            workflow.name
-                        ));
-                    }
+                    listing.push_str(&format!("\n- {}", workflow.name));
+                }
+                if approved.is_empty() {
+                    listing.push_str(
+                        "\nNo approved workflows yet. Create and approve a workflow in OMAR.",
+                    );
                 }
                 Some(listing)
             } else if selected.is_none() && !conversational {
-                let usage = self.messenger.usage(if c.workflows.is_empty() {
-                    &c.command
-                } else {
-                    "<workflow>"
-                });
-                Some(if message.command.starts_with("run ") {
-                    format!("Unknown workflow. Use list to see approved workflows. {usage}")
-                } else if c.workflows.is_empty() {
-                    usage
-                } else {
-                    format!("{usage}. Use list to see approved workflows.")
-                })
+                Some(format!(
+                    "{}. Use list to see saved workflows.",
+                    self.messenger.usage("<workflow>")
+                ))
             } else if state.uncertain {
                 Some("A previous run needs operator checking in OMAR. No new run started.".into())
             } else if state.busy {

@@ -1,5 +1,5 @@
 use super::*;
-use runtime::{OmarRuntime, Run};
+use runtime::Run;
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -8,12 +8,12 @@ use std::sync::{
 use tokio::sync::Notify;
 
 pub(super) fn fixture() -> Config {
-    let mut c: Config = serde_json::from_value(json!({
+    let c: Config = serde_json::from_value(json!({
         "runtimeUrl":"http://127.0.0.1:8000/chats/test", "platform":"mock", "accountId":"account",
         "allowedUsers":["user"], "allowedConversations":["room"], "command":"demo", "outputPort":"run.result",
         "programPath":"demo.omar"
     })).unwrap();
-    c.request = json!({"program":"fixed source","raw_inputs":["run.request=fixed"]});
+
     c
 }
 pub(super) fn incoming() -> Incoming {
@@ -35,6 +35,29 @@ impl Default for FakeRuntime {
     }
 }
 impl Runtime for FakeRuntime {
+    async fn approved(&self) -> Result<Vec<runtime::ApprovedWorkflow>> {
+        Ok(vec![
+            runtime::ApprovedWorkflow {
+                name: "demo".into(),
+                request: json!({"program":"fixed source","raw_inputs":["run.request=fixed"]}),
+                output_port: "run.result".into(),
+                timeout_seconds: 60,
+            },
+            runtime::ApprovedWorkflow {
+                name: "first".into(),
+                request: json!({"program":"FIRST","raw_inputs":["in=one"],"files":{"schema.json":"first schema"}}),
+                output_port: "first.result".into(),
+                timeout_seconds: 10,
+            },
+            runtime::ApprovedWorkflow {
+                name: "second".into(),
+                request: json!({"program":"SECOND","inputs":{"count":2},"files":{"schema.json":"second schema"}}),
+                output_port: "second.result".into(),
+                timeout_seconds: 20,
+            },
+        ])
+    }
+
     async fn converse(&self, sender: &str, text: &str) -> Result<String> {
         Ok(format!("Answer to {sender}: {text}"))
     }
@@ -174,7 +197,7 @@ async fn adapter_owns_usage_and_receives_full_output() {
     assert_eq!(g.runtime.starts.load(Ordering::SeqCst), 0);
     assert_eq!(
         g.messenger.replies.lock().unwrap()[0].1.text,
-        "Mock: run demo"
+        "Mock: run <workflow>. Use list to see saved workflows."
     );
     let mut m = incoming();
     m.event_id = "second".into();
@@ -335,127 +358,19 @@ fn config_rejects_unscoped_remote_and_credential_urls() {
     }
 }
 #[test]
-fn config_rejects_empty_policy_invalid_command_timeout_and_raw_inputs() {
-    for index in 0..5 {
+fn config_rejects_empty_user_and_channel_allowlists() {
+    for index in 0..2 {
         let mut c = fixture();
         match index {
             0 => c.allowed_users.clear(),
             1 => c.allowed_conversations = vec!["".into()],
-            2 => c.timeout_seconds = 0,
-            3 => c.command = "../path".into(),
-            _ => c.output_port.clear(),
+            _ => unreachable!(),
         }
         assert!(c.validate().is_err());
     }
 }
-#[test]
-fn legacy_config_resolves_bundle_relative_to_config_without_changing_inputs() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("demo.omar"), "main {}").unwrap();
-    std::fs::write(dir.path().join("schema.json"), "{}").unwrap();
-    let path = dir.path().join("config.json");
-    let value = json!({"runtimeUrl":"http://localhost/chats/x","workspaceId":"T1","allowedUsers":["U1"],"allowedChannels":["C1"],"command":"demo","outputPort":"out","programPath":"demo.omar","rawInputs":["in=hello"],"files":{"schemas/type.json":"schema.json"}});
-    std::fs::write(&path, value.to_string()).unwrap();
-    let c = Config::load(&path).unwrap();
-    assert_eq!(c.account_id, "T1");
-    assert_eq!(c.allowed_conversations, ["C1"]);
-    assert_eq!(c.request["files"]["schemas/type.json"], "{}");
-    assert_eq!(c.request["raw_inputs"][0], "in=hello");
-    assert_eq!(c.request["replace"], false);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap(),
-        value
-    );
-}
 
 // Invoked by the Python CI harness against an isolated, already running OMAR.
-#[tokio::test]
-#[ignore = "requires test runtime; run through tests/ci/slack_workflow.py"]
-async fn real_runtime() {
-    let path = std::env::var("OMAR_MESSAGING_TEST_CONFIG").unwrap();
-    let mut c = Config::load(std::path::Path::new(&path)).unwrap();
-    if c.auto_chat {
-        runtime::bind_chat(&mut c).await.unwrap();
-        println!("AUTO_CHAT_URL={}", c.runtime_url);
-    }
-    if c.platform == "discord" {
-        c.allowed_conversations = vec!["456".into()];
-    }
-    let runtime = OmarRuntime::new(c.runtime_url.clone()).unwrap();
-    let g = Gateway::new(c.clone(), runtime, FakeMessenger::default());
-    let m = Incoming {
-        platform: c.platform.clone(),
-        account_id: c.account_id.clone(),
-        sender_id: c.allowed_users[0].clone(),
-        event_id: "fixture-event".into(),
-        command: format!("run {}", c.command),
-        destination: Destination {
-            platform: c.platform.clone(),
-            account_id: c.account_id.clone(),
-            conversation_id: c.allowed_conversations[0].clone(),
-            thread_id: (c.platform == "slack").then(|| "parent".into()),
-        },
-    };
-    let m = if c.platform == "slack" {
-        slack::normalize(&json!({"type":"event_callback","team_id":c.account_id,"event_id":"fixture-event","event":{"type":"app_mention","user":m.sender_id,"channel":m.destination.conversation_id,"ts":"message","thread_ts":"parent","text":format!("<@BOT> run {}",c.command)}}),"BOT").unwrap()
-    } else if c.platform == "discord" {
-        discord::normalize(&json!({"id":"789","type":0,"channel_id":"456","author":{"id":m.sender_id},"content":m.command}),
-            &c.account_id, &std::collections::HashMap::from([(c.allowed_users[0].clone(), "456".into())])).unwrap()
-    } else {
-        m
-    };
-    g.handle(m.clone()).await;
-    g.handle(m.clone()).await;
-    let id = {
-        let replies = g.messenger.replies.lock().unwrap();
-        assert_eq!(replies.len(), 2);
-        assert_eq!(replies[1].0, m.destination);
-        assert!(
-            replies[1].1.text.contains(": completed.\n"),
-            "{}",
-            replies[1].1.text
-        );
-        replies[1].1.run_id.clone().unwrap()
-    };
-    let runs = g.runtime.call("/v1/runs", None).await.unwrap();
-    assert_eq!(
-        runs["runs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|r| r["run_id"] == id)
-            .count(),
-        1
-    );
-    let expected = std::env::var("OMAR_MESSAGING_TEST_OUTPUT").unwrap();
-    assert!(g.messenger.replies.lock().unwrap()[1]
-        .1
-        .text
-        .ends_with(&expected));
-}
-
-#[test]
-fn research_launcher_forwards_arguments_without_global_configuration_changes() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let fake = dir.path().join("fake-codex");
-    std::fs::write(&fake, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let output = std::process::Command::new("sh")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/integrations/slack/research-bin/codex"
-        ))
-        .args(["--model", "fixture"])
-        .env("SLACK_RESEARCH_CODEX_BIN", fake)
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "-c\ncheck_for_update_on_startup=false\n--model\nfixture\n"
-    );
-}
 
 #[test]
 fn cli_preserves_config_argument_and_supports_login_logout() {
@@ -477,20 +392,7 @@ fn cli_preserves_config_argument_and_supports_login_logout() {
 }
 
 fn registry_config() -> Config {
-    let mut config: Config = serde_json::from_value(json!({
-        "runtimeUrl":"http://localhost/chats/test", "platform":"mock", "accountId":"account",
-        "allowedUsers":["user"],"allowedConversations":["room"],"workflows":{}
-    }))
-    .unwrap();
-    config.workflows = serde_json::from_value(json!({
-        "first": {"description":"First approved workflow", "programPath":"first.omar", "outputPort":"first.result", "timeoutSeconds":10},
-        "second": {"description":"Second approved workflow", "programPath":"second.omar", "outputPort":"second.result", "timeoutSeconds":20}
-    })).unwrap();
-    config.workflows.get_mut("first").unwrap().request =
-        json!({"program":"FIRST", "raw_inputs":["in=one"], "files":{"schema.json":"first schema"}});
-    config.workflows.get_mut("second").unwrap().request =
-        json!({"program":"SECOND", "inputs":{"count":2}, "files":{"schema.json":"second schema"}});
-    config
+    fixture()
 }
 #[derive(Default)]
 struct RegistryRuntime {
@@ -498,6 +400,29 @@ struct RegistryRuntime {
     timeouts: Mutex<Vec<u64>>,
 }
 impl Runtime for RegistryRuntime {
+    async fn approved(&self) -> Result<Vec<runtime::ApprovedWorkflow>> {
+        Ok(vec![
+            runtime::ApprovedWorkflow {
+                name: "demo".into(),
+                request: json!({"program":"fixed source","raw_inputs":["run.request=fixed"]}),
+                output_port: "run.result".into(),
+                timeout_seconds: 60,
+            },
+            runtime::ApprovedWorkflow {
+                name: "first".into(),
+                request: json!({"program":"FIRST","raw_inputs":["in=one"],"files":{"schema.json":"first schema"}}),
+                output_port: "first.result".into(),
+                timeout_seconds: 10,
+            },
+            runtime::ApprovedWorkflow {
+                name: "second".into(),
+                request: json!({"program":"SECOND","inputs":{"count":2},"files":{"schema.json":"second schema"}}),
+                output_port: "second.result".into(),
+                timeout_seconds: 20,
+            },
+        ])
+    }
+
     async fn start(&self, request: &Value) -> Result<Run> {
         self.requests.lock().unwrap().push(request.clone());
         Ok(Run {
@@ -545,8 +470,8 @@ async fn registry_runs_different_workflows_sequentially_with_own_inputs_outputs_
     assert_eq!(
         *g.runtime.requests.lock().unwrap(),
         vec![
-            config.workflows["first"].request.clone(),
-            config.workflows["second"].request.clone()
+            json!({"program":"FIRST","raw_inputs":["in=one"],"files":{"schema.json":"first schema"}}),
+            json!({"program":"SECOND","inputs":{"count":2},"files":{"schema.json":"second schema"}})
         ]
     );
     assert_eq!(*g.runtime.timeouts.lock().unwrap(), vec![10, 20]);
@@ -569,7 +494,10 @@ async fn registry_list_is_authorized_deterministic_and_does_not_start_work() {
     assert_eq!(g.runtime.starts.load(Ordering::SeqCst), 0);
     let replies = g.messenger.replies.lock().unwrap();
     assert_eq!(replies.len(), 1);
-    assert_eq!(replies[0].1.text,"Available workflows:\n- first — First approved workflow\n- second — Second approved workflow");
+    assert_eq!(
+        replies[0].1.text,
+        "Saved workflows:\n- demo\n- first\n- second"
+    );
     assert!(!replies[0].1.text.contains(".omar"));
 }
 #[tokio::test]
@@ -646,7 +574,7 @@ async fn registry_has_one_busy_state_across_names_but_list_still_works() {
         .unwrap()
         .1
         .text
-        .contains("Available workflows"));
+        .contains("Saved workflows"));
     assert_eq!(g.runtime.starts.load(Ordering::SeqCst), 1);
     notify.notify_one();
     task.await.unwrap();
@@ -685,87 +613,6 @@ async fn registry_uncertainty_blocks_all_names_not_just_the_first() {
         .1
         .text
         .contains("operator checking"));
-}
-#[test]
-fn registry_loads_each_source_bundle_and_rejects_ambiguous_or_invalid_entries() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("one.omar"), "FIRST").unwrap();
-    std::fs::write(dir.path().join("two.omar"), "SECOND").unwrap();
-    std::fs::write(dir.path().join("schema.json"), "{schema}").unwrap();
-    let path = dir.path().join("registry.json");
-    let base = json!({"runtimeUrl":"http://localhost/chats/x","platform":"mock","accountId":"account","allowedUsers":["user"],"allowedConversations":["room"],"workflows":{
-        "first":{"programPath":"one.omar","outputPort":"one.out","rawInputs":["in=one"]},
-        "second":{"programPath":"two.omar","outputPort":"two.out","files":{"schemas/type.json":"schema.json"},"timeoutSeconds":25}
-    }});
-    std::fs::write(&path, base.to_string()).unwrap();
-    let config = Config::load(&path).unwrap();
-    assert_eq!(config.workflows["first"].request["program"], "FIRST");
-    assert_eq!(
-        config.workflows["second"].request["files"]["schemas/type.json"],
-        "{schema}"
-    );
-    assert_eq!(config.select("second").unwrap().timeout_seconds, 25);
-    for mutation in 0..7 {
-        let mut value = base.clone();
-        match mutation {
-            0 => value["command"] = json!("legacy"),
-            1 => value["workflows"]["../escape"] = value["workflows"]["first"].clone(),
-            2 => value["workflows"]["first"]["programPath"] = json!("missing.omar"),
-            3 => value["workflows"]["first"]["timeoutSeconds"] = json!(0),
-            4 => value["workflows"]["first"]["outputPort"] = json!(""),
-            5 => value["workflows"]["first"]["rawInputs"] = json!(["not-an-assignment"]),
-            _ => value["workflows"] = json!({}),
-        }
-        std::fs::write(&path, value.to_string()).unwrap();
-        assert!(Config::load(&path).is_err(), "mutation {mutation}");
-    }
-}
-
-#[tokio::test]
-#[ignore = "requires test runtime; run through tests/ci/slack_workflow.py"]
-async fn real_registry() {
-    let path = std::env::var("OMAR_MESSAGING_TEST_CONFIG").unwrap();
-    let c = Config::load(std::path::Path::new(&path)).unwrap();
-    let expected: std::collections::BTreeMap<String, String> =
-        serde_json::from_str(&std::env::var("OMAR_MESSAGING_REGISTRY_EXPECTED").unwrap()).unwrap();
-    let runtime = OmarRuntime::new(c.runtime_url.clone()).unwrap();
-    let g = Gateway::new(c.clone(), runtime, FakeMessenger::default());
-    let mut m = Incoming {
-        platform: c.platform.clone(),
-        account_id: c.account_id.clone(),
-        sender_id: c.allowed_users[0].clone(),
-        event_id: "list".into(),
-        command: "list".into(),
-        destination: Destination {
-            platform: c.platform.clone(),
-            account_id: c.account_id.clone(),
-            conversation_id: c.allowed_conversations[0].clone(),
-            thread_id: Some("registry-thread".into()),
-        },
-    };
-    g.handle(m.clone()).await;
-    for (name, output) in expected {
-        assert!(g.messenger.replies.lock().unwrap()[0]
-            .1
-            .text
-            .contains(&name));
-        m.event_id = format!("run-{name}");
-        m.command = format!("run {name}");
-        g.handle(m.clone()).await;
-        g.handle(m.clone()).await;
-        let replies = g.messenger.replies.lock().unwrap();
-        let (destination, reply) = replies.last().unwrap();
-        assert_eq!(destination, &m.destination);
-        assert!(reply.text.contains(": completed.\n"), "{}", reply.text);
-        assert!(reply.text.ends_with(&output), "{}", reply.text);
-    }
-    let replies = g.messenger.replies.lock().unwrap();
-    assert_eq!(replies.len(), 1 + c.workflows.len() * 2);
-    let ids: std::collections::HashSet<_> = replies
-        .iter()
-        .filter_map(|(_, r)| r.run_id.as_ref())
-        .collect();
-    assert_eq!(ids.len(), c.workflows.len());
 }
 
 #[tokio::test]

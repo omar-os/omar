@@ -66,7 +66,6 @@ fn import(path: &Path, platform: &str) -> Result<Value> {
         value.is_object(),
         "Invalid existing messaging configuration"
     );
-    let folder = path.parent().context("Missing configuration folder")?;
     let account = value
         .get("accountId")
         .or_else(|| value.get("workspaceId"))
@@ -76,40 +75,10 @@ fn import(path: &Path, platform: &str) -> Result<Value> {
         .get("allowedConversations")
         .or_else(|| value.get("allowedChannels"))
         .cloned();
-    if value
-        .get("workflows")
-        .is_some_and(|w| w.as_object().is_some_and(|w| !w.is_empty()))
-    {
-        // The existing registry stays canonical: do not copy its workflow entries.
-        value = json!({"accountId":account,"allowedUsers":value["allowedUsers"],"workflowCatalog":path});
-    } else if let Some(catalog) = value["workflowCatalog"].as_str() {
-        value["workflowCatalog"] = json!(std::fs::canonicalize(folder.join(catalog))?);
-    } else {
-        if let Some(program) = value["programPath"].as_str() {
-            value["programPath"] = json!(std::fs::canonicalize(folder.join(program))?);
-        }
-        if let Some(files) = value["files"].as_object_mut() {
-            for source in files.values_mut() {
-                *source = json!(std::fs::canonicalize(
-                    folder.join(source.as_str().context("Invalid schema path")?)
-                )?);
-            }
-        }
-    }
     value.as_object_mut().unwrap().retain(|key, _| {
         matches!(
             key.as_str(),
-            "accountId"
-                | "allowedUsers"
-                | "allowedConversations"
-                | "command"
-                | "programPath"
-                | "outputPort"
-                | "timeoutSeconds"
-                | "files"
-                | "inputs"
-                | "rawInputs"
-                | "workflowCatalog"
+            "accountId" | "allowedUsers" | "allowedConversations"
         )
     });
     value["accountId"] = account;
@@ -127,32 +96,6 @@ fn import(path: &Path, platform: &str) -> Result<Value> {
     value["runtimeUrl"] = json!(RUNTIME_URL);
     value["autoChat"] = json!(true);
     Ok(value)
-}
-
-fn default_catalog(folder: &Path) -> Result<PathBuf> {
-    let catalog = folder.join("workflows.json");
-    if catalog.exists() {
-        return Ok(catalog);
-    }
-    // The shared store prepares an owner-only directory before writing sources.
-    credential_store::private_directory(folder, true)?;
-    let program = folder.join("messaging-demo.omar");
-    match crate::paths::create_private_file(&program) {
-        Ok(mut file) => {
-            file.write_all(include_str!("../../integrations/slack/demo.omar").as_bytes())?;
-            file.sync_all()?;
-        }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
-    }
-    credential_store::save(
-        &catalog,
-        &json!({"workflows":{"demo":{
-            "description":"Check OMAR messaging without model calls", "programPath":"messaging-demo.omar",
-            "outputPort":"run.result", "rawInputs":["run.request=OMAR messaging demo completed."]
-        }}}),
-    )?;
-    Ok(catalog)
 }
 
 async fn setup(platform: &str, path: &Path) -> Result<Config> {
@@ -185,15 +128,8 @@ async fn setup(platform: &str, path: &Path) -> Result<Config> {
         } else {
             Vec::new()
         };
-        let catalog =
-            prompt("Approved workflow catalog JSON path (Enter for the model-free demo)")?;
-        let catalog = if catalog.is_empty() {
-            default_catalog(path.parent().unwrap())?
-        } else {
-            std::fs::canonicalize(catalog).context("Cannot open workflow catalog")?
-        };
         json!({"platform":platform,"accountId":account,"allowedUsers":users,
-            "allowedConversations":channels,"runtimeUrl":RUNTIME_URL,"autoChat":true,"workflowCatalog":catalog})
+            "allowedConversations":channels,"runtimeUrl":RUNTIME_URL,"autoChat":true})
     };
     // Validate before saving a setup that subsequent launches would trust.
     let scratch = path.with_extension(format!("{}.json", uuid::Uuid::new_v4()));

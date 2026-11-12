@@ -179,35 +179,6 @@ async fn provider_errors_and_redirects_do_not_leak_bodies_or_retry() {
     }
 }
 
-#[test]
-fn shared_catalog_reuses_sources_relative_to_catalog_not_adapter() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir(temp.path().join("catalog")).unwrap();
-    std::fs::create_dir(temp.path().join("discord")).unwrap();
-    std::fs::write(temp.path().join("catalog/demo.omar"), "canonical workflow").unwrap();
-    std::fs::write(
-        temp.path().join("catalog/workflows.json"),
-        json!({"workflows":{"demo":{"programPath":"demo.omar","outputPort":"out"}}}).to_string(),
-    )
-    .unwrap();
-    let path = temp.path().join("discord/config.json");
-    let mut config = json!({"platform":"discord","accountId":"999","allowedUsers":["123"],"runtimeUrl":"http://127.0.0.1:45073/chats/test","workflowCatalog":"../catalog/workflows.json"});
-    std::fs::write(&path, config.to_string()).unwrap();
-    let loaded = Config::load(&path).unwrap();
-    assert_eq!(
-        loaded.select("demo").unwrap().request["program"],
-        "canonical workflow"
-    );
-    assert!(loaded.allowed_conversations.is_empty());
-    config["workflows"] = json!({"copy":{"programPath":"demo.omar","outputPort":"out"}});
-    std::fs::write(&path, config.to_string()).unwrap();
-    assert!(Config::load(&path).is_err());
-    config.as_object_mut().unwrap().remove("workflows");
-    config["allowedConversations"] = json!(["123"]);
-    std::fs::write(&path, config.to_string()).unwrap();
-    assert!(Config::load(&path).is_err());
-}
-
 async fn sockets() -> (
     tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
     tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
@@ -331,7 +302,7 @@ async fn gateway_heartbeats_during_work_and_resumes_without_duplicate_execution(
             .unwrap()
             .1
             .text
-            .contains("Available workflows"));
+            .contains("Saved workflows"));
         notify.notify_one();
         timeout(Duration::from_secs(3), async {
             while gateway.messenger.replies.lock().unwrap().len() < 3 {
