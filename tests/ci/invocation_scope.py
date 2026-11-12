@@ -614,7 +614,9 @@ def fresh_worker_per_invocation(backend='claude'):
             assert 'memories' not in keeper[0]['argv'], keeper
             sockets = {launch['argv'].split('--listen ')[1].split()[0] for launch in launches}
             assert len(sockets) == 3, sockets
-            reads = [e for e in events if e['event'] == 'rpc' and e['method'] == 'thread/read']
+            # Turn monitors also read with turns (usage-limit errors); only proofs count here.
+            reads = [e for e in events if e['event'] == 'rpc' and e['method'] == 'thread/read'
+                     and not e['params'].get('includeTurns')]
             assert [(r['pid'], r['params']) for r in reads] == [
                 (launch['pid'], {'threadId': thread, 'includeTurns': False})
                 for launch, thread in zip(coder, opened)], reads
