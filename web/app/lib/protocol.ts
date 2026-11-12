@@ -383,7 +383,7 @@ export function applyDiagramEvent(
       const { agent, attempt } = event.payload as { agent?: unknown; attempt?: Record<string, unknown> };
       // A window is published as it starts, serves invocations and ends:
       // the latest of each replaces the last.
-      const upsert = (attempts: Record<string, unknown>[]) => {
+      const upsert = (attempts: Record<string, unknown>[] = []) => {
         if (!attempt) return attempts;
         const at = attempts.findIndex((item) => item.attempt_id === attempt.attempt_id);
         return at < 0 ? [...attempts, attempt] : attempts.map((item, index) => index === at ? attempt : item);

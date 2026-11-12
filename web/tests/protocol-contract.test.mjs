@@ -409,3 +409,14 @@ test("an old window cannot put its restart count on a later task of the same ste
       attempt: { attempt_id: "old", retry: 2, invocations: [{ reaction: reaction.name, invocation_id: 7 }] } } });
   assert.equal(later.reactions.find((item) => item.id === reaction.id).restarts, undefined);
 });
+
+
+test("attempt updates accept snapshots from before attempt history was added", () => {
+  const agent = { ...golden.agents[0] };
+  delete agent.attempts;
+  const base = { ...golden, agents: [agent] };
+  const attempt = { attempt_id: "first", outcome: "started" };
+  const next = applyDiagramEvent(base, { protocol_version: 1, sequence: golden.sequence + 1,
+    team: golden.team, tag: null, kind: "agent_attempt", payload: { agent: agent.id, attempt } });
+  assert.deepEqual(next.agents[0].attempts, [attempt]);
+});

@@ -482,18 +482,22 @@ pub fn teardown_sessions(
                 continue;
             }
         }
-        if let Ok(log) = host.capture(session) {
-            let _ = std::fs::create_dir_all(logs);
-            let _ = std::fs::write(
-                logs.join(format!("{}.txt", crate::tmux::flatten_agent_name(agent))),
-                log,
-            );
-        }
+        capture_session_log(host, agent, session, logs);
         if let Err(error) = host.kill(session) {
             failures.push(format!("{agent}: {error:#}"));
         }
     }
     failures
+}
+
+pub(crate) fn capture_session_log(host: &dyn SessionHost, agent: &str, session: &str, logs: &Path) {
+    if let Ok(log) = host.capture(session) {
+        let _ = std::fs::create_dir_all(logs);
+        let _ = std::fs::write(
+            logs.join(format!("{}.txt", crate::tmux::flatten_agent_name(agent))),
+            log,
+        );
+    }
 }
 
 pub fn now_unix_millis() -> u64 {

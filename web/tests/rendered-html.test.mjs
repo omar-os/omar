@@ -154,7 +154,7 @@ test("the inspector and diagram render the restart rows and badge with id toolti
     readFile(new URL("../app/diagram/diagram-canvas.tsx", import.meta.url), "utf8"),
   ]);
   assert.match(inspector, /restartText\(reaction.restarts\).headline/);
-  assert.match(inspector, /restartRows\(agent.attempts, reaction.name\)/);
+  assert.match(inspector, /restartRows\(attempts, reaction.name\)/);
   assert.match(inspector, /title=\{`Attempt \$\{attempt.id\}`\}/);
   assert.match(inspector, /title=\{attempt.session\}.*attempt.session.slice\(0, 8\)/);
   assert.match(diagram, /className="omar-restart-badge"/);
