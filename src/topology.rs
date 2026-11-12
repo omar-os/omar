@@ -2646,6 +2646,13 @@ impl AgentReactionExecutor {
             Vec::new()
         };
         if tree.is_empty() {
+            anyhow::ensure!(
+                !self
+                    .scoped
+                    .as_ref()
+                    .is_some_and(|workers| workers.launcher.shutdown.load(Ordering::Acquire)),
+                "runtime is shutting down"
+            );
             return Err(WorkerDied {
                 reason: "worker process exited".into(),
                 conversation: window.conversation.clone(),
@@ -3096,6 +3103,10 @@ impl ScopedWorkers {
         attempt: &manager::TopologyAttempt,
         retries: u32,
     ) -> Result<Window> {
+        anyhow::ensure!(
+            retries == 0 || !self.launcher.shutdown.load(Ordering::Acquire),
+            "runtime is shutting down"
+        );
         let agent = &self.states[&invocation.agent];
         let backend = crate::backend::by_name(&agent.backend)
             .context("agent with a lifetime has no backend")?;
@@ -3307,6 +3318,12 @@ impl ScopedWorkers {
             return Ok(());
         };
         let agent = &self.states[&window.agent];
+        deploy::capture_session_log(
+            &self.launcher.client,
+            &window.agent,
+            &window.session,
+            &deploy::logs_dir(&self.launcher.runtime_dir),
+        );
         let stopped = self.stop(
             &window.session,
             &window.attempt,
@@ -3709,6 +3726,8 @@ pub struct TopologyRunConfig<'a> {
     pub inputs: &'a [String],
     pub replace: bool,
     pub timeout: Duration,
+    /// Runtime shutdown must not turn teardown into a worker restart.
+    pub shutdown: Arc<AtomicBool>,
     /// How the run's logical clock is paced against the wall clock.
     pub pace: Pace,
     pub diagram_address: Option<std::net::SocketAddr>,
@@ -4681,6 +4700,7 @@ struct AgentLauncher {
     ea_id: crate::ea::EaId,
     base_prefix: String,
     health_idle_warning: i64,
+    shutdown: Arc<AtomicBool>,
     endpoint: String,
     token: String,
     /// Each instance's worktree and temp directory.
@@ -4721,6 +4741,7 @@ impl AgentLauncher {
             ea_id: config.ea_id,
             base_prefix: config.base_prefix.to_string(),
             health_idle_warning: config.health_idle_warning,
+            shutdown: config.shutdown.clone(),
             endpoint: invocation_server.endpoint.clone(),
             token: invocation_server.token.clone(),
             workspaces: workspaces
@@ -11119,6 +11140,7 @@ mod tests {
                 ea_id: 0,
                 base_prefix: "restart-test".into(),
                 health_idle_warning: 0,
+                shutdown: Arc::new(AtomicBool::new(false)),
                 endpoint: "".into(),
                 token: "".into(),
                 workspaces: BTreeMap::new(),
@@ -11169,7 +11191,13 @@ mod tests {
             1
         );
         client.kill_session(&session).unwrap();
-        let executor = AgentReactionExecutor {
+        workers.launcher.shutdown.store(true, Ordering::Release);
+        let error = workers
+            .open(&invocation, &retry, 1)
+            .err()
+            .expect("shutdown must refuse a retry");
+        assert!(error.to_string().contains("runtime is shutting down"));
+        let mut executor = AgentReactionExecutor {
             client,
             team: "test".into(),
             registry: InvocationRegistry::default(),
@@ -11179,6 +11207,10 @@ mod tests {
         };
         let error = executor.watch_worker(&mut window, None).unwrap_err();
         assert_eq!(error.to_string(), "worker process exited");
+        executor.scoped = Some(workers);
+        let error = executor.watch_worker(&mut window).unwrap_err();
+        assert_eq!(error.to_string(), "runtime is shutting down");
+        assert!(error.downcast_ref::<WorkerDied>().is_none());
     }
 
     #[test]

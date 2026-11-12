@@ -887,6 +887,29 @@ mod tests {
             Some("own-session")
         );
         assert!(!ephemeral_worker(&context));
+        let prompt = dir.path().join("prompt");
+        std::fs::write(&prompt, "Complete the retry.").unwrap();
+        let command = crate::manager::build_agent_command("codex", &prompt, &[], &context);
+        assert!(
+            command.contains("backend-runner --backend codex"),
+            "{command}"
+        );
+        let config = std::fs::read_dir(dir.path().join("mcp/ea-0"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("protocol-")
+            })
+            .unwrap();
+        let config: crate::backend_runner::Config =
+            serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+        assert_eq!(config.initial_session.as_deref(), Some("own-session"));
+        assert!(config
+            .command
+            .contains("--dangerously-bypass-approvals-and-sandbox"));
         let topology = context.topology.as_mut().unwrap();
         topology.resume = None;
         topology.attempt = Some(crate::manager::TopologyAttempt {

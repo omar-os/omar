@@ -315,6 +315,7 @@ def configure(root, home, env, backend, server, live):
         env.update(RESTART_READY=str(root / 'ready'), RESTART_COUNT=str(root / 'count'), RESTART_DEATHS=str(server.deaths))
         profile.append(f'export PATH="{shims}:$PATH"')
     elif backend == 'Codex':
+        profile.append(f'export PATH={shlex.quote(env["PATH"])}')
         codex_home = home / '.codex'
         codex_home.mkdir()
         (codex_home / 'config.toml').write_text(f'''check_for_update_on_startup=false

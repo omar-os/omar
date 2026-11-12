@@ -206,7 +206,13 @@ impl Backend for Codex {
                 })
         });
         let (tui_command, reasoning_effort) = codex_launch_reasoning_effort(base_command);
-        if !codex_refuses_to_attach(&tui_command) {
+        // Older remote TUIs reset permissions on resume. Exec can resume the
+        // same thread with the worker's explicit permissions intact.
+        let retry = mcp_context
+            .topology
+            .as_ref()
+            .is_some_and(|topology| topology.resume.is_some());
+        if !retry && !codex_refuses_to_attach(&tui_command) {
             if let Some(command) = instructions.ok().and_then(|instructions| {
                 codex_server_command(
                     mcp_context,
