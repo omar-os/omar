@@ -2618,7 +2618,7 @@ impl AgentReactionExecutor {
         };
         if tree.is_empty() {
             return Err(WorkerDied {
-                reason: format!("tmux pane exited or process tree gone ({})", window.session),
+                reason: "worker process exited".into(),
                 conversation: window.conversation.clone(),
             }
             .into());
@@ -3010,17 +3010,26 @@ impl ScopedWorkers {
             "run": self.run,
             "logical_agent": invocation.agent,
             "attempt_id": attempt.id,
+            "worker_session": session,
             "backend": agent.backend,
             "native_session_id": Value::Null,
             "verification": if agent.lifetime.is_some() { backend.freshness().name() } else { "unscoped" },
             "retry": retries,
             "resume_session_id": if agent.lifetime.is_none() && !attempt.native_session.is_empty() { Some(&attempt.native_session) } else { None },
-            "conversation_mode": if agent.lifetime.is_some() || attempt.native_session.is_empty() { "fresh conversation (earlier context unavailable)" } else { "resumed native conversation" },
             "lifetime": agent.lifetime,
             "invocations": [served_invocation(invocation)],
             "outcome": "started",
             "cleanup_status": "pending",
         });
+        if retries > 0 {
+            record["conversation_mode"] = json!(if agent.lifetime.is_some()
+                || attempt.native_session.is_empty()
+            {
+                "fresh conversation (earlier context unavailable)"
+            } else {
+                "resumed native conversation"
+            });
+        }
         // Anything already in the session is some earlier worker, and taking
         // it over would be the reuse a new window rules out.
         if agent.lifetime.is_some() && client.has_session(&session)? {
@@ -3033,7 +3042,9 @@ impl ScopedWorkers {
                 invocation.id
             );
         }
-        self.record(&record);
+        if agent.lifetime.is_some() && retries == 0 {
+            self.record(&record);
+        }
         if let Err(error) = self.track(&invocation.agent, Some(&session)) {
             record["outcome"] = json!("refused");
             record["cleanup_status"] = json!("not_started");
@@ -10969,6 +10980,102 @@ mod tests {
     }
 
     #[test]
+    fn worker_attempt_records_label_only_retries_and_start_them_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = TmuxClient::on_server(
+            "restart-test",
+            Some(format!("omar-test-{}", Uuid::new_v4())),
+        );
+        let session = client.session_for("coder");
+        struct Cleanup(TmuxClient, String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.kill_session(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(client.clone(), session.clone());
+        client
+            .new_session(&session, "sleep 60", dir.path().to_str())
+            .unwrap();
+        let agent = AgentState {
+            backend: "Stub".into(),
+            instance: "".into(),
+            lifetime: None,
+        };
+        let workers = ScopedWorkers {
+            states: BTreeMap::from([("coder".into(), agent)]),
+            windows: BTreeMap::new(),
+            launcher: AgentLauncher {
+                client: client.clone(),
+                team: "test".into(),
+                runtime_dir: dir.path().into(),
+                omar_dir: dir.path().into(),
+                ea_id: 0,
+                base_prefix: "restart-test".into(),
+                health_idle_warning: 0,
+                endpoint: "".into(),
+                token: "".into(),
+                workspaces: BTreeMap::new(),
+                resumed: "".into(),
+            },
+            run: "test".into(),
+            deployment: Arc::new(Mutex::new(deploy::DeploymentRecord::create(
+                "test",
+                BTreeMap::new(),
+                60,
+            ))),
+            log: dir.path().join("attempts.jsonl"),
+            seen: Mutex::new(Ok(BTreeSet::new())),
+            publisher: None,
+        };
+        let invocation = InvocationSpec {
+            agent: "coder".into(),
+            ..Default::default()
+        };
+        let original = manager::TopologyAttempt {
+            id: "original".into(),
+            key: "original".into(),
+            native_session: "".into(),
+        };
+        let window = workers.open(&invocation, &original, 0).unwrap();
+        assert!(window.record.get("conversation_mode").is_none());
+        assert_eq!(window.record["worker_session"], session);
+        let retry = manager::TopologyAttempt {
+            id: "retry".into(),
+            key: "retry".into(),
+            native_session: "native".into(),
+        };
+        let mut window = workers.open(&invocation, &retry, 1).unwrap();
+        assert_eq!(
+            window.record["conversation_mode"],
+            "resumed native conversation"
+        );
+        let lines: Vec<Value> = fs::read_to_string(&workers.log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|record| record["attempt_id"] == "retry" && record["outcome"] == "started")
+                .count(),
+            1
+        );
+        client.kill_session(&session).unwrap();
+        let executor = AgentReactionExecutor {
+            client,
+            team: "test".into(),
+            registry: InvocationRegistry::default(),
+            timeout: Duration::from_secs(60),
+            web: BTreeSet::new(),
+            scoped: None,
+        };
+        let error = executor.watch_worker(&mut window).unwrap_err();
+        assert_eq!(error.to_string(), "worker process exited");
+    }
+
+    #[test]
     fn a_task_gets_exactly_two_retries_and_its_failure_names_the_worker_and_task() {
         let task = InvocationSpec {
             id: 42,
@@ -10977,7 +11084,7 @@ mod tests {
             ..Default::default()
         };
         let death = WorkerDied {
-            reason: "tmux pane exited or process tree gone (worker-42)".into(),
+            reason: "worker process exited".into(),
             conversation: "native".into(),
         };
         assert!(retry_task(&task, 0, &death).is_ok());
@@ -10988,8 +11095,7 @@ mod tests {
             "task 42",
             "p.work",
             "after 2 retries",
-            "worker-42",
-            "process tree gone",
+            "worker process exited",
         ] {
             assert!(error.contains(expected), "{error}");
         }

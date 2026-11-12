@@ -423,11 +423,15 @@ def execute(backend, per=False, deaths=1, live=False):
             killer.join(timeout=2)
             output = stdout + stderr
             attempts = {}
+            started_attempts = []
             for path in state.rglob('attempts.jsonl'):
                 for line in path.read_text().splitlines():
                     record = json.loads(line)
+                    if record['outcome'] == 'started' and record.get('retry', 0) > 0:
+                        started_attempts.append(record['attempt_id'])
                     attempts[record['attempt_id']] = record
             records = list(attempts.values())
+            assert len(started_attempts) == len(set(started_attempts)), started_attempts
             detail = output + '\n' + json.dumps(records) + ('\nLast worker screen:\n' + ''.join(screens) if live else '')
             if not live and backend == 'Agy':
                 assert not (home / '.gemini/config').exists(), 'workflow MCP must be session-scoped'
@@ -447,7 +451,7 @@ def execute(backend, per=False, deaths=1, live=False):
                     assert records[0]['native_session_id'] == records[-1]['native_session_id'], detail
             else:
                 assert process.returncode != 0, detail
-                for expected in ['p.coder', 'task ', 'after 2 retries', 'tmux pane exited or process tree gone']:
+                for expected in ['p.coder', 'task ', 'after 2 retries', 'worker process exited']:
                     assert expected in output, detail
             print(f'PASS: {backend}{" per task" if per else ""} {"live" if live else "local provider"}: '
                   f'{deaths} worker death(s), ' + ('completed' if deaths <= 2 else 'failed after 2 retries'), flush=True)

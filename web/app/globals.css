@@ -1007,6 +1007,17 @@ h2 {
   font-weight: 500;
 }
 
+.omar-restart-badge rect {
+  fill: var(--dia-chrome);
+  stroke: var(--dia-badge-line);
+}
+
+.omar-restart-badge text {
+  fill: var(--dia-meta);
+  font-size: 0.6875rem;
+  font-weight: 600;
+}
+
 .omar-reaction.completed .omar-reaction-body {
   fill: var(--dia-done);
   stroke: #5d9c7b;

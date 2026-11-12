@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { restartRows, restartText } from "../app/lib/attempts.ts";
 
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -119,4 +120,43 @@ test("uses the LF-inspired visual grammar without KIELER", async () => {
   // The LF look is reproduced with the web stack; KIELER/KLighD is never pulled in.
   assert.doesNotMatch(manifest, /kieler|klighd/i);
   assert.doesNotMatch(diagram, /(?:import|require)\s*\(?[^\n)]*(?:kieler|klighd)/i);
+});
+
+
+test("restarted tasks have readable attempt rows in order and concise badge text", () => {
+  const record = (id, task, retry, outcome, extra = {}) => ({
+    attempt_id: id, native_session_id: "01a1cdfa-full-native-session", retry, outcome,
+    invocations: [{ reaction: "b.reaction.0", invocation_id: task }], ...extra,
+  });
+  const rows = restartRows([
+    record("older-task", 7, 0, "completed"),
+    record("dead-attempt", 8, 0, "died", { death_reason: "worker process exited", started_at: "2026-11-11T12:30:00Z" }),
+    record("retry-attempt", 8, 1, "completed", { conversation_mode: "resumed native conversation" }),
+  ], "b.reaction.0");
+  assert.deepEqual(rows.map((row) => row.summary), [
+    "Attempt 1 · died — worker process exited",
+    "Attempt 2 · retry 1 of 2 · resumed its conversation · completed",
+  ]);
+  assert.equal(rows[0].time, "2026-11-11T12:30:00.000Z");
+  assert.equal(rows[1].time, null);
+  assert.equal(rows[0].session.slice(0, 8), "01a1cdfa");
+  assert.ok(rows.every((row) => !row.summary.includes(row.id) && !row.summary.includes(row.session)));
+  assert.deepEqual(restartText(1), { headline: "1 restart", badge: "restarted ×1" });
+  assert.deepEqual(restartText(2), { headline: "2 restarts", badge: "restarted ×2" });
+  const fresh = restartRows([record("fresh", 9, 2, "open", { lifetime: { count: 1, unit: "task" } })], "b.reaction.0");
+  assert.match(fresh[0].summary, /retry 2 of 2 · new conversation · in progress/);
+  assert.deepEqual(restartRows([], "b.reaction.0"), []);
+});
+
+test("the inspector and diagram render the restart rows and badge with id tooltips", async () => {
+  const [inspector, diagram] = await Promise.all([
+    readFile(new URL("../app/step-inspector.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/diagram/diagram-canvas.tsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(inspector, /restartText\(reaction.restarts\).headline/);
+  assert.match(inspector, /restartRows\(agent.attempts, reaction.name\)/);
+  assert.match(inspector, /title=\{`Attempt \$\{attempt.id\}`\}/);
+  assert.match(inspector, /title=\{attempt.session\}.*attempt.session.slice\(0, 8\)/);
+  assert.match(diagram, /className="omar-restart-badge"/);
+  assert.match(diagram, /restartText\(reaction.restarts\).badge/);
 });
