@@ -121,6 +121,39 @@ Reach a nested port from outside with the full path: `run.draft.out`.
 Nest when it makes a program clearer — a team that is used twice is worth
 naming once — not for its own sake.
 
+A team can keep values between its tasks. `state` is one any task of the team
+reads as `$(name)` and may change with `omar_set_state`. `context` is state the
+named agents keep together: the runtime hands it to them in every invocation,
+and each must set it or keep it before its task completes. No prompt has to
+mention it:
+
+```
+team Trip[scout : Claude, planner : Claude]
+{
+    input request : string
+    output plan : string
+    action area : string
+    state round : int = 1
+
+    context constraints(scout, planner) """
+        The traveler's hard constraints, one per line. Never drop one.
+    """
+
+    task scout(request) -> area "Round $(round). Pick a neighborhood for: $(request)"
+    task planner(area) -> plan "Plan one dinner near $(area)."
+}
+
+main Trip { t = Trip() }
+```
+
+Reach for a context when agents of one team need the same accumulated
+knowledge — constraints, decisions, findings — instead of threading it through
+extra ports or repeating it in every prompt. A context belongs to one instance:
+nested and sibling teams cannot see it, so keep the agents that must share it
+in the same team, and send values to other teams through ports. Give it a
+one-line directive saying what to keep, or a name that says it. A `Web` agent
+cannot be listed in a context yet.
+
 Always name the main block, as `Relay` is named above. That name identifies the
 run in Mission Control, and the runtime lets only one run of a given name go at
 a time, so two designs sharing a name cannot run together.
@@ -140,7 +173,8 @@ https://raw.githubusercontent.com/omar-os/omar/main/lang/spec.md
 
 Fetch it before proposing anything the summary does not cover: types beyond
 `int` and `string`, optional or alternative effects (`log?`, `(a | b)`),
-`within(...)` deadlines, `after` delays on connections, or `action` ports. It
+`within(...)` deadlines, `after` delays on connections, `action` ports, or
+`state` and `context` beyond the example above. It
 is the same spec the compiler implements, so it settles what compiles.
 
 If you cannot reach the network, propose from the summary above and say which

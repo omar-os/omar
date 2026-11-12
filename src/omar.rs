@@ -120,10 +120,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Connect an external messaging platform to an approved workflow
+    /// Connect an external messaging platform to approved saved workflows
     Messaging {
         #[command(subcommand)]
         command: messaging::Command,
+    },
+    /// Reopen the default workspace, starting its runtime only when needed
+    Open {
+        #[arg(long)]
+        print_url: bool,
     },
     /// Create a new independent background runtime, or restart a stopped one by name on this build
     Up(sessions::UpOptions),
@@ -240,7 +245,7 @@ enum Commands {
     /// Configure tmux for optimal omar experience
     SetupTmux,
 
-    /// Show which agent backends are installed and signed in
+    /// Show the connected agent backends, or the named ones
     Backends {
         /// Print JSON instead of a table
         #[arg(long)]
@@ -258,6 +263,16 @@ enum Commands {
     Connect {
         /// claude, codex, cursor, opencode, pi or agy; omit to pick from a list
         backend: Option<String>,
+        /// Sign in again even if its sign-in works, to switch to another
+        /// account or kind of sign-in
+        #[arg(long, requires = "backend")]
+        replace: bool,
+    },
+
+    /// Sign an agent backend out
+    Disconnect {
+        /// claude, codex, cursor, opencode, pi or agy
+        backend: String,
     },
 
     /// Restore authoritative coordination state to a backend lifecycle hook.
@@ -573,6 +588,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     match cli.command {
         Some(
             Commands::Messaging { .. }
+            | Commands::Open { .. }
             | Commands::Up(_)
             | Commands::Ls
             | Commands::Info
@@ -679,7 +695,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             check,
             backends,
         }) => check_backends(json, check, &backends),
-        Some(Commands::Connect { backend: None }) => {
+        Some(Commands::Connect { backend: None, .. }) => {
             use std::io::IsTerminal;
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                 crate::backend::connect::wizard()
@@ -690,14 +706,10 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         }
         Some(Commands::Connect {
             backend: Some(name),
-        }) => {
-            let backend = crate::backend::resolve(&name).map_err(anyhow::Error::msg)?;
-            anyhow::ensure!(
-                crate::backend::ASSISTANT.contains(&backend.kind()),
-                "{} is not an agent backend to connect",
-                backend.kind().name()
-            );
-            crate::backend::connect::host(backend)
+            replace,
+        }) => crate::backend::connect::host(assistant_backend(&name)?, replace),
+        Some(Commands::Disconnect { backend }) => {
+            crate::backend::connect::disconnect(assistant_backend(&backend)?)
         }
         Some(Commands::Ea {
             action: sessions::EaAction::Event { action },
@@ -827,7 +839,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
 /// `omar --help` lists commands by what they are for. The last section is
 /// what OMAR launches inside agent panes and hooks; a person never types it.
 const HELP_SECTIONS: &[(&str, &[&str])] = &[
-    ("Backends", &["connect", "backends"]),
+    ("Backends", &["connect", "disconnect", "backends"]),
     (
         "Sessions",
         &["up", "ls", "info", "attach", "logs", "down", "rm", "serve"],
@@ -864,7 +876,8 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Each backend's status, under the Backends commands in help.
+/// The connected backends, under the Backends commands in help; `omar
+/// connect` lists the rest.
 fn backends_help() -> String {
     use crate::backend::{connection, Connection};
     let mut out = String::new();
@@ -872,11 +885,15 @@ fn backends_help() -> String {
         let name = backend.kind().name();
         let next = match status {
             Connection::Connected { .. } => String::new(),
-            _ => format!("omar connect {name}"),
+            Connection::SignedOut | Connection::NotInstalled => continue,
+            Connection::Unknown { .. } => format!("omar connect {name}"),
         };
         let row = format!("    {name:<10}{:<26}{next}", connection::label(&status));
         out += row.trim_end();
         out.push('\n');
+    }
+    if out.is_empty() {
+        out += "    No backend is connected yet.\n";
     }
     out
 }
@@ -1559,9 +1576,20 @@ fn sync_tmux_setup_warning(app: &mut app::App) {
 }
 
 /// Interactive tmux configuration setup.
+/// The agent backend `name` names, for `omar connect` and `omar disconnect`.
+fn assistant_backend(name: &str) -> Result<&'static dyn crate::backend::Backend> {
+    let backend = crate::backend::resolve(name).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        crate::backend::ASSISTANT.contains(&backend.kind()),
+        "{} is not an agent backend to connect",
+        backend.kind().name()
+    );
+    Ok(backend)
+}
+
 /// Every assistant backend's sign-in, as a table or as JSON.
 fn backends_report(json: bool) -> String {
-    report_backends(&crate::backend::connection::assistants(), &[], json)
+    report_backends(&crate::backend::connection::assistants(), &[], json, true)
 }
 
 /// `omar backends`: the report for the named backends (all when none), and
@@ -1626,7 +1654,10 @@ fn check_backends(json: bool, check: bool, names: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
-    print!("{}", report_backends(&statuses, &checks, json));
+    print!(
+        "{}",
+        report_backends(&statuses, &checks, json, !names.is_empty())
+    );
     let failed = checks
         .iter()
         .flatten()
@@ -1643,6 +1674,7 @@ fn report_backends(
     )],
     checks: &[Option<Result<(), String>>],
     json: bool,
+    all: bool,
 ) -> String {
     use crate::backend::{connection, Connection};
     let check_of = |index: usize| checks.get(index).and_then(Option::as_ref);
@@ -1674,16 +1706,53 @@ fn report_backends(
             None => {}
         }
     }
-    let mut out = format!("{:<10}{:<28}NEXT\n", "BACKEND", "STATUS");
-    for (backend, status) in statuses {
-        let name = backend.kind().name();
-        let next = match status {
-            Connection::Connected { .. } => String::new(),
-            _ => format!("omar connect {name}"),
-        };
-        let row = format!("{name:<10}{:<28}{next}", connection::label(status));
-        out += row.trim_end();
+    // The table lists what is connected, so it stays short however many
+    // backends OMAR supports; `omar connect` lists the rest. An unreadable
+    // status may be a working sign-in, so it is listed too.
+    let shown: Vec<_> = statuses
+        .iter()
+        .filter(|(_, status)| {
+            all || !matches!(status, Connection::SignedOut | Connection::NotInstalled)
+        })
+        .collect();
+    let next_of = |(backend, status): &&(&dyn crate::backend::Backend, Connection)| match status {
+        Connection::Connected { .. } => String::new(),
+        _ => format!("omar connect {}", backend.kind().name()),
+    };
+    let mut out = String::new();
+    if !shown.is_empty() {
+        let next = shown.iter().any(|row| !next_of(row).is_empty());
+        // As wide as the longest status, which can be a CLI's own words.
+        let width = shown
+            .iter()
+            .map(|(_, status)| connection::label(status).chars().count() + 2)
+            .max()
+            .unwrap_or(0)
+            .max(28);
+        let header = format!(
+            "{:<10}{:<width$}{}",
+            "BACKEND",
+            "STATUS",
+            if next { "NEXT" } else { "" }
+        );
+        out += header.trim_end();
         out.push('\n');
+        for row in &shown {
+            let (backend, status) = row;
+            let line = format!(
+                "{:<10}{:<width$}{}",
+                backend.kind().name(),
+                connection::label(status),
+                next_of(row)
+            );
+            out += line.trim_end();
+            out.push('\n');
+        }
+    }
+    if shown.is_empty() {
+        out += "No backend is connected. Use `omar connect` to add one.\n";
+    } else if shown.len() < statuses.len() {
+        out += "\nUse `omar connect` to add more backends.\n";
     }
     if !lines.is_empty() {
         out.push('\n');

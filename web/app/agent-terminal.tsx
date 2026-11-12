@@ -23,6 +23,7 @@ export function AgentTerminal({
   url: socketUrl,
   title,
   note,
+  onEnded,
   onClose,
 }: {
   serveUrl: string;
@@ -35,10 +36,17 @@ export function AgentTerminal({
   note?: ReactNode;
   /** A view port drops keystrokes and resizes, so neither is sent. */
   readOnly?: boolean;
+  /** Its session ended, as a sign-in's does when its command finishes. */
+  onEnded?: () => void;
   onClose: () => void;
 }) {
   const screenRef = useRef<HTMLDivElement | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
+  // Read when the socket closes, so a new callback needs no new socket.
+  const endedRef = useRef(onEnded);
+  useEffect(() => {
+    endedRef.current = onEnded;
+  });
   const [error, setError] = useState("");
   const [size, setSize] = useState<{ cols: number; rows: number } | null>(null);
 
@@ -136,6 +144,8 @@ export function AgentTerminal({
       // 1000 and 1005 are an ordinary close, including the one we ask for.
       if (event.code !== 1000 && event.code !== 1005) {
         setError(`The terminal closed (${event.code}).`);
+      } else if (event.reason === "ended") {
+        endedRef.current?.();
       }
     };
 
