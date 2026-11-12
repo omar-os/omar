@@ -15,6 +15,47 @@ use std::time::Duration;
 pub struct Opencode;
 
 impl Backend for Opencode {
+    fn blocked_input(
+        &self,
+        target: &super::Target<'_>,
+        _hook_file: &std::path::Path,
+    ) -> Option<String> {
+        pending_input(target).map(|(id, _)| id)
+    }
+    fn answer_input(
+        &self,
+        target: &super::Target<'_>,
+        _hook_file: &std::path::Path,
+        id: &str,
+        text: &str,
+    ) -> Result<bool> {
+        let Some((current, request)) = pending_input(target).filter(|(current, _)| current == id)
+        else {
+            return Ok(false);
+        };
+        let (port, _) = from_stamp(target.stamp.context("OpenCode has no stamp")?)
+            .context("invalid OpenCode stamp")?;
+        let (kind, id) = current.split_once(':').context("invalid input id")?;
+        let body = if kind == "question" {
+            serde_json::json!({"answers":request["questions"].as_array().context("question omitted questions")?.iter().map(|_| vec![text]).collect::<Vec<_>>()})
+        } else {
+            serde_json::json!({"reply":"reject","message":text})
+        };
+        let (status, _) = http_json(
+            port,
+            "POST",
+            &format!("/{kind}/{id}/reply"),
+            Some(&body.to_string()),
+        )?;
+        if status == 404 {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            (200..300).contains(&status),
+            "OpenCode rejected question response (HTTP {status})"
+        );
+        Ok(true)
+    }
     fn ended_turn(
         &self,
         target: &super::Target<'_>,
@@ -190,6 +231,29 @@ impl Backend for Opencode {
             None => Ok(None),
         }
     }
+}
+
+fn pending_input(target: &super::Target<'_>) -> Option<(String, serde_json::Value)> {
+    let (port, session) = from_stamp(target.stamp?)?;
+    for kind in ["question", "permission"] {
+        let Ok((200, body)) = http_json(port, "GET", &format!("/{kind}"), None) else {
+            continue;
+        };
+        let Ok(requests) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        if let Some(request) = requests
+            .as_array()?
+            .iter()
+            .find(|request| request["sessionID"] == session)
+        {
+            return Some((
+                format!("{kind}:{}", request["id"].as_str()?),
+                request.clone(),
+            ));
+        }
+    }
+    None
 }
 
 /// Give opencode a port so OMAR can reach it without the input box.
@@ -708,6 +772,47 @@ mod tests {
             seen
         });
         (port, server)
+    }
+
+    #[test]
+    fn user_input_is_scoped_to_its_session_and_permissions_are_declined() {
+        for kind in ["question", "permission"] {
+            let request = r#"[{"id":"other","sessionID":"ses_other","questions":[{}]}, {"id":"own","sessionID":"ses_own","questions":[{},{}]}]"#;
+            let mut script = Vec::new();
+            for _ in 0..2 {
+                if kind == "permission" {
+                    script.push((200, r#"[{"id":"other","sessionID":"ses_other"}]"#));
+                }
+                script.push((200, request));
+            }
+            script.push((200, "true"));
+            let (port, server) = scripted(script);
+            let stamp = format!("opencode:{port}:ses_own");
+            let target = super::super::Target {
+                name: "worker",
+                pane_pid: 0,
+                stamp: Some(&stamp),
+            };
+            let path = std::path::Path::new("unused");
+            let id = Opencode.blocked_input(&target, path).unwrap();
+            assert_eq!(id, format!("{kind}:own"));
+            assert!(Opencode
+                .answer_input(&target, path, &id, "OMAR REMINDER")
+                .unwrap());
+            let seen = server.join().unwrap();
+            let (route, body) = seen.last().unwrap();
+            assert_eq!(route, &format!("POST /{kind}/own/reply HTTP/1.1"));
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            if kind == "question" {
+                assert_eq!(
+                    body["answers"],
+                    serde_json::json!([["OMAR REMINDER"], ["OMAR REMINDER"]])
+                );
+            } else {
+                assert_eq!(body["reply"], "reject");
+                assert_eq!(body["message"], "OMAR REMINDER");
+            }
+        }
     }
 
     /// An attempt's session is created with the id it was given, once the

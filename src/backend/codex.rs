@@ -28,6 +28,11 @@ impl Backend for Codex {
             )
             .ok()?;
         let ended = completed_turn(&state);
+        let inputs = session
+            .inputs
+            .drain(..)
+            .filter(|input| input["params"]["threadId"] == thread)
+            .collect();
         session
             .socket
             .get_mut()
@@ -37,6 +42,7 @@ impl Backend for Codex {
             session,
             thread,
             ended,
+            inputs,
         }))
     }
     fn ended_turn(&self, target: &super::Target<'_>, _hook_file: &Path) -> Option<String> {
@@ -631,6 +637,7 @@ pub fn codex_socket_path(home: &Path) -> PathBuf {
 pub(crate) struct CodexSession {
     socket: tungstenite::WebSocket<UnixStream>,
     next_id: u64,
+    inputs: Vec<serde_json::Value>,
 }
 
 fn completed_turn(value: &serde_json::Value) -> Option<String> {
@@ -648,6 +655,7 @@ struct CodexTurnMonitor {
     session: CodexSession,
     thread: String,
     ended: Option<String>,
+    inputs: Vec<serde_json::Value>,
 }
 
 impl super::TurnMonitor for CodexTurnMonitor {
@@ -662,10 +670,16 @@ impl super::TurnMonitor for CodexTurnMonitor {
                         continue;
                     }
                     match event["method"].as_str() {
+                        // Nonmodal questions in Default mode still await a reply.
+                        Some("item/tool/requestUserInput") => self.inputs.push(event),
+                        Some("serverRequest/resolved") => self
+                            .inputs
+                            .retain(|input| input["id"] != event["params"]["requestId"]),
                         Some("turn/started") => self.ended = None,
                         Some("turn/completed")
                             if event["params"]["turn"]["status"] == "completed" =>
                         {
+                            self.inputs.clear();
                             self.ended = event["params"]["turn"]["id"].as_str().map(str::to_owned);
                         }
                         Some("thread/status/changed")
@@ -693,6 +707,36 @@ impl super::TurnMonitor for CodexTurnMonitor {
         }
         self.ended.clone()
     }
+
+    fn blocked_input(&self) -> Option<String> {
+        self.inputs
+            .first()
+            .map(|input| format!("{}:{}", input["id"], input["params"]["itemId"]))
+    }
+
+    fn answer_input(&mut self, id: &str, text: &str) -> Result<bool> {
+        let Some(input) = self
+            .inputs
+            .first()
+            .filter(|_| self.blocked_input().as_deref() == Some(id))
+        else {
+            return Ok(false);
+        };
+        let answers: serde_json::Map<String, serde_json::Value> = input["params"]["questions"]
+            .as_array()
+            .context("question request omitted questions")?
+            .iter()
+            .filter_map(|question| {
+                question["id"]
+                    .as_str()
+                    .map(|id| (id.to_owned(), serde_json::json!({"answers":[text]})))
+            })
+            .collect();
+        self.session
+            .send(serde_json::json!({"id":input["id"],"result":{"answers":answers}}))?;
+        self.inputs.remove(0);
+        Ok(true)
+    }
 }
 
 impl CodexSession {
@@ -719,7 +763,11 @@ impl CodexSession {
             }
         })?;
 
-        let mut session = CodexSession { socket, next_id: 1 };
+        let mut session = CodexSession {
+            socket,
+            next_id: 1,
+            inputs: Vec::new(),
+        };
         session
             .call(
                 "initialize",
@@ -728,7 +776,8 @@ impl CodexSession {
                         "name": "omar",
                         "title": "omar",
                         "version": env!("CARGO_PKG_VERSION"),
-                    }
+                    },
+                    "capabilities": {"experimentalApi":true},
                 }),
             )
             .context("initialize the app-server session")?;
@@ -772,7 +821,15 @@ impl CodexSession {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
                 continue;
             };
-            if value.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
+            if value["method"] == "item/tool/requestUserInput" {
+                self.inputs.push(value.clone());
+            } else if value["method"] == "serverRequest/resolved" {
+                self.inputs
+                    .retain(|input| input["id"] != value["params"]["requestId"]);
+            }
+            if value.get("method").is_some()
+                || value.get("id").and_then(serde_json::Value::as_u64) != Some(id)
+            {
                 continue;
             }
             if let Some(error) = value.get("error") {
@@ -1052,6 +1109,78 @@ mod tests {
             std::fs::read_to_string(history).unwrap(),
             "persistent conversation"
         );
+    }
+
+    #[test]
+    fn a_resumed_nonmodal_question_is_answered_on_its_own_request() {
+        let dir = short_tempdir();
+        let path = dir.path().join("input.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let read = |socket: &mut tungstenite::WebSocket<UnixStream>| -> serde_json::Value {
+                let message = socket.read().unwrap();
+                serde_json::from_str(message.to_text().unwrap()).unwrap()
+            };
+            let send = |socket: &mut tungstenite::WebSocket<UnixStream>,
+                        value: serde_json::Value| {
+                socket
+                    .send(tungstenite::Message::Text(value.to_string()))
+                    .unwrap();
+            };
+            let init = read(&mut socket);
+            assert_eq!(init["params"]["capabilities"]["experimentalApi"], true);
+            send(
+                &mut socket,
+                serde_json::json!({"id":init["id"],"result":{}}),
+            );
+            assert_eq!(read(&mut socket)["method"], "initialized");
+            let list = read(&mut socket);
+            send(
+                &mut socket,
+                serde_json::json!({"id":list["id"],"result":{"data":["own"]}}),
+            );
+            let resume = read(&mut socket);
+            assert_eq!(resume["method"], "thread/resume");
+            for (id, thread) in [
+                (resume["id"].as_u64().unwrap(), "own"),
+                (43, "another-task"),
+                (44, "own"),
+            ] {
+                send(
+                    &mut socket,
+                    serde_json::json!({"id":id,"method":"item/tool/requestUserInput","params":{
+                    "threadId":thread,"turnId":"turn","itemId":"question","isBlocking":false,
+                    "questions":[{"id":"audience"},{"id":"length"}]}}),
+                );
+            }
+            send(
+                &mut socket,
+                serde_json::json!({"id":resume["id"],"result":{"thread":{"status":{"type":"active"},"turns":[]}}}),
+            );
+            (read(&mut socket), resume["id"].clone())
+        });
+        let stamp = format!("codex:{}", path.display());
+        let mut monitor = Codex
+            .turn_monitor(&super::super::Target {
+                name: "worker",
+                pane_pid: 0,
+                stamp: Some(&stamp),
+            })
+            .unwrap();
+        let id = monitor.blocked_input().unwrap();
+        assert!(!monitor.answer_input("another-request", "wrong").unwrap());
+        assert!(monitor.answer_input(&id, "OMAR REMINDER").unwrap());
+        assert!(monitor.blocked_input().unwrap().starts_with("44:"));
+        let (answer, request_id) = server.join().unwrap();
+        assert_eq!(answer["id"], request_id);
+        for id in ["audience", "length"] {
+            assert_eq!(
+                answer["result"]["answers"][id]["answers"],
+                serde_json::json!(["OMAR REMINDER"])
+            );
+        }
     }
 
     /// Play the app-server's half of one delivery and report what it was

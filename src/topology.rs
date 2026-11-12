@@ -2579,7 +2579,11 @@ impl AgentReactionExecutor {
         if !self.web.contains(&invocation.agent) {
             if let Some(window) = window.as_deref_mut() {
                 self.watch_worker(window, None)?;
-                turns.seen = window.ended_turn(&self.client);
+                let ended = window.ended_turn(&self.client);
+                turns.seen = window
+                    .blocked_input(&self.client)
+                    .map(|id| format!("input:{id}"))
+                    .or(ended);
             }
             let mut message = invocation_message(invocation, rendered)?;
             if retries > 0 {
@@ -2665,10 +2669,11 @@ impl AgentReactionExecutor {
         window.tree.dedup();
         window.observe_conversation(&self.client);
         if let Some((invocation, turns)) = task {
+            let ended = window.ended_turn(&self.client);
+            let input = window.blocked_input(&self.client);
+            let stopped = input.as_ref().map(|id| format!("input:{id}")).or(ended);
             // Usage-limit waiting can veto recovery here alongside completion.
-            if !self.registry.answered(&invocation.id)
-                && turns.stopped(window.ended_turn(&self.client), Instant::now())
-            {
+            if !self.registry.answered(&invocation.id) && turns.stopped(stopped, Instant::now()) {
                 if turns.reminded {
                     return Err(WorkerDied {
                         reason: "stopped without finishing after a reminder".into(),
@@ -2680,12 +2685,18 @@ impl AgentReactionExecutor {
                     "OMAR REMINDER\ntask_id: {}\nYour task is still open. Required output contract: {}. Outputs: {}. Finish the task, set its required outputs with omar_set_port, and call omar_complete with this task_id. No questions will be answered. Continue now.",
                     invocation.id, invocation.contract, serde_json::to_string(&invocation.effect_names)?,
                 );
-                self.client.deliver_prompt_until(
-                    &window.session,
-                    &message,
-                    &DeliveryOptions::default(),
-                    &|| self.registry.answered(&invocation.id),
-                )?;
+                if let Some(id) = &input {
+                    if !window.answer_input(&self.client, id, &message)? {
+                        return Ok(());
+                    }
+                } else {
+                    self.client.deliver_prompt_until(
+                        &window.session,
+                        &message,
+                        &DeliveryOptions::default(),
+                        &|| self.registry.answered(&invocation.id),
+                    )?;
+                }
                 turns.seen = turns.idle.take().map(|(id, _)| id);
                 turns.reminded = true;
                 window.record["outcome"] = json!("open");
@@ -2703,6 +2714,7 @@ impl AgentReactionExecutor {
                     "task_id": invocation.id, "reaction": invocation.reaction_id,
                     "invocation_id": logical_id,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "reason": if input.is_some() { "asked the user a question" } else { "stopped without finishing" },
                 }));
                 if let Some(workers) = &self.scoped {
                     workers.record(&window.record);
@@ -2796,6 +2808,45 @@ struct Window {
 }
 
 impl Window {
+    fn blocked_input(&self, client: &TmuxClient) -> Option<String> {
+        if let Some(monitor) = &self.turn_monitor {
+            return monitor.blocked_input();
+        }
+        let backend = crate::backend::by_name(self.record["backend"].as_str()?)?;
+        let stamp = client.session_delivery(&self.session);
+        backend.blocked_input(
+            &crate::backend::Target {
+                name: &self.session,
+                pane_pid: client.get_pane_pid(&self.session).ok()?,
+                stamp: stamp.as_deref(),
+            },
+            &self.turn_file,
+        )
+    }
+
+    fn answer_input(&mut self, client: &TmuxClient, id: &str, text: &str) -> Result<bool> {
+        if let Some(monitor) = &mut self.turn_monitor {
+            return monitor.answer_input(id, text);
+        }
+        let backend = crate::backend::by_name(
+            self.record["backend"]
+                .as_str()
+                .context("worker has no backend")?,
+        )
+        .context("unknown worker backend")?;
+        let stamp = client.session_delivery(&self.session);
+        backend.answer_input(
+            &crate::backend::Target {
+                name: &self.session,
+                pane_pid: client.get_pane_pid(&self.session)?,
+                stamp: stamp.as_deref(),
+            },
+            &self.turn_file,
+            id,
+            text,
+        )
+    }
+
     fn ended_turn(&mut self, client: &TmuxClient) -> Option<String> {
         let backend = crate::backend::by_name(self.record["backend"].as_str()?)?;
         let stamp = client.session_delivery(&self.session);

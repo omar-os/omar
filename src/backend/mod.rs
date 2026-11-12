@@ -249,9 +249,37 @@ pub struct TopologyInvocation<'a> {
 
 pub(crate) trait TurnMonitor: Send {
     fn ended_turn(&mut self) -> Option<String>;
+    fn blocked_input(&self) -> Option<String>;
+    fn answer_input(&mut self, id: &str, text: &str) -> Result<bool>;
 }
 
 pub trait Backend: Send + Sync {
+    fn blocked_input(&self, target: &Target<'_>, hook_file: &Path) -> Option<String> {
+        if target.stamp.and_then(managed::from_stamp).is_some() {
+            return managed::blocked_input(target);
+        }
+        let value: Value = serde_json::from_slice(&std::fs::read(hook_file).ok()?).ok()?;
+        value["input"].as_str().map(str::to_owned)
+    }
+    fn answer_input(
+        &self,
+        target: &Target<'_>,
+        hook_file: &Path,
+        id: &str,
+        text: &str,
+    ) -> Result<bool> {
+        if target.stamp.and_then(managed::from_stamp).is_some() {
+            return managed::answer_input(target, id, text);
+        }
+        if self.blocked_input(target, hook_file).as_deref() != Some(id) {
+            return Ok(false);
+        }
+        crate::manager::write_private_file(
+            &hook_file.with_extension("answer.json"),
+            &serde_json::to_vec(&serde_json::json!({"id":id,"text":text}))?,
+        )?;
+        Ok(true)
+    }
     fn turn_monitor(&self, _target: &Target<'_>) -> Option<Box<dyn TurnMonitor>> {
         None
     }

@@ -1,9 +1,22 @@
 import net from "node:net";
 import { chmod, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 
 // One private socket per launch. It is published only after MCP discovery.
 export async function startDelivery(path, pi, ctx, turn = {}) {
   if (!path) return undefined;
+  turn.inputs = [];
+  if (process.env.OMAR_PI_TOPOLOGY === "1" && ctx?.ui) {
+    for (const method of ["select", "confirm", "input", "editor", "custom"]) {
+      ctx.ui[method] = () => new Promise((resolve) => {
+        turn.inputs.push({ id: randomUUID(), answer: (text) => {
+          pi.sendMessage({ customType: "omar_event", content: text, display: true },
+            { triggerTurn: true, deliverAs: "steer" });
+          resolve(method === "confirm" ? false : ["input", "editor"].includes(method) ? text : undefined);
+        } });
+      });
+    }
+  }
   const clients = new Set();
   const server = net.createServer((socket) => {
     clients.add(socket);
@@ -19,7 +32,14 @@ export async function startDelivery(path, pi, ctx, turn = {}) {
       socket.removeAllListeners("data");
       try {
         const message = JSON.parse(input.slice(0, input.indexOf("\n")));
-        if (message.turn === true) {
+        if (message.input === true) {
+          socket.end(JSON.stringify({ blocked: turn.inputs[0]?.id ?? null }) + "\n");
+        } else if (typeof message.answer_input === "string") {
+          const pending = turn.inputs[0];
+          const answered = pending?.id === message.answer_input;
+          if (answered) { turn.inputs.shift(); pending.answer(message.text); }
+          socket.end(JSON.stringify({ answered }) + "\n");
+        } else if (message.turn === true) {
           socket.end(JSON.stringify({ ended: turn.idle ? turn.id : null }) + "\n");
         } else if (message.session === true) {
           // The file `--session` reopens, and the id, which is all a

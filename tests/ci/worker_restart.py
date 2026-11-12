@@ -45,6 +45,12 @@ class Provider(BaseHTTPRequestHandler):
         request = json.loads(self.rfile.read(int(self.headers.get('content-length', '0'))))
         self.server.requests.append(request)
         scenario = getattr(self.server, 'scenario', None)
+        names = tool_names(request)
+        for tool in request.get('tools', []):
+            for inner in [tool, *tool.get('tools', [])]:
+                name = inner.get('function', {}).get('name', inner.get('name', ''))
+                if name in ['request_user_input', 'question', 'ask_user', 'bash']:
+                    names[name] = (tool.get('name') if inner is not tool else None, name)
         chat = 'messages' in request
         items = request.get('messages' if chat else 'input', [])
         text = json.dumps(items)
@@ -56,7 +62,17 @@ class Provider(BaseHTTPRequestHandler):
             last = items[-1] if items else {}
             done = last.get('tool_call_id' if chat else 'call_id', '')
             reminded = re.search(r'OMAR REMINDER.{0,20}task_id: ' + str(task) + r'\D', text)
-            if scenario == 'ignore' or (scenario == 'complete' and not reminded):
+            if scenario == 'question_permission' and not reminded:
+                calls = [('call_permission', 'bash', {'command':'printf permission-probe', 'description':'permission probe'})]
+            elif scenario and scenario.startswith('question') and (scenario.endswith('ignore') or not reminded):
+                name = next(name for name in ['request_user_input', 'question', 'ask_user'] if name in names)
+                question = {'header': 'Audience', 'question': 'Who is the audience for this summary?',
+                            'options': [{'label': label, 'description': label} for label in ['General readers', 'Young students', 'Science students']]}
+                if name == 'request_user_input': question['id'] = 'audience'
+                args = {'questions': [question]} if name != 'ask_user' else {'question': question['question']}
+                self.server.questions += 1
+                calls = [('call_question', name, args)]
+            elif scenario == 'ignore' or (scenario == 'complete' and not reminded):
                 calls = []
             elif done.startswith('call_set'):
                 if task not in self.server.killed and len(self.server.killed) < self.server.deaths:
@@ -78,12 +94,12 @@ class Provider(BaseHTTPRequestHandler):
                            'value': 'recovered' if scenario or 'This is retry' in text else 'discard-me'})]
         n = len(self.server.requests)
         if chat:
-            names = {bare: t['function']['name'] for t in request.get('tools', [])
-                     for bare in ['omar_set_port', 'omar_complete']
+            chat_names = {bare: t['function']['name'] for t in request.get('tools', [])
+                     for bare in ['omar_set_port', 'omar_complete', 'question', 'ask_user', 'bash']
                      if t.get('function', {}).get('name', '').endswith(bare)}
             delta = {'role': 'assistant', 'tool_calls': [
                 {'index': i, 'id': f'{kind}_{n}', 'type': 'function',
-                 'function': {'name': names[name], 'arguments': json.dumps(args)}}
+                 'function': {'name': chat_names[name], 'arguments': json.dumps(args)}}
                 for i, (kind, name, args) in enumerate(calls)]} if calls else {'role': 'assistant', 'content': 'done'}
             chunks = [{'id': f'chat-{n}', 'object': 'chat.completion.chunk', 'created': int(time.time()),
                        'model': 'mock', 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]},
@@ -91,7 +107,7 @@ class Provider(BaseHTTPRequestHandler):
                        'model': 'mock', 'choices': [{'index': 0, 'delta': {},
                                                    'finish_reason': 'tool_calls' if calls else 'stop'}]}]
         else:
-            tools = tool_names(request)
+            tools = names
             output = []
             for kind, name, args in calls:
                 namespace, full = tools[name]
@@ -151,13 +167,33 @@ FAKE_ANSWER += r'''
 _answer = answer
 def answer(text):
     import shlex
-    def hook(event):
+    def hook(event, tool=None):
+        result = {}
         if flag("--settings"):
             for entry in json.loads(flag("--settings")).get("hooks", {}).get(event, []):
+                if tool and entry.get("matcher") and not re.fullmatch(entry["matcher"], tool): continue
                 for handler in entry["hooks"]:
-                    subprocess.run(shlex.split(handler["command"]), input=json.dumps({"hook_event_name": event}),
-                                   text=True, stdout=subprocess.DEVNULL, check=True)
+                    response = subprocess.run(shlex.split(handler["command"]), input=json.dumps({"hook_event_name": event, "tool_name": tool}),
+                                   text=True, capture_output=True, check=True)
+                    result = json.loads(response.stdout)
+        return result
     hook("UserPromptSubmit")
+    scenario = os.environ.get("REMIND_SCENARIO", "")
+    if flag("--settings") and scenario.startswith("question"):
+        while True:
+            permission = scenario == "question_permission"
+            response = hook("PermissionRequest" if permission else "PreToolUse", "Bash" if permission else "AskUserQuestion")
+            result = response["hookSpecificOutput"]
+            if permission:
+                assert result["decision"]["behavior"] == "deny"
+                reason = result["decision"]["message"]
+            else:
+                assert result["permissionDecision"] == "deny"
+                reason = result["permissionDecisionReason"]
+            assert "OMAR REMINDER" in reason
+            if not scenario.endswith("ignore"):
+                text += "\n" + reason
+                break
     _answer(text)
     hook("Stop")
 '''
@@ -177,8 +213,40 @@ for line in sys.stdin:
             assert request["params"]["mcpServers"][0]["args"][-1] == os.environ["OMAR_MCP_CONTEXT_FILE"]
         result = {"sessionId": session} if method == "session/new" else {}
         if method == "session/prompt":
-            answer(request["params"]["prompt"][0]["text"])
-            result = {"stopReason": "end_turn"}
+            text = request["params"]["prompt"][0]["text"]
+            scenario = os.environ.get("REMIND_SCENARIO", "")
+            if "cursor-agent" in sys.argv[0] and scenario in ["question", "question_ignore"]:
+                while True:
+                    print(json.dumps({"jsonrpc":"2.0","id":777,"method":"cursor/ask_question",
+                        "params":{"toolCallId":"ask_audience","questions":[{"id":"audience","prompt":"Who is the audience?","options":[{"id":"general","label":"General readers"}],"allowMultiple":False}]}}), flush=True)
+                    response = json.loads(next(sys.stdin))
+                    assert response["id"] == 777 and response["result"]["outcome"]["outcome"] == "skipped", response
+                    reason = response["result"]["outcome"]["reason"]
+                    assert "OMAR REMINDER" in reason and "task_id:" in reason, response
+                    if scenario.endswith("ignore"): continue
+                    answer(text + "\n" + reason)
+                    result = {"stopReason":"end_turn"}
+                    break
+            elif scenario.startswith("question") and (scenario.endswith("ignore") or "OMAR REMINDER" not in text):
+                permission = scenario in ["question_permission", "question_fallback"]
+                params = {"sessionId":session,"options":[{"optionId":"no","kind":"reject_once","name":"Deny"}]} if permission else {"sessionId":session,"mode":"form","message":"Who is the audience?","requestedSchema":{"type":"object","properties":{"audience":{"type":"string"}}}}
+                if scenario == "question_fallback": params["options"] = [{"optionId":"general","kind":"allow_once","name":"General readers"},{"optionId":"__ask_question_skip__","kind":"reject_once","name":"Skip"}]
+                print(json.dumps({"jsonrpc":"2.0", "id":777,"method":"session/request_permission" if permission else "elicitation/create", "params":params}), flush=True)
+                response = json.loads(next(sys.stdin))
+                assert response["id"] == 777, response
+                assert response["result"] == ({"outcome":{"outcome":"cancelled"}} if permission else {"action":"decline"}), response
+                cancel = json.loads(next(sys.stdin))
+                assert cancel["method"] == "session/cancel", cancel
+                result = {"stopReason":"cancelled"}
+            else:
+                if scenario == "permission":
+                    print(json.dumps({"jsonrpc":"2.0","id":778,"method":"session/request_permission",
+                        "params":{"sessionId":session,"options":[{"optionId":"yes","kind":"allow_once","name":"Allow"}]}}), flush=True)
+                    response = json.loads(next(sys.stdin))
+                    assert response["result"]["outcome"] == {"outcome":"selected","optionId":"yes"}, response
+                    text += "\nOMAR REMINDER"
+                answer(text)
+                result = {"stopReason": "end_turn"}
         if "id" in request:
             print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
     else:
@@ -268,15 +336,15 @@ def live_scratch(backend):
                 preflight(root, env, backend, 'post-run sign-in check')
 
 
-def configure_live(root, env, backend):
+def configure_live(root, env, backend, questions=False):
     # Select inexpensive models through command arguments, never user settings.
-    if backend in LIVE_MODELS:
-        command = {'Pi': 'pi', 'OpenCode': 'opencode', 'Agy': 'agy'}[backend]
+    if backend in LIVE_MODELS or (backend == 'Codex' and questions):
+        command = {'Pi': 'pi', 'OpenCode': 'opencode', 'Agy': 'agy', 'Codex': 'codex'}[backend]
         executable = shutil.which(command, path=env['PATH'])
         shims = root / 'shims'
         shims.mkdir()
         shim = shims / command
-        args = f'--model {LIVE_MODELS[backend]} "$@"' if backend != 'OpenCode' else f'"$@" --model {LIVE_MODELS[backend]}'
+        args = '-c features.default_mode_request_user_input=true "$@"' if backend == 'Codex' else f'--model {LIVE_MODELS[backend]} "$@"' if backend != 'OpenCode' else f'"$@" --model {LIVE_MODELS[backend]}'
         shim.write_text(f'#!/bin/sh\nexec {shlex.quote(executable)} {args}\n')
         shim.chmod(0o700)
         # macOS login shells reorder PATH. Reapply the test's model shim in
@@ -294,7 +362,7 @@ def configure_live(root, env, backend):
 
 def configure(root, home, env, backend, server, live):
     if live:
-        configure_live(root, env, backend)
+        configure_live(root, env, backend, questions=bool(server.scenario and server.scenario.startswith("question")))
         return
     profile = []
     if getattr(server, 'scenario', None):
@@ -321,6 +389,7 @@ def configure(root, home, env, backend, server, live):
         (codex_home / 'config.toml').write_text(f'''check_for_update_on_startup=false
 model="tree"
 model_provider="restart_test"
+features.default_mode_request_user_input=true
 [model_providers.restart_test]
 name="restart test"
 base_url="http://127.0.0.1:{server.server_port}/v1"
@@ -335,7 +404,8 @@ trust_level="trusted"
         agent.mkdir(parents=True)
         (agent / 'settings.json').write_text(json.dumps({
             'defaultProvider': 'omar-pi-e2e', 'defaultModel': 'tree',
-            'extensions': [str(REPO / 'src/backend/pi/test/fixtures/deterministic-provider.mjs')]}))
+            'extensions': [str(REPO / 'src/backend/pi/test/fixtures/deterministic-provider.mjs'), str(root / 'question.mjs')]}))
+        (root / 'question.mjs').write_text('export default pi => pi.registerTool({name:"ask_user",label:"Ask user",description:"Ask the user a question",parameters:{type:"object",properties:{question:{type:"string"}},required:["question"]},async execute(_id,args,_signal,_update,ctx){const answer=await ctx.ui.input(args.question);return {content:[{type:"text",text:answer??"cancelled"}]};}});')
         shims = home / 'shims'
         shims.mkdir()
         shim = shims / 'pi'
@@ -348,6 +418,7 @@ trust_level="trusted"
         config.mkdir(parents=True)
         (config / 'opencode.json').write_text(json.dumps({
             'enabled_providers': ['restart_mock'], 'model': 'restart_mock/mock',
+            'permission': {'bash': 'ask'} if server.scenario == 'question_permission' else {},
             'provider': {'restart_mock': {'npm': '@ai-sdk/openai-compatible', 'name': 'local',
                 'options': {'baseURL': f'http://127.0.0.1:{server.server_port}/v1', 'apiKey': 'local'},
                 'models': {'mock': {'name': 'Mock', 'limit': {'context': 32000, 'output': 1000}}}}}}))
@@ -371,7 +442,7 @@ trust_level="trusted"
 def execute(backend, per=False, deaths=1, live=False, scenario=None):
     server = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     server.requests, server.killed, server.deaths = [], set(), deaths
-    server.scenario, server.waited = scenario, set()
+    server.scenario, server.waited, server.questions = scenario, set(), 0
     server.kill, server.release = threading.Event(), threading.Event()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
@@ -391,6 +462,10 @@ def execute(backend, per=False, deaths=1, live=False, scenario=None):
             if live and scenario:
                 prompt = ('First reply exactly Ready? and end your turn waiting for confirmation. '
                           'Do not call any tools in that first turn. On a later message, set result to recovered and complete.')
+            if live and scenario and scenario.startswith('question'):
+                prompt = ('You are writing a short summary. Before doing any work, use your built-in request_user_input tool '
+                          'to ask the user one clarifying question about the audience, with three audience options, '
+                          'and wait for their answer. Do not ask in plain text. After the answer, set result to recovered and complete.')
             program = root / 'Restart.omar'
             program.write_text(PROGRAM.replace('BACKEND', backend).replace('LIFETIME', ' per task' if per else '').replace('PROMPT', prompt))
             up = subprocess.run([str(BIN), 'up', '-s', 'restart-test', '--no-ea'],
@@ -450,6 +525,18 @@ def execute(backend, per=False, deaths=1, live=False, scenario=None):
                 except Exception as error:
                     errors.append(error)
 
+            visible = []
+            def observe_question():
+                while process.poll() is None:
+                    capture = subprocess.run(['tmux', '-L', env['OMAR_TMUX_SERVER'], 'capture-pane', '-S', '-50', '-pt', 'omar-agent-0-p_coder'], env=env, capture_output=True, text=True)
+                    screen = capture.stdout
+                    if not live and screen.strip(): screens[:] = [screen[-3000:]]
+                    if '1 question' in screen or re.search(r'Question \d+/\d+', screen) or ('General readers' in screen and 'Science students' in screen):
+                        visible.append(True)
+                    time.sleep(.05)
+            observer = threading.Thread(target=observe_question, daemon=True)
+            if backend == 'Codex' and scenario and scenario.startswith('question'):
+                observer.start()
             killer = threading.Thread(target=kill_workers, daemon=True)
             if not scenario:
                 killer.start()
@@ -472,14 +559,20 @@ def execute(backend, per=False, deaths=1, live=False, scenario=None):
                     attempts[record['attempt_id']] = record
             records = list(attempts.values())
             assert len(started_attempts) == len(set(started_attempts)), started_attempts
-            detail = output + '\n' + json.dumps(records) + ('\nLast worker screen:\n' + ''.join(screens) if live else '')
+            detail = output + '\n' + json.dumps(records) + ('\nLast worker screen:\n' + ''.join(screens) if screens else '')
             if not live and backend == 'Agy':
                 assert not (home / '.gemini/config').exists(), 'workflow MCP must be session-scoped'
             assert not errors, f'{errors}\n{detail}'
             if scenario:
                 reminders = [r for a in records for r in a.get('reminders', [])]
                 assert all(len(a.get('reminders', [])) <= 1 for a in records), detail
-                if scenario == 'ignore':
+                if scenario.startswith('question'):
+                    assert all(r.get('reason') == 'asked the user a question' for r in reminders), detail
+                    assert reminders, detail
+                    if backend == 'Codex':
+                        assert visible, 'real Codex CLI did not show its question'
+                        if not live: assert server.questions, 'provider did not call the question tool'
+                if scenario.endswith('ignore'):
                     assert len(records) == 3 and len(reminders) == 3, detail
                     assert process.returncode != 0, detail
                     assert 'after 2 retries' in output and 'stopped without finishing after a reminder' in output, detail
@@ -489,12 +582,12 @@ def execute(backend, per=False, deaths=1, live=False, scenario=None):
                     outcome = 'one reminder per attempt, failed after 2 retries'
                 else:
                     assert process.returncode == 0 and 'Output p.result = ' in output, detail
-                    assert (not records if scenario == 'working' and not per else len(records) == 1 and records[0]['retry'] == 0), detail
-                    assert len(reminders) == (0 if scenario == 'working' else 1), detail
+                    assert (not records if scenario in ['working', 'permission'] and not per else len(records) == 1 and records[0]['retry'] == 0), detail
+                    assert len(reminders) == (0 if scenario in ['working', 'permission'] else 1), detail
                     if scenario == 'working':
                         assert time.monotonic() - began >= 6, 'working fixture did not stay active'
-                    outcome = 'still working, no reminder' if scenario == 'working' else 'one reminder, completed'
-                print(f'PASS: {backend}{" per task" if per else ""} {"live" if live else "local provider"}: {outcome}', flush=True)
+                    outcome = 'permission auto-approved, no reminder' if scenario == 'permission' else 'still working, no reminder' if scenario == 'working' else 'one reminder, completed'
+                print(f'PASS: {backend}{" per task" if per else ""} {"live" if live else "local provider"}{" question" if scenario.startswith("question") else " permission" if scenario == "permission" else ""}: {outcome}', flush=True)
                 return
             assert len(killed) == deaths, detail
             assert len([a for a in records if a['outcome'] == 'died']) == deaths, detail
