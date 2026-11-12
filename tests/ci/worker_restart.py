@@ -49,7 +49,7 @@ class Provider(BaseHTTPRequestHandler):
         for tool in request.get('tools', []):
             for inner in [tool, *tool.get('tools', [])]:
                 name = inner.get('function', {}).get('name', inner.get('name', ''))
-                if name in ['request_user_input', 'question', 'ask_user', 'bash']:
+                if name in ['request_user_input', 'request_user_input_async', 'sleep', 'question', 'ask_user', 'bash']:
                     names[name] = (tool.get('name') if inner is not tool else None, name)
         chat = 'messages' in request
         items = request.get('messages' if chat else 'input', [])
@@ -62,9 +62,21 @@ class Provider(BaseHTTPRequestHandler):
             last = items[-1] if items else {}
             done = last.get('tool_call_id' if chat else 'call_id', '')
             reminded = re.search(r'OMAR REMINDER.{0,20}task_id: ' + str(task) + r'\D', text)
-            if scenario == 'question_permission' and not reminded:
+            asynchronous = scenario and scenario.startswith('question_async')
+            port = re.findall(r'contract: ([\w.]+)', text)[-1].rstrip('.') if asynchronous else 'result'
+            researcher = asynchronous and port.endswith('.notes')
+            if asynchronous and not researcher and 'request_user_input_async' not in names:
+                calls = []
+            elif asynchronous and not researcher and done.startswith('call_question'):
+                self.server.sleeps += 1
+                calls = [('call_sleep', 'sleep', {'duration_ms': 60000})]
+            elif asynchronous and not researcher and (scenario.endswith('ignore') or not reminded):
+                self.server.questions += 1
+                calls = [('call_question', 'request_user_input_async', {'questions': [
+                    {'title':'Who is the audience for this summary?', 'options':['General readers','Young students','Science students']}]})]
+            elif scenario == 'question_permission' and not reminded:
                 calls = [('call_permission', 'bash', {'command':'printf permission-probe', 'description':'permission probe'})]
-            elif scenario and scenario.startswith('question') and (scenario.endswith('ignore') or not reminded):
+            elif scenario and scenario.startswith('question') and not asynchronous and (scenario.endswith('ignore') or not reminded):
                 name = next(name for name in ['request_user_input', 'question', 'ask_user'] if name in names)
                 question = {'header': 'Audience', 'question': 'Who is the audience for this summary?',
                             'options': [{'label': label, 'description': label} for label in ['General readers', 'Young students', 'Science students']]}
@@ -90,7 +102,7 @@ class Provider(BaseHTTPRequestHandler):
                 if scenario == 'working' and task not in self.server.waited:
                     self.server.waited.add(task)
                     time.sleep(6)
-                calls = [('call_set', 'omar_set_port', {'task_id': task, 'port': 'result',
+                calls = [('call_set', 'omar_set_port', {'task_id': task, 'port': port,
                            'value': 'recovered' if scenario or 'This is retry' in text else 'discard-me'})]
         n = len(self.server.requests)
         if chat:
@@ -386,8 +398,18 @@ def configure(root, home, env, backend, server, live):
         profile.append(f'export PATH={shlex.quote(env["PATH"])}')
         codex_home = home / '.codex'
         codex_home.mkdir()
+        catalog = ''
+        if server.scenario and server.scenario.startswith('question_async'):
+            models = codex_home / 'models.json'
+            models.write_text(json.dumps({'models':[{
+                'slug':'tree', 'display_name':'Local test', 'supported_reasoning_levels':[],
+                'base_instructions':'Follow OMAR task instructions.',
+                'shell_type':'shell_command', 'visibility':'list', 'supported_in_api':True,
+                'priority':0, 'support_verbosity':False, 'truncation_policy':{'mode':'tokens','limit':10000},
+                'experimental_supported_tools':['request_user_input_async','clock']}]}))
+            catalog = f'model_catalog_json={json.dumps(str(models))}\n'
         (codex_home / 'config.toml').write_text(f'''check_for_update_on_startup=false
-model="tree"
+{catalog}model="tree"
 model_provider="restart_test"
 features.default_mode_request_user_input=true
 [model_providers.restart_test]
@@ -442,7 +464,7 @@ trust_level="trusted"
 def execute(backend, per=False, deaths=1, live=False, scenario=None):
     server = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     server.requests, server.killed, server.deaths = [], set(), deaths
-    server.scenario, server.waited, server.questions = scenario, set(), 0
+    server.scenario, server.waited, server.questions, server.sleeps = scenario, set(), 0, 0
     server.kill, server.release = threading.Event(), threading.Event()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
@@ -463,12 +485,19 @@ def execute(backend, per=False, deaths=1, live=False, scenario=None):
                 prompt = ('First reply exactly Ready? and end your turn waiting for confirmation. '
                           'Do not call any tools in that first turn. On a later message, set result to recovered and complete.')
             if live and scenario and scenario.startswith('question'):
-                prompt = ('You are writing a short summary. Before doing any work, use your built-in request_user_input tool '
+                question_tool = {'Codex':'request_user_input_async', 'Claude':'AskUserQuestion', 'Cursor':'AskQuestion',
+                                 'Agy':'ask_question', 'OpenCode':'question'}.get(backend, 'question')
+                prompt = (f'You are writing a short summary. Before doing any work, use your built-in {question_tool} tool '
                           'to ask the user one clarifying question about the audience, with three audience options, '
                           'and wait for their answer. Do not ask in plain text. After the answer, set result to recovered and complete.')
             program = root / 'Restart.omar'
-            program.write_text(PROGRAM.replace('BACKEND', backend).replace('LIFETIME', ' per task' if per else '').replace('PROMPT', prompt))
-            up = subprocess.run([str(BIN), 'up', '-s', 'restart-test', '--no-ea'],
+            source = PROGRAM
+            if scenario and scenario.startswith('question_async'):
+                source = source.replace('team Work[', 'team Work[researcher : Codex, ')
+                source = source.replace('    output result', '    action notes : string\n    task researcher(start) -> notes "List a fact."\n    output result')
+                source = source.replace('task coder(start)', 'task coder(notes)')
+            program.write_text(source.replace('BACKEND', backend).replace('LIFETIME', ' per task' if per else '').replace('PROMPT', prompt))
+            up = subprocess.run([str(BIN), 'up', '-s', 'restart-test', '--no-ea', '--port', '0'],
                                 env=env, cwd=root, capture_output=True, text=True, timeout=90)
             assert up.returncode == 0, up.stdout + up.stderr
             launch = json.loads((state / 'sessions/restart-test/launch.json').read_text())
@@ -525,7 +554,7 @@ def execute(backend, per=False, deaths=1, live=False, scenario=None):
                 except Exception as error:
                     errors.append(error)
 
-            visible = []
+            visible, native_tui = [], []
             def observe_question():
                 while process.poll() is None:
                     capture = subprocess.run(['tmux', '-L', env['OMAR_TMUX_SERVER'], 'capture-pane', '-S', '-50', '-pt', 'omar-agent-0-p_coder'], env=env, capture_output=True, text=True)
@@ -533,6 +562,9 @@ def execute(backend, per=False, deaths=1, live=False, scenario=None):
                     if not live and screen.strip(): screens[:] = [screen[-3000:]]
                     if '1 question' in screen or re.search(r'Question \d+/\d+', screen) or ('General readers' in screen and 'Science students' in screen):
                         visible.append(True)
+                        if scenario.startswith('question_async'):
+                            command = subprocess.run(['tmux', '-L', env['OMAR_TMUX_SERVER'], 'display-message', '-p', '-t', 'omar-agent-0-p_coder', '#{pane_start_command}'], env=env, capture_output=True, text=True).stdout
+                            if 'app-server --listen' in command and ' --remote ' in command: native_tui.append(True)
                     time.sleep(.05)
             observer = threading.Thread(target=observe_question, daemon=True)
             if backend == 'Codex' and scenario and scenario.startswith('question'):
@@ -567,11 +599,16 @@ def execute(backend, per=False, deaths=1, live=False, scenario=None):
                 reminders = [r for a in records for r in a.get('reminders', [])]
                 assert all(len(a.get('reminders', [])) <= 1 for a in records), detail
                 if scenario.startswith('question'):
-                    assert all(r.get('reason') == 'asked the user a question' for r in reminders), detail
+                    questions = reminders[:1] if scenario.startswith('question_async') and not per else reminders
+                    assert all(r.get('reason') == 'asked the user a question' for r in questions), detail
                     assert reminders, detail
                     if backend == 'Codex':
                         assert visible, 'real Codex CLI did not show its question'
                         if not live: assert server.questions, 'provider did not call the question tool'
+                if scenario.startswith('question_async'):
+                    assert native_tui and server.sleeps, 'test must run a real remote TUI asking, then sleeping'
+                    assert time.monotonic() - began < 60, detail
+                    assert 'Sleep interrupted by new input' in json.dumps(server.requests), 'reminder did not wake the active sleep'
                 if scenario.endswith('ignore'):
                     assert len(records) == 3 and len(reminders) == 3, detail
                     assert process.returncode != 0, detail

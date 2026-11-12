@@ -566,9 +566,36 @@ pub(crate) fn http_json(
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
 
-    let mut response = Vec::new();
-    std::io::Read::read_to_end(&mut stream, &mut response)?;
-    let response = String::from_utf8_lossy(&response).into_owned();
+    use std::io::{BufRead, Read};
+    let mut stream = std::io::BufReader::new(stream);
+    let mut headers = String::new();
+    loop {
+        anyhow::ensure!(
+            stream.read_line(&mut headers)? > 0,
+            "OpenCode closed before its headers"
+        );
+        if headers.ends_with("\r\n\r\n") {
+            break;
+        }
+    }
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then_some(value.trim())
+        })
+        .map(str::parse::<usize>)
+        .transpose()
+        .context("invalid OpenCode content length")?;
+    let mut body = Vec::new();
+    if let Some(length) = length {
+        body.resize(length, 0);
+        stream.read_exact(&mut body)?;
+    } else {
+        stream.read_to_end(&mut body)?;
+    }
+    let response = format!("{headers}{}", String::from_utf8_lossy(&body));
     let (status, body) = split_response(&response).context("parse opencode response")?;
     Ok((status, body))
 }
@@ -660,6 +687,36 @@ mod tests {
 
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn a_complete_response_does_not_wait_for_the_server_to_close() {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                stream.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        });
+        let reply = http_json(port, "GET", "/session/id", None);
+        server.join().unwrap();
+        assert_eq!(reply.unwrap(), (200, "{}".into()));
+    }
 
     #[test]
     fn a_footer_wrapped_by_a_long_path_still_reads_as_ready() {

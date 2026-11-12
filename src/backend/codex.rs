@@ -18,7 +18,8 @@ pub struct Codex;
 
 impl Backend for Codex {
     fn turn_monitor(&self, target: &super::Target<'_>) -> Option<Box<dyn super::TurnMonitor>> {
-        let mut session = CodexSession::open(&from_stamp(target.stamp?)?).ok()?;
+        let socket = from_stamp(target.stamp?)?;
+        let mut session = CodexSession::open(&socket).ok()?;
         let thread = session.only_thread().ok()?;
         let state = session
             .call(
@@ -28,11 +29,29 @@ impl Backend for Codex {
             )
             .ok()?;
         let ended = completed_turn(&state);
-        let inputs = session
+        let mut inputs: Vec<_> = session
             .inputs
             .drain(..)
             .filter(|input| input["params"]["threadId"] == thread)
             .collect();
+        if let Some(turn) = state["thread"]["turns"]
+            .as_array()
+            .and_then(|turns| turns.last())
+        {
+            if let Some(items) = turn["items"].as_array() {
+                for item in items
+                    .iter()
+                    .rev()
+                    .take_while(|item| item["type"] != "userMessage")
+                {
+                    if async_question(item) {
+                        inputs.push(serde_json::json!({"method":"item/completed","params":{
+                            "threadId":thread,"turnId":turn["id"],"item":item,
+                        }}));
+                    }
+                }
+            }
+        }
         session
             .socket
             .get_mut()
@@ -40,6 +59,7 @@ impl Backend for Codex {
             .ok()?;
         Some(Box::new(CodexTurnMonitor {
             session,
+            socket,
             thread,
             ended,
             inputs,
@@ -653,9 +673,18 @@ fn completed_turn(value: &serde_json::Value) -> Option<String> {
 
 struct CodexTurnMonitor {
     session: CodexSession,
+    socket: PathBuf,
     thread: String,
     ended: Option<String>,
     inputs: Vec<serde_json::Value>,
+}
+
+fn async_question(item: &serde_json::Value) -> bool {
+    item["type"] == "agentMessage"
+        && item["delivery"] == "async"
+        && item["questions"]
+            .as_array()
+            .is_some_and(|questions| !questions.is_empty())
 }
 
 impl super::TurnMonitor for CodexTurnMonitor {
@@ -672,6 +701,15 @@ impl super::TurnMonitor for CodexTurnMonitor {
                     match event["method"].as_str() {
                         // Nonmodal questions in Default mode still await a reply.
                         Some("item/tool/requestUserInput") => self.inputs.push(event),
+                        Some("item/completed") if async_question(&event["params"]["item"]) => {
+                            self.inputs.push(event)
+                        }
+                        Some("item/started")
+                            if event["params"]["item"]["type"] == "userMessage" =>
+                        {
+                            self.inputs
+                                .retain(|input| input["method"] != "item/completed");
+                        }
                         Some("serverRequest/resolved") => self
                             .inputs
                             .retain(|input| input["id"] != event["params"]["requestId"]),
@@ -679,7 +717,8 @@ impl super::TurnMonitor for CodexTurnMonitor {
                         Some("turn/completed")
                             if event["params"]["turn"]["status"] == "completed" =>
                         {
-                            self.inputs.clear();
+                            self.inputs
+                                .retain(|input| input["method"] == "item/completed");
                             self.ended = event["params"]["turn"]["id"].as_str().map(str::to_owned);
                         }
                         Some("thread/status/changed")
@@ -709,9 +748,16 @@ impl super::TurnMonitor for CodexTurnMonitor {
     }
 
     fn blocked_input(&self) -> Option<String> {
-        self.inputs
-            .first()
-            .map(|input| format!("{}:{}", input["id"], input["params"]["itemId"]))
+        self.inputs.first().map(|input| {
+            if input["method"] == "item/completed" {
+                format!(
+                    "async:{}:{}",
+                    input["params"]["turnId"], input["params"]["item"]["id"]
+                )
+            } else {
+                format!("{}:{}", input["id"], input["params"]["itemId"])
+            }
+        })
     }
 
     fn answer_input(&mut self, id: &str, text: &str) -> Result<bool> {
@@ -722,6 +768,18 @@ impl super::TurnMonitor for CodexTurnMonitor {
         else {
             return Ok(false);
         };
+        if input["method"] == "item/completed" {
+            // User input wakes sleep and dismisses async questions on every client.
+            CodexSession::open(&self.socket)?.call(
+                "turn/start",
+                serde_json::json!({
+                    "threadId":self.thread,"input":[{"type":"text","text":text}],
+                }),
+            )?;
+            self.inputs
+                .retain(|input| input["method"] != "item/completed");
+            return Ok(true);
+        }
         let answers: serde_json::Map<String, serde_json::Value> = input["params"]["questions"]
             .as_array()
             .context("question request omitted questions")?

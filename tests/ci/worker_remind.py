@@ -39,8 +39,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--live', action='store_true')
     parser.add_argument('--questions', action='store_true', help='Run blocking user-input recovery scenarios')
+    parser.add_argument('--async-questions', action='store_true', help='Run Codex 0.167 async questions through its real TUI and serve')
     parser.add_argument('--backend', choices=['Claude', 'Cursor', 'Agy', 'Codex', 'Pi', 'OpenCode', 'Stub'])
     args = parser.parse_args()
+    if args.async_questions:
+        assert not args.live, 'the deterministic async scenario uses a local model catalog'
+        execute('Codex', deaths=0, scenario='question_async')
+        execute('Codex', per=True, deaths=0, scenario='question_async_ignore')
+        execute('Codex', deaths=0, scenario='question_async_ignore')
+        return
     if not args.live:
         verify_opencode_event_order()
     backends = [args.backend] if args.backend else ['Claude', 'Cursor', 'Agy', 'Codex', 'Pi', 'OpenCode', 'Stub']

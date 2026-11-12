@@ -284,7 +284,13 @@ async fn codex_turn(
     let resume = previous
         .map(|session| format!(" resume {}", crate::manager::shell_single_quote(&session)))
         .unwrap_or_default();
-    let command = format!("exec env {} --json{resume} -", config.command);
+    // Exec JSON omits async question metadata and cannot accept an answer.
+    let questions = if context.topology.is_some() {
+        " -c tools.experimental_request_user_input.enabled=false"
+    } else {
+        ""
+    };
+    let command = format!("exec env {}{questions} --json{resume} -", config.command);
     let mut child = tokio::process::Command::new("sh")
         .args(["-c", &command])
         .env("OMAR_MCP_CONTEXT_FILE", &config.context_file)
