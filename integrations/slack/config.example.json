@@ -6,12 +6,5 @@
   ],
   "allowedChannels": [
     "C_DEMO_CHANNEL"
-  ],
-  "command": "demo",
-  "programPath": "demo.omar",
-  "outputPort": "run.result",
-  "timeoutSeconds": 60,
-  "rawInputs": [
-    "run.request=Slack → OMAR → Slack: demo completed."
   ]
 }
