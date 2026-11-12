@@ -7,6 +7,7 @@ import {
   connectTerminalUrl,
   fetchBackendStatus,
   startConnect,
+  startDisconnect,
   type BackendStatus,
 } from "./lib/runtime-client";
 import { backendLabel } from "./backend-menu";
@@ -16,6 +17,16 @@ const POLL_MS = 3000;
 
 const NOTE =
   "This is the backend's own install and sign-in; it closes once the backend answers a test prompt.";
+
+/** What a terminal opened here does to a backend's sign-in. */
+type Action = "connect" | "replace" | "disconnect";
+
+const NOTES: Record<Action, string> = {
+  connect: NOTE,
+  replace:
+    "This is the backend's own sign-in, run again; it closes once the new one answers a test prompt.",
+  disconnect: "This is the backend's own sign-out; it closes once it finishes.",
+};
 
 function describe(status: BackendStatus, rejected?: string): string {
   if (rejected) return "Signed in, but its test prompt failed";
@@ -36,7 +47,9 @@ function describe(status: BackendStatus, rejected?: string): string {
  * that runs `omar connect <backend>` in a terminal here, the same install and
  * sign-in as on the command line. Once the backend reports connected, its CLI
  * answers a test prompt, since a stored key can still be rejected; the
- * terminal closes only when that works.
+ * terminal closes only when that works. A working sign-in can be replaced
+ * (`omar connect <backend> --replace`) or, once confirmed, signed out
+ * (`omar disconnect <backend>`); both are done when their terminal ends.
  */
 export function BackendsPage({
   serveUrl,
@@ -48,6 +61,9 @@ export function BackendsPage({
   const [statuses, setStatuses] = useState<BackendStatus[] | null>(null);
   const [error, setError] = useState("");
   const [connecting, setConnecting] = useState<string | null>(null);
+  const [action, setAction] = useState<Action>("connect");
+  // The backend whose sign-out is waiting on a second click.
+  const [confirming, setConfirming] = useState<string | null>(null);
   // "waiting" for the sign-in, "checking" its test prompt, or "rejected".
   const [phase, setPhase] = useState<"waiting" | "checking" | "rejected">(
     "waiting",
@@ -83,8 +99,10 @@ export function BackendsPage({
     };
   }, [serveUrl]);
 
+  // `closing`: the terminal has ended, so a rejection closes it too and the
+  // row says why; there is nothing left in it to sign in again with.
   const check = useCallback(
-    async (backend: string) => {
+    async (backend: string, closing = false) => {
       setPhase("checking");
       try {
         await checkSignIn(serveUrl, backend);
@@ -98,15 +116,21 @@ export function BackendsPage({
       } catch (cause) {
         const reason = cause instanceof Error ? cause.message : String(cause);
         setRejected((all) => ({ ...all, [backend]: reason }));
-        setPhase("rejected");
+        if (closing) {
+          setConnecting(null);
+          setPhase("waiting");
+        } else {
+          setPhase("rejected");
+        }
       }
     },
     [serveUrl],
   );
 
   // A sign-in is done when its backend says so and then answers a prompt.
+  // A replaced one already reads connected, so it waits for its terminal.
   useEffect(() => {
-    if (!connecting || phase !== "waiting") return;
+    if (!connecting || action !== "connect" || phase !== "waiting") return;
     const timer = setInterval(() => {
       void refresh().then((list) => {
         const now = list?.find((status) => status.name === connecting);
@@ -114,16 +138,34 @@ export function BackendsPage({
       });
     }, POLL_MS);
     return () => clearInterval(timer);
-  }, [connecting, phase, refresh, check]);
+  }, [connecting, action, phase, refresh, check]);
 
-  async function connect(backend: string) {
+  async function connect(backend: string, next: Action = "connect") {
     setError("");
+    setConfirming(null);
     try {
-      await startConnect(serveUrl, backend);
+      if (next === "disconnect") {
+        await startDisconnect(serveUrl, backend);
+      } else {
+        await startConnect(serveUrl, backend, next === "replace");
+      }
       setPhase("waiting");
+      setAction(next);
       setConnecting(backend);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  // A replace or sign-out is done when its terminal ends.
+  async function ended() {
+    if (!connecting || action === "connect") return;
+    const list = await refresh();
+    const now = list?.find((status) => status.name === connecting);
+    if (action === "replace" && now?.status === "connected") {
+      void check(connecting, true);
+    } else {
+      setConnecting(null);
     }
   }
 
@@ -168,17 +210,57 @@ export function BackendsPage({
                   {describe(status, rejected[status.name])}
                 </small>
               </span>
-              {working(status) ? (
-                <span aria-hidden="true">✓</span>
-              ) : (
-                <button
-                  type="button"
-                  aria-label={`Connect ${backendLabel(status.name)}`}
-                  onClick={() => void connect(status.name)}
-                >
-                  Connect
-                </button>
-              )}
+              <span className="backend-actions">
+                {confirming === status.name ? (
+                  <>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => setConfirming(null)}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Sign ${backendLabel(status.name)} out`}
+                      onClick={() => void connect(status.name, "disconnect")}
+                    >
+                      Sign out
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    {status.status === "connected" ? (
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        aria-label={`Disconnect ${backendLabel(status.name)}`}
+                        onClick={() => setConfirming(status.name)}
+                      >
+                        Disconnect
+                      </button>
+                    ) : null}
+                    {working(status) ? (
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        aria-label={`Replace ${backendLabel(status.name)}'s sign-in`}
+                        onClick={() => void connect(status.name, "replace")}
+                      >
+                        Replace
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        aria-label={`Connect ${backendLabel(status.name)}`}
+                        onClick={() => void connect(status.name)}
+                      >
+                        Connect
+                      </button>
+                    )}
+                  </>
+                )}
+              </span>
             </li>
           ))}
         </ul>
@@ -188,7 +270,13 @@ export function BackendsPage({
           serveUrl={serveUrl}
           agent={connecting}
           url={connectTerminalUrl(serveUrl, connecting)}
-          title={`Connect ${backendLabel(connecting)}`}
+          title={
+            action === "replace"
+              ? `Replace ${backendLabel(connecting)}'s sign-in`
+              : action === "disconnect"
+                ? `Disconnect ${backendLabel(connecting)}`
+                : `Connect ${backendLabel(connecting)}`
+          }
           note={
             phase === "checking" ? (
               <span role="status">
@@ -202,9 +290,10 @@ export function BackendsPage({
                 </button>
               </span>
             ) : (
-              NOTE
+              NOTES[action]
             )
           }
+          onEnded={() => void ended()}
           onClose={() => {
             setConnecting(null);
             setPhase("waiting");
