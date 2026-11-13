@@ -722,9 +722,11 @@ impl TmuxClient {
                 ..Default::default()
             },
         };
-        let env: Vec<String> = setup
-            .env
+        // Provider keys the session's admins set reach every agent it starts.
+        let team = crate::team::agent_environment();
+        let env: Vec<String> = team
             .iter()
+            .chain(&setup.env)
             .chain(environment)
             .map(|(key, value)| format!("{key}={value}"))
             .collect();

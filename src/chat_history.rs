@@ -17,6 +17,11 @@ pub struct Conversation {
     pub title: String,
     #[serde(default)]
     pub ea_id: Option<crate::ea::EaId>,
+    /// The team member who started it; none for the session's operator.
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub visibility: crate::team::Visibility,
     pub created_at: u64,
     pub updated_at: u64,
     pub messages: Vec<ChatMessage>,
@@ -33,6 +38,8 @@ pub struct ConversationSummary {
     pub message_count: usize,
     pub ea_id: Option<crate::ea::EaId>,
     pub workflow_name: Option<String>,
+    pub owner: Option<String>,
+    pub visibility: crate::team::Visibility,
     pub busy: bool,
     pub run: Option<crate::serve::RunRecord>,
 }
@@ -90,6 +97,8 @@ impl Conversation {
             id: Uuid::new_v4().to_string(),
             title: "New chat".into(),
             ea_id: None,
+            owner: None,
+            visibility: crate::team::Visibility::default(),
             created_at: now(),
             updated_at: now(),
             messages: Vec::new(),
@@ -106,6 +115,8 @@ impl Conversation {
             message_count: self.messages.len(),
             ea_id: self.ea_id,
             workflow_name: self.workspace.name.clone(),
+            owner: self.owner.clone(),
+            visibility: self.visibility,
             busy: false,
             run: None,
         }
@@ -462,6 +473,31 @@ impl History {
                 next.conversations.push(chat);
             }
         }
+        next.save()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// A team member's new chat. Unlike `select(None)` it leaves the active
+    /// chat alone: members always name the chat they mean.
+    pub fn create_owned(&mut self, owner: &str) -> Result<String> {
+        let mut next = self.clone();
+        let mut chat = Conversation::new();
+        chat.owner = Some(owner.to_string());
+        let id = chat.id.clone();
+        next.conversations.push(chat);
+        next.save()?;
+        *self = next;
+        Ok(id)
+    }
+
+    pub fn set_visibility(&mut self, id: &str, visibility: crate::team::Visibility) -> Result<()> {
+        let mut next = self.clone();
+        next.conversations
+            .iter_mut()
+            .find(|chat| chat.id == id)
+            .context("unknown chat")?
+            .visibility = visibility;
         next.save()?;
         *self = next;
         Ok(())

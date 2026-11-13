@@ -668,12 +668,12 @@ export async function startFakeServe({
     agy: { status: "not_installed" },
   };
   function newChat() {
-    return { id: randomUUID(), title: "New chat", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map(), workspace: { revision: 0, name: null, draft: null } };
+    return { id: randomUUID(), title: "New chat", owner: null, visibility: "private", created_at: Date.now(), updated_at: Date.now(), messages: [], subscribers: new Set(), sequence: 0, busy: false, runs: new Map(), workspace: { revision: 0, name: null, draft: null } };
   }
   let activeChat = newChat();
   const chats = new Map([[activeChat.id, activeChat]]);
   function chatSummary(value = activeChat) {
-    return { id: value.id, title: value.title, created_at: value.created_at, updated_at: Math.max(value.updated_at, (value.run?.started_at ?? 0) * 1000, value.run?.activity_at ?? 0), workflow_name: value.workspace.name, message_count: value.messages.length, ea_id: [...chats.keys()].indexOf(value.id), busy: value.busy, run: value.run ?? null };
+    return { id: value.id, title: value.title, created_at: value.created_at, updated_at: Math.max(value.updated_at, (value.run?.started_at ?? 0) * 1000, value.run?.activity_at ?? 0), workflow_name: value.workspace.name, message_count: value.messages.length, ea_id: [...chats.keys()].indexOf(value.id), owner: value.owner, visibility: value.visibility, busy: value.busy, run: value.run ?? null };
   }
   function historyListing() { return { active_id: activeChat.id, conversations: [...chats.values()].filter(chat => !chat.removed).map(chatSummary).sort((a, b) => b.updated_at - a.updated_at), removed_ids: [...chats.values()].filter(chat => chat.removed).map(chat => chat.id) }; }
   const agentToken = randomUUID();

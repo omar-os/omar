@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 type IconName =
   | "arrow"
   | "bolt"
+  | "chat"
   | "chevron"
   | "clock"
   | "close"
@@ -22,6 +23,7 @@ export function WorkflowIcon({ name, size = 18 }: { name: IconName; size?: numbe
   const paths: Record<IconName, ReactNode> = {
     arrow: <><path d="m5 12 14 0M14 7l5 5-5 5" /></>,
     bolt: <path d="m13 2-8 11h7l-1 9 8-12h-7l1-8Z" />,
+    chat: <path d="M4 5h16v11H9l-5 4V5Z" />,
     chevron: <path d="m9 18 6-6-6-6" />,
     clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
     close: <><path d="m7 7 10 10M17 7 7 17" /></>,

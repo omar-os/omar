@@ -5,6 +5,7 @@ import { forgetWorkflowCache, saveWorkflowName, useWorkflowNames } from "./lib/w
 import { WorkflowIcon } from "./workflow-icon";
 import { WorkflowSortMenu, type WorkflowSort } from "./workflow-sort-menu";
 import type { ConversationSummary } from "./lib/protocol";
+import { Avatar } from "./team-presence";
 import { describeError, fetchConversations, deleteConversation, fetchArchivedConversations, setConversationArchived, selectConversation } from "./lib/runtime-client";
 
 const mobileQuery = "(max-width: 900px)";
@@ -33,7 +34,7 @@ export function SidebarIcon({ direction }: { direction: "open" | "close" }) {
   );
 }
 
-export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, readOnly = false, offline = false, onClose, onSelect, onSwitchingChange }: {
+export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, readOnly = false, team, viewers, offline = false, onClose, onSelect, onSwitchingChange }: {
   serveUrl: string;
   activeId: string;
   mobile: boolean;
@@ -41,6 +42,11 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
   collapsed: boolean;
   /** A view port refuses `activate`: selecting stays in this tab. */
   readOnly?: boolean;
+  /** The signed-in member, through `omar gateway`: their own workflows, or
+      every one they can see. */
+  team?: string;
+  /** Other members on each workflow they have open, when its owner shares it. */
+  viewers?: Record<string, string[]>;
   /** The runtime is down, which the studio already says: keep the last list,
       dimmed, rather than a second error. It reloads once the runtime is back. */
   offline?: boolean;
@@ -70,6 +76,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
   useEffect(() => { selectionRef.current = {activeId, onSelect}; }, [activeId, onSelect]);
   const [retry, setRetry] = useState(0);
   const [sort, setSort] = useState<WorkflowSort>("recent");
+  const [scope, setScope] = useState<"mine" | "all">("mine");
   const names = useWorkflowNames(serveUrl);
   const namesRef = useRef(names);
   useEffect(() => { namesRef.current = names; }, [names]);
@@ -196,7 +203,11 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
     } finally { mutation.current++; setSwitching(false); }
   }
 
-  const visible = (showArchive ? archivedChats : chats).filter((chat) => `${displayName(chat)} ${chat.run?.team ?? ""}`.toLowerCase().includes(query.toLowerCase())).sort((a, b) => {
+  const listed = showArchive ? archivedChats : chats;
+  // Only a workflow's owner archives, restores or deletes it.
+  const notMine = (chat: ConversationSummary) => team !== undefined && chat.owner !== team;
+  const scoped = team && scope === "mine" ? listed.filter((chat) => chat.owner === team) : listed;
+  const visible = scoped.filter((chat) => `${displayName(chat)} ${chat.run?.team ?? ""}`.toLowerCase().includes(query.toLowerCase())).sort((a, b) => {
     const byName = () => displayName(a).localeCompare(displayName(b), undefined, { sensitivity: "base", numeric: true });
     if (sort === "name") return byName() || updatedAt(b) - updatedAt(a);
     if (sort === "status") {
@@ -214,8 +225,17 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
     </header>
     <div className="sidebar-heading">
       <div><span className="eyebrow">WORKSPACE</span><h2 id="chat-history-title">Workflows</h2></div>
-      <span className="workflow-count">{showArchive ? archivedChats.length : chats.length}</span>
+      <span className="workflow-count">{scoped.length}</span>
     </div>
+    {team ? (
+      <div className="workflow-scope" role="tablist" aria-label="Whose workflows">
+        {(["mine", "all"] as const).map((option) => (
+          <button key={option} type="button" role="tab" aria-selected={scope === option} onClick={() => setScope(option)}>
+            {option === "mine" ? "My workflows" : "All workflows"}
+          </button>
+        ))}
+      </div>
+    ) : null}
     <div className="history-actions">
       {readOnly ? null : <button className="new-workflow" type="button" disabled={loading || switching} onClick={() => void select()}><span className="new-icon"><WorkflowIcon name="plus" size={15} /></span>New workflow</button>}
       <label className="workflow-search"><WorkflowIcon name="search" size={15} /><input aria-label="Search workflows" placeholder="Search workflows…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
@@ -229,13 +249,13 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
     <ul aria-label={showArchive ? "Archive" : "Saved chats"} aria-busy={loading || switching} className={offline ? "stale" : undefined}>
       {visible.map((chat) => (
         <li key={chat.id} className="workflow-row">
-          {showArchive ? <div className="archived-workflow"><span className="workflow-title">{displayName(chat)}</span><small>{chat.message_count} messages · Saved workflow</small><div className="archived-workflow-actions"><button type="button" disabled={readOnly || switching} onClick={() => void archiveOrRestore(chat, false)}>Restore workflow</button><button type="button" className="workflow-delete" aria-label="Delete workflow permanently" title={`Delete ${displayName(chat)} permanently`} disabled={readOnly || switching} onClick={() => { setDeleteError(""); setDeleteTarget(chat); }}><WorkflowIcon name="trash" size={16} /></button></div></div> : <>
+          {showArchive ? <div className="archived-workflow"><span className="workflow-title">{displayName(chat)}</span><small>{chat.message_count} messages · Saved workflow</small><div className="archived-workflow-actions"><button type="button" disabled={readOnly || notMine(chat) || switching} onClick={() => void archiveOrRestore(chat, false)}>Restore workflow</button><button type="button" className="workflow-delete" aria-label="Delete workflow permanently" title={`Delete ${displayName(chat)} permanently`} disabled={readOnly || notMine(chat) || switching} onClick={() => { setDeleteError(""); setDeleteTarget(chat); }}><WorkflowIcon name="trash" size={16} /></button></div></div> : <>
           <button className="workflow-select" type="button" disabled={switching} aria-current={chat.id === activeId ? "true" : undefined} aria-keyshortcuts="F2" onKeyDown={(event) => { if (event.key === "F2") { event.preventDefault(); cancelRename.current = false; setEditedName(displayName(chat)); setEditing(chat.id); } }} onClick={() => void select(chat.id)}>
             <span className="workflow-name"><span className="workflow-title" title={`${displayName(chat)} · Double-click to rename (saved automatically)`} onDoubleClick={(event) => { if (readOnly) return; event.preventDefault(); event.stopPropagation(); cancelRename.current = false; setEditedName(displayName(chat)); setEditing(chat.id); }}>{displayName(chat)}</span>{chat.id === activeId ? <WorkflowIcon name="chevron" size={14} /> : null}</span>
             <span className="workflow-description">{chat.run?.team ?? (chat.message_count ? `${chat.message_count} messages in this workflow` : "Describe what you want to automate")}</span>
-            <span className="workflow-meta"><small className={`workflow-status status-${workflowStatus(chat).toLowerCase()}`}><i />{workflowStatus(chat)}</small><time dateTime={new Date(updatedAt(chat)).toISOString()}>{new Date(updatedAt(chat)).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</time>{chat.busy && chat.run ? <small>Thinking</small> : null}</span>
+            <span className="workflow-meta"><small className={`workflow-status status-${workflowStatus(chat).toLowerCase()}`}><i />{workflowStatus(chat)}</small>{team ? <small className="workflow-owner" title={`${chat.visibility === "private" ? "Private" : chat.visibility === "team" ? "Shared with the team" : "Public"}`}>{chat.owner === team ? (chat.visibility === "private" ? "Private" : chat.visibility === "team" ? "Team" : "Public") : (chat.owner ?? "operator")}</small> : null}<time dateTime={new Date(updatedAt(chat)).toISOString()}>{new Date(updatedAt(chat)).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</time>{chat.busy && chat.run ? <small>Thinking</small> : null}{viewers?.[chat.id] ? <span className="workflow-viewers" title={`Open now: ${viewers[chat.id].join(", ")}`}>{viewers[chat.id].map((user) => <Avatar key={user} user={user} size="small" />)}</span> : null}</span>
           </button>
-          <button type="button" className="workflow-archive" aria-label="Archive workflow" title={archiveReason(chat) || `Archive ${displayName(chat)}`} disabled={readOnly || switching || !!archiveReason(chat)} onClick={() => void archiveOrRestore(chat, true)}><WorkflowIcon name="archive" size={16} /></button>
+          <button type="button" className="workflow-archive" aria-label="Archive workflow" title={archiveReason(chat) || `Archive ${displayName(chat)}`} disabled={readOnly || notMine(chat) || switching || !!archiveReason(chat)} onClick={() => void archiveOrRestore(chat, true)}><WorkflowIcon name="archive" size={16} /></button>
           {editing === chat.id ? <input className="workflow-rename" aria-label="Workflow name" maxLength={120} value={editedName} autoFocus onFocus={(event) => event.target.select()} onChange={(event) => setEditedName(event.target.value)} onBlur={() => void saveName(chat.id)} onKeyDown={(event) => {
             if (event.key === "Escape") { event.preventDefault(); cancelRename.current = true; setEditing(null); }
             if (event.key === "Enter") { event.preventDefault(); void saveName(chat.id); }

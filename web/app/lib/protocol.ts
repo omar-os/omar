@@ -33,8 +33,10 @@ export type {
   ProofProblem,
   ProposedDesign,
   ReactionStatus,
+  Role,
   RunRecord,
   RunStatus,
+  Visibility,
 } from "./protocol-generated.ts";
 
 export {
@@ -44,7 +46,9 @@ export {
   EDGE_KINDS,
   PORT_KINDS,
   REACTION_STATUSES,
+  ROLES,
   RUN_STATUSES,
+  VISIBILITIES,
 } from "./protocol-generated.ts";
 
 import { CHAT_ROLES, RUN_STATUSES } from "./protocol-generated.ts";

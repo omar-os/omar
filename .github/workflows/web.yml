@@ -124,6 +124,10 @@ jobs:
           key: playwright-${{ runner.os }}-${{ hashFiles('web/package-lock.json') }}
       - run: npx playwright install --with-deps chromium
       - run: npm run test:serve-ui
+      # `omar up` and `omar gateway`: members signing in to a real session.
+      - run: .github/scripts/install-packages.sh tmux
+        working-directory: .
+      - run: npm run test:team-ui
 
   e2e:
     name: Web E2E

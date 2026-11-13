@@ -382,6 +382,9 @@ struct Workspaces {
     selection: Mutex<()>,
     editors: Mutex<crate::editor::Editors>,
     presence: Mutex<Presence>,
+    /// Members with Mission Control open: when each last checked in, and the
+    /// chat they had open.
+    online: Mutex<BTreeMap<String, (Instant, Option<String>)>>,
     launch_ea: AtomicBool,
     shutdown: Arc<AtomicBool>,
 }
@@ -941,6 +944,7 @@ impl Serve {
             selection: Mutex::new(()),
             editors: Mutex::new(crate::editor::Editors::default()),
             presence: Mutex::new(Presence::default()),
+            online: Mutex::new(BTreeMap::new()),
             launch_ea: AtomicBool::new(false),
             shutdown,
         });
@@ -1433,6 +1437,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
     let mut origin = None;
     let mut origin_header = None;
     let mut websocket_key = None;
+    let mut user = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 || line == "\r\n" {
@@ -1441,6 +1446,10 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         let lower = line.to_ascii_lowercase();
         if let Some(value) = lower.strip_prefix("host:") {
             host = Some(value.trim().to_owned());
+        }
+        // Set by `omar gateway`, which strips any the browser sent.
+        if let Some(value) = lower.strip_prefix("x-omar-user:") {
+            user = Some(value.trim().to_owned());
         }
         if let Some(value) = lower.strip_prefix("content-length:") {
             content_length = value.trim().parse().unwrap_or(0);
@@ -1486,10 +1495,175 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             return write_json(&mut stream, 403, &json!({"error": reason}), None);
         }
     }
-    let context = if path == "/v1/agent/reply"
+    // A team member, named by the gateway in front of this loopback port. The
+    // view port ignores the header: anyone may reach it.
+    let session_dir = workspaces.settings.omar_dir.clone();
+    let member = match user.filter(|_| access == Access::Full) {
+        Some(user) => match crate::team::role(&session_dir, &user) {
+            Some(role) => Some(Member { user, role }),
+            None => {
+                return write_json(
+                    &mut stream,
+                    403,
+                    &json!({"error": "not a member of this session"}),
+                    None,
+                )
+            }
+        },
+        None => None,
+    };
+    // Once a session has a team, its view port shows public chats only.
+    let public_only = access == Access::View
+        && !crate::team::members(&session_dir)
+            .unwrap_or_default()
+            .is_empty();
+    let viewer = Viewer {
+        member: member.as_ref(),
+        public_only,
+    };
+    if path == "/v1/team" || path.starts_with("/v1/team/") {
+        let (status, body) = team_request(
+            &workspaces,
+            access,
+            member.as_ref(),
+            &method,
+            &path,
+            &raw_body,
+        );
+        return write_json(&mut stream, status, &body, origin);
+    }
+    if let Some(member) = &member {
+        if member.role != crate::team::Role::Admin && path.starts_with(CONNECT_PREFIX) {
+            return write_json(
+                &mut stream,
+                403,
+                &json!({"error": "only a session admin signs in backends"}),
+                None,
+            );
+        }
+    }
+    if viewer.restricted() {
+        // Answered before any chat is looked up: the operator's active chat
+        // may be one this viewer cannot see.
+        if method == "GET" && path == "/health" {
+            let access = if access == Access::View {
+                "view"
+            } else {
+                "full"
+            };
+            let health = json!({"status": "ok", "protocol_version": SERVE_PROTOCOL_VERSION, "access": access});
+            return write_json(&mut stream, 200, &health, origin);
+        }
+        if method == "GET" && path == "/v1/chats" {
+            return write_json(
+                &mut stream,
+                200,
+                &workspaces.list_where(|chat| viewer.can_read(chat)),
+                origin,
+            );
+        }
+        if let (Some(member), "POST", "/v1/chats") = (&member, method.as_str(), path.as_str()) {
+            let (status, body) = create_member_chat(&workspaces, &member.user);
+            return write_json(&mut stream, status, &body, origin);
+        }
+        // Archived chats: a viewer sees only those they could see before, and
+        // archives, restores or deletes only their own.
+        if method == "GET" && (path == "/v1/chats/removed" || path == "/v1/chats/archived") {
+            let removed = workspaces.removed_where(|chat| viewer.can_read(chat));
+            return write_json(&mut stream, 200, &json!({"conversations": removed}), origin);
+        }
+        if let Some(id) = path.strip_prefix("/v1/chats/").and_then(|rest| {
+            ["/remove", "/archive", "/restore", "/delete"]
+                .iter()
+                .find_map(|action| rest.strip_suffix(action))
+        }) {
+            let owner = workspaces.owner_of(id).flatten();
+            if method != "POST"
+                || member.is_none()
+                || owner.as_deref() != member.as_ref().map(|m| m.user.as_str())
+            {
+                return write_json(&mut stream, 404, &json!({"error": "unknown chat"}), origin);
+            }
+            // The same origin check as the operator's history mutations below.
+            let address = workspaces.settings.address;
+            let local_hosts = [address.to_string(), format!("localhost:{}", address.port())];
+            if !host.as_ref().is_some_and(|h| local_hosts.contains(h))
+                || (origin_header.is_some() && origin.is_none())
+            {
+                return write_json(&mut stream, 403, &json!({"error": "origin rejected"}), None);
+            }
+            // Acts on the chat it names, so no chat of the member's is opened.
+            let action = path.rsplit('/').next().unwrap_or_default();
+            let (status, body) = archive_action(&workspaces, action, id, &raw_body);
+            return write_json(&mut stream, status, &body, origin);
+        }
+        // Members always name their chat, so activating one changes nothing
+        // the operator shares; it only confirms the chat is theirs to see.
+        if let Some(id) = path
+            .strip_prefix("/v1/chats/")
+            .and_then(|rest| rest.strip_suffix("/activate"))
+            .filter(|_| method == "POST")
+        {
+            let summary = workspaces.summary(id).filter(|chat| viewer.can_read(chat));
+            return match summary {
+                Some(summary) => write_json(&mut stream, 200, &json!(summary), origin),
+                None => write_json(&mut stream, 404, &json!({"error": "unknown chat"}), origin),
+            };
+        }
+    }
+    // A member's unnamed chat is their newest own one, as the operator's is
+    // the active one; a member who has none is given one.
+    let member_home = match (&scoped_id, &member) {
+        (None, Some(member)) => {
+            let newest = workspaces
+                .summaries()
+                .1
+                .into_iter()
+                .find(|chat| chat.owner.as_deref() == Some(member.user.as_str()));
+            match newest {
+                Some(chat) => Some(chat.id),
+                None => match create_member_chat(&workspaces, &member.user) {
+                    (200, chat) => chat["id"].as_str().map(str::to_string),
+                    (status, body) => return write_json(&mut stream, status, &body, origin),
+                },
+            }
+        }
+        _ => None,
+    };
+    let chat_id = scoped_id.clone().or(member_home).unwrap_or_else(|| {
+        workspaces
+            .history
+            .lock()
+            .expect("history poisoned")
+            .active_id
+            .clone()
+    });
+    let is_agent_route = path == "/v1/agent/reply"
         || path == "/v1/agent/proposals"
-        || path == "/v1/agent/properties"
-    {
+        || path == "/v1/agent/properties";
+    // Someone else's chat is read-only, exactly as on the view port; one the
+    // viewer may not see does not exist for them.
+    let access = if viewer.restricted() && !is_agent_route {
+        let summary = workspaces.summary(&chat_id);
+        match summary {
+            Some(chat) if viewer.owns(&chat) => Access::Full,
+            Some(chat) if viewer.can_read(&chat) => {
+                if let Some(reason) = view_refusal(&method, &path) {
+                    let reason = if member.is_some() {
+                        "read-only: this chat is someone else's"
+                    } else {
+                        reason
+                    };
+                    return write_json(&mut stream, 403, &json!({"error": reason}), None);
+                }
+                Access::View
+            }
+            _ => return write_json(&mut stream, 404, &json!({"error": "unknown chat"}), origin),
+        }
+    } else {
+        access
+    };
+    let context = if is_agent_route {
         let body: Value = match serde_json::from_slice(&raw_body) {
             Ok(body) => body,
             Err(error) => {
@@ -1520,17 +1694,9 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             _ => return write_json(&mut stream, 403, &json!({"error": "forbidden"}), origin),
         }
     } else {
-        let id = scoped_id.unwrap_or_else(|| {
-            workspaces
-                .history
-                .lock()
-                .expect("history poisoned")
-                .active_id
-                .clone()
-        });
         let context = match access {
-            Access::Full => workspaces.get(&id),
-            Access::View => workspaces.get_for_view(&id),
+            Access::Full => workspaces.get(&chat_id),
+            Access::View => workspaces.get_for_view(&chat_id),
         };
         match context {
             Ok(context) => context,
@@ -1857,23 +2023,33 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
                 .trim_start_matches("/v1/chats/")
                 .strip_suffix(&format!("/{action}"))
                 .unwrap();
-            if action == "delete" {
-                if content_length > MAX_BODY_BYTES {
-                    (413, json!({"error": "request too large"}))
-                } else {
-                    let body: Value =
-                        serde_json::from_slice(&read_body(content_length)?).unwrap_or(Value::Null);
-                    if body["confirm"] != true {
-                        (
-                            400,
-                            json!({"error": "Confirm permanent deletion of this archived workflow."}),
-                        )
-                    } else {
-                        delete_archived_chat(&workspaces, id)
+            archive_action(&workspaces, action, id, &raw_body)
+        }
+        ("POST", "/v1/chat/visibility") => {
+            let visibility = serde_json::from_slice::<Value>(&read_body(content_length)?)
+                .ok()
+                .and_then(|body| {
+                    body.get("visibility")?
+                        .as_str()
+                        .and_then(crate::team::Visibility::parse)
+                });
+            match visibility {
+                None => (
+                    400,
+                    json!({"error": "visibility is private, team or public"}),
+                ),
+                Some(visibility) => {
+                    let set = context
+                        .history
+                        .lock()
+                        .expect("history poisoned")
+                        .set_visibility(&context.conversation_id, visibility);
+                    match set.map(|()| workspaces.summary(&context.conversation_id)) {
+                        Ok(Some(summary)) => (200, json!(summary)),
+                        Ok(None) => (404, json!({"error": "unknown chat"})),
+                        Err(error) => (500, json!({"error": error.to_string()})),
                     }
                 }
-            } else {
-                remove_or_restore_chat(&workspaces, id, action != "restore")
             }
         }
         ("POST", "/v1/chats") => {
@@ -2792,6 +2968,57 @@ impl Workspaces {
     }
 
     fn list(&self) -> Value {
+        let (active_id, conversations, removed_ids) = self.summaries();
+        json!({"active_id": active_id, "conversations": conversations, "removed_ids": removed_ids})
+    }
+
+    /// The chats `keep` admits, for a viewer who may not see them all. The
+    /// operator's active chat is reported only if kept; otherwise the newest
+    /// kept one stands in for it. Removed chats are named only if kept.
+    fn list_where(&self, keep: impl Fn(&ConversationSummary) -> bool) -> Value {
+        let (active_id, conversations, removed_ids) = self.summaries();
+        let conversations: Vec<_> = conversations
+            .into_iter()
+            .filter(|chat| keep(chat))
+            .collect();
+        let active_id = conversations
+            .iter()
+            .find(|chat| chat.id == active_id)
+            .or(conversations.first())
+            .map_or(String::new(), |chat| chat.id.clone());
+        let removed: Vec<String> = self
+            .removed_where(&keep)
+            .into_iter()
+            .map(|chat| chat.id)
+            .filter(|id| removed_ids.contains(id))
+            .collect();
+        json!({"active_id": active_id, "conversations": conversations, "removed_ids": removed})
+    }
+
+    /// Archived chats `keep` admits.
+    fn removed_where(
+        &self,
+        keep: impl Fn(&ConversationSummary) -> bool,
+    ) -> Vec<ConversationSummary> {
+        let history = self.history.lock().expect("history poisoned");
+        history
+            .removed()
+            .into_iter()
+            .filter(|chat| keep(chat))
+            .collect()
+    }
+
+    /// Who owns a chat in any state, archived included: `None` if no such chat.
+    fn owner_of(&self, id: &str) -> Option<Option<String>> {
+        let history = self.history.lock().expect("history poisoned");
+        history
+            .conversations
+            .iter()
+            .find(|chat| chat.id == id)
+            .map(|chat| chat.owner.clone())
+    }
+
+    fn summaries(&self) -> (String, Vec<ConversationSummary>, Vec<String>) {
         let contexts = self.contexts.lock().expect("workspaces poisoned").clone();
         let (active_id, mut conversations, removed_ids) = {
             let history = self.history.lock().expect("history poisoned");
@@ -2818,7 +3045,215 @@ impl Workspaces {
                 .cmp(&a.updated_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        json!({"active_id": active_id, "conversations": conversations, "removed_ids": removed_ids})
+        (active_id, conversations, removed_ids)
+    }
+
+    fn summary(&self, id: &str) -> Option<ConversationSummary> {
+        self.summaries().1.into_iter().find(|chat| chat.id == id)
+    }
+}
+
+/// A team member, as `X-Omar-User` names them and `members.json` ranks them.
+struct Member {
+    user: String,
+    role: crate::team::Role,
+}
+
+/// Who is asking, when that limits what they see: a member through the
+/// gateway, or anyone on the view port of a session with a team. The
+/// operator on the loopback port is neither and sees everything.
+struct Viewer<'a> {
+    member: Option<&'a Member>,
+    public_only: bool,
+}
+
+impl Viewer<'_> {
+    fn restricted(&self) -> bool {
+        self.member.is_some() || self.public_only
+    }
+
+    fn owns(&self, chat: &ConversationSummary) -> bool {
+        self.member
+            .is_some_and(|member| chat.owner.as_deref() == Some(member.user.as_str()))
+    }
+
+    fn can_read(&self, chat: &ConversationSummary) -> bool {
+        use crate::team::Visibility;
+        if self.public_only {
+            return chat.visibility == Visibility::Public;
+        }
+        self.owns(chat) || chat.visibility != Visibility::Private
+    }
+}
+
+fn create_member_chat(workspaces: &Arc<Workspaces>, user: &str) -> (u16, Value) {
+    let _selection = workspaces.selection.lock().expect("selection poisoned");
+    let created = workspaces
+        .history
+        .lock()
+        .expect("history poisoned")
+        .create_owned(user);
+    let id = match created {
+        Ok(id) => id,
+        Err(error) => return (500, json!({"error": error.to_string()})),
+    };
+    if let Err(error) = workspaces.get(&id) {
+        return (500, json!({"error": error.to_string()}));
+    }
+    match workspaces.summary(&id) {
+        Some(summary) => (200, json!(summary)),
+        None => (500, json!({"error": "chat vanished"})),
+    }
+}
+
+/// The accounts a session's members come from: the OMAR home whose
+/// `sessions/` holds it.
+fn accounts_home(session_dir: &Path) -> PathBuf {
+    match session_dir.parent() {
+        Some(sessions) if sessions.file_name().is_some_and(|name| name == "sessions") => sessions
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(crate::sessions::home_root),
+        _ => crate::sessions::home_root(),
+    }
+}
+
+/// How long a member stays online after Mission Control last checked in.
+const ONLINE_FOR: Duration = Duration::from_secs(30);
+
+/// `/v1/team`: who is asking, and for admins (and the operator) the members
+/// with their chat and live workflow counts, never their content, plus the
+/// session's provider keys, masked. Also who is online, and the team room.
+fn team_request(
+    workspaces: &Workspaces,
+    access: Access,
+    member: Option<&Member>,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, Value) {
+    use crate::team::{self, Role};
+    if access == Access::View {
+        return (403, json!({"error": "read-only view"}));
+    }
+    let session = &workspaces.settings.omar_dir;
+    let admin = member.is_none_or(|member| member.role == Role::Admin);
+    let field = |name: &str| -> Option<String> {
+        serde_json::from_slice::<Value>(body)
+            .ok()?
+            .get(name)?
+            .as_str()
+            .map(str::to_string)
+    };
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let result = match (method, path) {
+        // Every open Mission Control checks in, naming the chat it shows, and
+        // learns who else is here. A chat is named to others only once its
+        // owner shares it.
+        ("POST", "/v1/team/presence") => {
+            let mut online = workspaces.online.lock().expect("online poisoned");
+            let now = Instant::now();
+            if let Some(member) = member {
+                online.insert(member.user.clone(), (now, field("chat")));
+            }
+            online.retain(|_, (seen, _)| now.duration_since(*seen) < ONLINE_FOR);
+            let members = team::members(session).unwrap_or_default();
+            let (_, chats, _) = workspaces.summaries();
+            let here: Vec<Value> = online
+                .iter()
+                .filter(|(user, _)| members.contains_key(*user))
+                .map(|(user, (_, chat))| {
+                    let shared = chat.as_ref().and_then(|id| {
+                        chats.iter().find(|chat| {
+                            &chat.id == id && chat.visibility != team::Visibility::Private
+                        })
+                    });
+                    json!({"user": user, "chat": shared})
+                })
+                .collect();
+            return (
+                200,
+                json!({"online": here, "room_seq": team::room_seq(session)}),
+            );
+        }
+        ("GET", "/v1/team/room") => {
+            let after = query
+                .split('&')
+                .find_map(|field| field.strip_prefix("after="))
+                .and_then(|after| after.parse().ok())
+                .unwrap_or(0);
+            return match team::room(session, after) {
+                Ok(messages) => (200, json!({"messages": messages})),
+                Err(error) => (500, json!({"error": error.to_string()})),
+            };
+        }
+        ("POST", "/v1/team/room") => {
+            let Some(member) = member else {
+                return (
+                    403,
+                    json!({"error": "sign in through omar gateway to talk in the room"}),
+                );
+            };
+            return match team::post(session, &member.user, &field("text").unwrap_or_default()) {
+                Ok(message) => (200, json!(message)),
+                Err(error) => (400, json!({"error": error.to_string()})),
+            };
+        }
+        ("GET", "/v1/team") => {
+            let mut answer = json!({
+                "user": member.map(|member| member.user.clone()),
+                "role": member.map(|member| member.role),
+                "admin": admin,
+            });
+            if admin {
+                let (_, chats, _) = workspaces.summaries();
+                let members: Vec<Value> = team::members(session)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(user, role)| {
+                        let owned: Vec<_> =
+                            chats.iter().filter(|chat| chat.owner.as_deref() == Some(user.as_str())).collect();
+                        let live = owned
+                            .iter()
+                            .filter(|chat| chat.run.as_ref().is_some_and(|run| run.status.is_active()))
+                            .count();
+                        json!({"user": user, "role": role, "chats": owned.len(), "live_workflows": live})
+                    })
+                    .collect();
+                let accounts: Vec<String> = crate::accounts::Accounts::at(&accounts_home(session))
+                    .list()
+                    .map(|accounts| accounts.into_keys().collect())
+                    .unwrap_or_default();
+                answer["members"] = json!(members);
+                answer["accounts"] = json!(accounts);
+                answer["keys"] = json!(team::masked_keys(session).unwrap_or_default());
+                answer["key_vars"] = json!(team::KEY_VARS);
+            }
+            return (200, answer);
+        }
+        _ if !admin => return (403, json!({"error": "only a session admin can do that"})),
+        ("POST", "/v1/team/members") => {
+            let role = match field("role").as_deref() {
+                Some("admin") => Role::Admin,
+                Some("member") | None => Role::Member,
+                Some(other) => return (400, json!({"error": format!("unknown role '{other}'")})),
+            };
+            let user = field("user").unwrap_or_default();
+            team::add_member(session, &accounts_home(session), &user, role)
+        }
+        ("POST", "/v1/team/members/remove") => {
+            team::remove_member(session, &field("user").unwrap_or_default())
+        }
+        ("POST", "/v1/team/keys") => team::set_key(
+            session,
+            &field("var").unwrap_or_default(),
+            &field("value").unwrap_or_default(),
+        ),
+        _ => return (404, json!({"error": "not found"})),
+    };
+    match result {
+        Ok(()) => (200, json!({"ok": true})),
+        Err(error) => (400, json!({"error": error.to_string()})),
     }
 }
 
@@ -2859,6 +3294,27 @@ fn update_recency(summary: &mut ConversationSummary) {
 
 /// Selection and removal share a lock; removal and deployment share the chat
 /// operation lock. A stale tab cannot admit a run after its workflow is hidden.
+/// `remove`, `archive`, `restore` or `delete` (of an archived chat, with
+/// `{"confirm": true}`) on chat `id`.
+fn archive_action(
+    workspaces: &Arc<Workspaces>,
+    action: &str,
+    id: &str,
+    body: &[u8],
+) -> (u16, Value) {
+    if action != "delete" {
+        return remove_or_restore_chat(workspaces, id, action != "restore");
+    }
+    let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    if body["confirm"] != true {
+        return (
+            400,
+            json!({"error": "Confirm permanent deletion of this archived workflow."}),
+        );
+    }
+    delete_archived_chat(workspaces, id)
+}
+
 fn remove_or_restore_chat(workspaces: &Arc<Workspaces>, id: &str, removed: bool) -> (u16, Value) {
     let _selection = workspaces.selection.lock().expect("selection poisoned");
     if !workspaces
@@ -5195,7 +5651,7 @@ fn write_json(
 /// compressed, and this only ever answers loopback, where every client
 /// understands the encoding. `no-store` because the bundle changes whenever the
 /// binary does and the two carry no version between them.
-fn write_asset(stream: &mut TcpStream, asset: &crate::web_assets::Asset) -> Result<()> {
+pub(crate) fn write_asset(stream: &mut TcpStream, asset: &crate::web_assets::Asset) -> Result<()> {
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
@@ -7796,6 +8252,296 @@ while True:
 
         assert!(plain.starts_with("HTTP/1.1 400"), "{plain}");
         assert!(plain.contains("WebSocket"), "{plain}");
+    }
+
+    fn request_as(
+        address: SocketAddr,
+        user: &str,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> (u16, Value) {
+        let mut stream = TcpStream::connect(address).expect("connect");
+        let body = body.unwrap_or("");
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: {address}\r\nX-Omar-User: {user}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("response");
+        let status = response[9..12].parse().expect("status");
+        let body = response.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+        (status, serde_json::from_str(body).unwrap_or(Value::Null))
+    }
+
+    fn chat_ids(list: &Value) -> Vec<String> {
+        list["conversations"]
+            .as_array()
+            .expect("conversations")
+            .iter()
+            .map(|chat| chat["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn members_see_who_is_online_where_they_may_and_share_a_room() {
+        let home = tempfile::tempdir().unwrap();
+        let session = home.path().join("sessions/demo");
+        std::fs::create_dir_all(&session).unwrap();
+        let accounts = crate::accounts::Accounts::at(home.path());
+        for user in ["alice", "bob"] {
+            accounts.add(user).unwrap();
+        }
+        crate::team::add_member(&session, home.path(), "alice", crate::team::Role::Admin).unwrap();
+        crate::team::add_member(&session, home.path(), "bob", crate::team::Role::Member).unwrap();
+        let mut config = Config::default();
+        config.dashboard.session_prefix = format!("team-{}-", Uuid::new_v4());
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, &session, 0).unwrap();
+        let address = server.address();
+        let view = server.start_viewer("127.0.0.1:0".parse().unwrap()).unwrap();
+
+        let (_, chat) = request_as(address, "alice", "POST", "/v1/chats", Some("{}"));
+        let a = chat["id"].as_str().unwrap().to_string();
+        let check_in = |user, chat: &str| {
+            let body = format!(r#"{{"chat":"{chat}"}}"#);
+            request_as(address, user, "POST", "/v1/team/presence", Some(&body))
+        };
+        let (status, here) = check_in("alice", &a);
+        assert_eq!(status, 200, "{here}");
+        let (_, here) = check_in("bob", "");
+        let online = |here: &Value| -> Vec<(String, Option<String>)> {
+            here["online"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    let chat = entry["chat"]["id"].as_str().map(str::to_string);
+                    (entry["user"].as_str().unwrap().to_string(), chat)
+                })
+                .collect()
+        };
+        // Alice's chat is private, so bob sees her here but not where.
+        assert_eq!(
+            online(&here),
+            vec![("alice".into(), None), ("bob".into(), None)]
+        );
+        let body = r#"{"visibility":"team"}"#;
+        let path = format!("/chats/{a}/v1/chat/visibility");
+        assert_eq!(
+            request_as(address, "alice", "POST", &path, Some(body)).0,
+            200
+        );
+        let (_, here) = check_in("bob", "");
+        assert_eq!(online(&here)[0], ("alice".into(), Some(a.clone())));
+        assert_eq!(here["room_seq"], 0);
+
+        let say = |user, text: &str| {
+            let body = json!({ "text": text }).to_string();
+            request_as(address, user, "POST", "/v1/team/room", Some(&body))
+        };
+        assert_eq!(say("alice", "standup in 5").0, 200);
+        assert_eq!(say("bob", "  ").0, 400);
+        let (_, message) = say("bob", "on my way");
+        assert_eq!(message["seq"], 2);
+        let (_, here) = check_in("alice", &a);
+        assert_eq!(here["room_seq"], 2);
+        let (_, room) = request_as(address, "alice", "GET", "/v1/team/room?after=1", None);
+        let texts: Vec<_> = room["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| (m["user"].as_str().unwrap(), m["text"].as_str().unwrap()))
+            .collect();
+        assert_eq!(texts, vec![("bob", "on my way")]);
+
+        // The public view port sees neither.
+        assert_eq!(
+            request_as(view, "alice", "GET", "/v1/team/room", None).0,
+            403
+        );
+        assert_eq!(
+            request_as(view, "alice", "POST", "/v1/team/presence", Some("{}")).0,
+            403
+        );
+    }
+
+    #[test]
+    fn team_members_see_their_own_chats_and_what_others_share() {
+        let home = tempfile::tempdir().unwrap();
+        let session = home.path().join("sessions/demo");
+        std::fs::create_dir_all(&session).unwrap();
+        let accounts = crate::accounts::Accounts::at(home.path());
+        for user in ["alice", "bob", "carol"] {
+            accounts.add(user).unwrap();
+        }
+        crate::team::add_member(&session, home.path(), "alice", crate::team::Role::Admin).unwrap();
+        crate::team::add_member(&session, home.path(), "bob", crate::team::Role::Member).unwrap();
+        let mut config = Config::default();
+        config.dashboard.session_prefix = format!("team-{}-", Uuid::new_v4());
+        let server = Serve::start("127.0.0.1:0".parse().unwrap(), &config, &session, 0).unwrap();
+        let address = server.address();
+        let view = server.start_viewer("127.0.0.1:0".parse().unwrap()).unwrap();
+
+        let (status, alice_chat) = request_as(address, "alice", "POST", "/v1/chats", Some("{}"));
+        assert_eq!(status, 200, "{alice_chat}");
+        assert_eq!(alice_chat["owner"], "alice");
+        assert_eq!(alice_chat["visibility"], "private");
+        let a = alice_chat["id"].as_str().unwrap().to_string();
+        // A member who names no chat gets their own, made on first use.
+        let (status, bob_chat) = request_as(address, "bob", "GET", "/v1/chat", None);
+        assert_eq!(
+            (status, bob_chat["owner"].as_str()),
+            (200, Some("bob")),
+            "{bob_chat}"
+        );
+        let b = bob_chat["id"].as_str().unwrap().to_string();
+        let (_, again) = request_as(address, "bob", "GET", "/v1/chat", None);
+        assert_eq!(again["id"], b.as_str());
+
+        // Private: each sees only their own, and the other's does not exist.
+        let (_, list) = request_as(address, "bob", "GET", "/v1/chats", None);
+        assert_eq!(chat_ids(&list), vec![b.clone()]);
+        assert_eq!(list["active_id"], b.as_str());
+        let (status, _) = request_as(address, "bob", "GET", &format!("/chats/{a}/v1/chat"), None);
+        assert_eq!(status, 404);
+        assert_eq!(request_as(address, "bob", "GET", "/health", None).0, 200);
+
+        // Team: bob reads alice's chat but cannot write to it or reshare it.
+        let set = |user, id: &str, visibility| {
+            request_as(
+                address,
+                user,
+                "POST",
+                &format!("/chats/{id}/v1/chat/visibility"),
+                Some(&format!(r#"{{"visibility":"{visibility}"}}"#)),
+            )
+        };
+        assert_eq!(set("alice", &a, "team").0, 200);
+        let (status, chat) =
+            request_as(address, "bob", "GET", &format!("/chats/{a}/v1/chat"), None);
+        assert_eq!((status, chat["owner"].as_str()), (200, Some("alice")));
+        let (status, refusal) = set("bob", &a, "private");
+        assert_eq!(status, 403);
+        assert!(
+            refusal["error"]
+                .as_str()
+                .unwrap()
+                .contains("someone else's"),
+            "{refusal}"
+        );
+        let message = request_as(
+            address,
+            "bob",
+            "POST",
+            &format!("/chats/{a}/v1/chat"),
+            Some(r#"{"text":"hi"}"#),
+        );
+        assert_eq!(message.0, 403);
+        assert_eq!(set("alice", &a, "everyone").0, 400);
+
+        // The view port: nothing until alice makes her chat public, and the
+        // header is ignored there.
+        assert!(chat_ids(&request_as(view, "alice", "GET", "/v1/chats", None).1).is_empty());
+        assert_eq!(set("alice", &a, "public").0, 200);
+        assert_eq!(
+            chat_ids(&request_as(view, "bob", "GET", "/v1/chats", None).1),
+            vec![a.clone()]
+        );
+        assert_eq!(
+            request_as(view, "bob", "GET", &format!("/chats/{b}/v1/chat"), None).0,
+            404
+        );
+
+        // Archiving is the owner's: bob cannot archive alice's chat, and a
+        // private archived chat stays out of everyone else's archive.
+        let archive = |user, id: &str| {
+            request_as(
+                address,
+                user,
+                "POST",
+                &format!("/v1/chats/{id}/archive"),
+                Some("{}"),
+            )
+        };
+        assert_eq!(archive("bob", &a).0, 404);
+        assert_eq!(archive("bob", &b).0, 200, "bob archives his own");
+        let (_, archived) = request_as(address, "alice", "GET", "/v1/chats/archived", None);
+        assert!(chat_ids(&archived).is_empty(), "{archived}");
+        let (_, archived) = request_as(address, "bob", "GET", "/v1/chats/archived", None);
+        assert_eq!(chat_ids(&archived), vec![b.clone()]);
+        assert_eq!(
+            request_as(
+                address,
+                "bob",
+                "POST",
+                &format!("/v1/chats/{b}/restore"),
+                Some("{}")
+            )
+            .0,
+            200
+        );
+
+        // Not a member, or not an admin.
+        assert_eq!(
+            request_as(address, "carol", "GET", "/v1/chats", None).0,
+            403
+        );
+        let (status, _) = request_as(
+            address,
+            "bob",
+            "POST",
+            "/v1/backends/claude/connect",
+            Some("{}"),
+        );
+        assert_eq!(status, 403);
+        let (status, team) = request_as(address, "bob", "GET", "/v1/team", None);
+        assert_eq!((status, team["role"].as_str()), (200, Some("member")));
+        assert!(team.get("members").is_none(), "{team}");
+        let key = r#"{"var":"ANTHROPIC_API_KEY","value":"sk-ant-0123456789f3a9"}"#;
+        assert_eq!(
+            request_as(address, "bob", "POST", "/v1/team/keys", Some(key)).0,
+            403
+        );
+
+        // An admin sees counts and masked keys, never content.
+        assert_eq!(
+            request_as(address, "alice", "POST", "/v1/team/keys", Some(key)).0,
+            200
+        );
+        let (_, team) = request_as(address, "alice", "GET", "/v1/team", None);
+        assert_eq!(team["keys"]["ANTHROPIC_API_KEY"], "sk-…f3a9");
+        let counts: Vec<_> = team["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["user"].as_str().unwrap(),
+                    m["chats"].as_u64().unwrap(),
+                    m["live_workflows"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(counts, vec![("alice", 1, 0), ("bob", 1, 0)]);
+        assert!(
+            !team.to_string().contains(&b),
+            "admin view names a chat: {team}"
+        );
+        assert_eq!(team["accounts"], json!(["alice", "bob", "carol"]));
+
+        // The operator, on loopback with no header, still sees everything.
+        let all = chat_ids(
+            &serde_json::from_str::<Value>(
+                request(address, "GET", "/v1/chats", None)
+                    .split_once("\r\n\r\n")
+                    .unwrap()
+                    .1,
+            )
+            .unwrap(),
+        );
+        assert!(all.contains(&a) && all.contains(&b));
     }
 
     fn request(address: SocketAddr, method: &str, path: &str, body: Option<&str>) -> String {

@@ -1,3 +1,4 @@
+mod accounts;
 mod app;
 mod backend;
 mod backend_probe;
@@ -11,6 +12,7 @@ mod diagram;
 mod ea;
 mod ea_lifecycle;
 mod event;
+mod gateway;
 mod manager;
 mod mcp;
 mod memory;
@@ -33,6 +35,7 @@ mod serve;
 mod sessions;
 mod stub_agent;
 mod supervision;
+mod team;
 mod terminal;
 mod tmux;
 mod topology;
@@ -127,6 +130,45 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum UserAction {
+    /// Create an account and print its temporary password, shown only once
+    Add {
+        name: String,
+    },
+    /// Issue a new temporary password and sign the account out everywhere
+    Reset {
+        name: String,
+    },
+    /// Stop an account from signing in, keeping it
+    Disable {
+        name: String,
+    },
+    Enable {
+        name: String,
+    },
+    /// Delete an account; its chats keep their owner's name
+    Rm {
+        name: String,
+    },
+    Ls,
+}
+
+#[derive(Subcommand)]
+enum MemberAction {
+    /// Add an account to the session (-s), or change its role
+    Add {
+        name: String,
+        /// Manage members and the session's API keys
+        #[arg(long)]
+        admin: bool,
+    },
+    Rm {
+        name: String,
+    },
+    Ls,
+}
+
+#[derive(Subcommand)]
 enum Commands {
     #[command(hide = true)]
     SandboxWorker,
@@ -134,6 +176,23 @@ enum Commands {
     Open {
         #[arg(long)]
         print_url: bool,
+    },
+    /// Team accounts on this machine: one per person, shared by every session
+    /// they are a member of
+    User {
+        #[command(subcommand)]
+        action: UserAction,
+    },
+    /// The selected session's team: who may sign in to it through the gateway
+    Member {
+        #[command(subcommand)]
+        action: MemberAction,
+    },
+    /// Sign team members in at one address and route them to their sessions.
+    /// Listens on loopback; put an HTTPS proxy such as Caddy in front
+    Gateway {
+        #[arg(long, default_value = "127.0.0.1:8090")]
+        address: std::net::SocketAddr,
     },
     /// Create a new independent background runtime, or restart a stopped one by name on this build
     Up(sessions::UpOptions),
@@ -562,6 +621,61 @@ fn main() -> Result<()> {
         .block_on(async_main(cli))
 }
 
+/// Accounts and teams live in the OMAR home, not in any one session.
+fn team_dispatch(cli: &Cli) -> Option<Result<()>> {
+    let home = sessions::home_root();
+    let accounts = accounts::Accounts::at(&home);
+    Some(match cli.command.as_ref()? {
+        Commands::User { action } => match action {
+            UserAction::Add { name } => accounts.add(name).map(|password| {
+                println!("Created {name}. Temporary password, shown once:\n  {password}");
+                println!("{name} changes it at first sign-in. Add them to a session: omar -s SESSION member add {name}");
+            }),
+            UserAction::Reset { name } => accounts.reset(name).map(|password| {
+                println!("New temporary password for {name}, shown once:\n  {password}");
+            }),
+            UserAction::Disable { name } => accounts.set_disabled(name, true),
+            UserAction::Enable { name } => accounts.set_disabled(name, false),
+            UserAction::Rm { name } => accounts.remove(name),
+            UserAction::Ls => accounts.list().map(|accounts| {
+                for (name, account) in accounts {
+                    let state = if account.disabled {
+                        "disabled"
+                    } else if account.must_change {
+                        "temporary password"
+                    } else {
+                        "active"
+                    };
+                    println!("{name}\t{state}");
+                }
+            }),
+        },
+        Commands::Member { action } => {
+            let Some(session) = cli.session.as_deref() else {
+                return Some(Err(anyhow::anyhow!("name the session: omar -s SESSION member …")));
+            };
+            let directory = home.join("sessions").join(session);
+            if !directory.is_dir() {
+                return Some(Err(anyhow::anyhow!("no session '{session}'; see omar ls")));
+            }
+            match action {
+                MemberAction::Add { name, admin } => {
+                    let role = if *admin { team::Role::Admin } else { team::Role::Member };
+                    team::add_member(&directory, &home, name, role)
+                }
+                MemberAction::Rm { name } => team::remove_member(&directory, name),
+                MemberAction::Ls => team::members(&directory).map(|members| {
+                    for (name, role) in members {
+                        println!("{name}\t{}", serde_json::to_value(role).unwrap().as_str().unwrap());
+                    }
+                }),
+            }
+        }
+        Commands::Gateway { address } => gateway::run(*address),
+        _ => return None,
+    })
+}
+
 async fn async_main(mut cli: Cli) -> Result<()> {
     if matches!(cli.command, Some(Commands::SandboxWorker)) {
         return topology::sandbox_worker();
@@ -575,6 +689,9 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         false
     };
     if !internal {
+        if let Some(result) = team_dispatch(&cli) {
+            return result;
+        }
         if let Some(result) = sessions::dispatch(&cli).await {
             return result;
         }
@@ -617,7 +734,10 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Rollback { .. }
             | Commands::SessionDaemon { .. }
             | Commands::SessionExec { .. }
-            | Commands::Serve { .. },
+            | Commands::Serve { .. }
+            | Commands::User { .. }
+            | Commands::Member { .. }
+            | Commands::Gateway { .. },
         ) => unreachable!(),
         Some(Commands::Spawn {
             name,
