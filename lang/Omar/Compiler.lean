@@ -61,6 +61,34 @@ private partial def readText (acc : List Char) : List Char -> Except String (Str
   | '"' :: rest => pure (String.ofList acc.reverse, rest)
   | c :: rest => readText (c :: acc) rest
 
+/-- `"""…"""`, read verbatim up to the closing three quotes: no escapes, so a
+    lone `"` needs none. -/
+private partial def readBlockText (acc : List Char) : List Char -> Except String (String × List Char)
+  | [] => throw "unterminated \"\"\" string"
+  | '"' :: '"' :: '"' :: rest => pure (String.ofList acc.reverse, rest)
+  | c :: rest => readBlockText (c :: acc) rest
+
+/-- A block string as the program means it, not as it is indented: a line
+    break straight after the opening quotes and the blank line before the
+    closing ones are dropped, and so is the indentation every other line
+    shares, so the text can sit indented with the code around it. -/
+def dedent (raw : String) : String :=
+  let blank (line : List Char) : Bool := line.all Char.isWhitespace
+  let lines := (raw.toList.splitOn '\n').map fun line =>
+    (line.reverse.dropWhile (· == '\r')).reverse
+  let lines := match lines with
+    | first :: rest => if blank first then rest else first :: rest
+    | [] => []
+  let lines := match lines.reverse with
+    | last :: rest => if blank last then rest.reverse else lines
+    | [] => []
+  let indent (line : List Char) : Nat := (line.takeWhile (fun c => c == ' ' || c == '\t')).length
+  let common := ((lines.filter (!blank ·)).map indent).foldl
+    (fun acc n => some (match acc with | some m => min m n | none => n)) none
+  let common := common.getD 0
+  String.intercalate "\n" (lines.map fun line =>
+    if blank line then "" else String.ofList (line.drop common))
+
 /-- The `#` count opening a raw string after `r`, and what follows the quote. -/
 private def rawOpen : List Char -> Option (Nat × List Char)
   | '"' :: rest => some (0, rest)
@@ -168,6 +196,9 @@ private partial def lexChars : List Char -> Except String (List Token)
   | '{' :: '=' :: rest => do
       let (raw, tail) ← readCode [] rest
       pure (Token.code raw :: (← lexChars tail))
+  | '"' :: '"' :: '"' :: rest => do
+      let (value, tail) ← readBlockText [] rest
+      pure (Token.text (dedent value) :: (← lexChars tail))
   | '"' :: rest => do
       let (value, tail) ← readText [] rest
       pure (Token.text value :: (← lexChars tail))
@@ -309,6 +340,11 @@ structure StateVar where
   type : String
   initial : Literal
   instance_ : String := ""
+  /-- For `context name(a, b) "…"`: the agents whose tasks are handed it
+      before they run and asked to update it after. Empty for plain state. -/
+  sharedBy : Array String := #[]
+  /-- How a context should be kept, when the program says. -/
+  directive : Option String := none
   deriving Repr
 
 /-- A team parameter with the argument its instantiation bound to it. A
@@ -573,6 +609,18 @@ private def parseActionDelay : Parser (Option Nat)
       pure (some delay, rest)
   | tokens => pure (none, tokens)
 
+/-- `a, b)`: the names a `context` lists, through the closing parenthesis. -/
+private partial def parseNames (acc : Array String) : Parser (Array String)
+  | Token.sym ")" :: rest =>
+      if acc.isEmpty then throw "a context lists no agents; name the agents that share it"
+      else pure (acc, rest)
+  | tokens => do
+      let (name, rest) ← word tokens
+      match rest with
+      | Token.sym "," :: rest => parseNames (acc.push name) rest
+      | Token.sym ")" :: _ => parseNames (acc.push name) rest
+      | _ => throw s!"expected ',' or ')' after '{name}' in a context's agents"
+
 private partial def parseDeclarations
     (aliases : Array (String × String))
     (reactionIndex : Nat)
@@ -634,6 +682,17 @@ private partial def parseDeclarations
       let (initial, rest) ← literal rest
       parseDeclarations aliases reactionIndex ports timers connections reactions instances
         (states.push { name, type, initial }) rest
+  -- `context notes(planner, coder) "…"`: state the listed agents' tasks are
+  -- handed before they run and asked to update after. Matched with the name
+  -- and `(` after it, so a port named `context` still connects.
+  | Token.word "context" :: Token.word name :: Token.sym "(" :: rest => do
+      let (agents, rest) ← parseNames #[] rest
+      let (directive, rest) := match rest with
+        | Token.text text :: tail => (some text, tail)
+        | _ => (none, rest)
+      parseDeclarations aliases reactionIndex ports timers connections reactions instances
+        (states.push { name, type := "string", initial := .str "", sharedBy := agents, directive })
+        rest
   | Token.word name :: Token.sym "=" :: rest => do
       let (team, rest) ← word rest
       let (_, rest) ← expectSym "(" rest
@@ -745,6 +804,20 @@ private def parseTeam (aliases : Array (String × String)) : Parser TeamDecl := 
     parseDeclarations aliases 0 #[] #[] #[] #[] #[] #[] tokens
   -- `shutdown` is the runtime's, so a team cannot declare something by that
   -- name, and reacting to it is what declares it.
+  for var in states do
+    for agent in var.sharedBy do
+      match agents.find? (·.name == agent) with
+      | none =>
+          throw s!"context '{var.name}' lists '{agent}', which is not an agent of team '{name}'"
+      -- A `Web` agent is answered from Mission Control's panel, which cannot
+      -- yet show a context or set or keep one, so every completion would be
+      -- refused. Matched as the runtime matches backends: case aside.
+      | some found =>
+          if found.backend.toLower == "web" then
+            throw s!"context '{var.name}' lists '{agent}', a Web agent; \
+              Mission Control can't keep a context yet"
+    if var.sharedBy.toList.eraseDups.length != var.sharedBy.size then
+      throw s!"context '{var.name}' lists an agent twice"
   let declared := ports.map (·.name) ++ timers.map (·.name) ++ states.map (·.name)
   if declared.contains "shutdown" then
     throw s!"team '{name}' declares 'shutdown', which is the trigger the run's last tag fires"
@@ -887,8 +960,9 @@ private def validate (program : Program) : Except String Program := do
       throw s!"timer '{timer.name}' never fires; give it an offset, a period, or both"
   ensureUnique "state" (program.states.map (·.name))
   for var in program.states do
+    let kind := if var.sharedBy.isEmpty then "state" else "context"
     if containsName portNames var.name || containsName timerNames var.name then
-      throw s!"state '{var.name}' is also a port or timer; a name means one thing"
+      throw s!"{kind} '{var.name}' is also a port or timer; a name means one thing"
     -- OMAR's types, not the host's, so a value can be recorded and shown.
     if var.type != "int" && var.type != "bool" && var.type != "string" then
       throw s!"state '{var.name}' is {var.type}; state is int, bool, or string"
@@ -954,6 +1028,12 @@ private def validate (program : Program) : Except String Program := do
       | none => throw s!"connection names unknown target port '{connection.target}'"
     if source.type != target.type then
       throw s!"connection type mismatch from '{connection.source}' to '{connection.target}'"
+    -- A port holds one value per tag. Two connections into it would leave
+    -- only the last value carried, and drop the other without a word.
+    let sources := program.connections.filter (·.target == connection.target) |>.map (·.source)
+    if sources.size > 1 then
+      throw s!"port '{connection.target}' has {sources.size} incoming connections \
+        ({", ".intercalate sources.toList}); a port takes one, so give each source its own port"
   pure program
 
 /-- `instance.member`. The VM has one flat namespace, so instantiating a team
@@ -1056,7 +1136,9 @@ private partial def elaborateInstance
   let timers := decl.timers.map fun timer =>
     { timer with name := qualify path timer.name, instance_ := path }
   let states := decl.states.map fun var =>
-    { var with name := qualify path var.name, instance_ := path }
+    { var with
+        name := qualify path var.name, instance_ := path
+        sharedBy := var.sharedBy.map (qualify path) }
   -- An endpoint written `a.out` is already the nested instance's local name,
   -- so prefixing the path is all it takes to reach `b.a.out`.
   let connections := decl.connections.map fun connection =>
@@ -1192,12 +1274,15 @@ def instructionTexts (program : Program) : Array String :=
       ("period", toJson timer.period)
     ] ++ (if timer.shutdown then [("shutdown", toJson true)] else []))
   let states := program.states.map fun var =>
-    instruction "declare_state" [
+    instruction "declare_state" ([
       ("instance", toJson var.instance_),
       ("name", toJson var.name),
       ("type", toJson var.type),
       ("initial", literalJson var.initial)
-    ]
+    ] ++ (if var.sharedBy.isEmpty then [] else [("agents", jsonStringArray var.sharedBy)])
+      ++ match var.directive with
+      | some directive => [("directive", toJson directive)]
+      | none => [])
   let params := program.params.map fun param =>
     instruction "declare_param" [
       ("instance", toJson param.instance_),

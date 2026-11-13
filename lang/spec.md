@@ -28,7 +28,7 @@ backend     = identifier ;
 main        = "main", [ identifier ], "{", { instance | wiring }, "}" ;
 wiring      = qualified, "->", qualified, [ "after", delay ] ;
 
-declaration = input | output | action | timer | state | instance
+declaration = input | output | action | timer | state | context | instance
             | connection | task | reaction | ";" ;
 input       = "input", identifier, ":", type ;
 output      = "output", identifier, ":", type ;
@@ -36,6 +36,8 @@ action      = "action", identifier, [ "(", "delay", "=", delay, ")" ],
               [ ":", type ] ;
 timer       = "timer", identifier, "(", delay, ",", delay, ")" ;
 state       = "state", identifier, ":", type, "=", literal ;
+context     = "context", identifier, "(", identifier, { ",", identifier }, ")",
+              [ string ] ;
 instance    = identifier, "=", identifier, "(", [ args ], ")" ;
 args        = literal, { ",", literal } ;
 literal     = natural | string | boolean ;
@@ -69,6 +71,13 @@ natural     = digit, { digit } ;
 
 Identifiers are case-sensitive. `//` starts a line comment and `/* ... */`
 delimits a block comment.
+
+A string is `"…"`, where `\"` and `\\` are the only escapes, or `"""…"""`,
+which has none and ends at the next `"""`. A `"""` string is written indented
+with the code around it, and means the text without that indentation: a line
+break straight after the opening quotes and a blank last line before the
+closing ones are dropped, and so is the leading whitespace every non-blank
+line shares. It goes wherever a string does, a prompt included.
 
 ### 2.1 Teams, agents and main
 
@@ -222,6 +231,29 @@ invocation, its interpolation expands to `<absent>`.
   `omar_set_state` sets it (§4.2). Since the instance's reactions run one at a
   time, no two hold its state at once. State is the instance's own: a nested
   team's is out of reach, and data crosses instances only through ports.
+- `context notes(planner, coder) """Keep decisions; drop what is resolved."""`
+  declares state the listed agents keep together without their prompts saying
+  so: a `string`, starting empty. Each task of a listed agent is invoked with
+  the context — the directive if the program gave one (`null` if not), and
+  what it holds now — in the invocation itself, beside its triggers (§4.2);
+  the prompt is the program's own. The task must then either set the full
+  updated text with `omar_set_state`, or say it leaves it as it was with
+  `omar_complete(task_id, keep: ["notes"])`: completion is refused until every
+  context it shares is one or the other. Without a directive the name is the
+  only hint, so name it for what it holds.
+
+  The write commits with the task, like any state write (§4.2): the next task
+  that shares it starts from it, at the same tag if declared later, and a task
+  that expires or fails leaves it as it was. It is not an effect, so no
+  contract names it. A write over 16 KiB is refused, with the agent told to
+  condense it: it is handed whole to every task that shares it.
+
+  The listed names must be agents of the team, each once, and none a `Web`
+  agent: Mission Control's panel cannot yet show a context or set or keep one,
+  so its every completion would be refused. Otherwise a context
+  is the team's state like any other: a task of an unlisted agent may read
+  `$(notes)` and set it, and a body reads `self.notes`. Changing its
+  declaration in a mutation (§5.1) declares it again, empty.
 
 ### 2.3 Effect contracts
 
@@ -242,7 +274,9 @@ The expression after `->` declares the ports a reaction may set:
 
 Every trigger must be an input, action, timer or `shutdown`. Every effect must be an output or
 action. A connection target must be an output or action, and its source and
-target types must match. Values must match their port types.
+target types must match. A port takes at most one incoming connection: it holds
+one value per tag, so two would drop one. Give each source its own input and
+merge them in a reaction. Values must match their port types.
 
 ### 2.4 Deadlines
 
@@ -429,7 +463,7 @@ scoped MCP tools:
 ```text
 omar_set_port(task_id, port, value)
 omar_set_state(task_id, name, value)
-omar_complete(task_id)
+omar_complete(task_id, keep?)
 omar_pending()
 ```
 
@@ -457,7 +491,8 @@ value `null`; this preserves the distinction between absence and a signal.
 `omar_set_state` writes the state of the invocation's own instance, which no
 contract lists: any task of the instance may set any of its state. It accepts
 no port and no other instance's state, and otherwise follows the same rules:
-validated immediately, callable many times, last writer wins.
+validated immediately, callable many times, last writer wins. A context
+(§2.2) over 16 KiB is refused.
 
 Writes remain private until `omar_complete`. Completion validates the final
 port snapshot against the contract, and commits state writes with the effects;
@@ -466,6 +501,19 @@ rejected.
 
 The invocation message lists the instance's state as it stands, under
 `state:`, so an agent knows what it may read and set without its prompt saying.
+The contexts the agent shares (§2.2) are on their own line instead, and left
+out of `state:`:
+
+```text
+contexts: {"t.notes": {"directive": "Keep decisions.", "value": "Use SQLite."}}
+```
+
+`omar_complete` refuses an invocation that shares a context until each one has
+been set with `omar_set_state` in it, or is named in `keep`; naming anything
+else in `keep` is refused too. A refusal is the tool's error, not the run's:
+the invocation stays open, and the agent completes it once it has set or kept
+what it missed. A panel answering for a `web` agent completes through the same
+check.
 
 A task with a `check` has one more step. After the contract holds,
 `omar_complete` runs the command with `sh -c`, in the instance workspace the
@@ -498,7 +546,8 @@ the earlier value; an optional effect replaces it only when present.
 
 `omar_pending` lists the invocations addressed to the asking agent that are not
 yet complete, each with its prompt, trigger values, permitted effects, and its
-instance's state with each variable's type. It is
+instance's state with each variable's type, and the contexts its agent shares
+in the same form as the `contexts:` line. It is
 scoped to that agent, so it discloses nothing the agent's own reactions were not
 already wired to see.
 
@@ -590,7 +639,7 @@ DECLARE_INSTANCE name team parent
 SPAWN_AGENT name backend
 DEFINE_PORT kind name type [delay]
 DECLARE_TIMER name offset period
-DECLARE_STATE name type initial
+DECLARE_STATE name type initial [agents] [directive]
 DECLARE_PARAM name type value
 CONNECT_PORTS source target [delay]
 INSTALL_REACTION id agent triggers effects contract prompt [body] [within] [check]

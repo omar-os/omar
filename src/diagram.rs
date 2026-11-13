@@ -86,6 +86,9 @@ pub enum DiagramEventKind {
     ClockStarted,
     /// A task's completion check finished; the payload carries the run.
     CheckCompleted,
+    /// A team instance's Docker Sandbox is up: the payload names the
+    /// `instance` and the `sandbox`.
+    SandboxStarted,
 }
 
 impl std::fmt::Display for DiagramEventKind {
@@ -121,6 +124,11 @@ pub struct DiagramInstance {
     /// the other.
     #[serde(default)]
     pub parent: String,
+    /// The Docker Sandbox it runs in, once that sandbox is up. Absent for a
+    /// team on the host, and for one whose sandbox is still starting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sandbox: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -255,6 +263,7 @@ impl DiagramSnapshot {
                 } else {
                     instance_id(&instance.parent)
                 },
+                sandbox: None,
             })
             .collect();
         let agents = state
@@ -431,6 +440,8 @@ pub trait TopologyObserver: Send + Sync {
     fn clock_started(&self, _origin_unix_millis: u64) {}
     /// A checkpoint was published after `tag` completed; `trigger` says why.
     fn checkpoint_published(&self, _checkpoint: &str, _trigger: &str, _tag: Option<(u64, u64)>) {}
+    /// `instance` now runs in the Docker Sandbox `sandbox`.
+    fn sandbox_started(&self, _instance: &str, _sandbox: &str) {}
 }
 
 pub struct NoopTopologyObserver;
@@ -671,6 +682,20 @@ impl TopologyObserver for DiagramPublisher {
             }),
             json!({ "checkpoint": checkpoint, "trigger": trigger }),
             |_| {},
+        );
+    }
+
+    fn sandbox_started(&self, instance: &str, sandbox: &str) {
+        let id = instance_id(instance);
+        self.publish_with(
+            DiagramEventKind::SandboxStarted,
+            None,
+            json!({ "instance": id, "sandbox": sandbox }),
+            |snapshot| {
+                if let Some(found) = snapshot.instances.iter_mut().find(|i| i.id == id) {
+                    found.sandbox = Some(sandbox.to_owned());
+                }
+            },
         );
     }
 }
@@ -1247,6 +1272,34 @@ mod tests {
         assert!(seen.contains(": connected"), "{seen}");
         assert!(seen.contains("event: run_started"), "{seen}");
         assert!(seen.contains("\"protocol_version\":1"), "{seen}");
+    }
+
+    #[test]
+    fn a_team_in_a_sandbox_is_drawn_with_it() {
+        let server = DiagramServer::start(
+            &two_instance_state(),
+            "127.0.0.1:0".parse().expect("valid address"),
+        )
+        .expect("server starts");
+        let sandbox = |name: &str| {
+            let body = get(server.address(), "/v1/diagram");
+            let json: Value = serde_json::from_str(&body[body.find("\r\n\r\n").unwrap() + 4..])
+                .expect("snapshot json");
+            json["instances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|instance| instance["name"] == name)
+                .unwrap()["sandbox"]
+                .clone()
+        };
+        // On the host until its sandbox is up: no field at all.
+        assert_eq!(sandbox("writer"), Value::Null);
+        server
+            .publisher()
+            .sandbox_started("writer", "omar-team-1234");
+        assert_eq!(sandbox("writer"), "omar-team-1234");
+        assert_eq!(sandbox("reviewer"), Value::Null);
     }
 
     #[test]

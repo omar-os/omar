@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// How much of a check's combined stdout and stderr is kept, from the end:
 /// what a failing command says last is what the agent needs.
@@ -24,7 +24,7 @@ pub const OUTPUT_LIMIT: usize = 16 * 1024;
 /// descendant can hold the pipe open, and `run` may not wait on it forever.
 const READER_GRACE: Duration = Duration::from_millis(250);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckOutcome {
     Passed,
@@ -36,7 +36,7 @@ pub enum CheckOutcome {
 }
 
 /// One run of a check, as it is recorded.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckRun {
     pub started_ms: u64,
     pub ended_ms: u64,

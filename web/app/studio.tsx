@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
 import { QuoteSelection, withQuote } from "./quote-selection";
 import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
@@ -15,6 +15,7 @@ import { SettingsMenu } from "./settings-menu";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
 import { PortPanel } from "./port-panel";
+import { WorkflowDraftStore } from "./lib/workflow-state";
 import { PropertiesPanel } from "./properties";
 import { Resizer } from "./resizer";
 import { useWorkflowNames } from "./lib/workflow-names";
@@ -118,11 +119,12 @@ export function Studio({ serveUrl = "", designAgent }: StudioProps) {
   const [readOnly, setReadOnly] = useState(false);
   const select = useCallback((conversation: ConversationSummary) => {
     setSelected(conversation.id);
-    sessionStorage.setItem(`omar-chat:${serveUrl}`, conversation.id);
+    try { sessionStorage.setItem(`omar-chat:${serveUrl}`, conversation.id); localStorage.setItem(`omar-chat:${serveUrl}`, conversation.id); } catch { /* Server also remembers selection. */ }
   }, [serveUrl]);
   useEffect(() => {
     if (!serveUrl) return;
-    const saved = sessionStorage.getItem(`omar-chat:${serveUrl}`);
+    let saved: string | null = null;
+    try { saved = sessionStorage.getItem(`omar-chat:${serveUrl}`) || localStorage.getItem(`omar-chat:${serveUrl}`); } catch { /* Use server selection. */ }
     const abort = new AbortController();
     const health = checkServeHealth(serveUrl, abort.signal).then((health) => {
       if (!abort.signal.aborted && health.ok) setReadOnly(health.access === "view");
@@ -130,7 +132,11 @@ export function Studio({ serveUrl = "", designAgent }: StudioProps) {
     void fetchConversations(serveUrl, abort.signal).then(async (history) => {
       await health;
       if (abort.signal.aborted) return;
-      if (saved && history.conversations.some((chat) => chat.id === saved)) setSelected(saved);
+      const id = saved && history.conversations.some((chat) => chat.id === saved) ? saved : history.active_id;
+      setSelected(id);
+      // Pin the initial selection too: another tab can change the shared
+      // fallback before this tab has ever explicitly selected a workflow.
+      try { sessionStorage.setItem(`omar-chat:${serveUrl}`, id); } catch { /* Fall back to the server. */ }
       setRestoredUrl(serveUrl);
     }).catch(async () => { await health; if (!abort.signal.aborted) setRestoredUrl(serveUrl); });
     return () => abort.abort();
@@ -153,6 +159,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   onReadOnly: (readOnly: boolean) => void;
 }) {
   const isDemo = serveUrl.trim().length === 0;
+  const draftStore = useMemo(() => new WorkflowDraftStore(serveUrl, readOnly), [serveUrl, readOnly]);
+  const saveStatus = useSyncExternalStore(draftStore.subscribe, draftStore.snapshot, () => "Saved");
+  const proposalSequenceRef = useRef(0);
   // Requests from a previous selection must not update the retained workspace.
   const scopeRef = useRef(0);
   useEffect(() => {
@@ -456,9 +465,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
 
   const restoreConversation = useCallback((conversation: ConversationSummary) => {
     setHistoryRevision((current) => current + 1);
-    setConversationTitle(conversation.message_count ? conversation.title : "What should the team do?");
+    setConversationTitle(conversation.workflow_name || (conversation.message_count ? conversation.title : "What should the team do?"));
     if (conversationIdRef.current === conversation.id) return;
     conversationIdRef.current = conversation.id;
+    proposalSequenceRef.current = 0;
     setConversationId(conversation.id);
     disconnectRef.current?.();
     disconnectRef.current = null;
@@ -740,6 +750,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         return;
       }
       if (replaying) replayedProposal = true;
+      proposalSequenceRef.current = message.sequence;
       // A fresh proposal remains in the transcript while this chat's
       // deployed topology continues to own the live diagram and controls.
       // A change to the live run, paused or not: shown as the plan that
@@ -801,6 +812,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         const replay = buffered;
         buffered = [];
         const restore = async () => {
+          const restoringChat = conversationIdRef.current !== conversation.id;
+          let savedWorkflow: Awaited<ReturnType<typeof draftStore.load>> | null = null;
+          let saveLoadError = "";
+          if (restoringChat) {
+            try { savedWorkflow = await draftStore.load(); }
+            catch (cause) { saveLoadError = cause instanceof Error ? cause.message : String(cause); }
+          }
           const activeRun = conversation.run && !isRunFinished(conversation.run.status);
           // Parked, not over: a paused run keeps its controls and its timeline.
           const parkedRun = conversation.run?.status === "paused";
@@ -820,6 +838,12 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           replayedProposal = false;
           for (const message of replay) applyMessage(message);
           replaying = false;
+          if (savedWorkflow?.draft && savedWorkflow.draft.proposal_sequence >= proposalSequenceRef.current) {
+            const draft = savedWorkflow.draft;
+            setDesign(draft.design); setSource(draft.design.program); setFilename(draft.filename);
+            if (!activeRun && !parkedRun) { setSnapshot(draft.design.preview); replayedProposal = true; }
+          }
+          if (saveLoadError) setError(saveLoadError);
           if (liveSnapshot) setSnapshot(liveSnapshot);
           setHydratedUrl(serveUrl);
           if (serveUrl === historyUrl) onSelect(conversation);
@@ -866,7 +890,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       disconnectRef.current?.();
       disconnectRef.current = null;
     };
-  }, [agent, restoreConversation, observe, loadPanel, serveUrl, historyUrl, onSelect]);
+  }, [agent, restoreConversation, observe, loadPanel, serveUrl, historyUrl, onSelect, draftStore]);
 
   async function confirmDesign(options: DeployOptions) {
     if (!design || !["review", "finished", "failed"].includes(phase)) return;
@@ -875,6 +899,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     const scope = scopeRef.current;
     setError("");
     try {
+      if (!isDemo) await draftStore.flush();
       // The source, not the design: the operator may have edited it, and what
       // they are looking at is what they are deploying.
       const record = await startRun(serveUrl, {
@@ -885,11 +910,15 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         conversation_id: conversationIdRef.current ?? undefined,
         keep_workspaces: options.keepWorkspaces,
         checkpoint_period: options.checkpointPeriod,
+        // Said either way: unticked overrides a runtime that defaults on.
+        sandbox: options.sandbox,
+        no_sandbox: !options.sandbox,
       });
       if (scope !== scopeRef.current) return;
       setSnapshot((current) => (current ? { ...current, team: record.team } : current));
       setRun(record);
       setPhase("observing");
+      setHistoryRevision(current => current + 1);
       setTab("events");
 
       observe(record);
@@ -925,6 +954,19 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     }
   }
 
+  function stageDraft(nextSource = source, nextFilename = filename, nextDesign = design) {
+    if (readOnly || isDemo || !nextDesign) return;
+    draftStore.stage({ design: { ...nextDesign, program: nextSource }, filename: nextFilename, proposal_sequence: proposalSequenceRef.current });
+  }
+  async function restoreSavedDraft() {
+    try {
+      const saved = await draftStore.useSaved();
+      const latest = [...messages].reverse().find(message => message.design);
+      const next = saved.draft?.design ?? latest?.design;
+      if (next) { setDesign(next); setSource(next.program); setFilename(saved.draft?.filename ?? `${next.preview.team}.omar`); }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+
   async function applyStepConfiguration(nextSource: string) {
     if (applyingConfiguration) throw new Error("Another configuration update is being validated.");
     const scope = scopeRef.current;
@@ -939,6 +981,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       setSource(nextSource);
       setSourceErrors([]);
       if (checked.preview && !runRef.current) setSnapshot(checked.preview);
+      stageDraft(nextSource, filename, design && checked.preview ? { ...design, preview: checked.preview } : design);
+      if (!isDemo) await draftStore.flush();
     } finally {
       if (scope === scopeRef.current) setApplyingConfiguration(false);
     }
@@ -1709,6 +1753,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               <button type="button" className="primary-button" onClick={() => setPanelAgent(manualStep.agent)}>Open response panel</button>
             </div>
           ) : null}
+          {!isDemo && design ? <div className="workflow-save" role="status">{saveStatus}
+            {saveStatus !== "Saved" && !saveStatus.startsWith("Saving") ? <><button onClick={() => void draftStore.flush().catch(() => {})}>Retry save</button><button onClick={() => void restoreSavedDraft()}>Use saved version</button></> : null}
+          </div> : null}
           <div className="topology-body">
           <DiagramCanvas
             snapshot={snapshot}
@@ -1851,12 +1898,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               readOnly={readOnly}
               onSourceChange={(next) => {
                 setSource(next);
+                stageDraft(next);
                 // A plan describes the text it was made from; edited, the
                 // text is the operator's own.
                 setMutationPlan(null);
                 declinedRef.current = null;
               }}
-              onFilenameChange={setFilename}
+              onFilenameChange={(value) => { setFilename(value); stageDraft(source, value); }}
             />
             </>
           ) : shownTab === "properties" ? (
@@ -1892,6 +1940,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
 
       {confirming && canConfirm ? (
         <DeployConfirmation
+          serveUrl={serveUrl}
           team={snapshot?.team ?? "this topology"}
           // The background check does not gate this either: the daemon
           // compiles what it is sent and refuses a bad program itself.
@@ -1915,7 +1964,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         />
       ) : null}
 
-      {filesOpen && !readOnly ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); }} onClose={() => setFilesOpen(false)} /> : null}
+      {filesOpen && !readOnly ? <Artifacts key={serveUrl} serveUrl={serveUrl} runId={run?.run_id ?? null} proposal={design ? { ...design, program: source } : null} onWorkflowChange={(workflow) => { setSource(workflow.program); setDesign((current) => current ? { ...current, ...workflow } : current); stageDraft(workflow.program, filename, design ? { ...design, ...workflow } : null); }} onClose={() => setFilesOpen(false)} /> : null}
       {backendsOpen && !readOnly ? (
         <BackendsPage serveUrl={hydratedUrl ?? serveUrl} onClose={() => setBackendsOpen(false)} />
       ) : null}

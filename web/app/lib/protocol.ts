@@ -282,6 +282,10 @@ export type RunRequest = {
   keep_workspaces?: boolean;
   /** `off`, `tag`, `30m` (physical) or `logical:30m`; the daemon's default is an hour. */
   checkpoint_period?: string;
+  /** Run each team instance in a Docker Sandbox. */
+  sandbox?: boolean;
+  /** Run on the host even where the runtime's config turns sandboxes on. */
+  no_sandbox?: boolean;
 };
 
 /**
@@ -442,6 +446,17 @@ export function applyDiagramEvent(
       // countdown measures from.
       const origin = (event.payload as { clock_origin?: unknown }).clock_origin;
       return typeof origin === "number" ? { ...snapshot, clock_origin: origin } : snapshot;
+    }
+    case "sandbox_started": {
+      // The team instance's Docker Sandbox is up; the box says it runs there.
+      const { instance, sandbox } = event.payload as { instance?: unknown; sandbox?: unknown };
+      if (typeof sandbox !== "string") return snapshot;
+      return {
+        ...snapshot,
+        instances: (snapshot.instances ?? []).map((each) =>
+          each.id === instance ? { ...each, sandbox } : each,
+        ),
+      };
     }
     case "run_paused":
       // A pause lands at a tag boundary, where nothing is in flight: whatever

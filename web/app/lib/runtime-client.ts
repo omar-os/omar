@@ -53,10 +53,28 @@ export function connectTerminalUrl(serveUrl: string, backend: string): string {
 export async function startConnect(
   serveUrl: string,
   backend: string,
+  /** Sign in again, or (`--sandbox`) give sandboxed teams a sign-in. */
+  { replace = false, sandbox = false }: { replace?: boolean; sandbox?: boolean } = {},
 ): Promise<void> {
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(
     `${base}/v1/backends/${encodeURIComponent(backend)}/connect`,
+    { method: "POST", body: JSON.stringify({ replace, sandbox }) },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+}
+
+/**
+ * Starts `omar disconnect <backend>`, the CLI's own sign-out, in the same
+ * terminal a sign-in uses.
+ */
+export async function startDisconnect(
+  serveUrl: string,
+  backend: string,
+): Promise<void> {
+  const base = normalizeRuntimeUrl(serveUrl);
+  const response = await fetch(
+    `${base}/v1/backends/${encodeURIComponent(backend)}/disconnect`,
     { method: "POST", body: "{}" },
   );
   if (!response.ok) throw new Error(await readError(response));
@@ -83,22 +101,41 @@ export async function checkSignIn(
 export const ASSISTANT = "\u0000assistant";
 
 /** What the assistant runs on, and what else it could run on. */
-export type AgentBackends = { backend: string | null; available: string[] };
+export type AgentBackends = {
+  backend: string | null;
+  available: string[];
+  /** Whether a run that says nothing runs its teams in sandboxes. */
+  sandboxDefault: boolean;
+  /** Whether Docker Sandboxes is installed, so there is a sandbox to offer. */
+  sandboxInstalled: boolean;
+};
 
 export async function fetchBackends(serveUrl: string): Promise<AgentBackends> {
   const base = normalizeRuntimeUrl(serveUrl);
   const response = await fetch(`${base}/v1/agent`);
   if (!response.ok) throw new Error(await readError(response));
-  const body = (await response.json()) as Partial<AgentBackends>;
+  const body = (await response.json()) as Partial<AgentBackends> & {
+    sandbox?: { default?: unknown; installed?: unknown };
+  };
   return {
     backend: typeof body.backend === "string" ? body.backend : null,
     available: Array.isArray(body.available) ? body.available : [],
+    sandboxDefault: body.sandbox?.default === true,
+    sandboxInstalled: body.sandbox?.installed === true,
   };
 }
 
 /** Whether a backend is installed and signed in, as its own CLI says. */
-export type BackendStatus = {
+export type BackendStatus = Connection & {
   name: string;
+  /**
+   * Whether its agents can run in sandboxes: a key in Docker Sandboxes'
+   * store. `not_installed` means sbx is not. Absent from older runtimes.
+   */
+  sandbox?: Connection;
+};
+
+type Connection = {
   status: "connected" | "signed_out" | "not_installed" | "unknown";
   /** The account or credential it signed in with. */
   via?: string;
@@ -795,6 +832,7 @@ export async function fetchConversations(
 ): Promise<{
   active_id: string;
   conversations: ConversationSummary[];
+  removed_ids?: string[];
 }> {
   const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/chats`, {
     signal,
@@ -817,4 +855,26 @@ export async function selectConversation(
   });
   if (!response.ok) throw new Error(await readError(response));
   return response.json();
+}
+
+export async function fetchArchivedConversations(serveUrl: string, signal?: AbortSignal): Promise<ConversationSummary[]> {
+  const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/chats/archived`, { signal });
+  if (!response.ok) throw new Error(await readError(response));
+  return (await response.json()).conversations;
+}
+
+export async function setConversationArchived(serveUrl: string, id: string, archived: boolean): Promise<Awaited<ReturnType<typeof fetchConversations>>> {
+  const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/chats/${encodeURIComponent(id)}/${archived ? "archive" : "restore"}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+  });
+  if (!response.ok) throw new Error(await readError(response));
+  return response.json();
+}
+
+/** Called only after the operator confirms the named archived workflow. */
+export async function deleteConversation(serveUrl: string, id: string): Promise<void> {
+  const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/chats/${encodeURIComponent(id)}/delete`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm: true }),
+  });
+  if (!response.ok) throw new Error(await readError(response));
 }
