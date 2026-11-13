@@ -2229,7 +2229,7 @@ fn validate_contract(contract: &str, writes: &BTreeMap<String, Value>) -> Result
     Ok(())
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct InvocationSpec {
     id: u64,
     reaction_id: String,
@@ -3635,6 +3635,195 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
     }
 }
 
+/// The host trusts only typed, contract-checked invocation results from the VM.
+struct SandboxExecutor<'a, E> {
+    state: &'a VmState,
+    workers: BTreeMap<String, crate::sandbox::Worker>,
+    workspaces: &'a BTreeMap<String, crate::workspace::Workspace>,
+    root: &'a Path,
+    timeout: Duration,
+    host: E,
+}
+impl<E: ReactionExecutor> ReactionExecutor for SandboxExecutor<'_, E> {
+    fn invoke(&self, mut invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+        let reaction = &self.state.reactions[&invocation.reaction_id];
+        if self.workers.is_empty()
+            || self
+                .state
+                .agents
+                .get(&invocation.agent)
+                .is_some_and(|a| is_web_backend(&a.backend))
+        {
+            return self.host.invoke(invocation);
+        }
+        let workspace = &self.workspaces[&reaction.instance];
+        for (name, value) in &mut invocation.trigger_values {
+            if let Some(port) = self.state.ports.get(name) {
+                crate::sandbox::map_input_paths(value, &port.ty, workspace, self.root)?;
+            }
+        }
+        let worker = self
+            .workers
+            .get(&reaction.instance)
+            .context("missing team sandbox")?;
+        let deadline = invocation.within.unwrap_or(self.timeout);
+        let response = worker.request(
+            serde_json::to_value(&invocation)?,
+            deadline.saturating_add(Duration::from_secs(20)),
+        )?;
+        let writes: BTreeMap<String, Value> = serde_json::from_value(
+            response
+                .get("writes")
+                .context("missing sandbox writes")?
+                .clone(),
+        )?;
+        validate_sandbox_writes(self.state, &invocation, &writes)?;
+        Ok(writes)
+    }
+}
+fn validate_sandbox_writes(
+    state: &VmState,
+    invocation: &InvocationSpec,
+    writes: &BTreeMap<String, Value>,
+) -> Result<()> {
+    let mut effects = BTreeMap::new();
+    for (name, value) in writes {
+        if invocation.state_values.contains_key(name)
+            && state.reactions[&invocation.reaction_id].body.is_some()
+        {
+            validate_value(&state.state_vars[name].ty, value)?;
+        } else {
+            let ty = invocation
+                .allowed_effects
+                .get(name)
+                .context("sandbox wrote outside invocation effects")?;
+            validate_value(ty, value)?;
+            effects.insert(name.clone(), value.clone());
+        }
+    }
+    validate_contract(&invocation.contract, &effects)
+}
+
+/// A worker receives only its team's definitions and initial values. The host
+/// retains routing and other teams' parameters/state, including nested teams.
+fn sandbox_state(state: &VmState, instance: &str) -> VmState {
+    let mut local = state.clone();
+    local.instances.retain(|name, _| name == instance);
+    local
+        .agents
+        .retain(|_, agent| agent.instance == instance && !is_web_backend(&agent.backend));
+    local
+        .reactions
+        .retain(|_, reaction| reaction.instance == instance);
+    let referenced: BTreeSet<_> = local
+        .reactions
+        .values()
+        .flat_map(|reaction| reaction.triggers.iter().chain(&reaction.effects))
+        .cloned()
+        .collect();
+    // Parents may consume child outputs; retain their schemas, not child values.
+    local.ports.retain(|name, _| referenced.contains(name));
+    local.timers.retain(|name, _| referenced.contains(name));
+    local.state_vars.retain(|_, var| var.instance == instance);
+    local.params.retain(|_, param| param.instance == instance);
+    local.connections.clear();
+    local
+}
+
+/// Internal VM-side service. No host paths other than the two mounts are used.
+/// stdout is reserved for bounded protocol frames; backend panes/logs stay in VM.
+pub fn sandbox_worker() -> Result<()> {
+    let mut input = BufReader::new(std::io::stdin());
+    let init: crate::sandbox::Init =
+        serde_json::from_slice(&crate::sandbox::read_frame(&mut input)?)?;
+    anyhow::ensure!(
+        init.protocol == crate::sandbox::PROTOCOL,
+        "sandbox protocol mismatch"
+    );
+    let local_root = dirs::home_dir()
+        .context("sandbox home")?
+        .join(".omar-sandbox");
+    fs::create_dir_all(&local_root)?;
+    let generated = local_root.join("generated");
+    let runtime_dir = local_root.join("runtime");
+    let worktree = init.workspace.worktree(&init.root);
+    let config = TopologyRunConfig {
+        ea_id: 0,
+        omar_dir: &local_root,
+        generated: &generated,
+        base_prefix: "omar-team-",
+        health_idle_warning: 15,
+        sandbox_template: None,
+        inputs: &[],
+        replace: true,
+        timeout: init.timeout,
+        pace: Pace::Fast,
+        diagram_address: None,
+        diagram_ready: None,
+        panel_ready: None,
+        // The host checkpoints and owns the workspace's lifetime.
+        checkpoint_policy: None,
+        keep_workspaces: true,
+        program_path: None,
+        // The VM goes with the run; the host's shutdown stops it.
+        shutdown: Arc::default(),
+    };
+    let server = InvocationServer::start()?;
+    let client = TmuxClient::new("omar-team-");
+    let workspaces = BTreeMap::from([(init.workspace.instance.clone(), init.workspace.clone())]);
+    let mut sessions = BTreeMap::new();
+    let result = (|| -> Result<()> {
+        let code = crate::reaction::build(&init.state, &generated)?
+            .map(|code| code.with_cleanup_directory(local_root.join("reactions")));
+        let launcher = AgentLauncher::new(
+            &init.state,
+            &client,
+            &runtime_dir,
+            &server,
+            &config,
+            (&workspaces, &init.root),
+            init.resumed_from.as_ref(),
+        );
+        spawn_topology_agents(&init.state, &launcher, config.replace, &mut sessions)?;
+        let executor = DispatchExecutor {
+            state: &init.state,
+            code,
+            timeout: init.timeout,
+            workspace_dirs: BTreeMap::from([(
+                init.workspace.instance.clone(),
+                (worktree.clone(), init.workspace.temp(&init.root)),
+            )]),
+            agents: AgentReactionExecutor {
+                client: client.clone(),
+                team: init.state.team.clone(),
+                registry: server.registry.clone(),
+                timeout: init.timeout,
+                web: BTreeSet::new(),
+                // `launch` refuses a sandboxed run with a `per` agent.
+                scoped: None,
+            },
+        };
+        crate::sandbox::write_frame(
+            &mut std::io::stdout(),
+            &json!({"protocol": crate::sandbox::PROTOCOL}),
+        )?;
+        loop {
+            let bytes = crate::sandbox::read_frame(&mut input)?;
+            let invocation: InvocationSpec = serde_json::from_slice(&bytes)?;
+            let result = executor.invoke(invocation);
+            let reply = match result {
+                Ok(writes) => json!({"protocol": crate::sandbox::PROTOCOL, "writes": writes}),
+                Err(error) => {
+                    json!({"protocol": crate::sandbox::PROTOCOL, "error": format!("{error:#}")})
+                }
+            };
+            crate::sandbox::write_frame(&mut std::io::stdout(), &reply)?;
+        }
+    })();
+    let _ = deploy::teardown_sessions(&client, &sessions, &deploy::logs_dir(&runtime_dir));
+    result
+}
+
 pub struct TopologyRunConfig<'a> {
     pub ea_id: crate::ea::EaId,
     pub omar_dir: &'a Path,
@@ -3642,6 +3831,7 @@ pub struct TopologyRunConfig<'a> {
     pub generated: &'a Path,
     pub base_prefix: &'a str,
     pub health_idle_warning: i64,
+    pub sandbox_template: Option<&'a str>,
     pub inputs: &'a [String],
     pub replace: bool,
     pub timeout: Duration,
@@ -3725,14 +3915,17 @@ fn cleanup_recorded_sessions(
     sessions: &BTreeMap<String, String>,
     dir: &Path,
 ) -> Vec<String> {
+    let guard = match record.lock() {
+        Ok(guard) => guard,
+        Err(_) => return vec!["deployment record lock poisoned".into()],
+    };
+    if !guard.sandboxes.is_empty() {
+        return crate::sandbox::stop_all(&guard.sandboxes);
+    }
     if sessions.is_empty() {
         return Vec::new();
     }
-    let client = record
-        .lock()
-        .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))
-        .and_then(|record| record.session_client());
-    match client {
+    match guard.session_client() {
         Ok(client) => deploy::teardown_sessions(&client, sessions, &deploy::logs_dir(dir)),
         Err(error) => vec![format!("{error:#}")],
     }
@@ -4059,6 +4252,9 @@ struct ResumePlan {
 
 pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunOutcome> {
     let state = verify(bytecode)?;
+    if let Some(template) = config.sandbox_template {
+        crate::sandbox::validate_template(template)?;
+    }
     launch(&state, bytecode, config, None)
 }
 
@@ -4131,9 +4327,17 @@ pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunO
         }
         return Err(error);
     }
-    // The paused run's choice carries over: a resume is the same run.
-    let mut config = config;
-    config.keep_workspaces = record.keep_workspaces;
+    // The paused run's choices carry over: a resume is the same run, so it
+    // gets fresh sandboxes from the template the run pinned, or none.
+    let template = record.sandbox_template.clone();
+    if let Some(template) = &template {
+        crate::sandbox::validate_template(template)?;
+    }
+    let config = TopologyRunConfig {
+        keep_workspaces: record.keep_workspaces,
+        sandbox_template: template.as_deref(),
+        ..config
+    };
     launch(
         &state,
         &bytecode,
@@ -4166,21 +4370,30 @@ fn launch(
                 existing.pid
             );
         }
+        anyhow::ensure!(
+            config.replace || existing.sandboxes.is_empty() || existing.sessions_cleaned,
+            "deployment '{}' has unconfirmed sandbox cleanup; use --replace to clean it up first",
+            state.team
+        );
         if config.replace && !existing.sessions.is_empty() {
             existing.session_client()?;
         }
         if config.replace && !existing.sessions_cleaned {
-            let old_client = existing.session_client()?;
-            for session in existing.sessions.values() {
-                if old_client.has_session_for_cleanup(session)? {
-                    old_client.ensure_session_not_attached(session)?;
+            let failures = if existing.sandboxes.is_empty() {
+                let old_client = existing.session_client()?;
+                for session in existing.sessions.values() {
+                    if old_client.has_session_for_cleanup(session)? {
+                        old_client.ensure_session_not_attached(session)?;
+                    }
                 }
-            }
-            let failures = deploy::teardown_sessions(
-                &old_client,
-                &existing.sessions,
-                &deploy::logs_dir(&runtime_dir),
-            );
+                deploy::teardown_sessions(
+                    &old_client,
+                    &existing.sessions,
+                    &deploy::logs_dir(&runtime_dir),
+                )
+            } else {
+                crate::sandbox::stop_all(&existing.sandboxes)
+            };
             anyhow::ensure!(
                 failures.is_empty(),
                 "cannot replace deployment until old sessions are cleaned up: {}",
@@ -4207,10 +4420,25 @@ fn launch(
     let client = TmuxClient::new(crate::ea::ea_prefix(config.ea_id, config.base_prefix));
     // A session of an agent with a lifetime is recorded only while a window
     // may have one: see `ScopedWorkers::track`.
+    // A window's worker is started and stopped by the host, which a team in
+    // a sandbox does not run its agents on.
+    if config.sandbox_template.is_some() {
+        if let Some((name, _)) = state
+            .agents
+            .iter()
+            .find(|(_, agent)| agent.lifetime.is_some())
+        {
+            bail!("agent '{name}' has a `per` lifetime, which does not run in a sandbox yet; run with --no-sandbox");
+        }
+    }
     let planned_sessions: BTreeMap<String, String> = state
         .agents
         .iter()
-        .filter(|(_, agent)| needs_agent_process(&agent.backend) && agent.lifetime.is_none())
+        .filter(|(_, agent)| {
+            config.sandbox_template.is_none()
+                && needs_agent_process(&agent.backend)
+                && agent.lifetime.is_none()
+        })
         .map(|(name, _)| (name.clone(), client.session_for(name)))
         .collect();
     let record = Arc::new(Mutex::new(deploy::DeploymentRecord::create(
@@ -4262,11 +4490,16 @@ fn launch(
         Option<crate::reaction::Reactions>,
         BTreeMap<String, crate::workspace::Workspace>,
         AgentLauncher,
+        BTreeMap<String, crate::sandbox::Worker>,
     );
     let prepared = (|| -> Result<Prepared> {
         // Before anything is spawned: compiling the bodies is the step most
         // likely to fail, and it costs nothing to find out first.
-        let reactions = crate::reaction::build(&state, config.generated)?;
+        let reactions = if config.sandbox_template.is_none() {
+            crate::reaction::build(&state, config.generated)?
+        } else {
+            None
+        };
         let deployment_id = record
             .lock()
             .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
@@ -4300,10 +4533,51 @@ fn launch(
             &runtime_dir,
             &invocation_server,
             &config,
-            &workspaces,
+            (&workspaces, config.omar_dir),
             resumed_from.as_ref(),
         );
-        spawn_topology_agents(&state, &launcher, config.replace, &mut spawned)?;
+        let mut workers = BTreeMap::new();
+        if let Some(template) = config.sandbox_template {
+            for (instance, workspace) in &workspaces {
+                let name = crate::sandbox::name(workspace);
+                // Persist ownership before create; failures/crashes leave a
+                // cleanup obligation instead of orphaning an unrecorded VM.
+                {
+                    let mut guard = record
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("deployment lock poisoned"))?;
+                    guard.sandboxes.insert(instance.clone(), name.clone());
+                    guard.sandbox_template = Some(template.to_owned());
+                    guard.save(&runtime_dir)?;
+                }
+                crate::sandbox::create(
+                    &name,
+                    template,
+                    &workspace.worktree(config.omar_dir),
+                    &workspace.temp(config.omar_dir),
+                )?;
+                let worker = crate::sandbox::Worker::start(
+                    &name,
+                    &workspace.worktree(config.omar_dir),
+                    &runtime_dir
+                        .join("sandbox-logs")
+                        .join(format!("{}.log", workspace.id)),
+                )?;
+                let init = crate::sandbox::Init {
+                    protocol: crate::sandbox::PROTOCOL,
+                    state: sandbox_state(&state, instance),
+                    workspace: workspace.clone(),
+                    root: config.omar_dir.to_path_buf(),
+                    timeout: config.timeout,
+                    resumed_from: resumed_from.clone(),
+                };
+                worker.request(serde_json::to_value(init)?, Duration::from_secs(180))?;
+                observer.sandbox_started(instance, &name);
+                workers.insert(instance.clone(), worker);
+            }
+        } else {
+            spawn_topology_agents(&state, &launcher, config.replace, &mut spawned)?;
+        }
         // A resumed run's inputs were consumed at its start tag; what it
         // continues with is in the checkpoint's queue.
         let inputs = if start_state.is_some() {
@@ -4311,9 +4585,16 @@ fn launch(
         } else {
             parse_inputs(&state, config.inputs)?
         };
-        Ok((invocation_server, inputs, reactions, workspaces, launcher))
+        Ok((
+            invocation_server,
+            inputs,
+            reactions,
+            workspaces,
+            launcher,
+            workers,
+        ))
     })();
-    let (invocation_server, inputs, reactions, workspaces, launcher) = match prepared {
+    let (invocation_server, inputs, reactions, workspaces, launcher, workers) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             observer.run_failed(&error.to_string());
@@ -4365,6 +4646,14 @@ fn launch(
             )?,
         },
     };
+    let executor = SandboxExecutor {
+        state: &state,
+        workspaces: &workspaces,
+        root: config.omar_dir,
+        workers,
+        timeout: config.timeout,
+        host: executor,
+    };
     let checkpointer = match RunCheckpointer::new(
         config.omar_dir,
         &runtime_dir,
@@ -4382,7 +4671,10 @@ fn launch(
             return Err(error);
         }
     };
-    advance_record(&record, &runtime_dir, DeploymentState::Running, None)?;
+    if let Err(error) = advance_record(&record, &runtime_dir, DeploymentState::Running, None) {
+        fail_deployment(&record, &runtime_dir, &spawned, &error);
+        return Err(error);
+    }
     // Flip RUNNING to STOPPING or PAUSING the moment a request lands, even
     // while the loop is blocked mid-tag, so an operator polling status sees
     // it acknowledged.
@@ -4435,7 +4727,7 @@ fn launch(
     );
     // However the loop ended, no window's worker outlives it: a resume starts
     // new conversations, as a conversation cannot be rolled back.
-    if let Some(scoped) = &executor.agents.scoped {
+    if let Some(scoped) = &executor.host.agents.scoped {
         scoped.close_all();
     }
     watcher_shutdown.store(true, Ordering::Release);
@@ -4448,7 +4740,7 @@ fn launch(
                 .lock()
                 .map(|guard| guard.sessions.clone())
                 .unwrap_or_default();
-            let sessions = executor.agents.scoped.as_ref().map_or_else(
+            let sessions = executor.host.agents.scoped.as_ref().map_or_else(
                 || sessions.clone(),
                 |workers| workers.cleanup_sessions(&sessions),
             );
@@ -4456,21 +4748,28 @@ fn launch(
             return Err(error);
         }
     };
-    write_json_atomic(&runtime_dir.join("state.json"), &state)?;
     let sessions = record
         .lock()
         .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
         .sessions
         .clone();
-    let sessions = executor.agents.scoped.as_ref().map_or_else(
+    let sessions = executor.host.agents.scoped.as_ref().map_or_else(
         || sessions.clone(),
         |workers| workers.cleanup_sessions(&sessions),
     );
+    if let Err(error) = write_json_atomic(&runtime_dir.join("state.json"), &state) {
+        fail_deployment(&record, &runtime_dir, &sessions, &error);
+        return Err(error);
+    }
     if let LoopEnd::Paused(paused) = end {
         // The checkpoint is already published. What remains is to leave
         // nothing running: agents are torn down, and the record says the
         // run can continue from where it stands.
-        write_json_atomic(&deploy::outputs_path(&runtime_dir), &paused.outputs)?;
+        if let Err(error) = write_json_atomic(&deploy::outputs_path(&runtime_dir), &paused.outputs)
+        {
+            fail_deployment(&record, &runtime_dir, &sessions, &error);
+            return Err(error);
+        }
         let cleanup_failures = cleanup_recorded_sessions(&record, &sessions, &runtime_dir);
         for failure in &cleanup_failures {
             eprintln!("warning: session not cleaned up: {failure}");
@@ -4526,7 +4825,10 @@ fn launch(
         state_vars,
     } = settled;
     observer.run_completed(&outputs);
-    write_json_atomic(&deploy::outputs_path(&runtime_dir), &outputs)?;
+    if let Err(error) = write_json_atomic(&deploy::outputs_path(&runtime_dir), &outputs) {
+        fail_deployment(&record, &runtime_dir, &sessions, &error);
+        return Err(error);
+    }
     let cleanup_failures = cleanup_recorded_sessions(&record, &sessions, &runtime_dir);
     for failure in &cleanup_failures {
         eprintln!("warning: session not cleaned up: {failure}");
@@ -4643,9 +4945,10 @@ impl AgentLauncher {
         runtime_dir: &Path,
         invocation_server: &InvocationServer,
         config: &TopologyRunConfig<'_>,
-        workspaces: &BTreeMap<String, crate::workspace::Workspace>,
+        workspace_access: (&BTreeMap<String, crate::workspace::Workspace>, &Path),
         resumed_from: Option<&checkpoint::Manifest>,
     ) -> Self {
+        let (workspaces, workspace_root) = workspace_access;
         // No backend restores a conversation at a recorded turn, so a resumed
         // agent is told plainly that it continues a run it has no memory of.
         let resumed = resumed_from
@@ -4676,7 +4979,7 @@ impl AgentLauncher {
                 .map(|(name, ws)| {
                     (
                         name.clone(),
-                        (ws.worktree(config.omar_dir), ws.temp(config.omar_dir)),
+                        (ws.worktree(workspace_root), ws.temp(workspace_root)),
                     )
                 })
                 .collect(),
@@ -4897,7 +5200,7 @@ fn parse_input_value(ty: &str, value: &str) -> Result<Value> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct Tag {
     timestamp: u64,
     microstep: u64,
@@ -6207,6 +6510,83 @@ fn canonical_backend(backend: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sandbox_replies_cannot_write_unrelated_ports_or_wrong_types() {
+        let state = hr_state();
+        let reaction = state.reactions.get_key_value("reaction.1").unwrap();
+        let invocation = invocation_spec(
+            &state,
+            reaction,
+            &BTreeMap::from([("triage".into(), json!("ready"))]),
+            &BTreeMap::new(),
+            Tag::default(),
+        )
+        .unwrap();
+        assert!(validate_sandbox_writes(
+            &state,
+            &invocation,
+            &BTreeMap::from([("opinion1".into(), json!("ok"))])
+        )
+        .is_ok());
+        assert!(validate_sandbox_writes(
+            &state,
+            &invocation,
+            &BTreeMap::from([("opinion2".into(), json!("other team"))])
+        )
+        .is_err());
+        assert!(validate_sandbox_writes(
+            &state,
+            &invocation,
+            &BTreeMap::from([("opinion1".into(), json!(123))])
+        )
+        .is_err());
+        assert!(validate_sandbox_writes(&state, &invocation, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn sandbox_initialization_does_not_disclose_other_teams_values() {
+        let mut state = hr_state();
+        state.state_vars.insert(
+            "child.secret".into(),
+            StateVarState {
+                ty: "string".into(),
+                initial: json!("private child state"),
+                instance: "child".into(),
+                agents: Vec::new(),
+                directive: None,
+            },
+        );
+        state.params.insert(
+            "child.key".into(),
+            ParamState {
+                ty: "string".into(),
+                value: json!("private child parameter"),
+                instance: "child".into(),
+            },
+        );
+        state.params.insert(
+            "key".into(),
+            ParamState {
+                ty: "string".into(),
+                value: json!("own parameter"),
+                instance: "".into(),
+            },
+        );
+        state.ports.get_mut("opinion1").unwrap().instance = "child".into();
+        let parent = sandbox_state(&state, "");
+        assert!(parent.ports.contains_key("opinion1"));
+        let serialized = serde_json::to_string(&parent).unwrap();
+        assert!(!serialized.contains("private child"));
+        assert!(serialized.contains("own parameter"));
+        assert!(parent.connections.is_empty());
+        assert!(!parent.reactions.is_empty());
+        let child = sandbox_state(&state, "child");
+        assert_eq!(child.state_vars.len(), 1);
+        assert_eq!(child.params.len(), 1);
+        assert!(child.agents.is_empty());
+        assert!(child.reactions.is_empty());
+    }
+
     #[test]
     fn cleanup_refuses_unknown_recorded_tmux_identity() {
         let mut record = crate::deploy::DeploymentRecord::create("test", Default::default(), 10);

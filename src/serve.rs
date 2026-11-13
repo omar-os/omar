@@ -201,6 +201,16 @@ struct StartRunRequest {
     /// Keep the instances' workspaces when the run ends; off, they go with it.
     #[serde(default)]
     keep_workspaces: bool,
+    /// Run the teams in Docker Sandboxes, as `omar run --sandbox`.
+    #[serde(default)]
+    sandbox: bool,
+    /// Docker Sandbox template for this run; the runtime's configured one
+    /// otherwise.
+    #[serde(default)]
+    sandbox_template: Option<String>,
+    /// Run the teams on the host even where the config enables sandboxes.
+    #[serde(default)]
+    no_sandbox: bool,
 }
 
 fn default_replace() -> bool {
@@ -384,6 +394,7 @@ struct Settings {
     health_idle_warning: i64,
     command: String,
     address: SocketAddr,
+    sandbox: crate::sandbox::Config,
 }
 
 struct Context_ {
@@ -394,6 +405,7 @@ struct Context_ {
     session_prefix: String,
     default_workdir: String,
     health_idle_warning: i64,
+    sandbox: crate::sandbox::Config,
     runs: Runs,
     /// Where each run's web-backed invocations are answered. Absent for a run
     /// whose program has no `Web` agent, which is what makes the panel routes
@@ -892,6 +904,7 @@ impl Serve {
             session_prefix: config.dashboard.session_prefix.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
+            sandbox: config.sandbox.clone(),
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             mutations: Mutex::default(),
@@ -923,6 +936,7 @@ impl Serve {
                 health_idle_warning: config.health.idle_warning,
                 command: config.agent.default_command.clone(),
                 address,
+                sandbox: config.sandbox.clone(),
             },
             selection: Mutex::new(()),
             editors: Mutex::new(crate::editor::Editors::default()),
@@ -1877,27 +1891,45 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         ("GET", "/v1/agent/backends") => (200, backend_connections()),
         ("POST", "/v1/agent/backend") => switch_backend(&context, &read_body(content_length)?),
         ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/connect") => {
-            let body = read_body(content_length)?;
-            let replace = serde_json::from_slice::<Value>(&body)
-                .ok()
-                .and_then(|body| body["replace"].as_bool())
-                .unwrap_or(false);
+            #[derive(Deserialize, Default)]
+            struct Request {
+                #[serde(default)]
+                replace: bool,
+                #[serde(default)]
+                sandbox: bool,
+            }
+            let request: Request =
+                serde_json::from_slice(&read_body(content_length)?).unwrap_or_default();
             let name = rest
                 .trim_start_matches(CONNECT_PREFIX)
                 .trim_end_matches("/connect");
-            start_connect(
-                &context,
-                name,
-                "connect",
-                if replace { "--replace" } else { "" },
-            )
+            let flags = [
+                (request.replace, "--replace"),
+                (request.sandbox, "--sandbox"),
+            ]
+            .iter()
+            .filter_map(|(on, flag)| on.then_some(*flag))
+            .collect::<Vec<_>>()
+            .join(" ");
+            start_connect(&context, name, "connect", &flags)
         }
         ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/disconnect") => {
-            let _ = read_body(content_length)?;
+            #[derive(Deserialize, Default)]
+            struct Request {
+                #[serde(default)]
+                sandbox: bool,
+            }
+            let request: Request =
+                serde_json::from_slice(&read_body(content_length)?).unwrap_or_default();
             let name = rest
                 .trim_start_matches(CONNECT_PREFIX)
                 .trim_end_matches("/disconnect");
-            start_connect(&context, name, "disconnect", "")
+            start_connect(
+                &context,
+                name,
+                "disconnect",
+                if request.sandbox { "--sandbox" } else { "" },
+            )
         }
         ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/check") => {
             let _ = read_body(content_length)?;
@@ -2310,6 +2342,12 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
             .find(|kind| crate::backend::of(*kind).default_command() == command)
             .map(crate::backend::Kind::name),
         "available": crate::backend::assistant_names(),
+        // What a run that says nothing does, so Mission Control's deploy
+        // dialog starts from it, and whether sbx is here to offer at all.
+        "sandbox": {
+            "default": context.sandbox.on_by_default(),
+            "installed": crate::sandbox::installed(),
+        },
     })
 }
 
@@ -2317,9 +2355,13 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
 /// answer comes from each CLI and takes up to a few seconds.
 fn backend_connections() -> Value {
     use crate::backend::connection;
-    let backends: Vec<Value> = connection::assistants()
+    let (statuses, sandboxes) = connection::assistants_and_sandboxes();
+    let backends: Vec<Value> = statuses
         .into_iter()
-        .map(|(backend, status)| connection::describe(backend, &status))
+        .zip(&sandboxes)
+        .map(|((backend, status), sandbox)| {
+            connection::describe_with_sandbox(backend, &status, sandbox)
+        })
         .collect();
     json!({ "backends": backends })
 }
@@ -2406,9 +2448,10 @@ fn connect_session(context: &Context_, backend: &dyn crate::backend::Backend) ->
 }
 
 /// Run `omar connect <backend>` (install, then the CLI's own sign-in), with
-/// `--replace` to sign in again, or `omar disconnect <backend>`, in a session
-/// Mission Control attaches a terminal to. One already running is reused, so
-/// a second click shows the same sign-in.
+/// `--replace` to sign in again or `--sandbox` for sandboxes, or `omar
+/// disconnect <backend>`, in a session Mission Control attaches a terminal
+/// to. One already running is reused, so a second click shows the same
+/// sign-in.
 fn start_connect(context: &Context_, name: &str, verb: &str, flags: &str) -> (u16, Value) {
     let Some(backend) = connectable(name) else {
         return (
@@ -2700,6 +2743,7 @@ impl Workspaces {
             session_prefix: self.settings.session_prefix.clone(),
             default_workdir: self.settings.default_workdir.clone(),
             health_idle_warning: self.settings.health_idle_warning,
+            sandbox: self.settings.sandbox.clone(),
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             mutations: Mutex::default(),
@@ -3132,6 +3176,13 @@ fn mission_control_envelope(text: &str, selection: &[String], live: Option<&Live
          OMAR program. Include companion files in `files`, keyed by their relative paths \
          (for example schemas/decision.json), so imported types compile. The entry \
          source is program.omar. The operator approves and runs it; you do not.\n\n\
+         When asked how to get started, invite the operator to describe a workflow \
+         they want to automate, from development to marketing and beyond. Lead with \
+         concrete developer examples: a GitHub issue into a tested pull request, \
+         fixing failing CI builds; then a product release into launch emails and \
+         social posts. Explain that you will work out the steps and agents and \
+         propose an implementation to review and run. Ask focused questions only \
+         where needed; do not require a full workflow checklist up front.\n\n\
          {live}{selected}{text}",
         live = live.map(ToString::to_string).unwrap_or_default(),
     )
@@ -3440,7 +3491,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": "Restore this workflow before continuing."}),
         );
     }
-    let request: StartRunRequest = match serde_json::from_slice(body) {
+    let mut request: StartRunRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
@@ -3514,6 +3565,18 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             return (409, team_held_error(active));
         }
     }
+    let backends: Vec<&str> = state.agents.values().map(|a| a.backend.as_str()).collect();
+    let notes;
+    (request.sandbox_template, notes) = match crate::sandbox::select(
+        request.sandbox,
+        request.sandbox_template.as_deref(),
+        request.no_sandbox,
+        &context.sandbox,
+        &backends,
+    ) {
+        Ok(template) => template,
+        Err(error) => return (400, json!({"error": format!("{error:#}")})),
+    };
 
     // The verified bytecode beside the source: a later timeline projection
     // or resume reads it back without a compiler.
@@ -3568,7 +3631,12 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
                     record.activity_at = activity_now();
                     persist_run(context, record);
                 }
-                return (201, json!(record));
+                // What getting sandboxes ready did, for the caller to say.
+                let mut started = json!(record);
+                if !notes.is_empty() {
+                    started["notes"] = json!(notes);
+                }
+                return (201, started);
             }
             (500, json!({"error": "run vanished"}))
         }
@@ -3933,6 +4001,7 @@ fn spawn_run_thread(
         .as_deref()
         .and_then(|period| crate::checkpoint::parse_policy(period).ok());
     let keep_workspaces = request.keep_workspaces;
+    let sandbox_template = request.sandbox_template.clone();
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let outcome = topology::run_topology(
@@ -3943,6 +4012,7 @@ fn spawn_run_thread(
                 generated: &topology::generated_dir(&program_path),
                 base_prefix: &context.session_prefix,
                 health_idle_warning: context.health_idle_warning,
+                sandbox_template: sandbox_template.as_deref(),
                 inputs: &inputs,
                 replace,
                 timeout,
@@ -4986,6 +5056,8 @@ fn spawn_resume_thread(
                 generated: &generated,
                 base_prefix: &context.session_prefix,
                 health_idle_warning: context.health_idle_warning,
+                // The paused run's recorded template wins.
+                sandbox_template: None,
                 inputs: &[],
                 replace: true,
                 timeout: Duration::from_secs(default_timeout_seconds()),

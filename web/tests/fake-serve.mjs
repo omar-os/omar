@@ -381,11 +381,17 @@ export async function startFakeServe({
       return json(response, 200, {
         backend,
         available: ["claude", "codex", "cursor", "opencode", "agy"],
+        sandbox: { default: sandboxDefault, installed: true },
       });
     }
     if (request.method === "GET" && url.pathname === "/v1/agent/backends") {
       return json(response, 200, {
-        backends: Object.entries(backendStatus).map(([name, status]) => ({ name, ...status, login: `omar connect ${name}` })),
+        backends: Object.entries(backendStatus).map(([name, status]) => ({
+          name,
+          ...status,
+          login: `omar connect ${name}`,
+          sandbox: { ...sandboxStatus[name], login: `omar connect ${name} --sandbox` },
+        })),
       });
     }
     // The daemon starts `omar connect <name>` in a session; here, pressing
@@ -398,8 +404,16 @@ export async function startFakeServe({
         if (!(connect[1] in backendStatus)) {
           return json(response, 404, { error: `'${connect[1]}' is not an assistant backend` });
         }
+        // `--sandbox`: Enter in the terminal stores a key for sandboxes instead.
+        const request = JSON.parse(body || "{}");
         signInActions[connect[1]] =
-          connect[2] === "disconnect" ? "disconnect" : JSON.parse(body || "{}").replace ? "replace" : "connect";
+          connect[2] === "disconnect"
+            ? "disconnect"
+            : request.sandbox
+              ? "sandbox"
+              : request.replace
+                ? "replace"
+                : "connect";
         return json(response, 200, { terminal: `/v1/backends/${connect[1]}/terminal` });
       });
     }
@@ -607,6 +621,8 @@ export async function startFakeServe({
             const action = signInActions[agent];
             if (action === "disconnect") {
               backendStatus[agent] = { status: "signed_out" };
+            } else if (action === "sandbox") {
+              sandboxStatus[agent] = { status: "connected", via: "anthropic key" };
             } else {
               backendStatus[agent] = { status: "connected", via: typed.startsWith("work") ? "work account" : "fake sign-in" };
               rejectedKeys[agent] = typed.startsWith("bad");
@@ -627,9 +643,20 @@ export async function startFakeServe({
   viewServer?.on("upgrade", upgrade(true));
 
   let backend = "codex";
+  /** Whether a run that says nothing runs in sandboxes (`[sandbox] enabled`). */
+  const sandboxDefault = process.env.FAKE_SANDBOX_DEFAULT === "1";
+  /** Each backend's key for sandboxes. */
+  const sandboxStatus = {
+    claude: { status: "signed_out" },
+    codex: { status: "connected", via: "ChatGPT" },
+    cursor: { status: "signed_out" },
+    opencode: { status: "signed_out" },
+    pi: { status: "signed_out" },
+    agy: { status: "signed_out" },
+  };
   /** Backends signed in with a key the test prompt finds rejected. */
   const rejectedKeys = {};
-  /** What each backend's open terminal does: connect, replace or disconnect. */
+  /** What each backend's open terminal does: connect, replace, disconnect or sandbox. */
   const signInActions = {};
   /** Each backend's status; a sign-in in its terminal connects it. */
   const backendStatus = {
@@ -938,6 +965,8 @@ export async function startFakeServe({
       options: {
         keep_workspaces: request.keep_workspaces === true,
         checkpoint_period: typeof request.checkpoint_period === "string" ? request.checkpoint_period : null,
+        sandbox: request.sandbox === true,
+        no_sandbox: request.no_sandbox === true,
       },
       // One workspace per instance, named after the run: the file viewer
       // shows a run's own, never another run's.
@@ -1045,6 +1074,14 @@ export async function startFakeServe({
     const wait = () => new Promise((resolve) => setTimeout(resolve, stepMs));
     await wait();
     publish(entry, "run_started", {});
+    // A sandboxed run's teams each come up in a sandbox named the way the
+    // runtime names them, after the instance's workspace.
+    if (entry.options.sandbox) {
+      for (const instance of entry.snapshot.instances ?? []) {
+        instance.sandbox = `omar-team-${entry.record.run_id.slice(0, 8)}-${instance.name}`;
+        publish(entry, "sandbox_started", { instance: instance.id, sandbox: instance.sandbox });
+      }
+    }
     startClock(entry);
 
     // A pause lands at a tag boundary: nothing in flight, a checkpoint
