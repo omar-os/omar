@@ -4259,10 +4259,13 @@ pub fn sandbox_worker() -> Result<()> {
             init.resumed_from.as_ref(),
         );
         spawn_topology_agents(&init.state, &launcher, config.replace, &mut sessions)?;
+        // The worker starts with the run; the host bounds the run as well.
+        let run_started = Instant::now();
         let executor = DispatchExecutor {
             state: &init.state,
             code,
             timeout: init.timeout,
+            run_started,
             workspace_dirs: BTreeMap::from([(
                 init.workspace.instance.clone(),
                 (worktree.clone(), init.workspace.temp(&init.root)),
@@ -4272,6 +4275,7 @@ pub fn sandbox_worker() -> Result<()> {
                 team: init.state.team.clone(),
                 registry: server.registry.clone(),
                 timeout: init.timeout,
+                run_started,
                 web: BTreeSet::new(),
                 // `launch` refuses a sandboxed run with a `per` agent.
                 scoped: None,
