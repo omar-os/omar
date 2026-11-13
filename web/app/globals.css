@@ -37,6 +37,7 @@
   --dia-team-line: #4e4c56;
   --dia-team-name: #f0edf5;
   --dia-team-kind: #96939f;
+  --dia-sandbox: #4fa8e8;
   --dia-port: #e9e6ef;
   --dia-label: #dcd8e3;
   --dia-node: #24242b;
@@ -116,6 +117,7 @@
   --dia-team-line: #8e8c92;
   --dia-team-name: #1b1a1e;
   --dia-team-kind: #7d7a82;
+  --dia-sandbox: #1f74b8;
   --dia-port: #17161a;
   --dia-label: #2c2b30;
   --dia-node: #ffffff;
@@ -799,6 +801,28 @@ h2 {
 
 .omar-team.running .omar-team-body {
   stroke: #8079a3;
+}
+
+/* A team in a Docker Sandbox: a dashed frame outside its status border, in a
+   hue no status uses. */
+.omar-team-sandbox {
+  fill: none;
+  stroke: var(--dia-sandbox);
+  stroke-width: 1.5;
+  stroke-dasharray: 6 4;
+  transition:
+    x 320ms cubic-bezier(0.22, 0.61, 0.36, 1),
+    y 320ms cubic-bezier(0.22, 0.61, 0.36, 1),
+    width 320ms cubic-bezier(0.22, 0.61, 0.36, 1),
+    height 320ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.omar-team-sandbox-name {
+  fill: var(--dia-sandbox);
+}
+
+.diagram-legend .omar-team-sandbox {
+  stroke-dasharray: 3 2;
 }
 
 .omar-team-name {
@@ -2775,6 +2799,18 @@ p.connection-error { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; 
   border-color: var(--line-2);
   background: transparent;
   color: var(--text-2);
+}
+
+/* A sandbox sign-in is set up from its own line, not another button. */
+.backends-panel li button.link-button {
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-2);
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
 }
 
 .backend-status-failed {

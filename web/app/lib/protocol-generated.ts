@@ -33,7 +33,7 @@ export const LIFETIME_UNITS = ["task", "tag"] as const;
 export type LifetimeUnit = (typeof LIFETIME_UNITS)[number];
 
 /** What happened, as the event stream names it. */
-export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started", "agent_attempt"] as const;
+export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started", "agent_attempt", "sandbox_started"] as const;
 export type DiagramEventKind = (typeof DIAGRAM_EVENT_KINDS)[number];
 
 /** Who spoke. */
@@ -54,7 +54,12 @@ team: string,
  * given rather than the name so a client never has to re-derive one from
  * the other.
  */
-parent: string, };
+parent: string,
+/**
+ * The Docker Sandbox it runs in, once that sandbox is up. Absent for a
+ * team on the host, and for one whose sandbox is still starting.
+ */
+sandbox?: string, };
 
 export type Lifetime = { unit: LifetimeUnit, count: number, };
 

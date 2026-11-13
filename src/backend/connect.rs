@@ -22,17 +22,17 @@ pub fn host(backend: &dyn Backend, replace: bool) -> Result<()> {
 }
 
 /// `omar connect` on a terminal: pick a backend with the arrow keys, connect,
-/// replace or disconnect its sign-in, and come back to the list for the next
-/// one.
-pub fn wizard() -> Result<()> {
+/// replace or disconnect its sign-in, or connect it for sandboxes, and come
+/// back to the list for the next one.
+pub fn wizard(sandbox: &crate::sandbox::Config) -> Result<()> {
     let mut selected = 0;
     loop {
         println!("{}", "Checking backends…".dim());
-        let statuses = connection::assistants();
+        let (statuses, sandboxes) = connection::assistants_and_sandboxes();
         let mut stdout = std::io::stdout();
         stdout.queue(cursor::MoveToPreviousLine(1))?;
         stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
-        let outcome = match pick(&statuses, selected)? {
+        let outcome = match pick(&statuses, &sandboxes, selected)? {
             Choice::Quit => return Ok(()),
             Choice::Connect(index, replace) => {
                 selected = index;
@@ -41,6 +41,10 @@ pub fn wizard() -> Result<()> {
             Choice::Disconnect(index) => {
                 selected = index;
                 disconnect(statuses[index].0)
+            }
+            Choice::Sandbox(index) => {
+                selected = index;
+                crate::sandbox::connect(statuses[index].0, sandbox, false)
             }
         };
         if let Err(error) = outcome {
@@ -74,7 +78,15 @@ enum Choice {
     /// Connect; `true` replaces a sign-in it already has.
     Connect(usize, bool),
     Disconnect(usize),
+    Sandbox(usize),
     Quit,
+}
+
+/// Whether sbx is here, so sandboxes are worth showing at all.
+fn sandboxed(sandboxes: &[Connection]) -> bool {
+    sandboxes
+        .iter()
+        .any(|sandbox| *sandbox != Connection::NotInstalled)
 }
 
 /// What the picker asks before acting on a connected backend.
@@ -86,7 +98,11 @@ enum Ask {
 
 /// What to do next. Drawn inline, so what each sign-in prints stays in the
 /// scrollback above the next list.
-fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choice> {
+fn pick(
+    statuses: &[(&dyn Backend, Connection)],
+    sandboxes: &[Connection],
+    selected: usize,
+) -> Result<Choice> {
     let _raw = RawMode::enable()?;
     let mut stdout = std::io::stdout();
     let mut selected = selected.min(statuses.len().saturating_sub(1));
@@ -94,7 +110,7 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
     // How wide each drawn line was; a resize redraws.
     let mut drawn: Vec<usize> = Vec::new();
     loop {
-        let lines = menu(statuses, selected, confirming);
+        let lines = menu(statuses, sandboxes, selected, confirming);
         up_over(&mut stdout, &drawn)?;
         for line in &lines {
             write!(stdout, "{line}\r\n")?;
@@ -120,6 +136,7 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
                 confirming = connected.then_some(Ask::SignOut);
                 continue;
             }
+            KeyCode::Char('s') if sandboxed(sandboxes) => Choice::Sandbox(selected),
             KeyCode::Up | KeyCode::Char('k') => {
                 selected = selected.checked_sub(1).unwrap_or(statuses.len() - 1);
                 continue;
@@ -149,6 +166,12 @@ fn pick(statuses: &[(&dyn Backend, Connection)], selected: usize) -> Result<Choi
             }
             Choice::Disconnect(index) => {
                 format!("Disconnecting {}", statuses[index].0.kind().name())
+            }
+            Choice::Sandbox(index) => {
+                format!(
+                    "Connecting {} for sandboxes",
+                    statuses[index].0.kind().name()
+                )
             }
             Choice::Quit => "Done".to_string(),
         };
@@ -198,13 +221,20 @@ fn visible_width(line: &str) -> usize {
 /// or signing out its sign-in.
 fn menu(
     statuses: &[(&dyn Backend, Connection)],
+    sandboxes: &[Connection],
     selected: usize,
     confirming: Option<Ask>,
 ) -> Vec<String> {
+    let sandboxed = sandboxed(sandboxes);
+    let keys = if sandboxed {
+        "↑/↓ move · enter connect · s sandboxes · d disconnect · q quit"
+    } else {
+        "↑/↓ move · enter connect · d disconnect · q quit"
+    };
     let mut lines = vec![format!(
         "{} Connect an agent backend  {}",
         "◆".cyan(),
-        "↑/↓ move · enter connect · d disconnect · q quit".dim()
+        keys.dim()
     )];
     for (index, (backend, status)) in statuses.iter().enumerate() {
         let name = format!("{:<10}", backend.kind().name());
@@ -212,6 +242,12 @@ fn menu(
         let label = match status {
             Connection::Connected { .. } => label.green(),
             _ => label.yellow(),
+        };
+        let label = match sandboxes.get(index) {
+            Some(sandbox) if sandboxed => {
+                format!("{label}{}", connection::sandbox_note(sandbox, true).dim())
+            }
+            _ => label.to_string(),
         };
         lines.push(if index == selected {
             format!("{} {} {name}{label}", "│".cyan(), "●".cyan())
@@ -564,7 +600,8 @@ mod tests {
             .iter()
             .map(|kind| (crate::backend::of(*kind), Connection::SignedOut))
             .collect();
-        menu(&statuses, 0, None)
+        let sandboxes = vec![Connection::NotInstalled; statuses.len()];
+        menu(&statuses, &sandboxes, 0, None)
             .iter()
             .map(|line| visible_width(line))
             .collect()

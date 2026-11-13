@@ -652,6 +652,16 @@ function containerId(instance: string, snapshot: DiagramSnapshot): string {
  * inside it repeats the prefix on every port and pushes the text into the
  * shapes beside it.
  */
+/**
+ * A sandbox's name short enough for a box's subtitle. OMAR names them
+ * `omar-team-<workspace uuid>`; the uuid's first block tells them apart, and
+ * the full name is the tooltip, which is what `sbx ls` lists.
+ */
+function shortSandbox(name: string): string {
+  const id = name.startsWith("omar-team-") ? name.slice("omar-team-".length) : name;
+  return id.split("-")[0] || id;
+}
+
 function localName(name: string, instance: string): string {
   const prefix = `${instance}.`;
   return instance && name.startsWith(prefix) ? name.slice(prefix.length) : name;
@@ -1309,7 +1319,9 @@ function strandedPorts(node: ElkNode, into = new Set<string>()): Set<string> {
 function layoutKey(snapshot: DiagramSnapshot): string {
   return JSON.stringify({
     team: snapshot.team,
-    instances: snapshot.instances ?? [],
+    // Where an instance runs is paint, not shape: its sandbox starting must
+    // not lay the diagram out again.
+    instances: (snapshot.instances ?? []).map((instance) => ({ ...instance, sandbox: undefined })),
     agents: snapshot.agents,
     timers: snapshot.timers ?? [],
     edges: snapshot.edges,
@@ -1371,6 +1383,13 @@ export function DiagramCanvas({
   focus?: ReadonlySet<string>;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  // Read from the snapshot, not the layout: a sandbox starting repaints the
+  // box without laying it out again.
+  const sandboxOf = new Map(
+    (snapshot.instances ?? []).flatMap((instance) =>
+      instance.sandbox ? [[instance.id, instance.sandbox] as const] : [],
+    ),
+  );
   const edgeEnds = useMemo(
     () => new Map(snapshot.edges.map((edge) => [edge.id, edge] as const)),
     [snapshot.edges],
@@ -1675,10 +1694,13 @@ export function DiagramCanvas({
       >
         {layout && view ? (
           <g transform={`translate(${view.x},${view.y}) scale(${view.scale})`}>
-            {layout.containers.map((container) => (
+            {layout.containers.map((container) => {
+              const sandbox = sandboxOf.get(container.id);
+              return (
               <g
                 key={container.id}
-                className={`omar-team ${layout.status}${focusClass(container.id)}`}
+                className={`omar-team ${layout.status}${sandbox ? " sandboxed" : ""}${focusClass(container.id)}`}
+                data-sandbox={sandbox}
                 // Which box this one sits in. Nesting is structure, so it is
                 // readable from the drawing rather than only inferable from
                 // the geometry.
@@ -1702,6 +1724,24 @@ export function DiagramCanvas({
                   rx={9}
                   ry={9}
                 />
+                {sandbox ? (
+                  // A second frame outside the status border, so running,
+                  // done and failed still read on the box itself. It takes
+                  // in the title too: the whole team is in the sandbox.
+                  <rect
+                    className="omar-team-sandbox"
+                    x={container.box.x - 6}
+                    // Only 2 above the name: a nested team's title band is its
+                    // parent's top padding, just under the parent's subtitle.
+                    y={container.box.y - TITLE_BAND - 2}
+                    width={container.box.width + 12}
+                    height={container.box.height + TITLE_BAND + 8}
+                    rx={12}
+                    ry={12}
+                  >
+                    <title>{`Runs in Docker Sandbox ${sandbox}`}</title>
+                  </rect>
+                ) : null}
                 <text
                   className="omar-team-name"
                   x={container.box.x + 2}
@@ -1719,9 +1759,16 @@ export function DiagramCanvas({
                   {container.team
                     ? `${container.team} · ${layout.status}`
                     : `team · ${layout.status}`}
+                  {sandbox ? (
+                    <tspan className="omar-team-sandbox-name">
+                      {` · sandbox ${shortSandbox(sandbox)}`}
+                      <title>{sandbox}</title>
+                    </tspan>
+                  ) : null}
                 </text>
               </g>
-            ))}
+              );
+            })}
 
             <g className="omar-edges">
               {layout.edges.map((edge) => (
@@ -2020,6 +2067,14 @@ export function DiagramCanvas({
           </svg>
           resets conversation
         </span>
+        {sandboxOf.size ? (
+          <span>
+            <svg viewBox="0 0 18 12" aria-hidden="true">
+              <rect className="omar-team-sandbox" x="1" y="1" width="16" height="10" rx="3" />
+            </svg>
+            sandbox
+          </span>
+        ) : null}
       </div>
     </div>
   );

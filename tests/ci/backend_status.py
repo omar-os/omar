@@ -82,8 +82,10 @@ class BackendStatus(unittest.TestCase):
         Path(cursor).write_text("#!/bin/sh\nexit 0\n")
         Path(cursor).chmod(0o755)
         status = {row["name"]: row for row in json.loads(self.omar("--json"))}
+        # No sbx here, so no backend can run in sandboxes.
         self.assertEqual(status["cursor"], {"name": "cursor", "status": "connected",
-            "via": "CURSOR_API_KEY", "login": "omar connect cursor"})
+            "via": "CURSOR_API_KEY", "login": "omar connect cursor",
+            "sandbox": {"status": "not_installed", "login": "omar connect cursor --sandbox"}})
 
     def test_pi_is_signed_in_to_what_its_store_holds(self):
         store = Path(self.env["HOME"]) / ".pi/agent"

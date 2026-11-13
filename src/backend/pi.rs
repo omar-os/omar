@@ -80,10 +80,7 @@ impl Backend for Pi {
     /// store (names only), then the keys most people sign in with. The one
     /// place OMAR opens a credential file.
     fn connection(&self, _program: &str) -> Connection {
-        let dir = std::env::var_os("PI_CODING_AGENT_DIR")
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".pi").join("agent")));
-        let store = match dir {
+        let store = match agent_dir() {
             Some(dir) => std::fs::read_to_string(dir.join("auth.json")),
             None => Err(std::io::ErrorKind::NotFound.into()),
         };
@@ -260,6 +257,13 @@ fn store_connection(store: std::io::Result<String>, env: Option<String>) -> Conn
         (Ok(_), None) => Connection::SignedOut,
         (Err(reason), None) => Connection::unknown(reason),
     }
+}
+
+/// Where pi keeps its `auth.json`.
+pub(crate) fn agent_dir() -> Option<PathBuf> {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".pi").join("agent")))
 }
 
 /// `auth.json` maps each provider signed in through `/login` to its credential.

@@ -1039,7 +1039,7 @@ pub(crate) fn only_thread(listed: &serde_json::Value) -> Option<String> {
 
 /// `codex login status` answers in a sentence, on stderr.
 /// The operator's Codex home: `CODEX_HOME`, or Codex's default.
-fn codex_home() -> std::io::Result<Option<PathBuf>> {
+pub(crate) fn codex_home() -> std::io::Result<Option<PathBuf>> {
     std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
