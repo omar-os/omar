@@ -3593,18 +3593,24 @@ fn launch(
             let _ = fs::remove_file(&check_log);
         }
         let publisher = diagram_publisher.clone();
+        // Checks of different invocations end concurrently; one writer at a
+        // time, one write per line, so lines never interleave.
+        let writing = Mutex::new(());
         invocation_server
             .registry
             .set_check_sink(Box::new(move |reaction, task_id, run| {
                 let mut line = serde_json::to_value(run).unwrap_or_else(|_| json!({}));
                 line["task_id"] = json!(task_id);
                 line["reaction"] = json!(reaction);
-                if let Ok(mut file) = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&check_log)
-                {
-                    let _ = writeln!(file, "{line}");
+                let line = format!("{line}\n");
+                if let (Ok(_writing), Ok(mut file)) = (
+                    writing.lock(),
+                    fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&check_log),
+                ) {
+                    let _ = file.write_all(line.as_bytes());
                 }
                 if let Some(publisher) = &publisher {
                     publisher.check_completed(reaction, &task_id.to_string(), run);
