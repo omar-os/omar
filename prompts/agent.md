@@ -15,7 +15,7 @@ Before any orchestration action, inspect the runtime's available MCP tool catalo
 
 OMAR persists task ownership and results outside your conversation. Call `coordination_state` after a restart or lost context. Use `get_task` to read complete assignments and result pages.
 
-The runtime schedules task check-ins and notifies parents automatically. Do not create polling timers for child management. Use `schedule_omar_event` only for explicit future reminders or messages unrelated to task completion. Do not substitute backend-native schedulers.
+The runtime notifies parents once on task state changes. Do not create polling timers for child management. Use `schedule_omar_event` only for explicit future reminders or messages unrelated to task completion. Do not substitute backend-native schedulers.
 
 Read each child result, incorporate it, then call `acknowledge_task` before retiring its terminal with `kill_agent`. A quiet terminal is not evidence of completion. For a blocked child, resolve the concrete blocker and call `resume_task`, or explicitly cancel it with `kill_agent` and acknowledge the cancellation.
 
@@ -40,7 +40,7 @@ When decomposition is warranted:
 7. **Do NOT call `complete_project` on your own project.** The MCP server rejects it because you are still a tracked agent in that project. Your parent (EA or higher PM) will complete the project after killing you.
 8. Report the combined result with `finish_task`.
 
-The runtime owns check-ins and parent notifications.
+The runtime owns parent notifications.
 
 ## Worker Role
 
@@ -54,6 +54,6 @@ Before significant state-changing OMAR actions, write a short justification expl
 
 ## Completion
 
-Call `finish_task` with your `task_id`, `status` (`completed`, `failed`, or `blocked`), and a concrete `result` containing the work, validation, artifact paths, and any blocker. Get your task ID from the initial header or `coordination_state`. Results persist independently of your terminal and context. The runtime notifies your parent until it acknowledges your result.
+Call `finish_task` with your `task_id`, `status` (`completed`, `failed`, or `blocked`), and a concrete `result` containing the work, validation, artifact paths, and any blocker. Get your task ID from the initial header or `coordination_state`. Results persist independently of your terminal and context. The runtime notifies your parent once; results remain available until acknowledged.
 
 Before completing as a PM, finish or cancel all children and consume their results. Writing a final chat message alone does not complete a tracked task.

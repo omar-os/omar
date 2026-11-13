@@ -451,3 +451,32 @@ button:focus-visible, select:focus-visible { outline-offset: 3px; }
   .diagram-legend { max-width: calc(100% - 140px); }
   .prompt-box > div { flex-wrap: wrap; gap: 8px; }
 }
+
+/* History actions are siblings of the selection button, including on touch. */
+.history-view-actions { display: flex; align-items: center; gap: 4px; }
+.chat-history .history-archive-toggle { display: grid; place-items: center; padding: 8px; color: var(--muted); border: 0; background: transparent; box-shadow: none; }
+.chat-history .history-archive-toggle:hover { color: var(--text); background: var(--panel-2); }
+.chat-history li .workflow-select { padding-right: 42px; }
+.chat-history li .workflow-archive { position: absolute; top: 10px; right: 5px; width: 32px; height: 32px; padding: 7px; display: grid; place-items: center; color: var(--muted); opacity: 0; }
+.workflow-row:hover .workflow-archive, .workflow-row:focus-within .workflow-archive, .workflow-row:has([aria-current="true"]) .workflow-archive { opacity: 1; }
+.chat-history li .workflow-archive:hover:not(:disabled) { color: var(--purple); border-color: transparent; }
+.history-undo { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; font-size: .8125rem; }
+.history-undo button { padding: 5px 8px; }
+.archived-workflow { padding: 12px; display: grid; gap: 8px; border: 1px solid var(--line); border-radius: 8px; }
+.chat-history .archived-workflow button { width: auto; justify-self: start; border-color: var(--line); padding: 6px 10px; }
+@media (hover: none), (max-width: 900px) { .chat-history li .workflow-archive { opacity: 1; } }
+
+/* Leave space for both the selection chevron and the archive action while renaming. */
+.chat-history li .workflow-rename { right: 72px; width: auto; }
+.archived-workflow-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.chat-history .archived-workflow .workflow-delete { display: grid; place-items: center; border: 0; background: transparent; padding: 8px; color: var(--muted); }
+.chat-history .archived-workflow .workflow-delete:hover { color: #ffb4b4; }
+.delete-workflow-dialog { box-sizing: border-box; width: min(440px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); margin: auto; padding: 24px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel-2); color: var(--text); overflow: auto; overflow-wrap: anywhere; }
+.delete-workflow-dialog::backdrop { background: rgb(0 0 0 / 65%); }
+.delete-workflow-dialog h2 { margin: 0 0 16px; font-size: 20px; }
+.delete-workflow-dialog p { line-height: 1.5; margin: 0 0 16px; }
+.delete-workflow-note { color: var(--muted); font-size: 13px; }
+.delete-workflow-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.chat-history .delete-workflow-actions button { padding: 10px 14px; }
+.chat-history .delete-workflow-actions .confirm-workflow-delete { color: #fff; background: #a62e3c; border-color: #a62e3c; }
+.chat-history .delete-workflow-actions .confirm-workflow-delete:hover:not(:disabled) { background: #be3545; border-color: #be3545; }

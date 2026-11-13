@@ -313,6 +313,12 @@ impl Attachment {
         })
     }
 
+    /// Whether `tmux attach` has exited: the session ended, as a sign-in's
+    /// does when its command finishes.
+    pub fn ended(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
     /// Bytes the agent has drawn since the last call, if any.
     pub fn read(&self, timeout: std::time::Duration) -> Option<Vec<u8>> {
         self.output.recv_timeout(timeout).ok()

@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
-use super::{connection, Connection, Login};
+use super::{connection, Connection, Login, SignInHome};
 use super::{detect, detect_token, Backend, Kind, Launch};
 use super::{managed, NotReady, PaneSetup, WRITE_TIMEOUT};
 use crate::manager::{
@@ -81,6 +81,15 @@ impl Backend for Codex {
         Some(Login {
             args: &["logout"],
             note: None,
+        })
+    }
+    /// `codex login` deletes `auth.json` as it starts, so an abandoned
+    /// replace would leave Codex signed out.
+    fn sign_in_home(&self) -> Option<SignInHome> {
+        Some(SignInHome {
+            var: "CODEX_HOME",
+            dir: codex_home().ok()??,
+            files: &["auth.json"],
         })
     }
     /// The check runs in an empty directory, which is no git repository.
@@ -181,23 +190,6 @@ impl Backend for Codex {
         }
         Ok(codex_launch_socket(command).map(|socket| format!("codex:{}", socket.display())))
     }
-}
-
-/// The operator's Codex home: `CODEX_HOME`, else `~/.codex`.
-fn codex_home() -> Result<Option<PathBuf>> {
-    std::env::var_os("CODEX_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-        .map(|home| {
-            if home.is_absolute() {
-                Ok(home)
-            } else {
-                std::env::current_dir().map(|cwd| cwd.join(home))
-            }
-        })
-        .transpose()
-        .map_err(Into::into)
 }
 
 /// Codex loads a project's `.codex/hooks.json` only when the project is
@@ -778,6 +770,22 @@ pub(crate) fn only_thread(listed: &serde_json::Value) -> Option<String> {
 }
 
 /// `codex login status` answers in a sentence, on stderr.
+/// The operator's Codex home: `CODEX_HOME`, or Codex's default.
+pub(crate) fn codex_home() -> std::io::Result<Option<PathBuf>> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .map(|home| {
+            if home.is_absolute() {
+                Ok(home)
+            } else {
+                std::env::current_dir().map(|cwd| cwd.join(home))
+            }
+        })
+        .transpose()
+}
+
 fn login_status(text: &str) -> Connection {
     if text.contains("Not logged in") {
         return Connection::SignedOut;
@@ -788,6 +796,13 @@ fn login_status(text: &str) -> Connection {
     {
         Some(via) if via.starts_with("an API key") => Connection::connected("API key"),
         Some(via) => Connection::connected(via.trim()),
+        // Codex 0.167 and later, for a key it has not tried yet.
+        None if text
+            .lines()
+            .any(|line| line.trim().starts_with("API key configured")) =>
+        {
+            Connection::connected("API key")
+        }
         None => Connection::unknown("`codex login status` gave no answer OMAR knows"),
     }
 }
@@ -803,6 +818,12 @@ mod tests {
         );
         assert_eq!(
             login_status("Logged in using an API key - sk-proj-***ABCD"),
+            Connection::connected("API key")
+        );
+        assert_eq!(
+            login_status(
+                "API key configured - sk-dummy***gn-in\nAuthentication is checked when you send a request.\n"
+            ),
             Connection::connected("API key")
         );
         assert_eq!(

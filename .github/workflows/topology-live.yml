@@ -183,3 +183,24 @@ jobs:
             [[ -S $socket ]] && env -u TMUX tmux -S "$socket" kill-server 2>/dev/null || true
           done
           rm -rf "$OMAR_HOME"
+
+  report:
+    name: Report nightly failure
+    # Scheduled runs belong to the merge-queue bot, so GitHub tells no one when
+    # they fail. Comment on the tracking issue instead; it mentions assignees.
+    needs: [live-topology, ultracode-live]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Comment on the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: .github/scripts/report-nightly-failure.sh
