@@ -33,7 +33,7 @@ export const LIFETIME_UNITS = ["task", "tag"] as const;
 export type LifetimeUnit = (typeof LIFETIME_UNITS)[number];
 
 /** What happened, as the event stream names it. */
-export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started", "agent_attempt"] as const;
+export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started", "agent_attempt", "sandbox_started"] as const;
 export type DiagramEventKind = (typeof DIAGRAM_EVENT_KINDS)[number];
 
 /** Who spoke. */
@@ -54,7 +54,12 @@ team: string,
  * given rather than the name so a client never has to re-derive one from
  * the other.
  */
-parent: string, };
+parent: string,
+/**
+ * The Docker Sandbox it runs in, once that sandbox is up. Absent for a
+ * team on the host, and for one whose sandbox is still starting.
+ */
+sandbox?: string, };
 
 export type Lifetime = { unit: LifetimeUnit, count: number, };
 
@@ -191,9 +196,17 @@ progress: boolean, design: ProposedDesign | null,
  */
 selection: Array<string>, };
 
-export type Conversation = { id: string, title: string, ea_id: number | null, created_at: number, updated_at: number, messages: Array<ChatMessage>, };
+export type WorkflowDraft = { design: ProposedDesign, filename: string,
+/**
+ * A later assistant proposal supersedes an older edited draft.
+ */
+proposal_sequence: number, };
 
-export type ConversationSummary = { id: string, title: string, created_at: number, updated_at: number, message_count: number, ea_id: number | null, busy: boolean, run: RunRecord | null, };
+export type WorkflowState = { revision: number, name: string | null, draft: WorkflowDraft | null, };
+
+export type Conversation = { id: string, title: string, ea_id: number | null, created_at: number, updated_at: number, messages: Array<ChatMessage>, workspace: WorkflowState, };
+
+export type ConversationSummary = { id: string, title: string, created_at: number, updated_at: number, message_count: number, ea_id: number | null, workflow_name: string | null, busy: boolean, run: RunRecord | null, };
 
 export type MutationRecord = { status: MutationStatus,
 /**
@@ -209,7 +222,11 @@ dropped?: Array<string>,
  */
 checkpoint?: string, error?: string, };
 
-export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number, finished_at: number | null, error: string | null,
+export type RunRecord = { run_id: string, team: string, status: RunStatus, diagram_address: string | null, started_at: number,
+/**
+ * Last meaningful run activity, in milliseconds like chat timestamps.
+ */
+activity_at: number, finished_at: number | null, error: string | null,
 /**
  * Input ports the run was admitted with, so its timeline can be
  * projected again later from the same starting point.
