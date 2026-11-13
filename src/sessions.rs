@@ -1396,6 +1396,18 @@ fn watch_interrupt() {
     }
 }
 /// The registry record once the daemon has published `stopped`.
+/// Whether a session's daemon is still running. One this process started is
+/// its child, and reaped here: `kill -0` would see its zombie as running.
+fn daemon_running(pid: u32) -> bool {
+    let mut status = 0;
+    // SAFETY: WNOHANG never blocks; `status` is a valid out-pointer.
+    match unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) } {
+        0 => true,
+        reaped if reaped > 0 => false,
+        _ => crate::process::pid_alive(pid),
+    }
+}
+
 fn wait_stopped(session: &Session, timeout: Duration) -> Result<Session> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1789,7 +1801,12 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             } else if owned {
                 // A session made for one run goes with it.
                 let _ = rpc(&s,json!({"op":"down","force":false}),Duration::from_secs(10));
-                remove_session(&wait_stopped(&s, Duration::from_secs(30))?)?;
+                let stopped = wait_stopped(&s, Duration::from_secs(30))?;
+                // The daemon publishes "stopped" just before it exits; its
+                // directory goes once it has.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while daemon_running(stopped.pid) && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(50)); }
+                remove_session(&stopped)?;
             }
             if state["status"] == "failed" { bail!("topology failed: {}", state["error"]); }
             if cli.json { return print_value(state); }
