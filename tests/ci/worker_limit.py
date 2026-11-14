@@ -176,8 +176,11 @@ def execute(backend, unknown=False, timeout=False, credit=None, slow=False, over
             program = root / 'Limit.omar'
             # Exercise the demo's effect name too: the provider must not hardcode result.
             port = 'patch' if slow and backend in ['Codex', 'Pi', 'OpenCode'] else 'result'
+            # Work after the reset counts toward within; the slow model's 6 s
+            # needs room, and the 16 s wait still runs past the deadline.
+            within = 30 if credit else WITHIN + 5 if slow else WITHIN
             program.write_text(workers.PROGRAM.replace('BACKENDLIFETIME', backend).replace(
-                '-> result "PROMPT"', f'-> result within({30 if credit else WITHIN}s) "Return one word."').replace('result', port))
+                '-> result "PROMPT"', f'-> result within({within}s) "Return one word."').replace('result', port))
             up = subprocess.run([str(workers.BIN), 'up', '-s', 'limit-test', '--no-ea'], env=env, cwd=root, capture_output=True, text=True, timeout=90)
             assert up.returncode == 0, up.stdout + up.stderr
             launch = json.loads((home / '.omar/sessions/limit-test/launch.json').read_text())
