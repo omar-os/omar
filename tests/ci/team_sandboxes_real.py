@@ -61,7 +61,9 @@ out = Some("isolated".to_string());
         instructions = [{"op": "begin_plan", "team": "IsolationSmoke"}]
         for instance, parent in [("parent", ""), ("parent.child", "parent")]:
             instructions += [
-                dict(op="declare_instance", name=instance, parent=parent, team="Writer"),
+                # A sandboxed team's setup runs in its VM, before its agents.
+                dict(op="declare_instance", name=instance, parent=parent, team="Writer",
+                     **({"setup": 'echo "$HOME" > setup-home'} if instance == "parent.child" else {})),
                 dict(op="define_port", instance=instance, kind="input", name=instance+".tick", type="int"),
                 dict(op="define_port", instance=instance, kind="output", name=instance+".out", type="string"),
                 dict(op="spawn_agent", instance=instance, name=instance+".agent", backend="stub"),
@@ -112,7 +114,10 @@ out = Some("isolated".to_string());
                 assert (tree/"boundary-probe").read_text() == "untouched"
                 assert (tree/"artifact").read_text() == "inside sandbox"
                 assert len(list((state_root/"workspace-history"/ws/"snapshots").glob("*.json"))) == 2
-            print("PASS: real Docker Sandbox execution, parent/child separation, denied host/history access, native backend, snapshots, egress")
+            homes = [(t/"setup-home").read_text().strip() for t in (state_root/"workspaces"/ws/"worktree" for ws in record["workspaces"].values())
+                     if (t/"setup-home").exists()]
+            assert len(homes) == 1 and homes[0] and homes[0] not in (str(home), os.environ["HOME"]), homes
+            print("PASS: real Docker Sandbox execution, parent/child separation, denied host/history access, native backend, snapshots, egress, team setup in the VM")
         finally:
             subprocess.run([str(BIN), "down", "-s", runtime["name"], "--force", "--timeout", "5"], env=env, capture_output=True)
             subprocess.run(["tmux", "-L", runtime["tmux_server"], "kill-server"], capture_output=True)
