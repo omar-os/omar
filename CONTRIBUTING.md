@@ -40,4 +40,4 @@ CI's `Repository Rules` job enforces 1 and 2 on files a change adds.
 14. Every feature comes with a test, and every test runs in CI.
 15. When CI fails, find out why and iterate until it passes.
 16. Flaky tests: if a re-run passes, say so in the PR and open an issue for the flake. Don't just re-run.
-17. Once CI passes, request a review from GitHub Copilot and address it judiciously.
+17. Once CI passes, have the coding agent that helped write the PR review it (e.g. Claude Code `/code-review`, `codex review`). Address its findings judiciously; say in the PR description what it found and what changed.
