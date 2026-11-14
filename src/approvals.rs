@@ -271,6 +271,15 @@ impl ApprovalRun {
         );
     }
 
+    pub fn watch_sandbox(&self, agent: &str) {
+        self.hub.watch_observer(
+            format!("agent::{agent}"),
+            agent.into(),
+            Some(self.run_id.clone()),
+            None,
+        );
+    }
+
     pub fn invocation(&self, agent: &str, invocation: &str) -> InvocationGuard {
         let mut state = self.hub.0.lock().expect("approval state poisoned");
         for watch in state.watches.values_mut() {
