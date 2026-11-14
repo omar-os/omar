@@ -69,6 +69,11 @@ impl Backend for Opencode {
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         from_stamp(target.stamp?).map(|(_, session)| session)
     }
+    fn forget(&self, target: &super::Target<'_>) {
+        if let Some((port, session)) = target.stamp.and_then(from_stamp) {
+            let _ = http_json(port, "DELETE", &format!("/session/{session}"), None);
+        }
+    }
     /// Single words: a long workspace path wraps the footer and splits
     /// "tab agents" and "ctrl+p commands" across lines.
     fn readiness_markers(&self) -> &'static [&'static str] {
@@ -177,6 +182,17 @@ pub(crate) fn materialize_opencode_coordination_plugin(
     Some(format!("file://{encoded}"))
 }
 
+/// Nobody answers a permission prompt in a worker, so no rule may be left at
+/// opencode's `ask` default: `external_directory` (paths outside the
+/// workspace) and `read` of `*.env` files. `doom_loop` is denied, not asked.
+fn permission_rules() -> serde_json::Value {
+    serde_json::json!({
+        "doom_loop": "deny",
+        "external_directory": "allow",
+        "read": "allow"
+    })
+}
+
 pub(crate) fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
     let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
@@ -209,9 +225,7 @@ pub(crate) fn opencode_config_env(context: &McpLaunchContext) -> Option<String> 
             }
         },
         "tools": tools,
-        "permission": {
-            "doom_loop": "deny"
-        }
+        "permission": permission_rules()
     });
     if let Some(plugin) = materialize_opencode_coordination_plugin(context) {
         config["plugin"] = serde_json::json!([plugin]);
@@ -447,6 +461,18 @@ mod tests {
     use std::io::Read;
 
     #[test]
+    fn config_never_leaves_a_blocking_permission_at_ask() {
+        let rules = permission_rules();
+        assert_eq!(rules["external_directory"], "allow");
+        assert_eq!(rules["read"], "allow");
+        assert!(rules
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|action| action != "ask"));
+    }
+
+    #[test]
     fn a_footer_wrapped_by_a_long_path_still_reads_as_ready() {
         let screen = "  ┃  Build · GPT-5.6 Terra Fast OpenAI\n\
             \x20  /tmp/omar/sessions/cosmic- tab      ctrl+p\n\
@@ -551,6 +577,33 @@ mod tests {
         });
         deliver_over_http(port, "session_test", "agent event").unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn forgetting_a_worker_deletes_its_session_over_http() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stamp = format!("opencode:{}:ses_abc", listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntrue")
+                .unwrap();
+            line
+        });
+        Opencode.forget(&super::super::Target {
+            name: "pane",
+            pane_pid: 0,
+            stamp: Some(&stamp),
+        });
+        assert_eq!(
+            server.join().unwrap(),
+            "DELETE /session/ses_abc HTTP/1.1\r\n"
+        );
     }
 
     #[test]
