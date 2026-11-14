@@ -837,6 +837,199 @@ def testProve : IO Unit := do
   -- The mistake is reported where it is, counting from the theorem.
   assertEqual "wrong proof's line" ((verdict "wrong").map (·.problems.map (·.line) |>.contains 4)) (some true)
 
+/-- `agent : Backend per tag`: the default, every form of the lifetime, what
+    is refused, and that only a lifetime changes the bytecode. -/
+def testAgentLifetime : IO Unit := do
+  let source (decl : String) :=
+    "team T[" ++ decl ++ "] { input token : string output out : string " ++
+    "task coder(token) -> out \"Go $(token)\" } main Scoped { t = T() }"
+  let compiled (decl : String) : IO Json := do
+    match compileSource "Scoped" (source decl) >>= Json.parse with
+    | .ok json => pure json
+    | .error error => throw (IO.userError s!"{decl}: {error}")
+  let spawn (json : Json) : IO Json := do
+    let instructions ← IO.ofExcept (json.getObjValAs? (Array Json) "instructions")
+    match instructions.find? (fun i => (i.getObjValAs? String "op").toOption == some "spawn_agent") with
+    | some instruction => pure instruction
+    | none => throw (IO.userError "no spawn_agent")
+  let version (json : Json) := (json.getObjValAs? Nat "version").toOption
+  let lifetime (instruction : Json) : Option (String × Nat) :=
+    match instruction.getObjVal? "lifetime" with
+    | .ok life =>
+      match life.getObjValAs? String "unit", life.getObjValAs? Nat "count" with
+      | .ok unit, .ok count => some (unit, count)
+      | _, _ => none
+    | .error _ => none
+  -- No `per` leaves the bytecode exactly as it was before lifetimes existed.
+  let plain ← compiled "coder : Claude"
+  assertEqual "default version" (version plain) (some 1)
+  assertEqual "default lifetime omitted" (lifetime (← spawn plain)) none
+  -- Every form, carried and versioned so an older runtime refuses it. A bare
+  -- unit is a count of one; singular and plural are interchangeable.
+  for (spelled, expected) in [
+      ("per task", ("task", 1)), ("per tag", ("tag", 1)),
+      ("per 1 task", ("task", 1)), ("per 1 tag", ("tag", 1)),
+      ("per 5 tasks", ("task", 5)), ("per 10 tags", ("tag", 10)),
+      ("per 2 task", ("task", 2)), ("per 3 tag", ("tag", 3))] do
+    let decl := s!"coder : Claude {spelled}"
+    let json ← compiled decl
+    assertEqual decl (version json) (some 2)
+    assertEqual decl (lifetime (← spawn json)) (some expected)
+  assertEqual "per 1 task is per task"
+    (← compiled "coder : Claude per 1 task").compress (← compiled "coder : Claude per task").compress
+  let _ ← compiled "coder : Claude per tag, other : Web"
+  -- Every backend that can start a fresh conversation is accepted by any
+  -- alias a source file can spell, in any case, as the runtime resolves it.
+  let supported := Omar.Backends.freshConversation
+  for aliases in supported do
+    for alias in aliases.filter (!·.contains '-') do
+      for spelled in [alias, alias.capitalize, alias.toUpper] do
+        let decl := s!"coder : {spelled} per tag"
+        assertEqual decl (version (← compiled decl)) (some 2)
+  -- The model-free stub, which CI runs end to end, Jev, which holds no
+  -- conversation at all, Pi and OpenCode, which open one by the id they are
+  -- given, and Codex, which mints one the runtime checks is new, are among
+  -- them.
+  for backend in ["Stub", "Jev", "Pi", "OpenCode", "Codex"] do
+    let decl := s!"coder : {backend} per task"
+    assertEqual decl (lifetime (← spawn (← compiled decl))) (some ("task", 1))
+  -- One that cannot, or one omarc does not know, is refused before bytecode
+  -- exists, naming those that can. Without `per` it still compiles, unknown
+  -- backend included.
+  let names := ", ".intercalate (supported.map (·[0]!)).toList
+  -- Antigravity and Cursor hand every new conversation its earlier ones'
+  -- transcripts.
+  for backend in ["Web", "Agy", "Antigravity", "Cursor", "Nope"] do
+    let _ ← compiled s!"coder : {backend}"
+    for (spelled, shown) in [("per tag", "per tag"), ("per 5 tasks", "per 5 tasks")] do
+      match compileSource "Scoped" (source s!"coder : {backend} {spelled}") with
+      | .ok _ => throw (IO.userError s!"accepted {backend} {spelled}")
+      | .error error =>
+        if error != s!"agent 'coder' resets its conversation ({shown}), but backend '{backend}' \
+            cannot start a fresh conversation; supported: {names}" then
+          throw (IO.userError s!"{backend}: {error}")
+  -- Nor does a mutation to one plan.
+  match compileDiffSourcesWithSchemas "Scoped" (source "coder : Web") #[]
+      "Scoped" (source "coder : Web per tag") #[] with
+  | .ok _ => throw (IO.userError "planned a mutation to Web per tag")
+  | .error error =>
+    if !mentions error "cannot start a fresh conversation" then
+      throw (IO.userError s!"lifetime plan to Web: {error}")
+  for (decl, expected) in [
+      ("coder : Claude per 0 tasks", "at least 1"),
+      ("coder : Claude per 0 tag", "at least 1"),
+      ("coder : Claude per", "lifetime must be written"),
+      ("coder : Claude per week", "lifetime must be written"),
+      ("coder : Claude per 5", "lifetime must be written"),
+      ("coder : Claude per 5 weeks", "lifetime must be written"),
+      ("coder : Claude per tags tasks", "expected"),
+      ("coder : Claude(scope = invocation)", "unknown option 'scope'"),
+      ("coder : Claude per 1.5 tags", "lifetime must be written")] do
+    match compileSource "Scoped" (source decl) with
+    | .ok _ => throw (IO.userError s!"accepted {decl}")
+    | .error error =>
+      if !mentions error expected then
+        throw (IO.userError s!"{decl}: expected '{expected}', got {error}")
+  -- A lifetime change is a different agent: killed and spawned again, never
+  -- kept with the conversation it had. The plan is versioned like the
+  -- program it produces.
+  for (before, after) in [("coder : Claude", "coder : Claude per tag"),
+      ("coder : Claude per tag", "coder : Claude per 2 tags"),
+      ("coder : Claude per task", "coder : Claude per tag"),
+      ("coder : Claude per tag", "coder : Claude")] do
+    let plan ← match compileDiffSourcesWithSchemas "Scoped" (source before) #[]
+        "Scoped" (source after) #[] >>= Json.parse with
+      | .ok plan => pure plan
+      | .error error => throw (IO.userError s!"lifetime plan: {error}")
+    let ops := ((plan.getObjValAs? (Array Json) "instructions").toOption.getD #[]).map
+      (fun i => (i.getObjValAs? String "op").toOption.getD "")
+    assertEqual s!"{before} -> {after}" ops #["begin_mutation", "kill_agent", "spawn_agent", "commit_plan"]
+  IO.println "agent lifetime tests passed"
+
+/-- `agent : Backend(model = "...")`: carried, versioned, and refused where
+    the backend cannot take one or the name is not safe on a command line. -/
+def testAgentModel : IO Unit := do
+  let source (decl : String) :=
+    "team T[" ++ decl ++ "] { input token : string output out : string " ++
+    "task coder(token) -> out \"Go $(token)\" } main M { t = T() }"
+  let compiled (decl : String) : IO Json := do
+    match compileSource "M" (source decl) >>= Json.parse with
+    | .ok json => pure json
+    | .error error => throw (IO.userError s!"{decl}: {error}")
+  let spawn (json : Json) : IO Json := do
+    let instructions ← IO.ofExcept (json.getObjValAs? (Array Json) "instructions")
+    match instructions.find? (fun i => (i.getObjValAs? String "op").toOption == some "spawn_agent") with
+    | some instruction => pure instruction
+    | none => throw (IO.userError "no spawn_agent")
+  let version (json : Json) := (json.getObjValAs? Nat "version").toOption
+  let model (instruction : Json) := (instruction.getObjValAs? String "model").toOption
+  let lifetime (instruction : Json) :=
+    (instruction.getObjVal? "lifetime").toOption.map (·.compress)
+  -- No model: the bytecode is what it was before models existed.
+  let plain ← compiled "coder : Claude"
+  assertEqual "default model omitted" (model (← spawn plain)) none
+  assertEqual "default version" (version plain) (some 1)
+  -- A model is carried and versioned; `per` composes with it, after it.
+  let named ← compiled "coder : Claude(model = \"claude-sonnet-5-5\")"
+  assertEqual "model" (model (← spawn named)) (some "claude-sonnet-5-5")
+  assertEqual "model version" (version named) (some 3)
+  for (decl, expected) in [
+      ("coder : Claude(model = \"claude-haiku-5-5\") per tag",
+        "{\"count\":1,\"unit\":\"tag\"}"),
+      ("coder : Codex(model = \"gpt-x\") per 2 tasks", "{\"count\":2,\"unit\":\"task\"}")] do
+    let json ← compiled decl
+    assertEqual decl (version json) (some 3)
+    assertEqual decl (lifetime (← spawn json)) (some expected)
+  let lifetimeOnly ← compiled "coder : Codex per 2 tasks"
+  assertEqual "lifetime without model stays v2" (version lifetimeOnly) (some 2)
+  assertEqual "lifetime without model" (model (← spawn lifetimeOnly)) none
+  let routed ← compiled "coder : OpenCode(model = \"openrouter/nvidia/x:free\")"
+  assertEqual "provider/model" (model (← spawn routed)) (some "openrouter/nvidia/x:free")
+  -- Every backend that can take one, by any alias a source file can spell.
+  for aliases in Omar.Backends.modelSelectable do
+    for alias in aliases.filter (!·.contains '-') do
+      let _ ← compiled s!"coder : {alias.capitalize}(model = \"m\")"
+  -- One that cannot, or one omarc does not know, is refused before bytecode.
+  let names := ", ".intercalate (Omar.Backends.modelSelectable.map (·[0]!)).toList
+  for backend in ["Web", "Stub", "Nope"] do
+    match compileSource "M" (source s!"coder : {backend}(model = \"m\")") with
+    | .ok _ => throw (IO.userError s!"accepted {backend}(model)")
+    | .error error =>
+      if error != s!"agent 'coder' sets a model, but backend '{backend}' cannot take one; \
+          supported: {names}" then
+        throw (IO.userError s!"{backend}: {error}")
+  -- Claude aliases carry brackets; the model is single-quoted at every use.
+  let _ ← compiled "coder : Claude(model = \"opus[1m]\")"
+  for (decl, expected) in [
+      ("coder : Claude(model = \"\")", "invalid model"),
+      ("coder : Claude(model = \"$(x)\")", "invalid model"),
+      ("coder : Claude(model = \"a b\")", "invalid model"),
+      ("coder : Claude(model = \"--dangerous\")", "invalid model"),
+      ("coder : Claude(model = \"a'b\")", "invalid model"),
+      ("coder : Claude(model = \"a;b\")", "invalid model"),
+      ("coder : Claude(model = sonnet)", "must be a quoted name"),
+      ("coder : Claude(model = \"a\", model = \"b\")", "options must be written"),
+      ("coder : Claude(scope = agent)", "unknown option 'scope'"),
+      ("coder : Claude(model = \"a\", scope = agent)", "options must be written"),
+      ("coder : Claude()", "options must be written"),
+      ("coder : Claude(model = \"a\"", "options must be written"),
+      ("coder : Claude per tag(model = \"a\")", "expected")] do
+    match compileSource "M" (source decl) with
+    | .ok _ => throw (IO.userError s!"accepted {decl}")
+    | .error error =>
+      if !mentions error expected then
+        throw (IO.userError s!"{decl}: expected '{expected}', got {error}")
+  -- A model change is a different agent: killed and spawned again.
+  let plan ← match compileDiffSourcesWithSchemas "M" (source "coder : Claude") #[]
+      "M" (source "coder : Claude(model = \"claude-haiku-5-5\")") #[] >>= Json.parse with
+    | .ok plan => pure plan
+    | .error error => throw (IO.userError s!"model plan: {error}")
+  assertEqual "model plan version" (version plan) (some 3)
+  let ops := ((plan.getObjValAs? (Array Json) "instructions").toOption.getD #[]).map
+    (fun i => (i.getObjValAs? String "op").toOption.getD "")
+  assertEqual "model plan" ops #["begin_mutation", "kill_agent", "spawn_agent", "commit_plan"]
+  IO.println "agent model tests passed"
+
 /-- Every complete program in the EA's prompt — a fenced block with a team
     and a `main` — compiles, so the examples it designs from cannot drift
     from the language. -/
@@ -873,6 +1066,8 @@ def main : IO UInt32 := do
     testExternalSchemas
     testSchemaTypeResolution
     testMutation
+    testAgentLifetime
+    testAgentModel
     testContracts
     testModels
     testProve

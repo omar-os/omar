@@ -39,6 +39,23 @@ pub struct TopologyMcpContext {
     pub agent: String,
     pub endpoint: String,
     pub token: String,
+    /// Set for a worker of an agent with a `per` lifetime, which exists for
+    /// one window. Its calls carry the attempt, so a worker from an earlier
+    /// attempt cannot answer for a later one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<TopologyAttempt>,
+}
+
+/// One `per`-lifetime worker: the attempt OMAR started it for, and the
+/// native conversation it was told to open, which no earlier worker used.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TopologyAttempt {
+    pub id: String,
+    /// What the worker's calls carry, and the only thing that tells them from
+    /// an earlier attempt's. Unlike `id`, which `attempts.jsonl` records, it
+    /// is written only to the attempt's own files, removed when it stops.
+    pub key: String,
+    pub native_session: String,
 }
 
 /// Lets the EA talk back to whoever is driving `omar serve` — replies and
@@ -214,12 +231,29 @@ pub fn ea_mcp_context_path(omar_dir: &Path, ea_id: EaId) -> PathBuf {
 }
 
 pub(crate) fn mcp_ea_dir(context: &McpLaunchContext) -> Option<PathBuf> {
-    let dir = context
-        .omar_dir
-        .join("mcp")
-        .join(format!("ea-{}", context.ea_id));
+    let attempt = context
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.attempt.as_ref());
+    let dir = match attempt {
+        Some(attempt) => attempt_mcp_dir(&context.omar_dir, context.ea_id, &attempt.id),
+        None => context
+            .omar_dir
+            .join("mcp")
+            .join(format!("ea-{}", context.ea_id)),
+    };
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// Where a `per`-lifetime attempt's launch writes its context and
+/// configs: its own, so a process left from an earlier attempt that rereads
+/// its paths finds nothing of a later one's. Removed once the attempt stops.
+pub(crate) fn attempt_mcp_dir(omar_dir: &Path, ea_id: EaId, attempt: &str) -> PathBuf {
+    omar_dir
+        .join("mcp")
+        .join(format!("ea-{ea_id}"))
+        .join(format!("attempt-{attempt}"))
 }
 
 /// Atomically write `bytes` to `path` with mode 0600 on Unix.
@@ -301,9 +335,12 @@ pub(crate) fn actor_file(actor: Option<&str>, stem: &str) -> String {
 pub(crate) fn materialize_shared_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
     // User-global backend configs must not overwrite the EA's private context.
     // Each launched pane supplies its own full context through the environment.
+    // Nor carry a topology agent's: every MCP server reading this file would
+    // act as whichever agent, or attempt, launched last.
     let mut shared = context.clone();
     shared.agent_name = None;
     shared.serve = None;
+    shared.topology = None;
     let path = mcp_ea_dir(context)?.join("context-shared.json");
     write_private_file(&path, &serde_json::to_vec(&shared).ok()?).ok()?;
     Some(path)
@@ -670,6 +707,23 @@ pub(crate) mod tests {
         assert_eq!(read(a_path).agent_name.as_deref(), Some("worker/a"));
         assert_eq!(read(b_path).agent_name.as_deref(), Some("worker-b"));
         assert!(read(shared_path).serve.is_none());
+        // A topology agent's identity, and its attempt's, stay in its own file.
+        let mut scoped = a.clone();
+        scoped.topology = Some(TopologyMcpContext {
+            team: "Scoped".into(),
+            agent: "t.coder".into(),
+            endpoint: "localhost:1".into(),
+            token: "t".into(),
+            attempt: Some(TopologyAttempt {
+                id: "attempt".into(),
+                key: "key".into(),
+                native_session: "unused".into(),
+            }),
+        });
+        let shared_path = materialize_shared_mcp_context_file(&scoped).unwrap();
+        assert!(read(shared_path).topology.is_none());
+        let scoped_path = materialize_mcp_context_file(&scoped).unwrap();
+        assert_eq!(read(scoped_path).topology.unwrap().agent, "t.coder");
     }
 
     // Exercise the real manager lifecycle: worktree/backend launchers can keep
@@ -1459,6 +1513,17 @@ pub(crate) mod tests {
             ("stub", "omar stub-agent"),
             ("unknown", "custom-agent --x"),
             ("env-wrapper", "FOO=bar claude"),
+            // A topology agent with `model = "..."`: the backend's own words
+            // for it, added after the operator's command.
+            (
+                "claude-model",
+                "claude --some-flag --model 'claude-haiku-5-5'",
+            ),
+            ("codex-model", "codex -m 'gpt-5.1-codex'"),
+            (
+                "opencode-model",
+                "opencode --port 4444 --model 'openrouter/nvidia/x:free'",
+            ),
         ] {
             lines.push((name, mask(build_agent_command(base, &prompt, &subs, &ctx))));
         }
@@ -1471,6 +1536,60 @@ pub(crate) mod tests {
             lines.push((name, mask(build_ea_command(base, 7, "Seven", dir, &ctx).0)));
         }
         lines
+    }
+
+    /// What the topology launcher adds for `model = "..."` reaches each
+    /// backend's real launch: on the line for the TUI backends, in the
+    /// runner's saved command for the protocol ones.
+    #[test]
+    fn a_model_reaches_every_backends_launch() {
+        let _env_lock = global_home_env_lock();
+        let dir = short_tempdir();
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let prompt = dir.path().join("prompt.md");
+        std::fs::write(&prompt, "You are a worker.\n").unwrap();
+        let ctx = test_mcp_context(dir.path());
+        for (name, base, model) in [
+            ("claude", "claude", "claude-haiku-5-5"),
+            ("codex", "codex", "gpt-5.1-codex"),
+            (
+                "opencode",
+                "opencode --port 4444",
+                "openrouter/nvidia/x:free",
+            ),
+            ("cursor", "cursor agent --yolo", "sonnet-4"),
+            ("agy", "agy --dangerously-skip-permissions", "gemini-3-pro"),
+        ] {
+            let backend = crate::backend::by_name(name).unwrap();
+            let flag = backend.model_flag(model).unwrap();
+            assert!(flag.contains(model), "{name}: {flag}");
+            let line = build_agent_command(&format!("{base} {flag}"), &prompt, &[], &ctx);
+            // A protocol backend keeps its command in the runner's config.
+            let saved = line
+                .split("--config-file '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .map(|path| std::fs::read_to_string(path).unwrap())
+                .unwrap_or_default();
+            assert!(
+                line.contains(&flag)
+                    || saved.contains(&flag.replace('\'', "'\\''"))
+                    || saved.contains(model),
+                "{name} lost its model: {line}\n{saved}"
+            );
+            if saved.is_empty() {
+                continue;
+            }
+            let config: serde_json::Value = serde_json::from_str(&saved).unwrap();
+            let command = config["command"].as_str().unwrap();
+            assert!(command.contains(&flag), "{name}: {command}");
+        }
+        // The same names the model has in a pi launch.
+        let pi = crate::backend::by_name("pi")
+            .unwrap()
+            .model_flag("openai/gpt-4o")
+            .unwrap();
+        assert_eq!(pi, "--model 'openai/gpt-4o'");
     }
 
     #[test]

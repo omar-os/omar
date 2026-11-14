@@ -70,6 +70,9 @@ pub struct AgentConfig {
     /// Default working directory
     #[serde(default = "default_workdir")]
     pub default_workdir: String,
+    /// Locally enabled model IDs keyed by the canonical backend name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub models: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -171,6 +174,7 @@ impl Default for AgentConfig {
         Self {
             default_command: default_command(),
             default_workdir: default_workdir(),
+            models: Default::default(),
         }
     }
 }

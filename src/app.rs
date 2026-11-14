@@ -2018,6 +2018,7 @@ mod tests {
             },
             health: HealthConfig::default(),
             agent: AgentConfig {
+                models: Default::default(),
                 default_command: "true".to_string(),
                 default_workdir: ".".to_string(),
             },

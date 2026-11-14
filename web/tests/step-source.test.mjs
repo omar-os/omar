@@ -82,3 +82,29 @@ test('an inter-instance connection is split in its enclosing block and keeps its
  assert.match(graph,/team auditStep\[worker : Web\]/);
  assert.match(graph,/flow.result -> audit.value\s+audit.result -> other.request after 2s/);
 });
+
+test('an agent lifetime is kept when its step backend is edited', () => {
+ const timed = program.replace('planner:Codex', 'planner:Claude per 5 tasks');
+ const step = locateStep(timed, snapshot, snapshot.reactions[0]);
+ assert.equal(step.backend, 'Claude');
+ const changed = replaceStep(timed, step, { backend:'ClaudeCode', prompt:step.prompt, triggers:step.triggers, contract:step.contract });
+ assert.match(changed, /planner:ClaudeCode per 5 tasks/);
+});
+
+test('an agent model is kept when its step backend is edited', () => {
+ const modelled = program.replace('planner:Codex', 'planner:Claude(model = "claude-haiku-5-5") per 5 tasks');
+ const step = locateStep(modelled, snapshot, snapshot.reactions[0]);
+ const changed = replaceStep(modelled, step, { backend:'Codex', prompt:step.prompt, triggers:step.triggers, contract:step.contract });
+ assert.match(changed, /planner:Codex\(model = "claude-haiku-5-5"\) per 5 tasks/);
+});
+
+test('selecting and clearing a shared role model preserves other roles and lifetimes', () => {
+ const source = program.replace('planner:Codex', 'planner:Codex per 5 tasks');
+ const role = locateStep(source, snapshot, snapshot.reactions[0]);
+ const changed = replaceStep(source, role, {...role, model:'provider/model-v2'});
+ assert.equal(locateStep(changed, snapshot, snapshot.reactions[2]).model, 'provider/model-v2');
+ assert.equal(locateStep(changed, snapshot, snapshot.reactions[1]).model, '');
+ assert.ok(changed.includes('per 5 tasks'));
+ assert.equal(replaceStep(changed, locateStep(changed, snapshot, snapshot.reactions[0]), {...role, model:''}), source);
+ assert.throws(() => replaceStep(source, role, {...role, model:'--bad'}), /valid backend model/);
+});

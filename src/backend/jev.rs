@@ -84,6 +84,18 @@ impl Backend for Jev {
     fn topology_only(&self) -> bool {
         true
     }
+    /// There is no conversation to carry over: every invocation is one
+    /// request, built from that invocation's triggers and prompt alone, sent
+    /// by a curl process of its own that is gone before its answer is
+    /// returned, and nothing here outlives the call.
+    fn fresh_conversation(&self) -> bool {
+        true
+    }
+    /// Sent as the request's `model` by `invoke_topology`; there is no command
+    /// to add it to.
+    fn model_flag(&self, _model: &str) -> Option<String> {
+        Some(String::new())
+    }
     fn invoke_topology(
         &self,
         invocation: &TopologyInvocation<'_>,
@@ -92,12 +104,18 @@ impl Backend for Jev {
     }
 }
 
+/// The exact default passed in the provider request when a role omits a model.
+pub(crate) fn default_model() -> String {
+    std::env::var("OMAR_JEV_MODEL").unwrap_or_else(|_| "jev-1.13.0".into())
+}
+
 fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>> {
     let TopologyInvocation {
         effects,
         triggers,
         instructions,
         timeout,
+        model: agent_model,
     } = invocation;
     let mut decision = None;
     let mut evidence = None;
@@ -127,7 +145,11 @@ fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>
             "OMAR_JEV_ON_ERROR=defer requires a defer enum value and an evidence string output"
         );
     }
-    let model = std::env::var("OMAR_JEV_MODEL").unwrap_or_else(|_| "jev-1.13.0".into());
+    // The agent's own model wins over the run-wide default.
+    let model = match agent_model {
+        Some(model) => model.to_string(),
+        None => default_model(),
+    };
     ensure!(!model.trim().is_empty(), "OMAR_JEV_MODEL must not be empty");
     let criteria: BTreeMap<_, _> = options
         .iter()
@@ -427,6 +449,7 @@ mod tests {
                 triggers: &triggers,
                 instructions: "not sent",
                 timeout: Duration::from_secs(1),
+                model: None,
             };
             assert!(Jev.invoke_topology(&request).is_err());
         }

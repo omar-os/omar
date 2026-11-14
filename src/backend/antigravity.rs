@@ -55,8 +55,20 @@ impl Backend for Antigravity {
     fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
         Some(vec!["-p", connection::CHECK_PROMPT])
     }
+    // No `fresh_conversation`: agy's system prompt points every new
+    // conversation at earlier ones' transcripts under `brain/`, and its
+    // Knowledge Items and conversation search reach them too, with no switch
+    // for any of it. A new conversation id is not a new context, so omarc
+    // refuses `Antigravity per tag`.
     // No readiness banner is pinned: `agy` is not available in CI or local
     // discovery, so a marker would be an unverified guess.
+    /// `--model`.
+    fn model_flag(&self, model: &str) -> Option<String> {
+        Some(format!(
+            "--model {}",
+            crate::manager::shell_single_quote(model)
+        ))
+    }
     /// Antigravity takes no message from outside its protocol, so it runs
     /// under OMAR's protocol runner, once its MCP registration is written.
     fn launch_command(&self, launch: &Launch<'_>) -> String {
