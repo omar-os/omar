@@ -1545,6 +1545,7 @@ pub(crate) mod tests {
     fn a_model_reaches_every_backends_launch() {
         let _env_lock = global_home_env_lock();
         let dir = short_tempdir();
+        let _home = EnvVarGuard::set("HOME", dir.path());
         let prompt = dir.path().join("prompt.md");
         std::fs::write(&prompt, "You are a worker.\n").unwrap();
         let ctx = test_mcp_context(dir.path());

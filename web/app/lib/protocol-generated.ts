@@ -241,6 +241,11 @@ outputs?: Record<string, unknown>,
  */
 state?: Record<string, unknown>,
 /**
+ * Model passed to each model-capable role at admission. Null means
+ * the backend chose its default without reporting a model ID.
+ */
+role_models?: Record<string, string | null>,
+/**
  * The last mutation asked of the run, and how it went.
  */
 mutation?: MutationRecord, };

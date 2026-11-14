@@ -581,6 +581,13 @@ pub fn fresh_conversation_backends() -> Vec<&'static str> {
         .collect()
 }
 
+/// Some backends resolve a default inside OMAR; CLI-managed defaults may be unknown.
+pub fn resolved_model(kind: Kind, explicit: Option<&str>) -> Option<String> {
+    explicit
+        .map(str::to_owned)
+        .or_else(|| (kind == Kind::Jev).then(jev::default_model))
+}
+
 /// The backends an agent may give a model, as an error lists them.
 pub fn model_backends() -> Vec<&'static str> {
     ALL.iter()

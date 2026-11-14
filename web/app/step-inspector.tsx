@@ -8,7 +8,9 @@ import { componentName } from "./diagram/diagram-canvas";
 import { WorkflowIcon } from "./workflow-icon";
 
 /** Details come from the compiled topology, never from prototype sample data. */
-export function StepInspector({ component, snapshot, source, editable, readOnly = false, onApply, onClose, onEdit, onAsk }: {
+export function StepInspector({ component, snapshot, source, modelCatalog, runModels, editable, readOnly = false, onApply, onClose, onEdit, onAsk }: {
+  modelCatalog: Record<string, string[]>;
+  runModels?: Record<string, string | null>;
   source: string;
   editable: boolean;
   /** Details only: nothing here may lead to a change. */
@@ -27,6 +29,9 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
   const configuration = useMemo(() => reaction ? locateStep(source, snapshot, reaction) : null, [source, snapshot, reaction]);
   const name = reaction ? (/(?:^|\.)reaction\.\d+$/.test(reaction.name) ? agent?.name ?? reaction.name : reaction.name) : port?.name ?? timer?.name ?? component;
   const label = (id: string) => snapshot.ports.find((item) => item.id === id)?.name ?? (snapshot.timers ?? []).find((item) => item.id === id)?.name ?? componentName(id);
+  const sameTeam = new Set(snapshot.instances.filter(instance => instance.team === configuration?.team).map(instance => instance.id.replace(/^instance::/, "")));
+  const sharedRoles = new Set(snapshot.agents.filter(item => sameTeam.has(item.instance) && item.name.split(".").at(-1) === configuration?.role).map(item => item.id));
+  const affected = snapshot.reactions.filter(item => sharedRoles.has(item.agent)).map(item => item.name);
   const connectionNames = (ids: string[]) => ids.length ? ids.map((id) => <span className="step-connection" key={id}><i />{label(id)}</span>) : <span className="step-empty">None declared</span>;
 
   return (
@@ -44,7 +49,8 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
         <div className="inspector-field"><span>Produces</span>{connectionNames(reaction.effects)}</div>
         </> : null}
         {agent?.lifetime ? <div className="inspector-field"><span>Conversation</span><strong>{`New ${lifetimeLabel(agent.lifetime)}`}</strong>{agent.attempts.filter((item) => (item.invocations as { reaction?: unknown }[] | undefined)?.some((served) => served.reaction === reaction.name)).map((item) => <pre className="step-contract" key={String(item.attempt_id)}>{`attempt ${String(item.attempt_id)}\nsession ${String(item.native_session_id)}\n${String(item.outcome)}, worker ${String(item.cleanup_status)}`}</pre>)}</div> : null}
-        {configuration ? <StepEditor key={`${component}:${source}`} source={source} step={configuration} enabled={editable} readOnly={readOnly} onApply={onApply} ports={snapshot.ports.filter((item) => item.instance === reaction.instance && item.kind !== "output").map((item) => item.name.startsWith(`${reaction.instance}.`) ? item.name.slice(reaction.instance.length + 1) : item.name)} /> : <p className="step-empty">Use the source editor for this step’s configuration.</p>}
+        {agent && runModels && Object.hasOwn(runModels, agent.name) ? <p className="inspector-field">Model at run start: {runModels[agent.name] ?? "Backend default (ID unreported)"}</p> : null}
+        {configuration ? <StepEditor key={`${component}:${source}`} source={source} modelCatalog={modelCatalog} affected={affected} step={configuration} enabled={editable} readOnly={readOnly} onApply={onApply} ports={snapshot.ports.filter((item) => item.instance === reaction.instance && item.kind !== "output").map((item) => item.name.startsWith(`${reaction.instance}.`) ? item.name.slice(reaction.instance.length + 1) : item.name)} /> : <p className="step-empty">Use the source editor for this step’s configuration.</p>}
         {readOnly ? null : <>
         <button type="button" className="step-edit" onClick={onEdit}>Edit prompt & backend in source <WorkflowIcon name="arrow" size={14} /></button>
         <button type="button" className="step-ask" onClick={() => onAsk(`Update the prompt or execution backend for ${component}: `)}>Edit with OMAR</button>
@@ -60,10 +66,13 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
   );
 }
 
-function StepEditor({ source, step, ports, enabled, readOnly, onApply }: {
+function StepEditor({ source, step, ports, modelCatalog, affected, enabled, readOnly, onApply }: {
+  modelCatalog: Record<string, string[]>; affected: string[];
   source: string; step: StepSource; ports: string[]; enabled: boolean; readOnly: boolean; onApply: (source: string) => Promise<void>;
 }) {
   const [backend, setBackend] = useState(step.backend);
+  const [model, setModel] = useState(step.model);
+  const options = modelCatalog[backend.toLowerCase()];
   const [prompt, setPrompt] = useState(step.prompt);
   const [contract, setContract] = useState(step.contract);
   const [triggers, setTriggers] = useState(step.triggers);
@@ -72,11 +81,11 @@ function StepEditor({ source, step, ports, enabled, readOnly, onApply }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
-  const changed = backend !== step.backend || prompt !== step.prompt || contract !== step.contract || triggers.join(",") !== step.triggers.join(",");
+  const changed = model !== step.model || backend !== step.backend || prompt !== step.prompt || contract !== step.contract || triggers.join(",") !== step.triggers.join(",");
   const backends = Array.from(new Set([step.backend, "ClaudeCode", "Codex", "Cursor", "OpenCode", "Pi", "Agy", "Web"]));
   async function apply() {
     setBusy(true); setError(""); setSaved(false);
-    try { await onApply(replaceStep(source, step, { backend, prompt, triggers, contract })); setSaved(true); }
+    try { await onApply(replaceStep(source, step, { backend, model, prompt, triggers, contract })); setSaved(true); }
     catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setBusy(false); }
   }
@@ -85,8 +94,16 @@ function StepEditor({ source, step, ports, enabled, readOnly, onApply }: {
     {readOnly ? null : <p className="step-edit-note">Changes update the {step.team} definition and all its instances. The workflow still requires confirmation before running.</p>}
     {!enabled && !readOnly ? <p role="status">Configuration is read-only while the workflow is running or the runtime is unavailable.</p> : null}
     <fieldset disabled={!enabled || busy}>
-      <label className="inspector-field"><span>Execution agent</span><select aria-label="Step execution agent" value={backend} onChange={(event) => setBackend(event.target.value)}>{backends.map((value) => <option key={value} value={value}>{value === "ClaudeCode" ? "Claude Code" : value === "OpenCode" ? "opencode" : value === "Pi" ? "pi" : value === "Agy" ? "agy" : value}</option>)}</select></label>
-      <p className="step-edit-note">Uses the model configured for this agent.</p>
+      <label className="inspector-field"><span>Execution agent</span><select aria-label="Step execution agent" value={backend} onChange={(event) => { setBackend(event.target.value); setModel(""); }}>{backends.map((value) => <option key={value} value={value}>{value === "ClaudeCode" ? "Claude Code" : value === "OpenCode" ? "opencode" : value === "Pi" ? "pi" : value === "Agy" ? "agy" : value}</option>)}</select></label>
+      {options ? <>
+        <label className="inspector-field"><span>Model for {step.role}</span><select aria-label="Role model" value={model} onChange={event => setModel(event.target.value)}>
+          <option value="">Backend default</option>
+          {model && !options.includes(model) ? <option value={model}>{model} (saved)</option> : null}
+          {options.map(id => <option key={id} value={id}>{id}</option>)}
+        </select></label>
+        <p className="step-edit-note">Applies to {affected.length} {affected.length === 1 ? "step" : "steps"}: {affected.join(", ")}.</p>
+        {!options.length ? <p className="step-edit-note">To enable model choices, list the model IDs for this backend under [agent.models] in the local OMAR configuration and restart the runtime.</p> : null}
+      </> : null}
       <label className="inspector-field"><span>Prompt</span><textarea aria-label="Step prompt" rows={7} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
       <label className="inspector-field"><span>Output connection / contract</span><input aria-label="Step output contract" value={contract} onChange={(event) => setContract(event.target.value)} /></label>
       <div className="inspector-field"><span>Input connections</span>{triggers.length ? triggers.map((name) => <div className="step-input-row" key={name}><span>{name}</span><button type="button" aria-label={`Remove input ${name}`} onClick={() => setTriggers((current) => current.filter((item) => item !== name))}>×</button></div>) : <small>No inputs selected</small>}</div>

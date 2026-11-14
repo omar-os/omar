@@ -103,6 +103,7 @@ export const ASSISTANT = "\u0000assistant";
 
 /** What the assistant runs on, and what else it could run on. */
 export type AgentBackends = {
+  models: Record<string, string[]>;
   backend: string | null;
   available: string[];
   /** Whether a run that says nothing runs its teams in sandboxes. */
@@ -121,6 +122,7 @@ export async function fetchBackends(serveUrl: string): Promise<AgentBackends> {
   return {
     backend: typeof body.backend === "string" ? body.backend : null,
     available: Array.isArray(body.available) ? body.available : [],
+    models: body.models ?? {},
     sandboxDefault: body.sandbox?.default === true,
     sandboxInstalled: body.sandbox?.installed === true,
   };
