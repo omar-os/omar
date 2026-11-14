@@ -310,6 +310,17 @@ pub(crate) fn materialize_opencode_coordination_plugin(
     Some(format!("file://{encoded}"))
 }
 
+/// Nobody answers a permission prompt in a worker, so no rule may be left at
+/// opencode's `ask` default: `external_directory` (paths outside the
+/// workspace) and `read` of `*.env` files. `doom_loop` is denied, not asked.
+fn permission_rules() -> serde_json::Value {
+    serde_json::json!({
+        "doom_loop": "deny",
+        "external_directory": "allow",
+        "read": "allow"
+    })
+}
+
 pub(crate) fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
     let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
@@ -342,9 +353,7 @@ pub(crate) fn opencode_config_env(context: &McpLaunchContext) -> Option<String> 
             }
         },
         "tools": tools,
-        "permission": {
-            "doom_loop": "deny"
-        }
+        "permission": permission_rules()
     });
     if let Some(plugin) = materialize_opencode_coordination_plugin(context) {
         config["plugin"] = serde_json::json!([plugin]);
@@ -783,6 +792,18 @@ mod tests {
         let reply = http_json(port, "GET", "/session/id", None);
         server.join().unwrap();
         assert_eq!(reply.unwrap(), (200, "{}".into()));
+    }
+
+    #[test]
+    fn config_never_leaves_a_blocking_permission_at_ask() {
+        let rules = permission_rules();
+        assert_eq!(rules["external_directory"], "allow");
+        assert_eq!(rules["read"], "allow");
+        assert!(rules
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|action| action != "ask"));
     }
 
     #[test]

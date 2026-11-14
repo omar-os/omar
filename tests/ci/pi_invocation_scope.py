@@ -103,10 +103,10 @@ class Responses(BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers.get('content-length', '0'))))
         requests.append(request)
-        # Pi names OMAR's tools as its extension does: `omar_` and the MCP
-        # name, itself `omar_set_port` and so on.
-        tools = {t['name'].removeprefix('omar_'): t['name'] for t in request.get('tools', [])
-                 if t.get('name', '').startswith('omar_')}
+        # Pi offers OMAR's tools under the names OMAR's prompts use
+        # (`omar_set_port`), as its extension adds `omar_` to the bare MCP name.
+        tools = {'omar_' + t['name'].removeprefix('omar_').removeprefix('omar_'): t['name']
+                 for t in request.get('tools', []) if t.get('name', '').startswith('omar_')}
         calls = [(kind, tools[name], args) for kind, name, args in turn(request)]
         n = len(requests)
         if calls:
