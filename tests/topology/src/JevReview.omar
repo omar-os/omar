@@ -113,15 +113,19 @@ team Resolve {
 }
 
 team Next {
+    // One input per source: a port takes one incoming connection.
     input approved : string
+    input resolved_approved : string
+    input invalid : string
     input rejected : string
+    input resolved_rejected : string
     input unresolved : string
     output continued : string
     output repair : string
     output blocked : string
-    reaction(approved, rejected, unresolved) -> (continued | repair | blocked) {=
-        if let Some(value) = approved { continued = Some(value); }
-        else if let Some(value) = rejected { repair = Some(value); }
+    reaction(approved, resolved_approved, invalid, rejected, resolved_rejected, unresolved) -> (continued | repair | blocked) {=
+        if let Some(value) = approved.or(resolved_approved) { continued = Some(value); }
+        else if let Some(value) = invalid.or(rejected).or(resolved_rejected) { repair = Some(value); }
         else { blocked = unresolved; }
     =}
 }
@@ -134,7 +138,7 @@ main JevReview {
     resolved = Resolve()
     next = Next()
     checks.valid -> review.request
-    checks.invalid -> next.rejected
+    checks.invalid -> next.invalid
     review.out -> decider.decision
     review.evidence -> decider.evidence
     decider.needs_review -> reasoning.request
@@ -143,7 +147,7 @@ main JevReview {
     reasoning.reason -> resolved.reason
     decider.proceed -> next.approved
     decider.stop -> next.rejected
-    resolved.proceed -> next.approved
-    resolved.stop -> next.rejected
+    resolved.proceed -> next.resolved_approved
+    resolved.stop -> next.resolved_rejected
     resolved.blocked -> next.unresolved
 }

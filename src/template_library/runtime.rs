@@ -49,16 +49,16 @@ impl Run {
         }
         Ok(())
     }
-    pub fn command(&self, backend: &str) -> Result<String> {
+    pub fn command(expected_backend: &str, backend: &str) -> Result<String> {
         ensure!(
             crate::backend::resolve(backend)
                 .map_err(anyhow::Error::msg)?
                 .kind()
                 .name()
-                == self.backend,
+                == expected_backend,
             "template backend changed"
         );
-        Ok(match self.backend.as_str() {
+        Ok(match expected_backend {
             "codex" => "codex --sandbox read-only --ignore-user-config --disable shell_tool --disable multi_agent -c mcp_servers.omar.tools.omar_set_port.approval_mode='\"approve\"' -c mcp_servers.omar.tools.omar_complete.approval_mode='\"approve\"' -c web_search='\"disabled\"' --model gpt-6.1-sol -c model_reasoning_effort='\"high\"'",
             "claude" => "claude --tools '' --strict-mcp-config --disable-slash-commands --model claude-sonnet-5-5 --effort high",
             _ => anyhow::bail!("Web templates do not launch a native command"),

@@ -311,11 +311,10 @@ def check_leaves():
         client.settimeout(3)
         client.connect(stamp.split("=pi:", 1)[1])
         client.sendall(b'{"session":true}\n')
-        native = json.loads(client.makefile().readline())["session"]
-    assert Path(native).is_file(), native
-    saved = Path(native).read_text()
-    assert sentinel in saved and draft not in saved, saved
-    print("PASS: idle Pi receives an OMAR event without submitting its draft; native session is persisted", flush=True)
+        native = json.loads(client.makefile().readline())
+    # Workers run with --no-session, so Pi keeps no session file to list or resume.
+    assert "session" not in native, native
+    print("PASS: idle Pi receives an OMAR event without submitting its draft; worker session is not persisted", flush=True)
 
 
 try:
