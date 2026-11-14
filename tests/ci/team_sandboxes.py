@@ -179,8 +179,19 @@ total = Some(self.count);
                  {"op": "declare_instance", "name": "c", "team": "Writer", "parent": ""},
                  {"op": "spawn_agent", "instance": "c", "name": "c.agent", "backend": "codex"},
                  {"op": "commit_plan"}]
+        web_check = [
+            {"op": "begin_plan", "team": "SandboxWebCheck"},
+            {"op": "spawn_agent", "name": "panel", "backend": "Web"},
+            {"op": "define_port", "kind": "input", "name": "topic", "type": "string"},
+            {"op": "define_port", "kind": "output", "name": "answer", "type": "string"},
+            {"op": "install_reaction", "id": "panel.answer", "agent": "panel",
+             "triggers": ["topic"], "effects": ["answer"], "contract": "answer",
+             "prompt": "Answer the topic.", "check": "true"},
+            {"op": "commit_plan"},
+        ]
         for name, team, plan in [("program", "SandboxTeams", instructions), ("ticker", "SandboxTicker", ticker),
-                                 ("claude", "SandboxClaude", claude), ("codex", "SandboxCodex", codex)]:
+                                 ("claude", "SandboxClaude", claude), ("codex", "SandboxCodex", codex),
+                                 ("web_check", "SandboxWebCheck", web_check)]:
             (root / (name + ".json")).write_text(json.dumps(dict(version=1, team=team, instructions=plan)))
             (source / (name + ".omar")).write_text("// Compiler-fixture input\n")
         program, ticker_program = source / "program.omar", source / "ticker.omar"
@@ -309,6 +320,12 @@ total = Some(self.count);
             fault()
             assert refused.returncode != 0, refused
             assert record()["sessions_cleaned"], record()
+            # Web checks must never fall back to running on the host.
+            before = len(entries())
+            refused = omar("run", str(source / "web_check.omar"), "--sandbox-template", TEMPLATE, "--fg")
+            assert refused.returncode != 0, refused
+            assert "task 'panel.answer' has a `check` on a Web agent, which does not run in a sandbox yet; run with --no-sandbox" in refused.stdout + refused.stderr, refused
+            assert not [e for e in entries(before) if e[0] == "create"], entries(before)
             # Invalid pin fails before another create.
             before = calls.read_text()
             refused = omar("run", str(program), "--sandbox-template", "test:latest", "--fg")

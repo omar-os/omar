@@ -1708,18 +1708,19 @@ impl InvocationRegistry {
                 if let Some(sink) = self.on_check.get() {
                     sink(&reaction, task_id, &run);
                 }
-                checking.store(false, Ordering::Release);
                 let mut entries = self
                     .entries
                     .lock()
                     .map_err(|_| anyhow::anyhow!("invocation registry lock poisoned"))?;
-                let invocation = entries
-                    .get_mut(&task_id)
-                    .context("invocation is no longer active")?;
-                if run.passed() {
-                    return release(invocation);
-                }
-                bail!("{}", refusal(&run))
+                let result = match entries.get_mut(&task_id) {
+                    Some(invocation) if run.passed() => release(invocation),
+                    Some(_) => Err(anyhow::anyhow!("{}", refusal(&run))),
+                    None => Err(anyhow::anyhow!("invocation is no longer active")),
+                };
+                // Freeze writes until the result is committed under the lock.
+                // Also wake remove() if it cancelled this invocation meanwhile.
+                checking.store(false, Ordering::Release);
+                result
             }
         }
     }
@@ -3431,6 +3432,18 @@ fn launch(
     config: TopologyRunConfig<'_>,
     resume: Option<ResumePlan>,
 ) -> Result<RunOutcome> {
+    if config.sandbox_template.is_some() {
+        for (id, reaction) in &state.reactions {
+            if reaction.check.is_some()
+                && state
+                    .agents
+                    .get(&reaction.agent)
+                    .is_some_and(|agent| is_web_backend(&agent.backend))
+            {
+                bail!("task '{}' has a `check` on a Web agent, which does not run in a sandbox yet; run with --no-sandbox", id);
+            }
+        }
+    }
     let state = state.clone();
     let runtime_dir = deploy::dir_for(config.omar_dir, config.ea_id, &state.team);
     fs::create_dir_all(&runtime_dir)?;
@@ -10089,6 +10102,39 @@ mod tests {
     }
 
     #[test]
+    fn check_writes_stay_frozen_if_committing_cannot_acquire_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InvocationRegistry::default();
+        let (completion, _) = checked(&registry, "true", dir.path(), Duration::from_secs(30));
+        set_answer(&registry, "checked").unwrap();
+        let checking = registry.entries.lock().unwrap()[&21].checking.clone();
+        // Poison the mutex after the shell passes, exactly where completion
+        // must re-acquire it. No timing or competing lock acquisition needed.
+        let entries = registry.entries.clone();
+        let registry = InvocationRegistry {
+            entries,
+            ..Default::default()
+        };
+        let poison = registry.entries.clone();
+        registry.set_check_sink(Box::new(move |_, _, _| {
+            let poison = poison.clone();
+            assert!(thread::spawn(move || {
+                let _guard = poison.lock().unwrap();
+                panic!("prevent check commit");
+            })
+            .join()
+            .is_err());
+        }));
+        let error = complete(&registry).unwrap_err().to_string();
+        assert!(error.contains("registry lock poisoned"), "{error}");
+        assert!(
+            checking.load(Ordering::Acquire),
+            "writes thawed before commit"
+        );
+        assert!(completion.try_recv().is_err());
+    }
+
+    #[test]
     fn a_check_running_at_the_deadline_is_killed_and_refuses() {
         let dir = tempfile::tempdir().unwrap();
         let registry = InvocationRegistry::default();
@@ -10178,6 +10224,39 @@ mod tests {
         };
         let state = verify(&task("panel", "Web", r#""prompt":"p""#, "true")).unwrap();
         assert_eq!(state.reactions["reaction.0"].check.as_deref(), Some("true"));
+        // An invalid runtime root proves refusal happens before launch can
+        // write anything or create a sandbox; no external tools are invoked.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-a-directory");
+        fs::write(&root, "occupied").unwrap();
+        let bytecode = task("panel", "Web", r#""prompt":"p""#, "true");
+        let error = launch(
+            &state,
+            &bytecode,
+            TopologyRunConfig {
+                ea_id: 0,
+                omar_dir: &root,
+                generated: dir.path(),
+                base_prefix: "check-test-",
+                health_idle_warning: 15,
+                sandbox_template: Some("unused@sha256:unused"),
+                inputs: &[],
+                replace: false,
+                timeout: Duration::from_secs(1),
+                pace: Pace::Fast,
+                diagram_address: None,
+                diagram_ready: None,
+                panel_ready: None,
+                checkpoint_policy: None,
+                keep_workspaces: false,
+                program_path: None,
+            },
+            None,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(error, "task 'reaction.0' has a `check` on a Web agent, which does not run in a sandbox yet; run with --no-sandbox");
         let error = verify(&task("panel", "Web", r#""prompt":"p""#, "  "))
             .unwrap_err()
             .to_string();
