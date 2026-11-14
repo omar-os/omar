@@ -33,6 +33,10 @@ struct Inbox {
     #[serde(default)]
     completed: Option<String>,
     #[serde(default)]
+    usage_limit: Option<crate::backend::UsageLimit>,
+    #[serde(default)]
+    credit_error: Option<crate::backend::OutOfCredit>,
+    #[serde(default)]
     input: Option<String>,
     #[serde(default)]
     input_answer: Option<String>,
@@ -67,6 +71,7 @@ impl Queue {
             }
         }
         let id = uuid::Uuid::new_v4().to_string();
+        state.usage_limit = None;
         state.pending.push_back(Message {
             id: id.clone(),
             text,
@@ -149,6 +154,12 @@ impl Engine {
             let msg = self.next().await?;
             if msg["id"] == id && msg.get("method").is_none() {
                 if let Some(error) = msg.get("error") {
+                    if let Some(credit) = crate::backend::OutOfCredit::from_error(error) {
+                        return Err(credit.into());
+                    }
+                    if let Some(limit) = crate::backend::UsageLimit::from_error(error) {
+                        return Err(limit.into());
+                    }
                     bail!("{method}: {error}");
                 }
                 return Ok(msg["result"].clone());
@@ -328,7 +339,15 @@ async fn codex_turn(
                 }
             }
             Some("turn.completed") => completed = true,
-            Some("turn.failed" | "error") => bail!("Codex exec turn failed: {event}"),
+            Some("turn.failed" | "error") => {
+                if let Some(credit) = crate::backend::OutOfCredit::from_error(&event) {
+                    return Err(credit.into());
+                }
+                if let Some(limit) = crate::backend::UsageLimit::from_error(&event) {
+                    return Err(limit.into());
+                }
+                bail!("Codex exec turn failed: {event}")
+            }
             _ => {}
         }
     }
@@ -507,6 +526,7 @@ pub async fn run(path: &Path) -> Result<()> {
             // Queued events may contain an older ownership snapshot. Finish with
             // the state read immediately before this native turn.
             let prompt = format!("{instructions}\n\n[{origin}; message {}]\n{}\n\n{live}", message.id, message.text);
+            let turn_result: Result<()> = async {
             if config.backend == "codex" {
                 codex_turn(&config, &context, &queue, &prompt).await?;
             } else if acp {
@@ -529,13 +549,28 @@ pub async fn run(path: &Path) -> Result<()> {
                     }
                     if let Some(text) = event["step_update"]["text_delta"].as_str() { print!("{text}"); std::io::Write::flush(&mut std::io::stdout())?; }
                     if event["event"] == "result" {
+                        if let Some(credit) = crate::backend::OutOfCredit::from_error(&event["result"]) { return Err(credit.into()); }
                         anyhow::ensure!(event["result"]["status"] == "SUCCESS", "Antigravity turn failed: {}", event["result"]);
                         break;
                     }
                 }
             }
+            Ok(())
+            }.await;
+            let mut credit_error = None;
+            let limit = match turn_result {
+                Err(error) if context.topology.is_none() => return Err(error),
+                Err(error) if error.is::<crate::backend::OutOfCredit>() => { credit_error = Some(error.downcast::<crate::backend::OutOfCredit>().unwrap()); None },
+                Ok(()) => None,
+                Err(error) => match error.downcast::<crate::backend::UsageLimit>() {
+                    Ok(limit) => Some(limit),
+                    Err(error) => return Err(error),
+                },
+            };
             println!("\n[OMAR turn complete: {}]", message.id);
             let mut state = queue.state.lock().await;
+            state.credit_error = credit_error;
+            state.usage_limit = limit;
             state.pending.pop_front();
             state.completed = Some(message.id);
             save(&queue.path, &state)?;
@@ -549,6 +584,78 @@ pub async fn run(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unsupervised_limits_preserve_the_failed_message() {
+        for backend in ["cursor", "codex"] {
+            for error in ["Usage limit reached", "insufficient credits"] {
+                let dir = tempfile::tempdir_in("/tmp").unwrap();
+                let context = crate::manager::tests::test_mcp_context(dir.path());
+                assert!(context.topology.is_none());
+                let context_file = dir.path().join("context.json");
+                std::fs::write(&context_file, serde_json::to_vec(&context).unwrap()).unwrap();
+                let prompt_file = dir.path().join("prompt");
+                std::fs::write(&prompt_file, "Handle the operator's task.").unwrap();
+                let peer = dir.path().join("peer.py");
+                std::fs::write(
+                    &peer,
+                    format!(
+                        r#"import json, sys
+error = {{"message": {error:?}}}
+if {backend:?} == "codex":
+    sys.stdin.read()
+    print(json.dumps({{"type":"turn.failed", "error":error}}), flush=True)
+else:
+    for line in sys.stdin:
+        request = json.loads(line)
+        reply = {{"jsonrpc":"2.0", "id":request["id"]}}
+        if request["method"] == "session/prompt": reply["error"] = error
+        else: reply["result"] = {{"sessionId":"test-session"}}
+        print(json.dumps(reply), flush=True)
+"#
+                    ),
+                )
+                .unwrap();
+                let path = dir.path().join("runner.json");
+                let config = Config {
+                    backend: backend.into(),
+                    command: format!("python3 {}", peer.display()),
+                    context_file,
+                    prompt_file,
+                    socket: dir.path().join("runner.sock"),
+                    initial_session: None,
+                };
+                std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+                let inbox = path.with_extension("inbox.json");
+                save(
+                    &inbox,
+                    &Inbox {
+                        pending: VecDeque::from([Message {
+                            id: "operator-task".into(),
+                            text: "Do not lose this task".into(),
+                            operator: true,
+                        }]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let result = tokio::time::timeout(std::time::Duration::from_secs(2), run(&path))
+                    .await
+                    .expect("an unsupervised limit must be reported");
+                let error = result.unwrap_err();
+                assert!(
+                    error.is::<crate::backend::UsageLimit>()
+                        || error.is::<crate::backend::OutOfCredit>(),
+                    "{error:#}"
+                );
+                let state: Inbox = serde_json::from_slice(&std::fs::read(inbox).unwrap()).unwrap();
+                assert_eq!(state.pending.len(), 1);
+                assert_eq!(state.pending[0].id, "operator-task");
+                assert!(state.completed.is_none());
+                assert!(!config.socket.exists());
+            }
+        }
+    }
 
     #[test]
     fn cursor_spinner_prefix_does_not_discard_initialize_reply() {

@@ -40,7 +40,7 @@ export async function startDelivery(path, pi, ctx, turn = {}) {
           if (answered) { turn.inputs.shift(); pending.answer(message.text); }
           socket.end(JSON.stringify({ answered }) + "\n");
         } else if (message.turn === true) {
-          socket.end(JSON.stringify({ ended: turn.idle ? turn.id : null }) + "\n");
+          socket.end(JSON.stringify({ ended: turn.idle && (ctx.isIdle?.() ?? true) ? turn.id : null, error: turn.error, limit_id: turn.limitId }) + "\n");
         } else if (message.session === true) {
           // The file `--session` reopens, and the id, which is all a
           // `--no-session` conversation has.

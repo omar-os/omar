@@ -30,21 +30,23 @@ impl OnError {
     }
 }
 
-// Messages are controlled by the adapter, never copied from provider bodies,
-// curl stderr, request headers, or credentials.
+// Transport messages are controlled by the adapter. Billing errors retain only
+// the provider message, never request headers or curl stderr.
 #[derive(Debug)]
 struct Failure {
     kind: &'static str,
-    message: &'static str,
+    message: String,
     http_status: Option<u16>,
+    resets_at: Option<i64>,
 }
 
 impl Failure {
     fn new(kind: &'static str, message: &'static str) -> Self {
         Self {
             kind,
-            message,
+            message: message.into(),
             http_status: None,
+            resets_at: None,
         }
     }
     fn evidence(&self) -> Value {
@@ -164,6 +166,17 @@ fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>
     });
     let (choice, mut response) = match result {
         Ok(answer) => answer,
+        // OMAR_JEV_ON_ERROR=defer is the operator's answer to provider errors;
+        // only the default `fail` policy waits out limits or fails on credit.
+        Err(error) if on_error == OnError::Fail && error.kind == "out_of_credit" => {
+            return Err(super::OutOfCredit(error.message).into())
+        }
+        Err(error) if on_error == OnError::Fail && error.kind == "rate_limit" => {
+            return Err(super::UsageLimit {
+                resets_at: error.resets_at,
+            }
+            .into())
+        }
         Err(error)
             if *retries < crate::topology::MAX_TASK_RETRIES
                 && matches!(error.kind, "transport" | "service") =>
@@ -217,6 +230,7 @@ fn evaluate(request: &Value, timeout: Duration) -> std::result::Result<Value, Fa
             "5",
             "--max-time",
             &budget.as_secs_f64().to_string(),
+            "--include",
             "--write-out",
             "\n%{http_code}",
             "--config",
@@ -320,7 +334,26 @@ fn decode_http(bytes: &[u8]) -> std::result::Result<Value, Failure> {
         .ok()
         .and_then(|text| text.parse().ok())
         .ok_or_else(|| Failure::new("transport", "HTTP status was not reported"))?;
+    let response = &bytes[..split];
+    let (headers, body) = if response.starts_with(b"HTTP/") {
+        let text = std::str::from_utf8(response).unwrap_or("");
+        text.rsplit_once("\r\n\r\n")
+            .map_or(("", response), |(headers, body)| (headers, body.as_bytes()))
+    } else {
+        ("", response)
+    };
     if !(200..300).contains(&status) {
+        let error: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        if let Some(credit) =
+            super::OutOfCredit::from_error(&json!({"status":status,"error":error}))
+        {
+            return Err(Failure {
+                kind: "out_of_credit",
+                message: credit.0,
+                http_status: Some(status),
+                resets_at: None,
+            });
+        }
         let (kind, message) = match status {
             401 | 403 => ("authentication", "Jev rejected the API credentials"),
             429 => ("rate_limit", "Jev rate limit exceeded"),
@@ -329,11 +362,19 @@ fn decode_http(bytes: &[u8]) -> std::result::Result<Value, Failure> {
         };
         return Err(Failure {
             kind,
-            message,
+            message: message.into(),
             http_status: Some(status),
+            resets_at: headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .and_then(|(_, value)| {
+                    super::UsageLimit::from_error(&json!({"status":429,"retry-after":value.trim()}))
+                })
+                .and_then(|limit| limit.resets_at),
         });
     }
-    serde_json::from_slice(&bytes[..split])
+    serde_json::from_slice(body)
         .map_err(|_| Failure::new("invalid_response", "Jev response is not valid JSON"))
 }
 

@@ -327,6 +327,7 @@ jobs:
           npm install -g opencode-ai@1.18.31
           python3 tests/ci/worker_restart.py
           python3 tests/ci/worker_remind.py
+          python3 tests/ci/worker_limit.py
           # Async questions arrived in Codex 0.167; the rest of CI keeps the pinned 0.154.
           npm install --prefix "$RUNNER_TEMP/codex-async" @openai/codex@0.167.0
           PATH="$RUNNER_TEMP/codex-async/node_modules/.bin:$PATH" python3 tests/ci/worker_remind.py --async-questions

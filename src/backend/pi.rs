@@ -14,6 +14,28 @@ use anyhow::{Context, Result};
 pub struct Pi;
 
 impl Backend for Pi {
+    fn out_of_credit(
+        &self,
+        target: &Target<'_>,
+        _hook_file: &std::path::Path,
+    ) -> Option<super::OutOfCredit> {
+        let socket = target.stamp?.strip_prefix("pi:")?;
+        let value = request(socket, serde_json::json!({"turn": true})).ok()?;
+        super::OutOfCredit::from_error(&value["error"])
+    }
+
+    fn usage_limit(
+        &self,
+        target: &Target<'_>,
+        _hook_file: &std::path::Path,
+    ) -> Option<(String, super::UsageLimit)> {
+        let socket = target.stamp?.strip_prefix("pi:")?;
+        let value = request(socket, serde_json::json!({"turn": true})).ok()?;
+        Some((
+            value["limit_id"].as_str()?.into(),
+            super::UsageLimit::from_error(&value["error"])?,
+        ))
+    }
     fn blocked_input(&self, target: &Target<'_>, _hook_file: &std::path::Path) -> Option<String> {
         let socket = target.stamp?.strip_prefix("pi:")?;
         request(socket, serde_json::json!({"input":true})).ok()?["blocked"]

@@ -67,6 +67,9 @@ pub fn run(context_file: &Path) -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
+    let mut usage_wait = std::env::var("OMAR_STUB_USAGE_WAIT_MILLIS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
     loop {
         for message in crate::backend::spool::drain_spool(Path::new(&spool)) {
             crate::supervision::backend_hook_response(
@@ -74,7 +77,9 @@ pub fn run(context_file: &Path) -> Result<()> {
                 &json!({"hook_event_name":"Busy"}),
                 "stub",
             )?;
-            if message.starts_with("OMAR REMINDER") && !pending.is_empty() {
+            if (message.starts_with("OMAR REMINDER") || message.starts_with("OMAR CONTINUE"))
+                && !pending.is_empty()
+            {
                 if stops == 0 {
                     answer(topology, &pending)?;
                 } else {
@@ -96,6 +101,16 @@ pub fn run(context_file: &Path) -> Result<()> {
                     }
                 }
                 pending = fields;
+                if let Some(millis) = usage_wait.take() {
+                    crate::supervision::backend_hook_response(
+                        &context,
+                        &json!({
+                            "hook_event_name":"UsageLimit", "error":{"type":"usage_limit_reached", "resets_at":chrono::Utc::now().timestamp() + millis.div_ceil(1000) as i64}
+                        }),
+                        "stub",
+                    )?;
+                    continue;
+                }
                 if stops > 0 {
                     stops -= 1;
                     continue;
