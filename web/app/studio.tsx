@@ -934,6 +934,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         conversation_id: conversationIdRef.current ?? undefined,
         keep_workspaces: options.keepWorkspaces,
         checkpoint_period: options.checkpointPeriod,
+        // Said either way: unticked overrides a runtime that defaults on.
+        sandbox: options.sandbox,
+        no_sandbox: !options.sandbox,
       });
       if (scope !== scopeRef.current) return;
       setSnapshot((current) => (current ? { ...current, team: record.team } : current));
@@ -1986,6 +1989,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
 
       {confirming && canConfirm ? (
         <DeployConfirmation
+          serveUrl={serveUrl}
           team={snapshot?.team ?? "this topology"}
           // The background check does not gate this either: the daemon
           // compiles what it is sent and refuses a bad program itself.
