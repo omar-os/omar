@@ -181,6 +181,14 @@ total = Some(self.count);
                                  ("claude", "SandboxClaude", claude), ("codex", "SandboxCodex", codex)]:
             (root / (name + ".json")).write_text(json.dumps(dict(version=1, team=team, instructions=plan)))
             (source / (name + ".omar")).write_text("// Compiler-fixture input\n")
+        # A `per` agent's windows are run by the host: refused in a sandbox.
+        scoped = [{"op": "begin_plan", "team": "SandboxScoped"},
+                  {"op": "declare_instance", "name": "s", "team": "Writer", "parent": ""},
+                  {"op": "spawn_agent", "instance": "s", "name": "s.agent", "backend": "stub",
+                   "lifetime": {"unit": "tag", "count": 1}},
+                  {"op": "commit_plan"}]
+        (root / "scoped.json").write_text(json.dumps(dict(version=2, team="SandboxScoped", instructions=scoped)))
+        (source / "scoped.omar").write_text("// Compiler-fixture input\n")
         program, ticker_program = source / "program.omar", source / "ticker.omar"
         compiler = shims / "omarc"
         # omarc [options] <input> <output>: copy the bytecode named after the input.
@@ -265,6 +273,11 @@ total = Some(self.count);
                 assert len(list((state_root/"workspace-history"/ws/"snapshots").glob("*.json"))) == 2
             # No host compilation of untrusted reaction bodies.
             assert not list(state_root.rglob("src-gen/**/main.rs"))
+            before = len(entries())
+            refused = omar("run", str(source/"scoped.omar"), "--sandbox-template", TEMPLATE, "--fast", "--fg")
+            said = refused.stdout + refused.stderr
+            assert refused.returncode != 0 and "`per` lifetime, which does not run in a sandbox yet" in said, refused
+            assert not [e for e in entries(before) if e[0] == "create"], entries(before)
             # Cleanup failure blocks final and manual snapshots.
             fault(FAIL_STOP=1)
             omar(*args, "--replace")

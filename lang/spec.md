@@ -22,8 +22,9 @@ team        = "team", identifier, [ "(", [ params ], ")" ],
 params      = param, { ",", param } ;
 param       = identifier, ":", type ;
 agents      = agent, { ",", agent } ;
-agent       = identifier, ":", backend ;
+agent       = identifier, ":", backend, [ "per", lifetime ] ;
 backend     = identifier ;
+lifetime    = "task" | "tag" | natural, ( "task" | "tasks" | "tag" | "tags" ) ;
 
 main        = "main", [ identifier ], "{", { instance | wiring }, "}" ;
 wiring      = qualified, "->", qualified, [ "after", delay ] ;
@@ -107,9 +108,155 @@ A parameter is read back in a prompt as `$(idx)`, the same spelling a trigger
 uses.
 
 An agent's backend names what answers its reactions: `Claude` (or
-`ClaudeCode`), `Codex`, `Cursor`, `OpenCode`, `Agy`, `Stub`, or `Web`. The
+`ClaudeCode`), `Codex`, `Cursor`, `OpenCode`, `Pi`, `Agy` (or `Antigravity`),
+`Jev`, `Stub`, or `Web`. The
 compiler takes any identifier here; an unknown one compiles and fails when the
-runtime tries to start it. Case does not matter.
+runtime tries to start it, unless the agent has a lifetime (below). Case
+does not matter.
+
+An agent may name its lifetime with `per`: `reviewer: Codex per task` starts a
+fresh conversation for every invocation, `per tag` for each tag in which the
+agent runs, and `per 10 tags` or `per 5 tasks` after that many. Without `per`,
+an agent keeps one conversation for the whole run. Only the conversation is
+reset; the instance's workspace and state remain. A reset happens between
+invocations, never during one, and counts only the tags in which the agent
+itself is invoked, so the activity of other teams does not shorten its
+lifetime. A tag is a timestamp and a microstep, so a loop through `after 0`
+reaches a new tag on every pass.
+
+```omar
+team Foo[coder : Claude, reviewer : Codex per tag]
+{
+    input brief : string
+    action draft : string
+    output report : string
+
+    task coder(brief) -> draft "Draft $(brief) into draft.md."
+    task reviewer(draft) -> report "Review draft.md and report."
+}
+
+main Lead {
+    foo = Foo()
+}
+```
+
+`per task` and `per tag` are `per 1 task` and `per 1 tag`; the count is a
+positive integer (`per 0 tags` is refused) and `task`/`tasks`, `tag`/`tags`
+are interchangeable after any count. The lifetime follows the backend.
+
+A window is one worker and one conversation, serving the invocations of one
+lifetime. The agent's first invocation starts a worker and a new conversation.
+Later invocations that fall in the same window, by the agent's own count of
+tasks or of tags, are delivered to that same worker, still running between
+them. The first invocation outside the window stops the worker and starts the
+next; the stop waits for that invocation, never interrupts one. Two
+invocations of an agent in one tag run one after another, in declaration
+order, so the second finds in the conversation what the first left. A window
+whose tasks are used up (`per task`, or the last of `per 5 tasks`) is stopped
+right after its last invocation, before that invocation's effects are
+released. A run that is paused, stopped, resumed or rolled back ends every
+window: a conversation cannot be rolled back, so a resumed run starts new
+ones. Changing an agent's `per` in a mutation replaces the agent, like a
+change of backend.
+
+Within a window, a task is a message to the same worker as ever. What carries
+over from window to window is what was written down: the workspace is the
+same, so `draft.md` written in one is there in the next. Nothing of an earlier
+window is put in front of a later one: no transcript, no summary.
+
+The runtime makes sure of it rather than assuming it:
+
+- the compiler refuses an agent with a lifetime whose backend cannot promise
+  a fresh conversation, or that it does not know, before it writes any
+  bytecode or mutation plan, and names the backends that can:
+
+  ```text
+  agent 'step' resets its conversation (per tag), but backend 'Web' cannot
+  start a fresh conversation; supported: claude, codex, opencode, pi, jev,
+  stub
+  ```
+
+  The runtime refuses it again before the run starts, so bytecode from
+  anywhere else cannot get one through. `Web` is always refused: its client
+  is no process OMAR starts, so nothing can show its context is new. `Agy`
+  (or `Antigravity`) is refused too: its system prompt points every new
+  conversation at earlier conversations' transcripts, and its Knowledge Items
+  and conversation search reach them, with no switch for any of it, so a new
+  conversation id is not a new context. `Claude`, `Codex`,
+  `OpenCode`, `Pi`, `Stub` and `Jev` can today;
+- the runtime checks the conversation a worker reports before delivering
+  anything to a window's first invocation. Where the backend is told the id of the new conversation to open
+  (`Claude`, by `--session-id`, with auto memory, and the team and subagent
+  memory it gates, off, and org memory off, since all of them outlive the
+  conversation; `Pi`, by `--no-session --session-id`, an
+  in-memory conversation that reads nothing from disk; `OpenCode`, created
+  through its `/api/session`, which needs an opencode that has it, only once
+  the server has no session of that id, and taken only while it holds no
+  message and the server is the worker's own; `Stub`, in its launch context), the worker must report exactly
+  that id. Where the backend mints its own (`Codex`, which takes
+  no id), the id must be non-empty, never reported by an earlier
+  attempt of the deployment (those recorded in `attempts.jsonl` included), and
+  pass whatever proof the backend has that the conversation is new. A `Codex`
+  attempt starts an app-server of its own with memories off, never resumes,
+  and never falls back to the exec runner; its thread must be the server's
+  only loaded one, not forked, no subagent's, hold no message, and be created
+  after the attempt began. `Cursor` and `Antigravity` are refused: each saves
+  earlier conversations' transcripts where a new one finds them, with no
+  switch to stop it;
+- every later invocation in a window is delivered to the same worker, and the
+  conversation it reports, by the same means, must be the one it started with,
+  both before the invocation is delivered and before its writes are released.
+  A worker that moved to another conversation fails the invocation, its writes
+  refused, and the window ends;
+- a worker that cannot be started, or whose conversation fails the check, fails
+  the invocation, and is stopped without being handed it. There is no falling
+  back to a worker that has one;
+- the window's worker is the only caller that may answer its invocations:
+  its calls carry a key that only its own files hold, never recorded, and
+  those files are removed when it stops, so a worker left from an earlier
+  window of the same agent is refused;
+- when a window ends (because an invocation fell outside it, the run ended or
+  its last task was served, or an invocation in it failed or expired), the
+  worker's processes are stopped and seen gone, before the effects of the
+  invocation that ended it are released downstream: its
+  process tree, and whatever it left running outside it, found by the
+  session it was started in and by an `OMAR_ATTEMPT` variable in its
+  environment. macOS hides the environment of its own binaries, the shells
+  among them, so there a process is also found by having its working
+  directory, or a file open, in the instance's workspace, if it started
+  during the attempt and is no process of the runtime's or of another live
+  worker's (their trees and sessions). Not found: a process that starts a
+  session of its own and clears its environment (on macOS: or is one of its
+  binaries) and holds nothing in the workspace when the worker is stopped,
+  say one that writes there later by its full path. If the stop cannot be
+  confirmed in time, or what is left cannot be listed, the invocation fails
+  with the effects withheld. Between invocations in a window the worker is
+  idle, not stopped, and its effects are released as each invocation
+  completes.
+  A worker that exits while idle fails the next invocation in its window (its
+  conversation cannot be checked), and the run; it is not replaced silently.
+
+`Jev` starts no worker and has no conversation, so there is nothing to check
+or stop: every invocation is one request built from that invocation's
+triggers and prompt alone, sent by a process of its own that has exited
+before the answer is used. Its lifetime changes nothing it does, and it
+records no attempts.
+
+Each window is recorded in `attempts.jsonl` in the run's directory, as it
+starts, once its conversation is checked, after each invocation it serves, and
+as it ends; the last line of an `attempt_id` is its record: `run`,
+`logical_agent`, `attempt_id`, `backend`, `native_session_id` (what the worker
+reported, refused or not), `verification` (`chosen` or `reported`, the form of
+the check), `lifetime` (`{"unit": "tag", "count": 1}`), `invocations` (each
+with its `invocation_id`, `reaction` and `tag`), `outcome` (`open`, `completed`,
+`failed` or `refused`) and `cleanup_status`. A minted id that cannot be
+recorded fails the window: the next run's check reads it from there.
+Mission Control draws an agent that resets its conversation with a dashed
+card and its lifetime, and shows a step the windows that served it.
+
+Anything else after `per` is refused: `Claude per`, `Claude per week`,
+`Claude per 5`, `Claude per 0 tasks`, `Claude(scope = invocation)` and
+`Web per tag` do not compile.
 
 An argument is an int or a string literal, and nothing else — there are no
 expressions. `main` may be named or bare; the name identifies the run, and a
@@ -537,6 +684,10 @@ The name says what answers the reaction, not how the bytes get there. `Codex`
 and `ClaudeCode` do not encode their transport either; a `Web` agent's panel may
 reach it however it likes, and changing that must not mean editing the program.
 
+A `Web` agent cannot have a lifetime (§2.1): whatever answers it may
+remember every earlier invocation, and the runtime cannot tell, so the
+compiler refuses `Web per tag`.
+
 Everything after that is unchanged. Its reactions are invoked when their
 triggers are present, their prompts are interpolated the same way, and their
 writes are checked against the same effect contract. A client answering is a
@@ -583,6 +734,8 @@ Executing a plan on a checkpoint:
 - an instance whose team, parent or arguments changed is replaced whole, with
   everything it contains: state from its initial values, a new empty
   workspace;
+- an agent whose backend or `per` lifetime changed is killed and spawned again,
+  so no conversation outlives the lifetime it was started under;
 - a removed port or timer drops its queued events (reported); a removed
   instance's workspace stays reachable from earlier checkpoints;
 - a new timer is armed from the last completed tag: `timer t(1s, …)` first
@@ -607,7 +760,7 @@ BEGIN_PLAN team
 
 DEFINE_TYPE name type [title] [description]
 DECLARE_INSTANCE name team parent
-SPAWN_AGENT name backend
+SPAWN_AGENT name backend [lifetime]
 DEFINE_PORT kind name type [delay]
 DECLARE_TIMER name offset period
 DECLARE_STATE name type initial [agents] [directive]
@@ -662,7 +815,17 @@ op, kind, name, type, delay
 op, source, target, delay
 ```
 
-The port `delay` field is omitted when no fixed delay is declared.
+The port `delay` field is omitted when no fixed delay is declared. An agent's
+`lifetime`, `{"unit": "task" | "tag", "count": N}` (`per tag` is
+`{"unit": "tag", "count": 1}`), is omitted for a whole-run conversation.
+
+A program with an agent lifetime is bytecode version 2; every other program,
+and every plan that produces one, stays version 1, byte for byte. A version 1
+runtime does not know `lifetime` and would read it as absent, keeping the
+conversation the program said to reset; the version is what makes it refuse
+the program instead, whether it arrives compiled or in a checkpoint, whose
+`program.json` is the bytecode. Version 1 bytecode that carries a `lifetime` is
+rejected for the same reason.
 Reaction fields are ordered:
 
 ```text

@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import { locateStep, replaceStep, type StepSource } from "./lib/step-source";
 import type { DiagramSnapshot } from "./lib/protocol";
-import { formatDuration } from "./lib/protocol";
+import { formatDuration, lifetimeLabel } from "./lib/protocol";
 import { componentName } from "./diagram/diagram-canvas";
 import { WorkflowIcon } from "./workflow-icon";
 
@@ -43,6 +43,7 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
         <div className="inspector-field"><span>Receives</span>{connectionNames(reaction.triggers)}</div>
         <div className="inspector-field"><span>Produces</span>{connectionNames(reaction.effects)}</div>
         </> : null}
+        {agent?.lifetime ? <div className="inspector-field"><span>Conversation</span><strong>{`New ${lifetimeLabel(agent.lifetime)}`}</strong>{agent.attempts.filter((item) => (item.invocations as { reaction?: unknown }[] | undefined)?.some((served) => served.reaction === reaction.name)).map((item) => <pre className="step-contract" key={String(item.attempt_id)}>{`attempt ${String(item.attempt_id)}\nsession ${String(item.native_session_id)}\n${String(item.outcome)}, worker ${String(item.cleanup_status)}`}</pre>)}</div> : null}
         {configuration ? <StepEditor key={`${component}:${source}`} source={source} step={configuration} enabled={editable} readOnly={readOnly} onApply={onApply} ports={snapshot.ports.filter((item) => item.instance === reaction.instance && item.kind !== "output").map((item) => item.name.startsWith(`${reaction.instance}.`) ? item.name.slice(reaction.instance.length + 1) : item.name)} /> : <p className="step-empty">Use the source editor for this step’s configuration.</p>}
         {readOnly ? null : <>
         <button type="button" className="step-edit" onClick={onEdit}>Edit prompt & backend in source <WorkflowIcon name="arrow" size={14} /></button>

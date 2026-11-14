@@ -84,6 +84,13 @@ impl Backend for Jev {
     fn topology_only(&self) -> bool {
         true
     }
+    /// There is no conversation to carry over: every invocation is one
+    /// request, built from that invocation's triggers and prompt alone, sent
+    /// by a curl process of its own that is gone before its answer is
+    /// returned, and nothing here outlives the call.
+    fn fresh_conversation(&self) -> bool {
+        true
+    }
     fn invoke_topology(
         &self,
         invocation: &TopologyInvocation<'_>,

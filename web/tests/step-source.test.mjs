@@ -42,3 +42,11 @@ test('unsupported or ambiguous source remains for the source editor', () => {
  assert.equal(locateStep(program, snapshot, {...snapshot.reactions[0], name:'reaction.99'}), null);
  assert.equal(locateStep(program, snapshot, {...snapshot.reactions[0], agent:'agent::unknown'}), null);
 });
+
+test('an agent lifetime is kept when its step backend is edited', () => {
+ const timed = program.replace('planner:Codex', 'planner:Claude per 5 tasks');
+ const step = locateStep(timed, snapshot, snapshot.reactions[0]);
+ assert.equal(step.backend, 'Claude');
+ const changed = replaceStep(timed, step, { backend:'ClaudeCode', prompt:step.prompt, triggers:step.triggers, contract:step.contract });
+ assert.match(changed, /planner:ClaudeCode per 5 tasks/);
+});

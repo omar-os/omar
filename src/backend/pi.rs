@@ -95,13 +95,26 @@ impl Backend for Pi {
         anyhow::ensure!(reply["accepted"] == true, "Pi rejected delivery: {reply}");
         Ok(())
     }
+    /// The session file, which `--session` reopens; with none (a
+    /// `--no-session` launch), the in-memory id it was opened with.
     fn conversation_id(&self, target: &Target<'_>) -> Option<String> {
         let socket = target.stamp?.strip_prefix("pi:")?;
-        request(socket, serde_json::json!({"session": true})).ok()?["session"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
+        reported_conversation(&request(socket, serde_json::json!({"session": true})).ok()?)
     }
+    /// An attempt's launch is `--no-session --session-id <native_session>`:
+    /// an in-memory conversation with that id that reads nothing from disk.
+    /// Pi before 0.80.3 ignores the id under `--no-session` and reports
+    /// another, so the check fails closed.
+    fn fresh_conversation(&self) -> bool {
+        true
+    }
+}
+
+fn reported_conversation(reply: &serde_json::Value) -> Option<String> {
+    [&reply["session"], &reply["id"]]
+        .into_iter()
+        .find_map(|value| value.as_str().filter(|s| !s.is_empty()))
+        .map(str::to_owned)
 }
 
 fn request(socket: &str, body: serde_json::Value) -> Result<serde_json::Value> {
@@ -135,26 +148,37 @@ fn launch_command(launch: &Launch<'_>) -> Result<String> {
     let socket = short_protocol_dir()?.join("pi.sock");
     let binary = omar_server_exe().context("OMAR executable")?;
     let (_, end) = super::executable(launch.base_command).context("Pi executable")?;
+    let words = shlex::split(launch.base_command).unwrap_or_default();
+    let opens_a_session = |word: &String| {
+        matches!(
+            word.as_str(),
+            "--session" | "--resume" | "-r" | "--continue" | "-c"
+        ) || word.starts_with("--session=")
+    };
+    let attempt = context.topology.as_ref().and_then(|t| t.attempt.as_ref());
+    // An attempt's conversation is new and in memory, whatever the operator
+    // keeps: nothing on its line may name another.
+    if let Some(word) = attempt.and_then(|_| {
+        words.iter().find(|word| {
+            opens_a_session(word) || *word == "--fork" || word.starts_with("--session-id")
+        })
+    }) {
+        anyhow::bail!("an agent that resets its conversation (per lifetime) has a command that must not pass {word}");
+    }
     let mut command = format!(
         "{} --approve{}{}",
         &launch.base_command[..end],
-        if super::ephemeral_worker(context) {
-            " --no-session"
-        } else {
-            ""
+        match attempt {
+            Some(attempt) => format!(
+                " --no-session --session-id {}",
+                shell_single_quote(&attempt.native_session)
+            ),
+            None if super::ephemeral_worker(context) => " --no-session".to_string(),
+            None => String::new(),
         },
         &launch.base_command[end..]
     );
-    if !shlex::split(launch.base_command)
-        .unwrap_or_default()
-        .iter()
-        .any(|word| {
-            matches!(
-                word.as_str(),
-                "--session" | "--resume" | "-r" | "--continue" | "-c"
-            ) || word.starts_with("--session=")
-        })
-    {
+    if attempt.is_none() && !words.iter().any(opens_a_session) {
         if let Some(path) =
             super::saved_conversation(context, "pi").filter(|p| std::path::Path::new(p).is_file())
         {
@@ -246,6 +270,9 @@ mod tests {
     use super::*;
     #[test]
     fn pi_launch_materializes_scoped_bridge_and_resumes_only_saved_chat() {
+        // A worker's launch line reads OMAR_PERSIST_WORKER_SESSIONS, which
+        // another test sets under this lock.
+        let _lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let prompt = dir.path().join("prompt.md");
         std::fs::write(&prompt, "hello").unwrap();
@@ -291,6 +318,75 @@ mod tests {
                 .contains("--session")
         );
     }
+    /// An attempt's worker opens an in-memory conversation with the id its
+    /// attempt names, even where workers keep their sessions, and its line
+    /// may name no other.
+    #[test]
+    fn an_attempt_opens_the_conversation_it_names_and_no_other() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = dir.path().join("prompt.md");
+        std::fs::write(&prompt, "hello").unwrap();
+        let mut context = crate::manager::tests::test_mcp_context(dir.path());
+        context.topology = Some(crate::manager::TopologyMcpContext {
+            team: "Scoped".into(),
+            agent: "t.coder".into(),
+            endpoint: "localhost:1".into(),
+            token: "t".into(),
+            attempt: Some(crate::manager::TopologyAttempt {
+                id: "attempt".into(),
+                key: "key".into(),
+                native_session: "11111111-1111-4111-8111-111111111111".into(),
+            }),
+        });
+        std::env::set_var("OMAR_PERSIST_WORKER_SESSIONS", "1");
+        let line = crate::manager::build_agent_command("pi --model m", &prompt, &[], &context);
+        std::env::remove_var("OMAR_PERSIST_WORKER_SESSIONS");
+        assert!(
+            line.contains(
+                "pi --approve --no-session --session-id '11111111-1111-4111-8111-111111111111' --model m"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("--session "), "{line}");
+        for flag in [
+            "-c",
+            "--continue",
+            "--session x",
+            "--session=x",
+            "-r",
+            "--fork x",
+            "--session-id y",
+        ] {
+            let line =
+                crate::manager::build_agent_command(&format!("pi {flag}"), &prompt, &[], &context);
+            assert!(line.starts_with("printf "), "{flag}: {line}");
+            assert!(line.contains("must not pass"), "{flag}: {line}");
+        }
+        assert!(Pi.fresh_conversation());
+    }
+
+    /// The file `--session` reopens wins; a conversation with none is known
+    /// by its id.
+    #[test]
+    fn a_conversation_is_its_file_or_else_its_id() {
+        use serde_json::json;
+        assert_eq!(
+            reported_conversation(&json!({"session": null, "id": "x"})),
+            Some("x".into())
+        );
+        assert_eq!(
+            reported_conversation(&json!({"session": "/f.jsonl", "id": "x"})),
+            Some("/f.jsonl".into())
+        );
+        assert_eq!(
+            reported_conversation(&json!({"session": "", "id": "x"})),
+            Some("x".into())
+        );
+        assert_eq!(reported_conversation(&json!({})), None);
+        assert_eq!(reported_conversation(&json!({"id": ""})), None);
+    }
+
     #[test]
     fn missing_pi_extension_is_retryable_without_terminal_input() {
         let target = Target {

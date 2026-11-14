@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PassThrough } from "node:stream";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import net from "node:net";
 import test from "node:test";
 import extension from "../index.js";
 
@@ -347,6 +349,8 @@ test("reaps an actual child that ignores SIGTERM", { timeout: 5000 }, async (t) 
   assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
 });
 
+// As a `per`-lifetime attempt launches it: an in-memory conversation with
+// the id OMAR chose, which the delivery socket reports.
 test("is runnable by Pi 0.85.1 with the E2E provider loaded before RPC", async (t) => {
   const agentDir = await mkdtemp(join(tmpdir(), "omar-pi-rpc-"));
   t.after(() => rm(agentDir, { recursive: true, force: true }));
@@ -357,15 +361,18 @@ test("is runnable by Pi 0.85.1 with the E2E provider loaded before RPC", async (
   }));
   const fakeOmar = fakeOmarPath;
   await chmod(fakeOmar, 0o755);
+  const sessionId = randomUUID();
+  const socketPath = join(agentDir, "pi.sock");
   const pi = spawn(
     process.env.PI_BINARY || "npx",
     process.env.PI_BINARY
-      ? ["--mode", "rpc", "--no-session", "--offline", "-e", extensionPath]
-      : ["--yes", "--package=@earendil-works/pi-coding-agent@0.85.1", "--", "pi", "--mode", "rpc", "--no-session", "--offline", "-e", extensionPath],
+      ? ["--mode", "rpc", "--no-session", "--session-id", sessionId, "--offline", "-e", extensionPath]
+      : ["--yes", "--package=@earendil-works/pi-coding-agent@0.85.1", "--", "pi", "--mode", "rpc", "--no-session", "--session-id", sessionId, "--offline", "-e", extensionPath],
     {
       env: {
         ...process.env,
         OMAR_BINARY: fakeOmar,
+        OMAR_PI_SOCKET: socketPath,
         PI_CODING_AGENT_DIR: agentDir,
         PI_E2E_BASE_URL: "http://127.0.0.1:9/v1",
       },
@@ -413,6 +420,16 @@ test("is runnable by Pi 0.85.1 with the E2E provider loaded before RPC", async (
   assert.equal(state.data.model.provider, "omar-pi-e2e");
   assert.equal(state.data.model.id, "tree");
   assert.match(output, /OMAR: loaded [1-9][0-9]* MCP tools/);
+  assert.equal(state.data.sessionId, sessionId);
+  const reply = await new Promise((resolvePromise, reject) => {
+    const socket = net.connect(socketPath);
+    let text = "";
+    socket.on("error", reject);
+    socket.on("connect", () => socket.write('{"session":true}\n'));
+    socket.on("data", (chunk) => { text += chunk; });
+    socket.on("end", () => resolvePromise(JSON.parse(text)));
+  });
+  assert.deepEqual(reply, { session: null, id: sessionId });
 });
 
 test("registers and calls the discovered omar_spawn_agent Pi tool", async () => {

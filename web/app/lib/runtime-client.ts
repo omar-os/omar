@@ -1,4 +1,5 @@
 import {
+  DIAGRAM_EVENT_KINDS,
   assertChatMessage,
   assertDiagramSnapshot,
   assertRunRecord,
@@ -805,18 +806,8 @@ export function subscribeToDiagram(
   stream.onopen = () => onConnectionChange(true);
   stream.onerror = () => onConnectionChange(false);
 
-  const kinds: DiagramEvent["kind"][] = [
-    "run_started",
-    "tag_advanced",
-    "reaction_started",
-    "reaction_completed",
-    "run_completed",
-    "run_failed",
-    "run_paused",
-    "run_checkpointed",
-    "clock_started",
-  ];
-  for (const kind of kinds) {
+  // Every kind the protocol names: a missing one is silently never delivered.
+  for (const kind of DIAGRAM_EVENT_KINDS) {
     stream.addEventListener(kind, (raw) => {
       onEvent(JSON.parse((raw as MessageEvent<string>).data) as DiagramEvent);
     });
