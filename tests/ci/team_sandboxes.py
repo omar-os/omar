@@ -322,7 +322,7 @@ total = Some(self.count);
             assert record()["sessions_cleaned"], record()
             # Web checks must never fall back to running on the host.
             before = len(entries())
-            refused = omar("run", str(source / "web_check.omar"), "--sandbox-template", TEMPLATE, "--fg")
+            refused = omar("run", str(source / "web_check.omar"), "--sandbox-template", TEMPLATE, "--input", "topic=go", "--fg")
             assert refused.returncode != 0, refused
             assert "task 'panel.answer' has a `check` on a Web agent, which does not run in a sandbox yet; run with --no-sandbox" in refused.stdout + refused.stderr, refused
             assert not [e for e in entries(before) if e[0] == "create"], entries(before)
