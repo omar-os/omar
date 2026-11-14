@@ -11418,6 +11418,8 @@ mod tests {
                 conversation: String::new(),
                 used,
                 failed: false,
+                turn_file: PathBuf::new(),
+                turn_monitor: None,
                 record: json!({"logical_agent": agent}),
             });
         }
@@ -11746,6 +11748,8 @@ mod tests {
             conversation: String::new(),
             used: Used::first(invocation.tag),
             failed: false,
+            turn_file: PathBuf::new(),
+            turn_monitor: None,
             record: json!({"attempt_id": attempt.id, "outcome": "started"}),
         });
         workers.states.get_mut("coder").unwrap().lifetime = Some(life(LifetimeUnit::Tag, 1));
