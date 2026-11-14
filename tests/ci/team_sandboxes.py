@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import time
@@ -26,6 +27,16 @@ def main():
             path.mkdir()
         (source / "seed.txt").write_text("stays in the operator's directory")
         calls = root / "calls.jsonl"
+        launches = root / "launches.jsonl"
+        real_tmux = shutil.which("tmux")
+        assert real_tmux, "tmux is required"
+        tmux = shims / "tmux"
+        tmux.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+                        "args = sys.argv[1:]\n"
+                        "if 'new-session' in args:\n"
+                        f"    with open({str(launches)!r}, 'a') as f: f.write(json.dumps(args)+'\\n')\n"
+                        f"os.execv({real_tmux!r}, [{real_tmux!r}, *args])\n")
+        tmux.chmod(0o700)
         toggles = root / "toggles.json"
         sbx = root / "sbx"
         sbx.write_text("""#!/usr/bin/env python3
@@ -115,6 +126,9 @@ else: sys.exit(2)
         instructions = [{"op": "begin_plan", "team": "SandboxTeams"}]
         for instance, parent in [("a", ""), ("a.child", "a"), ("b", "")]:
             instructions.append(dict(op="declare_instance", name=instance, team="Writer", parent=parent))
+            if instance == "b":
+                # A sandboxed team's setup runs in its VM, before its agents.
+                instructions[-1]["setup"] = 'echo "$HOME" > setup-home'
             for kind, name, ty in [("input", "tick", "int"), ("output", "out", "string")]:
                 instructions.append(dict(op="define_port", instance=instance, kind=kind,
                                          name=instance+"."+name, type=ty))
@@ -254,6 +268,9 @@ total = Some(self.count);
                 assert not (mounts[0]/"seed.txt").exists()
                 assert not any("workspace-history" in a for a in create)
             assert not (source/"artifact").exists()
+            homes = [(Path(c[-2])/"setup-home", boxes/c[c.index("--name")+1]) for c in creates]
+            homes = [(f.read_text().strip(), str(box)) for f, box in homes if f.exists()]
+            assert len(homes) == 1 and homes[0][0] == homes[0][1], homes
             binary = hashlib.sha256(BIN.read_bytes()).hexdigest()
             for create in creates:
                 assert (boxes/create[create.index("--name")+1]/"worker-sha").read_text() == binary
@@ -265,6 +282,27 @@ total = Some(self.count);
                 assert len(list((state_root/"workspace-history"/ws/"snapshots").glob("*.json"))) == 2
             # No host compilation of untrusted reaction bodies.
             assert not list(state_root.rglob("src-gen/**/main.rs"))
+            # A later VM's failing setup must reach the host with the same
+            # diagnostic as a host setup, before ANY VM launches an agent.
+            fixture = root / "program.json"
+            original = fixture.read_text()
+            failing = json.loads(original)
+            for instruction in failing["instructions"]:
+                if instruction.get("op") == "declare_instance":
+                    instruction["setup"] = ("echo sandbox-setup-tail >&2; exit 7"
+                                            if instruction["name"] == "b" else "echo ready > setup-ready")
+            fixture.write_text(json.dumps(failing))
+            launches.write_text("")
+            refused = omar(*args, "--replace")
+            fixture.write_text(original)
+            assert refused.returncode != 0, refused
+            said = refused.stdout + refused.stderr
+            assert "setup for instance 'b' exited 7" in said and "sandbox-setup-tail" in said, said
+            assert "sandbox control stream closed or truncated" not in said, said
+            assert launches.read_text() == "", "an agent launched before every sandbox setup succeeded"
+            failed_setup = record()
+            assert failed_setup["error"] == "setup for instance 'b' exited 7: echo sandbox-setup-tail >&2; exit 7\nsandbox-setup-tail", failed_setup
+            assert failed_setup["state"] == "FAILED" and failed_setup["sessions_cleaned"], failed_setup
             # Cleanup failure blocks final and manual snapshots.
             fault(FAIL_STOP=1)
             omar(*args, "--replace")

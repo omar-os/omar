@@ -353,7 +353,16 @@ pub fn apply(omar_dir: &Path, ea_id: u32, to: &Bytecode, source: &Path) -> Resul
             "state variable '{name}' has no value after the mutation"
         );
     }
-    let (workspaces, created) = carry_workspaces(omar_dir, ea_id, &manifest, &plan, &to_state)?;
+    let (workspaces, created) = carry_workspaces(
+        omar_dir,
+        ea_id,
+        &manifest,
+        &plan,
+        &to_state,
+        &runtime_dir,
+        std::time::Duration::from_secs(record.timeout_seconds),
+        record.sandbox_template.is_some(),
+    )?;
     let result = (|| -> Result<String> {
         let (existing, _) = store.list()?;
         let new = checkpoint::Manifest {
@@ -411,12 +420,17 @@ pub fn apply(omar_dir: &Path, ea_id: u32, to: &Bytecode, source: &Path) -> Resul
 /// The resume point's files for every instance the new program keeps, and a
 /// new, empty workspace for each it adds or replaces. A removed instance's
 /// workspace is left as it is, still reachable from the checkpoints before.
+/// A new workspace gets its team's `setup`, as a fresh run's would.
+#[allow(clippy::too_many_arguments)]
 fn carry_workspaces(
     omar_dir: &Path,
     ea_id: u32,
     manifest: &checkpoint::Manifest,
     plan: &Bytecode,
     to: &VmState,
+    runtime_dir: &Path,
+    timeout: std::time::Duration,
+    sandboxed: bool,
 ) -> Result<(
     BTreeMap<String, checkpoint::ArtifactRef>,
     Vec<crate::workspace::Workspace>,
@@ -428,6 +442,18 @@ fn carry_workspaces(
             _ => None,
         })
         .collect();
+    // Refuse the whole mutation before creating a workspace or running setup.
+    if sandboxed {
+        for (name, instance) in &to.instances {
+            if instance.setup.is_some()
+                && (declared.contains(name.as_str()) || !manifest.workspaces.contains_key(name))
+            {
+                anyhow::bail!(
+                    "instance '{name}' has a `setup`, which does not run in a sandbox mutation yet"
+                );
+            }
+        }
+    }
     let mut artifacts = BTreeMap::new();
     let mut created = Vec::new();
     let result = (|| -> Result<()> {
@@ -447,11 +473,27 @@ fn carry_workspaces(
             )
             .with_context(|| format!("create a workspace for instance '{instance}'"))?;
             created.push(workspace.clone());
-            let snapshot = workspace
-                .snapshots(omar_dir)?
-                .into_iter()
-                .next()
-                .context("a new workspace has no initial snapshot")?;
+            let setup = to.instances.get(&instance).and_then(|i| i.setup.as_ref());
+            if let Some(command) = setup {
+                crate::setup::run(
+                    &instance,
+                    command,
+                    &workspace.worktree(omar_dir),
+                    &workspace.temp(omar_dir),
+                    timeout,
+                    &runtime_dir.join("setup"),
+                )?;
+            }
+            // What setup wrote is part of the files a resume restores.
+            let snapshot = if setup.is_some() {
+                workspace.snapshot(omar_dir, "setup")?
+            } else {
+                workspace
+                    .snapshots(omar_dir)?
+                    .into_iter()
+                    .next()
+                    .context("a new workspace has no initial snapshot")?
+            };
             artifacts.insert(
                 instance,
                 checkpoint::ArtifactRef {
@@ -475,6 +517,78 @@ fn carry_workspaces(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_mutations_refuse_new_or_replaced_setups_before_creating_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = topology::verify(&relay(2, "go", vec![])).unwrap();
+        state.instances.get_mut("n2").unwrap().setup = Some("echo ran".into());
+        let mut manifest: checkpoint::Manifest = serde_json::from_value(json!({
+            "version": 1, "id": "test", "sequence": 1, "deployment_id": "test",
+            "team": "Relay", "ea_id": 0, "created_at": 0, "trigger": "pause",
+            "policy": {"period_secs": 0}, "pace": "fast", "program_sha256": "",
+            "state_sha256": "", "elapsed_ns": 0, "workspaces": {}, "agents": {}
+        }))
+        .unwrap();
+        let replacement = plan(replace_n2());
+        for replacing in [false, true] {
+            if replacing {
+                manifest.workspaces.insert(
+                    "n2".into(),
+                    checkpoint::ArtifactRef {
+                        workspace_id: "kept".into(),
+                        snapshot_id: "kept".into(),
+                        commit: "kept".into(),
+                    },
+                );
+            }
+            let error = carry_workspaces(
+                dir.path(),
+                0,
+                &manifest,
+                &replacement,
+                &state,
+                &dir.path().join("runtime"),
+                std::time::Duration::from_secs(10),
+                true,
+            )
+            .unwrap_err()
+            .to_string();
+            assert_eq!(
+                error,
+                "instance 'n2' has a `setup`, which does not run in a sandbox mutation yet"
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+        // A retained instance's setup is not rerun and does not block mutation.
+        let kept = plan(vec![]);
+        carry_workspaces(
+            dir.path(),
+            0,
+            &manifest,
+            &kept,
+            &state,
+            &dir.path().join("runtime"),
+            std::time::Duration::from_secs(10),
+            true,
+        )
+        .unwrap();
+        // Host mutations still seed new workspaces.
+        let (artifacts, created) = carry_workspaces(
+            dir.path(),
+            0,
+            &manifest,
+            &replacement,
+            &state,
+            &dir.path().join("runtime"),
+            std::time::Duration::from_secs(10),
+            false,
+        )
+        .unwrap();
+        assert!(artifacts.contains_key("n2"));
+        assert_eq!(created.len(), 2);
+        assert!(dir.path().join("runtime/setup/n2.json").exists());
+    }
 
     /// Two `Node` instances in a relay: what `main { n1 = Node(1) n2 =
     /// Node(2) n1.out -> n2.token }` compiles to, less what these tests do

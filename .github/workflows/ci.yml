@@ -144,6 +144,7 @@ jobs:
           python3 tests/ci/workspace_restore.py
           python3 tests/ci/ea_deletion.py
           python3 tests/ci/team_workspaces.py
+          python3 tests/ci/workspace_setup.py
           python3 tests/ci/team_sandboxes.py
           python3 tests/ci/team_checkpoints.py
           python3 tests/ci/session_upgrade.py

@@ -395,6 +395,15 @@ def rejectionCases : Array (String × String × String) := #[
   ("a parameter named like a state variable",
     "team Wire(n : int) { input src : int output dst : int state n : int = 0 }
      main { w = Wire(1) }", "is also a port, timer or state"),
+  -- A setup is one command that says something.
+  ("an empty setup",
+    wireTeam "setup \"\"", "setup command is empty"),
+  ("a blank setup",
+    wireTeam "setup \"  \"", "setup command is empty"),
+  ("two setups in one team",
+    wireTeam "setup \"a\" setup \"b\"", "more than one setup"),
+  ("a setup that is not a string",
+    wireTeam "setup 1", "expected '->'"),
   -- A context names the agents of its own team that share it.
   ("a context listing an unknown agent",
     contextTeam "context ops(a, ghost)", "lists 'ghost', which is not an agent of team 'T'"),
@@ -752,6 +761,35 @@ def testMutation : IO Unit := do
   IO.println "mutation tests passed"
 
 
+/-- `setup "cmd"` rides on each instance of its team as an optional field of
+    `declare_instance`; a program without one compiles exactly as before, and a
+    changed command replaces the instance the way a changed team does. -/
+def testSetup : IO Unit := do
+  let team (setup : String) :=
+    "team T[agent : Stub] { input a : int output b : int " ++ setup ++
+    " task agent(a) -> b \"go\" } "
+  let source (setup : String) := team setup ++ "main { x = T() y = T() }"
+  match compileSource "S" (source "setup \"sh install.sh --agent codex .\"") with
+  | .ok bytecode =>
+      assertEqual "setup on every instance"
+        ((bytecode.splitOn "\"setup\": \"sh install.sh --agent codex .\"").length - 1) 2
+  | .error message => throw (IO.userError s!"setup: {message}")
+  match compileSource "S" (source "") with
+  | .ok bytecode => assertEqual "no setup, no field" (mentions bytecode "\"setup\"") false
+  | .error message => throw (IO.userError s!"no setup: {message}")
+  -- A nested instance runs its own team's setup, not its parent's.
+  match compileSource "S" ("team Inner { setup \"inner\" } team Outer { setup \"outer\" i = Inner() } main { o = Outer() }") with
+  | .ok bytecode => do
+      assertEqual "outer setup" (mentions bytecode "\"team\": \"Outer\", \"setup\": \"outer\"") true
+      assertEqual "inner setup" (mentions bytecode "\"team\": \"Inner\", \"setup\": \"inner\"") true
+  | .error message => throw (IO.userError s!"nested setup: {message}")
+  let before := source "setup \"one\""
+  let changed ← planOf before (source "setup \"two\"")
+  for expected in ["kill_agent", "remove_instance", "declare_instance", "\"setup\":\"two\""] do
+    unless changed.any (mentions · expected) do
+      throw (IO.userError s!"changed setup: {expected} missing from {changed}")
+  IO.println "setup tests passed"
+
 /-- Contracts are read the way the runtime reads them (`parse_contract`). -/
 def testContracts : IO Unit := do
   let show_ (text : String) : String :=
@@ -869,6 +907,7 @@ def main : IO UInt32 := do
     testContexts
     testPromptExamples
     testShutdown
+    testSetup
     testCodeTerminator
     testExternalSchemas
     testSchemaTypeResolution
