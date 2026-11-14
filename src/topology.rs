@@ -85,6 +85,13 @@ pub enum Instruction {
         initial: Value,
         #[serde(default)]
         instance: String,
+        /// For a `context`: the agents whose tasks are handed it before they
+        /// run and asked to update it after. Empty for plain state.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        agents: Vec<String>,
+        /// How the program says a context should be kept, if it does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directive: Option<String>,
     },
     /// A team parameter and the argument its instantiation bound to it.
     DeclareParam {
@@ -263,6 +270,11 @@ pub struct StateVarState {
     pub initial: Value,
     #[serde(default)]
     pub instance: String,
+    /// A context's sharing agents and directive; see `Instruction::DeclareState`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directive: Option<String>,
 }
 
 /// A team parameter with the argument bound to it, which is constant for the
@@ -805,6 +817,8 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 ty,
                 initial,
                 instance,
+                agents,
+                directive,
             } => {
                 require_identifier("state", name)?;
                 check_instance(&state, "state", name, instance)?;
@@ -820,10 +834,28 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 if !starts_well {
                     bail!("state '{name}' is {ty} but starts as {initial}");
                 }
+                // A context is a note its agents read and rewrite: text, and
+                // shared only by agents of its own instance.
+                if !agents.is_empty() || directive.is_some() {
+                    if ty != "string" {
+                        bail!("context '{name}' is {ty}; a context is a string");
+                    }
+                    if agents.is_empty() {
+                        bail!("context '{name}' lists no agents");
+                    }
+                }
+                for agent in agents {
+                    match state.agents.get(agent) {
+                        Some(spec) if spec.instance == *instance => {}
+                        _ => bail!("context '{name}' lists '{agent}', which is not an agent of its instance"),
+                    }
+                }
                 let var = StateVarState {
                     ty: ty.clone(),
                     initial: initial.clone(),
                     instance: instance.clone(),
+                    agents: agents.clone(),
+                    directive: directive.clone(),
                 };
                 if state.state_vars.insert(name.clone(), var).is_some() {
                     bail!("duplicate state '{name}'");
@@ -921,6 +953,19 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                     .any(|connection| connection.source == *source && connection.target == *target)
                 {
                     bail!("duplicate connection from '{source}' to '{target}'");
+                }
+                // A port holds one value per tag; a second incoming connection
+                // would drop one of the two. omarc rejects it; so does the
+                // runtime, for bytecode that did not come from omarc.
+                if let Some(other) = state
+                    .connections
+                    .iter()
+                    .find(|connection| connection.target == *target)
+                {
+                    bail!(
+                        "port '{target}' already has an incoming connection from '{}'; a port takes one",
+                        other.source
+                    );
                 }
                 state.connections.push(ConnectionState {
                     source: source.clone(),
@@ -1257,7 +1302,7 @@ fn reject_causality_loops(state: &VmState) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct InvocationRecord {
     id: u64,
     team: String,
@@ -1269,6 +1314,16 @@ struct InvocationRecord {
     /// would read it. An agent in a pane is handed both in its prompt; a human
     /// has no pane, so the record is where a panel reads them from.
     trigger_values: BTreeMap<String, Value>,
+    /// Its instance's state as the invocation found it, and each variable's
+    /// type. Every task of an instance may read and write that instance's
+    /// state: its reactions run one at a time in declaration order, so no
+    /// two of them hold it at once.
+    state_values: BTreeMap<String, Value>,
+    state_types: BTreeMap<String, String>,
+    /// The contexts its agent shares, with their directives, and every
+    /// context of the instance; see `InvocationSpec`.
+    contexts: BTreeMap<String, Option<String>>,
+    context_names: BTreeSet<String>,
     prompt: String,
     writes: BTreeMap<String, Value>,
     completed: bool,
@@ -1287,6 +1342,14 @@ struct PendingInvocation {
     prompt: String,
     trigger_values: BTreeMap<String, Value>,
     allowed_effects: BTreeMap<String, String>,
+    /// Its instance's state, which it may also write, and each one's type.
+    #[serde(default)]
+    state: BTreeMap<String, Value>,
+    #[serde(default)]
+    state_types: BTreeMap<String, String>,
+    /// The contexts its agent shares: each one's directive and value.
+    #[serde(default)]
+    contexts: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1296,15 +1359,29 @@ struct SetPortArgs {
     value: Value,
 }
 
+/// A write to the team's state, which is not a port and has its own tool so
+/// an agent never mistakes one for the other.
+#[derive(Debug, Serialize, Deserialize)]
+struct SetStateArgs {
+    task_id: u64,
+    name: String,
+    value: Value,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CompleteArgs {
     task_id: u64,
+    /// Contexts the agent shares and leaves as they were. Every one it shares
+    /// must be set with `omar_set_state` in this invocation or named here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    keep: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum InvocationCommand {
     SetPort(SetPortArgs),
+    SetState(SetStateArgs),
     Complete(CompleteArgs),
     /// What this agent owes right now. An agent in a pane is told; a human has
     /// to be able to ask, because a panel can be opened at any time and a
@@ -1347,13 +1424,7 @@ fn resolve_effect_port<'a>(
     allowed: &'a BTreeMap<String, String>,
     port: &str,
 ) -> Result<(&'a String, &'a String)> {
-    if let Some(entry) = allowed.get_key_value(port) {
-        return Ok(entry);
-    }
-    let mut matches = allowed
-        .iter()
-        .filter(|(name, _)| name.rsplit_once('.').is_some_and(|(_, last)| last == port));
-    if let (Some(entry), None) = (matches.next(), matches.next()) {
+    if let Some(entry) = resolve_name(allowed, port) {
         return Ok(entry);
     }
     let names: Vec<&str> = allowed.keys().map(String::as_str).collect();
@@ -1362,6 +1433,23 @@ fn resolve_effect_port<'a>(
         port,
         names.join(", ")
     )
+}
+
+/// `name` exactly, or the one entry whose last segment it is.
+fn resolve_name<'a>(
+    names: &'a BTreeMap<String, String>,
+    name: &str,
+) -> Option<(&'a String, &'a String)> {
+    if let Some(entry) = names.get_key_value(name) {
+        return Some(entry);
+    }
+    let mut matches = names
+        .iter()
+        .filter(|(full, _)| full.rsplit_once('.').is_some_and(|(_, last)| last == name));
+    match (matches.next(), matches.next()) {
+        (Some(entry), None) => Some(entry),
+        _ => None,
+    }
 }
 
 impl InvocationRegistry {
@@ -1425,6 +1513,12 @@ impl InvocationRegistry {
                 if invocation.record.completed {
                     bail!("invocation '{}' is already complete", invocation.record.id);
                 }
+                if resolve_name(&invocation.record.state_types, &args.port).is_some() {
+                    bail!(
+                        "'{}' is the team's state, not a port; set it with omar_set_state",
+                        args.port
+                    );
+                }
                 let (port, ty) =
                     resolve_effect_port(&invocation.record.allowed_effects, &args.port)?;
                 let (port, ty) = (port.clone(), ty.clone());
@@ -1432,6 +1526,37 @@ impl InvocationRegistry {
                     .with_context(|| format!("invalid value for port '{}'", port))?;
                 invocation.record.writes.insert(port.clone(), args.value);
                 Ok(json!({"status":"buffered","port":port}))
+            }
+            // Any state of the invocation's own instance: its reactions run
+            // one at a time, so no contract needs to say who may write it.
+            InvocationCommand::SetState(args) => {
+                let invocation = entries
+                    .get_mut(&args.task_id)
+                    .with_context(|| format!("unknown task_id {}", args.task_id))?;
+                validate_invocation_owner(team, agent, &invocation.record)?;
+                if invocation.record.completed {
+                    bail!("invocation '{}' is already complete", invocation.record.id);
+                }
+                let state = &invocation.record.state_types;
+                let Some((name, ty)) = resolve_name(state, &args.name) else {
+                    if state.is_empty() {
+                        bail!("this task's team declares no state");
+                    }
+                    let names: Vec<&str> = state.keys().map(String::as_str).collect();
+                    bail!(
+                        "'{}' is not a state of this task's team; its state: {}",
+                        args.name,
+                        names.join(", ")
+                    );
+                };
+                let (name, ty) = (name.clone(), ty.clone());
+                validate_value(&ty, &args.value)
+                    .with_context(|| format!("invalid value for state '{name}'"))?;
+                if invocation.record.context_names.contains(&name) {
+                    check_context_size(&name, &args.value)?;
+                }
+                invocation.record.writes.insert(name.clone(), args.value);
+                Ok(json!({"status":"buffered","state":name}))
             }
             InvocationCommand::Pending => {
                 let pending: Vec<PendingInvocation> = entries
@@ -1448,6 +1573,9 @@ impl InvocationRegistry {
                         prompt: entry.record.prompt.clone(),
                         trigger_values: entry.record.trigger_values.clone(),
                         allowed_effects: entry.record.allowed_effects.clone(),
+                        state: entry.record.state_values.clone(),
+                        state_types: entry.record.state_types.clone(),
+                        contexts: context_view(&entry.record.contexts, &entry.record.state_values),
                     })
                     .collect();
                 Ok(json!({ "pending": pending }))
@@ -1460,13 +1588,24 @@ impl InvocationRegistry {
                 if invocation.record.completed {
                     return Ok(json!({"status":"already_complete"}));
                 }
-                validate_contract(&invocation.record.contract, &invocation.record.writes)
-                    .with_context(|| {
-                        format!(
-                            "reaction '{}' invocation '{}' failed",
-                            invocation.record.reaction, invocation.record.id
-                        )
-                    })?;
+                // Refused rather than failed: the invocation stays open, so
+                // the agent can set or keep what it missed in the same task.
+                check_contexts_kept(&invocation.record, &args.keep)?;
+                // State is the instance's, not the contract's: any task may
+                // leave it as it was or change it.
+                let effects: BTreeMap<_, _> = invocation
+                    .record
+                    .writes
+                    .iter()
+                    .filter(|(name, _)| !invocation.record.state_types.contains_key(*name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                validate_contract(&invocation.record.contract, &effects).with_context(|| {
+                    format!(
+                        "reaction '{}' invocation '{}' failed",
+                        invocation.record.reaction, invocation.record.id
+                    )
+                })?;
                 invocation.record.completed = true;
                 let writes = invocation.record.writes.clone();
                 let completion = invocation
@@ -1615,6 +1754,13 @@ pub(crate) fn mcp_set_port(context: &TopologyMcpContext, arguments: Value) -> Re
     )
 }
 
+pub(crate) fn mcp_set_state(context: &TopologyMcpContext, arguments: Value) -> Result<Value> {
+    send_invocation_command(
+        context,
+        InvocationCommand::SetState(serde_json::from_value(arguments)?),
+    )
+}
+
 pub(crate) fn mcp_complete(context: &TopologyMcpContext, arguments: Value) -> Result<Value> {
     send_invocation_command(
         context,
@@ -1661,6 +1807,18 @@ pub fn panel_pending(access: &PanelAccess, team: &str) -> Result<Vec<Value>> {
     Ok(waiting)
 }
 
+/// What a panel answers with: effect values, state to set, and the contexts
+/// it leaves as they were.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct PanelValues {
+    #[serde(default)]
+    pub values: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub state: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub keep: Vec<String>,
+}
+
 /// Answer one invocation: every value, then complete.
 ///
 /// The whole batch lands as one completion, so a reaction reading several of
@@ -1673,10 +1831,10 @@ pub fn panel_submit(
     team: &str,
     agent: &str,
     task_id: &u64,
-    values: &BTreeMap<String, Value>,
+    answer: &PanelValues,
 ) -> Result<()> {
     let context = panel_context(access, team, agent);
-    for (port, value) in values {
+    for (port, value) in &answer.values {
         send_invocation_command(
             &context,
             InvocationCommand::SetPort(SetPortArgs {
@@ -1686,9 +1844,24 @@ pub fn panel_submit(
             }),
         )?;
     }
+    for (name, value) in &answer.state {
+        send_invocation_command(
+            &context,
+            InvocationCommand::SetState(SetStateArgs {
+                task_id: *task_id,
+                name: name.clone(),
+                value: value.clone(),
+            }),
+        )?;
+    }
+    // Through the same completion as an agent's, so a context the web agent
+    // shares must be set above or kept here.
     send_invocation_command(
         &context,
-        InvocationCommand::Complete(CompleteArgs { task_id: *task_id }),
+        InvocationCommand::Complete(CompleteArgs {
+            task_id: *task_id,
+            keep: answer.keep.clone(),
+        }),
     )?;
     Ok(())
 }
@@ -1949,7 +2122,7 @@ fn validate_contract(contract: &str, writes: &BTreeMap<String, Value>) -> Result
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct InvocationSpec {
     id: u64,
     reaction_id: String,
@@ -1964,8 +2137,16 @@ struct InvocationSpec {
     /// schema said about each.
     types: BTreeMap<String, TypeState>,
     /// Its instance's state variables as they stand, which a code body reads
-    /// as `self`.
+    /// as `self` and a prompt as `$(name)`.
     state_values: BTreeMap<String, Value>,
+    /// Their types, which is what a task's write of one is checked against.
+    state_types: BTreeMap<String, String>,
+    /// The contexts this invocation's agent shares, each with the directive
+    /// the program gave it: handed to the agent ahead of its prompt.
+    contexts: BTreeMap<String, Option<String>>,
+    /// Every context of the instance, shared with this agent or not: a write
+    /// to one is held to `CONTEXT_LIMIT`.
+    context_names: BTreeSet<String>,
     contract: String,
     prompt: String,
     /// What the program allows this invocation, overriding the run-wide
@@ -1999,6 +2180,119 @@ fn expired(invocation: &InvocationSpec, deadline: Duration) -> Result<BTreeMap<S
     }
 }
 
+/// What a prompt's `$(name)` may read: the triggers present, and the
+/// instance's state as the invocation found it. Both are qualified names, and
+/// the compiler keeps them apart.
+fn prompt_values(invocation: &InvocationSpec) -> BTreeMap<String, Value> {
+    invocation
+        .trigger_values
+        .iter()
+        .chain(&invocation.state_values)
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+/// The most a context may hold, in bytes. It is handed whole to every task
+/// that shares it, so it is a note to keep short, not a transcript.
+const CONTEXT_LIMIT: usize = 16 * 1024;
+
+fn check_context_size(name: &str, value: &Value) -> Result<()> {
+    let size = value.as_str().map_or(0, str::len);
+    if size > CONTEXT_LIMIT {
+        bail!(
+            "context '{}' would be {size} bytes, over its {CONTEXT_LIMIT}-byte limit; condense it and set it again",
+            unqualified(name)
+        );
+    }
+    Ok(())
+}
+
+/// A name as the team wrote it, without the instance path before it.
+fn unqualified(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// The contexts an agent shares, as its invocation carries them: each one's
+/// directive (`null` when the program gave none) and what it holds now.
+fn context_view(
+    contexts: &BTreeMap<String, Option<String>>,
+    state: &BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    contexts
+        .iter()
+        .map(|(name, directive)| {
+            let value = state.get(name).cloned().unwrap_or_else(|| json!(""));
+            (
+                name.clone(),
+                json!({"directive": directive, "value": value}),
+            )
+        })
+        .collect()
+}
+
+/// Whether an invocation may complete as far as its contexts go: every
+/// context its agent shares was set in it with `omar_set_state` or is named
+/// in `keep`, and `keep` names nothing else. That is the whole of the
+/// write-back a context asks for, enforced rather than requested.
+fn check_contexts_kept(record: &InvocationRecord, keep: &[String]) -> Result<()> {
+    let shared: BTreeMap<String, String> = record
+        .contexts
+        .keys()
+        .map(|name| (name.clone(), "string".to_string()))
+        .collect();
+    let mut kept = BTreeSet::new();
+    for name in keep {
+        let Some((full, _)) = resolve_name(&shared, name) else {
+            let names: Vec<&str> = record.contexts.keys().map(|n| unqualified(n)).collect();
+            if names.is_empty() {
+                bail!("keep names '{name}', but this task shares no context");
+            }
+            bail!(
+                "keep names '{name}', which is not a context this task shares; it shares: {}",
+                names.join(", ")
+            );
+        };
+        kept.insert(full.clone());
+    }
+    let missing: Vec<&str> = record
+        .contexts
+        .keys()
+        .filter(|name| !record.writes.contains_key(*name) && !kept.contains(*name))
+        .map(|name| unqualified(name))
+        .collect();
+    if !missing.is_empty() {
+        let quoted: Vec<String> = missing.iter().map(|n| format!("\"{n}\"")).collect();
+        let named: Vec<String> = missing.iter().map(|n| format!("`{n}`")).collect();
+        bail!(
+            "not complete: set {} with omar_set_state, or keep {}: omar_complete(task_id, keep: [{}])",
+            named.join(" and "),
+            if missing.len() == 1 { "it" } else { "them" },
+            quoted.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The registry's record of an agent invocation, its prompt rendered.
+fn invocation_record(team: &str, invocation: &InvocationSpec) -> Result<InvocationRecord> {
+    Ok(InvocationRecord {
+        id: invocation.id,
+        team: team.to_string(),
+        agent: invocation.agent.clone(),
+        reaction: invocation.reaction_id.clone(),
+        contract: invocation.contract.clone(),
+        allowed_effects: invocation.allowed_effects.clone(),
+        trigger_values: invocation.trigger_values.clone(),
+        state_values: invocation.state_values.clone(),
+        state_types: invocation.state_types.clone(),
+        contexts: invocation.contexts.clone(),
+        context_names: invocation.context_names.clone(),
+        prompt: render_prompt(&invocation.prompt, &prompt_values(invocation))?,
+        writes: BTreeMap::new(),
+        completed: false,
+    })
+}
+
 struct AgentReactionExecutor {
     client: TmuxClient,
     team: String,
@@ -2013,19 +2307,8 @@ struct AgentReactionExecutor {
 impl ReactionExecutor for AgentReactionExecutor {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
         let task_id = invocation.id;
-        let rendered = render_prompt(&invocation.prompt, &invocation.trigger_values)?;
-        let record = InvocationRecord {
-            id: task_id,
-            team: self.team.clone(),
-            agent: invocation.agent.clone(),
-            reaction: invocation.reaction_id.clone(),
-            contract: invocation.contract.clone(),
-            allowed_effects: invocation.allowed_effects.clone(),
-            trigger_values: invocation.trigger_values.clone(),
-            prompt: rendered.clone(),
-            writes: BTreeMap::new(),
-            completed: false,
-        };
+        let record = invocation_record(&self.team, &invocation)?;
+        let rendered = record.prompt.clone();
         let completion = self.registry.register(record)?;
 
         // A web agent has no pane to deliver to: nothing was spawned for it,
@@ -2101,7 +2384,7 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
             .and_then(|agent| crate::backend::by_name(&agent.backend))
             .filter(|backend| backend.topology_only())
         {
-            let rendered = render_prompt(&invocation.prompt, &invocation.trigger_values)?;
+            let rendered = render_prompt(&invocation.prompt, &prompt_values(&invocation))?;
             let writes = backend.invoke_topology(&crate::backend::TopologyInvocation {
                 effects: &invocation.allowed_effects,
                 triggers: &invocation.trigger_values,
@@ -2154,6 +2437,191 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
     }
 }
 
+/// The host trusts only typed, contract-checked invocation results from the VM.
+struct SandboxExecutor<'a, E> {
+    state: &'a VmState,
+    workers: BTreeMap<String, crate::sandbox::Worker>,
+    workspaces: &'a BTreeMap<String, crate::workspace::Workspace>,
+    root: &'a Path,
+    timeout: Duration,
+    host: E,
+}
+impl<E: ReactionExecutor> ReactionExecutor for SandboxExecutor<'_, E> {
+    fn invoke(&self, mut invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+        let reaction = &self.state.reactions[&invocation.reaction_id];
+        if self.workers.is_empty()
+            || self
+                .state
+                .agents
+                .get(&invocation.agent)
+                .is_some_and(|a| is_web_backend(&a.backend))
+        {
+            return self.host.invoke(invocation);
+        }
+        let workspace = &self.workspaces[&reaction.instance];
+        for (name, value) in &mut invocation.trigger_values {
+            if let Some(port) = self.state.ports.get(name) {
+                crate::sandbox::map_input_paths(value, &port.ty, workspace, self.root)?;
+            }
+        }
+        let worker = self
+            .workers
+            .get(&reaction.instance)
+            .context("missing team sandbox")?;
+        let deadline = invocation.within.unwrap_or(self.timeout);
+        let response = worker.request(
+            serde_json::to_value(&invocation)?,
+            deadline.saturating_add(Duration::from_secs(20)),
+        )?;
+        let writes: BTreeMap<String, Value> = serde_json::from_value(
+            response
+                .get("writes")
+                .context("missing sandbox writes")?
+                .clone(),
+        )?;
+        validate_sandbox_writes(self.state, &invocation, &writes)?;
+        Ok(writes)
+    }
+}
+fn validate_sandbox_writes(
+    state: &VmState,
+    invocation: &InvocationSpec,
+    writes: &BTreeMap<String, Value>,
+) -> Result<()> {
+    let mut effects = BTreeMap::new();
+    for (name, value) in writes {
+        if invocation.state_values.contains_key(name)
+            && state.reactions[&invocation.reaction_id].body.is_some()
+        {
+            validate_value(&state.state_vars[name].ty, value)?;
+        } else {
+            let ty = invocation
+                .allowed_effects
+                .get(name)
+                .context("sandbox wrote outside invocation effects")?;
+            validate_value(ty, value)?;
+            effects.insert(name.clone(), value.clone());
+        }
+    }
+    validate_contract(&invocation.contract, &effects)
+}
+
+/// A worker receives only its team's definitions and initial values. The host
+/// retains routing and other teams' parameters/state, including nested teams.
+fn sandbox_state(state: &VmState, instance: &str) -> VmState {
+    let mut local = state.clone();
+    local.instances.retain(|name, _| name == instance);
+    local
+        .agents
+        .retain(|_, agent| agent.instance == instance && !is_web_backend(&agent.backend));
+    local
+        .reactions
+        .retain(|_, reaction| reaction.instance == instance);
+    let referenced: BTreeSet<_> = local
+        .reactions
+        .values()
+        .flat_map(|reaction| reaction.triggers.iter().chain(&reaction.effects))
+        .cloned()
+        .collect();
+    // Parents may consume child outputs; retain their schemas, not child values.
+    local.ports.retain(|name, _| referenced.contains(name));
+    local.timers.retain(|name, _| referenced.contains(name));
+    local.state_vars.retain(|_, var| var.instance == instance);
+    local.params.retain(|_, param| param.instance == instance);
+    local.connections.clear();
+    local
+}
+
+/// Internal VM-side service. No host paths other than the two mounts are used.
+/// stdout is reserved for bounded protocol frames; backend panes/logs stay in VM.
+pub fn sandbox_worker() -> Result<()> {
+    let mut input = BufReader::new(std::io::stdin());
+    let init: crate::sandbox::Init =
+        serde_json::from_slice(&crate::sandbox::read_frame(&mut input)?)?;
+    anyhow::ensure!(
+        init.protocol == crate::sandbox::PROTOCOL,
+        "sandbox protocol mismatch"
+    );
+    let local_root = dirs::home_dir()
+        .context("sandbox home")?
+        .join(".omar-sandbox");
+    fs::create_dir_all(&local_root)?;
+    let generated = local_root.join("generated");
+    let runtime_dir = local_root.join("runtime");
+    let worktree = init.workspace.worktree(&init.root);
+    let config = TopologyRunConfig {
+        ea_id: 0,
+        omar_dir: &local_root,
+        generated: &generated,
+        base_prefix: "omar-team-",
+        health_idle_warning: 15,
+        sandbox_template: None,
+        inputs: &[],
+        replace: true,
+        timeout: init.timeout,
+        pace: Pace::Fast,
+        diagram_address: None,
+        diagram_ready: None,
+        panel_ready: None,
+        // The host checkpoints and owns the workspace's lifetime.
+        checkpoint_policy: None,
+        keep_workspaces: true,
+        program_path: None,
+    };
+    let server = InvocationServer::start()?;
+    let client = TmuxClient::new("omar-team-");
+    let workspaces = BTreeMap::from([(init.workspace.instance.clone(), init.workspace.clone())]);
+    let mut sessions = BTreeMap::new();
+    let result = (|| -> Result<()> {
+        let code = crate::reaction::build(&init.state, &generated)?
+            .map(|code| code.with_cleanup_directory(local_root.join("reactions")));
+        spawn_topology_agents(
+            &init.state,
+            &client,
+            &runtime_dir,
+            &server,
+            &config,
+            (&workspaces, &init.root),
+            &mut sessions,
+            init.resumed_from.as_ref(),
+        )?;
+        let executor = DispatchExecutor {
+            state: &init.state,
+            code,
+            timeout: init.timeout,
+            workspace_dirs: BTreeMap::from([(
+                init.workspace.instance.clone(),
+                (worktree.clone(), init.workspace.temp(&init.root)),
+            )]),
+            agents: AgentReactionExecutor {
+                client: client.clone(),
+                team: init.state.team.clone(),
+                registry: server.registry.clone(),
+                timeout: init.timeout,
+                web: BTreeSet::new(),
+            },
+        };
+        crate::sandbox::write_frame(
+            &mut std::io::stdout(),
+            &json!({"protocol": crate::sandbox::PROTOCOL}),
+        )?;
+        loop {
+            let bytes = crate::sandbox::read_frame(&mut input)?;
+            let invocation: InvocationSpec = serde_json::from_slice(&bytes)?;
+            let result = executor.invoke(invocation);
+            let reply = match result {
+                Ok(writes) => json!({"protocol": crate::sandbox::PROTOCOL, "writes": writes}),
+                Err(error) => {
+                    json!({"protocol": crate::sandbox::PROTOCOL, "error": format!("{error:#}")})
+                }
+            };
+            crate::sandbox::write_frame(&mut std::io::stdout(), &reply)?;
+        }
+    })();
+    let _ = deploy::teardown_sessions(&client, &sessions, &deploy::logs_dir(&runtime_dir));
+    result
+}
+
 pub struct TopologyRunConfig<'a> {
     pub ea_id: crate::ea::EaId,
     pub omar_dir: &'a Path,
@@ -2161,6 +2629,7 @@ pub struct TopologyRunConfig<'a> {
     pub generated: &'a Path,
     pub base_prefix: &'a str,
     pub health_idle_warning: i64,
+    pub sandbox_template: Option<&'a str>,
     pub inputs: &'a [String],
     pub replace: bool,
     pub timeout: Duration,
@@ -2242,14 +2711,17 @@ fn cleanup_recorded_sessions(
     sessions: &BTreeMap<String, String>,
     dir: &Path,
 ) -> Vec<String> {
+    let guard = match record.lock() {
+        Ok(guard) => guard,
+        Err(_) => return vec!["deployment record lock poisoned".into()],
+    };
+    if !guard.sandboxes.is_empty() {
+        return crate::sandbox::stop_all(&guard.sandboxes);
+    }
     if sessions.is_empty() {
         return Vec::new();
     }
-    let client = record
-        .lock()
-        .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))
-        .and_then(|record| record.session_client());
-    match client {
+    match guard.session_client() {
         Ok(client) => deploy::teardown_sessions(&client, sessions, &deploy::logs_dir(dir)),
         Err(error) => vec![format!("{error:#}")],
     }
@@ -2576,6 +3048,9 @@ struct ResumePlan {
 
 pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunOutcome> {
     let state = verify(bytecode)?;
+    if let Some(template) = config.sandbox_template {
+        crate::sandbox::validate_template(template)?;
+    }
     launch(&state, bytecode, config, None)
 }
 
@@ -2648,9 +3123,17 @@ pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunO
         }
         return Err(error);
     }
-    // The paused run's choice carries over: a resume is the same run.
-    let mut config = config;
-    config.keep_workspaces = record.keep_workspaces;
+    // The paused run's choices carry over: a resume is the same run, so it
+    // gets fresh sandboxes from the template the run pinned, or none.
+    let template = record.sandbox_template.clone();
+    if let Some(template) = &template {
+        crate::sandbox::validate_template(template)?;
+    }
+    let config = TopologyRunConfig {
+        keep_workspaces: record.keep_workspaces,
+        sandbox_template: template.as_deref(),
+        ..config
+    };
     launch(
         &state,
         &bytecode,
@@ -2683,21 +3166,30 @@ fn launch(
                 existing.pid
             );
         }
+        anyhow::ensure!(
+            config.replace || existing.sandboxes.is_empty() || existing.sessions_cleaned,
+            "deployment '{}' has unconfirmed sandbox cleanup; use --replace to clean it up first",
+            state.team
+        );
         if config.replace && !existing.sessions.is_empty() {
             existing.session_client()?;
         }
         if config.replace && !existing.sessions_cleaned {
-            let old_client = existing.session_client()?;
-            for session in existing.sessions.values() {
-                if old_client.has_session_for_cleanup(session)? {
-                    old_client.ensure_session_not_attached(session)?;
+            let failures = if existing.sandboxes.is_empty() {
+                let old_client = existing.session_client()?;
+                for session in existing.sessions.values() {
+                    if old_client.has_session_for_cleanup(session)? {
+                        old_client.ensure_session_not_attached(session)?;
+                    }
                 }
-            }
-            let failures = deploy::teardown_sessions(
-                &old_client,
-                &existing.sessions,
-                &deploy::logs_dir(&runtime_dir),
-            );
+                deploy::teardown_sessions(
+                    &old_client,
+                    &existing.sessions,
+                    &deploy::logs_dir(&runtime_dir),
+                )
+            } else {
+                crate::sandbox::stop_all(&existing.sandboxes)
+            };
             anyhow::ensure!(
                 failures.is_empty(),
                 "cannot replace deployment until old sessions are cleaned up: {}",
@@ -2725,7 +3217,9 @@ fn launch(
     let planned_sessions: BTreeMap<String, String> = state
         .agents
         .iter()
-        .filter(|(_, agent)| needs_agent_process(&agent.backend))
+        .filter(|(_, agent)| {
+            config.sandbox_template.is_none() && needs_agent_process(&agent.backend)
+        })
         .map(|(name, _)| (name.clone(), client.session_for(name)))
         .collect();
     let record = Arc::new(Mutex::new(deploy::DeploymentRecord::create(
@@ -2776,11 +3270,16 @@ fn launch(
         BTreeMap<String, Value>,
         Option<crate::reaction::Reactions>,
         BTreeMap<String, crate::workspace::Workspace>,
+        BTreeMap<String, crate::sandbox::Worker>,
     );
     let prepared = (|| -> Result<Prepared> {
         // Before anything is spawned: compiling the bodies is the step most
         // likely to fail, and it costs nothing to find out first.
-        let reactions = crate::reaction::build(&state, config.generated)?;
+        let reactions = if config.sandbox_template.is_none() {
+            crate::reaction::build(&state, config.generated)?
+        } else {
+            None
+        };
         let deployment_id = record
             .lock()
             .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
@@ -2808,16 +3307,57 @@ fn launch(
             guard.save(&runtime_dir)?;
         }
         let invocation_server = InvocationServer::start()?;
-        spawn_topology_agents(
-            &state,
-            &client,
-            &runtime_dir,
-            &invocation_server,
-            &config,
-            &workspaces,
-            &mut spawned,
-            resumed_from.as_ref(),
-        )?;
+        let mut workers = BTreeMap::new();
+        if let Some(template) = config.sandbox_template {
+            for (instance, workspace) in &workspaces {
+                let name = crate::sandbox::name(workspace);
+                // Persist ownership before create; failures/crashes leave a
+                // cleanup obligation instead of orphaning an unrecorded VM.
+                {
+                    let mut guard = record
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("deployment lock poisoned"))?;
+                    guard.sandboxes.insert(instance.clone(), name.clone());
+                    guard.sandbox_template = Some(template.to_owned());
+                    guard.save(&runtime_dir)?;
+                }
+                crate::sandbox::create(
+                    &name,
+                    template,
+                    &workspace.worktree(config.omar_dir),
+                    &workspace.temp(config.omar_dir),
+                )?;
+                let worker = crate::sandbox::Worker::start(
+                    &name,
+                    &workspace.worktree(config.omar_dir),
+                    &runtime_dir
+                        .join("sandbox-logs")
+                        .join(format!("{}.log", workspace.id)),
+                )?;
+                let init = crate::sandbox::Init {
+                    protocol: crate::sandbox::PROTOCOL,
+                    state: sandbox_state(&state, instance),
+                    workspace: workspace.clone(),
+                    root: config.omar_dir.to_path_buf(),
+                    timeout: config.timeout,
+                    resumed_from: resumed_from.clone(),
+                };
+                worker.request(serde_json::to_value(init)?, Duration::from_secs(180))?;
+                observer.sandbox_started(instance, &name);
+                workers.insert(instance.clone(), worker);
+            }
+        } else {
+            spawn_topology_agents(
+                &state,
+                &client,
+                &runtime_dir,
+                &invocation_server,
+                &config,
+                (&workspaces, config.omar_dir),
+                &mut spawned,
+                resumed_from.as_ref(),
+            )?;
+        }
         // A resumed run's inputs were consumed at its start tag; what it
         // continues with is in the checkpoint's queue.
         let inputs = if start_state.is_some() {
@@ -2825,9 +3365,9 @@ fn launch(
         } else {
             parse_inputs(&state, config.inputs)?
         };
-        Ok((invocation_server, inputs, reactions, workspaces))
+        Ok((invocation_server, inputs, reactions, workspaces, workers))
     })();
-    let (invocation_server, inputs, reactions, workspaces) = match prepared {
+    let (invocation_server, inputs, reactions, workspaces, workers) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             observer.run_failed(&error.to_string());
@@ -2873,6 +3413,14 @@ fn launch(
             web,
         },
     };
+    let executor = SandboxExecutor {
+        state: &state,
+        workspaces: &workspaces,
+        root: config.omar_dir,
+        workers,
+        timeout: config.timeout,
+        host: executor,
+    };
     let checkpointer = match RunCheckpointer::new(
         config.omar_dir,
         &runtime_dir,
@@ -2890,7 +3438,10 @@ fn launch(
             return Err(error);
         }
     };
-    advance_record(&record, &runtime_dir, DeploymentState::Running, None)?;
+    if let Err(error) = advance_record(&record, &runtime_dir, DeploymentState::Running, None) {
+        fail_deployment(&record, &runtime_dir, &spawned, &error);
+        return Err(error);
+    }
     // Flip RUNNING to STOPPING or PAUSING the moment a request lands, even
     // while the loop is blocked mid-tag, so an operator polling status sees
     // it acknowledged.
@@ -2955,17 +3506,24 @@ fn launch(
             return Err(error);
         }
     };
-    write_json_atomic(&runtime_dir.join("state.json"), &state)?;
     let sessions = record
         .lock()
         .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
         .sessions
         .clone();
+    if let Err(error) = write_json_atomic(&runtime_dir.join("state.json"), &state) {
+        fail_deployment(&record, &runtime_dir, &sessions, &error);
+        return Err(error);
+    }
     if let LoopEnd::Paused(paused) = end {
         // The checkpoint is already published. What remains is to leave
         // nothing running: agents are torn down, and the record says the
         // run can continue from where it stands.
-        write_json_atomic(&deploy::outputs_path(&runtime_dir), &paused.outputs)?;
+        if let Err(error) = write_json_atomic(&deploy::outputs_path(&runtime_dir), &paused.outputs)
+        {
+            fail_deployment(&record, &runtime_dir, &sessions, &error);
+            return Err(error);
+        }
         let cleanup_failures = cleanup_recorded_sessions(&record, &sessions, &runtime_dir);
         for failure in &cleanup_failures {
             eprintln!("warning: session not cleaned up: {failure}");
@@ -3021,7 +3579,10 @@ fn launch(
         state_vars,
     } = settled;
     observer.run_completed(&outputs);
-    write_json_atomic(&deploy::outputs_path(&runtime_dir), &outputs)?;
+    if let Err(error) = write_json_atomic(&deploy::outputs_path(&runtime_dir), &outputs) {
+        fail_deployment(&record, &runtime_dir, &sessions, &error);
+        return Err(error);
+    }
     let cleanup_failures = cleanup_recorded_sessions(&record, &sessions, &runtime_dir);
     for failure in &cleanup_failures {
         eprintln!("warning: session not cleaned up: {failure}");
@@ -3115,10 +3676,11 @@ fn spawn_topology_agents(
     runtime_dir: &Path,
     invocation_server: &InvocationServer,
     config: &TopologyRunConfig<'_>,
-    workspaces: &BTreeMap<String, crate::workspace::Workspace>,
+    workspace_access: (&BTreeMap<String, crate::workspace::Workspace>, &Path),
     spawned: &mut BTreeMap<String, String>,
     resumed_from: Option<&checkpoint::Manifest>,
 ) -> Result<()> {
+    let (workspaces, workspace_root) = workspace_access;
     // The line each agent was launched with, which is what says how it
     // proves readiness.
     let mut launched: BTreeMap<String, String> = BTreeMap::new();
@@ -3136,7 +3698,7 @@ fn spawn_topology_agents(
             )
         })
         .unwrap_or_default();
-    let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
+    let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, and omar_set_state for your team's state, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
     for (name, agent) in &state.agents {
         // A web agent is not spawned. There is no command to resolve, no pane
         // to put it in, and no readiness to wait for — the agent exists as a
@@ -3161,8 +3723,8 @@ fn spawn_topology_agents(
         let workspace = workspaces
             .get(&agent.instance)
             .context("agent instance has no workspace")?;
-        let worktree = workspace.worktree(config.omar_dir);
-        let temp = workspace.temp(config.omar_dir);
+        let worktree = workspace.worktree(workspace_root);
+        let temp = workspace.temp(workspace_root);
         let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
         fs::write(&prompt_file, format!("{protocol}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.{resumed}\n", temp.display()))?;
         let backend = canonical_backend(&agent.backend);
@@ -4259,13 +4821,31 @@ fn invocation_spec(
         );
     }
     let types = types_for_effects(state, &effect_names);
-    // Only its own instance's: a body reaches state through `self`.
+    // Only its own instance's: a body reaches state through `self`, a task
+    // through `$(name)` and `omar_set_state`.
+    let state_types = state
+        .state_vars
+        .iter()
+        .filter(|(_, var)| var.instance == reaction.instance)
+        .map(|(name, var)| (name.clone(), var.ty.clone()))
+        .collect();
     let state_values = state
         .state_vars
         .iter()
         .filter(|(_, var)| var.instance == reaction.instance)
         .filter_map(|(name, _)| store.get(name).map(|value| (name.clone(), value.clone())))
         .collect();
+    let instance_contexts = || {
+        state
+            .state_vars
+            .iter()
+            .filter(|(_, var)| var.instance == reaction.instance && !var.agents.is_empty())
+    };
+    let contexts = instance_contexts()
+        .filter(|(_, var)| var.agents.contains(&reaction.agent))
+        .map(|(name, var)| (name.clone(), var.directive.clone()))
+        .collect();
+    let context_names = instance_contexts().map(|(name, _)| name.clone()).collect();
     Ok(InvocationSpec {
         id: next_task_id()?,
         reaction_id: reaction_id.clone(),
@@ -4275,6 +4855,9 @@ fn invocation_spec(
         effect_names,
         types,
         state_values,
+        state_types,
+        contexts,
+        context_names,
         contract: reaction.contract.clone(),
         prompt: reaction.prompt.clone(),
         within: reaction.within.map(Duration::from_nanos),
@@ -4327,8 +4910,34 @@ fn invocation_message(invocation: &InvocationSpec, rendered: &str) -> Result<Str
         described.push('\n');
     }
     header.push_str(&format!("contract: {}\n", invocation.contract));
+    let mut state_note = String::new();
+    // A context this agent shares is set out on its own line, with how to
+    // keep it, and not repeated as state.
+    if !invocation.contexts.is_empty() {
+        header.push_str(&format!(
+            "contexts: {}\n",
+            serde_json::to_string(&context_view(
+                &invocation.contexts,
+                &invocation.state_values
+            ))?
+        ));
+    }
+    let state: BTreeMap<_, _> = invocation
+        .state_values
+        .iter()
+        .filter(|(name, _)| !invocation.contexts.contains_key(*name))
+        .collect();
+    if !state.is_empty() {
+        header.push_str(&format!("state: {}\n", serde_json::to_string(&state)?));
+        state_note = " The state above is your team's, kept between its tasks: change any of it with omar_set_state(task_id, name, value) before omar_complete, if the next task should see something else.".to_string();
+    }
+    let context_note = if invocation.contexts.is_empty() {
+        ""
+    } else {
+        " Each context above is a note your team keeps between its tasks: before omar_complete, set it to its full updated text with omar_set_state, or pass it in omar_complete's keep list if nothing changed."
+    };
     Ok(format!(
-        "{header}\n{described}{rendered}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. Pass the integer task_id above to both tools. For a signal effect, set its value to null. Do not address another agent directly."
+        "{header}\n{described}{rendered}\n\nUse omar_set_port for each effect you choose, then call omar_complete exactly once. Pass the integer task_id above to both tools. For a signal effect, set its value to null.{state_note}{context_note} Do not address another agent directly."
     ))
 }
 
@@ -4520,6 +5129,82 @@ fn canonical_backend(backend: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sandbox_replies_cannot_write_unrelated_ports_or_wrong_types() {
+        let state = hr_state();
+        let reaction = state.reactions.get_key_value("reaction.1").unwrap();
+        let invocation = invocation_spec(
+            &state,
+            reaction,
+            &BTreeMap::from([("triage".into(), json!("ready"))]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(validate_sandbox_writes(
+            &state,
+            &invocation,
+            &BTreeMap::from([("opinion1".into(), json!("ok"))])
+        )
+        .is_ok());
+        assert!(validate_sandbox_writes(
+            &state,
+            &invocation,
+            &BTreeMap::from([("opinion2".into(), json!("other team"))])
+        )
+        .is_err());
+        assert!(validate_sandbox_writes(
+            &state,
+            &invocation,
+            &BTreeMap::from([("opinion1".into(), json!(123))])
+        )
+        .is_err());
+        assert!(validate_sandbox_writes(&state, &invocation, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn sandbox_initialization_does_not_disclose_other_teams_values() {
+        let mut state = hr_state();
+        state.state_vars.insert(
+            "child.secret".into(),
+            StateVarState {
+                ty: "string".into(),
+                initial: json!("private child state"),
+                instance: "child".into(),
+                agents: Vec::new(),
+                directive: None,
+            },
+        );
+        state.params.insert(
+            "child.key".into(),
+            ParamState {
+                ty: "string".into(),
+                value: json!("private child parameter"),
+                instance: "child".into(),
+            },
+        );
+        state.params.insert(
+            "key".into(),
+            ParamState {
+                ty: "string".into(),
+                value: json!("own parameter"),
+                instance: "".into(),
+            },
+        );
+        state.ports.get_mut("opinion1").unwrap().instance = "child".into();
+        let parent = sandbox_state(&state, "");
+        assert!(parent.ports.contains_key("opinion1"));
+        let serialized = serde_json::to_string(&parent).unwrap();
+        assert!(!serialized.contains("private child"));
+        assert!(serialized.contains("own parameter"));
+        assert!(parent.connections.is_empty());
+        assert!(!parent.reactions.is_empty());
+        let child = sandbox_state(&state, "child");
+        assert_eq!(child.state_vars.len(), 1);
+        assert_eq!(child.params.len(), 1);
+        assert!(child.agents.is_empty());
+        assert!(child.reactions.is_empty());
+    }
+
     #[test]
     fn cleanup_refuses_unknown_recorded_tmux_identity() {
         let mut record = crate::deploy::DeploymentRecord::create("test", Default::default(), 10);
@@ -4870,6 +5555,28 @@ mod tests {
     }
 
     #[test]
+    fn a_port_takes_one_incoming_connection() {
+        let mut program = body_with_enum("input", r#"["decision"]"#, r#"["memo"]"#);
+        for (at, extra) in [
+            r#"{"op":"define_port","kind":"input","name":"other","type":"string"}"#,
+            r#"{"op":"connect_ports","source":"token","target":"memo"}"#,
+            r#"{"op":"connect_ports","source":"other","target":"memo"}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            program
+                .instructions
+                .insert(6 + at, serde_json::from_str(extra).unwrap());
+        }
+        let error = verify(&program).unwrap_err().to_string();
+        assert!(
+            error.contains("port 'memo' already has an incoming connection from 'token'"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn rejects_a_duplicate_or_malformed_named_type() {
         for (extra, expected) in [
             (
@@ -4981,6 +5688,9 @@ mod tests {
             ]),
             types: BTreeMap::from([("Decision".to_string(), decision.clone())]),
             state_values: BTreeMap::new(),
+            state_types: BTreeMap::new(),
+            contexts: BTreeMap::new(),
+            context_names: BTreeSet::new(),
             contract: "out".into(),
             prompt: "Decide.".into(),
             within: None,
@@ -5931,6 +6641,7 @@ mod tests {
                 prompt: "decide".into(),
                 writes: BTreeMap::new(),
                 completed: false,
+                ..Default::default()
             })
             .unwrap();
 
@@ -7039,6 +7750,512 @@ mod tests {
         assert!(layer_of("reaction.1") < layer_of("reaction.2"));
     }
 
+    /// Two agents of one instance and the state they share. Each reaction
+    /// triggers on `go` and on `again`, which the first raises once, so the
+    /// run has two tags.
+    fn shared_notes_bytecode() -> Bytecode {
+        serde_json::from_str(
+            r#"{
+              "version": 1,
+              "team": "Shared",
+              "instructions": [
+                {"op":"begin_plan","team":"Shared"},
+                {"op":"declare_instance","name":"t","parent":"","team":"T"},
+                {"op":"spawn_agent","instance":"t","name":"t.a","backend":"stub"},
+                {"op":"spawn_agent","instance":"t","name":"t.b","backend":"stub"},
+                {"op":"define_port","instance":"t","kind":"input","name":"t.go","type":"int"},
+                {"op":"define_port","instance":"t","kind":"action","name":"t.again","type":"int"},
+                {"op":"declare_state","instance":"t","name":"t.notes","type":"string","initial":""},
+                {"op":"install_reaction","instance":"t","id":"t.reaction.0","agent":"t.a",
+                  "triggers":["t.go","t.again"],"effects":["t.again"],
+                  "contract":"t.again ?","prompt":"a reads [$(t.notes)]"},
+                {"op":"install_reaction","instance":"t","id":"t.reaction.1","agent":"t.b",
+                  "triggers":["t.go","t.again"],"effects":[],
+                  "contract":"","prompt":"b reads [$(t.notes)]"},
+                {"op":"commit_plan"}
+              ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// Answers each invocation through the registry, the way an agent in a
+    /// pane does over MCP: it writes the state by its bare name and
+    /// completes. Pauses the run from inside the first invocation when given
+    /// a deployment directory.
+    struct NoteTakers {
+        registry: InvocationRegistry,
+        prompts: Mutex<Vec<String>>,
+        pause: Option<PathBuf>,
+    }
+    impl ReactionExecutor for NoteTakers {
+        fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+            let record = invocation_record("Shared", &invocation)?;
+            let turn = {
+                let mut prompts = self.prompts.lock().unwrap();
+                prompts.push(record.prompt.clone());
+                prompts.len()
+            };
+            if let (1, Some(dir)) = (turn, &self.pause) {
+                deploy::request(dir, ControlOp::Pause).unwrap();
+            }
+            let completion = self.registry.register(record)?;
+            let agent = invocation.agent.clone();
+            let who = agent.trim_start_matches("t.");
+            self.registry.execute(
+                "Shared",
+                &agent,
+                InvocationCommand::SetState(SetStateArgs {
+                    task_id: invocation.id,
+                    name: "notes".into(),
+                    value: json!(format!("{who} was here")),
+                }),
+            )?;
+            if invocation.trigger_values.contains_key("t.go") && who == "a" {
+                self.registry.execute(
+                    "Shared",
+                    &agent,
+                    InvocationCommand::SetPort(SetPortArgs {
+                        task_id: invocation.id,
+                        port: "again".into(),
+                        value: json!(1),
+                    }),
+                )?;
+            }
+            self.registry.execute(
+                "Shared",
+                &agent,
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: invocation.id,
+                    keep: vec![],
+                }),
+            )?;
+            let writes = completion.try_recv()?;
+            self.registry.remove(&invocation.id);
+            Ok(writes)
+        }
+    }
+
+    /// Every task of an instance reads its state in the prompt and writes it
+    /// with `omar_set_state`, no contract saying so: a later task sees it at
+    /// the same tag, the next tag sees it, and a pause and resume keep it.
+    #[test]
+    fn tasks_share_their_instances_state() {
+        let state = verify(&shared_notes_bytecode()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let first = NoteTakers {
+            registry: InvocationRegistry::default(),
+            prompts: Mutex::new(Vec::new()),
+            pause: Some(dir.path().to_path_buf()),
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::from([("t.go".to_string(), json!(1))])),
+            &first,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&Recorder::new()),
+        )
+        .unwrap();
+        let LoopEnd::Paused(captured) = end else {
+            panic!("the pause request was not honoured");
+        };
+        // `b` is declared after `a`, so it runs after it and reads its write.
+        assert_eq!(
+            *first.prompts.lock().unwrap(),
+            ["a reads []", "b reads [a was here]"]
+        );
+        assert_eq!(captured.state_vars["t.notes"], json!("b was here"));
+
+        deploy::clear_stop(dir.path()).unwrap();
+        let second = NoteTakers {
+            registry: InvocationRegistry::default(),
+            prompts: Mutex::new(Vec::new()),
+            pause: None,
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Resume(captured),
+            &second,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            Some(dir.path()),
+            Some(&Recorder::new()),
+        )
+        .unwrap();
+        let LoopEnd::Completed(settled) = end else {
+            panic!("the resumed run should finish");
+        };
+        // The next tag, in a fresh process, starts from what the last one left.
+        assert_eq!(
+            *second.prompts.lock().unwrap(),
+            ["a reads [b was here]", "b reads [a was here]"]
+        );
+        assert_eq!(settled.state_vars["t.notes"], json!("b was here"));
+    }
+
+    /// A task's state write goes through `omar_set_state`, never
+    /// `omar_set_port`; it is checked like an effect's, stays private until
+    /// completion, and reaches only its own instance's state. The agent is
+    /// told what the state holds, in its message and by `omar_pending`.
+    #[test]
+    fn a_tasks_state_write_is_checked_and_scoped_to_its_instance() {
+        let registry = InvocationRegistry::default();
+        let record = InvocationRecord {
+            id: 9,
+            team: "Shared".into(),
+            agent: "t.a".into(),
+            reaction: "t.reaction.0".into(),
+            contract: "t.out".into(),
+            allowed_effects: BTreeMap::from([("t.out".into(), "string".into())]),
+            state_values: BTreeMap::from([("t.notes".into(), json!("old"))]),
+            state_types: BTreeMap::from([("t.notes".into(), "string".into())]),
+            ..Default::default()
+        };
+        let completion = registry.register(record).unwrap();
+        let set_port = |port: &str, value: Value| {
+            registry.execute(
+                "Shared",
+                "t.a",
+                InvocationCommand::SetPort(SetPortArgs {
+                    task_id: 9,
+                    port: port.into(),
+                    value,
+                }),
+            )
+        };
+        let set = |name: &str, value: Value| {
+            registry.execute(
+                "Shared",
+                "t.a",
+                InvocationCommand::SetState(SetStateArgs {
+                    task_id: 9,
+                    name: name.into(),
+                    value,
+                }),
+            )
+        };
+        let pending = registry
+            .execute("Shared", "t.a", InvocationCommand::Pending)
+            .unwrap();
+        assert_eq!(pending["pending"][0]["state"]["t.notes"], json!("old"));
+        assert_eq!(
+            pending["pending"][0]["state_types"]["t.notes"],
+            json!("string")
+        );
+        // State is not a port, and the refusal names the tool that sets it.
+        for name in ["notes", "t.notes"] {
+            let refused = set_port(name, json!("x")).unwrap_err();
+            assert!(
+                format!("{refused:#}").contains("omar_set_state"),
+                "{refused:#}"
+            );
+        }
+        // Nor is a port state.
+        assert!(set("out", json!("x")).is_err());
+        let wrong = set("notes", json!(3)).unwrap_err();
+        assert!(format!("{wrong:#}").contains("invalid value"), "{wrong:#}");
+        // Another instance's state is not this invocation's to write.
+        let elsewhere = set("u.notes", json!("x")).unwrap_err();
+        assert!(
+            format!("{elsewhere:#}").contains("t.notes"),
+            "{elsewhere:#}"
+        );
+        set("notes", json!("new")).unwrap();
+        set_port("out", json!("done")).unwrap();
+        assert!(completion.try_recv().is_err(), "private until complete");
+        registry
+            .execute(
+                "Shared",
+                "t.a",
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: 9,
+                    keep: vec![],
+                }),
+            )
+            .unwrap();
+        let writes = completion.try_recv().unwrap();
+        assert_eq!(writes["t.notes"], json!("new"));
+        assert_eq!(writes["t.out"], json!("done"));
+
+        let spec = InvocationSpec {
+            id: 9,
+            reaction_id: "t.reaction.0".into(),
+            agent: "t.a".into(),
+            trigger_values: BTreeMap::new(),
+            allowed_effects: BTreeMap::new(),
+            effect_names: BTreeMap::new(),
+            types: BTreeMap::new(),
+            state_values: BTreeMap::from([("t.notes".into(), json!("old"))]),
+            state_types: BTreeMap::from([("t.notes".into(), "string".into())]),
+            contexts: BTreeMap::new(),
+            context_names: BTreeSet::new(),
+            contract: String::new(),
+            prompt: "Notes: $(t.notes)".into(),
+            within: None,
+        };
+        let record = invocation_record("Shared", &spec).unwrap();
+        assert_eq!(record.prompt, "Notes: old");
+        let message = invocation_message(&spec, &record.prompt).unwrap();
+        assert!(
+            message.contains("state: {\"t.notes\":\"old\"}\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("change any of it with omar_set_state"),
+            "{message}"
+        );
+    }
+
+    /// Three agents of one instance; `a` and `b` share the context `ops`,
+    /// `c` does not. All run at the one tag `go` arrives, in that order.
+    fn shared_context_bytecode() -> Bytecode {
+        serde_json::from_str(
+            r#"{
+              "version": 1,
+              "team": "Ctx",
+              "instructions": [
+                {"op":"begin_plan","team":"Ctx"},
+                {"op":"declare_instance","name":"t","parent":"","team":"T"},
+                {"op":"spawn_agent","instance":"t","name":"t.a","backend":"stub"},
+                {"op":"spawn_agent","instance":"t","name":"t.b","backend":"stub"},
+                {"op":"spawn_agent","instance":"t","name":"t.c","backend":"stub"},
+                {"op":"define_port","instance":"t","kind":"input","name":"t.go","type":"int"},
+                {"op":"declare_state","instance":"t","name":"t.ops","type":"string","initial":"",
+                  "agents":["t.a","t.b"],"directive":"List decisions, newest last."},
+                {"op":"install_reaction","instance":"t","id":"t.reaction.0","agent":"t.a",
+                  "triggers":["t.go"],"effects":[],"contract":"","prompt":"Plan."},
+                {"op":"install_reaction","instance":"t","id":"t.reaction.1","agent":"t.b",
+                  "triggers":["t.go"],"effects":[],"contract":"","prompt":"Build."},
+                {"op":"install_reaction","instance":"t","id":"t.reaction.2","agent":"t.c",
+                  "triggers":["t.go"],"effects":[],"contract":"","prompt":"Review."},
+                {"op":"commit_plan"}
+              ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// Answers through the registry as an agent does over MCP. `a` records a
+    /// decision in the context; `b` first tries to complete without touching
+    /// it, then keeps it; `c` shares none. Each one's pending entry, message
+    /// and refusals are kept.
+    struct ContextKeepers {
+        registry: InvocationRegistry,
+        seen: Mutex<Vec<(String, Value, String)>>,
+        refusals: Mutex<Vec<String>>,
+    }
+    impl ReactionExecutor for ContextKeepers {
+        fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+            let record = invocation_record("Ctx", &invocation)?;
+            let message = invocation_message(&invocation, &record.prompt)?;
+            let completion = self.registry.register(record)?;
+            let agent = invocation.agent.clone();
+            let pending = self
+                .registry
+                .execute("Ctx", &agent, InvocationCommand::Pending)?;
+            self.seen
+                .lock()
+                .unwrap()
+                .push((agent.clone(), pending["pending"][0].clone(), message));
+            let complete = |keep: &[&str]| {
+                self.registry.execute(
+                    "Ctx",
+                    &agent,
+                    InvocationCommand::Complete(CompleteArgs {
+                        task_id: invocation.id,
+                        keep: keep.iter().map(|k| k.to_string()).collect(),
+                    }),
+                )
+            };
+            let refused = |result: Result<Value>| {
+                let error = result.expect_err("completion should be refused");
+                self.refusals.lock().unwrap().push(format!("{error:#}"));
+            };
+            match agent.as_str() {
+                "t.a" => {
+                    refused(complete(&[]));
+                    self.registry.execute(
+                        "Ctx",
+                        &agent,
+                        InvocationCommand::SetState(SetStateArgs {
+                            task_id: invocation.id,
+                            name: "ops".into(),
+                            value: json!("Use SQLite."),
+                        }),
+                    )?;
+                    complete(&[])?;
+                }
+                "t.b" => {
+                    refused(complete(&["style"]));
+                    complete(&["ops"])?;
+                }
+                _ => {
+                    refused(complete(&["ops"]));
+                    complete(&[])?;
+                }
+            }
+            let writes = completion.try_recv()?;
+            self.registry.remove(&invocation.id);
+            Ok(writes)
+        }
+    }
+
+    /// A context reaches the tasks of the agents that share it in the
+    /// invocation itself — a `contexts:` header line and `omar_pending` —
+    /// and the prompt is the program's own. Completion is refused until each
+    /// shared context is set or kept, and the invocation stays open to fix
+    /// that; what one writes reaches the next. An agent that does not share
+    /// it sees it only as the team's state, and cannot keep it.
+    #[test]
+    fn a_context_is_handed_to_its_agents_and_kept_by_them() {
+        let state = verify(&shared_context_bytecode()).unwrap();
+        let keepers = ContextKeepers {
+            registry: InvocationRegistry::default(),
+            seen: Mutex::new(Vec::new()),
+            refusals: Mutex::new(Vec::new()),
+        };
+        let end = run_event_loop_controlled(
+            &state,
+            LoopStart::Fresh(BTreeMap::from([("t.go".to_string(), json!(1))])),
+            &keepers,
+            &NoopTopologyObserver,
+            Pace::Fast,
+            None,
+            Some(&Recorder::new()),
+        )
+        .unwrap();
+        let LoopEnd::Completed(settled) = end else {
+            panic!("the run should finish");
+        };
+        assert_eq!(settled.state_vars["t.ops"], json!("Use SQLite."));
+        let seen = keepers.seen.lock().unwrap();
+        let [(_, a, a_message), (_, b, b_message), (_, c, c_message)] = &seen[..] else {
+            panic!("expected three invocations, got {}", seen.len());
+        };
+        // The prompt is exactly the program's; the context is data beside it.
+        assert_eq!(a["prompt"], json!("Plan."));
+        assert_eq!(
+            a["contexts"]["t.ops"],
+            json!({"directive": "List decisions, newest last.", "value": ""})
+        );
+        assert!(
+            a_message.contains(
+                "contexts: {\"t.ops\":{\"directive\":\"List decisions, newest last.\",\"value\":\"\"}}\n"
+            ),
+            "{a_message}"
+        );
+        assert!(
+            a_message.contains("before omar_complete, set it to its full updated text with omar_set_state, or pass it in omar_complete's keep list"),
+            "{a_message}"
+        );
+        // `b` runs after `a` at the same tag, so it starts from `a`'s note.
+        assert_eq!(b["prompt"], json!("Build."));
+        assert_eq!(b["contexts"]["t.ops"]["value"], json!("Use SQLite."));
+        // Set out on its own line, so not repeated as state.
+        for message in [a_message, b_message] {
+            assert!(!message.contains("state: "), "{message}");
+        }
+        // `c` shares no context: nothing to keep, and `ops` is just the
+        // team's state, which every task may read.
+        assert_eq!(c["prompt"], json!("Review."));
+        assert_eq!(c["contexts"], json!({}));
+        assert!(!c_message.contains("contexts: "), "{c_message}");
+        assert!(
+            c_message.contains("state: {\"t.ops\":\"Use SQLite.\"}\n"),
+            "{c_message}"
+        );
+        let refusals = keepers.refusals.lock().unwrap();
+        assert_eq!(
+            refusals[0],
+            "not complete: set `ops` with omar_set_state, or keep it: omar_complete(task_id, keep: [\"ops\"])"
+        );
+        assert!(
+            refusals[1].contains(
+                "keep names 'style', which is not a context this task shares; it shares: ops"
+            ),
+            "{}",
+            refusals[1]
+        );
+        assert!(
+            refusals[2].contains("keep names 'ops', but this task shares no context"),
+            "{}",
+            refusals[2]
+        );
+    }
+
+    /// A context write over the limit is refused by `omar_set_state` with what
+    /// to do about it, whoever writes it; one at the limit is taken.
+    #[test]
+    fn a_context_write_over_its_limit_is_refused() {
+        let registry = InvocationRegistry::default();
+        let completion = registry
+            .register(InvocationRecord {
+                id: 12,
+                team: "Ctx".into(),
+                agent: "t.c".into(),
+                reaction: "t.reaction.2".into(),
+                state_types: BTreeMap::from([("t.ops".into(), "string".into())]),
+                context_names: BTreeSet::from(["t.ops".to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+        let set = |value: String| {
+            registry.execute(
+                "Ctx",
+                "t.c",
+                InvocationCommand::SetState(SetStateArgs {
+                    task_id: 12,
+                    name: "ops".into(),
+                    value: json!(value),
+                }),
+            )
+        };
+        let refused = set("x".repeat(CONTEXT_LIMIT + 1)).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("over its 16384-byte limit; condense it"),
+            "{refused:#}"
+        );
+        set("x".repeat(CONTEXT_LIMIT)).unwrap();
+        registry
+            .execute(
+                "Ctx",
+                "t.c",
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: 12,
+                    keep: vec![],
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            completion.try_recv().unwrap()["t.ops"]
+                .as_str()
+                .unwrap()
+                .len(),
+            CONTEXT_LIMIT
+        );
+    }
+
+    /// A context is text, shared by agents of its own instance.
+    #[test]
+    fn a_context_must_be_text_shared_by_its_own_agents() {
+        let with = |declaration: &str| {
+            let mut bytecode = shared_context_bytecode();
+            let at = bytecode
+                .instructions
+                .iter()
+                .position(|i| matches!(i, Instruction::DeclareState { .. }))
+                .unwrap();
+            bytecode.instructions[at] = serde_json::from_str(declaration).unwrap();
+            verify(&bytecode).map(|_| ()).unwrap_err().to_string()
+        };
+        assert!(with(r#"{"op":"declare_state","instance":"t","name":"t.ops","type":"int","initial":0,"agents":["t.a"]}"#)
+            .contains("a context is a string"));
+        assert!(with(r#"{"op":"declare_state","instance":"t","name":"t.ops","type":"string","initial":"","agents":["t.z"]}"#)
+            .contains("not an agent of its instance"));
+    }
+
     #[test]
     fn integer_task_ids_are_exact_and_owned_by_the_caller() {
         let registry = InvocationRegistry::default();
@@ -7053,6 +8270,7 @@ mod tests {
             prompt: "answer".into(),
             writes: BTreeMap::new(),
             completed: false,
+            ..Default::default()
         };
         let completion = registry.register(record.clone()).unwrap();
         let set = |id| {
@@ -7068,7 +8286,10 @@ mod tests {
             .execute(
                 "Desk",
                 "worker",
-                InvocationCommand::Complete(CompleteArgs { task_id: 8 })
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: 8,
+                    keep: vec![]
+                })
             )
             .is_err());
         // A real ID is not a credential: both commands still check ownership.
@@ -7078,7 +8299,10 @@ mod tests {
                 .execute(
                     team,
                     agent,
-                    InvocationCommand::Complete(CompleteArgs { task_id: 7 })
+                    InvocationCommand::Complete(CompleteArgs {
+                        task_id: 7,
+                        keep: vec![]
+                    })
                 )
                 .is_err());
         }
@@ -7096,7 +8320,10 @@ mod tests {
             .execute(
                 "Desk",
                 "worker",
-                InvocationCommand::Complete(CompleteArgs { task_id: 7 }),
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: 7,
+                    keep: vec![],
+                }),
             )
             .unwrap();
         assert_eq!(completion.try_recv().unwrap()["answer"], json!("hello"));
@@ -7149,6 +8376,7 @@ mod tests {
             prompt: "p".into(),
             writes: BTreeMap::new(),
             completed: false,
+            ..Default::default()
         };
         let completion = server.registry.register(record).unwrap();
 
@@ -7191,6 +8419,7 @@ mod tests {
                 prompt: "Choose a permitted decision.".into(),
                 writes: BTreeMap::new(),
                 completed: false,
+                ..Default::default()
             })
             .unwrap();
 
@@ -7266,6 +8495,7 @@ mod tests {
             prompt: "p".into(),
             writes: BTreeMap::new(),
             completed: false,
+            ..Default::default()
         };
         let completion = server.registry.register(record).unwrap();
 

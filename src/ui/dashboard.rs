@@ -866,11 +866,9 @@ fn render_command_tree(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             // Build prefix from ancestor continuation lines
             let mut prefix = String::from(" ");
-            for i in 0..node.ancestor_is_last.len() {
-                if i == 0 {
-                    continue; // skip EA level (always root)
-                }
-                if node.ancestor_is_last[i] {
+            // skip EA level (always root)
+            for &is_last in node.ancestor_is_last.iter().skip(1) {
+                if is_last {
                     prefix.push_str("    ");
                 } else {
                     prefix.push_str(" │  ");
