@@ -923,7 +923,7 @@ def testAgentLifetime : IO Unit := do
       ("coder : Claude per 5", "lifetime must be written"),
       ("coder : Claude per 5 weeks", "lifetime must be written"),
       ("coder : Claude per tags tasks", "expected"),
-      ("coder : Claude(scope = invocation)", "expected"),
+      ("coder : Claude(scope = invocation)", "unknown option 'scope'"),
       ("coder : Claude per 1.5 tags", "lifetime must be written")] do
     match compileSource "Scoped" (source decl) with
     | .ok _ => throw (IO.userError s!"accepted {decl}")
@@ -945,6 +945,90 @@ def testAgentLifetime : IO Unit := do
       (fun i => (i.getObjValAs? String "op").toOption.getD "")
     assertEqual s!"{before} -> {after}" ops #["begin_mutation", "kill_agent", "spawn_agent", "commit_plan"]
   IO.println "agent lifetime tests passed"
+
+/-- `agent : Backend(model = "...")`: carried, versioned, and refused where
+    the backend cannot take one or the name is not safe on a command line. -/
+def testAgentModel : IO Unit := do
+  let source (decl : String) :=
+    "team T[" ++ decl ++ "] { input token : string output out : string " ++
+    "task coder(token) -> out \"Go $(token)\" } main M { t = T() }"
+  let compiled (decl : String) : IO Json := do
+    match compileSource "M" (source decl) >>= Json.parse with
+    | .ok json => pure json
+    | .error error => throw (IO.userError s!"{decl}: {error}")
+  let spawn (json : Json) : IO Json := do
+    let instructions ← IO.ofExcept (json.getObjValAs? (Array Json) "instructions")
+    match instructions.find? (fun i => (i.getObjValAs? String "op").toOption == some "spawn_agent") with
+    | some instruction => pure instruction
+    | none => throw (IO.userError "no spawn_agent")
+  let version (json : Json) := (json.getObjValAs? Nat "version").toOption
+  let model (instruction : Json) := (instruction.getObjValAs? String "model").toOption
+  let lifetime (instruction : Json) :=
+    (instruction.getObjVal? "lifetime").toOption.map (·.compress)
+  -- No model: the bytecode is what it was before models existed.
+  let plain ← compiled "coder : Claude"
+  assertEqual "default model omitted" (model (← spawn plain)) none
+  assertEqual "default version" (version plain) (some 1)
+  -- A model is carried and versioned; `per` composes with it, after it.
+  let named ← compiled "coder : Claude(model = \"claude-sonnet-5-5\")"
+  assertEqual "model" (model (← spawn named)) (some "claude-sonnet-5-5")
+  assertEqual "model version" (version named) (some 3)
+  for (decl, expected) in [
+      ("coder : Claude(model = \"claude-haiku-5-5\") per tag",
+        "{\"count\":1,\"unit\":\"tag\"}"),
+      ("coder : Codex(model = \"gpt-x\") per 2 tasks", "{\"count\":2,\"unit\":\"task\"}")] do
+    let json ← compiled decl
+    assertEqual decl (version json) (some 3)
+    assertEqual decl (lifetime (← spawn json)) (some expected)
+  let lifetimeOnly ← compiled "coder : Codex per 2 tasks"
+  assertEqual "lifetime without model stays v2" (version lifetimeOnly) (some 2)
+  assertEqual "lifetime without model" (model (← spawn lifetimeOnly)) none
+  let routed ← compiled "coder : OpenCode(model = \"openrouter/nvidia/x:free\")"
+  assertEqual "provider/model" (model (← spawn routed)) (some "openrouter/nvidia/x:free")
+  -- Every backend that can take one, by any alias a source file can spell.
+  for aliases in Omar.Backends.modelSelectable do
+    for alias in aliases.filter (!·.contains '-') do
+      let _ ← compiled s!"coder : {alias.capitalize}(model = \"m\")"
+  -- One that cannot, or one omarc does not know, is refused before bytecode.
+  let names := ", ".intercalate (Omar.Backends.modelSelectable.map (·[0]!)).toList
+  for backend in ["Web", "Stub", "Nope"] do
+    match compileSource "M" (source s!"coder : {backend}(model = \"m\")") with
+    | .ok _ => throw (IO.userError s!"accepted {backend}(model)")
+    | .error error =>
+      if error != s!"agent 'coder' sets a model, but backend '{backend}' cannot take one; \
+          supported: {names}" then
+        throw (IO.userError s!"{backend}: {error}")
+  -- Claude aliases carry brackets; the model is single-quoted at every use.
+  let _ ← compiled "coder : Claude(model = \"opus[1m]\")"
+  for (decl, expected) in [
+      ("coder : Claude(model = \"\")", "invalid model"),
+      ("coder : Claude(model = \"$(x)\")", "invalid model"),
+      ("coder : Claude(model = \"a b\")", "invalid model"),
+      ("coder : Claude(model = \"--dangerous\")", "invalid model"),
+      ("coder : Claude(model = \"a'b\")", "invalid model"),
+      ("coder : Claude(model = \"a;b\")", "invalid model"),
+      ("coder : Claude(model = sonnet)", "must be a quoted name"),
+      ("coder : Claude(model = \"a\", model = \"b\")", "options must be written"),
+      ("coder : Claude(scope = agent)", "unknown option 'scope'"),
+      ("coder : Claude(model = \"a\", scope = agent)", "options must be written"),
+      ("coder : Claude()", "options must be written"),
+      ("coder : Claude(model = \"a\"", "options must be written"),
+      ("coder : Claude per tag(model = \"a\")", "expected")] do
+    match compileSource "M" (source decl) with
+    | .ok _ => throw (IO.userError s!"accepted {decl}")
+    | .error error =>
+      if !mentions error expected then
+        throw (IO.userError s!"{decl}: expected '{expected}', got {error}")
+  -- A model change is a different agent: killed and spawned again.
+  let plan ← match compileDiffSourcesWithSchemas "M" (source "coder : Claude") #[]
+      "M" (source "coder : Claude(model = \"claude-haiku-5-5\")") #[] >>= Json.parse with
+    | .ok plan => pure plan
+    | .error error => throw (IO.userError s!"model plan: {error}")
+  assertEqual "model plan version" (version plan) (some 3)
+  let ops := ((plan.getObjValAs? (Array Json) "instructions").toOption.getD #[]).map
+    (fun i => (i.getObjValAs? String "op").toOption.getD "")
+  assertEqual "model plan" ops #["begin_mutation", "kill_agent", "spawn_agent", "commit_plan"]
+  IO.println "agent model tests passed"
 
 /-- Every complete program in the EA's prompt — a fenced block with a team
     and a `main` — compiles, so the examples it designs from cannot drift
@@ -983,6 +1067,7 @@ def main : IO UInt32 := do
     testSchemaTypeResolution
     testMutation
     testAgentLifetime
+    testAgentModel
     testContracts
     testModels
     testProve

@@ -22,8 +22,9 @@ team        = "team", identifier, [ "(", [ params ], ")" ],
 params      = param, { ",", param } ;
 param       = identifier, ":", type ;
 agents      = agent, { ",", agent } ;
-agent       = identifier, ":", backend, [ "per", lifetime ] ;
+agent       = identifier, ":", backend, [ "(", option, ")" ], [ "per", lifetime ] ;
 backend     = identifier ;
+option      = "model", "=", string ;
 lifetime    = "task" | "tag" | natural, ( "task" | "tasks" | "tag" | "tags" ) ;
 
 main        = "main", [ identifier ], "{", { instance | wiring }, "}" ;
@@ -254,9 +255,25 @@ recorded fails the window: the next run's check reads it from there.
 Mission Control draws an agent that resets its conversation with a dashed
 card and its lifetime, and shows a step the windows that served it.
 
-Anything else after `per` is refused: `Claude per`, `Claude per week`,
-`Claude per 5`, `Claude per 0 tasks`, `Claude(scope = invocation)` and
-`Web per tag` do not compile.
+An agent's model is the model its worker runs, in place of the CLI's own
+default: `coder : Claude(model = "claude-haiku-5-5") per tag`. It goes
+before `per`, applies to every worker launch, including those of each new
+window, and without `model` the launch is what it always was. The name is passed to the backend in
+its own flag, as written: `--model` for Claude, Cursor, Agy and Pi (Pi also
+takes `provider/model`), `-m` for Codex, `--model provider/model` for
+OpenCode (also written as its config `model`, which prompts OMAR posts over
+HTTP follow), and the request's `model` for Jev. The name must be non-empty,
+use only letters, digits and `. _ : / @ + - [ ]`, and not start with `-`. `Web`
+and `Stub` have no model to name: the compiler refuses them, and an unknown
+backend, before it writes any bytecode or mutation plan, naming the backends
+that can. The runtime refuses it again. Mission Control adds the model to the
+agent's label.
+
+Anything else after the backend or `per` is refused: `Claude per`,
+`Claude per week`, `Claude per 5`, `Claude per 0 tasks`, `Claude()`,
+`Claude(scope = invocation)`, `Claude(model = sonnet)` (not a string),
+`Claude(model = "a b")`, `Claude per tag(model = "x")`, `Web per tag` and
+`Web(model = "x")` do not compile.
 
 An argument is an int or a string literal, and nothing else — there are no
 expressions. `main` may be named or bare; the name identifies the run, and a
@@ -734,8 +751,8 @@ Executing a plan on a checkpoint:
 - an instance whose team, parent or arguments changed is replaced whole, with
   everything it contains: state from its initial values, a new empty
   workspace;
-- an agent whose backend or `per` lifetime changed is killed and spawned again,
-  so no conversation outlives the lifetime it was started under;
+- an agent whose backend, `per` lifetime or model changed is killed and spawned
+  again, so no conversation outlives the lifetime or model it was started under;
 - a removed port or timer drops its queued events (reported); a removed
   instance's workspace stays reachable from earlier checkpoints;
 - a new timer is armed from the last completed tag: `timer t(1s, …)` first
@@ -760,7 +777,7 @@ BEGIN_PLAN team
 
 DEFINE_TYPE name type [title] [description]
 DECLARE_INSTANCE name team parent
-SPAWN_AGENT name backend [lifetime]
+SPAWN_AGENT name backend [lifetime] [model]
 DEFINE_PORT kind name type [delay]
 DECLARE_TIMER name offset period
 DECLARE_STATE name type initial [agents] [directive]
@@ -817,7 +834,8 @@ op, source, target, delay
 
 The port `delay` field is omitted when no fixed delay is declared. An agent's
 `lifetime`, `{"unit": "task" | "tag", "count": N}` (`per tag` is
-`{"unit": "tag", "count": 1}`), is omitted for a whole-run conversation.
+`{"unit": "tag", "count": 1}`), is omitted for a whole-run conversation, and
+`model` when none is named.
 
 A program with an agent lifetime is bytecode version 2; every other program,
 and every plan that produces one, stays version 1, byte for byte. A version 1
@@ -826,6 +844,10 @@ conversation the program said to reset; the version is what makes it refuse
 the program instead, whether it arrives compiled or in a checkpoint, whose
 `program.json` is the bytecode. Version 1 bytecode that carries a `lifetime` is
 rejected for the same reason.
+
+A program with an agent `model` is version 3 (and may carry lifetimes), for the
+same reason: an older runtime would drop `model` and run the default. Version 1
+or 2 bytecode that carries `model` is rejected, as is any version above 3.
 Reaction fields are ordered:
 
 ```text

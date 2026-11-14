@@ -442,7 +442,7 @@ function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> 
   const agents = new Map(
     snapshot.agents.map((agent) => [
       agent.id,
-      { name: agent.name, backend: agent.backend },
+      { name: agent.name, backend: agent.backend, model: agent.model },
     ]),
   );
   return new Map(
@@ -452,7 +452,7 @@ function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> 
       const agent = localName(owner?.name ?? reaction.agent, reaction.instance);
       // Which model is behind an agent changes how you read what it did, and
       // the program picked it deliberately, so it belongs on the task card.
-      const detail = [owner?.backend, reaction.status]
+      const detail = [owner?.backend, owner?.model, reaction.status]
         .filter(Boolean)
         .join(" \u00b7 ");
       // The runtime names reactions `reaction.N` because OMAR prompts are

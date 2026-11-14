@@ -14,4 +14,16 @@ def freshConversation : Array (Array String) := #[
   #["stub"]
 ]
 
+/-- The backends an agent may give a model, likewise: those whose
+    `model_flag` is some. -/
+def modelSelectable : Array (Array String) := #[
+  #["claude", "claude-code", "claude_code", "claudecode"],
+  #["codex"],
+  #["cursor"],
+  #["opencode"],
+  #["pi"],
+  #["agy", "antigravity"],
+  #["jev"]
+]
+
 end Omar.Backends

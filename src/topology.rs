@@ -53,6 +53,9 @@ pub enum Instruction {
         /// bytecode it always had.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lifetime: Option<Lifetime>,
+        /// `Claude(model = "...")`; absent for the CLI's own default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     DefinePort {
         name: String,
@@ -243,6 +246,20 @@ impl std::fmt::Display for Lifetime {
 /// instead.
 pub const LIFETIME_BYTECODE: u32 = 2;
 
+/// The bytecode version a program with an agent model carries, for the same
+/// reason: an older runtime would ignore `model` and run the default.
+pub const MODEL_BYTECODE: u32 = 3;
+
+/// A model name a worker's command line can carry: no space, quote or control
+/// character, and not mistakable for a flag. omarc enforces the same.
+pub fn valid_model(model: &str) -> bool {
+    !model.is_empty()
+        && !model.starts_with('-')
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._:/@+-[]".contains(c))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentState {
     pub backend: String,
@@ -252,6 +269,8 @@ pub struct AgentState {
     pub instance: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifetime: Option<Lifetime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// A team instantiated by `main`, and the team it came from.
@@ -686,7 +705,7 @@ pub(crate) fn resolve_build_omarc() -> PathBuf {
 }
 
 pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
-    if bytecode.version != 1 && bytecode.version != LIFETIME_BYTECODE {
+    if !(1..=MODEL_BYTECODE).contains(&bytecode.version) {
         bail!("unsupported bytecode version {}", bytecode.version);
     }
     if !valid_identifier(&bytecode.team) {
@@ -757,6 +776,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 backend,
                 instance,
                 lifetime,
+                model,
             } => {
                 check_instance(&state, "agent", name, instance)?;
                 require_identifier("agent", name)?;
@@ -784,6 +804,24 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                         );
                     }
                 }
+                if let Some(model) = model {
+                    if bytecode.version < MODEL_BYTECODE {
+                        bail!(
+                            "agent '{name}' sets a model, which needs bytecode version {MODEL_BYTECODE}"
+                        );
+                    }
+                    if !valid_model(model) {
+                        bail!("agent '{name}' has invalid model '{model}'");
+                    }
+                    if !crate::backend::by_name(backend)
+                        .is_some_and(|b| b.model_flag("m").is_some())
+                    {
+                        bail!(
+                            "agent '{name}' sets a model, but backend '{backend}' cannot take one; supported: {}",
+                            crate::backend::model_backends().join(", ")
+                        );
+                    }
+                }
                 // Agents live in tmux sessions, and qualification is flattened
                 // to get there, so two names that differ only by a '.' would
                 // land in one session and answer each other's invocations.
@@ -802,6 +840,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                             backend: backend.clone(),
                             instance: instance.clone(),
                             lifetime: *lifetime,
+                            model: model.clone(),
                         },
                     )
                     .is_some()
@@ -3250,6 +3289,7 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
                 triggers: &invocation.trigger_values,
                 instructions: &rendered,
                 timeout: invocation.within.unwrap_or(self.timeout),
+                model: self.state.agents[&invocation.agent].model.as_deref(),
             })?;
             validate_contract(&invocation.contract, &writes)?;
             for (port, value) in &writes {
@@ -4570,6 +4610,19 @@ fn launch(
 
 const AGENT_PROTOCOL: &str = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, and omar_set_state for your team's state, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
 
+/// The command an agent's worker launches with: the backend's own, plus its
+/// model flag when the program named one. Every launch goes through here, a
+/// new window's included, so no worker runs the CLI's default by accident.
+fn model_command(agent: &AgentState, backend: &str, base_command: &str) -> Result<String> {
+    match (&agent.model, crate::backend::by_name(backend)) {
+        (Some(model), Some(b)) => match b.model_flag(model) {
+            Some(flag) => Ok(format!("{base_command} {flag}")),
+            None => bail!("backend '{backend}' cannot take a model"),
+        },
+        _ => Ok(base_command.to_string()),
+    }
+}
+
 /// What it takes to start one topology agent's worker. Kept for the whole
 /// run, because an agent with a `per` lifetime is started again for every
 /// window.
@@ -4690,7 +4743,10 @@ impl AgentLauncher {
                 attempt: attempt.cloned(),
             }),
         };
-        let command = manager::build_agent_command(&base_command, &prompt_file, &[], &context);
+        // The model is part of the command the backend launches, not of the
+        // context: sub-agents the worker spawns keep the backend's default.
+        let launch_command = model_command(agent, backend, &base_command)?;
+        let command = manager::build_agent_command(&launch_command, &prompt_file, &[], &context);
         let mut environment = vec![
             ("OMAR_WORKTREE".into(), workdir.into()),
             ("OMAR_TEMP".into(), temp.to_string_lossy().into_owned()),
@@ -6984,6 +7040,7 @@ mod tests {
                         backend: "claude".into(),
                         instance: String::new(),
                         lifetime: None,
+                        model: None,
                     },
                 ),
                 (
@@ -6992,6 +7049,7 @@ mod tests {
                         backend: "codex".into(),
                         instance: String::new(),
                         lifetime: None,
+                        model: None,
                     },
                 ),
                 (
@@ -7000,6 +7058,7 @@ mod tests {
                         backend: "opencode".into(),
                         instance: String::new(),
                         lifetime: None,
+                        model: None,
                     },
                 ),
             ]),
@@ -7247,6 +7306,7 @@ mod tests {
                 backend: "Codex".to_string(),
                 instance: String::new(),
                 lifetime: None,
+                model: None,
             },
         );
 
@@ -10742,6 +10802,130 @@ mod tests {
             .is_none());
     }
 
+    /// `coder : Backend(model = "...")` as `omarc` emits it, at `version`.
+    fn modelled_program(version: u32, backend: &str, model: &str) -> Bytecode {
+        serde_json::from_value(json!({
+            "version": version,
+            "team": "Scoped",
+            "instructions": [
+                {"op":"begin_plan","team":"Scoped"},
+                {"op":"declare_instance","name":"t","parent":"","team":"T"},
+                {"op":"spawn_agent","instance":"t","name":"t.coder","backend":backend,"model":model},
+                {"op":"commit_plan"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_agent_model_is_carried_and_the_default_is_not_written() {
+        let program = modelled_program(3, "Claude", "claude-haiku-5-5");
+        let state = verify(&program).unwrap();
+        assert_eq!(
+            state.agents["t.coder"].model.as_deref(),
+            Some("claude-haiku-5-5")
+        );
+        let kept: Bytecode =
+            serde_json::from_value(serde_json::to_value(&program).unwrap()).unwrap();
+        assert_eq!(kept.instructions, program.instructions);
+        assert_eq!(
+            serde_json::to_value(&state.agents["t.coder"]).unwrap()["model"],
+            json!("claude-haiku-5-5")
+        );
+        // No model: neither the instruction nor the state mention one.
+        let plain = lifetime_program(1, "Claude", None);
+        let state = verify(&plain).unwrap();
+        assert_eq!(state.agents["t.coder"].model, None);
+        assert!(serde_json::to_value(&plain.instructions[2])
+            .unwrap()
+            .get("model")
+            .is_none());
+        assert!(serde_json::to_value(&state.agents["t.coder"])
+            .unwrap()
+            .get("model")
+            .is_none());
+        // Every backend that can take one.
+        for backend in ["Claude", "Codex", "Cursor", "OpenCode", "Pi", "Agy", "Jev"] {
+            verify(&modelled_program(3, backend, "m")).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_relaunched_window_keeps_the_agents_model() {
+        let state = verify(
+            &serde_json::from_value::<Bytecode>(json!({
+                "version": 3, "team": "Scoped", "instructions": [
+                    {"op":"begin_plan","team":"Scoped"},
+                    {"op":"spawn_agent","name":"coder","backend":"Claude",
+                     "lifetime":{"unit":"task","count":1},"model":"claude-haiku-5-5"},
+                    {"op":"commit_plan"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let agent = &state.agents["coder"];
+        assert_eq!(
+            agent.lifetime,
+            Some(Lifetime {
+                unit: LifetimeUnit::Task,
+                count: 1
+            })
+        );
+        // The launcher is given the agent's state afresh for each window, so
+        // the first launch of every window is this one, and carries the flag.
+        for window in 0..3 {
+            let command = model_command(agent, "claude", "claude --some-flag").unwrap();
+            assert_eq!(
+                command, "claude --some-flag --model 'claude-haiku-5-5'",
+                "window {window}"
+            );
+        }
+        // No model, no flag.
+        let plain = AgentState {
+            model: None,
+            ..agent.clone()
+        };
+        assert_eq!(
+            model_command(&plain, "claude", "claude --some-flag").unwrap(),
+            "claude --some-flag"
+        );
+    }
+
+    #[test]
+    fn an_agent_model_is_refused_where_it_could_be_dropped_or_misused() {
+        // An older runtime ignores `model` and would run the default.
+        let error = verify(&modelled_program(2, "Claude", "m"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs bytecode version 3"), "{error}");
+        for backend in ["Web", "Stub", "Nope"] {
+            let error = verify(&modelled_program(3, backend, "m"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("cannot take one")
+                    && error.contains("supported: claude, codex, cursor, opencode, pi, agy, jev"),
+                "{backend}: {error}"
+            );
+        }
+        for model in ["", "a b", "--x", "a'b", "a;b", "$(x)", "a\nb"] {
+            let error = verify(&modelled_program(3, "Claude", model))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid model"), "{model:?}: {error}");
+        }
+        for model in [
+            "claude-sonnet-5-5",
+            "openrouter/nvidia/x:free",
+            "sonnet:high",
+            "gpt-5.1",
+            "opus[1m]",
+        ] {
+            assert!(valid_model(model), "{model}");
+        }
+    }
+
     #[test]
     fn a_lifetime_is_refused_where_it_could_be_dropped_or_unkept() {
         // Version 1 is what a runtime that predates lifetimes reads, ignoring
@@ -10788,7 +10972,12 @@ mod tests {
             assert!(unknown.is_err(), "{lifetime}");
         }
         // Nor does a newer version pass.
-        assert!(verify(&lifetime_program(3, "Claude", per("tag", 1))).is_err());
+        assert!(verify(&lifetime_program(
+            MODEL_BYTECODE + 1,
+            "Claude",
+            per("tag", 1)
+        ))
+        .is_err());
     }
 
     /// Which window each of an agent's invocations, at `tags`, falls in: the
