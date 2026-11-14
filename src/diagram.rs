@@ -84,6 +84,8 @@ pub enum DiagramEventKind {
     /// The run's clock started: the payload's `clock_origin` is the unix
     /// millisecond its logical time zero stands at.
     ClockStarted,
+    /// A task's completion check finished; the payload carries the run.
+    CheckCompleted,
     /// A team instance's Docker Sandbox is up: the payload names the
     /// `instance` and the `sandbox`.
     SandboxStarted,
@@ -182,6 +184,18 @@ pub struct DiagramReaction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub prompt: Option<String>,
+    /// The latest completion check run, for a task that has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub check: Option<DiagramCheck>,
+}
+
+/// The latest run of a task's completion check.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct DiagramCheck {
+    pub passed: bool,
+    /// `None` when the check was killed at the deadline.
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -314,6 +328,7 @@ impl DiagramSnapshot {
                 instance: reaction.instance.clone(),
                 within: reaction.within,
                 prompt: (!reaction.prompt.is_empty()).then(|| reaction.prompt.clone()),
+                check: None,
             })
             .collect();
         let mut edges = Vec::new();
@@ -404,6 +419,14 @@ pub trait TopologyObserver: Send + Sync {
         _reaction: &str,
         _invocation_id: &str,
         _writes: &BTreeMap<String, Value>,
+    ) {
+    }
+    /// A completion check ran; the invocation is still open if it failed.
+    fn check_completed(
+        &self,
+        _reaction: &str,
+        _invocation_id: &str,
+        _run: &crate::check::CheckRun,
     ) {
     }
     fn run_completed(&self, _outputs: &BTreeMap<String, Value>) {}
@@ -590,6 +613,30 @@ impl TopologyObserver for DiagramPublisher {
                 "writes": writes
             }),
             apply,
+        );
+    }
+
+    fn check_completed(&self, reaction: &str, invocation_id: &str, run: &crate::check::CheckRun) {
+        let latest = DiagramCheck {
+            passed: run.passed(),
+            exit_code: run.exit_code,
+        };
+        let mut payload = serde_json::to_value(run).unwrap_or_else(|_| json!({}));
+        payload["reaction"] = json!(reaction_id(reaction));
+        payload["invocation_id"] = json!(invocation_id);
+        self.publish_with(
+            DiagramEventKind::CheckCompleted,
+            None,
+            payload,
+            |snapshot| {
+                if let Some(item) = snapshot
+                    .reactions
+                    .iter_mut()
+                    .find(|item| item.name == reaction)
+                {
+                    item.check = Some(latest);
+                }
+            },
         );
     }
 
@@ -972,6 +1019,7 @@ mod tests {
                     prompt: "Respond".to_string(),
                     body: None,
                     within: None,
+                    check: None,
                 },
             )]),
         }
@@ -1043,6 +1091,7 @@ mod tests {
                     prompt: "Draft".to_string(),
                     body: None,
                     within: None,
+                    check: None,
                 },
             )]),
         }

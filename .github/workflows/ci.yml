@@ -367,6 +367,16 @@ jobs:
           echo "$output"
           grep -Fq 'Output run.result = "stub"' <<<"$output"
 
+      - name: Verify a completion check refuses, then accepts
+        env:
+          OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
+        run: |
+          output=$(cargo run --quiet --bin omar -- run \
+            tests/ci/completion_check_stub.omar --input run.request=go \
+            --timeout-seconds 30 --replace --fg)
+          echo "$output"
+          grep -Fq 'Output run.result = "stub"' <<<"$output"
+
       # This reaction program has code bodies, so
       # the ring is deterministic and costs no model call.
       - name: Verify a reaction end to end

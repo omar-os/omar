@@ -1102,6 +1102,15 @@ impl Worker {
         })
     }
     pub fn request(&self, request: Value, timeout: Duration) -> Result<Value> {
+        let response = self.exchange(request, timeout)?;
+        if let Some(error) = response.get("error") {
+            bail!("sandbox worker: {error}");
+        }
+        Ok(response)
+    }
+    /// One request and its reply, an `error` reply included: a failed
+    /// invocation's reply still carries the check runs it made.
+    pub fn exchange(&self, request: Value, timeout: Duration) -> Result<Value> {
         let mut process = self
             .process
             .lock()
@@ -1121,9 +1130,6 @@ impl Worker {
             let _ = process.child.kill();
         }
         let response = result?;
-        if let Some(error) = response.get("error") {
-            bail!("sandbox worker: {error}");
-        }
         anyhow::ensure!(
             response.get("protocol").and_then(Value::as_u64) == Some(PROTOCOL as u64),
             "sandbox worker protocol mismatch; rebuild the template with this OMAR version"

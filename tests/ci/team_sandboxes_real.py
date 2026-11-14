@@ -67,8 +67,10 @@ out = Some("isolated".to_string());
                 dict(op="spawn_agent", instance=instance, name=instance+".agent", backend="stub"),
                 dict(op="install_reaction", instance=instance, id=instance+".write", agent="",
                      triggers=[instance+".tick"], effects=[instance+".out"], contract=instance+".out", prompt="", body=body),
+                # Its completion check runs in the VM; refuses once, then accepts.
                 dict(op="install_reaction", instance=instance, id=instance+".prompt", agent=instance+".agent",
-                     triggers=[instance+".tick"], effects=[instance+".out"], contract=instance+".out", prompt="Return a string."),
+                     triggers=[instance+".tick"], effects=[instance+".out"], contract=instance+".out", prompt="Return a string.",
+                     check="test -e checked || { touch checked; echo 'not yet' >&2; exit 1; }"),
             ]
         instructions.append({"op": "commit_plan"})
         bytecode = root / "program.json"
@@ -112,7 +114,13 @@ out = Some("isolated".to_string());
                 assert (tree/"boundary-probe").read_text() == "untouched"
                 assert (tree/"artifact").read_text() == "inside sandbox"
                 assert len(list((state_root/"workspace-history"/ws/"snapshots").glob("*.json"))) == 2
-            print("PASS: real Docker Sandbox execution, parent/child separation, denied host/history access, native backend, snapshots, egress")
+            # Check runs made in the VMs reach the host's check log.
+            checks = [json.loads(line) for line in (next(state_root.rglob("deployment.json")).parent/"checks.jsonl").read_text().splitlines()]
+            for instance in ("parent", "parent.child"):
+                runs = [c for c in checks if c["reaction"] == instance+".prompt"]
+                assert [c["outcome"] for c in runs] == ["failed", "passed"], checks
+                assert "not yet" in runs[0]["output"], runs
+            print("PASS: real Docker Sandbox execution, parent/child separation, denied host/history access, native backend, snapshots, egress, completion checks in the VM")
         finally:
             subprocess.run([str(BIN), "down", "-s", runtime["name"], "--force", "--timeout", "5"], env=env, capture_output=True)
             subprocess.run(["tmux", "-L", runtime["tmux_server"], "kill-server"], capture_output=True)

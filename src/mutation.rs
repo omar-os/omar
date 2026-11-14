@@ -173,6 +173,7 @@ fn update_as_install(instruction: &Instruction) -> Option<(String, Instruction)>
             body,
             instance,
             within,
+            check,
         } => Some((
             id.clone(),
             Instruction::InstallReaction {
@@ -185,6 +186,7 @@ fn update_as_install(instruction: &Instruction) -> Option<(String, Instruction)>
                 body,
                 instance,
                 within,
+                check,
             },
         )),
         _ => None,

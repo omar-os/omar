@@ -127,9 +127,11 @@ else: sys.exit(2)
             instructions.append(dict(op="install_reaction", instance=instance, id=instance+".read",
                 agent="", triggers=[instance+".tick"], effects=[instance+".out"], contract=instance+".out", prompt="",
                 body='assert_eq!(std::fs::read_to_string("artifact").unwrap(), "first"); std::fs::write("artifact", "second").unwrap(); out = Some("second".to_string());'))
+            # Its completion check runs in the VM; refuses once, then accepts.
             instructions.append(dict(op="install_reaction", instance=instance, id=instance+".agent",
                 agent=instance+".second", triggers=[instance+".tick"], effects=[instance+".out"],
-                contract=instance+".out", prompt="Return a string."))
+                contract=instance+".out", prompt="Return a string.",
+                check="test -e checked || { touch checked; echo 'not yet' >&2; exit 1; }"))
         # A parent can react to a child's output without receiving child-private
         # definitions. Its worker still needs the referenced port's type.
         instructions.append(dict(op="define_port", instance="a", kind="output", name="a.observed", type="string"))
@@ -177,8 +179,19 @@ total = Some(self.count);
                  {"op": "declare_instance", "name": "c", "team": "Writer", "parent": ""},
                  {"op": "spawn_agent", "instance": "c", "name": "c.agent", "backend": "codex"},
                  {"op": "commit_plan"}]
+        web_check = [
+            {"op": "begin_plan", "team": "SandboxWebCheck"},
+            {"op": "spawn_agent", "name": "panel", "backend": "Web"},
+            {"op": "define_port", "kind": "input", "name": "topic", "type": "string"},
+            {"op": "define_port", "kind": "output", "name": "answer", "type": "string"},
+            {"op": "install_reaction", "id": "panel.answer", "agent": "panel",
+             "triggers": ["topic"], "effects": ["answer"], "contract": "answer",
+             "prompt": "Answer the topic.", "check": "true"},
+            {"op": "commit_plan"},
+        ]
         for name, team, plan in [("program", "SandboxTeams", instructions), ("ticker", "SandboxTicker", ticker),
-                                 ("claude", "SandboxClaude", claude), ("codex", "SandboxCodex", codex)]:
+                                 ("claude", "SandboxClaude", claude), ("codex", "SandboxCodex", codex),
+                                 ("web_check", "SandboxWebCheck", web_check)]:
             (root / (name + ".json")).write_text(json.dumps(dict(version=1, team=team, instructions=plan)))
             (source / (name + ".omar")).write_text("// Compiler-fixture input\n")
         program, ticker_program = source / "program.omar", source / "ticker.omar"
@@ -261,6 +274,12 @@ total = Some(self.count);
             assert first["sessions"] == {} and first["sessions_cleaned"]
             assert first["sandbox_template"] == TEMPLATE
             assert set(first["sandboxes"]) == {"a", "a.child", "b"}
+            # Check runs made in the VMs reach the host's check log.
+            checks = [json.loads(line) for line in (record_path("SandboxTeams").parent/"checks.jsonl").read_text().splitlines()]
+            for instance in ("a", "a.child", "b"):
+                runs = [c for c in checks if c["reaction"] == instance+".agent"]
+                assert [c["outcome"] for c in runs] == ["failed", "passed"], checks
+                assert "not yet" in runs[0]["output"], runs
             for ws in first["workspaces"].values():
                 assert len(list((state_root/"workspace-history"/ws/"snapshots").glob("*.json"))) == 2
             # No host compilation of untrusted reaction bodies.
@@ -301,6 +320,12 @@ total = Some(self.count);
             fault()
             assert refused.returncode != 0, refused
             assert record()["sessions_cleaned"], record()
+            # Web checks must never fall back to running on the host.
+            before = len(entries())
+            refused = omar("run", str(source / "web_check.omar"), "--sandbox-template", TEMPLATE, "--input", "topic=go", "--fg")
+            assert refused.returncode != 0, refused
+            assert "task 'panel.answer' has a `check` on a Web agent, which does not run in a sandbox yet; run with --no-sandbox" in refused.stdout + refused.stderr, refused
+            assert not [e for e in entries(before) if e[0] == "create"], entries(before)
             # Invalid pin fails before another create.
             before = calls.read_text()
             refused = omar("run", str(program), "--sandbox-template", "test:latest", "--fg")

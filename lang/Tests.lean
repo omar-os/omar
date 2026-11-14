@@ -526,6 +526,48 @@ def testRejection (label : String) (source : String) (expected : String) : IO Un
       if mentions message expected then IO.println s!"{label} rejected as expected"
       else throw (IO.userError s!"{label}: expected '{expected}', got '{message}'")
 
+/-- A task's check is the command `omar_complete` runs before accepting, and it
+    reaches the bytecode after the deadline, in its own field. -/
+def testCheck : IO Unit := do
+  let team (clauses : String) : String :=
+    "team Desk[a : Codex] { input req : string output res : string
+       task a(req) -> res within(2h) \"do it\" " ++ clauses ++ " }
+     main { d = Desk() }"
+  match lex (team "check \"bash ok.sh\"") >>= parse "Desk" with
+  | .ok program => do
+      assertEqual "check kept" (program.reactions.any (·.check == some "bash ok.sh")) true
+      assertEqual "deadline kept beside it" (program.reactions.any (·.within == some 7200000000000)) true
+      assertEqual "prompt kept beside it" (program.reactions.any (·.prompt == "do it")) true
+      let bytecode := compile program
+      assertEqual "check in the bytecode after the deadline"
+        (mentions bytecode "\"within\": 7200000000000, \"check\": \"bash ok.sh\"") true
+  | .error message => throw (IO.userError s!"check: {message}")
+  -- No check leaves the bytecode as it was: the field is omitted, not null.
+  match lex (team "") >>= parse "Desk" with
+  | .ok program =>
+      assertEqual "no check" (program.reactions.all (·.check == none)) true
+      assertEqual "no check field" (mentions (compile program) "\"check\"") false
+  | .error message => throw (IO.userError s!"no check: {message}")
+  -- Without a deadline the clause still follows the prompt.
+  match lex "team Desk[a : Codex] { input req : string output res : string
+      task a(req) -> res \"go\" check \"true\" } main { d = Desk() }" >>= parse "Desk" with
+  | .ok program => assertEqual "check without deadline" (program.reactions.any (·.check == some "true")) true
+  | .error message => throw (IO.userError s!"check without deadline: {message}")
+  -- `check` stays an ordinary port name: only a string after it makes a clause.
+  match lex "team Desk[a : Codex] { input check : string output res : string
+      task a(check) -> res \"go\"
+      check -> res } main { d = Desk() }" >>= parse "Desk" with
+  | .ok program =>
+      assertEqual "port named check" (program.connections.size) 1
+      assertEqual "no clause" (program.reactions.all (·.check == none)) true
+  | .error message => throw (IO.userError s!"port named check: {message}")
+  testRejection "empty check" (team "check \"\"") "check command is empty"
+  testRejection "blank check" (team "check \"  \"") "check command is empty"
+  testRejection "check on a code reaction"
+    "team T { input a : int output b : int reaction(a) -> b {= out.b = 1; =} check \"true\" }
+     main { t = T() }" "a check applies to a task"
+  IO.println "check tests passed"
+
 /-- A team with neither parameters nor agents needs neither bracket pair, and
     an unnamed main takes the fallback name — its source file's. -/
 def testBareTeamHeader : IO Unit :=
@@ -863,6 +905,7 @@ def main : IO UInt32 := do
     testBareTeamHeader
     testNamedMain
     testWithin
+    testCheck
     testDelayUnits
     testStateLiterals
     testPromptReads

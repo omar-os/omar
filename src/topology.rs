@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -137,6 +137,10 @@ pub enum Instruction {
         /// Absent leaves it to the run-wide timeout.
         #[serde(default)]
         within: Option<u64>,
+        /// A shell command `omar_complete` must pass before the completion
+        /// is accepted. Tasks only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        check: Option<String>,
     },
     CommitPlan,
     /// Opens a mutation plan: what turns the running program into a new one.
@@ -187,6 +191,10 @@ pub enum Instruction {
         instance: String,
         #[serde(default)]
         within: Option<u64>,
+        /// A shell command `omar_complete` must pass before the completion
+        /// is accepted. Tasks only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        check: Option<String>,
     },
 }
 
@@ -312,6 +320,9 @@ pub struct ReactionState {
     /// Nanoseconds one invocation may take. `None` uses the run-wide timeout.
     #[serde(default)]
     pub within: Option<u64>,
+    /// A shell command a completion must pass; see `Instruction::InstallReaction`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -983,6 +994,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 body,
                 instance,
                 within,
+                check,
             } => {
                 let order = state.reactions.len();
                 check_instance(&state, "reaction", id, instance)?;
@@ -994,6 +1006,24 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                     }
                 } else if !state.agents.contains_key(agent) {
                     bail!("reaction '{id}' references unknown agent '{agent}'");
+                }
+                if let Some(command) = check {
+                    // A body completes by returning, and a direct backend
+                    // answers without calling `omar_complete`: neither has a
+                    // completion to refuse.
+                    if body.is_some() {
+                        bail!("reaction '{id}' has a body, so it cannot have a check");
+                    }
+                    if command.trim().is_empty() {
+                        bail!("reaction '{id}' has an empty check command");
+                    }
+                    if crate::backend::by_name(&state.agents[agent].backend)
+                        .is_some_and(|backend| backend.topology_only())
+                    {
+                        bail!(
+                            "reaction '{id}' has a check, but agent '{agent}' answers directly and never calls omar_complete"
+                        );
+                    }
                 }
                 for trigger in triggers {
                     if state.timers.contains_key(trigger) {
@@ -1034,6 +1064,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                             prompt: prompt.clone(),
                             body: body.clone(),
                             within: *within,
+                            check: check.clone(),
                         },
                     )
                     .is_some()
@@ -1327,7 +1358,23 @@ struct InvocationRecord {
     prompt: String,
     writes: BTreeMap<String, Value>,
     completed: bool,
+    /// What `omar_complete` runs before accepting, if the task has a check.
+    check: Option<CheckPlan>,
 }
+
+/// A task's completion check, and where and until when it runs.
+#[derive(Debug, Clone)]
+struct CheckPlan {
+    command: String,
+    /// The instance workspace: the check's cwd, as it is the worker's.
+    worktree: PathBuf,
+    temp: PathBuf,
+    /// The invocation's deadline, which bounds the check too.
+    deadline: Instant,
+}
+
+/// Told of each check run: the reaction, the task id and the run.
+type CheckSink = Box<dyn Fn(&str, u64, &crate::check::CheckRun) + Send + Sync>;
 
 /// One invocation waiting to be answered, as a panel needs to draw it.
 ///
@@ -1406,11 +1453,16 @@ struct InvocationResponse {
 struct InvocationEntry {
     record: InvocationRecord,
     completion: Option<mpsc::SyncSender<BTreeMap<String, Value>>>,
+    /// Set when the invocation is removed, so a running check is killed.
+    cancel: Arc<AtomicBool>,
+    /// Whether a check is running, which freezes the writes it is judging.
+    checking: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
 struct InvocationRegistry {
     entries: Arc<Mutex<BTreeMap<u64, InvocationEntry>>>,
+    on_check: Arc<std::sync::OnceLock<CheckSink>>,
 }
 
 /// The effect a `set_port` call names, and its type.
@@ -1471,14 +1523,40 @@ impl InvocationRegistry {
             InvocationEntry {
                 record,
                 completion: Some(completion),
+                cancel: Arc::default(),
+                checking: Arc::default(),
             },
         );
         Ok(receiver)
     }
 
+    /// Where each check run is reported. Set once, before agents are told of
+    /// any invocation.
+    fn set_check_sink(&self, sink: CheckSink) {
+        let _ = self.on_check.set(sink);
+    }
+
+    /// Report a check that ran in a team's sandbox: its worker sends the runs
+    /// back with the invocation's result.
+    fn report_check(&self, reaction: &str, task_id: u64, run: &crate::check::CheckRun) {
+        if let Some(sink) = self.on_check.get() {
+            sink(reaction, task_id, run);
+        }
+    }
+
+    /// Forget an invocation. A check still running for it is killed first, so
+    /// nothing it started outlives the invocation.
     fn remove(&self, task_id: &u64) {
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.remove(task_id);
+        let removed = match self.entries.lock() {
+            Ok(mut entries) => entries.remove(task_id),
+            Err(_) => None,
+        };
+        if let Some(entry) = removed {
+            entry.cancel.store(true, Ordering::Release);
+            let give_up = Instant::now() + Duration::from_secs(5);
+            while entry.checking.load(Ordering::Acquire) && Instant::now() < give_up {
+                thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 
@@ -1513,6 +1591,9 @@ impl InvocationRegistry {
                 if invocation.record.completed {
                     bail!("invocation '{}' is already complete", invocation.record.id);
                 }
+                if invocation.checking.load(Ordering::Acquire) {
+                    bail!("the completion check is running; wait for its result before changing writes");
+                }
                 if resolve_name(&invocation.record.state_types, &args.port).is_some() {
                     bail!(
                         "'{}' is the team's state, not a port; set it with omar_set_state",
@@ -1536,6 +1617,9 @@ impl InvocationRegistry {
                 validate_invocation_owner(team, agent, &invocation.record)?;
                 if invocation.record.completed {
                     bail!("invocation '{}' is already complete", invocation.record.id);
+                }
+                if invocation.checking.load(Ordering::Acquire) {
+                    bail!("the completion check is running; wait for its result before changing writes");
                 }
                 let state = &invocation.record.state_types;
                 let Some((name, ty)) = resolve_name(state, &args.name) else {
@@ -1606,19 +1690,123 @@ impl InvocationRegistry {
                         invocation.record.reaction, invocation.record.id
                     )
                 })?;
-                invocation.record.completed = true;
+                let Some(plan) = invocation.record.check.clone() else {
+                    return release(invocation);
+                };
+                if invocation.checking.swap(true, Ordering::AcqRel) {
+                    bail!("the completion check is already running");
+                }
+                let task_id = invocation.record.id;
+                let reaction = invocation.record.reaction.clone();
                 let writes = invocation.record.writes.clone();
-                let completion = invocation
-                    .completion
-                    .take()
-                    .context("invocation completion channel is unavailable")?;
-                completion
-                    .send(writes)
-                    .map_err(|_| anyhow::anyhow!("invocation is no longer active"))?;
-                Ok(json!({"status":"complete"}))
+                let cancel = invocation.cancel.clone();
+                let checking = invocation.checking.clone();
+                // The check can take as long as the task's deadline, so it
+                // runs without the registry: other invocations keep answering.
+                drop(entries);
+                let run = run_check(&plan, task_id, &reaction, &writes, &cancel);
+                if let Some(sink) = self.on_check.get() {
+                    sink(&reaction, task_id, &run);
+                }
+                let mut entries = self
+                    .entries
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("invocation registry lock poisoned"))?;
+                let result = match entries.get_mut(&task_id) {
+                    Some(invocation) if run.passed() => release(invocation),
+                    Some(_) => Err(anyhow::anyhow!("{}", refusal(&run))),
+                    None => Err(anyhow::anyhow!("invocation is no longer active")),
+                };
+                // Freeze writes until the result is committed under the lock.
+                // Also wake remove() if it cancelled this invocation meanwhile.
+                checking.store(false, Ordering::Release);
+                result
             }
         }
     }
+}
+
+/// Accept a completion: its writes are released to the run.
+fn release(invocation: &mut InvocationEntry) -> Result<Value> {
+    invocation.record.completed = true;
+    let writes = invocation.record.writes.clone();
+    let completion = invocation
+        .completion
+        .take()
+        .context("invocation completion channel is unavailable")?;
+    completion
+        .send(writes)
+        .map_err(|_| anyhow::anyhow!("invocation is no longer active"))?;
+    Ok(json!({"status":"complete"}))
+}
+
+/// Run a task's check with the worker's environment (OMAR's own, as the worker
+/// inherits it, with the same `OMAR_WORKTREE`, `OMAR_TEMP` and `TMPDIR`) plus the
+/// task and what it has written so far. The writes go in a JSON file, `OMAR_EFFECTS`, rather
+/// than variables: a value can be larger than the environment allows.
+fn run_check(
+    plan: &CheckPlan,
+    task_id: u64,
+    reaction: &str,
+    writes: &BTreeMap<String, Value>,
+    cancel: &AtomicBool,
+) -> crate::check::CheckRun {
+    let effects = plan.temp.join(format!("omar-effects-{task_id}.json"));
+    let env = vec![
+        (
+            "OMAR_WORKTREE".to_string(),
+            plan.worktree.display().to_string(),
+        ),
+        ("OMAR_TEMP".to_string(), plan.temp.display().to_string()),
+        ("TMPDIR".to_string(), plan.temp.display().to_string()),
+        ("OMAR_TASK_ID".to_string(), task_id.to_string()),
+        ("OMAR_REACTION".to_string(), reaction.to_string()),
+        ("OMAR_EFFECTS".to_string(), effects.display().to_string()),
+    ];
+    let written = fs::create_dir_all(&plan.temp)
+        .and_then(|_| fs::write(&effects, serde_json::to_vec(writes).unwrap_or_default()));
+    let run = match written {
+        Ok(()) => crate::check::run(&plan.command, &plan.worktree, &env, plan.deadline, cancel),
+        Err(error) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as u64);
+            crate::check::CheckRun {
+                started_ms: now,
+                ended_ms: now,
+                outcome: crate::check::CheckOutcome::Failed,
+                exit_code: None,
+                output: format!("could not write {}: {error}", effects.display()),
+                truncated: false,
+            }
+        }
+    };
+    let _ = fs::remove_file(&effects);
+    run
+}
+
+/// What the agent is told when its completion is refused: the check's output
+/// and that its writes stand, so it can fix the cause and call again.
+fn refusal(run: &crate::check::CheckRun) -> String {
+    use crate::check::CheckOutcome;
+    let headline = match (run.outcome, run.exit_code) {
+        (CheckOutcome::TimedOut, _) => {
+            "completion refused: the check was still running at the task's deadline and was killed"
+                .to_string()
+        }
+        (CheckOutcome::Cancelled, _) => "completion refused: the invocation ended".to_string(),
+        (_, Some(code)) => format!("completion refused: the check failed (exit {code})"),
+        (_, None) => "completion refused: the check failed".to_string(),
+    };
+    let truncated = if run.truncated {
+        format!(" [only the last {} bytes]", crate::check::OUTPUT_LIMIT)
+    } else {
+        String::new()
+    };
+    format!(
+        "{headline}. The task is still open and your writes are kept; fix the cause, change any writes, then call omar_complete again, which re-runs the check.\n--- check output{truncated} ---\n{}",
+        run.output
+    )
 }
 
 struct InvocationServer {
@@ -1646,9 +1834,14 @@ impl InvocationServer {
                     break;
                 }
                 match connection {
+                    // One thread each: a completion waits on its check, and the
+                    // other invocations must keep answering meanwhile.
                     Ok(stream) => {
-                        let _ =
-                            serve_invocation_connection(stream, &thread_token, &thread_registry);
+                        let token = thread_token.clone();
+                        let registry = thread_registry.clone();
+                        thread::spawn(move || {
+                            let _ = serve_invocation_connection(stream, &token, &registry);
+                        });
                     }
                     Err(_) if thread_shutdown.load(Ordering::Acquire) => break,
                     Err(_) => continue,
@@ -1717,7 +1910,13 @@ fn send_invocation_command(
 ) -> Result<Value> {
     let mut stream = TcpStream::connect(&context.endpoint)
         .with_context(|| format!("topology runtime '{}' is unavailable", context.endpoint))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // A completion waits on the task's check, which the service bounds by the
+    // task's deadline; everything else answers at once.
+    let read_timeout = match command {
+        InvocationCommand::Complete(_) => None,
+        _ => Some(Duration::from_secs(5)),
+    };
+    stream.set_read_timeout(read_timeout)?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let request = InvocationRequest {
         token: context.token.clone(),
@@ -2152,6 +2351,11 @@ struct InvocationSpec {
     /// What the program allows this invocation, overriding the run-wide
     /// timeout. `None` means the program said nothing and the run's applies.
     within: Option<Duration>,
+    /// The task's completion check, if it has one.
+    check: Option<String>,
+    /// The instance workspace (worktree, temp) a check runs in, filled in by
+    /// the dispatcher, which knows the workspaces.
+    workspace: Option<(PathBuf, PathBuf)>,
 }
 
 trait ReactionExecutor: Sync {
@@ -2290,6 +2494,7 @@ fn invocation_record(team: &str, invocation: &InvocationSpec) -> Result<Invocati
         prompt: render_prompt(&invocation.prompt, &prompt_values(invocation))?,
         writes: BTreeMap::new(),
         completed: false,
+        check: None,
     })
 }
 
@@ -2307,7 +2512,23 @@ struct AgentReactionExecutor {
 impl ReactionExecutor for AgentReactionExecutor {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
         let task_id = invocation.id;
-        let record = invocation_record(&self.team, &invocation)?;
+        let deadline = invocation.within.unwrap_or(self.timeout);
+        let expires = Instant::now() + deadline;
+        let check = match (&invocation.check, &invocation.workspace) {
+            (Some(command), Some((worktree, temp))) => Some(CheckPlan {
+                command: command.clone(),
+                worktree: worktree.clone(),
+                temp: temp.clone(),
+                deadline: expires,
+            }),
+            (Some(_), None) => bail!(
+                "reaction '{}' has a check but its instance has no workspace to run it in",
+                invocation.reaction_id
+            ),
+            _ => None,
+        };
+        let mut record = invocation_record(&self.team, &invocation)?;
+        record.check = check;
         let rendered = record.prompt.clone();
         let completion = self.registry.register(record)?;
 
@@ -2330,14 +2551,14 @@ impl ReactionExecutor for AgentReactionExecutor {
             }
         }
 
-        let deadline = invocation.within.unwrap_or(self.timeout);
-        let result = match completion.recv_timeout(deadline) {
-            Ok(writes) => Ok(writes),
-            Err(mpsc::RecvTimeoutError::Timeout) => expired(&invocation, deadline),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-                "topology invocation service stopped unexpectedly"
-            )),
-        };
+        let result =
+            match completion.recv_timeout(expires.saturating_duration_since(Instant::now())) {
+                Ok(writes) => Ok(writes),
+                Err(mpsc::RecvTimeoutError::Timeout) => expired(&invocation, deadline),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                    "topology invocation service stopped unexpectedly"
+                )),
+            };
         self.registry.remove(&task_id);
         result
     }
@@ -2433,6 +2654,13 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
                 return Ok(writes);
             }
         }
+        let mut invocation = invocation;
+        if invocation.check.is_some() {
+            invocation.workspace = self
+                .workspace_dirs
+                .get(&self.state.reactions[&invocation.reaction_id].instance)
+                .cloned();
+        }
         self.agents.invoke(invocation)
     }
 }
@@ -2445,6 +2673,8 @@ struct SandboxExecutor<'a, E> {
     root: &'a Path,
     timeout: Duration,
     host: E,
+    /// Where the check runs a sandbox sends back are reported.
+    checks: InvocationRegistry,
 }
 impl<E: ReactionExecutor> ReactionExecutor for SandboxExecutor<'_, E> {
     fn invoke(&self, mut invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
@@ -2469,10 +2699,39 @@ impl<E: ReactionExecutor> ReactionExecutor for SandboxExecutor<'_, E> {
             .get(&reaction.instance)
             .context("missing team sandbox")?;
         let deadline = invocation.within.unwrap_or(self.timeout);
-        let response = worker.request(
+        let response = worker.exchange(
             serde_json::to_value(&invocation)?,
             deadline.saturating_add(Duration::from_secs(20)),
         )?;
+        // Only this invocation's runs, typed and bounded: the VM is not trusted.
+        let checks = response.get("checks").and_then(Value::as_array);
+        for check in checks.into_iter().flatten() {
+            if check.get("task_id").and_then(Value::as_u64) != Some(invocation.id)
+                || check.get("reaction").and_then(Value::as_str)
+                    != Some(invocation.reaction_id.as_str())
+            {
+                continue;
+            }
+            let Some(Ok(mut run)) = check
+                .get("run")
+                .map(|run| serde_json::from_value::<crate::check::CheckRun>(run.clone()))
+            else {
+                continue;
+            };
+            if run.output.len() > crate::check::OUTPUT_LIMIT {
+                let mut start = run.output.len() - crate::check::OUTPUT_LIMIT;
+                while !run.output.is_char_boundary(start) {
+                    start += 1;
+                }
+                run.output.drain(..start);
+                run.truncated = true;
+            }
+            self.checks
+                .report_check(&invocation.reaction_id, invocation.id, &run);
+        }
+        if let Some(error) = response.get("error") {
+            bail!("sandbox worker: {error}");
+        }
         let writes: BTreeMap<String, Value> = serde_json::from_value(
             response
                 .get("writes")
@@ -2569,6 +2828,17 @@ pub fn sandbox_worker() -> Result<()> {
         program_path: None,
     };
     let server = InvocationServer::start()?;
+    // Check runs go back to the host with each result: the host keeps the
+    // run's check log and diagram stream.
+    let checks = Arc::new(Mutex::new(Vec::new()));
+    let sink = checks.clone();
+    server
+        .registry
+        .set_check_sink(Box::new(move |reaction, task_id, run| {
+            if let Ok(mut runs) = sink.lock() {
+                runs.push(json!({"reaction": reaction, "task_id": task_id, "run": run}));
+            }
+        }));
     let client = TmuxClient::new("omar-team-");
     let workspaces = BTreeMap::from([(init.workspace.instance.clone(), init.workspace.clone())]);
     let mut sessions = BTreeMap::new();
@@ -2609,11 +2879,21 @@ pub fn sandbox_worker() -> Result<()> {
             let bytes = crate::sandbox::read_frame(&mut input)?;
             let invocation: InvocationSpec = serde_json::from_slice(&bytes)?;
             let result = executor.invoke(invocation);
+            let checks: Vec<Value> = checks
+                .lock()
+                .map(|mut runs| std::mem::take(&mut *runs))
+                .unwrap_or_default();
             let reply = match result {
-                Ok(writes) => json!({"protocol": crate::sandbox::PROTOCOL, "writes": writes}),
-                Err(error) => {
-                    json!({"protocol": crate::sandbox::PROTOCOL, "error": format!("{error:#}")})
-                }
+                Ok(writes) => json!({
+                    "protocol": crate::sandbox::PROTOCOL,
+                    "writes": writes,
+                    "checks": checks,
+                }),
+                Err(error) => json!({
+                    "protocol": crate::sandbox::PROTOCOL,
+                    "error": format!("{error:#}"),
+                    "checks": checks,
+                }),
             };
             crate::sandbox::write_frame(&mut std::io::stdout(), &reply)?;
         }
@@ -3152,6 +3432,18 @@ fn launch(
     config: TopologyRunConfig<'_>,
     resume: Option<ResumePlan>,
 ) -> Result<RunOutcome> {
+    if config.sandbox_template.is_some() {
+        for (id, reaction) in &state.reactions {
+            if reaction.check.is_some()
+                && state
+                    .agents
+                    .get(&reaction.agent)
+                    .is_some_and(|agent| is_web_backend(&agent.backend))
+            {
+                bail!("task '{}' has a `check` on a Web agent, which does not run in a sandbox yet; run with --no-sandbox", id);
+            }
+        }
+    }
     let state = state.clone();
     let runtime_dir = deploy::dir_for(config.omar_dir, config.ea_id, &state.team);
     fs::create_dir_all(&runtime_dir)?;
@@ -3307,6 +3599,36 @@ fn launch(
             guard.save(&runtime_dir)?;
         }
         let invocation_server = InvocationServer::start()?;
+        // Each check run is kept beside the deployment record and sent to the
+        // diagram stream, so what an agent was told is auditable afterwards.
+        let check_log = runtime_dir.join("checks.jsonl");
+        if start_state.is_none() {
+            let _ = fs::remove_file(&check_log);
+        }
+        let publisher = diagram_publisher.clone();
+        // Checks of different invocations end concurrently; one writer at a
+        // time, one write per line, so lines never interleave.
+        let writing = Mutex::new(());
+        invocation_server
+            .registry
+            .set_check_sink(Box::new(move |reaction, task_id, run| {
+                let mut line = serde_json::to_value(run).unwrap_or_else(|_| json!({}));
+                line["task_id"] = json!(task_id);
+                line["reaction"] = json!(reaction);
+                let line = format!("{line}\n");
+                if let (Ok(_writing), Ok(mut file)) = (
+                    writing.lock(),
+                    fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&check_log),
+                ) {
+                    let _ = file.write_all(line.as_bytes());
+                }
+                if let Some(publisher) = &publisher {
+                    publisher.check_completed(reaction, &task_id.to_string(), run);
+                }
+            }));
         let mut workers = BTreeMap::new();
         if let Some(template) = config.sandbox_template {
             for (instance, workspace) in &workspaces {
@@ -3419,6 +3741,7 @@ fn launch(
         root: config.omar_dir,
         workers,
         timeout: config.timeout,
+        checks: invocation_server.registry.clone(),
         host: executor,
     };
     let checkpointer = match RunCheckpointer::new(
@@ -4861,6 +5184,8 @@ fn invocation_spec(
         contract: reaction.contract.clone(),
         prompt: reaction.prompt.clone(),
         within: reaction.within.map(Duration::from_nanos),
+        check: reaction.check.clone(),
+        workspace: None,
     })
 }
 
@@ -5694,6 +6019,8 @@ mod tests {
             contract: "out".into(),
             prompt: "Decide.".into(),
             within: None,
+            check: None,
+            workspace: None,
         };
         let message = invocation_message(&spec, "Decide.").unwrap();
         let header: Vec<&str> = message
@@ -6035,6 +6362,7 @@ mod tests {
                     prompt: "prompt".into(),
                     body: None,
                     within: None,
+                    check: None,
                 },
             );
         }
@@ -7994,6 +8322,8 @@ mod tests {
             contract: String::new(),
             prompt: "Notes: $(t.notes)".into(),
             within: None,
+            check: None,
+            workspace: None,
         };
         let record = invocation_record("Shared", &spec).unwrap();
         assert_eq!(record.prompt, "Notes: old");
@@ -9605,5 +9935,335 @@ mod tests {
         let error = run("s.out").unwrap_err().to_string();
         assert!(error.contains("requires an effect"), "{error}");
         assert!(error.contains("its body"), "{error}");
+    }
+
+    type Completion = mpsc::Receiver<BTreeMap<String, Value>>;
+
+    /// A registered invocation of agent `panel` whose completion is judged by
+    /// `command`, run in `dir`, and the runs the registry reported.
+    fn checked(
+        registry: &InvocationRegistry,
+        command: &str,
+        dir: &Path,
+        within: Duration,
+    ) -> (Completion, Arc<Mutex<Vec<crate::check::CheckRun>>>) {
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let seen = runs.clone();
+        registry.set_check_sink(Box::new(move |reaction, task_id, run| {
+            assert_eq!((reaction, task_id), ("reaction.0", 21));
+            seen.lock().unwrap().push(run.clone());
+        }));
+        let completion = registry
+            .register(InvocationRecord {
+                id: 21,
+                team: "Desk".into(),
+                agent: "panel".into(),
+                reaction: "reaction.0".into(),
+                contract: "answer".into(),
+                allowed_effects: BTreeMap::from([("answer".into(), "string".into())]),
+                trigger_values: BTreeMap::new(),
+                prompt: "answer".into(),
+                writes: BTreeMap::new(),
+                completed: false,
+                check: Some(CheckPlan {
+                    command: command.into(),
+                    worktree: dir.to_path_buf(),
+                    temp: dir.join("temp"),
+                    deadline: Instant::now() + within,
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        (completion, runs)
+    }
+
+    fn set_answer(registry: &InvocationRegistry, value: &str) -> Result<Value> {
+        registry.execute(
+            "Desk",
+            "panel",
+            InvocationCommand::SetPort(SetPortArgs {
+                task_id: 21,
+                port: "answer".into(),
+                value: json!(value),
+            }),
+        )
+    }
+
+    fn complete(registry: &InvocationRegistry) -> Result<Value> {
+        registry.execute(
+            "Desk",
+            "panel",
+            InvocationCommand::Complete(CompleteArgs {
+                task_id: 21,
+                keep: vec![],
+            }),
+        )
+    }
+
+    #[test]
+    fn a_failing_check_refuses_with_its_output_and_a_fixed_answer_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InvocationRegistry::default();
+        // Passes only for the right answer, read the way a check would: from
+        // the file `OMAR_EFFECTS` names.
+        let (completion, runs) = checked(
+            &registry,
+            "grep -q right \"$OMAR_EFFECTS\" || { echo \"task $OMAR_TASK_ID in $OMAR_REACTION: $(cat \"$OMAR_EFFECTS\")\" >&2; exit 4; }",
+            dir.path(),
+            Duration::from_secs(30),
+        );
+        set_answer(&registry, "wrong").unwrap();
+
+        let refusal = complete(&registry).unwrap_err().to_string();
+        assert!(refusal.contains("check failed (exit 4)"), "{refusal}");
+        assert!(
+            refusal.contains("task 21 in reaction.0: {\"answer\":\"wrong\"}"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("call omar_complete again"), "{refusal}");
+        // Nothing was released, and the invocation is still open and pending.
+        assert!(completion.try_recv().is_err());
+        let pending = registry
+            .execute("Desk", "panel", InvocationCommand::Pending)
+            .unwrap();
+        assert_eq!(pending["pending"].as_array().unwrap().len(), 1);
+        // The effects file does not outlive the run.
+        assert!(!dir.path().join("temp/omar-effects-21.json").exists());
+
+        // Writes can still change; the second completion re-runs the check.
+        set_answer(&registry, "right").unwrap();
+        assert_eq!(complete(&registry).unwrap()["status"], json!("complete"));
+        assert_eq!(completion.try_recv().unwrap()["answer"], json!("right"));
+        // Released once.
+        assert!(completion.try_recv().is_err());
+        assert_eq!(
+            complete(&registry).unwrap()["status"],
+            json!("already_complete")
+        );
+
+        // Both runs were reported, in order.
+        let runs = runs.lock().unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].exit_code, Some(4));
+        assert!(runs[0].output.contains("task 21"));
+        assert_eq!(runs[1].exit_code, Some(0));
+    }
+
+    #[test]
+    fn a_contract_failure_is_refused_before_the_check_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InvocationRegistry::default();
+        let (_completion, runs) = checked(&registry, "true", dir.path(), Duration::from_secs(30));
+        // `answer` is required and unset.
+        assert!(complete(&registry).is_err());
+        assert!(runs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn writes_are_frozen_while_the_check_runs_and_other_calls_still_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InvocationRegistry::default();
+        let (completion, _runs) = checked(
+            &registry,
+            "echo started > running; while [ ! -e go ]; do sleep 0.01; done",
+            dir.path(),
+            Duration::from_secs(30),
+        );
+        set_answer(&registry, "v").unwrap();
+        let background = registry.clone();
+        let waiting = thread::spawn(move || complete(&background));
+        while !dir.path().join("running").exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let error = set_answer(&registry, "changed").unwrap_err().to_string();
+        assert!(error.contains("check is running"), "{error}");
+        // A state write is a write the check would judge too.
+        let error = registry
+            .execute(
+                "Desk",
+                "panel",
+                InvocationCommand::SetState(SetStateArgs {
+                    task_id: 21,
+                    name: "notes".into(),
+                    value: json!("changed"),
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("check is running"), "{error}");
+        assert!(complete(&registry).is_err());
+        // The registry is not held: this answers while the check runs.
+        registry
+            .execute("Desk", "panel", InvocationCommand::Pending)
+            .unwrap();
+        fs::write(dir.path().join("go"), "").unwrap();
+        assert!(waiting.join().unwrap().is_ok());
+        assert_eq!(completion.try_recv().unwrap()["answer"], json!("v"));
+    }
+
+    #[test]
+    fn check_writes_stay_frozen_if_committing_cannot_acquire_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InvocationRegistry::default();
+        let (completion, _) = checked(&registry, "true", dir.path(), Duration::from_secs(30));
+        set_answer(&registry, "checked").unwrap();
+        let checking = registry.entries.lock().unwrap()[&21].checking.clone();
+        // Poison the mutex after the shell passes, exactly where completion
+        // must re-acquire it. No timing or competing lock acquisition needed.
+        let entries = registry.entries.clone();
+        let registry = InvocationRegistry {
+            entries,
+            ..Default::default()
+        };
+        let poison = registry.entries.clone();
+        registry.set_check_sink(Box::new(move |_, _, _| {
+            let poison = poison.clone();
+            assert!(thread::spawn(move || {
+                let _guard = poison.lock().unwrap();
+                panic!("prevent check commit");
+            })
+            .join()
+            .is_err());
+        }));
+        let error = complete(&registry).unwrap_err().to_string();
+        assert!(error.contains("registry lock poisoned"), "{error}");
+        assert!(
+            checking.load(Ordering::Acquire),
+            "writes thawed before commit"
+        );
+        assert!(completion.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_check_running_at_the_deadline_is_killed_and_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InvocationRegistry::default();
+        let (completion, runs) = checked(
+            &registry,
+            "sh -c 'echo $$ > child.pid; exec sleep 60' & wait",
+            dir.path(),
+            Duration::from_millis(500),
+        );
+        set_answer(&registry, "v").unwrap();
+        let refusal = complete(&registry).unwrap_err().to_string();
+        assert!(
+            refusal.contains("still running at the task's deadline"),
+            "{refusal}"
+        );
+        assert!(completion.try_recv().is_err());
+        let runs = runs.lock().unwrap();
+        assert_eq!(runs[0].outcome, crate::check::CheckOutcome::TimedOut);
+        let pid = fs::read_to_string(dir.path().join("child.pid")).unwrap();
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the check's child {pid} outlived the deadline");
+    }
+
+    #[test]
+    fn ending_the_invocation_kills_a_check_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InvocationRegistry::default();
+        let (_completion, runs) = checked(
+            &registry,
+            "echo $$ > pid; exec sleep 60",
+            dir.path(),
+            Duration::from_secs(60),
+        );
+        set_answer(&registry, "v").unwrap();
+        let background = registry.clone();
+        let waiting = thread::spawn(move || complete(&background));
+        while !dir.path().join("pid").exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        // What the executor does when the invocation expires.
+        registry.remove(&21);
+        let refusal = waiting.join().unwrap().unwrap_err().to_string();
+        assert!(!refusal.is_empty());
+        assert_eq!(
+            runs.lock().unwrap()[0].outcome,
+            crate::check::CheckOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_refusal_keeps_the_end_of_long_output_and_says_it_was_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = InvocationRegistry::default();
+        let (_completion, _runs) = checked(
+            &registry,
+            "yes 0123456789 | head -c 100000; echo; echo FINAL LINE; exit 1",
+            dir.path(),
+            Duration::from_secs(30),
+        );
+        set_answer(&registry, "v").unwrap();
+        let refusal = complete(&registry).unwrap_err().to_string();
+        assert!(refusal.contains("only the last 16384 bytes"), "{refusal}");
+        assert!(refusal.ends_with("FINAL LINE\n"), "{refusal}");
+        assert!(refusal.len() < crate::check::OUTPUT_LIMIT + 600);
+    }
+
+    #[test]
+    fn a_check_is_a_task_clause_the_vm_verifies() {
+        let task = |agent: &str, backend: &str, body: &str, check: &str| {
+            serde_json::from_str::<Bytecode>(&format!(
+                r#"{{"version":1,"team":"Desk","instructions":[
+                  {{"op":"begin_plan","team":"Desk"}},
+                  {{"op":"spawn_agent","name":"panel","backend":"{backend}"}},
+                  {{"op":"define_port","kind":"input","name":"topic","type":"string"}},
+                  {{"op":"define_port","kind":"output","name":"verdict","type":"string"}},
+                  {{"op":"install_reaction","id":"reaction.0","agent":"{agent}",
+                   "triggers":["topic"],"effects":["verdict"],"contract":"verdict",
+                   {body},"check":"{check}"}},
+                  {{"op":"commit_plan"}}]}}"#
+            ))
+            .unwrap()
+        };
+        let state = verify(&task("panel", "Web", r#""prompt":"p""#, "true")).unwrap();
+        assert_eq!(state.reactions["reaction.0"].check.as_deref(), Some("true"));
+        // An invalid runtime root proves refusal happens before launch can
+        // write anything or create a sandbox; no external tools are invoked.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-a-directory");
+        fs::write(&root, "occupied").unwrap();
+        let bytecode = task("panel", "Web", r#""prompt":"p""#, "true");
+        let error = launch(
+            &state,
+            &bytecode,
+            TopologyRunConfig {
+                ea_id: 0,
+                omar_dir: &root,
+                generated: dir.path(),
+                base_prefix: "check-test-",
+                health_idle_warning: 15,
+                sandbox_template: Some("unused@sha256:unused"),
+                inputs: &[],
+                replace: false,
+                timeout: Duration::from_secs(1),
+                pace: Pace::Fast,
+                diagram_address: None,
+                diagram_ready: None,
+                panel_ready: None,
+                checkpoint_policy: None,
+                keep_workspaces: false,
+                program_path: None,
+            },
+            None,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(error, "task 'reaction.0' has a `check` on a Web agent, which does not run in a sandbox yet; run with --no-sandbox");
+        let error = verify(&task("panel", "Web", r#""prompt":"p""#, "  "))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty check"), "{error}");
+        let error = verify(&task("", "Web", r#""prompt":"","body":"x""#, "true"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot have a check"), "{error}");
     }
 }

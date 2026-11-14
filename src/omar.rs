@@ -3,6 +3,7 @@ mod backend;
 mod backend_probe;
 mod backend_runner;
 mod chat_history;
+mod check;
 mod checkpoint;
 mod computer;
 mod config;

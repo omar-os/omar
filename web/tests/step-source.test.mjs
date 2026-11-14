@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { locateStep, replaceStep } from '../app/lib/step-source.ts';
+import { applyDiagramEvent } from '../app/lib/protocol.ts';
 const snapshot = JSON.parse(readFileSync(new URL('./fixtures/diagram-snapshot.v1.json', import.meta.url)));
 const program = `team ReviewFlow[planner:Codex, reviewer:Codex] {
  input request:string
@@ -41,4 +42,22 @@ test('unsupported or ambiguous source remains for the source editor', () => {
  assert.equal(locateStep(program.replace('"Inspect $(plan)."','{= println!("hi"); =}'), snapshot, snapshot.reactions[0]), null);
  assert.equal(locateStep(program, snapshot, {...snapshot.reactions[0], name:'reaction.99'}), null);
  assert.equal(locateStep(program, snapshot, {...snapshot.reactions[0], agent:'agent::unknown'}), null);
+});
+
+test('a completion check after the prompt is neither the prompt nor lost by an edit', () => {
+ const checked = program.replace('"Inspect $(plan)."', '"Inspect $(plan)." check "bash ok.sh"');
+ const step = locateStep(checked, snapshot, snapshot.reactions[1]);
+ assert.equal(step.prompt, 'Inspect $(plan).');
+ const changed = replaceStep(checked, step, { backend:'Codex', prompt:'Look again', triggers:['plan'], contract:'critique' });
+ assert.match(changed, /"Look again" check "bash ok\.sh"/);
+});
+
+test('a check_completed event sets the latest check on its reaction', () => {
+ const target = snapshot.reactions[1];
+ const event = { kind: 'check_completed', tag: null, payload: { reaction: target.id, outcome: 'failed', exit_code: 2 } };
+ const next = applyDiagramEvent(snapshot, event);
+ assert.deepEqual(next.reactions[1].check, { passed: false, exit_code: 2 });
+ assert.equal(next.reactions[0].check, undefined);
+ const passed = applyDiagramEvent(next, { ...event, payload: { ...event.payload, outcome: 'passed', exit_code: 0 } });
+ assert.deepEqual(passed.reactions[1].check, { passed: true, exit_code: 0 });
 });
