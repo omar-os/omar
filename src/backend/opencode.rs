@@ -250,6 +250,17 @@ fn command_model(command: &str) -> Option<String> {
         .map(|pair| pair[1].clone())
 }
 
+/// Nobody answers a permission prompt in a worker, so no rule may be left at
+/// opencode's `ask` default: `external_directory` (paths outside the
+/// workspace) and `read` of `*.env` files. `doom_loop` is denied, not asked.
+fn permission_rules() -> serde_json::Value {
+    serde_json::json!({
+        "doom_loop": "deny",
+        "external_directory": "allow",
+        "read": "allow"
+    })
+}
+
 pub(crate) fn opencode_config_env(
     context: &McpLaunchContext,
     model: Option<&str>,
@@ -285,9 +296,7 @@ pub(crate) fn opencode_config_env(
             }
         },
         "tools": tools,
-        "permission": {
-            "doom_loop": "deny"
-        }
+        "permission": permission_rules()
     });
     if let Some(plugin) = materialize_opencode_coordination_plugin(context) {
         config["plugin"] = serde_json::json!([plugin]);
@@ -619,6 +628,18 @@ mod tests {
             Some("y z")
         );
         assert_eq!(command_model("opencode"), None);
+    }
+
+    #[test]
+    fn config_never_leaves_a_blocking_permission_at_ask() {
+        let rules = permission_rules();
+        assert_eq!(rules["external_directory"], "allow");
+        assert_eq!(rules["read"], "allow");
+        assert!(rules
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|action| action != "ask"));
     }
 
     #[test]
