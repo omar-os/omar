@@ -27,6 +27,8 @@ use crate::ea::EaId;
 use crate::tmux::{DeliveryOptions, TmuxClient};
 use crate::topology::{self, PortKind, TopologyRunConfig, VmState};
 
+mod webhook;
+
 pub const SERVE_PROTOCOL_VERSION: u32 = 1;
 
 /// The diagram server binds early in `run_topology`, so this only covers
@@ -398,6 +400,8 @@ struct Settings {
 }
 
 struct Context_ {
+    webhook_operation: Mutex<()>,
+    webhook_active: AtomicBool,
     history: Arc<Mutex<History>>,
     conversation_id: String,
     omar_dir: PathBuf,
@@ -897,6 +901,8 @@ impl Serve {
             .max_by_key(|run| (run.status.holds_team(), run.started_at))
             .map(|run| run.run_id.clone());
         let context = Arc::new(Context_ {
+            webhook_operation: Mutex::new(()),
+            webhook_active: AtomicBool::new(false),
             history: history.clone(),
             conversation_id: conversation_id.clone(),
             omar_dir: omar_dir.to_path_buf(),
@@ -944,9 +950,45 @@ impl Serve {
             launch_ea: AtomicBool::new(false),
             shutdown,
         });
+        webhook::resume(&context);
+        let known = workspaces
+            .history
+            .lock()
+            .expect("history poisoned")
+            .conversations
+            .iter()
+            .filter_map(|chat| {
+                let root = crate::ea::ea_state_dir(chat.ea_id?, omar_dir);
+                root.join("webhook-inbox.json")
+                    .is_file()
+                    .then(|| chat.id.clone())
+            })
+            .collect::<Vec<_>>();
+        for id in known {
+            let _ = workspaces.get(&id);
+        }
         let shared_workspaces = workspaces.clone();
         listener.set_nonblocking(true)?;
         let running = Arc::new(AtomicBool::new(true));
+        let dispatch_workspaces = workspaces.clone();
+        let dispatch_running = running.clone();
+        thread::spawn(move || {
+            while dispatch_running.load(Ordering::Relaxed) {
+                let contexts = dispatch_workspaces
+                    .contexts
+                    .lock()
+                    .expect("workspaces poisoned")
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for context in contexts {
+                    if let Err(error) = webhook::dispatch(&context) {
+                        eprintln!("Webhook dispatch: {error}");
+                    }
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        });
         let thread_running = running.clone();
         #[cfg(test)]
         let shared = context.clone();
@@ -1433,12 +1475,28 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
     let mut origin = None;
     let mut origin_header = None;
     let mut websocket_key = None;
+    let mut hook_headers = BTreeMap::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 || line == "\r\n" {
             break;
         }
         let lower = line.to_ascii_lowercase();
+        if let Some((name, value)) = line.split_once(':') {
+            let key = name.to_ascii_lowercase();
+            if matches!(
+                key.as_str(),
+                "x-github-delivery" | "x-github-event" | "x-hub-signature-256"
+            ) && hook_headers.insert(key, value.trim().to_owned()).is_some()
+            {
+                return write_json(
+                    &mut stream,
+                    400,
+                    &json!({"error":"Duplicate provider header."}),
+                    None,
+                );
+            }
+        }
         if let Some(value) = lower.strip_prefix("host:") {
             host = Some(value.trim().to_owned());
         }
@@ -1576,7 +1634,12 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
     }
 
-    if path == "/v1/workflow" || path == "/v1/workspaces" || path.starts_with("/v1/workspaces/") {
+    if path == "/v1/webhook-trigger"
+        || path.starts_with("/v1/webhook-deliveries/")
+        || path == "/v1/workflow"
+        || path == "/v1/workspaces"
+        || path.starts_with("/v1/workspaces/")
+    {
         // Workspace reads expose host files; editor launch grants shell access.
         // Reject cross-site requests, including simple POSTs, rather than only
         // withholding CORS headers after executing the operation.
@@ -1591,6 +1654,17 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         if method == "OPTIONS" {
             return write_json(&mut stream, 204, &Value::Null, origin);
+        }
+        if path == "/v1/webhook-trigger" {
+            let (status, body) = webhook::settings(&context, &method, &raw_body);
+            return write_json(&mut stream, status, &body, origin);
+        }
+        if let Some(trigger) = path.strip_prefix("/v1/webhook-deliveries/") {
+            if method != "POST" {
+                return write_json(&mut stream, 405, &json!({"error":"POST required."}), origin);
+            }
+            let (status, body) = webhook::accept(&context, trigger, &hook_headers, &raw_body);
+            return write_json(&mut stream, status, &body, origin);
         }
         if path == "/v1/workflow" {
             let _operation = (method == "POST").then(|| {
@@ -2188,7 +2262,12 @@ fn view_refusal(method: &str, path: &str) -> Option<&'static str> {
     let route = path.split_once('?').map_or(path, |(route, _)| route);
     let panel = route.starts_with("/v1/runs/") && route.ends_with("/panel");
     let workspaces = route == "/v1/workspaces" || route.starts_with("/v1/workspaces/");
-    (method != "GET" || panel || workspaces).then_some("read-only view")
+    (method != "GET"
+        || panel
+        || workspaces
+        || route == "/v1/webhook-trigger"
+        || route.starts_with("/v1/webhook-deliveries/"))
+    .then_some("read-only view")
 }
 
 /// Forward one read to a run's diagram server, which binds loopback only, and
@@ -2650,12 +2729,13 @@ impl Workspaces {
             .cloned()
             .collect();
         let active = contexts.iter().any(|context| {
-            context
-                .runs
-                .lock()
-                .expect("runs poisoned")
-                .values()
-                .any(|run| run.status.is_active())
+            webhook::armed(context)
+                || context
+                    .runs
+                    .lock()
+                    .expect("runs poisoned")
+                    .values()
+                    .any(|run| run.status.is_active())
         });
         if !presence.shutdown_due(
             Instant::now(),
@@ -2736,6 +2816,8 @@ impl Workspaces {
             .max_by_key(|run| (run.status.holds_team(), run.started_at))
             .map(|run| run.run_id.clone());
         let context = Arc::new(Context_ {
+            webhook_operation: Mutex::new(()),
+            webhook_active: AtomicBool::new(false),
             history: self.history.clone(),
             conversation_id: id.to_string(),
             omar_dir: self.settings.omar_dir.clone(),
@@ -2765,6 +2847,7 @@ impl Workspaces {
             address: self.settings.address,
             shutdown: self.shutdown.clone(),
         });
+        webhook::resume(&context);
         contexts.insert(id.to_string(), context.clone());
         Ok(context)
     }
@@ -3472,6 +3555,10 @@ fn write_chat_event(stream: &mut TcpStream, message: &ChatMessage) -> Result<()>
 }
 
 fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
+    start_run_id(context, body, None)
+}
+
+fn start_run_id(context: &Arc<Context_>, body: &[u8], reserved: Option<&str>) -> (u16, Value) {
     let _admission = match context.admit() {
         Ok(admission) => admission,
         Err(error) => return (410, json!({"error":error.to_string()})),
@@ -3506,7 +3593,14 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": "The request belongs to another chat."}),
         );
     }
-    let run_id = Uuid::new_v4().to_string();
+    if let Some(id) = reserved {
+        if run_record_path(context, id).is_file() {
+            return (201, json!({"run_id":id}));
+        }
+    }
+    let run_id = reserved
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
         .join("serve")
         .join(&run_id);
@@ -3602,7 +3696,12 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         state: BTreeMap::new(),
         mutation: None,
     };
-    persist_run(context, &record);
+    if let Err(error) = topology::write_json_atomic(&run_record_path(context, &run_id), &record) {
+        return (
+            500,
+            json!({"error":format!("Could not save the run record: {error}")}),
+        );
+    }
     context
         .runs
         .lock()
