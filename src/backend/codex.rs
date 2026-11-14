@@ -17,6 +17,68 @@ use std::path::{Path, PathBuf};
 pub struct Codex;
 
 impl Backend for Codex {
+    fn turn_monitor(&self, target: &super::Target<'_>) -> Option<Box<dyn super::TurnMonitor>> {
+        let socket = from_stamp(target.stamp?)?;
+        let mut session = CodexSession::open(&socket).ok()?;
+        let thread = session.only_thread().ok()?;
+        let state = session
+            .call(
+                // Resume subscribes this connection to the loaded thread's events.
+                "thread/resume",
+                serde_json::json!({"threadId":thread}),
+            )
+            .ok()?;
+        let ended = completed_turn(&state);
+        let mut inputs: Vec<_> = session
+            .inputs
+            .drain(..)
+            .filter(|input| input["params"]["threadId"] == thread)
+            .collect();
+        if let Some(turn) = state["thread"]["turns"]
+            .as_array()
+            .and_then(|turns| turns.last())
+        {
+            if let Some(items) = turn["items"].as_array() {
+                for item in items
+                    .iter()
+                    .rev()
+                    .take_while(|item| item["type"] != "userMessage")
+                {
+                    if async_question(item) {
+                        inputs.push(serde_json::json!({"method":"item/completed","params":{
+                            "threadId":thread,"turnId":turn["id"],"item":item,
+                        }}));
+                    }
+                }
+            }
+        }
+        session
+            .socket
+            .get_mut()
+            .set_read_timeout(Some(std::time::Duration::from_millis(1)))
+            .ok()?;
+        Some(Box::new(CodexTurnMonitor {
+            session,
+            socket,
+            thread,
+            ended,
+            inputs,
+        }))
+    }
+    fn ended_turn(&self, target: &super::Target<'_>, _hook_file: &Path) -> Option<String> {
+        if target.stamp.and_then(managed::from_stamp).is_some() {
+            return managed::ended_turn(target);
+        }
+        let mut session = CodexSession::open(&from_stamp(target.stamp?)?).ok()?;
+        let thread = session.only_thread().ok()?;
+        let value = session
+            .call(
+                "thread/read",
+                serde_json::json!({"threadId":thread,"includeTurns":true}),
+            )
+            .ok()?;
+        completed_turn(&value)
+    }
     fn has_startup_gates(&self) -> bool {
         true
     }
@@ -596,6 +658,144 @@ pub fn codex_socket_path(home: &Path) -> PathBuf {
 pub(crate) struct CodexSession {
     socket: tungstenite::WebSocket<UnixStream>,
     next_id: u64,
+    inputs: Vec<serde_json::Value>,
+}
+
+fn completed_turn(value: &serde_json::Value) -> Option<String> {
+    let thread = &value["thread"];
+    if thread["status"]["type"] != "idle" {
+        return None;
+    }
+    let turn = thread["turns"].as_array()?.last()?;
+    (turn["status"] == "completed")
+        .then(|| turn["id"].as_str().map(str::to_owned))
+        .flatten()
+}
+
+struct CodexTurnMonitor {
+    session: CodexSession,
+    socket: PathBuf,
+    thread: String,
+    ended: Option<String>,
+    inputs: Vec<serde_json::Value>,
+}
+
+fn async_question(item: &serde_json::Value) -> bool {
+    item["type"] == "agentMessage"
+        && item["delivery"] == "async"
+        && item["questions"]
+            .as_array()
+            .is_some_and(|questions| !questions.is_empty())
+}
+
+impl super::TurnMonitor for CodexTurnMonitor {
+    fn ended_turn(&mut self) -> Option<String> {
+        loop {
+            match self.session.socket.read() {
+                Ok(tungstenite::Message::Text(body)) => {
+                    let Ok(event) = serde_json::from_str::<serde_json::Value>(&body) else {
+                        continue;
+                    };
+                    if event["params"]["threadId"] != self.thread {
+                        continue;
+                    }
+                    match event["method"].as_str() {
+                        // Nonmodal questions in Default mode still await a reply.
+                        Some("item/tool/requestUserInput") => self.inputs.push(event),
+                        Some("item/completed") if async_question(&event["params"]["item"]) => {
+                            self.inputs.push(event)
+                        }
+                        Some("item/started")
+                            if event["params"]["item"]["type"] == "userMessage" =>
+                        {
+                            self.inputs
+                                .retain(|input| input["method"] != "item/completed");
+                        }
+                        Some("serverRequest/resolved") => self
+                            .inputs
+                            .retain(|input| input["id"] != event["params"]["requestId"]),
+                        Some("turn/started") => self.ended = None,
+                        Some("turn/completed")
+                            if event["params"]["turn"]["status"] == "completed" =>
+                        {
+                            self.inputs
+                                .retain(|input| input["method"] == "item/completed");
+                            self.ended = event["params"]["turn"]["id"].as_str().map(str::to_owned);
+                        }
+                        Some("thread/status/changed")
+                            if event["params"]["status"]["type"] != "idle" =>
+                        {
+                            self.ended = None
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break
+                }
+                Err(_) => {
+                    self.ended = None;
+                    break;
+                }
+            }
+        }
+        self.ended.clone()
+    }
+
+    fn blocked_input(&self) -> Option<String> {
+        self.inputs.first().map(|input| {
+            if input["method"] == "item/completed" {
+                format!(
+                    "async:{}:{}",
+                    input["params"]["turnId"], input["params"]["item"]["id"]
+                )
+            } else {
+                format!("{}:{}", input["id"], input["params"]["itemId"])
+            }
+        })
+    }
+
+    fn answer_input(&mut self, id: &str, text: &str) -> Result<bool> {
+        let Some(input) = self
+            .inputs
+            .first()
+            .filter(|_| self.blocked_input().as_deref() == Some(id))
+        else {
+            return Ok(false);
+        };
+        if input["method"] == "item/completed" {
+            // User input wakes sleep and dismisses async questions on every client.
+            CodexSession::open(&self.socket)?.call(
+                "turn/start",
+                serde_json::json!({
+                    "threadId":self.thread,"input":[{"type":"text","text":text}],
+                }),
+            )?;
+            self.inputs
+                .retain(|input| input["method"] != "item/completed");
+            return Ok(true);
+        }
+        let answers: serde_json::Map<String, serde_json::Value> = input["params"]["questions"]
+            .as_array()
+            .context("question request omitted questions")?
+            .iter()
+            .filter_map(|question| {
+                question["id"]
+                    .as_str()
+                    .map(|id| (id.to_owned(), serde_json::json!({"answers":[text]})))
+            })
+            .collect();
+        self.session
+            .send(serde_json::json!({"id":input["id"],"result":{"answers":answers}}))?;
+        self.inputs.remove(0);
+        Ok(true)
+    }
 }
 
 impl CodexSession {
@@ -622,7 +822,11 @@ impl CodexSession {
             }
         })?;
 
-        let mut session = CodexSession { socket, next_id: 1 };
+        let mut session = CodexSession {
+            socket,
+            next_id: 1,
+            inputs: Vec::new(),
+        };
         session
             .call(
                 "initialize",
@@ -631,7 +835,8 @@ impl CodexSession {
                         "name": "omar",
                         "title": "omar",
                         "version": env!("CARGO_PKG_VERSION"),
-                    }
+                    },
+                    "capabilities": {"experimentalApi":true},
                 }),
             )
             .context("initialize the app-server session")?;
@@ -675,7 +880,15 @@ impl CodexSession {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
                 continue;
             };
-            if value.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
+            if value["method"] == "item/tool/requestUserInput" {
+                self.inputs.push(value.clone());
+            } else if value["method"] == "serverRequest/resolved" {
+                self.inputs
+                    .retain(|input| input["id"] != value["params"]["requestId"]);
+            }
+            if value.get("method").is_some()
+                || value.get("id").and_then(serde_json::Value::as_u64) != Some(id)
+            {
                 continue;
             }
             if let Some(error) = value.get("error") {
@@ -955,6 +1168,78 @@ mod tests {
             std::fs::read_to_string(history).unwrap(),
             "persistent conversation"
         );
+    }
+
+    #[test]
+    fn a_resumed_nonmodal_question_is_answered_on_its_own_request() {
+        let dir = short_tempdir();
+        let path = dir.path().join("input.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let read = |socket: &mut tungstenite::WebSocket<UnixStream>| -> serde_json::Value {
+                let message = socket.read().unwrap();
+                serde_json::from_str(message.to_text().unwrap()).unwrap()
+            };
+            let send = |socket: &mut tungstenite::WebSocket<UnixStream>,
+                        value: serde_json::Value| {
+                socket
+                    .send(tungstenite::Message::Text(value.to_string()))
+                    .unwrap();
+            };
+            let init = read(&mut socket);
+            assert_eq!(init["params"]["capabilities"]["experimentalApi"], true);
+            send(
+                &mut socket,
+                serde_json::json!({"id":init["id"],"result":{}}),
+            );
+            assert_eq!(read(&mut socket)["method"], "initialized");
+            let list = read(&mut socket);
+            send(
+                &mut socket,
+                serde_json::json!({"id":list["id"],"result":{"data":["own"]}}),
+            );
+            let resume = read(&mut socket);
+            assert_eq!(resume["method"], "thread/resume");
+            for (id, thread) in [
+                (resume["id"].as_u64().unwrap(), "own"),
+                (43, "another-task"),
+                (44, "own"),
+            ] {
+                send(
+                    &mut socket,
+                    serde_json::json!({"id":id,"method":"item/tool/requestUserInput","params":{
+                    "threadId":thread,"turnId":"turn","itemId":"question","isBlocking":false,
+                    "questions":[{"id":"audience"},{"id":"length"}]}}),
+                );
+            }
+            send(
+                &mut socket,
+                serde_json::json!({"id":resume["id"],"result":{"thread":{"status":{"type":"active"},"turns":[]}}}),
+            );
+            (read(&mut socket), resume["id"].clone())
+        });
+        let stamp = format!("codex:{}", path.display());
+        let mut monitor = Codex
+            .turn_monitor(&super::super::Target {
+                name: "worker",
+                pane_pid: 0,
+                stamp: Some(&stamp),
+            })
+            .unwrap();
+        let id = monitor.blocked_input().unwrap();
+        assert!(!monitor.answer_input("another-request", "wrong").unwrap());
+        assert!(monitor.answer_input(&id, "OMAR REMINDER").unwrap());
+        assert!(monitor.blocked_input().unwrap().starts_with("44:"));
+        let (answer, request_id) = server.join().unwrap();
+        assert_eq!(answer["id"], request_id);
+        for id in ["audience", "length"] {
+            assert_eq!(
+                answer["result"]["answers"][id]["answers"],
+                serde_json::json!(["OMAR REMINDER"])
+            );
+        }
     }
 
     /// Play the app-server's half of one delivery and report what it was

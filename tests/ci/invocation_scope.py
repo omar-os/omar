@@ -196,7 +196,13 @@ channel.listen()
 while True:
     conn = channel.accept()[0]
     message = json.loads(conn.makefile().readline())
-    if message.get("session") is True:
+    if message.get("input") is True:
+        conn.sendall(b'{"blocked":null}\n')
+        conn.close()
+    elif message.get("turn") is True:
+        conn.sendall(b'{"ended":null}\n')
+        conn.close()
+    elif message.get("session") is True:
         conn.sendall((json.dumps({"session": None, "id": session}) + "\n").encode())
         conn.close()
     else:

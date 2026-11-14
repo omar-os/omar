@@ -2419,6 +2419,29 @@ struct AgentReactionExecutor {
 
 pub(crate) const MAX_TASK_RETRIES: u32 = 2;
 const WORKER_POLL: Duration = Duration::from_millis(250);
+const TURN_GRACE: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct TaskTurnWatch {
+    seen: Option<String>,
+    idle: Option<(String, Instant)>,
+    reminded: bool,
+}
+
+impl TaskTurnWatch {
+    fn stopped(&mut self, ended: Option<String>, now: Instant) -> bool {
+        let Some(ended) = ended.filter(|id| Some(id) != self.seen.as_ref()) else {
+            self.idle = None;
+            return false;
+        };
+        let (id, since) = self.idle.get_or_insert_with(|| (ended.clone(), now));
+        if *id != ended {
+            *id = ended;
+            *since = now;
+        }
+        now.duration_since(*since) >= TURN_GRACE
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{reason}")]
@@ -2552,9 +2575,15 @@ impl AgentReactionExecutor {
         retries: u32,
     ) -> Result<(BTreeMap<String, Value>, bool)> {
         let started = Instant::now();
+        let mut turns = TaskTurnWatch::default();
         if !self.web.contains(&invocation.agent) {
             if let Some(window) = window.as_deref_mut() {
-                self.watch_worker(window)?;
+                self.watch_worker(window, None)?;
+                let ended = window.ended_turn(&self.client);
+                turns.seen = window
+                    .blocked_input(&self.client)
+                    .map(|id| format!("input:{id}"))
+                    .or(ended);
             }
             let mut message = invocation_message(invocation, rendered)?;
             if retries > 0 {
@@ -2575,7 +2604,7 @@ impl AgentReactionExecutor {
             if !self.registry.answered(&invocation.id) {
                 if let Some(window) = window.as_deref_mut() {
                     if delivery.is_err() {
-                        self.watch_worker(window)?;
+                        self.watch_worker(window, None)?;
                     }
                 }
                 delivery
@@ -2592,7 +2621,7 @@ impl AgentReactionExecutor {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if let Some(window) = window.as_deref_mut() {
-                let status = self.watch_worker(window);
+                let status = self.watch_worker(window, Some((invocation, &mut turns)));
                 // Completion can race the process observation. A worker that
                 // completed before exiting has already answered this task.
                 if let Ok(writes) = completion.try_recv() {
@@ -2608,7 +2637,11 @@ impl AgentReactionExecutor {
     }
 
     /// The single periodic check for an open task's worker.
-    fn watch_worker(&self, window: &mut Window) -> Result<()> {
+    fn watch_worker(
+        &self,
+        window: &mut Window,
+        task: Option<(&InvocationSpec, &mut TaskTurnWatch)>,
+    ) -> Result<()> {
         let tree = if self.client.has_session(&window.session)? {
             self.client
                 .session_process_tree(&window.session)
@@ -2635,6 +2668,60 @@ impl AgentReactionExecutor {
         window.tree.sort_unstable();
         window.tree.dedup();
         window.observe_conversation(&self.client);
+        if let Some((invocation, turns)) = task {
+            let ended = window.ended_turn(&self.client);
+            let input = window.blocked_input(&self.client);
+            let stopped = input.as_ref().map(|id| format!("input:{id}")).or(ended);
+            // Usage-limit waiting can veto recovery here alongside completion.
+            if !self.registry.answered(&invocation.id) && turns.stopped(stopped, Instant::now()) {
+                if turns.reminded {
+                    return Err(WorkerDied {
+                        reason: "stopped without finishing after a reminder".into(),
+                        conversation: window.conversation.clone(),
+                    }
+                    .into());
+                }
+                let message = format!(
+                    "OMAR REMINDER\ntask_id: {}\nYour task is still open. Required output contract: {}. Outputs: {}. Finish the task, set its required outputs with omar_set_port, and call omar_complete with this task_id. No questions will be answered. Continue now.",
+                    invocation.id, invocation.contract, serde_json::to_string(&invocation.effect_names)?,
+                );
+                if let Some(id) = &input {
+                    if !window.answer_input(&self.client, id, &message)? {
+                        return Ok(());
+                    }
+                } else {
+                    self.client.deliver_prompt_until(
+                        &window.session,
+                        &message,
+                        &DeliveryOptions::default(),
+                        &|| self.registry.answered(&invocation.id),
+                    )?;
+                }
+                turns.seen = turns.idle.take().map(|(id, _)| id);
+                turns.reminded = true;
+                window.record["outcome"] = json!("open");
+                let logical_id = window.record["invocations"]
+                    .as_array()
+                    .and_then(|items| items.last())
+                    .map(|item| item["invocation_id"].clone());
+                let reminders = window
+                    .record
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("reminders")
+                    .or_insert_with(|| json!([]));
+                reminders.as_array_mut().unwrap().push(json!({
+                    "task_id": invocation.id, "reaction": invocation.reaction_id,
+                    "invocation_id": logical_id,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "reason": if input.is_some() { "asked the user a question" } else { "stopped without finishing" },
+                }));
+                if let Some(workers) = &self.scoped {
+                    workers.record(&window.record);
+                    workers.publish(&window.agent, &window.record);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -2719,9 +2806,66 @@ struct Window {
     failed: bool,
     /// What `attempts.jsonl` holds for it.
     record: Value,
+    turn_file: PathBuf,
+    turn_monitor: Option<Box<dyn crate::backend::TurnMonitor>>,
 }
 
 impl Window {
+    fn blocked_input(&self, client: &TmuxClient) -> Option<String> {
+        if let Some(monitor) = &self.turn_monitor {
+            return monitor.blocked_input();
+        }
+        let backend = crate::backend::by_name(self.record["backend"].as_str()?)?;
+        let stamp = client.session_delivery(&self.session);
+        backend.blocked_input(
+            &crate::backend::Target {
+                name: &self.session,
+                pane_pid: client.get_pane_pid(&self.session).ok()?,
+                stamp: stamp.as_deref(),
+            },
+            &self.turn_file,
+        )
+    }
+
+    fn answer_input(&mut self, client: &TmuxClient, id: &str, text: &str) -> Result<bool> {
+        if let Some(monitor) = &mut self.turn_monitor {
+            return monitor.answer_input(id, text);
+        }
+        let backend = crate::backend::by_name(
+            self.record["backend"]
+                .as_str()
+                .context("worker has no backend")?,
+        )
+        .context("unknown worker backend")?;
+        let stamp = client.session_delivery(&self.session);
+        backend.answer_input(
+            &crate::backend::Target {
+                name: &self.session,
+                pane_pid: client.get_pane_pid(&self.session)?,
+                stamp: stamp.as_deref(),
+            },
+            &self.turn_file,
+            id,
+            text,
+        )
+    }
+
+    fn ended_turn(&mut self, client: &TmuxClient) -> Option<String> {
+        let backend = crate::backend::by_name(self.record["backend"].as_str()?)?;
+        let stamp = client.session_delivery(&self.session);
+        let target = crate::backend::Target {
+            name: &self.session,
+            pane_pid: client.get_pane_pid(&self.session).ok()?,
+            stamp: stamp.as_deref(),
+        };
+        if self.turn_monitor.is_none() {
+            self.turn_monitor = backend.turn_monitor(&target);
+        }
+        match self.turn_monitor.as_mut() {
+            Some(monitor) => monitor.ended_turn(),
+            None => backend.ended_turn(&target, &self.turn_file),
+        }
+    }
     fn observe_conversation(&mut self, client: &TmuxClient) {
         if self.record["lifetime"].is_null() {
             if let Some(native) = worker_conversation(client, &self.session) {
@@ -2955,6 +3099,14 @@ impl ScopedWorkers {
             *slot = Some(self.open(invocation, attempt, retries)?);
         }
         let window = slot.as_mut().context("agent has no open window")?;
+        if !fresh {
+            window.record["invocations"]
+                .as_array_mut()
+                .context("window record has no invocations")?
+                .push(served_invocation(invocation));
+            self.record(&window.record);
+            self.publish(&window.agent, &window.record);
+        }
         let result = (|| -> Result<(BTreeMap<String, Value>, bool)> {
             if !fresh && agent.lifetime.is_some() {
                 self.same_conversation(window, backend)?;
@@ -2971,12 +3123,6 @@ impl ScopedWorkers {
             }
             Ok((writes, timed_out))
         })();
-        if !fresh {
-            window.record["invocations"]
-                .as_array_mut()
-                .context("window record has no invocations")?
-                .push(served_invocation(invocation));
-        }
         let lifetime = agent.lifetime;
         match result {
             Ok((writes, true)) => {
@@ -3155,6 +3301,14 @@ impl ScopedWorkers {
                 // Mission Control shows the window as soon as it is proved.
                 self.publish(&invocation.agent, &record);
                 Ok(Window {
+                    turn_monitor: None,
+                    turn_file: manager::topology_turn_file(
+                        &self.launcher.omar_dir,
+                        self.launcher.ea_id,
+                        &self.launcher.team,
+                        &invocation.agent,
+                        agent.lifetime.map(|_| attempt.id.as_str()),
+                    ),
                     agent: invocation.agent.clone(),
                     attempt: attempt.clone(),
                     session,
@@ -3458,7 +3612,10 @@ impl ScopedWorkers {
 }
 
 fn unscoped_without_restart(record: &Value) -> bool {
-    record["verification"] == "unscoped" && record["retry"] == 0 && record["outcome"] != "died"
+    record["verification"] == "unscoped"
+        && record["retry"] == 0
+        && record["outcome"] != "died"
+        && record["reminders"].as_array().is_none_or(Vec::is_empty)
 }
 
 /// Every conversation an attempt recorded in `log`, in this run or an earlier
@@ -11261,6 +11418,8 @@ mod tests {
                 conversation: String::new(),
                 used,
                 failed: false,
+                turn_file: PathBuf::new(),
+                turn_monitor: None,
                 record: json!({"logical_agent": agent}),
             });
         }
@@ -11589,6 +11748,8 @@ mod tests {
             conversation: String::new(),
             used: Used::first(invocation.tag),
             failed: false,
+            turn_file: PathBuf::new(),
+            turn_monitor: None,
             record: json!({"attempt_id": attempt.id, "outcome": "started"}),
         });
         workers.states.get_mut("coder").unwrap().lifetime = Some(life(LifetimeUnit::Tag, 1));
@@ -11675,10 +11836,10 @@ mod tests {
             web: BTreeSet::new(),
             scoped: None,
         };
-        let error = executor.watch_worker(&mut window).unwrap_err();
+        let error = executor.watch_worker(&mut window, None).unwrap_err();
         assert_eq!(error.to_string(), "worker process exited");
         executor.scoped = Some(workers);
-        let error = executor.watch_worker(&mut window).unwrap_err();
+        let error = executor.watch_worker(&mut window, None).unwrap_err();
         assert_eq!(error.to_string(), "runtime is shutting down");
         assert!(error.downcast_ref::<WorkerDied>().is_none());
         let workers = executor.scoped.as_ref().unwrap();
@@ -11692,6 +11853,28 @@ mod tests {
         assert!(workers.cleanup_sessions(&sessions).is_empty());
         workers.track("coder", Some(&session)).unwrap();
         assert_eq!(workers.cleanup_sessions(&sessions), sessions);
+    }
+
+    #[test]
+    fn turn_recovery_waits_for_grace_and_ignores_busy_or_earlier_tasks() {
+        let now = Instant::now();
+        let mut watch = TaskTurnWatch {
+            seen: Some("earlier-task".into()),
+            ..Default::default()
+        };
+        assert!(!watch.stopped(Some("earlier-task".into()), now));
+        assert!(!watch.stopped(Some("current-task".into()), now));
+        assert!(!watch.stopped(Some("current-task".into()), now + TURN_GRACE / 2));
+        // Activity during grace cancels the candidate, even on a quiet screen.
+        assert!(!watch.stopped(None, now + TURN_GRACE));
+        assert!(!watch.stopped(Some("current-task".into()), now + TURN_GRACE));
+        assert!(watch.stopped(Some("current-task".into()), now + TURN_GRACE * 2));
+        watch.seen = watch.idle.take().map(|(id, _)| id);
+        watch.reminded = true;
+        assert!(!watch.stopped(Some("current-task".into()), now + TURN_GRACE * 3));
+        assert!(!watch.stopped(Some("reminder-turn".into()), now + TURN_GRACE * 3));
+        assert!(watch.stopped(Some("reminder-turn".into()), now + TURN_GRACE * 4));
+        assert!(watch.reminded);
     }
 
     #[test]

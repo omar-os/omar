@@ -27,6 +27,8 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
   const agent = snapshot.agents.find((item) => item.id === reaction?.agent);
   const attempts = agent?.attempts ?? [];
   const configuration = useMemo(() => reaction ? locateStep(source, snapshot, reaction) : null, [source, snapshot, reaction]);
+  const attemptRows = agent && reaction ? restartRows(attempts, reaction.name) : [];
+  const reminded = attemptRows.some((attempt) => attempt.reminded);
   const name = reaction ? (/(?:^|\.)reaction\.\d+$/.test(reaction.name) ? agent?.name ?? reaction.name : reaction.name) : port?.name ?? timer?.name ?? component;
   const label = (id: string) => snapshot.ports.find((item) => item.id === id)?.name ?? (snapshot.timers ?? []).find((item) => item.id === id)?.name ?? componentName(id);
   const connectionNames = (ids: string[]) => ids.length ? ids.map((id) => <span className="step-connection" key={id}><i />{label(id)}</span>) : <span className="step-empty">None declared</span>;
@@ -45,9 +47,9 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
         <div className="inspector-field"><span>Receives</span>{connectionNames(reaction.triggers)}</div>
         <div className="inspector-field"><span>Produces</span>{connectionNames(reaction.effects)}</div>
         </> : null}
-        {agent && (agent.lifetime || attempts.length > 0) ? <div className="inspector-field"><span>Conversation</span><strong>{agent.lifetime ? `New ${lifetimeLabel(agent.lifetime)}` : "Run conversation"}</strong>{reaction.restarts ? <>
-          <strong className="step-restart-heading">{restartText(reaction.restarts).headline}</strong>
-          <ol className="step-attempts">{restartRows(attempts, reaction.name).map((attempt) => <li key={attempt.id} title={`Attempt ${attempt.id}`}>
+        {agent && (agent.lifetime || attempts.length > 0) ? <div className="inspector-field"><span>Conversation</span><strong>{agent.lifetime ? `New ${lifetimeLabel(agent.lifetime)}` : "Run conversation"}</strong>{reaction.restarts || reminded ? <>
+          {reaction.restarts ? <strong className="step-restart-heading">{restartText(reaction.restarts).headline}</strong> : null}
+          <ol className="step-attempts">{attemptRows.map((attempt) => <li key={attempt.id} title={`Attempt ${attempt.id}`}>
             <p>{attempt.summary}</p>
             <div className="step-attempt-meta">{attempt.session ? <code title={attempt.session}>Session {attempt.session.slice(0, 8)}</code> : null}{attempt.time ? <time dateTime={attempt.time}>{new Date(attempt.time).toLocaleTimeString()}</time> : null}</div>
           </li>)}</ol>
