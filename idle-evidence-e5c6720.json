@@ -1,0 +1,43 @@
+{
+  "mode": "idle",
+  "commit": "e5c6720e7798449b97d4e39cbb76b2d5d7cc1b3a",
+  "binary": "$REPO/.worktrees/idle-escalation/target/debug/omar",
+  "binary_sha256": "ac19046b08e92d990392c4c5628801a6aceca5b0879901790b30dfb987fa1121",
+  "tmux_socket": "omar-demo-d28cc723a219",
+  "receipts": [
+    {
+      "seconds": 5.299,
+      "path": "/session/ses_child/prompt_async",
+      "body": {
+        "parts": [
+          {
+            "synthetic": true,
+            "text": "[EVENT at t=1794628115922970000]\nFrom omar-runtime: OMAR COORDINATION STATE (authoritative runtime state, not conversation memory)\n{\"agent\":\"child\",\"next_offset\":null,\"offset\":0,\"tasks\":[{\"acknowledged\":false,\"agent\":\"child\",\"has_result\":false,\"idle_escalated\":false,\"idle_without_result\":true,\"parent\":\"ea\",\"project_id\":1,\"result_preview\":null,\"result_revision\":0,\"retired\":false,\"status\":\"running\",\"task\":\"Return a durable result\",\"task_id\":\"d26fb610-97de-42a6-9c29-cc09e6529594\"}],\"total_tasks\":1,\"truncated\":false}\nUse finish_task(task_id, status, result) to return your work; the runtime notifies your parent. Read child results and call acknowledge_task(task_id, result_revision) after incorporating each result. If truncated, use coordination_state(offset=next_offset) to inspect remaining tasks. Running children are owned by the runtime; do not create polling timers. If blocked, finish_task with status=blocked and the concrete reason. Retire acknowledged terminal children with kill_agent. Never infer completion from a quiet terminal.\nIdle without a result: child. Report with finish_task, or status=blocked with a concrete reason.",
+            "type": "text"
+          }
+        ]
+      }
+    },
+    {
+      "seconds": 10.38,
+      "path": "/session/ses_parent/prompt_async",
+      "body": {
+        "parts": [
+          {
+            "synthetic": true,
+            "text": "[EVENT at t=1794628121004011000]\nFrom omar-runtime: OMAR COORDINATION STATE (authoritative runtime state, not conversation memory)\n{\"agent\":\"ea\",\"next_offset\":null,\"offset\":0,\"tasks\":[{\"acknowledged\":false,\"agent\":\"child\",\"has_result\":false,\"idle_escalated\":true,\"idle_without_result\":true,\"parent\":\"ea\",\"project_id\":1,\"result_preview\":null,\"result_revision\":0,\"retired\":false,\"status\":\"running\",\"task\":\"Return a durable result\",\"task_id\":\"d26fb610-97de-42a6-9c29-cc09e6529594\"}],\"total_tasks\":1,\"truncated\":false}\nUse finish_task(task_id, status, result) to return your work; the runtime notifies your parent. Read child results and call acknowledge_task(task_id, result_revision) after incorporating each result. If truncated, use coordination_state(offset=next_offset) to inspect remaining tasks. Running children are owned by the runtime; do not create polling timers. If blocked, finish_task with status=blocked and the concrete reason. Retire acknowledged terminal children with kill_agent. Never infer completion from a quiet terminal.\nStalled child: child is still idle without a result after its reminder.",
+            "type": "text"
+          }
+        ]
+      }
+    }
+  ],
+  "duplicate_observation_seconds": 12,
+  "observed_receipts_before_cleanup": 2,
+  "status": "passed",
+  "cleanup": {
+    "processes_stopped": true,
+    "state_removed": true,
+    "tmux_stopped": true
+  }
+}

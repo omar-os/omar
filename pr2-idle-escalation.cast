@@ -1,0 +1,11 @@
+{"version":2,"width":100,"height":25,"timestamp":1793252464,"idle_time_limit":2.0,"command":"python3 /private/tmp/omar-pr-demos/demo.py --mode idle --binary $REPO/.worktrees/idle-escalation/target/debug/omar","title":"OMAR: one-shot idle escalation (waits sped up)","env":{"SHELL":"/bin/zsh"}}
+[0.082341, "o", "\u001b[2J\u001b[HOMAR | One-shot idle escalation\r\nCommit 6eab891 | production target/debug/omar\r\nDedicated tmux socket + disposable OMAR home; no paid model calls.\r\nShell child; local HTTP receipt sink replaces inference only.\r\nAll waits use real wall-clock time; playback waits are sped up.\r\n\r\n"]
+[0.501533, "o", "[   0.4s] spawn_agent: tracked shell child started; parent = ea\r\n"]
+[0.512801, "o", "[   0.5s] No result; child screen goes idle. idle_critical = 2 s.\r\n"]
+[5.576747, "o", "[   5.5s] PASS: child received 1 progress reminder\r\n"]
+[10.689543, "o", "[  10.6s] PASS: parent received exactly 1 idle escalation\r\n"]
+[10.6896, "o", "[  10.6s] Watching 12 s more (6 idle thresholds; sped up).\r\n"]
+[22.694395, "o", "[  22.6s] PASS: no repeat; worker reminders = 1, parent escalations = 1\r\n"]
+[22.695647, "o", "[  22.6s] PASS: task remains running; idleness does not mark it failed\r\n"]
+[23.244134, "o", "[  23.2s] Cleanup: own MCP processes, tmux server and temporary state removed.\r\n"]
+[26.283188, "x", "0"]

@@ -1,0 +1,14 @@
+OMAR | One-shot idle escalation
+Commit e5c6720 | production target/debug/omar
+Dedicated tmux socket + disposable OMAR home; no paid model calls.
+Shell child; local HTTP receipt sink replaces inference only.
+All waits use real wall-clock time; playback waits are sped up.
+
+[   0.2s] spawn_agent: tracked shell child started; parent = ea
+[   0.2s] No result; child screen goes idle. idle_critical = 2 s.
+[   5.3s] PASS: child received 1 progress reminder
+[  10.4s] PASS: parent received exactly 1 idle escalation
+[  10.4s] Watching 12 s more (6 idle thresholds; sped up).
+[  22.4s] PASS: no repeat; worker reminders = 1, parent escalations = 1
+[  22.4s] PASS: task remains running; idleness does not mark it failed
+[  22.9s] Cleanup: own MCP processes, tmux server and temporary state removed.
