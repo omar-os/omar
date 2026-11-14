@@ -169,6 +169,22 @@ def answer(text):
     count = Path(os.environ["RESTART_COUNT"])
     attempt = int(count.read_text()) + 1 if count.exists() else 1
     count.write_text(str(attempt))
+    if os.environ.get("RESTART_CHILDREN"):
+        children = Path(os.environ["RESTART_CHILDREN"])
+        old = [json.loads(line) for line in children.read_text().splitlines()] if children.exists() else []
+        for child in old:
+            write({"event": "detached", "pid": child["pid"], "alive": alive(child["pid"])})
+        if attempt <= int(os.environ["RESTART_DEATHS"]):
+            # Reparent before the worker dies; leave its tree and session,
+            # and keep no workspace files or cwd for macOS's fallback to find.
+            code = "import time; time.sleep(120)"
+            spawn = ("import subprocess,sys; "
+                     f"p=subprocess.Popen([sys.executable, '-c', {code!r}, {str(children)!r}], "
+                     "cwd='/', start_new_session=True, stdin=subprocess.DEVNULL, "
+                     "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); print(p.pid)")
+            pid = int(subprocess.check_output([sys.executable, "-c", spawn], text=True))
+            with children.open("a") as out:
+                out.write(json.dumps({"pid": pid, "attempt": os.environ.get("OMAR_ATTEMPT")}) + "\n")
     if attempt <= int(os.environ["RESTART_DEATHS"]):
         Path(os.environ["RESTART_READY"]).touch()
         while True: time.sleep(.1)
@@ -393,6 +409,8 @@ def configure(root, home, env, backend, server, live):
         shim.chmod(0o700)
         env['PATH'] = str(shims) + ':' + env['PATH']
         env.update(RESTART_READY=str(root / 'ready'), RESTART_COUNT=str(root / 'count'), RESTART_DEATHS=str(server.deaths))
+        if backend == 'Claude':
+            env['RESTART_CHILDREN'] = str(root / 'children.jsonl')
         profile.append(f'export PATH="{shims}:$PATH"')
     elif backend == 'Codex':
         profile.append(f'export PATH={shlex.quote(env["PATH"])}')
@@ -591,6 +609,26 @@ def execute(backend, per=False, deaths=1, live=False, scenario=None):
                         started_attempts.append(record['attempt_id'])
                     attempts[record['attempt_id']] = record
             records = list(attempts.values())
+            if not live and backend == 'Claude':
+                children = [json.loads(line) for line in (root / 'children.jsonl').read_text().splitlines()]
+                try:
+                    assert len(children) == deaths, children
+                    for child in children:
+                        status = subprocess.run(['ps', '-o', 'stat=', '-p', str(child['pid'])],
+                                                capture_output=True, text=True).stdout.strip()
+                        assert not status or status.startswith('Z'), f'detached child survived restart: {child}'
+                    observations = [json.loads(line) for line in (root / 'fake.jsonl').read_text().splitlines()
+                                    if json.loads(line).get('event') == 'detached']
+                    assert observations and not any(item['alive'] for item in observations), observations
+                    assert {child['attempt'] for child in children} == {
+                        a['attempt_id'] for a in records if a['outcome'] == 'died'}, children
+                finally:
+                    # The failing-before case must not leave our detached children.
+                    for child in children:
+                        try:
+                            os.kill(child['pid'], signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
             assert len(started_attempts) == len(set(started_attempts)), started_attempts
             detail = output + '\n' + json.dumps(records) + ('\nLast worker screen:\n' + ''.join(screens) if screens else '')
             if not live and backend == 'Agy':
