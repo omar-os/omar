@@ -61,6 +61,10 @@ $SUDO install "$TMP/omar" "$INSTALL_DIR/"
 if [ -f "$TMP/omarc" ]; then
   $SUDO install "$TMP/omarc" "$INSTALL_DIR/"
 fi
+# macOS: the Linux build team sandboxes run as their worker.
+if [ -f "$TMP/omar-linux" ]; then
+  $SUDO install "$TMP/omar-linux" "$INSTALL_DIR/"
+fi
 # The semantics the compiler checks properties against, where it looks for
 # them: beside its directory, in lib/lean.
 if [ -d "$TMP/lib/lean/Omar" ]; then
