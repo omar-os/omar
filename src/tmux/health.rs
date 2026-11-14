@@ -69,6 +69,14 @@ impl HealthChecker {
         Ok(self.observe_idle_for(session_name, current, now, initial_change))
     }
 
+    /// Ignore the reminder's rendering without resetting the idle clock.
+    pub fn refresh_after_delivery(&mut self, session_name: &str) -> anyhow::Result<()> {
+        if let Some((frame, _)) = self.last_frames.get_mut(session_name) {
+            *frame = self.client.capture_pane(session_name, 50)?;
+        }
+        Ok(())
+    }
+
     fn observe(
         &mut self,
         session: &str,

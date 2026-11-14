@@ -771,6 +771,13 @@ pub async fn run_event_loop(scheduler: Arc<Scheduler>, ticker: TickerBuffer, bas
                         continue;
                     }
 
+                    if batch.iter().any(|event| event.sender == "omar-runtime") {
+                        let target = pane_target_name(&receiver, ea_id, &base_prefix);
+                        if let Err(error) = health.refresh_after_delivery(&target) {
+                            ticker.push(format!("supervision delivery capture: {error}"));
+                        }
+                    }
+
                     let lag_ns = now_ns().saturating_sub(timestamp);
                     let lag_ms = lag_ns as f64 / 1_000_000.0;
                     ticker.push(format!(
