@@ -62,6 +62,13 @@ test("prefixes and sanitizes Pi tool names (discovery checks collisions)", () =>
   assert.equal(piToolName("tool/name"), "omar_tool_name");
 });
 
+test("Pi sees the tool names OMAR prompts use, not omar_omar_*", () => {
+  // The server lists bare names (set_port); piToolName adds omar_ back once.
+  assert.ok(new OmarMcpClient({ binary: "/custom/omar" }).args.includes("--bare-tool-names"));
+  assert.equal(piToolName("set_port"), "omar_set_port");
+  assert.equal(piToolName("complete"), "omar_complete");
+});
+
 test("keeps MCP JSON Schema without a TypeBox runtime dependency", () => {
   const schema = { type: "object", properties: { limit: { type: "integer" } } };
   assert.equal(jsonSchemaForPi(schema), schema);
@@ -98,13 +105,13 @@ test("uses an exact per-context OMAR MCP command", () => {
     binary: "/custom/omar",
     env: { OMAR_MCP_CONTEXT_FILE: "/tmp/context.json" },
   });
-  assert.deepEqual(client.args, ["mcp-server", "--context-file", "/tmp/context.json"]);
+  assert.deepEqual(client.args, ["mcp-server", "--bare-tool-names", "--context-file", "/tmp/context.json"]);
 
   const previous = process.env.OMAR_MCP_CONTEXT_FILE;
   process.env.OMAR_MCP_CONTEXT_FILE = "/tmp/context.json";
   try {
     const contextual = new OmarMcpClient({ binary: "/custom/omar" });
-    assert.deepEqual(contextual.args, ["mcp-server", "--context-file", "/tmp/context.json"]);
+    assert.deepEqual(contextual.args, ["mcp-server", "--bare-tool-names", "--context-file", "/tmp/context.json"]);
   } finally {
     if (previous === undefined) delete process.env.OMAR_MCP_CONTEXT_FILE;
     else process.env.OMAR_MCP_CONTEXT_FILE = previous;
