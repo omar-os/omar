@@ -3085,6 +3085,13 @@ test("step configuration validates real source edits and never starts a run", as
   page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/v1/runs")) admissions++; });
   await page.locator(".omar-reaction").first().press("Enter");
   const inspector = page.getByRole("complementary", { name: "Step details" });
+  const editPrompt = inspector.getByRole("button", { name: "Edit prompt", exact: true });
+  await editPrompt.click();
+  await expect(inspector.getByLabel("Step prompt")).toBeFocused();
+  await inspector.getByLabel("Step prompt").fill("Discard this edit");
+  await inspector.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(editPrompt).toBeFocused();
+  await editPrompt.click();
   await expect(inspector.getByLabel("Step prompt")).toHaveValue(/Draft a concrete plan/);
   let releaseValidation: (() => void) | undefined;
   await page.route("**/v1/programs/check", async (route) => {
@@ -3092,13 +3099,19 @@ test("step configuration validates real source edits and never starts a run", as
     return route.continue();
   });
   await inspector.getByLabel("Step execution agent").selectOption("ClaudeCode");
-  await inspector.getByLabel("Step prompt").fill('Read $(request), then produce a "reviewed" plan.');
+  await inspector.getByRole("button", { name: "Cancel", exact: true }).click();
   await inspector.getByRole("button", { name: "Apply configuration" }).click();
   await expect(page.getByRole("button", { name: "Deploy", exact: true })).toBeDisabled();
   releaseValidation?.();
   await expect(inspector.getByRole("button", { name: "Apply configuration", exact: true })).toBeDisabled();
+  await editPrompt.click();
+  await inspector.getByLabel("Step prompt").fill('Read $(request), then produce a "reviewed" plan.');
+  await inspector.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(editPrompt).toBeVisible();
+  await editPrompt.click();
   await expect(inspector.getByLabel("Step prompt")).toHaveValue('Read $(request), then produce a "reviewed" plan.');
-  await inspector.getByRole("button", { name: "Edit prompt & backend in source" }).click();
+  await inspector.getByRole("button", { name: "Cancel", exact: true }).click();
+  await inspector.getByRole("button", { name: "Open source", exact: true }).click();
   const program = page.getByRole("textbox", { name: "OMAR program", exact: true });
   await expect(program).toContainText(/planner\s+: ClaudeCode/);
   await expect(program).toContainText(/\\"reviewed\\"/);
@@ -3109,8 +3122,9 @@ test("step configuration validates real source edits and never starts a run", as
     return route.continue();
   });
   await page.locator(".omar-reaction").first().press("Enter");
+  await editPrompt.click();
   await inspector.getByLabel("Step prompt").fill("Rejected edit");
-  await inspector.getByRole("button", { name: "Apply configuration" }).click();
+  await inspector.getByRole("button", { name: "Save", exact: true }).click();
   await expect(inspector.getByRole("alert")).toContainText("not declared");
   await inspector.getByRole("button", { name: "Add connection", exact: true }).click();
   await inspector.getByLabel("Input connection").selectOption("critique");
