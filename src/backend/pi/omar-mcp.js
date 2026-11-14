@@ -83,8 +83,11 @@ export class OmarMcpClient {
   } = {}) {
     const contextFile = env.OMAR_MCP_CONTEXT_FILE ?? process.env.OMAR_MCP_CONTEXT_FILE;
     this.binary = binary;
+    // Bare names: piToolName adds the `omar_` prefix back, so Pi agents see
+    // `omar_set_port`, the name every OMAR prompt uses (not `omar_omar_set_port`).
     this.args = args || [
       "mcp-server",
+      "--bare-tool-names",
       ...(contextFile
         ? ["--context-file", contextFile]
         : []),
