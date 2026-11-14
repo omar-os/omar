@@ -242,7 +242,7 @@ main JevConfigurationTest { review = Review() }
                     subprocess.run([str(REPO / "target/debug/omar"), "down", "-s", session.group(1)], env=env, capture_output=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 calls = (temp / "calls").read_text().splitlines() if (temp / "calls").exists() else []
-                self.assertEqual(calls, [] if deterministic_failure else ["call"])
+                self.assertEqual(calls, [] if deterministic_failure else ["call"] * (3 if mode == "service_error" else 1))
                 self.assertEqual('Output checks.invalid = ' in result.stdout, deterministic_failure)
                 self.assertEqual('Output review.out = ' in result.stdout, not deterministic_failure)
                 self.assertEqual('Output reasoning.decision = ' in result.stdout, fallback)

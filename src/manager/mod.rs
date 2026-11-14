@@ -44,6 +44,9 @@ pub struct TopologyMcpContext {
     /// attempt cannot answer for a later one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<TopologyAttempt>,
+    /// Native conversation for an unscoped worker retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
 }
 
 /// One `per`-lifetime worker: the attempt OMAR started it for, and the
@@ -439,6 +442,13 @@ pub(crate) fn managed_agent_command(
         .context("missing EA context directory")?
         .join(format!("protocol-{}.json", Uuid::new_v4().simple()));
     write_private_file(&config_path, &serde_json::to_vec(&config)?)?;
+    write_private_file(
+        &directory.join("inbox-path"),
+        config_path
+            .with_extension("inbox.json")
+            .to_string_lossy()
+            .as_bytes(),
+    )?;
     Ok(format!(
         "export OMAR_AGENT_SOCKET={}; {} backend-runner --backend {} --config-file {}",
         shell_single_quote(&socket.display().to_string()),
@@ -710,6 +720,7 @@ pub(crate) mod tests {
         // A topology agent's identity, and its attempt's, stay in its own file.
         let mut scoped = a.clone();
         scoped.topology = Some(TopologyMcpContext {
+            resume: None,
             team: "Scoped".into(),
             agent: "t.coder".into(),
             endpoint: "localhost:1".into(),

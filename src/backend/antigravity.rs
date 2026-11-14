@@ -1,5 +1,4 @@
-//! Antigravity: registered as an MCP plugin in the operator's config and
-//! driven over its protocol by OMAR's runner.
+//! Antigravity: driven over its protocol by OMAR's runner.
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -62,11 +61,12 @@ impl Backend for Antigravity {
     // refuses `Antigravity per tag`.
     // No readiness banner is pinned: `agy` is not available in CI or local
     // discovery, so a marker would be an unverified guess.
-    /// Antigravity takes no message from outside its protocol, so it runs
-    /// under OMAR's protocol runner, once its MCP registration is written.
+    /// Workflows use session-scoped ACP servers; operator sessions use a plugin.
     fn launch_command(&self, launch: &Launch<'_>) -> String {
         let rendered = materialize_prompt_file(launch.prompt_file, launch.substitutions);
-        if ensure_antigravity_mcp_config(launch.context).is_none() {
+        if launch.context.topology.is_none()
+            && ensure_antigravity_mcp_config(launch.context).is_none()
+        {
             return "printf '%s\n' 'OMAR cannot configure Antigravity MCP' >&2; exit 1".into();
         }
         managed_agent_command("agy", launch.base_command, &rendered, launch.context, None)

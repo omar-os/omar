@@ -123,6 +123,13 @@ fn exact_pane_target(target: &str) -> String {
     }
 }
 
+fn missing_target(error: &str) -> bool {
+    error.contains("can't find session")
+        || error.contains("can't find window")
+        || error.contains("can't find pane")
+        || error.contains("no current target")
+}
+
 fn popup_attach_command(target: &str) -> String {
     let tmux_server = std::env::var("OMAR_TMUX_SERVER")
         .ok()
@@ -512,7 +519,17 @@ impl TmuxClient {
                     acted_at = Instant::now();
                     answered_gate = self.startup_state(session, "@omar_startup_answered");
                 }
-            } else if backend.startup_finished(&screen, pane_pid) {
+            } else if backend.startup_finished(&screen, pane_pid)
+                || self.session_delivery(session).is_some_and(|stamp| {
+                    backend
+                        .conversation_id(&crate::backend::Target {
+                            name: session,
+                            pane_pid,
+                            stamp: Some(&stamp),
+                        })
+                        .is_some()
+                })
+            {
                 self.run(&[
                     "set-option",
                     "-u",
@@ -862,11 +879,23 @@ impl TmuxClient {
     /// Stop the assistant and its sidecars, including background children
     /// which may ignore the terminal hangup sent by `kill-session` alone.
     pub fn kill_session_tree(&self, name: &str) -> Result<()> {
-        self.has_session_for_cleanup(name)?;
-        let tree = crate::process::process_tree(self.get_pane_pid(name)?);
+        let pane = self
+            .has_session_for_cleanup(name)
+            .and_then(|_| self.get_pane_pid(name));
+        let tree = match pane {
+            Ok(pid) => crate::process::process_tree(pid),
+            Err(error) if missing_target(&error.to_string()) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         // Capture ownership before closing tmux. Always signal the captured
         // descendants, including when kill-session itself fails.
-        let teardown = self.kill_session(name);
+        let teardown = self.kill_session(name).or_else(|error| {
+            if missing_target(&error.to_string()) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        });
         crate::process::signal_tree(&tree, "-TERM");
         thread::sleep(Duration::from_millis(500));
         crate::process::signal_tree(&tree, "-KILL");
@@ -883,7 +912,12 @@ impl TmuxClient {
             &target,
             "-F",
             "#{pane_pid}|#{pane_dead}",
-        ])?;
+        ]);
+        let panes = match panes {
+            Ok(panes) => panes,
+            Err(error) if missing_target(&error.to_string()) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
         let mut tree = Vec::new();
         for pane in panes.lines() {
             let (pid, dead) = pane.split_once('|').context("invalid tmux pane identity")?;
@@ -954,7 +988,7 @@ impl TmuxClient {
         }
         let error = String::from_utf8_lossy(&result.stderr);
         if !require_server
-            && (error.contains("can't find session")
+            && (missing_target(&error)
                 || error.contains("no server running")
                 || error.contains("no sessions")
                 // Asked while it shut down after its last session: none left.
@@ -983,7 +1017,7 @@ impl TmuxClient {
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
-            if stderr.contains("can't find")
+            if missing_target(&stderr)
                 || stderr.contains("no server running")
                 || stderr.contains("no sessions")
                 || stderr.contains("error connecting to")
@@ -1062,6 +1096,7 @@ mod tests {
         let client = TmuxClient::new("");
         for (message, ordinary_missing, cleanup_missing) in [
             ("can't find session: example", true, false),
+            ("no current target", true, false),
             ("no server running on /tmp/test", true, false),
             ("server exited unexpectedly", true, false),
             (
@@ -1092,6 +1127,52 @@ mod tests {
                 cleanup_missing,
                 "{message}"
             );
+            if message == "no current target" {
+                assert!(!client.has_session("example").unwrap());
+                assert!(!client.session_has_live_pane("example").unwrap());
+                assert!(client.session_process_tree("example").unwrap().is_empty());
+                client.kill_session_tree("example").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn stopping_tolerates_a_target_disappearing_between_tmux_queries() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("tmux");
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_TMUX.with(|p| *p.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        TEST_TMUX.with(|p| *p.borrow_mut() = Some(script.clone()));
+        let client = TmuxClient::new("");
+        for vanished_at in ["display-message", "kill-session"] {
+            let mut worker = Command::new("sleep").arg("30").spawn().unwrap();
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = '{vanished_at}' ]; then\n\
+                     echo 'no current target' >&2\nexit 1\nfi\n\
+                     if [ \"$1\" = display-message ]; then echo {}; fi\nexit 0\n",
+                    worker.id()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result = client.kill_session_tree("example");
+            let stopped = worker.try_wait().unwrap().is_some();
+            if !stopped {
+                let _ = worker.kill();
+            }
+            worker.wait().unwrap();
+            result.unwrap();
+            if vanished_at == "kill-session" {
+                assert!(stopped, "captured descendants must still be stopped");
+            }
         }
     }
 

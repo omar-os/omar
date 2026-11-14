@@ -322,6 +322,11 @@ jobs:
           npm install -g @openai/codex@0.154.0
           cargo build --bin omar
           python3 tests/ci/codex_invocation_scope.py
+      - name: Verify workflow workers recover from death and exhaust two retries
+        run: |
+          npm install -g opencode-ai@1.18.31
+          python3 tests/ci/worker_restart.py
+
       - name: Verify safety properties are proved through serve
         run: |
           cargo build --bin omar

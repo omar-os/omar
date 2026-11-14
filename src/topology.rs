@@ -1867,6 +1867,7 @@ pub(crate) fn pending_invocations(context: &TopologyMcpContext) -> Result<Value>
 
 fn panel_context(access: &PanelAccess, team: &str, agent: &str) -> TopologyMcpContext {
     TopologyMcpContext {
+        resume: None,
         team: team.to_string(),
         agent: agent.to_string(),
         endpoint: access.endpoint.clone(),
@@ -2264,6 +2265,7 @@ struct InvocationSpec {
 
 trait ReactionExecutor: Sync {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>>;
+    fn record_attempt(&self, _invocation: &InvocationSpec, _record: Value) {}
 }
 
 /// What an expired deadline means, which the effect contract decides.
@@ -2411,108 +2413,280 @@ struct AgentReactionExecutor {
     /// no pane to deliver a prompt to — the registration is the work item, and
     /// a web client picks it up from there.
     web: BTreeSet<String>,
-    /// Agents with a `per` lifetime, whose workers this executor starts and
-    /// stops. `None` for a program with none.
+    /// Process workers and the run's attempt log. Web agents need neither.
     scoped: Option<ScopedWorkers>,
 }
 
+pub(crate) const MAX_TASK_RETRIES: u32 = 2;
+const WORKER_POLL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
+struct WorkerDied {
+    reason: String,
+    conversation: String,
+}
+
+fn retry_task(invocation: &InvocationSpec, retries: u32, death: &WorkerDied) -> Result<()> {
+    anyhow::ensure!(
+        retries < MAX_TASK_RETRIES,
+        "agent '{}' task {} ({}): worker died after {MAX_TASK_RETRIES} retries: {}",
+        invocation.agent,
+        invocation.id,
+        invocation.reaction_id,
+        death.reason
+    );
+    Ok(())
+}
+
 impl ReactionExecutor for AgentReactionExecutor {
+    fn record_attempt(&self, invocation: &InvocationSpec, mut record: Value) {
+        if let Some(workers) = &self.scoped {
+            record["run"] = json!(workers.run);
+            record["logical_agent"] = json!(invocation.agent);
+            record["invocations"] = json!([served_invocation(invocation)]);
+            workers.record(&record);
+            workers.publish(&invocation.agent, &record);
+        }
+    }
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
-        let task_id = invocation.id;
-        let windowed = self
-            .scoped
-            .as_ref()
-            .filter(|scoped| scoped.states.contains_key(&invocation.agent));
+        let workers = self.scoped.as_ref().filter(|workers| {
+            workers
+                .states
+                .get(&invocation.agent)
+                .is_some_and(|agent| needs_agent_process(&agent.backend))
+        });
         // One invocation of such an agent at a time: they share a
         // conversation, and the window an invocation falls in depends on the
         // ones before it.
-        let mut slot = windowed.map(|scoped| scoped.slot(&invocation.agent));
+        let mut slot = workers.map(|workers| workers.slot(&invocation.agent));
         // Decided here, before the invocation can be answered, so only the
         // worker of its window can answer.
-        let admitted = match (windowed, slot.as_mut()) {
-            (Some(scoped), Some(slot)) => Some(scoped.admit(&invocation, slot)?),
+        let mut admitted = match (workers, slot.as_mut()) {
+            (Some(workers), Some(slot)) => Some(workers.admit(&invocation, slot)?),
             _ => None,
         };
-        let attempt = admitted.as_ref().map(|(attempt, _)| attempt);
-        let mut record = invocation_record(&self.team, &invocation)?;
-        record.attempt = attempt.map(|attempt| attempt.key.clone());
-        let rendered = record.prompt.clone();
-        let completion = self.registry.register(record)?;
-        let answer = || self.answer(&invocation, &rendered, completion);
-        let result = match (windowed, slot.as_mut(), &admitted) {
-            (Some(scoped), Some(slot), Some((attempt, fresh))) => {
-                scoped.run(&invocation, attempt, *fresh, slot, answer)
+        let started = Instant::now();
+        let deadline = invocation.within.unwrap_or(self.timeout);
+        let mut delivered = invocation.clone();
+        for retries in 0..=MAX_TASK_RETRIES {
+            let mut record = invocation_record(&self.team, &delivered)?;
+            record.attempt = admitted
+                .as_ref()
+                .filter(|_| workers.is_some_and(|w| w.states[&invocation.agent].lifetime.is_some()))
+                .map(|(attempt, _)| attempt.key.clone());
+            let rendered = record.prompt.clone();
+            let completion = self.registry.register(record)?;
+            let result = match (workers, slot.as_mut(), &admitted) {
+                (Some(workers), Some(slot), Some((attempt, fresh))) => {
+                    workers.run(&invocation, attempt, *fresh, retries, slot, |window| {
+                        self.answer(
+                            &delivered,
+                            &rendered,
+                            completion,
+                            Some(window),
+                            deadline.saturating_sub(started.elapsed()),
+                            retries,
+                        )
+                    })
+                }
+                _ => self
+                    .answer(
+                        &delivered,
+                        &rendered,
+                        completion,
+                        None,
+                        deadline.saturating_sub(started.elapsed()),
+                        retries,
+                    )
+                    .map(|(writes, _)| writes),
+            };
+            // Removing the entry discards both port and state writes. A new
+            // wire id also fences delayed calls from a non-per worker.
+            self.registry.remove(&delivered.id);
+            let death = match &result {
+                Err(error) => error.downcast_ref::<WorkerDied>(),
+                _ => None,
+            };
+            let Some(death) = death else {
+                return result;
+            };
+            retry_task(&invocation, retries, death)?;
+            if started.elapsed() >= deadline {
+                return expired(&invocation, deadline);
             }
-            _ => answer().map(|(writes, _)| writes),
-        };
-        self.registry.remove(&task_id);
-        result
+            let workers = workers.context("dead worker has no launcher")?;
+            let agent = &workers.states[&invocation.agent];
+            let backend = crate::backend::by_name(&agent.backend).context("unknown backend")?;
+            admitted = Some((
+                manager::TopologyAttempt {
+                    id: Uuid::new_v4().to_string(),
+                    key: Uuid::new_v4().to_string(),
+                    native_session: if agent.lifetime.is_some() {
+                        backend.new_conversation_id()
+                    } else {
+                        death.conversation.clone()
+                    },
+                },
+                true,
+            ));
+            delivered.id = next_task_id()?;
+        }
+        unreachable!("retry limit is checked after every death")
     }
 }
 
 impl AgentReactionExecutor {
-    /// Hand the invocation to its agent and wait for the answer. The flag is
-    /// whether the deadline expired, in which case the writes are empty and
-    /// the agent may still be working on it.
+    /// Hand the invocation to its agent and wait for the answer, watching the
+    /// agent's worker meanwhile. The flag is whether the deadline expired, in
+    /// which case the writes are empty and the agent may still be working on
+    /// it. A web agent has no pane to deliver to: the registration is the work
+    /// item a panel asks for, and a client answering is a slow agent.
     fn answer(
         &self,
         invocation: &InvocationSpec,
         rendered: &str,
         completion: mpsc::Receiver<BTreeMap<String, Value>>,
+        mut window: Option<&mut Window>,
+        deadline: Duration,
+        retries: u32,
     ) -> Result<(BTreeMap<String, Value>, bool)> {
-        let task_id = invocation.id;
-        // A web agent has no pane to deliver to: nothing was spawned for it,
-        // and the registration is the work item a panel asks for. What
-        // follows is the same either way — a client answering is a slow agent,
-        // and the registry does not care which kind it is waiting on.
+        let started = Instant::now();
         if !self.web.contains(&invocation.agent) {
-            let message = invocation_message(invocation, rendered)?;
-            let session = self.client.session_for(&invocation.agent);
-            self.client
-                .deliver_prompt_until(&session, &message, &DeliveryOptions::default(), &|| {
-                    self.registry.answered(&task_id)
-                })
-                .with_context(|| format!("failed to deliver {}", invocation.reaction_id))?;
-        }
-
-        let deadline = invocation.within.unwrap_or(self.timeout);
-        match completion.recv_timeout(deadline) {
-            Ok(writes) => Ok((writes, false)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                expired(invocation, deadline).map(|writes| (writes, true))
+            if let Some(window) = window.as_deref_mut() {
+                self.watch_worker(window)?;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-                "topology invocation service stopped unexpectedly"
-            )),
+            let mut message = invocation_message(invocation, rendered)?;
+            if retries > 0 {
+                let conversation = window.as_ref().map_or("fresh conversation", |w| {
+                    w.record["conversation_mode"]
+                        .as_str()
+                        .unwrap_or("fresh conversation")
+                });
+                message.push_str(&format!("\n\nThis is retry {retries}/{MAX_TASK_RETRIES} after your worker died. Your workspace may contain files from the earlier attempt. Earlier buffered port/state writes were discarded; answer this task_id again. Conversation: {conversation}."));
+            }
+            let session = self.client.session_for(&invocation.agent);
+            let delivery = self.client.deliver_prompt_until(
+                &session,
+                &message,
+                &DeliveryOptions::default(),
+                &|| self.registry.answered(&invocation.id),
+            );
+            if !self.registry.answered(&invocation.id) {
+                if let Some(window) = window.as_deref_mut() {
+                    if delivery.is_err() {
+                        self.watch_worker(window)?;
+                    }
+                }
+                delivery
+                    .with_context(|| format!("failed to deliver {}", invocation.reaction_id))?;
+            }
         }
+        loop {
+            let remaining = deadline.saturating_sub(started.elapsed());
+            match completion.recv_timeout(remaining.min(WORKER_POLL)) {
+                Ok(writes) => return Ok((writes, false)),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("topology invocation service stopped unexpectedly")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if let Some(window) = window.as_deref_mut() {
+                let status = self.watch_worker(window);
+                // Completion can race the process observation. A worker that
+                // completed before exiting has already answered this task.
+                if let Ok(writes) = completion.try_recv() {
+                    return Ok((writes, false));
+                }
+                status?;
+            }
+            if started.elapsed() >= deadline {
+                return expired(invocation, invocation.within.unwrap_or(self.timeout))
+                    .map(|writes| (writes, true));
+            }
+        }
+    }
+
+    /// The single periodic check for an open task's worker.
+    fn watch_worker(&self, window: &mut Window) -> Result<()> {
+        let tree = if self.client.has_session(&window.session)? {
+            self.client
+                .session_process_tree(&window.session)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if tree.is_empty() {
+            anyhow::ensure!(
+                !self
+                    .scoped
+                    .as_ref()
+                    .is_some_and(|workers| workers.launcher.shutdown.load(Ordering::Acquire)),
+                "runtime is shutting down"
+            );
+            return Err(WorkerDied {
+                reason: "worker process exited".into(),
+                conversation: window.conversation.clone(),
+            }
+            .into());
+        }
+        window.sessions.extend(crate::process::sessions(&tree));
+        window.tree.extend(tree);
+        window.tree.sort_unstable();
+        window.tree.dedup();
+        window.observe_conversation(&self.client);
+        Ok(())
     }
 }
 
-/// Agents with a `per` lifetime: a worker, and a native conversation, for each
-/// window of invocations.
+fn worker_conversation(client: &TmuxClient, session: &str) -> Option<String> {
+    let backend = client.session_backend(session)?;
+    let backend = crate::backend::by_name(&backend)?;
+    let stamp = client.session_delivery(session);
+    let target = crate::backend::Target {
+        name: session,
+        pane_pid: client.get_pane_pid(session).ok()?,
+        stamp: stamp.as_deref(),
+    };
+    backend
+        .conversation_id(&target)
+        .or_else(|| crate::backend::managed::conversation_id(&target))
+}
+
+/// Every process agent's window: a worker, and a native conversation.
 ///
-/// A window is one worker and one conversation, serving the invocations the
-/// agent's lifetime lets share it: `per task` serves one, `per tag` all the
-/// agent's invocations in a tag, `per 5 tasks` five. The first is started,
-/// proved to have opened a new conversation -- the one the attempt named,
-/// or, for a backend that mints its own id, one no earlier attempt reported --
-/// and handed the invocation. Later ones are handed to the same worker, and
-/// the conversation it reports must still be that one before an invocation's
+/// For an agent with a `per` lifetime, a window serves the invocations the
+/// lifetime lets share it: `per task` serves one, `per tag` all the agent's
+/// invocations in a tag, `per 5 tasks` five. The first is started, proved to
+/// have opened a new conversation -- the one the attempt named, or, for a
+/// backend that mints its own id, one no earlier attempt reported -- and
+/// handed the invocation. Later ones are handed to the same worker, and the
+/// conversation it reports must still be that one before an invocation's
 /// writes are released. The window ends lazily, when an invocation falls
 /// outside it, or at once when its count of tasks is spent, or when the run
 /// ends or an invocation in it fails: its process tree is stopped and seen
 /// gone. If any of that cannot be made sure of, the invocation fails: there is
 /// no falling back to a worker that already has a conversation.
+///
+/// An agent without `per` has one window for the run, adopting the worker
+/// started with it. A worker that dies with a task open is stopped and
+/// replaced, and the task delivered again (#411): a `per` agent's in a fresh,
+/// verified window, an unscoped agent's resuming its native conversation,
+/// whose history is kept for that. A worker that dies while idle fails the
+/// run.
 struct ScopedWorkers {
     states: BTreeMap<String, AgentState>,
     /// Each agent's open window, if any. Locked for a whole invocation.
     windows: BTreeMap<String, Mutex<Option<Window>>>,
+    /// Confirmed stops, separate from unscoped agents' retained session history.
+    stopped: Mutex<BTreeSet<String>>,
     launcher: AgentLauncher,
     run: String,
-    /// The run's record, whose `sessions` holds a window's session from
+    /// The run's record, whose `sessions` holds a `per` window's session from
     /// before its worker is launched until it is seen stopped, so a run that
     /// dies in between leaves it for `--replace` and snapshots to find, and
-    /// one that does not leaves nothing to clean.
+    /// one that does not leaves nothing to clean. Unscoped session names
+    /// remain in the record as history after a confirmed stop.
     deployment: Arc<Mutex<deploy::DeploymentRecord>>,
     /// One JSON line per window as it starts, once its conversation is
     /// checked, after each invocation it serves, and as it ends. The last line
@@ -2545,6 +2719,25 @@ struct Window {
     failed: bool,
     /// What `attempts.jsonl` holds for it.
     record: Value,
+}
+
+impl Window {
+    fn observe_conversation(&mut self, client: &TmuxClient) {
+        if self.record["lifetime"].is_null() {
+            if let Some(native) = worker_conversation(client, &self.session) {
+                self.conversation = native;
+                self.record["native_session_id"] = json!(self.conversation);
+                if self.record["retry"].as_u64().is_some_and(|retry| retry > 0) {
+                    self.record["conversation_mode"] =
+                        json!(if self.record["resume_session_id"] == self.conversation {
+                            "resumed native conversation"
+                        } else {
+                            "fresh conversation (earlier context unavailable)"
+                        });
+                }
+            }
+        }
+    }
 }
 
 /// What every process of an attempt's worker inherits, as `NAME=<attempt id>`.
@@ -2618,7 +2811,7 @@ impl ScopedWorkers {
         let states: BTreeMap<String, AgentState> = state
             .agents
             .iter()
-            .filter(|(_, agent)| agent.lifetime.is_some())
+            .filter(|(_, agent)| !is_web_backend(&agent.backend))
             .map(|(name, agent)| (name.clone(), agent.clone()))
             .collect();
         let log = launcher.runtime_dir.join("attempts.jsonl");
@@ -2633,6 +2826,7 @@ impl ScopedWorkers {
                 .map(|name| (name.clone(), Mutex::new(None)))
                 .collect(),
             states,
+            stopped: Mutex::new(BTreeSet::new()),
             seen: Mutex::new(reported_conversations(&log)),
             log,
             launcher,
@@ -2645,6 +2839,9 @@ impl ScopedWorkers {
     /// Record `agent`'s session as one the run must clean up, or, with
     /// `None`, as gone.
     fn track(&self, agent: &str, session: Option<&str>) -> Result<()> {
+        if session.is_some() {
+            self.stopped.lock().unwrap().remove(agent);
+        }
         let mut deployment = self
             .deployment
             .lock()
@@ -2656,6 +2853,24 @@ impl ScopedWorkers {
             None => deployment.sessions.remove(agent),
         };
         deployment.save(&self.launcher.runtime_dir)
+    }
+
+    fn record_stop(&self, agent: &str) -> Result<()> {
+        if self.states[agent].lifetime.is_some() {
+            self.track(agent, None)
+        } else {
+            self.stopped.lock().unwrap().insert(agent.to_owned());
+            Ok(())
+        }
+    }
+
+    fn cleanup_sessions(&self, sessions: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let stopped = self.stopped.lock().unwrap();
+        sessions
+            .iter()
+            .filter(|(agent, _)| !stopped.contains(*agent))
+            .map(|(agent, session)| (agent.clone(), session.clone()))
+            .collect()
     }
 
     fn slot(&self, agent: &str) -> std::sync::MutexGuard<'_, Option<Window>> {
@@ -2674,11 +2889,21 @@ impl ScopedWorkers {
         invocation: &InvocationSpec,
         slot: &mut Option<Window>,
     ) -> Result<(manager::TopologyAttempt, bool)> {
-        let lifetime = self.states[&invocation.agent]
-            .lifetime
-            .context("agent has no lifetime")?;
+        let lifetime = self.states[&invocation.agent].lifetime;
         if let Some(window) = slot.as_mut() {
-            if !window.used.spent(lifetime, invocation.tag) {
+            if lifetime.is_none_or(|lifetime| !window.used.spent(lifetime, invocation.tag)) {
+                anyhow::ensure!(
+                    self.launcher.client.has_session(&window.session)?
+                        && !self
+                            .launcher
+                            .client
+                            .session_process_tree(&window.session)?
+                            .is_empty(),
+                    "agent '{}' task {}: worker died while idle ({})",
+                    invocation.agent,
+                    invocation.id,
+                    window.session
+                );
                 window.used.take(invocation.tag);
                 return Ok((window.attempt.clone(), false));
             }
@@ -2689,13 +2914,23 @@ impl ScopedWorkers {
                 )
             })?;
         }
+        if lifetime.is_none() {
+            return Ok((
+                self.launcher.initial_attempts[&invocation.agent].clone(),
+                true,
+            ));
+        }
         let backend = crate::backend::by_name(&self.states[&invocation.agent].backend)
             .context("agent with a lifetime has no backend")?;
         Ok((
             manager::TopologyAttempt {
                 id: Uuid::new_v4().to_string(),
                 key: Uuid::new_v4().to_string(),
-                native_session: backend.new_conversation_id(),
+                native_session: if lifetime.is_some() {
+                    backend.new_conversation_id()
+                } else {
+                    String::new()
+                },
             },
             true,
         ))
@@ -2709,25 +2944,30 @@ impl ScopedWorkers {
         invocation: &InvocationSpec,
         attempt: &manager::TopologyAttempt,
         fresh: bool,
+        retries: u32,
         slot: &mut Option<Window>,
-        answer: impl FnOnce() -> Result<(BTreeMap<String, Value>, bool)>,
+        answer: impl FnOnce(&mut Window) -> Result<(BTreeMap<String, Value>, bool)>,
     ) -> Result<BTreeMap<String, Value>> {
         let agent = &self.states[&invocation.agent];
         let backend = crate::backend::by_name(&agent.backend)
             .context("agent with a lifetime has no backend")?;
         if fresh {
-            *slot = Some(self.open(invocation, attempt)?);
+            *slot = Some(self.open(invocation, attempt, retries)?);
         }
         let window = slot.as_mut().context("agent has no open window")?;
         let result = (|| -> Result<(BTreeMap<String, Value>, bool)> {
-            if !fresh {
+            if !fresh && agent.lifetime.is_some() {
                 self.same_conversation(window, backend)?;
             }
-            let (writes, timed_out) = answer()?;
+            let (writes, timed_out) = answer(window)?;
             // A worker that ran out of time is busy and about to be stopped,
             // so what it holds is no longer asked.
             if !timed_out {
-                self.same_conversation(window, backend)?;
+                if agent.lifetime.is_some() {
+                    self.same_conversation(window, backend)?;
+                } else {
+                    window.observe_conversation(&self.launcher.client);
+                }
             }
             Ok((writes, timed_out))
         })();
@@ -2737,7 +2977,7 @@ impl ScopedWorkers {
                 .context("window record has no invocations")?
                 .push(served_invocation(invocation));
         }
-        let lifetime = agent.lifetime.context("agent has no lifetime")?;
+        let lifetime = agent.lifetime;
         match result {
             Ok((writes, true)) => {
                 // The contract let it stay silent, but the worker is still on
@@ -2755,7 +2995,7 @@ impl ScopedWorkers {
                 // No later invocation can join a window whose tasks are
                 // spent, so its worker is stopped before the writes are
                 // released, as the last thing it did.
-                if window.used.exhausted(lifetime) {
+                if lifetime.is_some_and(|lifetime| window.used.exhausted(lifetime)) {
                     self.close(slot).with_context(|| {
                         format!(
                             "agent '{}' invocation {}: worker attempt {} was not confirmed stopped, so its effects are withheld",
@@ -2772,6 +3012,10 @@ impl ScopedWorkers {
             Err(error) => {
                 // A worker that failed an invocation is in an unknown state.
                 window.failed = true;
+                if let Some(death) = error.downcast_ref::<WorkerDied>() {
+                    window.record["outcome"] = json!("died");
+                    window.record["death_reason"] = json!(death.reason);
+                }
                 let error = error.context(format!(
                     "agent '{}' invocation {}: worker attempt {}",
                     invocation.agent, invocation.id, attempt.id
@@ -2793,7 +3037,12 @@ impl ScopedWorkers {
         &self,
         invocation: &InvocationSpec,
         attempt: &manager::TopologyAttempt,
+        retries: u32,
     ) -> Result<Window> {
+        anyhow::ensure!(
+            retries == 0 || !self.launcher.shutdown.load(Ordering::Acquire),
+            "runtime is shutting down"
+        );
         let agent = &self.states[&invocation.agent];
         let backend = crate::backend::by_name(&agent.backend)
             .context("agent with a lifetime has no backend")?;
@@ -2803,17 +3052,29 @@ impl ScopedWorkers {
             "run": self.run,
             "logical_agent": invocation.agent,
             "attempt_id": attempt.id,
+            "worker_session": session,
             "backend": agent.backend,
             "native_session_id": Value::Null,
-            "verification": backend.freshness().name(),
+            "verification": if agent.lifetime.is_some() { backend.freshness().name() } else { "unscoped" },
+            "retry": retries,
+            "resume_session_id": if agent.lifetime.is_none() && !attempt.native_session.is_empty() { Some(&attempt.native_session) } else { None },
             "lifetime": agent.lifetime,
             "invocations": [served_invocation(invocation)],
             "outcome": "started",
             "cleanup_status": "pending",
         });
+        if retries > 0 {
+            record["conversation_mode"] = json!(if agent.lifetime.is_some()
+                || attempt.native_session.is_empty()
+            {
+                "fresh conversation (earlier context unavailable)"
+            } else {
+                "resumed native conversation"
+            });
+        }
         // Anything already in the session is some earlier worker, and taking
         // it over would be the reuse a new window rules out.
-        if client.has_session(&session)? {
+        if agent.lifetime.is_some() && client.has_session(&session)? {
             record["outcome"] = json!("refused");
             record["cleanup_status"] = json!("not_started");
             self.record(&record);
@@ -2823,7 +3084,9 @@ impl ScopedWorkers {
                 invocation.id
             );
         }
-        self.record(&record);
+        if agent.lifetime.is_some() && retries == 0 {
+            self.record(&record);
+        }
         if let Err(error) = self.track(&invocation.agent, Some(&session)) {
             record["outcome"] = json!("refused");
             record["cleanup_status"] = json!("not_started");
@@ -2839,11 +3102,25 @@ impl ScopedWorkers {
         let mut reported = None;
         let since = std::time::SystemTime::now();
         let started = (|| -> Result<()> {
-            let command = self
-                .launcher
-                .launch(&invocation.agent, agent, Some(attempt))?;
-            self.launcher
-                .wait_ready(&invocation.agent, agent, &command)?;
+            if !client.has_session(&session)? {
+                let command = self.launcher.launch(
+                    &invocation.agent,
+                    agent,
+                    attempt,
+                    (agent.lifetime.is_none() && !attempt.native_session.is_empty())
+                        .then_some(attempt.native_session.as_str()),
+                )?;
+                if agent.lifetime.is_some() || attempt.native_session.is_empty() {
+                    self.launcher
+                        .wait_ready(&invocation.agent, agent, &command)?;
+                }
+            }
+            if agent.lifetime.is_none() {
+                tree = client.session_process_tree(&session)?;
+                sessions.extend(crate::process::sessions(&tree));
+                reported = worker_conversation(client, &session);
+                return Ok(());
+            }
             client.finish_backend_startup(&session, WORKER_START_TIMEOUT)?;
             self.opened_conversation(
                 &session,
@@ -2858,6 +3135,10 @@ impl ScopedWorkers {
         // A minted id is on disk before the worker hears anything: the next
         // run's check is only as good as this log.
         let started = started.and_then(|()| match backend.freshness() {
+            _ if agent.lifetime.is_none() => {
+                self.record(&record);
+                Ok(())
+            }
             Freshness::Chosen => {
                 self.record(&record);
                 Ok(())
@@ -2880,17 +3161,29 @@ impl ScopedWorkers {
                     tree,
                     sessions,
                     since,
-                    conversation: reported.unwrap_or_default(),
+                    conversation: reported.unwrap_or_else(|| {
+                        if agent.lifetime.is_none() {
+                            attempt.native_session.clone()
+                        } else {
+                            String::new()
+                        }
+                    }),
                     used: Used::first(invocation.tag),
                     failed: false,
                     record,
                 })
             }
             Err(error) => {
-                let stopped =
-                    self.stop(&session, attempt, (agent, since), &mut tree, &mut sessions);
+                let stopped = self.stop(
+                    &session,
+                    attempt,
+                    (agent, since),
+                    &mut tree,
+                    &mut sessions,
+                    false,
+                );
                 if stopped.is_ok() {
-                    if let Err(error) = self.track(&invocation.agent, None) {
+                    if let Err(error) = self.record_stop(&invocation.agent) {
                         eprintln!("warning: could not record {session} as stopped: {error:#}");
                     }
                 }
@@ -2953,22 +3246,31 @@ impl ScopedWorkers {
             return Ok(());
         };
         let agent = &self.states[&window.agent];
+        deploy::capture_session_log(
+            &self.launcher.client,
+            &window.agent,
+            &window.session,
+            &deploy::logs_dir(&self.launcher.runtime_dir),
+        );
         let stopped = self.stop(
             &window.session,
             &window.attempt,
             (agent, window.since),
             &mut window.tree,
             &mut window.sessions,
+            agent.lifetime.is_none() && window.record["outcome"] == "died",
         );
         if stopped.is_ok() {
-            if let Err(error) = self.track(&window.agent, None) {
+            if let Err(error) = self.record_stop(&window.agent) {
                 eprintln!(
                     "warning: could not record {} as stopped: {error:#}",
                     window.session
                 );
             }
         }
-        window.record["outcome"] = json!(if window.failed { "failed" } else { "completed" });
+        if window.record["outcome"] != "died" {
+            window.record["outcome"] = json!(if window.failed { "failed" } else { "completed" });
+        }
         window.record["cleanup_status"] = json!(if stopped.is_ok() {
             "stopped"
         } else {
@@ -2998,6 +3300,9 @@ impl ScopedWorkers {
     }
 
     fn publish(&self, agent: &str, record: &Value) {
+        if unscoped_without_restart(record) {
+            return;
+        }
         if let Some(publisher) = &self.publisher {
             publisher.agent_attempt(agent, record);
         }
@@ -3033,7 +3338,7 @@ impl ScopedWorkers {
                         &attempt.native_session,
                         &native,
                         &self.seen,
-                        || backend.prove_fresh(&target, &native, since),
+                        || backend.prove_fresh(&target, &native, since, deadline),
                     );
                     *reported = Some(native);
                     return verified;
@@ -3058,13 +3363,18 @@ impl ScopedWorkers {
         (agent, since): (&AgentState, std::time::SystemTime),
         tree: &mut Vec<(u32, String)>,
         sessions: &mut BTreeSet<u32>,
+        preserve_history: bool,
     ) -> Result<()> {
         let client = &self.launcher.client;
         if client.has_session(session)? {
             let live = client.session_process_tree(session)?;
             sessions.extend(crate::process::sessions(&live));
             tree.extend(live);
-            crate::backend::kill_worker(client, session, true)?;
+            if !preserve_history {
+                crate::backend::kill_worker(client, session, true)?;
+            } else {
+                client.kill_session_tree(session)?;
+            }
         }
         let marker = format!("{ATTEMPT_MARKER}={}", attempt.id);
         let deadline = Instant::now() + WORKER_STOP_TIMEOUT;
@@ -3126,6 +3436,9 @@ impl ScopedWorkers {
 
     /// Best effort: a record that cannot be written does not decide the run.
     fn record(&self, record: &Value) {
+        if unscoped_without_restart(record) {
+            return;
+        }
         if let Err(error) = self.append(record) {
             eprintln!(
                 "warning: could not record worker attempt in {}: {error}",
@@ -3142,6 +3455,10 @@ impl ScopedWorkers {
             .open(&self.log)
             .and_then(|mut file| file.write_all(line.as_bytes()))
     }
+}
+
+fn unscoped_without_restart(record: &Value) -> bool {
+    record["verification"] == "unscoped" && record["retry"] == 0 && record["outcome"] != "died"
 }
 
 /// Every conversation an attempt recorded in `log`, in this run or an earlier
@@ -3245,12 +3562,45 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
             .filter(|backend| backend.topology_only())
         {
             let rendered = render_prompt(&invocation.prompt, &prompt_values(&invocation))?;
-            let writes = backend.invoke_topology(&crate::backend::TopologyInvocation {
-                effects: &invocation.allowed_effects,
-                triggers: &invocation.trigger_values,
-                instructions: &rendered,
-                timeout: invocation.within.unwrap_or(self.timeout),
-            })?;
+            let started = Instant::now();
+            let budget = invocation.within.unwrap_or(self.timeout);
+            let mut writes = None;
+            for retries in 0..=MAX_TASK_RETRIES {
+                let mut attempt = json!({
+                    "attempt_id": Uuid::new_v4().to_string(), "backend": backend.kind().name(),
+                    "retry": retries, "outcome": "started", "cleanup_status": "no_process",
+                    "conversation_mode": "fresh HTTP invocation",
+                });
+                self.agents.record_attempt(&invocation, attempt.clone());
+                match backend.invoke_topology(&crate::backend::TopologyInvocation {
+                    effects: &invocation.allowed_effects,
+                    triggers: &invocation.trigger_values,
+                    instructions: &rendered,
+                    timeout: budget.saturating_sub(started.elapsed()),
+                    retries,
+                }) {
+                    Ok(answer) => {
+                        attempt["outcome"] = json!("completed");
+                        self.agents.record_attempt(&invocation, attempt);
+                        writes = Some(answer);
+                        break;
+                    }
+                    Err(error) => {
+                        let retryable = backend.retryable_topology_error(&error);
+                        attempt["outcome"] = json!(if retryable { "died" } else { "failed" });
+                        attempt["death_reason"] = json!(error.to_string());
+                        self.agents.record_attempt(&invocation, attempt);
+                        if !retryable || retries == MAX_TASK_RETRIES || started.elapsed() >= budget
+                        {
+                            return Err(error.context(format!(
+                                "agent '{}' task {} ({}): HTTP invocation failed after {retries} retries",
+                                invocation.agent, invocation.id, invocation.reaction_id
+                            )));
+                        }
+                    }
+                }
+            }
+            let writes = writes.context("HTTP invocation produced no answer")?;
             validate_contract(&invocation.contract, &writes)?;
             for (port, value) in &writes {
                 let port_type = self
@@ -3427,6 +3777,8 @@ pub fn sandbox_worker() -> Result<()> {
         checkpoint_policy: None,
         keep_workspaces: true,
         program_path: None,
+        // The VM goes with the run; the host's shutdown stops it.
+        shutdown: Arc::default(),
     };
     let server = InvocationServer::start()?;
     let client = TmuxClient::new("omar-team-");
@@ -3495,6 +3847,8 @@ pub struct TopologyRunConfig<'a> {
     pub inputs: &'a [String],
     pub replace: bool,
     pub timeout: Duration,
+    /// Runtime shutdown must not turn teardown into a worker restart.
+    pub shutdown: Arc<AtomicBool>,
     /// How the run's logical clock is paced against the wall clock.
     pub pace: Pace,
     pub diagram_address: Option<std::net::SocketAddr>,
@@ -4401,6 +4755,10 @@ fn launch(
                 .lock()
                 .map(|guard| guard.sessions.clone())
                 .unwrap_or_default();
+            let sessions = executor.host.agents.scoped.as_ref().map_or_else(
+                || sessions.clone(),
+                |workers| workers.cleanup_sessions(&sessions),
+            );
             fail_deployment(&record, &runtime_dir, &sessions, &error);
             return Err(error);
         }
@@ -4410,6 +4768,10 @@ fn launch(
         .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
         .sessions
         .clone();
+    let sessions = executor.host.agents.scoped.as_ref().map_or_else(
+        || sessions.clone(),
+        |workers| workers.cleanup_sessions(&sessions),
+    );
     if let Err(error) = write_json_atomic(&runtime_dir.join("state.json"), &state) {
         fail_deployment(&record, &runtime_dir, &sessions, &error);
         return Err(error);
@@ -4582,10 +4944,13 @@ struct AgentLauncher {
     ea_id: crate::ea::EaId,
     base_prefix: String,
     health_idle_warning: i64,
+    shutdown: Arc<AtomicBool>,
     endpoint: String,
     token: String,
     /// Each instance's worktree and temp directory.
     workspaces: BTreeMap<String, (PathBuf, PathBuf)>,
+    /// Unscoped workers start before their first invocation adopts them.
+    initial_attempts: BTreeMap<String, manager::TopologyAttempt>,
     /// What every agent of a resumed run is told; empty for a fresh run.
     resumed: String,
 }
@@ -4623,6 +4988,7 @@ impl AgentLauncher {
             ea_id: config.ea_id,
             base_prefix: config.base_prefix.to_string(),
             health_idle_warning: config.health_idle_warning,
+            shutdown: config.shutdown.clone(),
             endpoint: invocation_server.endpoint.clone(),
             token: invocation_server.token.clone(),
             workspaces: workspaces
@@ -4634,19 +5000,37 @@ impl AgentLauncher {
                     )
                 })
                 .collect(),
+            initial_attempts: state
+                .agents
+                .iter()
+                .filter(|(_, agent)| {
+                    agent.lifetime.is_none() && needs_agent_process(&agent.backend)
+                })
+                .map(|(name, _)| {
+                    (
+                        name.clone(),
+                        manager::TopologyAttempt {
+                            id: Uuid::new_v4().to_string(),
+                            key: Uuid::new_v4().to_string(),
+                            native_session: String::new(),
+                        },
+                    )
+                })
+                .collect(),
             resumed,
         }
     }
 
     /// Start `name`'s worker in its session and return the line it was
-    /// launched with, which says how it proves readiness. `attempt` is set
-    /// for an agent with a lifetime: the worker serves one window of it and
-    /// opens the native conversation the attempt names.
+    /// launched with, which says how it proves readiness. Every worker's
+    /// processes carry `attempt`'s id; only a `per` worker also scopes its
+    /// tools and native conversation to the attempt.
     fn launch(
         &self,
         name: &str,
         agent: &AgentState,
-        attempt: Option<&manager::TopologyAttempt>,
+        attempt: &manager::TopologyAttempt,
+        resume: Option<&str>,
     ) -> Result<String> {
         let session = self.client.session_for(name);
         let agent_dir = self.runtime_dir.join("agents").join(name);
@@ -4659,8 +5043,8 @@ impl AgentLauncher {
         let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
         // Nothing of an earlier window is put in front of it: what it knows
         // of the run is what the workspace holds.
-        let scoped = match (attempt, agent.lifetime) {
-            (Some(_), Some(lifetime)) => format!(
+        let scoped = match agent.lifetime {
+            Some(lifetime) => format!(
                 "\n\nYour conversation is reset {lifetime}. Invocations within it share it. After a reset, earlier conversations are gone and you cannot see them; whatever later work needs from them is in the workspace files."
             ),
             _ => String::new(),
@@ -4687,7 +5071,8 @@ impl AgentLauncher {
                 agent: name.to_string(),
                 endpoint: self.endpoint.clone(),
                 token: self.token.clone(),
-                attempt: attempt.cloned(),
+                attempt: agent.lifetime.map(|_| attempt.clone()),
+                resume: resume.map(str::to_owned),
             }),
         };
         let command = manager::build_agent_command(&base_command, &prompt_file, &[], &context);
@@ -4697,9 +5082,7 @@ impl AgentLauncher {
             ("TMPDIR".into(), temp.to_string_lossy().into_owned()),
         ];
         // So what the attempt leaves running can be found once it stops.
-        if let Some(attempt) = attempt {
-            environment.push((ATTEMPT_MARKER.into(), attempt.id.clone()));
-        }
+        environment.push((ATTEMPT_MARKER.into(), attempt.id.clone()));
         self.client.new_session_with_backend_env(
             &session,
             &command,
@@ -4762,7 +5145,7 @@ fn spawn_topology_agents(
         if agent.lifetime.is_some() {
             continue;
         }
-        let command = launcher.launch(name, agent, None)?;
+        let command = launcher.launch(name, agent, &launcher.initial_attempts[name], None)?;
         spawned.insert(name.clone(), session);
         launched.insert(name.clone(), command);
     }
@@ -7599,6 +7982,7 @@ mod tests {
             scoped: None,
         };
         let context = TopologyMcpContext {
+            resume: None,
             team: state.team.clone(),
             agent: "panel".into(),
             endpoint: server.endpoint.clone(),
@@ -9415,6 +9799,7 @@ mod tests {
     fn reactive_scoped_port_writes_are_last_writer_wins() {
         let server = InvocationServer::start().unwrap();
         let context = TopologyMcpContext {
+            resume: None,
             team: "Demo".into(),
             agent: "worker".into(),
             endpoint: server.endpoint.clone(),
@@ -9454,6 +9839,7 @@ mod tests {
     fn a_rejected_refinement_can_be_corrected_over_the_invocation_protocol() {
         let server = InvocationServer::start().unwrap();
         let context = TopologyMcpContext {
+            resume: None,
             team: "Recovery".into(),
             agent: "worker".into(),
             endpoint: server.endpoint.clone(),
@@ -9536,6 +9922,7 @@ mod tests {
     fn reactive_invocations_enforce_owner_and_contract() {
         let server = InvocationServer::start().unwrap();
         let context = TopologyMcpContext {
+            resume: None,
             team: "Demo".into(),
             agent: "worker".into(),
             endpoint: server.endpoint.clone(),
@@ -10842,9 +11229,11 @@ mod tests {
             ea_id: 0,
             base_prefix: "test-".into(),
             health_idle_warning: 15,
+            shutdown: Arc::new(AtomicBool::new(false)),
             endpoint: String::new(),
             token: String::new(),
             workspaces: BTreeMap::new(),
+            initial_attempts: BTreeMap::new(),
             resumed: String::new(),
         };
         let deployment = Arc::new(Mutex::new(deploy::DeploymentRecord::create(
@@ -11038,6 +11427,297 @@ mod tests {
         assert!(fresh_conversation(Freshness::Reported, "x", "b", &seen, || Ok(())).is_err());
         fs::write(&log, "{\"native_session_id\":\"a\"}\n{\"native_sess").unwrap();
         assert!(reported_conversations(&log).is_err());
+    }
+
+    #[test]
+    fn a_dead_tasks_buffered_ports_and_state_are_discarded_and_late_calls_refused() {
+        let registry = InvocationRegistry::default();
+        let mut spec = InvocationSpec {
+            id: 1,
+            agent: "coder".into(),
+            reaction_id: "work".into(),
+            contract: "out".into(),
+            allowed_effects: BTreeMap::from([("out".into(), "string".into())]),
+            state_types: BTreeMap::from([("state".into(), "string".into())]),
+            ..Default::default()
+        };
+        let dead = registry
+            .register(invocation_record("team", &spec).unwrap())
+            .unwrap();
+        registry
+            .execute(
+                "team",
+                "coder",
+                None,
+                InvocationCommand::SetPort(SetPortArgs {
+                    task_id: 1,
+                    port: "out".into(),
+                    value: json!("dead"),
+                }),
+            )
+            .unwrap();
+        registry
+            .execute(
+                "team",
+                "coder",
+                None,
+                InvocationCommand::SetState(SetStateArgs {
+                    task_id: 1,
+                    name: "state".into(),
+                    value: json!("dead state"),
+                }),
+            )
+            .unwrap();
+        registry.remove(&1);
+        assert!(dead.recv().is_err());
+        spec.id = 2;
+        let retry = registry
+            .register(invocation_record("team", &spec).unwrap())
+            .unwrap();
+        assert!(registry
+            .execute(
+                "team",
+                "coder",
+                None,
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: 1,
+                    keep: Vec::new(),
+                })
+            )
+            .is_err());
+        assert!(registry
+            .execute(
+                "team",
+                "coder",
+                None,
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: 2,
+                    keep: Vec::new(),
+                })
+            )
+            .is_err());
+        registry
+            .execute(
+                "team",
+                "coder",
+                None,
+                InvocationCommand::SetPort(SetPortArgs {
+                    task_id: 2,
+                    port: "out".into(),
+                    value: json!("retry"),
+                }),
+            )
+            .unwrap();
+        registry
+            .execute(
+                "team",
+                "coder",
+                None,
+                InvocationCommand::Complete(CompleteArgs {
+                    task_id: 2,
+                    keep: Vec::new(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            retry.recv().unwrap(),
+            BTreeMap::from([("out".into(), json!("retry"))])
+        );
+    }
+
+    fn restart_test_workers(dir: &Path, client: &TmuxClient) -> ScopedWorkers {
+        let agent = AgentState {
+            backend: "Stub".into(),
+            instance: "".into(),
+            lifetime: None,
+        };
+        ScopedWorkers {
+            states: BTreeMap::from([("coder".into(), agent)]),
+            windows: BTreeMap::new(),
+            stopped: Mutex::new(BTreeSet::new()),
+            launcher: AgentLauncher {
+                client: client.clone(),
+                team: "test".into(),
+                runtime_dir: dir.into(),
+                omar_dir: dir.into(),
+                ea_id: 0,
+                base_prefix: "restart-test".into(),
+                health_idle_warning: 0,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                endpoint: "".into(),
+                token: "".into(),
+                workspaces: BTreeMap::from([("".into(), (dir.into(), dir.into()))]),
+                initial_attempts: BTreeMap::new(),
+                resumed: "".into(),
+            },
+            run: "test".into(),
+            deployment: Arc::new(Mutex::new(deploy::DeploymentRecord::create(
+                "test",
+                BTreeMap::new(),
+                60,
+            ))),
+            log: dir.join("attempts.jsonl"),
+            seen: Mutex::new(Ok(BTreeSet::new())),
+            publisher: None,
+        }
+    }
+
+    #[test]
+    fn per_tag_dead_idle_worker_is_refused_only_when_reusing_its_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = TmuxClient::on_server(
+            "restart-test",
+            Some(format!("omar-test-{}", Uuid::new_v4())),
+        );
+        let mut workers = restart_test_workers(dir.path(), &client);
+        let mut invocation = InvocationSpec {
+            agent: "coder".into(),
+            ..Default::default()
+        };
+        let attempt = manager::TopologyAttempt {
+            id: Uuid::new_v4().to_string(),
+            key: "test".into(),
+            native_session: String::new(),
+        };
+        let mut slot = Some(Window {
+            agent: "coder".into(),
+            attempt: attempt.clone(),
+            session: client.session_for("coder"),
+            tree: Vec::new(),
+            sessions: BTreeSet::new(),
+            since: std::time::SystemTime::now(),
+            conversation: String::new(),
+            used: Used::first(invocation.tag),
+            failed: false,
+            record: json!({"attempt_id": attempt.id, "outcome": "started"}),
+        });
+        workers.states.get_mut("coder").unwrap().lifetime = Some(life(LifetimeUnit::Tag, 1));
+        let error = workers.admit(&invocation, &mut slot).unwrap_err();
+        assert!(error.to_string().contains("worker died while idle"));
+        invocation.tag.microstep += 1;
+        let (next, fresh) = workers.admit(&invocation, &mut slot).unwrap();
+        assert!(fresh);
+        assert_ne!(next.id, attempt.id);
+        assert!(slot.is_none(), "the spent window must be closed");
+        assert!(!workers
+            .deployment
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("coder"));
+    }
+
+    #[test]
+    fn worker_attempt_records_label_only_retries_and_start_them_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = TmuxClient::on_server(
+            "restart-test",
+            Some(format!("omar-test-{}", Uuid::new_v4())),
+        );
+        let session = client.session_for("coder");
+        struct Cleanup(TmuxClient, String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.kill_session(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(client.clone(), session.clone());
+        client
+            .new_session(&session, "sleep 60", dir.path().to_str())
+            .unwrap();
+        let workers = restart_test_workers(dir.path(), &client);
+        let invocation = InvocationSpec {
+            agent: "coder".into(),
+            ..Default::default()
+        };
+        let original = manager::TopologyAttempt {
+            id: "original".into(),
+            key: "original".into(),
+            native_session: "".into(),
+        };
+        let window = workers.open(&invocation, &original, 0).unwrap();
+        assert!(window.record.get("conversation_mode").is_none());
+        assert_eq!(window.record["worker_session"], session);
+        let retry = manager::TopologyAttempt {
+            id: "retry".into(),
+            key: "retry".into(),
+            native_session: "native".into(),
+        };
+        let mut window = workers.open(&invocation, &retry, 1).unwrap();
+        assert_eq!(
+            window.record["conversation_mode"],
+            "resumed native conversation"
+        );
+        let lines: Vec<Value> = fs::read_to_string(&workers.log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|record| record["attempt_id"] == "retry" && record["outcome"] == "started")
+                .count(),
+            1
+        );
+        client.kill_session(&session).unwrap();
+        workers.launcher.shutdown.store(true, Ordering::Release);
+        let error = workers
+            .open(&invocation, &retry, 1)
+            .err()
+            .expect("shutdown must refuse a retry");
+        assert!(error.to_string().contains("runtime is shutting down"));
+        let mut executor = AgentReactionExecutor {
+            client,
+            team: "test".into(),
+            registry: InvocationRegistry::default(),
+            timeout: Duration::from_secs(60),
+            web: BTreeSet::new(),
+            scoped: None,
+        };
+        let error = executor.watch_worker(&mut window).unwrap_err();
+        assert_eq!(error.to_string(), "worker process exited");
+        executor.scoped = Some(workers);
+        let error = executor.watch_worker(&mut window).unwrap_err();
+        assert_eq!(error.to_string(), "runtime is shutting down");
+        assert!(error.downcast_ref::<WorkerDied>().is_none());
+        let workers = executor.scoped.as_ref().unwrap();
+        let mut slot = Some(window);
+        workers.close(&mut slot).unwrap();
+        assert_eq!(
+            workers.deployment.lock().unwrap().sessions.get("coder"),
+            Some(&session)
+        );
+        let sessions = workers.deployment.lock().unwrap().sessions.clone();
+        assert!(workers.cleanup_sessions(&sessions).is_empty());
+        workers.track("coder", Some(&session)).unwrap();
+        assert_eq!(workers.cleanup_sessions(&sessions), sessions);
+    }
+
+    #[test]
+    fn a_task_gets_exactly_two_retries_and_its_failure_names_the_worker_and_task() {
+        let task = InvocationSpec {
+            id: 42,
+            agent: "p.coder".into(),
+            reaction_id: "p.work".into(),
+            ..Default::default()
+        };
+        let death = WorkerDied {
+            reason: "worker process exited".into(),
+            conversation: "native".into(),
+        };
+        assert!(retry_task(&task, 0, &death).is_ok());
+        assert!(retry_task(&task, 1, &death).is_ok());
+        let error = retry_task(&task, 2, &death).unwrap_err().to_string();
+        for expected in [
+            "p.coder",
+            "task 42",
+            "p.work",
+            "after 2 retries",
+            "worker process exited",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

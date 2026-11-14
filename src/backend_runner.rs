@@ -308,8 +308,11 @@ pub async fn run(path: &Path) -> Result<()> {
         state: Mutex::new(inbox),
         changed: Notify::new(),
     });
+    // Workflow ACP sessions carry their MCP server without global registration.
+    let acp = config.backend == "cursor" || (config.backend == "agy" && context.topology.is_some());
     let mut command = config.command.clone();
     match config.backend.as_str() {
+        "agy" if acp => command.push_str(" acp --include-default-customizations=false"),
         "cursor" => command.push_str(" acp"),
         "agy" => {
             if let Some(session) = &queue.state.lock().await.session {
@@ -318,7 +321,7 @@ pub async fn run(path: &Path) -> Result<()> {
                     crate::manager::shell_single_quote(session)
                 ));
             }
-            command.push_str(" --input-format stream-json --output-format stream-json");
+            command.push_str(" -p= --input-format stream-json --output-format stream-json");
         }
         "codex" => {}
         _ => unreachable!(),
@@ -345,25 +348,29 @@ pub async fn run(path: &Path) -> Result<()> {
                 output: BufReader::new(child.stdout.take().unwrap()).lines(),
                 child,
                 next_id: 0,
-                allow_permissions: config
-                    .command
-                    .split_whitespace()
-                    .any(|v| matches!(v, "--yolo" | "--force" | "-f")),
+                allow_permissions: config.command.split_whitespace().any(|v| {
+                    matches!(
+                        v,
+                        "--yolo" | "--force" | "-f" | "--dangerously-skip-permissions"
+                    )
+                }),
             }
         })
     };
-    if config.backend == "cursor" {
+    if acp {
         let engine = engine.as_mut().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(45), async {
             engine.rpc("initialize", json!({"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"omar","version":env!("CARGO_PKG_VERSION")}})).await?;
-            engine.rpc("authenticate", json!({"methodId":"cursor_login"})).await?;
+            if config.backend == "cursor" {
+                engine.rpc("authenticate", json!({"methodId":"cursor_login"})).await?;
+            }
             let previous = queue.state.lock().await.session.clone();
             let mut params = json!({"cwd":std::env::current_dir()?,"mcpServers":[{"name":"omar","command":std::env::current_exe()?,"args":["mcp-server","--context-file",config.context_file],"env":[]}]});
             let mut method = if let Some(session) = previous { params["sessionId"] = session.into(); "session/load" } else { "session/new" };
             let result = match engine.rpc(method, params.clone()).await {
                 Ok(result) => result,
                 Err(error) if method == "session/load" => {
-                    eprintln!("Could not resume Cursor session: {error:#}; restoring saved chat context.");
+                    eprintln!("Could not resume {} session: {error:#}; restoring saved chat context.", config.backend);
                     method = "session/new";
                     params.as_object_mut().unwrap().remove("sessionId");
                     engine.rpc(method, params.clone()).await?
@@ -372,7 +379,7 @@ pub async fn run(path: &Path) -> Result<()> {
             };
             let session = if method == "session/load" { params["sessionId"].as_str() } else { result["sessionId"].as_str() }.context("ACP omitted sessionId")?;
             let mut state = queue.state.lock().await;
-            crate::backend::remember_conversation(&context, "cursor", session)?;
+            crate::backend::remember_conversation(&context, &config.backend, session)?;
             state.session = Some(session.to_owned());
             save(&queue.path, &state)?;
             Ok::<_, anyhow::Error>(())
@@ -420,11 +427,11 @@ pub async fn run(path: &Path) -> Result<()> {
             let prompt = format!("{instructions}\n\n[{origin}; message {}]\n{}\n\n{live}", message.id, message.text);
             if config.backend == "codex" {
                 codex_turn(&config, &context, &queue, &prompt).await?;
-            } else if config.backend == "cursor" {
+            } else if acp {
                 let engine = engine.as_mut().unwrap();
                 let session = queue.state.lock().await.session.clone().context("missing ACP session")?;
                 let result = engine.rpc("session/prompt", json!({"sessionId":session,"prompt":[{"type":"text","text":prompt}]})).await?;
-                anyhow::ensure!(result["stopReason"] != "cancelled", "Cursor cancelled the turn; message remains pending");
+                anyhow::ensure!(result["stopReason"] != "cancelled", "ACP cancelled the turn; message remains pending");
             } else {
                 let engine = engine.as_mut().unwrap();
                 engine.write(json!({"event":"user","message":{"content":prompt}})).await?;

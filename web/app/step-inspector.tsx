@@ -6,6 +6,7 @@ import type { DiagramSnapshot } from "./lib/protocol";
 import { formatDuration, lifetimeLabel } from "./lib/protocol";
 import { componentName } from "./diagram/diagram-canvas";
 import { WorkflowIcon } from "./workflow-icon";
+import { restartRows, restartText } from "./lib/attempts";
 
 /** Details come from the compiled topology, never from prototype sample data. */
 export function StepInspector({ component, snapshot, source, editable, readOnly = false, onApply, onClose, onEdit, onAsk }: {
@@ -24,6 +25,7 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
   const port = snapshot.ports.find((item) => componentName(item.id) === component);
   const timer = (snapshot.timers ?? []).find((item) => componentName(item.id) === component);
   const agent = snapshot.agents.find((item) => item.id === reaction?.agent);
+  const attempts = agent?.attempts ?? [];
   const configuration = useMemo(() => reaction ? locateStep(source, snapshot, reaction) : null, [source, snapshot, reaction]);
   const name = reaction ? (/(?:^|\.)reaction\.\d+$/.test(reaction.name) ? agent?.name ?? reaction.name : reaction.name) : port?.name ?? timer?.name ?? component;
   const label = (id: string) => snapshot.ports.find((item) => item.id === id)?.name ?? (snapshot.timers ?? []).find((item) => item.id === id)?.name ?? componentName(id);
@@ -43,7 +45,13 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
         <div className="inspector-field"><span>Receives</span>{connectionNames(reaction.triggers)}</div>
         <div className="inspector-field"><span>Produces</span>{connectionNames(reaction.effects)}</div>
         </> : null}
-        {agent?.lifetime ? <div className="inspector-field"><span>Conversation</span><strong>{`New ${lifetimeLabel(agent.lifetime)}`}</strong>{agent.attempts.filter((item) => (item.invocations as { reaction?: unknown }[] | undefined)?.some((served) => served.reaction === reaction.name)).map((item) => <pre className="step-contract" key={String(item.attempt_id)}>{`attempt ${String(item.attempt_id)}\nsession ${String(item.native_session_id)}\n${String(item.outcome)}, worker ${String(item.cleanup_status)}`}</pre>)}</div> : null}
+        {agent && (agent.lifetime || attempts.length > 0) ? <div className="inspector-field"><span>Conversation</span><strong>{agent.lifetime ? `New ${lifetimeLabel(agent.lifetime)}` : "Run conversation"}</strong>{reaction.restarts ? <>
+          <strong className="step-restart-heading">{restartText(reaction.restarts).headline}</strong>
+          <ol className="step-attempts">{restartRows(attempts, reaction.name).map((attempt) => <li key={attempt.id} title={`Attempt ${attempt.id}`}>
+            <p>{attempt.summary}</p>
+            <div className="step-attempt-meta">{attempt.session ? <code title={attempt.session}>Session {attempt.session.slice(0, 8)}</code> : null}{attempt.time ? <time dateTime={attempt.time}>{new Date(attempt.time).toLocaleTimeString()}</time> : null}</div>
+          </li>)}</ol>
+        </> : attempts.filter((item) => (item.invocations as { reaction?: unknown }[] | undefined)?.some((served) => served.reaction === reaction.name)).map((item) => <pre className="step-contract" key={String(item.attempt_id)}>{`attempt ${String(item.attempt_id)}\nsession ${String(item.native_session_id)}\n${String(item.outcome)}, worker ${String(item.cleanup_status)}${item.retry ? `\nretry ${String(item.retry)}/2, ${String(item.conversation_mode)}` : ""}${item.death_reason ? `\n${String(item.death_reason)}` : ""}`}</pre>)}</div> : null}
         {configuration ? <StepEditor key={`${component}:${source}`} source={source} step={configuration} enabled={editable} readOnly={readOnly} onApply={onApply} ports={snapshot.ports.filter((item) => item.instance === reaction.instance && item.kind !== "output").map((item) => item.name.startsWith(`${reaction.instance}.`) ? item.name.slice(reaction.instance.length + 1) : item.name)} /> : <p className="step-empty">Use the source editor for this step’s configuration.</p>}
         {readOnly ? null : <>
         <button type="button" className="step-edit" onClick={onEdit}>Edit prompt & backend in source <WorkflowIcon name="arrow" size={14} /></button>
