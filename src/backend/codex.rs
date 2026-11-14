@@ -271,6 +271,19 @@ impl TrustedProjects {
         if let Some(parent) = config.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Rewrite the target, never the symlink an operator keeps in CODEX_HOME.
+        let resolved = if config.is_symlink() {
+            config.canonicalize()?
+        } else {
+            config
+                .parent()
+                .context("Codex config directory")?
+                .canonicalize()?
+                .join(config.file_name().context("Codex config filename")?)
+        };
+        self.config = Some(resolved);
+        let config = self.config.as_ref().unwrap();
+        let _held = Self::lock(config)?;
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -285,6 +298,7 @@ impl TrustedProjects {
         let Some(config) = self.config.as_ref().filter(|_| !self.blocks.is_empty()) else {
             return Ok(());
         };
+        let _held = Self::lock(config)?;
         let mut text = std::fs::read_to_string(config)?;
         for block in &self.blocks {
             text = text.replacen(block, "", 1);
@@ -292,10 +306,37 @@ impl TrustedProjects {
         if text.is_empty() && !self.existed {
             return Ok(std::fs::remove_file(config)?);
         }
-        let staged = config.with_extension("toml.omar-tmp");
-        std::fs::write(&staged, text)?;
-        std::fs::set_permissions(&staged, std::fs::metadata(config)?.permissions())?;
-        Ok(std::fs::rename(&staged, config)?)
+        let staged = config.with_extension(format!("toml.omar-{}.tmp", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let permissions = std::fs::metadata(config)?.permissions();
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(permissions.mode())
+                .open(&staged)?;
+            file.write_all(text.as_bytes())?;
+            std::fs::set_permissions(&staged, permissions)?;
+            Ok(std::fs::rename(&staged, config)?)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&staged);
+        }
+        result
+    }
+
+    fn lock(config: &Path) -> Result<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        // A separate inode survives config renames; closing releases flock.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(config.with_extension("toml.omar-lock"))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("lock Codex config");
+        }
+        Ok(file)
     }
 }
 
@@ -1012,6 +1053,112 @@ mod tests {
         );
         let plain = codex_server_command(&context, "hi", None, "codex").unwrap();
         assert!(!plain.contains("hook-trust"), "{plain}");
+    }
+
+    #[test]
+    fn project_trust_preserves_a_config_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.toml");
+        let config = dir.path().join("config.toml");
+        std::fs::write(&target, "model = \"x\"\n").unwrap();
+        std::os::unix::fs::symlink("settings.toml", &config).unwrap();
+        {
+            let mut trusted = TrustedProjects::at(Some(config.clone()));
+            trusted.trust(dir.path()).unwrap();
+            assert!(std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("projects"));
+        }
+        assert_eq!(
+            std::fs::read_link(&config).unwrap(),
+            Path::new("settings.toml")
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "model = \"x\"\n");
+    }
+
+    #[test]
+    fn project_trust_process() {
+        let Some(root) = std::env::var_os("OMAR_TRUST_TEST_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let id = std::env::var("OMAR_TRUST_TEST_ID").unwrap();
+        let workspace = root.join(&id);
+        std::fs::create_dir(&workspace).unwrap();
+        let mut trusted = TrustedProjects::at(Some(root.join("config.toml")));
+        std::fs::write(workspace.join("started"), "").unwrap();
+        trusted.trust(&workspace).unwrap();
+        std::fs::write(workspace.join("appended"), "").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !root.join("remove").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::write(workspace.join("removing"), "").unwrap();
+        trusted.remove().unwrap();
+        trusted.blocks.clear();
+        std::fs::write(workspace.join("removed"), "").unwrap();
+    }
+
+    #[test]
+    fn project_trust_serializes_process_appends_and_removals() {
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let original = "model = \"x\"\n";
+        std::fs::write(&config, original).unwrap();
+        let lock = std::fs::File::create(config.with_extension("toml.omar-lock")).unwrap();
+        let hold = |operation| {
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), operation) }, 0);
+        };
+        let wait = |name: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !(0..8).all(|id| dir.path().join(id.to_string()).join(name).exists()) {
+                assert!(Instant::now() < deadline, "waiting for {name}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        hold(libc::LOCK_EX);
+        let mut children: Vec<_> = (0..8)
+            .map(|id| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "backend::codex::tests::project_trust_process"])
+                    .env("OMAR_TRUST_TEST_ROOT", dir.path())
+                    .env("OMAR_TRUST_TEST_ID", id.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        wait("started");
+        std::thread::sleep(Duration::from_millis(200));
+        let append_locked = std::fs::read_to_string(&config).unwrap() == original;
+        hold(libc::LOCK_UN);
+        wait("appended");
+        let appended = std::fs::read_to_string(&config)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(appended["projects"].as_table().unwrap().len(), 8);
+        hold(libc::LOCK_EX);
+        std::fs::write(dir.path().join("remove"), "").unwrap();
+        wait("removing");
+        std::thread::sleep(Duration::from_millis(200));
+        let remove_locked =
+            !(0..8).any(|id| dir.path().join(id.to_string()).join("removed").exists());
+        hold(libc::LOCK_UN);
+        let statuses: Vec<_> = children
+            .iter_mut()
+            .map(|child| child.wait().unwrap())
+            .collect();
+        assert!(
+            statuses.iter().all(|status| status.success()),
+            "{statuses:?}"
+        );
+        assert!(append_locked, "appending did not acquire the config lock");
+        assert!(remove_locked, "removal did not acquire the config lock");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
     }
 
     #[test]

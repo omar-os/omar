@@ -2549,6 +2549,16 @@ fn sandbox_state(state: &VmState, instance: &str) -> VmState {
     local
 }
 
+fn sandbox_init_timeout(init: &crate::sandbox::Init) -> Duration {
+    let setup = init.resumed_from.is_none()
+        && init
+            .state
+            .instances
+            .values()
+            .any(|instance| instance.setup.is_some());
+    Duration::from_secs(180).saturating_add(if setup { init.timeout } else { Duration::ZERO })
+}
+
 /// Internal VM-side service. No host paths other than the two mounts are used.
 /// stdout is reserved for bounded protocol frames; backend panes/logs stay in VM.
 pub fn sandbox_worker() -> Result<()> {
@@ -2602,6 +2612,17 @@ pub fn sandbox_worker() -> Result<()> {
                 &runtime_dir,
             )?;
         }
+        crate::sandbox::write_frame(
+            &mut std::io::stdout(),
+            &json!({"protocol": crate::sandbox::PROTOCOL}),
+        )?;
+        // The host releases this barrier only after every VM's setup succeeds.
+        let launch: Value = serde_json::from_slice(&crate::sandbox::read_frame(&mut input)?)?;
+        anyhow::ensure!(
+            launch.get("protocol").and_then(Value::as_u64) == Some(crate::sandbox::PROTOCOL as u64)
+                && launch.get("launch").and_then(Value::as_bool) == Some(true),
+            "expected sandbox launch after setup"
+        );
         spawn_topology_agents(
             &init.state,
             &client,
@@ -2646,6 +2667,12 @@ pub fn sandbox_worker() -> Result<()> {
             crate::sandbox::write_frame(&mut std::io::stdout(), &reply)?;
         }
     })();
+    if let Err(error) = &result {
+        let _ = crate::sandbox::write_frame(
+            &mut std::io::stdout(),
+            &json!({"protocol": crate::sandbox::PROTOCOL, "error": format!("{error:#}")}),
+        );
+    }
     let _ = deploy::teardown_sessions(&client, &sessions, &deploy::logs_dir(&runtime_dir));
     result
 }
@@ -3384,9 +3411,16 @@ fn launch(
                     timeout: config.timeout,
                     resumed_from: resumed_from.clone(),
                 };
-                worker.request(serde_json::to_value(init)?, Duration::from_secs(180))?;
+                let timeout = sandbox_init_timeout(&init);
+                worker.request(serde_json::to_value(init)?, timeout)?;
                 observer.sandbox_started(instance, &name);
                 workers.insert(instance.clone(), worker);
+            }
+            for worker in workers.values() {
+                worker.request(
+                    json!({"protocol": crate::sandbox::PROTOCOL, "launch": true}),
+                    Duration::from_secs(180),
+                )?;
             }
         } else {
             spawn_topology_agents(
@@ -8736,6 +8770,32 @@ mod tests {
         );
         let error = verify(&with(r#","setup":"  ""#)).unwrap_err().to_string();
         assert!(error.contains("empty setup"), "{error}");
+    }
+
+    #[test]
+    fn sandbox_init_deadline_includes_the_setup_budget() {
+        let bytecode: Bytecode = serde_json::from_value(json!({
+            "version": 1, "team": "T", "instructions": [
+                {"op": "begin_plan", "team": "T"},
+                {"op": "declare_instance", "name": "a", "parent": "", "team": "T", "setup": "sleep 240"},
+                {"op": "commit_plan"}
+            ]
+        })).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = verify(&bytecode).unwrap();
+        let mut workspaces =
+            crate::workspace::for_topology(root.path(), 0, "test", &state).unwrap();
+        let mut init = crate::sandbox::Init {
+            protocol: crate::sandbox::PROTOCOL,
+            state,
+            workspace: workspaces.remove("a").unwrap(),
+            root: root.path().into(),
+            timeout: Duration::from_secs(300),
+            resumed_from: None,
+        };
+        assert_eq!(sandbox_init_timeout(&init), Duration::from_secs(480));
+        init.state.instances.get_mut("a").unwrap().setup = None;
+        assert_eq!(sandbox_init_timeout(&init), Duration::from_secs(180));
     }
 
     /// Setups run in instance order and the first failure ends the step, so
