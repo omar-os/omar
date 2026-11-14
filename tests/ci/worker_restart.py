@@ -451,7 +451,8 @@ def execute(backend, per=False, deaths=1, live=False):
                         started_attempts.append(record['attempt_id'])
                     attempts[record['attempt_id']] = record
             records = list(attempts.values())
-            if not live and backend == 'Claude':
+            # Only a worker that died leaves a detached child to check.
+            if not live and backend == 'Claude' and deaths:
                 children = [json.loads(line) for line in (root / 'children.jsonl').read_text().splitlines()]
                 try:
                     assert len(children) == deaths, children
