@@ -157,9 +157,15 @@ pub fn check_sign_in(backend: &dyn Backend) -> Result<(), String> {
         .map_err(|error| format!("cannot make {}: {error}", dir.display()))?;
     let mut run = Command::new(program);
     run.args(&args).current_dir(&dir);
-    let output = run_command(run, Instant::now() + CHECK_TIMEOUT);
+    let result = run_checked(run);
     let _ = std::fs::remove_dir_all(&dir);
-    match output {
+    result
+}
+
+/// Run a sign-in check's command, capped at [`CHECK_TIMEOUT`]; `Err` holds
+/// what it said last.
+pub(crate) fn run_checked(command: Command) -> Result<(), String> {
+    match run_command(command, Instant::now() + CHECK_TIMEOUT) {
         Some(output) if output.success => Ok(()),
         Some(output) => Err(last_words(&output.text)),
         None => Err(format!("no answer within {}s", CHECK_TIMEOUT.as_secs())),
@@ -221,6 +227,16 @@ pub fn assistants() -> Vec<(&'static dyn Backend, Connection)> {
     })
 }
 
+/// [`assistants`], and beside each, whether its agents can run in sandboxes
+/// (`crate::sandbox::connections`). Asked after the CLIs, not beside them:
+/// sbx is heavy enough to push a CLI's `--version` past its probe timeout.
+pub fn assistants_and_sandboxes() -> (Vec<(&'static dyn Backend, Connection)>, Vec<Connection>) {
+    let statuses = assistants();
+    let backends: Vec<_> = statuses.iter().map(|(backend, _)| *backend).collect();
+    let sandboxes = crate::sandbox::connections(&backends);
+    (statuses, sandboxes)
+}
+
 /// How the CLI shows a connection.
 pub fn label(connection: &Connection) -> String {
     match connection {
@@ -232,12 +248,39 @@ pub fn label(connection: &Connection) -> String {
     }
 }
 
+/// How a backend stands for sandboxes, said after its host sign-in. Its
+/// sandbox sign-in is its own, in sbx's store: the host's when that is an API
+/// key, but a subscription other than ChatGPT cannot cross into a sandbox.
+/// `missing` also says when it has none.
+pub fn sandbox_note(sandbox: &Connection, missing: bool) -> String {
+    match sandbox {
+        Connection::Connected { via: Some(via) } => format!(" · sandboxes: {via}"),
+        Connection::Connected { via: None } => " · sandboxes too".to_string(),
+        Connection::SignedOut if missing => " · sandboxes: not connected".to_string(),
+        Connection::Unknown { reason } => format!(" · sandboxes: ? {reason}"),
+        _ => String::new(),
+    }
+}
+
 /// One backend as the CLI, MCP and Mission Control report it.
 pub fn describe(backend: &dyn Backend, connection: &Connection) -> serde_json::Value {
     let mut value = serde_json::to_value(connection).expect("a connection serializes");
     let name = backend.kind().name();
     value["name"] = name.into();
     value["login"] = format!("omar connect {name}").into();
+    value
+}
+
+/// [`describe`], with how the backend stands for sandboxes under `sandbox`.
+pub fn describe_with_sandbox(
+    backend: &dyn Backend,
+    connection: &Connection,
+    sandbox: &Connection,
+) -> serde_json::Value {
+    let mut value = describe(backend, connection);
+    let mut sandbox = serde_json::to_value(sandbox).expect("a connection serializes");
+    sandbox["login"] = format!("omar connect {} --sandbox", backend.kind().name()).into();
+    value["sandbox"] = sandbox;
     value
 }
 
