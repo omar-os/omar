@@ -326,6 +326,8 @@ jobs:
         run: |
           cargo build --bin omar
           python3 tests/ci/property_proofs.py
+      - name: Verify signed deliveries start distinct workflows
+        run: python3 tests/ci/webhook_starts.py
 
       - name: Compile topology corpus to bytecode (offline)
         working-directory: lang

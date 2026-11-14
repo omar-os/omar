@@ -2055,7 +2055,7 @@ pub(crate) fn rename_type(ty: &str, names: &BTreeMap<String, String>) -> String 
     names.get(ty).cloned().unwrap_or_else(|| ty.to_string())
 }
 
-fn validate_value(ty: &str, value: &Value) -> Result<()> {
+pub(crate) fn validate_value(ty: &str, value: &Value) -> Result<()> {
     if let Some(allowed) = string_enum(ty) {
         // The agent acts on this message, so it names every legal answer
         // rather than only reporting that this one was wrong.
