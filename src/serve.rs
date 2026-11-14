@@ -2293,10 +2293,13 @@ fn relay_terminal(
             },
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
+            // A signal (e.g. SIGCHLD) interrupting the read is not a hangup.
             Err(tungstenite::Error::Io(error))
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
                 ) => {}
             // Anything else is the viewer going away, which is a detach.
             Err(_) => break,
@@ -3422,7 +3425,9 @@ fn stream_chat(
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
                 ) => {}
             Err(_) => break,
             Ok(_) => {}
@@ -7707,6 +7712,15 @@ while True:
             "sh",
         ]);
 
+        // A process that handles SIGCHLD (tokio does, once it reaps an orphaned
+        // child) has the session's `tmux attach` exiting interrupt the relay's
+        // socket read (EINTR). That is not the viewer hanging up.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _child_exits = runtime
+            .block_on(async {
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+            })
+            .unwrap();
         let server = test_server();
         let url = format!("ws://{}/v1/agents/wsended/terminal", server.address());
         let (mut socket, _) = tungstenite::connect(&url).expect("terminal connects");
