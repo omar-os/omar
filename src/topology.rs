@@ -2980,15 +2980,21 @@ impl ScopedWorkers {
     }
 
     /// Stop every open window, as the run ends.
-    fn close_all(&self) {
+    fn close_all(&self) -> Result<()> {
+        let mut result = Ok(());
         for (agent, window) in &self.windows {
             let mut slot = window
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Err(error) = self.close(&mut slot) {
                 eprintln!("warning: could not stop the worker of agent '{agent}': {error:#}");
+                if result.is_ok() {
+                    result =
+                        Err(error.context(format!("could not stop the worker of agent '{agent}'")));
+                }
             }
         }
+        result
     }
 
     fn publish(&self, agent: &str, record: &Value) {
@@ -4379,12 +4385,15 @@ fn launch(
     );
     // However the loop ended, no window's worker outlives it: a resume starts
     // new conversations, as a conversation cannot be rolled back.
-    if let Some(scoped) = &executor.host.agents.scoped {
-        scoped.close_all();
-    }
+    let cleanup = executor
+        .host
+        .agents
+        .scoped
+        .as_ref()
+        .map_or(Ok(()), ScopedWorkers::close_all);
     watcher_shutdown.store(true, Ordering::Release);
     let _ = watcher.join();
-    let end = match outcome {
+    let end = match outcome.and_then(|end| cleanup.map(|()| end)) {
         Ok(end) => end,
         Err(error) => {
             observer.run_failed(&error.to_string());
@@ -10812,6 +10821,84 @@ mod tests {
 
     fn life(unit: LifetimeUnit, count: u32) -> Lifetime {
         Lifetime { unit, count }
+    }
+
+    #[test]
+    fn closing_remaining_windows_reports_unconfirmed_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        // A socket below a regular file makes cleanup fail without reaching
+        // any tmux server or starting a worker.
+        let socket_parent = dir.path().join("not-a-directory");
+        fs::write(&socket_parent, "").unwrap();
+        let mut state = verify(&lifetime_program(2, "Stub", per("task", 5))).unwrap();
+        state
+            .agents
+            .insert("t.other".into(), state.agents["t.coder"].clone());
+        let launcher = AgentLauncher {
+            client: TmuxClient::on_socket(socket_parent.join("socket").display().to_string()),
+            team: state.team.clone(),
+            runtime_dir: dir.path().to_owned(),
+            omar_dir: dir.path().to_owned(),
+            ea_id: 0,
+            base_prefix: "test-".into(),
+            health_idle_warning: 15,
+            endpoint: String::new(),
+            token: String::new(),
+            workspaces: BTreeMap::new(),
+            resumed: String::new(),
+        };
+        let deployment = Arc::new(Mutex::new(deploy::DeploymentRecord::create(
+            &state.team,
+            BTreeMap::new(),
+            60,
+        )));
+        let workers = ScopedWorkers::new(&state, launcher, deployment, None)
+            .unwrap()
+            .unwrap();
+        for agent in state.agents.keys() {
+            let mut used = Used::first(Tag::default());
+            used.take(Tag::default());
+            *workers.slot(agent) = Some(Window {
+                agent: agent.clone(),
+                attempt: manager::TopologyAttempt {
+                    id: agent.clone(),
+                    key: String::new(),
+                    native_session: String::new(),
+                },
+                session: agent.clone(),
+                tree: Vec::new(),
+                sessions: BTreeSet::new(),
+                since: std::time::SystemTime::now(),
+                conversation: String::new(),
+                used,
+                failed: false,
+                record: json!({"logical_agent": agent}),
+            });
+        }
+
+        let error = workers.close_all().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("could not stop the worker of agent 't.coder'"),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("tmux session state is unknown"));
+        // One failure must not prevent closing the other remaining windows.
+        assert!(workers
+            .windows
+            .values()
+            .all(|slot| slot.lock().unwrap().is_none()));
+        let records: Vec<Value> = fs::read_to_string(&workers.log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .all(|record| record["cleanup_status"] == "unconfirmed"));
+        workers.close_all().unwrap();
     }
 
     #[test]
