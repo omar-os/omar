@@ -55,3 +55,30 @@ test('prompt-only save preserves adjacent Rust and the other role configuration'
  assert.equal(locateStep(edited, snapshot, snapshot.reactions[2]).prompt, 'Use $(critique).\nReview "again".');
  assert.ok(edited.includes(body));
 });
+
+import { graphChange, splitConnection } from '../app/lib/graph-edits.ts';
+const insert = {position:'before',name:'checked',role:'planner',prompt:'Check the value',repairs:{},port:'port::flow.request'};
+test('inserting and removing graph steps preserves typed ports and downstream branches', () => {
+ const first=snapshot.reactions[0];
+ const before=graphChange(program,snapshot,first,insert);
+ assert.match(before,/task planner\(request\) -> checked "Check the value"/);
+ assert.match(before,/task planner\(checked\) -> plan "Use \$\(checked\)/);
+ const after=graphChange(program,snapshot,first,{...insert,position:'after',port:first.effects[0]});
+ assert.match(after,/task planner\(request\) -> checked/);
+ assert.match(after,/task planner\(checked\) -> plan/);
+ assert.match(after,/task reviewer\(plan\) -> critique/);
+ const remove={...insert,position:'remove'};
+ assert.throws(()=>graphChange(program,snapshot,first,remove),/compatible replacement/);
+ const repaired=graphChange(program,snapshot,first,{...remove,repairs:{[first.effects[0]]:first.triggers[0]}});
+ assert.match(repaired,/request -> plan/);
+ assert.match(repaired,/task reviewer\(plan\) -> critique/);
+ assert.throws(()=>graphChange(program,snapshot,first,{...insert,name:'plan'}),/unique identifier/);
+});
+test('an inter-instance connection is split in its enclosing block and keeps its delay',()=>{
+ const workflow=program.replace('flow = ReviewFlow()','flow = ReviewFlow()\nother = ReviewFlow()\nflow.result -> other.request after 2s');
+ const port={...snapshot.ports.find(p=>p.name==='flow.request'),id:'port::other.request',name:'other.request',instance:'other'};
+ const snap={...snapshot,ports:[...snapshot.ports,port],instances:[...snapshot.instances,{id:'instance::other',name:'other',team:'ReviewFlow'}]};
+ const graph=splitConnection(workflow,snap,{kind:'connection',source:'port::flow.result',target:port.id},{...insert,name:'audit',role:'Web'});
+ assert.match(graph,/team auditStep\[worker : Web\]/);
+ assert.match(graph,/flow.result -> audit.value\s+audit.result -> other.request after 2s/);
+});

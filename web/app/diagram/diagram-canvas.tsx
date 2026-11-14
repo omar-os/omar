@@ -1339,6 +1339,7 @@ export function DiagramCanvas({
   selection = [],
   onToggleComponent,
   onInspectComponent,
+  onInspectEdge,
   onOpenTerminal,
   onOpenPanel,
   highlight,
@@ -1347,6 +1348,7 @@ export function DiagramCanvas({
   snapshot: DiagramSnapshot;
   selection?: string[];
   onToggleComponent?: (component: string) => void;
+  onInspectEdge?: (edge: string) => void;
   onInspectComponent?: (component: string) => void;
   /** Given only while agents are actually running and can be attached to. */
   onOpenTerminal?: (agent: string) => void;
@@ -1755,6 +1757,11 @@ export function DiagramCanvas({
             <g className="omar-edges">
               {layout.edges.map((edge) => (
                 <g key={edge.id} className={edgeFocusClass(edge.id).trim() || undefined}>
+                  {onInspectEdge ? <path className="edge-hit" d={edge.path} tabIndex={0} role="button"
+                    aria-label={`Edit connection ${edge.id}`}
+                    onClick={() => onInspectEdge(edge.id)} onKeyDown={event => {
+                      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onInspectEdge(edge.id); }
+                    }} /> : null}
                   <path
                     data-id={edge.id}
                     className={`omar-edge ${edge.kind}`}

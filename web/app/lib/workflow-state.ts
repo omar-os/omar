@@ -92,6 +92,12 @@ export class WorkflowDraftStore {
     await this.inflight;
     if (this.pending) await this.flush();
   }
+  async commitValidated(draft: WorkflowDraft) {
+    await this.flush();
+    const saved = await updateWorkflow(this.base, { revision: this.revision, draft });
+    this.revision = saved.revision;
+    this.publish("Saved");
+  }
   async useSaved(): Promise<WorkflowState> {
     if (this.inflight) await this.inflight.catch(() => {});
     clearTimeout(this.timer);

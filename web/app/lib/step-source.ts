@@ -44,7 +44,7 @@ function codeEnd(source: string, start: number): number {
 
 /** Locate editable spans, never decide whether a workflow is valid. The runtime
  * compiler validates every replacement before it becomes the current draft. */
-function tokens(source: string): Token[] {
+export function tokens(source: string): Token[] {
   const result: Token[] = [];
   let i = 0;
   while (i < source.length) {
@@ -133,7 +133,7 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
   } catch { return null; }
 }
 
-function quotedPrompt(prompt: string): string {
+export function quotedPrompt(prompt: string): string {
   return '"' + prompt.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 }
 

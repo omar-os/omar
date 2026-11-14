@@ -263,6 +263,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [historyRevision, setHistoryRevision] = useState(0);
   const [filesOpen, setFilesOpen] = useState(false);
+  const [graphUndo, setGraphUndo] = useState<{ before: string; after: string } | null>(null);
   const [inspected, setInspected] = useState<string | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const historyButtonRef = useRef<HTMLButtonElement>(null);
@@ -967,7 +968,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
   }
 
-  async function applyStepConfiguration(nextSource: string) {
+  async function applyStepConfiguration(nextSource: string, graph = false) {
     if (applyingConfiguration) throw new Error("Another configuration update is being validated.");
     const scope = scopeRef.current;
     const original = source;
@@ -978,11 +979,18 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
       if (scope !== scopeRef.current || sourceRef.current !== original) throw new Error("The workflow changed during validation. Reopen this step and try again.");
       if (runRef.current && !isRunFinished(runRef.current.status)) throw new Error("The workflow started during validation. Apply these changes after it finishes.");
       if (!checked.ok) throw new Error((checked.errors ?? ["The configuration did not compile."]).join("\n"));
+      const nextDesign = design && checked.preview ? { ...design, program: nextSource, preview: checked.preview } : design;
+      if (graph && nextDesign && !isDemo) {
+        await draftStore.commitValidated({ design: nextDesign, filename, proposal_sequence: proposalSequenceRef.current });
+        if (scope !== scopeRef.current || sourceRef.current !== original) throw new Error("The draft changed while saving. Reload its saved revision.");
+      } else {
+        stageDraft(nextSource, filename, nextDesign);
+        if (!isDemo) await draftStore.flush();
+      }
       setSource(nextSource);
       setSourceErrors([]);
-      if (checked.preview && !runRef.current) setSnapshot(checked.preview);
-      stageDraft(nextSource, filename, design && checked.preview ? { ...design, preview: checked.preview } : design);
-      if (!isDemo) await draftStore.flush();
+      if (checked.preview && (!runRef.current || isRunFinished(runRef.current.status))) setSnapshot(checked.preview);
+      if (nextDesign) setDesign(nextDesign);
     } finally {
       if (scope === scopeRef.current) setApplyingConfiguration(false);
     }
@@ -1756,11 +1764,15 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           {!isDemo && design ? <div className="workflow-save" role="status">{saveStatus}
             {saveStatus !== "Saved" && !saveStatus.startsWith("Saving") ? <><button onClick={() => void draftStore.flush().catch(() => {})}>Retry save</button><button onClick={() => void restoreSavedDraft()}>Use saved version</button></> : null}
           </div> : null}
+          {graphUndo && source === graphUndo.after && !readOnly && (!run || isRunFinished(run.status)) ? <button type="button" disabled={applyingConfiguration} onClick={() => {
+            void applyStepConfiguration(graphUndo.before, true).then(() => { setGraphUndo(null); setInspected(null); }).catch(cause => setError(describeError(cause)));
+          }}>Undo graph edit</button> : null}
           <div className="topology-body">
           <DiagramCanvas
             snapshot={snapshot}
             selection={selection}
             onToggleComponent={toggleComponent}
+            onInspectEdge={canRun && !readOnly && !switchingChat && (!run || isRunFinished(run.status)) ? setInspected : undefined}
             onInspectComponent={(component) => setInspected((current) => current === component ? null : component)}
             // Agents outlive the run that spawned them, so a finished run can
             // still be opened; before a run there is nothing behind the node.
@@ -1771,7 +1783,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             // answered through instead, which is the only thing there is.
             onOpenPanel={run ? setPanelAgent : undefined}
           />
-          {inspected ? <StepInspector key={`${serveUrl}:${inspected}`} component={inspected} snapshot={snapshot} source={source} readOnly={readOnly} editable={canRun && !readOnly && !switchingChat && (!run || isRunFinished(run.status))} onApply={applyStepConfiguration} onClose={() => setInspected(null)} onEdit={editSource} onAsk={askAboutStep} /> : null}
+          {inspected ? <StepInspector key={`${serveUrl}:${inspected}`} component={inspected} snapshot={snapshot} source={source} readOnly={readOnly} editable={canRun && !readOnly && !switchingChat && (!run || isRunFinished(run.status))} onApply={applyStepConfiguration} onGraph={async next => { await applyStepConfiguration(next, true); setGraphUndo({before:source, after:next}); }} onClose={() => setInspected(null)} onEdit={editSource} onAsk={askAboutStep} /> : null}
           </div>
           {timelineOpen ? (
             <Timeline

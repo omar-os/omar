@@ -5,14 +5,16 @@ import { locateStep, replacePrompt, replaceStep, type StepSource } from "./lib/s
 import type { DiagramSnapshot } from "./lib/protocol";
 import { formatDuration } from "./lib/protocol";
 import { componentName } from "./diagram/diagram-canvas";
+import { GraphStepEditor } from "./graph-step-editor";
 import { WorkflowIcon } from "./workflow-icon";
 
 /** Details come from the compiled topology, never from prototype sample data. */
-export function StepInspector({ component, snapshot, source, editable, readOnly = false, onApply, onClose, onEdit, onAsk }: {
+export function StepInspector({ component, snapshot, source, editable, readOnly = false, onGraph, onApply, onClose, onEdit, onAsk }: {
   source: string;
   editable: boolean;
   /** Details only: nothing here may lead to a change. */
   readOnly?: boolean;
+  onGraph: (source: string) => Promise<void>;
   onApply: (source: string) => Promise<void>;
   component: string;
   snapshot: DiagramSnapshot;
@@ -20,7 +22,8 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
   onEdit: () => void;
   onAsk: (request: string) => void;
 }) {
-  const reaction = snapshot.reactions.find((item) => componentName(item.id) === component);
+  const edge = snapshot.edges.find(item => item.id === component);
+  const reaction = snapshot.reactions.find((item) => componentName(item.id) === component || (edge && (item.id === edge.source || item.id === edge.target)));
   const port = snapshot.ports.find((item) => componentName(item.id) === component);
   const timer = (snapshot.timers ?? []).find((item) => componentName(item.id) === component);
   const agent = snapshot.agents.find((item) => item.id === reaction?.agent);
@@ -34,7 +37,8 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
       <header><span className="inspector-type">{reaction ? "TASK" : timer ? "TIMER" : port?.kind === "action" ? "ACTION" : "CONNECTION"}</span><button type="button" aria-label="Close step details" onClick={onClose}><WorkflowIcon name="close" size={16} /></button></header>
       <h3>{name}</h3>
       <p className="inspector-description">{component}</p>
-      {reaction ? <>
+      {editable && !readOnly && (reaction || edge) ? <GraphStepEditor source={source} snapshot={snapshot} reaction={reaction} edge={edge} onApply={onGraph} onClose={onClose} /> : null}
+      {reaction && !edge ? <>
         {configuration && !readOnly ? <PromptEditor step={configuration} source={source} enabled={editable} onApply={onApply} /> : null}
         {readOnly ? null : <button type="button" className="step-edit" onClick={onEdit}>Open source <WorkflowIcon name="arrow" size={14} /></button>}
         {!configuration ? <>
