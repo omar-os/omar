@@ -7,17 +7,20 @@
 //! entry in [`ALL`].
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use serde_json::Value;
 
 use crate::manager::McpLaunchContext;
+pub use connection::Connection;
 
 pub(crate) mod antigravity;
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod connect;
+pub(crate) mod connection;
 pub(crate) mod cursor;
 pub(crate) mod jev;
 pub(crate) mod managed;
@@ -198,6 +201,22 @@ pub struct StartupGate {
 
 /// A topology prompt evaluated directly by a backend, without a coding-agent pane.
 /// Output types are the canonical types already resolved and checked by the VM.
+/// A CLI's own sign-in: `program args`, attached to the operator's terminal.
+pub struct Login {
+    pub args: &'static [&'static str],
+    /// Said before it starts, when the CLI does not say it itself.
+    pub note: Option<&'static str>,
+}
+
+/// Where a CLI keeps its sign-in, for one whose login drops the old sign-in
+/// as soon as it starts: a replace signs in under a fresh home named by `var`
+/// first, and moves only `files` into `dir` once the new sign-in works.
+pub struct SignInHome {
+    pub var: &'static str,
+    pub dir: PathBuf,
+    pub files: &'static [&'static str],
+}
+
 pub struct TopologyInvocation<'a> {
     pub effects: &'a BTreeMap<String, String>,
     pub triggers: &'a BTreeMap<String, Value>,
@@ -228,6 +247,37 @@ pub trait Backend: Send + Sync {
         false
     }
     fn startup_gate(&self, _screen: &str) -> Option<StartupGate> {
+        None
+    }
+
+    /// Whether this backend's installed CLI, run as `program`, is signed in.
+    fn connection(&self, _program: &str) -> Connection {
+        Connection::unknown("no sign-in check for this backend")
+    }
+    /// The vendor's official installer, which `omar connect` runs.
+    fn install_command(&self) -> Option<&'static str> {
+        None
+    }
+    /// How `omar connect` has the installed CLI sign itself in. `headless`:
+    /// no browser can open here, so prefer a code the operator types elsewhere.
+    fn login(&self, _headless: bool) -> Option<Login> {
+        None
+    }
+    /// Environment variables that sign the CLI in, which no sign-out clears.
+    fn credential_vars(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// How the connect picker has the CLI sign itself out.
+    fn logout(&self) -> Option<Login> {
+        None
+    }
+    /// Set when the CLI's login signs it out before the new sign-in is made.
+    fn sign_in_home(&self) -> Option<SignInHome> {
+        None
+    }
+    /// The CLI's own headless run of `connection::CHECK_PROMPT` as `program`,
+    /// which proves a sign-in works (`connection::check_sign_in`).
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
         None
     }
 
@@ -328,6 +378,10 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Best-effort: delete the native session of an ephemeral worker, just
+    /// before its pane is killed. Errors are ignored.
+    fn forget(&self, _target: &Target<'_>) {}
+
     /// An executive assistant's launch line, when it differs from a worker's.
     /// `prompt_file` holds the prompt with its placeholders intact and
     /// `prompt` is the same text with them resolved; a backend that takes the
@@ -341,6 +395,55 @@ pub trait Backend: Send + Sync {
         _context: &McpLaunchContext,
     ) -> Option<String> {
         None
+    }
+}
+
+/// A worker (or topology agent) leaves no native session behind, unless the
+/// operator sets `OMAR_PERSIST_WORKER_SESSIONS=1`. Backends with no
+/// `ea_launch_command` launch the EA through the worker path, so the EA is
+/// excluded here.
+pub(crate) fn ephemeral_worker(context: &McpLaunchContext) -> bool {
+    (context.agent_name.is_some() || context.topology.is_some()) && !persist_worker_sessions()
+}
+
+fn persist_worker_sessions() -> bool {
+    std::env::var("OMAR_PERSIST_WORKER_SESSIONS").is_ok_and(|v| v == "1")
+}
+
+/// Kill a worker's tmux session (and its process tree when `tree`), after
+/// deleting its native session. The one teardown for every worker; never call
+/// it for an EA's manager session.
+pub(crate) fn kill_worker(
+    client: &crate::tmux::TmuxClient,
+    session: &str,
+    tree: bool,
+) -> anyhow::Result<()> {
+    forget_worker(client, session);
+    if tree {
+        client.kill_session_tree(session)
+    } else {
+        client.kill_session(session)
+    }
+}
+
+/// Delete a worker's native session before its tmux session is killed.
+fn forget_worker(client: &crate::tmux::TmuxClient, session: &str) {
+    if persist_worker_sessions() {
+        return;
+    }
+    let (Some(name), Ok(pane_pid)) = (
+        client.session_backend(session),
+        client.get_pane_pid(session),
+    ) else {
+        return;
+    };
+    let stamp = client.session_delivery(session);
+    if let Some(backend) = by_name(&name) {
+        backend.forget(&Target {
+            name: session,
+            pane_pid,
+            stamp: stamp.as_deref(),
+        });
     }
 }
 

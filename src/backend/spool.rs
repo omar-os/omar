@@ -33,6 +33,7 @@ pub(crate) fn append(path: &Path, text: &str) -> Result<()> {
         std::fs::create_dir_all(parent).context("create spool directory")?;
     }
     let line = serde_json::json!({ "at": now_secs(), "text": text }).to_string();
+    let _held = lock(path)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -40,6 +41,22 @@ pub(crate) fn append(path: &Path, text: &str) -> Result<()> {
         .with_context(|| format!("open spool {}", path.display()))?;
     writeln!(file, "{}", line).context("append to spool")?;
     Ok(())
+}
+
+/// Hold the spool's lock until the returned file is dropped. It is a file of
+/// its own, beside the spool, because the spool itself is renamed away.
+fn lock(path: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.with_extension("lock"))
+        .with_context(|| format!("open spool lock for {}", path.display()))?;
+    // SAFETY: flock on a descriptor this function owns; released on close.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("lock spool");
+    }
+    Ok(file)
 }
 
 pub(crate) fn now_secs() -> u64 {
@@ -72,6 +89,19 @@ pub(crate) fn drain_spool(path: &Path) -> Vec<String> {
     // if both fire at once a read-then-truncate would hand the same events
     // over twice. Only one rename can win.
     let claimed = path.with_extension("draining");
+    // Nothing queued: leave the directory alone. A polling drainer must not
+    // create the lock file on every pass.
+    if !path.exists() {
+        return Vec::new();
+    }
+    // Writers hold the lock from open to write, and the drain holds it from
+    // rename to removal. Otherwise a writer that opened the spool just before
+    // the rename writes into the claimed file after it was read and removed,
+    // and a second drain's rename can replace the claimed file before the
+    // first has read it: either way an event is lost.
+    let Ok(_held) = lock(path) else {
+        return Vec::new();
+    };
     let Ok(()) = std::fs::rename(path, &claimed) else {
         return Vec::new();
     };
@@ -225,6 +255,33 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(strays.is_empty(), "temp file left behind");
+    }
+
+    #[test]
+    fn an_event_queued_while_the_spool_drains_is_not_lost() {
+        // A writer that opened the spool just before a drain renamed it used
+        // to write into the claimed file after it was read and removed: the
+        // agent never saw the invocation and the run waited out its timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pane.jsonl");
+        let count = 20_000;
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 0..count {
+                    append(&path, &format!("event {i}")).unwrap();
+                }
+            })
+        };
+        let mut seen = Vec::new();
+        while !writer.is_finished() {
+            seen.extend(drain_spool(&path));
+        }
+        writer.join().unwrap();
+        seen.extend(drain_spool(&path));
+        assert_eq!(seen.len(), count, "events handed over");
+        let expected: Vec<_> = (0..count).map(|i| format!("event {i}")).collect();
+        assert_eq!(seen, expected, "each event once, in order");
     }
 
     #[test]

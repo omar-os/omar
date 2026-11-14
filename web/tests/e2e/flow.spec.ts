@@ -1080,7 +1080,7 @@ test("the confirmation chooses what the run keeps and how it checkpoints", async
   // What the daemon was asked for.
   const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
   const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
-  expect(options).toEqual({ keep_workspaces: true, checkpoint_period: "logical:2h30m" });
+  expect(options).toEqual({ keep_workspaces: true, checkpoint_period: "logical:2h30m", sandbox: false, no_sandbox: true });
 });
 
 test("checkpoints are off unless enabled", async ({ page }) => {
@@ -1093,7 +1093,7 @@ test("checkpoints are off unless enabled", async ({ page }) => {
   await expect(page.locator(".connection")).toContainText("observing");
   const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
   const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
-  expect(options).toEqual({ keep_workspaces: false, checkpoint_period: "off" });
+  expect(options).toEqual({ keep_workspaces: false, checkpoint_period: "off", sandbox: false, no_sandbox: true });
 });
 
 test("the file viewer shows the current run's instances only", async ({ page }) => {
@@ -1478,12 +1478,12 @@ test("the composer says which assistant is answering, and can change it", async 
   await trigger.click();
   const menu = page.getByRole("menu");
   await expect(menu).toBeVisible();
+  // Only connected backends are offered, each with how it is signed in;
+  // the rest are a click away on the Backends page.
   await expect(menu.getByRole("menuitem")).toHaveText([
-    "Claude Code",
-    "Codex✓",
-    "Cursor",
-    "opencode",
-    "agy",
+    "Claude CodeClaude Max",
+    "CodexChatGPT✓",
+    "Connect more backends…",
   ]);
 
   // It opens upward: it lives at the bottom of the composer.
@@ -1492,13 +1492,334 @@ test("the composer says which assistant is answering, and can change it", async 
   expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(triggerBox.y + 1);
 
   // Choosing another restarts the assistant, so it asks first.
-  await menu.getByRole("menuitem", { name: "Claude Code" }).click();
+  await menu.getByRole("menuitem", { name: /Claude Code/ }).click();
   await expect(page.locator(".backend-confirm")).toContainText(
     "session is lost",
   );
   await page.getByRole("button", { name: "Restart" }).click();
 
   await expect(page.getByRole("button", { name: /Claude Code/ })).toBeVisible();
+});
+
+test("no backend can be chosen before its status is known", async ({ page }) => {
+  await useFakeServe(page);
+  let answer: () => void = () => {};
+  const held = new Promise<void>((resolve) => (answer = resolve));
+  await page.route("**/v1/agent/backends", async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  const menu = page.getByRole("menu");
+  // Still asking: a signed-out one must not slip through.
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeDisabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeDisabled();
+
+  answer();
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeEnabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeHidden();
+});
+
+test("a backend the runtime finds signed out is refused with how to sign in", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  // Signed out since the menu last asked; the runtime checks again.
+  await page.route("**/v1/agent/backend", (route) =>
+    route.fulfill({
+      status: 409,
+      json: { error: "claude is not signed in; run `omar connect claude`" },
+    }),
+  );
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menu").getByRole("menuitem", { name: /Claude Code/ }).click();
+  await page.getByRole("button", { name: "Restart" }).click();
+
+  await expect(page.locator(".backend-error")).toHaveText(
+    "claude is not signed in; run `omar connect claude`",
+  );
+  await expect(page.getByRole("button", { name: /Codex/ })).toBeVisible();
+});
+
+test("a failed status check blocks switching until a retry answers", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({ status: 500, json: { error: "boom" } }),
+  );
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  const menu = page.getByRole("menu");
+  // Only a missing endpoint means an older runtime; a failure is not one.
+  await expect(menu.getByRole("alert")).toContainText("Couldn't check backends");
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeDisabled();
+
+  await page.unroute("**/v1/agent/backends");
+  await menu.getByRole("button", { name: "Retry" }).click();
+  await expect(menu.getByRole("alert")).toBeHidden();
+  await expect(menu.getByRole("menuitem", { name: /Claude Code/ })).toBeEnabled();
+  await expect(menu.getByRole("menuitem", { name: /Cursor/ })).toBeHidden();
+});
+
+test("a backend is connected from the Backends page, in a terminal that closes once it is", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await expect(backends).toContainText("2 of 6 connected.");
+  await expect(backends.getByRole("listitem")).toHaveText([
+    /Claude CodeConnected · Claude Max/,
+    /CodexConnected · ChatGPT/,
+    /CursorNot signed in.*Connect/,
+    /opencodeUnknown · no answer.*Connect/,
+    /piNot installed.*Connect/,
+    /agyNot installed.*Connect/,
+  ]);
+
+  // The same `omar connect cursor` as on the command line, in a terminal.
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+  await page.keyboard.press("Enter");
+
+  // Once cursor reports connected, the terminal goes on its own.
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorConnected · fake sign-in/,
+  );
+  await expect(backends).toContainText("3 of 6 connected.");
+
+  await backends.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await expect(page.getByRole("menuitem", { name: /Cursor/ })).toBeEnabled();
+});
+
+test("a backend is set up for sandboxes from the Backends page", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  // Each backend says whether sandboxed teams can use it.
+  await expect(backends.getByRole("listitem").first()).toHaveText(
+    /Claude CodeConnected · Claude MaxSandboxes · not connected/,
+  );
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(/Sandboxes · ChatGPT/);
+  await expect(backends.getByRole("button", { name: "Set up Codex for sandboxes" })).toHaveCount(0);
+
+  // `omar connect claude --sandbox`, in the same kind of terminal.
+  await backends.getByRole("button", { name: "Set up Claude Code for sandboxes" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Set up Claude Code for sandboxes" });
+  await expect(terminal).toContainText("claude $");
+  await expect(terminal).toContainText("inside a sandbox");
+  await page.keyboard.press("Enter");
+
+  // `omar connect --sandbox` checks the key in a sandbox itself; when it
+  // ends, so does the terminal, and the row reads the new sign-in.
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").first()).toHaveText(
+    /Claude CodeConnected · Claude MaxSandboxes · anthropic key/,
+  );
+  await expect(backends.getByRole("button", { name: "Set up Claude Code for sandboxes" })).toHaveCount(0);
+});
+
+test("the confirmation opts a run into sandboxes", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  // Off unless the runtime turns sandboxes on.
+  const sandbox = dialog.getByRole("checkbox", { name: "Run each team in a Docker Sandbox" });
+  await expect(sandbox).not.toBeChecked();
+  await expect(dialog).toContainText("Agents run on this machine");
+  await sandbox.check();
+  await expect(dialog).toContainText("must be connected for sandboxes");
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
+  const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
+  expect(options).toMatchObject({ sandbox: true, no_sandbox: false });
+  // Each team's box says it runs in a sandbox, and which one.
+  const team = page.locator(".omar-team.sandboxed").first();
+  await expect(team).toBeVisible();
+  await expect(team.locator(".omar-team-sandbox")).toHaveCount(1);
+  await expect(team.locator(".omar-team-kind")).toContainText("sandbox");
+  await expect(team).toHaveAttribute("data-sandbox", /^omar-team-/);
+  await expect(page.getByLabel("Diagram legend")).toContainText("sandbox");
+});
+
+test("a run on the host draws no sandbox", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  await expect(page.locator(".omar-team").first()).toBeVisible();
+  await expect(page.locator(".omar-team.sandboxed")).toHaveCount(0);
+  await expect(page.getByLabel("Diagram legend")).not.toContainText("sandbox");
+});
+
+test("without Docker Sandboxes the confirmation offers none", async ({ page }) => {
+  await useFakeServe(page);
+  await page.route("**/v1/agent", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    await route.fulfill({ response, json: { ...body, sandbox: { default: false, installed: false } } });
+  });
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  await expect(dialog.getByRole("button", { name: "Confirm deploy" })).toBeVisible();
+  await expect(dialog.getByRole("checkbox", { name: "Run each team in a Docker Sandbox" })).toHaveCount(0);
+});
+
+test("a sign-in whose test prompt fails keeps its terminal open until one works", async ({
+  page,
+}) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+
+  // Signed in with a key its vendor rejects: status says connected, the
+  // test prompt says otherwise, and the terminal stays for another try.
+  await page.keyboard.type("bad");
+  await page.keyboard.press("Enter");
+  const alert = terminal.getByRole("alert");
+  await expect(alert).toContainText(
+    "cursor is signed in, but its test prompt failed: 401 Invalid API Key",
+    { timeout: 10_000 },
+  );
+  await expect(terminal).toBeVisible();
+
+  // Signed in again, with a key that works.
+  await page.keyboard.type("good");
+  await page.keyboard.press("Enter");
+  await alert.getByRole("button", { name: "Check again" }).click();
+  await expect(terminal).toBeHidden();
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorConnected · fake sign-in/,
+  );
+  await expect(backends).toContainText("3 of 6 connected.");
+});
+
+test("a backend whose test prompt failed can be connected again", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await backends.getByRole("button", { name: "Connect Cursor" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Connect Cursor" });
+  await expect(terminal).toContainText("cursor $");
+  await page.keyboard.type("bad");
+  await page.keyboard.press("Enter");
+  await expect(terminal.getByRole("alert")).toBeVisible({ timeout: 10_000 });
+  await terminal.getByRole("button", { name: "Close" }).click();
+
+  // It reads as connected, but is not counted, and offers Connect again.
+  await expect(backends.getByRole("listitem").nth(2)).toHaveText(
+    /CursorSigned in, but its test prompt failed.*Connect/,
+  );
+  await expect(backends).toContainText("2 of 6 connected.");
+});
+
+test("a working sign-in is replaced from the Backends page", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(
+    /CodexConnected · ChatGPT.*Disconnect.*Replace/,
+  );
+
+  // `omar connect codex --replace`: signs in again although codex works,
+  // and is done when its terminal ends and the new sign-in answers.
+  await backends.getByRole("button", { name: "Replace Codex's sign-in" }).click();
+  const terminal = page.getByRole("dialog", {
+    name: "Terminal for Replace Codex's sign-in",
+  });
+  await expect(terminal).toContainText("codex $");
+  await page.keyboard.type("work");
+  await page.keyboard.press("Enter");
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(
+    /CodexConnected · work account/,
+  );
+  await expect(backends).toContainText("2 of 6 connected.");
+});
+
+test("a sign-in is disconnected from the Backends page once confirmed", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+
+  // The first click only asks.
+  await backends.getByRole("button", { name: "Disconnect Codex" }).click();
+  await backends.getByRole("button", { name: "Cancel" }).click();
+  await expect(backends.getByRole("button", { name: "Sign Codex out" })).toHaveCount(0);
+  await backends.getByRole("button", { name: "Disconnect Codex" }).click();
+  await backends.getByRole("button", { name: "Sign Codex out" }).click();
+
+  // `omar disconnect codex`, in a terminal that goes once it has run.
+  const terminal = page.getByRole("dialog", { name: "Terminal for Disconnect Codex" });
+  await expect(terminal).toContainText("codex $");
+  await page.keyboard.press("Enter");
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(
+    /CodexNot signed in.*Connect/,
+  );
+  await expect(backends).toContainText("1 of 6 connected.");
+});
+
+test("with no backend connected, the Backends page comes first", async ({ page }) => {
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({
+      json: {
+        backends: ["claude", "codex", "cursor", "opencode", "pi", "agy"].map((name) => ({
+          name,
+          status: "not_installed",
+          login: `omar connect ${name}`,
+        })),
+      },
+    }),
+  );
+  await useFakeServe(page);
+
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await expect(backends).toContainText(
+    "No backend is connected yet. Connect one to start the assistant.",
+  );
+  await expect(backends.getByRole("button", { name: /^Connect / })).toHaveCount(6);
+});
+
+test("settings open the Backends page", async ({ page }) => {
+  await useFakeServe(page);
+  await expect(page.getByRole("dialog", { name: "Backends" })).toBeHidden();
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("menuitem", { name: "Connect backends…" }).click();
+  await expect(page.getByRole("dialog", { name: "Backends" })).toContainText("2 of 6 connected.");
+});
+
+test("a runtime without backend status still switches", async ({ page }) => {
+  await useFakeServe(page);
+  await page.route("**/v1/agent/backends", (route) =>
+    route.fulfill({ status: 404, json: { error: "Not found" } }),
+  );
+
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menu").getByRole("menuitem", { name: /Cursor/ }).click();
+  await page.getByRole("button", { name: "Restart" }).click();
+  await expect(page.getByRole("button", { name: /Cursor/ })).toBeVisible();
 });
 
 test("a chevron names the backend behind its agent", async ({ page }) => {
@@ -2935,6 +3256,121 @@ test("workflow tabs support keyboard navigation and saved VS Code edits reach de
   await deploy(page);
   expect((await deployment).postDataJSON().files).toEqual(savedFiles);
 });
+
+test("workflow source and filename restore after reload without changing the transcript", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await expect(page.locator(".messages")).toContainText("It is in your queue for approval.");
+  const before = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+  await page.getByRole("button", {name:"Show the source pane"}).click();
+  const source = page.getByRole("textbox", {name:"OMAR program"});
+  const edited = "// saved edit\n" + before.messages.findLast((message: { design?: { program: string } }) => message.design)?.design.program;
+  await source.fill(edited);
+  await page.getByRole("textbox", {name:"Program file name"}).fill("edited.omar");
+  await expect(page.locator(".workflow-save")).toHaveText("Saved");
+  await page.reload();
+  await expect(page.locator(".diagram-panel")).toBeVisible();
+  await page.getByRole("button", {name:"Show the source pane"}).click();
+  await expect(source).toContainText("// saved edit");
+  await expect(page.getByRole("textbox", {name:"Program file name"})).toHaveValue("edited.omar");
+  const after = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+  expect(after.messages).toEqual(before.messages);
+});
+
+
+test("workflows can be archived, undone, and restored after reload with their saved drafts", async ({ page, context }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await expect(page.locator(".messages")).toContainText("It is in your queue for approval.");
+  const original = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+  const second = await context.newPage();
+  try {
+    await useFakeServe(second);
+    await expect(second.locator(".messages")).toContainText("Review the release plan");
+    const history = page.getByRole("complementary", {name:"Chat history"});
+    await history.locator(".workflow-row").filter({hasText:"Review the release plan"}).getByRole("button", {name:"Archive workflow",exact:true}).click();
+    await expect(history.getByRole("list", {name:"Saved chats"})).not.toContainText("Review the release plan");
+    await expect(history.getByRole("status")).toContainText("Workflow archived");
+    await expect(second.locator(".messages")).not.toContainText("Review the release plan");
+    await history.getByRole("button", {name:"Undo",exact:true}).click();
+    await expect(history.getByRole("list", {name:"Saved chats"})).toContainText("Review the release plan");
+    await history.locator(".workflow-row").filter({hasText:"Review the release plan"}).getByRole("button", {name:"Archive workflow",exact:true}).click();
+    await page.reload();
+    await history.getByRole("button", {name:"Archive",exact:true}).click();
+    await expect(history.getByRole("list", {name:"Archive"})).toContainText("Review the release plan");
+    await history.getByRole("button", {name:"Restore workflow",exact:true}).click();
+    await history.getByRole("button", {name:"Back to workflows",exact:true}).click();
+    await history.getByRole("button", {name:/Review the release plan/}).click();
+    await expect(page.locator(".messages")).toContainText("Review the release plan");
+    await expect(page.locator(".diagram-panel")).toBeVisible();
+    const restored = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+    expect(restored.id).toBe(original.id);
+    expect(restored.messages).toEqual(original.messages);
+  } finally { await second.close(); }
+});
+
+test("workflow archive failures keep the row and running workflows cannot be archived", async ({page}) => {
+  await fake.close();
+  fake = (await startFakeServe({stepMs:120,port:FAKE_SERVE_PORT,snapshot:"diagram-web.v1.json"})) as FakeServe;
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const history = page.getByRole("complementary", {name:"Chat history"});
+  await page.route("**/v1/chats/*/archive", route => route.fulfill({status:409,json:{error:"Stop this workflow before archiving it."}}));
+  await history.getByRole("button", {name:"Archive workflow",exact:true}).click();
+  await expect(history.getByRole("alert")).toContainText("Stop this workflow");
+  await expect(history.getByRole("list", {name:"Saved chats"})).toContainText("Review the release plan");
+  await page.unroute("**/v1/chats/*/archive");
+  await page.getByRole("button", {name:"Deploy",exact:true}).click();
+  await page.getByRole("button", {name:"Confirm deploy",exact:true}).click();
+  await expect(history.getByRole("button", {name:"Archive workflow",exact:true})).toBeDisabled();
+});
+
+for (const width of [1280, 390]) {
+  test(`archive separates restoration from confirmed permanent deletion at ${width}px`, async ({page}) => {
+    await page.setViewportSize({width, height: 900});
+    await useFakeServe(page);
+    await draftUntilProposed(page);
+    await expect(page.locator(".messages")).toContainText("It is in your queue for approval.");
+    if (width < 901) await page.getByRole("button", {name:"Open chat history", exact:true}).click();
+    const history = page.locator("#chat-history");
+    const archive = history.getByRole("button", {name:"Archive",exact:true});
+    await expect(archive).toHaveCSS("border-top-width", "0px");
+    await expect(archive).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+    await expect(history.getByRole("button", {name:"Delete workflow permanently"})).toHaveCount(0);
+    await history.getByRole("button", {name:"Archive workflow",exact:true}).click();
+    // Mobile selection may close the drawer after archiving the selected chat.
+    if (width < 901) {
+      await expect(history).not.toBeVisible();
+      await page.getByRole("button", {name:"Open chat history",exact:true}).click();
+    }
+    await archive.click();
+    const row = history.locator(".archived-workflow").filter({hasText:"Review the release plan"});
+    await row.getByRole("button", {name:"Delete workflow permanently"}).click();
+    const confirm = page.getByRole("dialog", {name:"Delete workflow?",exact:true});
+    await expect(confirm).toContainText("Review the release plan");
+    await expect(confirm.getByRole("button", {name:"Cancel",exact:true})).toBeFocused();
+    await confirm.getByRole("button", {name:"Cancel",exact:true}).click();
+    await expect(confirm).toHaveCount(0);
+    await expect(row).toBeVisible();
+    await row.getByRole("button", {name:"Delete workflow permanently"}).click();
+    await page.keyboard.press("Escape");
+    await expect(confirm).toHaveCount(0);
+    await row.getByRole("button", {name:"Delete workflow permanently"}).click();
+    await page.route("**/v1/chats/*/delete", route => route.fulfill({status:500,json:{error:"Could not save history."}}));
+    await confirm.getByRole("button", {name:"Delete permanently",exact:true}).click();
+    await expect(confirm.getByRole("alert")).toHaveText("Could not save history.");
+    await expect(row).toBeVisible();
+    await page.unroute("**/v1/chats/*/delete");
+    await confirm.getByRole("button", {name:"Delete permanently",exact:true}).click();
+    await expect(confirm).toHaveCount(0);
+    await expect(row).toHaveCount(0);
+    await expect(history.getByRole("button", {name:"Undo",exact:true})).toHaveCount(0);
+    await page.reload();
+    if (width < 901) await page.getByRole("button", {name:"Open chat history",exact:true}).click();
+    await archive.click();
+    await expect(history).toContainText("No archived workflows.");
+  });
+}
 
 test("a design's safety properties show their Lean proofs and single out what they are about", async ({ page }) => {
   await useFakeServe(page);

@@ -25,7 +25,12 @@ function applyTheme(theme: Theme) {
  * applied before paint by a script in the layout, so a light page does not
  * flash dark while React loads.
  */
-export function SettingsMenu() {
+export function SettingsMenu({
+  onOpenBackends,
+}: {
+  /** Opens the Backends page; absent where nothing can be connected. */
+  onOpenBackends?: () => void;
+} = {}) {
   // Read off the document rather than storage: the layout script has already
   // applied the stored choice by the time this runs. Nothing visible depends
   // on it until the menu opens, so the server's "dark" never mismatches.
@@ -91,6 +96,21 @@ export function SettingsMenu() {
               {theme === option ? <span aria-hidden="true">✓</span> : null}
             </button>
           ))}
+          {onOpenBackends ? (
+            <>
+              <span className="settings-heading">Backends</span>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setOpen(false);
+                  onOpenBackends();
+                }}
+              >
+                Connect backends…
+              </button>
+            </>
+          ) : null}
         </div>
       ) : null}
     </div>

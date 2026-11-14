@@ -128,6 +128,12 @@ with tempfile.TemporaryDirectory(prefix="omar-sessions-") as folder:
         cli("rm", "-s", "doomed")
         assert not Path(doomed["directory"]).exists() and "doomed" not in {s["name"] for s in json.loads(cli("ls", "--json"))}
         sessions.remove(doomed)
+        # A dead socket left by a crash, or by a deleted home, doesn't block a new session of that name.
+        socket.socket(socket.AF_UNIX).bind(doomed["socket"])
+        reborn = up("doomed")
+        assert reborn["socket"] == doomed["socket"]
+        cli("rm", "-s", "doomed")
+        sessions.remove(reborn)
         # Foreground serve honours --json for its startup record.
         foreground = subprocess.Popen([str(BIN), "--json", "serve", "-s", "fg", "--no-ea"], cwd=root, env=env,
                                       text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)

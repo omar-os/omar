@@ -1,0 +1,152 @@
+# syntax=docker/sandbox-kit:3
+# OMAR team sandbox: every OMAR backend CLI, with model access through the
+# sbx credential proxy. Keys stay on the host (`sbx secret set SERVICE`);
+# the VM sees placeholders. Only model API hosts are reachable.
+schemaVersion: "3"
+displayName: OMAR team sandbox
+description: Agent CLIs, Rust and tmux for OMAR topology teams
+sourceUrl: https://github.com/omar-os/omar
+licenses: [BSD-3-Clause]
+kind: workload
+dockerfile: omar-sandbox.dockerfile
+
+capabilities:
+  - type: com.docker.sandbox/sbx@1
+
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      runtime:
+        allow:
+          - api.anthropic.com:443
+          - platform.claude.com:443
+          - api.openai.com:443
+          - auth.openai.com:443
+          - chatgpt.com:443
+          - api2.cursor.sh:443
+          - api3.cursor.sh:443
+          - repo42.cursor.sh:443
+          - generativelanguage.googleapis.com:443
+          - cloudcode-pa.googleapis.com:443
+          - oauth2.googleapis.com:443
+          - openrouter.ai:443
+          - api.x.ai:443
+          - api.mistral.ai:443
+          - api.groq.com:443
+
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    config:
+      service: anthropic
+      phase: runtime
+      apiKey:
+        name: ANTHROPIC_API_KEY
+        inject:
+          - {domain: api.anthropic.com, header: x-api-key, format: "%s"}
+
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    config:
+      service: openai
+      phase: runtime
+      apiKey:
+        name: OPENAI_API_KEY
+        inject:
+          - {domain: api.openai.com, header: Authorization, format: "Bearer %s"}
+      # `sbx secret set openai --oauth`: Codex's ChatGPT sign-in, refreshed
+      # on the host.
+      oauth:
+        tokenEndpoint: {host: auth.openai.com, path: /oauth/token}
+        resourceHosts: [chatgpt.com]
+        sentinels:
+          accessToken: oai-oat01-proxy-managed
+          refreshToken: oai-ort01-proxy-managed
+
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    config:
+      service: cursor
+      phase: runtime
+      apiKey:
+        name: CURSOR_API_KEY
+        inject:
+          - {domain: api2.cursor.sh, header: Authorization, format: "Bearer %s"}
+          - {domain: api3.cursor.sh, header: Authorization, format: "Bearer %s"}
+          - {domain: repo42.cursor.sh, header: Authorization, format: "Bearer %s"}
+
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    config:
+      service: google
+      phase: runtime
+      apiKey:
+        name: GEMINI_API_KEY
+        inject:
+          - {domain: generativelanguage.googleapis.com, header: x-goog-api-key, format: "%s"}
+
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    config:
+      service: openrouter
+      phase: runtime
+      apiKey:
+        name: OPENROUTER_API_KEY
+        inject:
+          - {domain: openrouter.ai, header: Authorization, format: "Bearer %s"}
+
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    config:
+      service: xai
+      phase: runtime
+      apiKey:
+        name: XAI_API_KEY
+        inject:
+          - {domain: api.x.ai, header: Authorization, format: "Bearer %s"}
+
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    config:
+      service: mistral
+      phase: runtime
+      apiKey:
+        name: MISTRAL_API_KEY
+        inject:
+          - {domain: api.mistral.ai, header: Authorization, format: "Bearer %s"}
+
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    config:
+      service: groq
+      phase: runtime
+      apiKey:
+        name: GROQ_API_KEY
+        inject:
+          - {domain: api.groq.com, header: Authorization, format: "Bearer %s"}
+
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        # Headless first launch: no onboarding or trust prompts, and the
+        # proxy placeholder is the key (Claude would otherwise ask whether to
+        # use an unfamiliar ANTHROPIC_API_KEY).
+        - command: |
+            set -e
+            mkdir -p ~/.claude ~/.codex
+            printf '%s\n' '{"hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true,"projects":{"/":{"hasTrustDialogAccepted":true}}}' > ~/.claude.json
+            if [ "${SBX_CRED_ANTHROPIC_MODE:-none}" != none ]; then
+              printf '%s\n' '{"apiKeyHelper":"echo proxy-managed","skipDangerousModePermissionPrompt":true}' > ~/.claude/settings.json
+            fi
+            printf '%s\n' 'approval_policy = "never"' 'sandbox_mode = "danger-full-access"' > ~/.codex/config.toml
+            case "${SBX_CRED_OPENAI_MODE:-none}" in
+              oauth)
+                printf '%s\n' 'forced_login_method = "api"' 'model_provider = "sandboxd"' '[model_providers.sandboxd]' \
+                  'name = "Sandbox Proxy"' 'base_url = "https://chatgpt.com/backend-api/codex"' \
+                  'experimental_bearer_token = "oai-oat01-proxy-managed"' 'requires_openai_auth = false' >> ~/.codex/config.toml
+                printf '%s\n' '{"OPENAI_API_KEY":"proxy-managed"}' > ~/.codex/auth.json ;;
+              apikey)
+                printf '%s\n' 'forced_login_method = "api"' >> ~/.codex/config.toml
+                printf '%s\n' '{"OPENAI_API_KEY":"proxy-managed"}' > ~/.codex/auth.json ;;
+            esac
+          user: agent
+          env: [SBX_CRED_ANTHROPIC_MODE, SBX_CRED_OPENAI_MODE]
+          description: Seed headless agent CLI configuration from the bound credentials

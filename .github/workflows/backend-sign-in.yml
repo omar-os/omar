@@ -1,0 +1,133 @@
+name: Backend Sign-ins (Nightly)
+
+# Each agent CLI, updated to its latest release, against the sign-in checks
+# `omar connect` and Mission Control rely on:
+#   - its status command reads it as signed in;
+#   - its headless test prompt answers (`omar backends --check`);
+#   - a bogus key, which still reads as signed in, is refused, so a CLI that
+#     starts exiting 0 on a rejected key is caught too.
+# Runs on the self-hosted runner Live Topology uses, which is signed in to
+# every CLI (.github/scripts/setup-live-runner.sh); no keys pass through
+# GitHub. A scheduled failure opens an issue, or comments on the open one.
+on:
+  schedule:
+    # An hour before Live Topology, on the same runner.
+    - cron: "0 8 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: backend-sign-ins-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sign-in:
+    name: Sign-in (${{ matrix.backend }})
+    # The runner holds personal agent logins; only schedule and maintainers'
+    # manual runs reach it.
+    runs-on: [self-hosted, omar-live]
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # agy is off until the runner has a paid Antigravity plan, as in
+        # Live Topology.
+        include:
+          - backend: claude
+            program: claude
+            update: claude update
+          - backend: codex
+            program: codex
+            update: codex update
+          - backend: cursor
+            program: cursor-agent
+            update: cursor-agent update
+          - backend: opencode
+            program: opencode
+            update: opencode upgrade
+          - backend: pi
+            program: pi
+            update: pi update
+    env:
+      BACKEND: ${{ matrix.backend }}
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          clean: false
+
+      - name: Isolate run state
+        run: |
+          git clean -ffdx -e target -e lang/.lake
+          # Agent CLIs and Rust are installed per user on this machine.
+          printf '%s\n' "$HOME/.local/bin" "$HOME/.opencode/bin" "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+
+      - name: Build omar
+        run: cargo build --bin omar
+
+      - name: Update ${{ matrix.backend }} to its latest release
+        run: |
+          ${{ matrix.update }} </dev/null
+          ${{ matrix.program }} --version
+
+      - name: Signed in, and its test prompt answers
+        run: ./target/debug/omar backends --check "$BACKEND"
+
+      - name: A bogus key reads as signed in, and its test prompt is refused
+        run: |
+          scratch="$RUNNER_TEMP/bogus-$BACKEND"
+          rm -rf "$scratch" && mkdir -p "$scratch"
+          key=bogus-omar-nightly
+          # Each CLI's own way to hold a key, away from the runner's sign-in.
+          case "$BACKEND" in
+            claude) set -- env HOME="$scratch" ANTHROPIC_API_KEY="$key" ;;
+            codex)
+              printf '%s' "sk-$key" | HOME="$scratch" codex login --with-api-key
+              set -- env HOME="$scratch" ;;
+            cursor) set -- env CURSOR_API_KEY="$key" ;;
+            opencode) set -- env XDG_DATA_HOME="$scratch" OPENAI_API_KEY="$key" ;;
+            pi) set -- env PI_CODING_AGENT_DIR="$scratch" GROQ_API_KEY="$key" ;;
+          esac
+          if out=$("$@" ./target/debug/omar backends --check --json "$BACKEND"); then
+            echo "$out"
+            echo "::error::$BACKEND answered its test prompt with a bogus key"
+            exit 1
+          fi
+          echo "$out"
+          echo "$out" | jq -e '.[0].status == "connected" and .[0].check.ok == false' >/dev/null || {
+            echo "::error::$BACKEND did not read as signed in with a bogus key, so its refusal tests nothing"
+            exit 1
+          }
+          echo "Refused: $(echo "$out" | jq -r '.[0].check.error')"
+
+  report:
+    name: Report a failure
+    needs: sign-in
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          failed=$(gh run view "$RUN_ID" --json jobs \
+            --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")')
+          title="Nightly backend sign-in check failed"
+          body="Failed: ${failed:-see the run}. A backend CLI's latest release may have changed its status, headless mode or errors. Run: $RUN_URL"
+          issue=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

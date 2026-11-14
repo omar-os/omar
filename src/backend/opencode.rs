@@ -2,6 +2,7 @@
 //! and given its prompt as the first message over HTTP.
 
 use super::managed;
+use super::{connection, Connection, Login};
 use super::{Backend, Kind, Launch};
 use crate::manager::{
     actor_file, materialize_mcp_context_file, mcp_ea_dir, omar_server_exe, shell_single_quote,
@@ -27,8 +28,51 @@ impl Backend for Opencode {
         // opencode has no permission-skip flag.
         "opencode"
     }
+    /// `--standalone` keeps a running opencode daemon, whose environment may
+    /// not be ours, from answering. Both attempts share one deadline.
+    fn connection(&self, program: &str) -> Connection {
+        let deadline = connection::status_deadline();
+        let args = ["auth", "list", "--format", "json", "--standalone"];
+        let Some(output) = connection::run_until(program, &args, deadline) else {
+            return Connection::unknown("`opencode auth list` did not answer");
+        };
+        if let Some(connection) = auth_list(&output.stdout) {
+            return connection;
+        }
+        // opencode 1 has no JSON, only its table.
+        match connection::run_until(program, &["auth", "list"], deadline) {
+            Some(output) => auth_table(&output.stdout),
+            None => Connection::unknown("`opencode auth list` did not answer"),
+        }
+    }
+    fn install_command(&self) -> Option<&'static str> {
+        Some("curl -fsSL https://opencode.ai/install | bash")
+    }
+    fn login(&self, _headless: bool) -> Option<Login> {
+        Some(Login {
+            args: &["auth", "login"],
+            note: None,
+        })
+    }
+    fn credential_vars(&self) -> &'static [&'static str] {
+        connection::PROVIDER_KEYS
+    }
+    fn logout(&self) -> Option<Login> {
+        Some(Login {
+            args: &["auth", "logout"],
+            note: None,
+        })
+    }
+    fn sign_in_check(&self, _program: &str) -> Option<Vec<&'static str>> {
+        Some(vec!["run", connection::CHECK_PROMPT])
+    }
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         from_stamp(target.stamp?).map(|(_, session)| session)
+    }
+    fn forget(&self, target: &super::Target<'_>) {
+        if let Some((port, session)) = target.stamp.and_then(from_stamp) {
+            let _ = http_json(port, "DELETE", &format!("/session/{session}"), None);
+        }
     }
     /// Single words: a long workspace path wraps the footer and splits
     /// "tab agents" and "ctrl+p commands" across lines.
@@ -138,6 +182,17 @@ pub(crate) fn materialize_opencode_coordination_plugin(
     Some(format!("file://{encoded}"))
 }
 
+/// Nobody answers a permission prompt in a worker, so no rule may be left at
+/// opencode's `ask` default: `external_directory` (paths outside the
+/// workspace) and `read` of `*.env` files. `doom_loop` is denied, not asked.
+fn permission_rules() -> serde_json::Value {
+    serde_json::json!({
+        "doom_loop": "deny",
+        "external_directory": "allow",
+        "read": "allow"
+    })
+}
+
 pub(crate) fn opencode_config_env(context: &McpLaunchContext) -> Option<String> {
     let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
@@ -170,9 +225,7 @@ pub(crate) fn opencode_config_env(context: &McpLaunchContext) -> Option<String> 
             }
         },
         "tools": tools,
-        "permission": {
-            "doom_loop": "deny"
-        }
+        "permission": permission_rules()
     });
     if let Some(plugin) = materialize_opencode_coordination_plugin(context) {
         config["plugin"] = serde_json::json!([plugin]);
@@ -329,10 +382,95 @@ pub(crate) fn split_response(response: &str) -> Option<(u16, String)> {
     Some((status, body))
 }
 
+/// opencode 2 lists every provider it can use, with how it signed in.
+fn auth_list(stdout: &str) -> Option<Connection> {
+    let Ok(serde_json::Value::Array(integrations)) = serde_json::from_str(stdout) else {
+        return None;
+    };
+    let names: Vec<&str> = integrations
+        .iter()
+        .filter(|integration| {
+            integration["connections"]
+                .as_array()
+                .is_some_and(|connections| !connections.is_empty())
+        })
+        .filter_map(|integration| integration["name"].as_str())
+        .collect();
+    Some(signed_in(&names))
+}
+
+/// opencode 1 marks each stored or environment credential with `●`, its
+/// provider name ending where the dimmed source begins.
+fn auth_table(stdout: &str) -> Connection {
+    if !stdout.contains("Credentials") {
+        return Connection::unknown("`opencode auth list` gave no answer OMAR knows");
+    }
+    let names: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.split_once('●'))
+        .filter_map(|(_, rest)| rest.split('\x1b').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    signed_in(&names)
+}
+
+fn signed_in(providers: &[&str]) -> Connection {
+    if providers.is_empty() {
+        Connection::SignedOut
+    } else {
+        Connection::connected(providers.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auth_list_names_the_providers_with_a_connection() {
+        use super::{auth_list, auth_table, Connection};
+        let listed = r#"[
+            {"id":"anthropic","name":"Anthropic","connections":[{"type":"env","name":"ANTHROPIC_API_KEY"}]},
+            {"id":"openai","name":"OpenAI","connections":[{"type":"credential","id":"c1","label":"me","method":"oauth"}]},
+            {"id":"xai","name":"xAI","connections":[]}
+        ]"#;
+        assert_eq!(
+            auth_list(listed),
+            Some(Connection::connected("Anthropic, OpenAI"))
+        );
+        assert_eq!(auth_list("[]"), Some(Connection::SignedOut));
+        assert_eq!(auth_list("Usage: opencode auth list"), None);
+
+        // opencode 1's table, as printed with no credentials, then with one
+        // stored and one from the environment.
+        let empty = "\x1b[0m\n┌  Credentials \x1b[90m~/.local/share/opencode/auth.json\n│\n└  0 credentials\n";
+        assert_eq!(auth_table(empty), Connection::SignedOut);
+        let two = "┌  Credentials \x1b[90m~/.local/share/opencode/auth.json\n│\n\
+                   ●  OpenAI \x1b[90mapi\n│\n└  1 credentials\n\n┌  Environment\n│\n\
+                   ●  Google Vertex \x1b[90mGOOGLE_CLOUD_PROJECT\n│\n└  1 environment variable\n";
+        assert_eq!(
+            auth_table(two),
+            Connection::connected("OpenAI, Google Vertex")
+        );
+        assert!(matches!(
+            auth_table("Error: boom"),
+            Connection::Unknown { .. }
+        ));
+    }
+
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn config_never_leaves_a_blocking_permission_at_ask() {
+        let rules = permission_rules();
+        assert_eq!(rules["external_directory"], "allow");
+        assert_eq!(rules["read"], "allow");
+        assert!(rules
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|action| action != "ask"));
+    }
 
     #[test]
     fn a_footer_wrapped_by_a_long_path_still_reads_as_ready() {
@@ -439,6 +577,33 @@ mod tests {
         });
         deliver_over_http(port, "session_test", "agent event").unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn forgetting_a_worker_deletes_its_session_over_http() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stamp = format!("opencode:{}:ses_abc", listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntrue")
+                .unwrap();
+            line
+        });
+        Opencode.forget(&super::super::Target {
+            name: "pane",
+            pane_pid: 0,
+            stamp: Some(&stamp),
+        });
+        assert_eq!(
+            server.join().unwrap(),
+            "DELETE /session/ses_abc HTTP/1.1\r\n"
+        );
     }
 
     #[test]

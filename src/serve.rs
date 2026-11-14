@@ -45,6 +45,8 @@ enum Access {
 }
 const TERMINAL_PREFIX: &str = "/v1/agents/";
 const TERMINAL_SUFFIX: &str = "/terminal";
+/// A backend's sign-in terminal: `/v1/backends/<name>/terminal`.
+const CONNECT_PREFIX: &str = "/v1/backends/";
 /// How long the relay waits on each side before checking the other.
 const TERMINAL_POLL: Duration = Duration::from_millis(25);
 /// A selection names diagram components, and a diagram the operator can click
@@ -109,6 +111,9 @@ pub struct RunRecord {
     pub status: RunStatus,
     pub diagram_address: Option<String>,
     pub started_at: u64,
+    /// Last meaningful run activity, in milliseconds like chat timestamps.
+    #[serde(default)]
+    pub activity_at: u64,
     pub finished_at: Option<u64>,
     pub error: Option<String>,
     /// Input ports the run was admitted with, so its timeline can be
@@ -196,6 +201,16 @@ struct StartRunRequest {
     /// Keep the instances' workspaces when the run ends; off, they go with it.
     #[serde(default)]
     keep_workspaces: bool,
+    /// Run the teams in Docker Sandboxes, as `omar run --sandbox`.
+    #[serde(default)]
+    sandbox: bool,
+    /// Docker Sandbox template for this run; the runtime's configured one
+    /// otherwise.
+    #[serde(default)]
+    sandbox_template: Option<String>,
+    /// Run the teams on the host even where the config enables sandboxes.
+    #[serde(default)]
+    no_sandbox: bool,
 }
 
 fn default_replace() -> bool {
@@ -379,6 +394,7 @@ struct Settings {
     health_idle_warning: i64,
     command: String,
     address: SocketAddr,
+    sandbox: crate::sandbox::Config,
 }
 
 struct Context_ {
@@ -389,6 +405,7 @@ struct Context_ {
     session_prefix: String,
     default_workdir: String,
     health_idle_warning: i64,
+    sandbox: crate::sandbox::Config,
     runs: Runs,
     /// Where each run's web-backed invocations are answered. Absent for a run
     /// whose program has no `Web` agent, which is what makes the panel routes
@@ -834,7 +851,24 @@ impl Serve {
         let address = listener.local_addr()?;
         let agent_token = Uuid::new_v4().to_string();
         let mut history = History::load_session(omar_dir)?;
-        let has_history = !history.active().messages.is_empty();
+        let mut legacy = Vec::new();
+        let mut roots = vec![omar_dir.join("ea")];
+        if crate::sessions::is_managed() {
+            roots.push(crate::sessions::home_root().join("ea"));
+        }
+        for root in roots {
+            if let Ok(entries) = fs::read_dir(root) {
+                legacy.extend(
+                    entries
+                        .flatten()
+                        .map(|e| e.path().join("chats.json"))
+                        .filter(|p| p.exists()),
+                );
+            }
+        }
+        legacy.sort();
+        history.import_histories(&legacy)?;
+        let has_history = history.active().has_saved_context();
         let conversation_id = history.active_id.clone();
         let workspace_ea = match history.active().ea_id {
             Some(id) => id,
@@ -860,7 +894,7 @@ impl Serve {
         let parked = paused_runs(omar_dir, workspace_ea);
         let latest_parked = parked
             .values()
-            .max_by_key(|run| run.started_at)
+            .max_by_key(|run| (run.status.holds_team(), run.started_at))
             .map(|run| run.run_id.clone());
         let context = Arc::new(Context_ {
             history: history.clone(),
@@ -870,6 +904,7 @@ impl Serve {
             session_prefix: config.dashboard.session_prefix.clone(),
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
+            sandbox: config.sandbox.clone(),
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             mutations: Mutex::default(),
@@ -901,6 +936,7 @@ impl Serve {
                 health_idle_warning: config.health.idle_warning,
                 command: config.agent.default_command.clone(),
                 address,
+                sandbox: config.sandbox.clone(),
             },
             selection: Mutex::new(()),
             editors: Mutex::new(crate::editor::Editors::default()),
@@ -1521,7 +1557,26 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
     };
 
-    if path == "/v1/workspaces" || path.starts_with("/v1/workspaces/") {
+    // History mutations apply the same origin
+    // checks as workspace editing before accepting a simple cross-site POST.
+    if method == "POST"
+        && path.starts_with("/v1/chats/")
+        && ["/remove", "/archive", "/restore", "/delete"]
+            .iter()
+            .any(|action| path.ends_with(action))
+    {
+        let local_hosts = [
+            context.address.to_string(),
+            format!("localhost:{}", context.address.port()),
+        ];
+        if !host.as_ref().is_some_and(|h| local_hosts.contains(h))
+            || (origin_header.is_some() && origin.is_none())
+        {
+            return write_json(&mut stream, 403, &json!({"error":"origin rejected"}), None);
+        }
+    }
+
+    if path == "/v1/workflow" || path == "/v1/workspaces" || path.starts_with("/v1/workspaces/") {
         // Workspace reads expose host files; editor launch grants shell access.
         // Reject cross-site requests, including simple POSTs, rather than only
         // withholding CORS headers after executing the operation.
@@ -1536,6 +1591,38 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         if method == "OPTIONS" {
             return write_json(&mut stream, 204, &Value::Null, origin);
+        }
+        if path == "/v1/workflow" {
+            let _operation = (method == "POST").then(|| {
+                context
+                    .chat_operation
+                    .lock()
+                    .expect("chat operation poisoned")
+            });
+            let mut history = context.history.lock().expect("history poisoned");
+            let (status, body) = match method.as_str() {
+                "GET" => (
+                    200,
+                    json!(history.conversation(&context.conversation_id).workspace),
+                ),
+                "POST" => {
+                    match serde_json::from_slice::<crate::chat_history::WorkflowUpdate>(&raw_body) {
+                        Ok(update) => {
+                            match history.save_workspace(&context.conversation_id, update) {
+                                Ok(saved) => (200, json!(saved)),
+                                Err(error) => (409, json!({"error": error.to_string()})),
+                            }
+                        }
+                        Err(error) => (400, json!({"error": error.to_string()})),
+                    }
+                }
+                _ => (405, json!({"error": "method not allowed"})),
+            };
+            drop(history);
+            if method == "POST" && status == 200 {
+                context.chat.lock().expect("chat poisoned").needs_context = true;
+            }
+            return write_json(&mut stream, status, &body, origin);
         }
         let response = workspace_request(&workspaces, &context, &method, &path, &raw_body);
         let (status, body) = match response {
@@ -1564,6 +1651,33 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             crate::ea::ea_prefix(context.ea_id, &context.session_prefix),
             crate::tmux::flatten_agent_name(&agent)
         );
+        drop(admission);
+        return attach_terminal(
+            stream,
+            &session,
+            websocket_key.as_deref(),
+            origin_header.as_deref(),
+            terminal_query,
+            access,
+        );
+    }
+    // A backend's sign-in, started by `POST /v1/backends/<name>/connect`.
+    if method == "GET"
+        && terminal_path.starts_with(CONNECT_PREFIX)
+        && terminal_path.ends_with(TERMINAL_SUFFIX)
+    {
+        let name = terminal_path
+            .trim_start_matches(CONNECT_PREFIX)
+            .trim_end_matches(TERMINAL_SUFFIX);
+        let Some(backend) = connectable(name) else {
+            return write_json(
+                &mut stream,
+                404,
+                &json!({"error": format!("'{name}' is not an assistant backend")}),
+                origin_header.as_deref(),
+            );
+        };
+        let session = connect_session(&context, backend);
         drop(admission);
         return attach_terminal(
             stream,
@@ -1728,6 +1842,40 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             }
         }
         ("GET", "/v1/chats") => (200, workspaces.list()),
+        ("GET", "/v1/chats/removed" | "/v1/chats/archived") => (
+            200,
+            json!({"conversations": workspaces.history.lock().expect("history poisoned").removed()}),
+        ),
+        ("POST", rest)
+            if rest.starts_with("/v1/chats/")
+                && ["/remove", "/archive", "/restore", "/delete"]
+                    .iter()
+                    .any(|action| rest.ends_with(action)) =>
+        {
+            let action = rest.rsplit('/').next().unwrap();
+            let id = rest
+                .trim_start_matches("/v1/chats/")
+                .strip_suffix(&format!("/{action}"))
+                .unwrap();
+            if action == "delete" {
+                if content_length > MAX_BODY_BYTES {
+                    (413, json!({"error": "request too large"}))
+                } else {
+                    let body: Value =
+                        serde_json::from_slice(&read_body(content_length)?).unwrap_or(Value::Null);
+                    if body["confirm"] != true {
+                        (
+                            400,
+                            json!({"error": "Confirm permanent deletion of this archived workflow."}),
+                        )
+                    } else {
+                        delete_archived_chat(&workspaces, id)
+                    }
+                }
+            } else {
+                remove_or_restore_chat(&workspaces, id, action != "restore")
+            }
+        }
         ("POST", "/v1/chats") => {
             let _ = read_body(content_length)?;
             select_chat(&workspaces, None)
@@ -1740,7 +1888,56 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             select_chat(&workspaces, Some(id))
         }
         ("GET", "/v1/agent") => (200, describe_agent(&context)),
+        ("GET", "/v1/agent/backends") => (200, backend_connections()),
         ("POST", "/v1/agent/backend") => switch_backend(&context, &read_body(content_length)?),
+        ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/connect") => {
+            #[derive(Deserialize, Default)]
+            struct Request {
+                #[serde(default)]
+                replace: bool,
+                #[serde(default)]
+                sandbox: bool,
+            }
+            let request: Request =
+                serde_json::from_slice(&read_body(content_length)?).unwrap_or_default();
+            let name = rest
+                .trim_start_matches(CONNECT_PREFIX)
+                .trim_end_matches("/connect");
+            let flags = [
+                (request.replace, "--replace"),
+                (request.sandbox, "--sandbox"),
+            ]
+            .iter()
+            .filter_map(|(on, flag)| on.then_some(*flag))
+            .collect::<Vec<_>>()
+            .join(" ");
+            start_connect(&context, name, "connect", &flags)
+        }
+        ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/disconnect") => {
+            #[derive(Deserialize, Default)]
+            struct Request {
+                #[serde(default)]
+                sandbox: bool,
+            }
+            let request: Request =
+                serde_json::from_slice(&read_body(content_length)?).unwrap_or_default();
+            let name = rest
+                .trim_start_matches(CONNECT_PREFIX)
+                .trim_end_matches("/disconnect");
+            start_connect(
+                &context,
+                name,
+                "disconnect",
+                if request.sandbox { "--sandbox" } else { "" },
+            )
+        }
+        ("POST", rest) if rest.starts_with(CONNECT_PREFIX) && rest.ends_with("/check") => {
+            let _ = read_body(content_length)?;
+            let name = rest
+                .trim_start_matches(CONNECT_PREFIX)
+                .trim_end_matches("/check");
+            check_backend(name)
+        }
         // EA-only, authenticated with the token handed to its MCP sidecar.
         ("POST", "/v1/agent/reply") => agent_reply(&context, &read_body(content_length)?),
         ("POST", "/v1/agent/proposals") => {
@@ -2106,10 +2303,21 @@ fn relay_terminal(
         }
 
         // Screen output travelling back.
+        let ended = attachment.ended();
         while let Some(bytes) = attachment.read(Duration::from_millis(1)) {
             if socket.send(Message::Binary(bytes)).is_err() {
                 return Ok(());
             }
+        }
+        // The session is gone, with all it drew sent: say so, so a page
+        // waiting on a sign-in knows it finished.
+        if ended {
+            let _ = socket.close(Some(tungstenite::protocol::CloseFrame {
+                code: tungstenite::protocol::frame::coding::CloseCode::Normal,
+                reason: "ended".into(),
+            }));
+            let _ = socket.flush();
+            break;
         }
         if socket.flush().is_err() {
             break;
@@ -2134,7 +2342,28 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
             .find(|kind| crate::backend::of(*kind).default_command() == command)
             .map(crate::backend::Kind::name),
         "available": crate::backend::assistant_names(),
+        // What a run that says nothing does, so Mission Control's deploy
+        // dialog starts from it, and whether sbx is here to offer at all.
+        "sandbox": {
+            "default": context.sandbox.on_by_default(),
+            "installed": crate::sandbox::installed(),
+        },
     })
+}
+
+/// Whether each backend is installed and signed in. Asked on demand: the
+/// answer comes from each CLI and takes up to a few seconds.
+fn backend_connections() -> Value {
+    use crate::backend::connection;
+    let (statuses, sandboxes) = connection::assistants_and_sandboxes();
+    let backends: Vec<Value> = statuses
+        .into_iter()
+        .zip(&sandboxes)
+        .map(|((backend, status), sandbox)| {
+            connection::describe_with_sandbox(backend, &status, sandbox)
+        })
+        .collect();
+    json!({ "backends": backends })
 }
 
 /// Relaunch the assistant on a different backend.
@@ -2147,6 +2376,17 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         .chat_operation
         .lock()
         .expect("chat operation poisoned");
+    if context
+        .history
+        .lock()
+        .expect("history poisoned")
+        .is_removed(&context.conversation_id)
+    {
+        return (
+            409,
+            json!({"error": "Restore this workflow before continuing."}),
+        );
+    }
     #[derive(Deserialize)]
     struct Request {
         backend: String,
@@ -2165,6 +2405,16 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": format!("'{}' is not an assistant backend", request.backend)}),
         );
     }
+    // Asked before the running assistant is touched, and before the chat
+    // lock: a status check can take seconds.
+    let status = crate::backend::connection::connection(backend);
+    if let Some(reason) = unusable(backend, &status) {
+        return (409, json!({"error": reason, "status": status}));
+    }
+    let _operation = context
+        .chat_operation
+        .lock()
+        .expect("chat operation poisoned");
     let command = backend.default_command().to_string();
 
     match relaunch_ea(context, &command) {
@@ -2178,6 +2428,120 @@ fn switch_backend(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         }
         Err(error) => (502, json!({"error": format!("{error:#}")})),
     }
+}
+
+/// An assistant backend by name; anything else has no sign-in to run here.
+fn connectable(name: &str) -> Option<&'static dyn crate::backend::Backend> {
+    crate::backend::by_name(name)
+        .filter(|backend| crate::backend::ASSISTANT.contains(&backend.kind()))
+}
+
+/// The tmux session a backend's sign-in runs in. Named apart from agents
+/// (`<base><ea>-<agent>`) and the assistant (`<base>ea-<ea>`).
+fn connect_session(context: &Context_, backend: &dyn crate::backend::Backend) -> String {
+    format!(
+        "{}connect-{}-{}",
+        context.session_prefix,
+        context.ea_id,
+        backend.kind().name()
+    )
+}
+
+/// Run `omar connect <backend>` (install, then the CLI's own sign-in), with
+/// `--replace` to sign in again or `--sandbox` for sandboxes, or `omar
+/// disconnect <backend>`, in a session Mission Control attaches a terminal
+/// to. One already running is reused, so a second click shows the same
+/// sign-in.
+fn start_connect(context: &Context_, name: &str, verb: &str, flags: &str) -> (u16, Value) {
+    let Some(backend) = connectable(name) else {
+        return (
+            404,
+            json!({"error": format!("'{name}' is not an assistant backend")}),
+        );
+    };
+    let Some(omar) = crate::manager::omar_server_exe() else {
+        return (500, json!({"error": "cannot find the omar executable"}));
+    };
+    let client = TmuxClient::new(crate::ea::ea_prefix(context.ea_id, &context.session_prefix));
+    let session = connect_session(context, backend);
+    let name = backend.kind().name();
+    // A failed connect leaves its message on screen until a key is pressed;
+    // a successful one ends the session, and the page sees it connected.
+    let command = format!(
+        "{} {verb} {name} {flags} || {{ printf '\\nPress Enter to close.'; read _; }}",
+        crate::manager::shell_single_quote(&omar.display().to_string())
+    );
+    match sign_in_session(
+        &client,
+        &session,
+        format!("{verb} {flags}").trim(),
+        &command,
+    ) {
+        Ok(()) => (
+            200,
+            json!({"session": session, "terminal": format!("{CONNECT_PREFIX}{name}{TERMINAL_SUFFIX}")}),
+        ),
+        Err(error) => (502, json!({"error": format!("{error:#}")})),
+    }
+}
+
+/// Names, in a sign-in session's environment, what it was started to do.
+const SIGN_IN_ACTION_VAR: &str = "OMAR_SIGN_IN_ACTION";
+
+/// Start `command` in `session`, or leave the one there running: reopening
+/// the page reattaches to a sign-in under way. One started for another
+/// action, say a replace closed midway before a disconnect, is ended first;
+/// its terminal would otherwise stand in for the new one.
+fn sign_in_session(client: &TmuxClient, session: &str, action: &str, command: &str) -> Result<()> {
+    if client.has_session(session).unwrap_or(false) {
+        if client.session_env(session, SIGN_IN_ACTION_VAR).as_deref() == Some(action) {
+            return Ok(());
+        }
+        client.kill_session_tree(session)?;
+    }
+    client.new_session_with_backend_env(
+        session,
+        command,
+        None,
+        None,
+        &[(SIGN_IN_ACTION_VAR.to_string(), action.to_string())],
+    )
+}
+
+/// Whether `name`'s sign-in works, by its CLI answering a test prompt: what
+/// Mission Control asks before calling a sign-in done. 422 carries the CLI's
+/// own reason.
+fn check_backend(name: &str) -> (u16, Value) {
+    let Some(backend) = connectable(name) else {
+        return (
+            404,
+            json!({"error": format!("'{name}' is not an assistant backend")}),
+        );
+    };
+    match crate::backend::connection::check_sign_in(backend) {
+        Ok(()) => (200, json!({"ok": true})),
+        Err(error) => (
+            422,
+            json!({"error": format!("{} is signed in, but its test prompt failed: {error}", backend.kind().name())}),
+        ),
+    }
+}
+
+/// Why the assistant cannot move to `backend`, if it cannot: launching one that
+/// is missing or signed out would stop the working assistant for one that hangs.
+/// An unreadable status is let through, as Mission Control does.
+fn unusable(
+    backend: &dyn crate::backend::Backend,
+    status: &crate::backend::connection::Connection,
+) -> Option<String> {
+    use crate::backend::connection::Connection;
+    let name = backend.kind().name();
+    let state = match status {
+        Connection::NotInstalled => "not installed",
+        Connection::SignedOut => "not signed in",
+        Connection::Connected { .. } | Connection::Unknown { .. } => return None,
+    };
+    Some(format!("{name} is {state}; run `omar connect {name}`"))
 }
 
 fn assistant_command(root: &Path, ea_id: EaId, fallback: &str) -> String {
@@ -2328,6 +2692,14 @@ impl Workspaces {
 
     fn get(&self, id: &str) -> Result<Arc<Context_>> {
         let mut contexts = self.contexts.lock().expect("workspaces poisoned");
+        anyhow::ensure!(
+            !self
+                .history
+                .lock()
+                .expect("history poisoned")
+                .is_removed(id),
+            "This workflow is archived or deleted. Restore archived workflows from Archive."
+        );
         if let Some(context) = contexts.get(id) {
             let _admission = context.admit()?;
             return Ok(context.clone());
@@ -2338,7 +2710,7 @@ impl Workspaces {
             .iter()
             .find(|chat| chat.id == id)
             .context("unknown chat")?;
-        let has_history = !saved.messages.is_empty();
+        let has_history = saved.has_saved_context();
         let ea_id = match saved.ea_id {
             Some(ea_id) => ea_id,
             None => {
@@ -2361,7 +2733,7 @@ impl Workspaces {
         }
         let latest_parked = parked
             .values()
-            .max_by_key(|run| run.started_at)
+            .max_by_key(|run| (run.status.holds_team(), run.started_at))
             .map(|run| run.run_id.clone());
         let context = Arc::new(Context_ {
             history: self.history.clone(),
@@ -2371,6 +2743,7 @@ impl Workspaces {
             session_prefix: self.settings.session_prefix.clone(),
             default_workdir: self.settings.default_workdir.clone(),
             health_idle_warning: self.settings.health_idle_warning,
+            sandbox: self.settings.sandbox.clone(),
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             mutations: Mutex::default(),
@@ -2420,16 +2793,32 @@ impl Workspaces {
 
     fn list(&self) -> Value {
         let contexts = self.contexts.lock().expect("workspaces poisoned").clone();
-        let (active_id, mut conversations) = {
+        let (active_id, mut conversations, removed_ids) = {
             let history = self.history.lock().expect("history poisoned");
-            (history.active_id.clone(), history.list())
+            (
+                history.active_id.clone(),
+                history.list(),
+                history.hidden_ids(),
+            )
         };
+        let stored = stored_runs(&self.settings.omar_dir);
         for conversation in &mut conversations {
+            conversation.run = stored
+                .iter()
+                .filter(|v| v["ea_id"].as_u64() == conversation.ea_id.map(|id| id as u64))
+                .filter_map(|v| serde_json::from_value::<RunRecord>(v.clone()).ok())
+                .max_by_key(|r| r.activity_at.max(r.started_at * 1000));
             if let Some(context) = contexts.get(&conversation.id) {
                 context.live_summary(conversation);
             }
+            update_recency(conversation);
         }
-        json!({"active_id": active_id, "conversations": conversations})
+        conversations.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        json!({"active_id": active_id, "conversations": conversations, "removed_ids": removed_ids})
     }
 }
 
@@ -2448,6 +2837,148 @@ impl Context_ {
                     .max_by_key(|run| (run.status.is_active(), run.started_at))
                     .cloned()
             });
+        update_recency(summary);
+    }
+}
+
+fn activity_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+fn update_recency(summary: &mut ConversationSummary) {
+    if let Some(run) = &summary.run {
+        summary.updated_at = summary
+            .updated_at
+            .max(run.activity_at)
+            .max(run.started_at * 1000)
+            .max(run.finished_at.unwrap_or(0) * 1000);
+    }
+}
+
+/// Selection and removal share a lock; removal and deployment share the chat
+/// operation lock. A stale tab cannot admit a run after its workflow is hidden.
+fn remove_or_restore_chat(workspaces: &Arc<Workspaces>, id: &str, removed: bool) -> (u16, Value) {
+    let _selection = workspaces.selection.lock().expect("selection poisoned");
+    if !workspaces
+        .history
+        .lock()
+        .expect("history poisoned")
+        .conversations
+        .iter()
+        .any(|chat| chat.id == id)
+    {
+        return (404, json!({"error": "unknown chat"}));
+    }
+    if workspaces
+        .history
+        .lock()
+        .expect("history poisoned")
+        .is_deleted(id)
+    {
+        return (
+            404,
+            json!({"error": "This workflow was permanently deleted."}),
+        );
+    }
+    let result = if removed {
+        let context = match workspaces.get(id) {
+            Ok(context) => context,
+            Err(error) => return (404, json!({"error": error.to_string()})),
+        };
+        let _operation = context
+            .chat_operation
+            .lock()
+            .expect("chat operation poisoned");
+        if context.chat.lock().expect("chat poisoned").busy {
+            return (
+                409,
+                json!({"error": "Wait for the assistant to finish before archiving this workflow."}),
+            );
+        }
+        if context
+            .runs
+            .lock()
+            .expect("runs poisoned")
+            .values()
+            .any(|run| run.status.holds_team())
+        {
+            return (
+                409,
+                json!({"error": "Stop this workflow before archiving it."}),
+            );
+        }
+        workspaces
+            .history
+            .lock()
+            .expect("history poisoned")
+            .set_removed(id, true)
+    } else {
+        workspaces
+            .history
+            .lock()
+            .expect("history poisoned")
+            .set_removed(id, false)
+    };
+    match result {
+        Ok(()) => (200, workspaces.list()),
+        Err(error) => (500, json!({"error": error.to_string()})),
+    }
+}
+
+/// Only archived, inactive workflows can be permanently deleted. Holding the
+/// selection lock prevents a concurrent restore; the operation lock fences stale
+/// chat/deploy requests that already obtained a cached context.
+fn delete_archived_chat(workspaces: &Arc<Workspaces>, id: &str) -> (u16, Value) {
+    let _selection = workspaces.selection.lock().expect("selection poisoned");
+    {
+        let history = workspaces.history.lock().expect("history poisoned");
+        if !history.conversations.iter().any(|chat| chat.id == id) {
+            return (404, json!({"error": "unknown chat"}));
+        }
+        if !history.is_removed(id) {
+            return (
+                409,
+                json!({"error": "Archive this workflow before deleting it."}),
+            );
+        }
+    }
+    let context = workspaces
+        .contexts
+        .lock()
+        .expect("workspaces poisoned")
+        .get(id)
+        .cloned();
+    let _operation = context.as_ref().map(|context| {
+        context
+            .chat_operation
+            .lock()
+            .expect("chat operation poisoned")
+    });
+    if let Some(context) = &context {
+        if context.chat.lock().expect("chat poisoned").busy
+            || context
+                .runs
+                .lock()
+                .expect("runs poisoned")
+                .values()
+                .any(|run| run.status.holds_team())
+        {
+            return (
+                409,
+                json!({"error": "Finish or stop active work before deleting this workflow."}),
+            );
+        }
+    }
+    let result = workspaces
+        .history
+        .lock()
+        .expect("history poisoned")
+        .delete_archived(id);
+    match result {
+        Ok(()) => (200, workspaces.list()),
+        Err(error) => (500, json!({"error": error.to_string()})),
     }
 }
 
@@ -2460,6 +2991,9 @@ fn select_chat(workspaces: &Arc<Workspaces>, id: Option<&str>) -> (u16, Value) {
             let Some(chat) = history.conversations.iter().find(|chat| chat.id == id) else {
                 return (404, json!({"error": "unknown chat"}));
             };
+            if history.is_removed(id) {
+                return (404, json!({"error": "unknown chat"}));
+            }
             let omar_dir = &workspaces.settings.omar_dir;
             if chat
                 .ea_id
@@ -2492,6 +3026,17 @@ fn send_to_ea(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         .chat_operation
         .lock()
         .expect("chat operation poisoned");
+    if context
+        .history
+        .lock()
+        .expect("history poisoned")
+        .is_removed(&context.conversation_id)
+    {
+        return (
+            409,
+            json!({"error": "Restore this workflow before continuing."}),
+        );
+    }
     if context.shutdown.load(Ordering::SeqCst) {
         return (503, json!({"error": "runtime is shutting down"}));
     }
@@ -2635,7 +3180,14 @@ fn mission_control_envelope(text: &str, selection: &[String], live: Option<&Live
          after its output contract and optional within(...) deadline, before its prompt \
          string or code body. Use a specific 3–6 word action title and 1–3 plain-language \
          sentences explaining the work, result, and any manual handoff. Keep technical \
-         IDs and backend names out of titles; preserve the actual execution behavior.\n\
+         IDs and backend names out of titles; preserve the actual execution behavior.\n\n\
+         When asked how to get started, invite the operator to describe a workflow \
+         they want to automate, from development to marketing and beyond. Lead with \
+         concrete developer examples: a GitHub issue into a tested pull request, \
+         fixing failing CI builds; then a product release into launch emails and \
+         social posts. Explain that you will work out the steps and agents and \
+         propose an implementation to review and run. Ask focused questions only \
+         where needed; do not require a full workflow checklist up front.\n\n\
          {live}{selected}{text}",
         live = live.map(ToString::to_string).unwrap_or_default(),
     )
@@ -3012,7 +3564,18 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         .chat_operation
         .lock()
         .expect("chat operation poisoned");
-    let request: StartRunRequest = match serde_json::from_slice(body) {
+    if context
+        .history
+        .lock()
+        .expect("history poisoned")
+        .is_removed(&context.conversation_id)
+    {
+        return (
+            409,
+            json!({"error": "Restore this workflow before continuing."}),
+        );
+    }
+    let mut request: StartRunRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
@@ -3086,6 +3649,18 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             return (409, team_held_error(active));
         }
     }
+    let backends: Vec<&str> = state.agents.values().map(|a| a.backend.as_str()).collect();
+    let notes;
+    (request.sandbox_template, notes) = match crate::sandbox::select(
+        request.sandbox,
+        request.sandbox_template.as_deref(),
+        request.no_sandbox,
+        &context.sandbox,
+        &backends,
+    ) {
+        Ok(template) => template,
+        Err(error) => return (400, json!({"error": format!("{error:#}")})),
+    };
 
     // The verified bytecode beside the source: a later timeline projection
     // or resume reads it back without a compiler.
@@ -3099,6 +3674,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         status: RunStatus::Starting,
         diagram_address: None,
         started_at: now_unix(),
+        activity_at: activity_now(),
         finished_at: None,
         error: None,
         // From the combined list: a CLI start names its inputs in `raw_inputs`.
@@ -3136,8 +3712,15 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
                 record.diagram_address = Some(diagram_address.to_string());
                 if record.status == RunStatus::Starting {
                     record.status = RunStatus::Running;
+                    record.activity_at = activity_now();
+                    persist_run(context, record);
                 }
-                return (201, json!(record));
+                // What getting sandboxes ready did, for the caller to say.
+                let mut started = json!(record);
+                if !notes.is_empty() {
+                    started["notes"] = json!(notes);
+                }
+                return (201, started);
             }
             (500, json!({"error": "run vanished"}))
         }
@@ -3362,7 +3945,8 @@ fn stage_program(
 struct PanelAnswer {
     task_id: u64,
     agent: String,
-    values: BTreeMap<String, Value>,
+    #[serde(flatten)]
+    answer: topology::PanelValues,
 }
 
 /// A run's panel and the team it belongs to, or the reason there is neither.
@@ -3434,16 +4018,26 @@ fn panel_answer(context: &Arc<Context_>, run_id: &str, body: &[u8]) -> (u16, Val
         &team,
         &answer.agent,
         &answer.task_id,
-        &answer.values,
+        &answer.answer,
     ) {
-        Ok(()) => (
-            202,
-            json!({
-                "run_id": run_id,
-                "task_id": answer.task_id,
-                "sent": answer.values.keys().collect::<Vec<_>>()
-            }),
-        ),
+        Ok(()) => {
+            if let Err(error) = context
+                .history
+                .lock()
+                .expect("history poisoned")
+                .touch(&context.conversation_id)
+            {
+                eprintln!("Response accepted, but activity time could not be saved: {error:#}");
+            }
+            (
+                202,
+                json!({
+                    "run_id": run_id,
+                    "task_id": answer.task_id,
+                    "sent": answer.answer.values.keys().collect::<Vec<_>>()
+                }),
+            )
+        }
         // The runtime's own refusal — a port outside the invocation's effects,
         // a value of the wrong type, a contract left unsatisfied — reported as
         // the caller's error rather than the daemon's.
@@ -3491,6 +4085,7 @@ fn spawn_run_thread(
         .as_deref()
         .and_then(|period| crate::checkpoint::parse_policy(period).ok());
     let keep_workspaces = request.keep_workspaces;
+    let sandbox_template = request.sandbox_template.clone();
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let outcome = topology::run_topology(
@@ -3501,6 +4096,7 @@ fn spawn_run_thread(
                 generated: &topology::generated_dir(&program_path),
                 base_prefix: &context.session_prefix,
                 health_idle_warning: context.health_idle_warning,
+                sandbox_template: sandbox_template.as_deref(),
                 inputs: &inputs,
                 replace,
                 timeout,
@@ -3585,6 +4181,7 @@ fn stop_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
             // team; its checkpoints stay on disk for inspection.
             Some(record) if record.status == RunStatus::Paused => {
                 record.status = RunStatus::Stopped;
+                record.activity_at = activity_now();
                 record.finished_at = Some(now_unix());
                 persist_run(context, record);
                 return (200, json!(record));
@@ -3611,6 +4208,8 @@ fn stop_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
         // written, and a finished status must not be walked back to stopping.
         Some(record) if record.status.is_active() => {
             record.status = RunStatus::Stopping;
+            record.activity_at = activity_now();
+            persist_run(context, record);
             (202, json!(record))
         }
         Some(record) => (200, json!(record)),
@@ -3637,6 +4236,7 @@ fn pause_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
     match runs.get_mut(id) {
         Some(record) if record.status.is_active() => {
             record.status = RunStatus::Pausing;
+            record.activity_at = activity_now();
             persist_run(context, record);
             (202, json!(record))
         }
@@ -4166,6 +4766,17 @@ fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
         .chat_operation
         .lock()
         .expect("chat operation poisoned");
+    if context
+        .history
+        .lock()
+        .expect("history poisoned")
+        .is_removed(&context.conversation_id)
+    {
+        return (
+            409,
+            json!({"error": "Restore this workflow before continuing."}),
+        );
+    }
     let team = {
         let runs = context.runs.lock().expect("serve runs poisoned");
         match runs.get(id) {
@@ -4197,6 +4808,7 @@ fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
             return (404, json!({"error": "unknown run"}));
         };
         record.status = RunStatus::Starting;
+        record.activity_at = activity_now();
         record.diagram_address = None;
         record.finished_at = None;
         record.error = None;
@@ -4212,6 +4824,8 @@ fn resume_run(context: &Arc<Context_>, id: &str) -> (u16, Value) {
                 record.diagram_address = Some(diagram_address.to_string());
                 if record.status == RunStatus::Starting {
                     record.status = RunStatus::Running;
+                    record.activity_at = activity_now();
+                    persist_run(context, record);
                 }
                 return (200, json!(record));
             }
@@ -4374,6 +4988,7 @@ fn paused_runs(omar_dir: &Path, ea_id: EaId) -> BTreeMap<String, RunRecord> {
                         .join("run.json");
                     let _ = topology::write_json_atomic(&path, &record);
                 }
+                RunStatus::Failed | RunStatus::Completed => {}
                 _ => return None,
             }
             Some((record.run_id.clone(), record))
@@ -4461,6 +5076,7 @@ fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::R
         .remove(run_id);
     let mut runs = context.runs.lock().expect("serve runs poisoned");
     if let Some(record) = runs.get_mut(run_id) {
+        record.activity_at = activity_now();
         record.finished_at = Some(now_unix());
         match outcome {
             Ok(outcome) => {
@@ -4523,6 +5139,8 @@ fn spawn_resume_thread(
                 generated: &generated,
                 base_prefix: &context.session_prefix,
                 health_idle_warning: context.health_idle_warning,
+                // The paused run's recorded template wins.
+                sandbox_template: None,
                 inputs: &[],
                 replace: true,
                 timeout: Duration::from_secs(default_timeout_seconds()),
@@ -4900,6 +5518,7 @@ mod tests {
             status,
             diagram_address: None,
             started_at: 0,
+            activity_at: 0,
             finished_at: None,
             error: None,
             present: Vec::new(),
@@ -5329,6 +5948,177 @@ mod tests {
     }
 
     #[test]
+    fn deletion_requires_archiving_and_confirmation_and_blocks_late_writes() {
+        let server = test_server();
+        let id = server.context.conversation_id.clone();
+        server
+            .context
+            .publish_with_selection(
+                ChatRole::Operator,
+                "Delete only this test".into(),
+                false,
+                None,
+                vec![],
+            )
+            .unwrap();
+        let delete = format!("/v1/chats/{id}/delete");
+        assert!(request(
+            server.address(),
+            "POST",
+            &delete,
+            Some(r#"{"confirm":true}"#)
+        )
+        .contains(" 409 "));
+        assert!(request(
+            server.address(),
+            "POST",
+            &format!("/v1/chats/{id}/archive"),
+            Some("{}")
+        )
+        .contains(" 200 "));
+        assert!(request(server.address(), "GET", "/v1/chats/archived", None)
+            .contains("Delete only this test"));
+        assert!(request(server.address(), "POST", &delete, Some("{}")).contains(" 400 "));
+        assert!(request(
+            server.address(),
+            "POST",
+            &delete,
+            Some(r#"{"confirm":false}"#)
+        )
+        .contains(" 400 "));
+        server.context.chat.lock().unwrap().busy = true;
+        assert!(request(
+            server.address(),
+            "POST",
+            &delete,
+            Some(r#"{"confirm":true}"#)
+        )
+        .contains(" 409 "));
+        server.context.chat.lock().unwrap().busy = false;
+        assert!(request(
+            server.address(),
+            "POST",
+            &delete,
+            Some(r#"{"confirm":true}"#)
+        )
+        .contains(" 200 "));
+        assert!(!request(server.address(), "GET", "/v1/chats/archived", None).contains(&id));
+        assert!(request(
+            server.address(),
+            "POST",
+            &format!("/v1/chats/{id}/restore"),
+            Some("{}")
+        )
+        .contains(" 404 "));
+        assert!(request(
+            server.address(),
+            "GET",
+            &format!("/chats/{id}/v1/chat"),
+            None
+        )
+        .contains(" 404 "));
+        assert!(server
+            .context
+            .publish_with_selection(
+                ChatRole::Assistant,
+                "Late result".into(),
+                false,
+                None,
+                vec![]
+            )
+            .is_err());
+        assert_eq!(start_run(&server.context, b"{}").0, 409);
+        assert_eq!(send_to_ea(&server.context, b"{}").0, 409);
+        assert!(server
+            .context
+            .history
+            .lock()
+            .unwrap()
+            .conversation(&id)
+            .messages
+            .is_empty());
+        // The hidden ID remains in the list for stale tabs to leave this chat.
+        assert!(request(server.address(), "GET", "/v1/chats", None).contains(&id));
+    }
+
+    #[test]
+    fn removing_chat_preserves_history_blocks_active_work_and_can_be_undone() {
+        let server = test_server();
+        let id = server.context.conversation_id.clone();
+        server
+            .context
+            .publish_with_selection(
+                ChatRole::Operator,
+                "Keep this workflow".into(),
+                false,
+                None,
+                vec![],
+            )
+            .unwrap();
+        let path = format!("/v1/chats/{id}/remove");
+        server.context.chat.lock().unwrap().busy = true;
+        assert!(request(server.address(), "POST", &path, Some("{}")).contains(" 409 "));
+        server.context.chat.lock().unwrap().busy = false;
+        for status in [
+            RunStatus::Starting,
+            RunStatus::Running,
+            RunStatus::Paused,
+            RunStatus::Stopping,
+        ] {
+            server
+                .context
+                .runs
+                .lock()
+                .unwrap()
+                .insert("test".into(), record("Team", status));
+            assert!(request(server.address(), "POST", &path, Some("{}")).contains(" 409 "));
+        }
+        server.context.runs.lock().unwrap().clear();
+        assert!(request(server.address(), "POST", &path, Some("{}")).contains(" 200 "));
+        let listing = request(server.address(), "GET", "/v1/chats", None);
+        let listing: Value =
+            serde_json::from_str(listing.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert!(listing["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|chat| chat["id"] != id));
+        assert!(request(server.address(), "GET", "/v1/chats/removed", None)
+            .contains("Keep this workflow"));
+        assert!(request(
+            server.address(),
+            "GET",
+            &format!("/chats/{id}/v1/chat"),
+            None
+        )
+        .contains(" 404 "));
+        assert!(request(
+            server.address(),
+            "POST",
+            &format!("/v1/chats/{id}/activate"),
+            Some("{}")
+        )
+        .contains(" 404 "));
+        // A cached Context from a request admitted before removal must not run.
+        assert_eq!(start_run(&server.context, b"{}").0, 409);
+        assert_eq!(send_to_ea(&server.context, b"{}").0, 409);
+        assert!(request(
+            server.address(),
+            "POST",
+            &format!("/v1/chats/{id}/restore"),
+            Some("{}")
+        )
+        .contains(" 200 "));
+        assert!(request(
+            server.address(),
+            "GET",
+            &format!("/chats/{id}/v1/chat"),
+            None
+        )
+        .contains("Keep this workflow"));
+    }
+
+    #[test]
     fn chats_keep_independent_replies_runs_and_ea_workspaces() {
         let server = test_server();
         let first = &server.context;
@@ -5397,6 +6187,43 @@ mod tests {
     }
 
     #[test]
+    fn every_assistant_backend_reopens_the_same_saved_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        let mut history =
+            History::load(crate::ea::ea_state_dir(0, dir.path()).join("chats.json")).unwrap();
+        let id = history.active_id.clone();
+        history
+            .append(ChatMessage {
+                sequence: 0,
+                role: ChatRole::Operator,
+                text: "Keep this across harnesses".into(),
+                progress: false,
+                design: None,
+                selection: vec![],
+            })
+            .unwrap();
+        for kind in crate::backend::ASSISTANT {
+            config.agent.default_command = crate::backend::of(kind).default_command().into();
+            let server =
+                Serve::start("127.0.0.1:0".parse().unwrap(), &config, dir.path(), 0).unwrap();
+            assert_eq!(server.context.conversation_id, id);
+            assert!(server.context.chat.lock().unwrap().needs_context);
+            let response = request(server.address(), "GET", "/v1/chat", None);
+            assert!(
+                response.contains("Keep this across harnesses"),
+                "{}: {response}",
+                kind.name()
+            );
+            let response = request(server.address(), "GET", "/v1/agent", None);
+            assert!(
+                response.contains(&format!("\"backend\":\"{}\"", kind.name())),
+                "{response}"
+            );
+        }
+    }
+
+    #[test]
     fn reopening_saved_chats_keeps_their_ea_assignments() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::default();
@@ -5430,6 +6257,7 @@ mod tests {
                     status: RunStatus::Running,
                     diagram_address: None,
                     started_at: 1,
+                    activity_at: 0,
                     finished_at: None,
                     error: None,
                     present: Vec::new(),
@@ -5732,6 +6560,7 @@ while True:
                     status: RunStatus::Running,
                     diagram_address: None,
                     started_at: 0,
+                    activity_at: 0,
                     finished_at: None,
                     error: None,
                     present: Vec::new(),
@@ -5802,6 +6631,7 @@ while True:
                     status: RunStatus::Running,
                     diagram_address: None,
                     started_at: 0,
+                    activity_at: 0,
                     finished_at: None,
                     error: None,
                     present: Vec::new(),
@@ -5957,6 +6787,7 @@ while True:
                     status: RunStatus::Running,
                     diagram_address: None,
                     started_at: 0,
+                    activity_at: 0,
                     finished_at: None,
                     error: None,
                     present: Vec::new(),
@@ -6094,6 +6925,7 @@ while True:
                     status: RunStatus::Running,
                     diagram_address: None,
                     started_at: 0,
+                    activity_at: 0,
                     finished_at: None,
                     error: None,
                     present: Vec::new(),
@@ -6135,6 +6967,7 @@ while True:
             RunRecord {
                 run_id: "run-1".to_string(),
                 team: "Morph".to_string(),
+                activity_at: 0,
                 status: RunStatus::Running,
                 diagram_address: None,
                 started_at: 0,
@@ -6178,6 +7011,7 @@ while True:
                     status: RunStatus::Paused,
                     diagram_address: None,
                     started_at: 0,
+                    activity_at: 0,
                     finished_at: None,
                     error: None,
                     present: Vec::new(),
@@ -6467,6 +7301,53 @@ while True:
         );
         assert!(stub.starts_with("HTTP/1.1 400"), "{stub}");
         assert!(stub.contains("not an assistant backend"), "{stub}");
+    }
+
+    #[test]
+    fn only_an_assistant_backend_has_a_sign_in_to_start() {
+        let server = test_server();
+        for name in ["notabackend", "stub", "jev"] {
+            let refused = request(
+                server.address(),
+                "POST",
+                &format!("/v1/backends/{name}/connect"),
+                Some("{}"),
+            );
+            assert!(refused.starts_with("HTTP/1.1 404"), "{name}: {refused}");
+            assert!(refused.contains("not an assistant backend"), "{refused}");
+            let unchecked = request(
+                server.address(),
+                "POST",
+                &format!("/v1/backends/{name}/check"),
+                Some("{}"),
+            );
+            assert!(unchecked.starts_with("HTTP/1.1 404"), "{name}: {unchecked}");
+            let kept = request(
+                server.address(),
+                "POST",
+                &format!("/v1/backends/{name}/disconnect"),
+                Some("{}"),
+            );
+            assert!(kept.starts_with("HTTP/1.1 404"), "{name}: {kept}");
+        }
+        assert!(connectable("codex").is_some());
+        assert!(connectable("pi").is_some());
+    }
+
+    #[test]
+    fn a_backend_that_cannot_start_is_refused_with_how_to_connect_it() {
+        use crate::backend::connection::Connection;
+        let cursor = crate::backend::by_name("cursor").unwrap();
+        assert_eq!(
+            unusable(cursor, &Connection::SignedOut).as_deref(),
+            Some("cursor is not signed in; run `omar connect cursor`")
+        );
+        assert_eq!(
+            unusable(cursor, &Connection::NotInstalled).as_deref(),
+            Some("cursor is not installed; run `omar connect cursor`")
+        );
+        assert_eq!(unusable(cursor, &Connection::connected("me")), None);
+        assert_eq!(unusable(cursor, &Connection::unknown("timed out")), None);
     }
 
     #[test]
@@ -6977,6 +7858,92 @@ while True:
     }
 
     #[test]
+    fn a_terminal_says_when_its_session_ends() {
+        // A sign-in's session ends when its command does; the page waiting on
+        // it learns so from the close, not by polling.
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let prefix = crate::ea::ea_prefix(0, &Config::default().dashboard.session_prefix);
+        let session = format!("{prefix}wsended");
+        let tmux = |args: &[&str]| {
+            let _ = crate::tmux::tmux_command().args(args).output();
+        };
+        tmux(&["kill-session", "-t", &format!("={session}")]);
+        tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            &session,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sh",
+        ]);
+
+        let server = test_server();
+        let url = format!("ws://{}/v1/agents/wsended/terminal", server.address());
+        let (mut socket, _) = tungstenite::connect(&url).expect("terminal connects");
+        socket.read().expect("size frame");
+        if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_ref() {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+        }
+        tmux(&["kill-session", "-t", &format!("={session}")]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let close = loop {
+            assert!(
+                Instant::now() < deadline,
+                "no close after the session ended"
+            );
+            match socket.read() {
+                Ok(tungstenite::Message::Close(frame)) => break frame,
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("socket failed before closing: {error}"),
+            }
+        };
+        let close = close.expect("a close frame says why");
+        assert_eq!(
+            close.code,
+            tungstenite::protocol::frame::coding::CloseCode::Normal
+        );
+        assert_eq!(close.reason, "ended");
+    }
+
+    #[test]
+    fn a_sign_in_session_is_reused_only_for_the_same_action() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let prefix = crate::ea::ea_prefix(0, &Config::default().dashboard.session_prefix);
+        let client = TmuxClient::new(prefix.clone());
+        let session = format!("{prefix}signinaction");
+        let _ = client.kill_session(&session);
+        let pid = || client.get_pane_pid(&session).unwrap();
+
+        sign_in_session(&client, &session, "connect --replace", "sleep 30").unwrap();
+        let replacing = pid();
+        // The page reopened: the same sign-in, still under way.
+        sign_in_session(&client, &session, "connect --replace", "sleep 30").unwrap();
+        assert_eq!(pid(), replacing);
+        // Closed midway, then a disconnect: that one runs instead.
+        sign_in_session(&client, &session, "disconnect", "sleep 30").unwrap();
+        let disconnecting = pid();
+        assert_ne!(disconnecting, replacing);
+        assert_eq!(
+            client.session_env(&session, SIGN_IN_ACTION_VAR).as_deref(),
+            Some("disconnect")
+        );
+        let _ = client.kill_session(&session);
+    }
+
+    #[test]
     fn a_terminal_refuses_an_origin_it_does_not_know() {
         // CORS never reaches a WebSocket: the browser opens the socket whatever
         // the server would have said about cross-origin reads, so a page the
@@ -7022,5 +7989,22 @@ while True:
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("response");
         response
+    }
+    #[test]
+    fn recent_activity_includes_run_and_resume_times_without_polling_changes() {
+        let server = test_server();
+        let mut summary = server.context.history.lock().unwrap().active().summary();
+        summary.updated_at = 10;
+        let mut run = record("Sample", RunStatus::Running);
+        run.started_at = 20;
+        run.activity_at = 30_000;
+        summary.run = Some(run);
+        update_recency(&mut summary);
+        assert_eq!(summary.updated_at, 30_000);
+        update_recency(&mut summary);
+        assert_eq!(summary.updated_at, 30_000);
+        summary.run.as_mut().unwrap().activity_at = 40_000;
+        update_recency(&mut summary);
+        assert_eq!(summary.updated_at, 40_000);
     }
 }
