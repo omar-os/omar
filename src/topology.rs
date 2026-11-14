@@ -2724,7 +2724,18 @@ impl AgentReactionExecutor {
         }
         if let Some((invocation, turns, clock)) = task.as_mut() {
             if !self.registry.answered(&invocation.id) {
-                if let Some((identity, limit)) = window.usage_limit(&self.client) {
+                let limit = window.usage_limit(&self.client);
+                let native_retry = window.record["backend"]
+                    .as_str()
+                    .and_then(crate::backend::by_name)
+                    .is_some_and(|backend| {
+                        matches!(
+                            backend.kind(),
+                            crate::backend::Kind::Pi | crate::backend::Kind::Opencode
+                        )
+                    });
+                let native_resumed = native_retry && ended.is_none() && limit.is_none();
+                if let Some((identity, limit)) = limit {
                     if turns.limit_seen.as_ref() != Some(&identity) {
                         turns.limit_seen = Some(identity);
                         if turns.waiting.is_none() {
@@ -2761,20 +2772,16 @@ impl AgentReactionExecutor {
                 }
                 if let Some(wait) = turns.waiting.as_mut() {
                     turns.idle = None;
+                    if native_resumed {
+                        // Native work clears the limit before the turn ends.
+                        turns.waiting = None;
+                        self.end_usage_wait(window, clock);
+                        return self.watch_worker(window, None);
+                    }
                     if Instant::now() < wait.until {
                         return Ok(());
                     }
-                    if window.record["backend"]
-                        .as_str()
-                        .and_then(crate::backend::by_name)
-                        .is_some_and(|backend| {
-                            matches!(
-                                backend.kind(),
-                                crate::backend::Kind::Pi | crate::backend::Kind::Opencode
-                            )
-                        })
-                        && ended.is_none()
-                    {
+                    if native_retry && ended.is_none() {
                         let status = self.watch_worker(window, None);
                         if status.is_err() {
                             self.end_usage_wait(window, clock);
@@ -3002,21 +3009,7 @@ impl Window {
         let backend = crate::backend::by_name(self.record["backend"].as_str()?)?;
         if backend.kind() == crate::backend::Kind::Claude {
             let screen = client.capture_pane_plain(&self.session, 0).ok()?;
-            // Match Claude's error notice, not a task discussing billing.
-            if !screen.lines().any(|line| {
-                let line = line
-                    .trim_start_matches(|c: char| !c.is_alphanumeric())
-                    .to_lowercase();
-                line.starts_with("api error:")
-                    || line.starts_with("error:")
-                    || line.starts_with("credit balance is too low")
-            }) {
-                return None;
-            }
-            return crate::backend::OutOfCredit::from_error(&json!(screen
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")));
+            return Self::claude_credit_error(&screen);
         }
         let stamp = client.session_delivery(&self.session);
         backend.out_of_credit(
@@ -3027,6 +3020,37 @@ impl Window {
             },
             &self.turn_file,
         )
+    }
+
+    fn claude_credit_error(screen: &str) -> Option<crate::backend::OutOfCredit> {
+        // Match Claude's error notice, not a task discussing billing.
+        let mut lines = screen.lines().peekable();
+        while let Some(line) = lines.next() {
+            let text = line.trim_start();
+            let text = text.strip_prefix('⎿').unwrap_or(text).trim_start();
+            let lower = text.to_lowercase();
+            if !lower.starts_with("api error:")
+                && !lower.starts_with("error:")
+                && !lower.starts_with("credit balance is too low")
+            {
+                continue;
+            }
+            let column = line.chars().count() - text.chars().count();
+            let mut notice = text.to_owned();
+            while let Some(line) = lines.peek().filter(|line| {
+                !line.trim().is_empty()
+                    && line.chars().take_while(|c| c.is_whitespace()).count() >= column
+                    && !line.trim_start().starts_with(['❯', '⏺', '⎿', '─'])
+            }) {
+                notice.push(' ');
+                notice.push_str(line.trim());
+                lines.next();
+            }
+            if let Some(credit) = crate::backend::OutOfCredit::from_error(&json!(notice)) {
+                return Some(credit);
+            }
+        }
+        None
     }
 
     fn blocked_input(&self, client: &TmuxClient) -> Option<String> {
@@ -8178,6 +8202,27 @@ mod tests {
         // Saying nothing leaves the run-wide timeout in charge rather than
         // inventing a deadline the program never asked for.
         assert_eq!(deadline_spec("memo", None).within, None);
+    }
+
+    #[test]
+    fn claude_credit_checks_only_the_error_notice_and_its_wrapped_lines() {
+        let screen = "❯ Explain insufficient credits errors.\n\
+                      ⏺ The phrase insufficient credits concerns billing.\n\
+                        ⎿  API Error: Service temporarily unavailable\n\
+                      ❯ ";
+        assert!(Window::claude_credit_error(screen).is_none());
+        assert!(Window::claude_credit_error(
+            "  ⎿  API Error: Service temporarily unavailable\n\
+             ⏺ We should explain insufficient credits."
+        )
+        .is_none());
+        for screen in [
+            "  ⎿  API Error: Credit balance is too low",
+            "  ⎿  API Error: 400 {\"error\":{\"message\":\"Credit balance is\n     too low\"}}\n❯ ",
+            "API Error: insufficient\ncredits\n\n❯ ",
+        ] {
+            assert!(Window::claude_credit_error(screen).is_some(), "{screen}");
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ WITHIN = 10
 class Provider(workers.Provider):
     def do_POST(self):
         if self.server.reset is None:
-            self.server.reset = int(time.time()) + WAIT
+            self.server.reset = int(time.time()) + (5 if self.server.over_within else WAIT)
         credit = getattr(self.server, "credit", None)
         if credit or time.time() < self.server.reset:
             request = json.loads(self.rfile.read(int(self.headers.get('content-length', '0'))))
@@ -58,6 +58,9 @@ class Provider(workers.Provider):
             self.end_headers()
             self.wfile.write(body)
         else:
+            if self.server.over_within and self.server.resumed is None:
+                self.server.resumed = time.monotonic()
+                time.sleep(13)
             super().do_POST()
 
 
@@ -145,10 +148,11 @@ def check_credit(state, output, result, elapsed):
     assert elapsed < WAIT, f'credit failure took {elapsed:.1f}s after the credit error, expected less than {WAIT}s\n{detail}'
 
 
-def execute(backend, unknown=False, timeout=False, credit=None, slow=False):
+def execute(backend, unknown=False, timeout=False, credit=None, slow=False, over_within=False):
     server = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     server.requests, server.limited, server.reset = [], [], None
     server.credit = credit
+    server.over_within, server.resumed = over_within, None
     server.killed, server.deaths = set(), 0
     server.scenario, server.waited = 'working' if slow else None, set()
     server.kill, server.release = threading.Event(), threading.Event()
@@ -209,6 +213,19 @@ def execute(backend, unknown=False, timeout=False, credit=None, slow=False):
                 assert records and len({a['attempt_id'] for a in records}) == 1 and not any(a.get('reminders') or a.get('retry', 0) for a in records), records
                 assert records[-1]['usage_waits'][-1].get('ended_at'), records
                 print(f'PASS: {backend}: unknown reset bounded by run-wide timeout', flush=True)
+                return
+            if over_within:
+                records = [json.loads(line) for path in home.rglob('attempts.jsonl') for line in path.read_text().splitlines()]
+                detail = output + '\n' + json.dumps(records)
+                assert server.resumed is not None, detail
+                assert process.returncode != 0 and 'requires an effect' in output, detail
+                assert len({a['attempt_id'] for a in records}) == 1, detail
+                assert all(not a.get('reminders') and not a.get('retry', 0) for a in records), detail
+                waits = records[-1].get('usage_waits', [])
+                assert waits and all(w.get('ended_at') for w in waits), detail
+                assert 'OMAR CONTINUE' not in json.dumps(server.requests), detail
+                assert time.monotonic() - server.resumed < 13, detail
+                print(f'PASS: {backend}: native retry resumes within clock, active work expires, no prompt/reminder/restart', flush=True)
                 return
             waits = check_records(home / '.omar', output + f'\nRun took {time.monotonic()-began:.1f}s\nLast screen:\n' + '\n'.join(screens[-2:]) + '\nProvider requests: ' + json.dumps([{'items':r.get('input', r.get('messages'))[-2:]} for r in server.requests]) + '\nLimited requests: ' + str(len(server.limited)), process.returncode, port)
             if backend == 'Claude':
@@ -299,6 +316,8 @@ def main():
                 execute(backend)
                 if backend != 'Stub':
                     execute(backend, slow=True)
+                if backend in ['Pi', 'OpenCode']:
+                    execute(backend, over_within=True)
         if not args.backend:
             execute('Cursor', unknown=True)
             execute('Cursor', unknown=True, timeout=True)
