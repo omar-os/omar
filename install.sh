@@ -41,8 +41,10 @@ echo "  -> ${INSTALL_DIR}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-curl -fsSL "$URL" -o "$TMP/$TARBALL"
-tar xzf "$TMP/$TARBALL" -C "$TMP" --strip-components=1
+# Not saved as "$TMP/$TARBALL": v0.4.4's darwin tarballs carry a copy of
+# themselves, which extracting would write over the archive being read.
+curl -fsSL "$URL" -o "$TMP/download.tar.gz"
+tar xzf "$TMP/download.tar.gz" -C "$TMP" --strip-components=1
 
 # Install (use sudo if needed)
 SUDO=""
