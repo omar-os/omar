@@ -322,16 +322,6 @@ jobs:
           npm install -g @openai/codex@0.154.0
           cargo build --bin omar
           python3 tests/ci/codex_invocation_scope.py
-      - name: Verify workflow workers recover from death and exhaust two retries
-        run: |
-          npm install -g opencode-ai@1.18.31
-          python3 tests/ci/worker_restart.py
-          python3 tests/ci/worker_remind.py
-          python3 tests/ci/worker_limit.py
-          # Async questions arrived in Codex 0.167; the rest of CI keeps the pinned 0.154.
-          npm install --prefix "$RUNNER_TEMP/codex-async" @openai/codex@0.167.0
-          PATH="$RUNNER_TEMP/codex-async/node_modules/.bin:$PATH" python3 tests/ci/worker_remind.py --async-questions
-
       - name: Verify safety properties are proved through serve
         run: |
           cargo build --bin omar
@@ -950,10 +940,45 @@ jobs:
           path: |
             target/release/omar
 
+  # Real runs per backend that wait out real deadlines: about 25 minutes,
+  # more than OMAR Language's 30-minute budget can share.
+  worker-supervision:
+    name: Worker Supervision
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The workers' programs compile through omarc.
+      - name: Build the OMAR compiler
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lang
+          build: true
+          test: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify workflow workers recover from death and exhaust two retries
+        run: |
+          sudo apt-get update && sudo apt-get install -y tmux
+          npm install -g @openai/codex@0.154.0 opencode-ai@1.18.31
+          cargo build --bin omar
+          python3 tests/ci/worker_restart.py
+          python3 tests/ci/worker_remind.py
+          python3 tests/ci/worker_limit.py
+          # Async questions arrived in Codex 0.167; the rest of CI keeps the pinned 0.154.
+          npm install --prefix "$RUNNER_TEMP/codex-async" @openai/codex@0.167.0
+          PATH="$RUNNER_TEMP/codex-async/node_modules/.bin:$PATH" python3 tests/ci/worker_remind.py --async-questions
+
   # Ensure all jobs pass before allowing merge
   ci-success:
     name: CI Success
-    needs: [repo-rules, msrv, pi-bridge, check, fmt, clippy, test, codex-shared-history, backend-supervision-contracts, omar-language, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, install-script, build]
+    needs: [repo-rules, msrv, pi-bridge, check, fmt, clippy, test, codex-shared-history, backend-supervision-contracts, omar-language, worker-supervision, popup-quote-integration, unresolved-session-integration, codex-yolo-integration, ea-zero-selector-integration, dashboard-relaunch-handoff-integration, opencode-compat, install-paths, install-script, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: always()
@@ -969,6 +994,7 @@ jobs:
              [[ "${{ needs.codex-shared-history.result }}" != "success" ]] || \
              [[ "${{ needs.backend-supervision-contracts.result }}" != "success" ]] || \
              [[ "${{ needs.omar-language.result }}" != "success" ]] || \
+             [[ "${{ needs.worker-supervision.result }}" != "success" ]] || \
              [[ "${{ needs.popup-quote-integration.result }}" != "success" ]] || \
              [[ "${{ needs.unresolved-session-integration.result }}" != "success" ]] || \
              [[ "${{ needs.codex-yolo-integration.result }}" != "success" ]] || \
