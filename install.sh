@@ -68,8 +68,17 @@ fi
 # The semantics the compiler checks properties against, where it looks for
 # them: beside its directory, in lib/lean.
 if [ -d "$TMP/lib/lean/Omar" ]; then
-  $SUDO mkdir -p "$INSTALL_DIR/../lib/lean/Omar"
-  $SUDO cp "$TMP/lib/lean/Omar/"* "$INSTALL_DIR/../lib/lean/Omar/"
+  LEAN_DIR="$INSTALL_DIR/../lib/lean/Omar"
+  # Checked on its own: a runner's /usr/local/bin is writable, /usr/local/lib
+  # beside it is root's. The nearest directory that exists decides.
+  LEAN_SUDO=""
+  existing="$LEAN_DIR"
+  while [ ! -d "$existing" ]; do existing="$(dirname "$existing")"; done
+  if [ ! -w "$existing" ]; then
+    LEAN_SUDO="sudo"
+  fi
+  $LEAN_SUDO mkdir -p "$LEAN_DIR"
+  $LEAN_SUDO cp "$TMP/lib/lean/Omar/"* "$LEAN_DIR/"
 fi
 
 echo ""
