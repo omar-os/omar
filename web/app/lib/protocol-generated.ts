@@ -89,7 +89,11 @@ export type DiagramTimer = { id: string, name: string, offset: number,
  */
 period: number, last_tag: DiagramTag | null, instance: string, };
 
-export type DiagramReaction = { id: string, name: string, agent: string, order: number, triggers: Array<string>, effects: Array<string>, contract: string, status: ReactionStatus, invocation_id: string | null,
+export type DiagramReaction = { id: string, name: string,
+/**
+ * Human-readable task copy; absent in workflows created before task metadata.
+ */
+title?: string, description?: string, agent: string, order: number, triggers: Array<string>, effects: Array<string>, contract: string, status: ReactionStatus, invocation_id: string | null,
 /**
  * Restarts of the task currently shown on this step.
  */
