@@ -34,6 +34,8 @@ mod sessions;
 mod stub_agent;
 mod supervision;
 mod terminal;
+#[cfg(test)]
+mod test_tmux;
 mod tmux;
 mod topology;
 mod ui;

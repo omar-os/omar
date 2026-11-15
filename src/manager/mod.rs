@@ -686,6 +686,10 @@ pub(crate) mod tests {
             eprintln!("Skipping test: tmux not available");
             return;
         }
+        // Other tests point OMAR_TMUX_SERVER at their own servers while they
+        // hold this lock; without it this test's tmux calls, teardown
+        // included, can land on theirs. Declared first, so it drops last.
+        let _env = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let prefix = format!("omar-test-pi-switch-{}-", Uuid::new_v4());
         let session = ea::ea_manager_session(0, &prefix);
