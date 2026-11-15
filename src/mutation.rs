@@ -174,6 +174,8 @@ fn update_as_install(instruction: &Instruction) -> Option<(String, Instruction)>
             instance,
             within,
             check,
+            title,
+            description,
         } => Some((
             id.clone(),
             Instruction::InstallReaction {
@@ -187,6 +189,8 @@ fn update_as_install(instruction: &Instruction) -> Option<(String, Instruction)>
                 instance,
                 within,
                 check,
+                title,
+                description,
             },
         )),
         _ => None,
@@ -585,6 +589,19 @@ mod tests {
             back,
         ]);
         check(&b, &backward, &a).unwrap();
+    }
+
+    #[test]
+    fn display_metadata_survives_reaction_updates() {
+        let a = relay(2, "go", vec![]);
+        let mut changed = serde_json::to_value(&a).unwrap();
+        let reaction = &mut changed["instructions"][13];
+        reaction["title"] = json!("Pass the relay token");
+        reaction["description"] = json!("Forward the received token to the next node.");
+        let b: Bytecode = serde_json::from_value(changed).unwrap();
+        let mut update = serde_json::to_value(&b.instructions[13]).unwrap();
+        update["op"] = json!("update_reaction");
+        check(&a, &plan(vec![update]), &b).unwrap();
     }
 
     #[test]
