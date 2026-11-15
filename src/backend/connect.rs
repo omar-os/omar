@@ -609,6 +609,8 @@ mod tests {
 
     #[test]
     fn install_dirs_come_after_the_operators_own() {
+        // Reads HOME, which other tests repoint at a temp dir.
+        let _env = crate::test_env_lock();
         let home = dirs::home_dir().unwrap();
         let path = with_install_dirs(&OsString::from("/usr/bin"));
         let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
