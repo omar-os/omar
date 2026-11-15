@@ -3175,7 +3175,7 @@ fn mission_control_envelope(text: &str, selection: &[String], live: Option<&Live
          To offer a workflow, call the MCP tool `omar_propose_design` with a complete \
          OMAR program. Include companion files in `files`, keyed by their relative paths \
          (for example schemas/decision.json), so imported types compile. The entry \
-         source is program.omar. The operator approves and runs it; you do not.\n\n\
+         source is program.omar. Prefer optional // @title and // @desc comments directly above each task or reaction. The operator approves and runs it; you do not.\n\n\
          When asked how to get started, invite the operator to describe a workflow \
          they want to automate, from development to marketing and beyond. Lead with \
          concrete developer examples: a GitHub issue into a tested pull request, \
