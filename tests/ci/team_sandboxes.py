@@ -489,10 +489,14 @@ total = Some(self.count);
             (home / ".codex").mkdir(exist_ok=True)
             (home / ".codex" / "auth.json").write_text('{"OPENAI_API_KEY": "sk-codex"}')
             host_cli("codex", '[ "$1 $2" = "login status" ] && echo "Logged in using an API key - sk-***" && exit 0')
+            ran = len(entries())
             started = omar("run", str(source / "codex.omar"), "--sandbox")
             assert started.returncode == 0, started
             assert "Using codex's API key from this machine (codex's API key sign-in) for sandboxes." in started.stderr, started
             assert stored() == {"openai": "sk-codex"}
+            # The run creates its sandbox in the background; stopped first, that
+            # create can land after `before` below and count against the refusal.
+            wait_until(lambda: creates_since(ran), "the codex run's sandbox")
             ok("stop", json.loads(started.stdout)["run_id"])
             (home / ".codex" / "auth.json").unlink()
             (shims / "codex").unlink()
@@ -502,7 +506,7 @@ total = Some(self.count);
             fault(SIGNED_OUT=1)
             refused = omar(*plain, "--sandbox-template", TEMPLATE)
             assert refused.returncode != 0 and "not signed in" in refused.stdout + refused.stderr, refused
-            assert not creates_since(before)
+            assert not creates_since(before), creates_since(before)
             fault()
             # `[sandbox] enabled = true`: the published kit, no flag needed.
             (home / ".omar").mkdir(exist_ok=True)
