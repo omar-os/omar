@@ -100,7 +100,7 @@ export function WorkflowTrigger({
   return (
     <aside className="step-inspector" aria-label="Webhook trigger">
       <header>
-        <h3>Start on webhook</h3>
+        <h3>Webhook trigger</h3>
         <button
           type="button"
           aria-label="Close webhook settings"
@@ -110,8 +110,9 @@ export function WorkflowTrigger({
         </button>
       </header>
       <p>
-        Each signed GitHub delivery starts a new run. A retry returns its
-        original receipt. A busy workflow queues the next delivery.
+        Run this workflow when GitHub sends a matching event. Map event fields
+        to inputs. Redelivered events do not run it twice; events that arrive
+        while it runs wait their turn.
       </p>
       {inbox?.trigger ? (
         <div className="inspector-field">

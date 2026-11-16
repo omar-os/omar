@@ -104,13 +104,38 @@ pub(super) fn armed(context: &Context_) -> bool {
     context.webhook_active.load(Ordering::Relaxed)
 }
 
+// Finished receipts kept for display and duplicate suppression. Queued rows are never dropped.
+const KEEP_FINISHED: usize = 100;
+
+// An enabled trigger keeps the daemon up. Only queued rows make the dispatcher read the inbox.
+fn sync(context: &Context_, book: &Inbox) {
+    let queued = book.deliveries.iter().any(|d| d.request.is_some());
+    context.webhook_queued.store(queued, Ordering::Relaxed);
+    context.webhook_active.store(
+        queued || book.trigger.as_ref().is_some_and(|t| t.enabled),
+        Ordering::Relaxed,
+    );
+}
+
+fn prune(book: &mut Inbox) {
+    let finished = book
+        .deliveries
+        .iter()
+        .filter(|d| d.request.is_none())
+        .count();
+    let mut drop = finished.saturating_sub(KEEP_FINISHED);
+    book.deliveries.retain(|d| {
+        if drop > 0 && d.request.is_none() {
+            drop -= 1;
+            return false;
+        }
+        true
+    });
+}
+
 pub(super) fn resume(context: &Context_) {
     if let Ok(book) = load(context) {
-        context.webhook_active.store(
-            book.trigger.is_some_and(|t| t.enabled)
-                || book.deliveries.iter().any(|r| r.request.is_some()),
-            Ordering::Relaxed,
-        );
+        sync(context, &book);
     }
 }
 
@@ -238,11 +263,7 @@ pub(super) fn settings(context: &Context_, method: &str, body: &[u8]) -> (u16, V
     if topology::write_json_atomic(&path(context), &book).is_err() {
         return (500, json!({"error":"Could not persist trigger."}));
     }
-    context.webhook_active.store(
-        book.trigger.as_ref().is_some_and(|t| t.enabled)
-            || book.deliveries.iter().any(|d| d.request.is_some()),
-        Ordering::Relaxed,
-    );
+    sync(context, &book);
     (200, view(&book))
 }
 
@@ -356,7 +377,10 @@ pub(super) fn accept(
     let response = receipt(&row);
     book.deliveries.push(row);
     match topology::write_json_atomic(&path(context), &book) {
-        Ok(()) => (202, response),
+        Ok(()) => {
+            sync(context, &book);
+            (202, response)
+        }
         Err(_) => (500, json!({"error":"Delivery could not be saved."})),
     }
 }
@@ -364,7 +388,7 @@ pub(super) fn accept(
 // One dispatcher per daemon. Admission and runner retries share the persisted
 // run ID. A provider retry cannot create another run after a process restart.
 pub(super) fn dispatch(context: &Arc<Context_>) -> Result<()> {
-    if !armed(context) {
+    if !context.webhook_queued.load(Ordering::Relaxed) {
         return Ok(());
     }
     let next = {
@@ -404,11 +428,42 @@ pub(super) fn dispatch(context: &Arc<Context_>) -> Result<()> {
         }
         record.request = None;
     }
+    prune(&mut book);
     topology::write_json_atomic(&path(context), &book)?;
-    context.webhook_active.store(
-        book.trigger.as_ref().is_some_and(|t| t.enabled)
-            || book.deliveries.iter().any(|d| d.request.is_some()),
-        Ordering::Relaxed,
-    );
+    sync(context, &book);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: usize, queued: bool) -> Delivery {
+        Delivery {
+            id: id.to_string(),
+            run_id: id.to_string(),
+            revision: 1,
+            team: "T".into(),
+            received_at: id as u64,
+            status: if queued { "queued" } else { "started" }.into(),
+            request: queued.then(|| json!({})),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn prune_keeps_queued_rows_and_newest_finished_receipts() {
+        let mut book = Inbox::default();
+        book.deliveries.push(row(0, true));
+        book.deliveries
+            .extend((1..=KEEP_FINISHED + 5).map(|i| row(i, false)));
+        book.deliveries.push(row(KEEP_FINISHED + 6, true));
+        prune(&mut book);
+        assert_eq!(book.deliveries.len(), KEEP_FINISHED + 2);
+        assert_eq!(book.deliveries[0].id, "0");
+        assert_eq!(book.deliveries[1].id, "6");
+        assert!(book.deliveries.last().unwrap().request.is_some());
+        prune(&mut book);
+        assert_eq!(book.deliveries.len(), KEEP_FINISHED + 2);
+    }
 }

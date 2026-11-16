@@ -35,6 +35,7 @@ pub const SERVE_PROTOCOL_VERSION: u32 = 1;
 /// compilation and process start-up.
 const DIAGRAM_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_BYTES: usize = 512 * 1024;
+const MAX_WEBHOOK_BODY_BYTES: usize = 25 * 1024 * 1024;
 /// Relayed diagram routes: `/v1/runs/{id}` + this + the diagram server's path.
 const DIAGRAM_RELAY: &str = "/diagram";
 
@@ -402,6 +403,7 @@ struct Settings {
 struct Context_ {
     webhook_operation: Mutex<()>,
     webhook_active: AtomicBool,
+    webhook_queued: AtomicBool,
     history: Arc<Mutex<History>>,
     conversation_id: String,
     omar_dir: PathBuf,
@@ -903,6 +905,7 @@ impl Serve {
         let context = Arc::new(Context_ {
             webhook_operation: Mutex::new(()),
             webhook_active: AtomicBool::new(false),
+            webhook_queued: AtomicBool::new(false),
             history: history.clone(),
             conversation_id: conversation_id.clone(),
             omar_dir: omar_dir.to_path_buf(),
@@ -1519,7 +1522,13 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
     }
     let origin = origin.as_deref();
 
-    if content_length > MAX_BODY_BYTES {
+    // GitHub sends payloads up to 25 MB. Other routes keep the small limit.
+    let limit = if path.contains("/v1/webhook-deliveries/") {
+        MAX_WEBHOOK_BODY_BYTES
+    } else {
+        MAX_BODY_BYTES
+    };
+    if content_length > limit {
         return write_json(
             &mut stream,
             413,
@@ -1634,8 +1643,17 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
     }
 
+    // Deliveries come from GitHub through a relay or tunnel, so the Host is
+    // not local. The HMAC signature authenticates them instead.
+    if let Some(trigger) = path.strip_prefix("/v1/webhook-deliveries/") {
+        if method != "POST" {
+            return write_json(&mut stream, 405, &json!({"error":"POST required."}), None);
+        }
+        let (status, body) = webhook::accept(&context, trigger, &hook_headers, &raw_body);
+        return write_json(&mut stream, status, &body, None);
+    }
+
     if path == "/v1/webhook-trigger"
-        || path.starts_with("/v1/webhook-deliveries/")
         || path == "/v1/workflow"
         || path == "/v1/workspaces"
         || path.starts_with("/v1/workspaces/")
@@ -1657,13 +1675,6 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         if path == "/v1/webhook-trigger" {
             let (status, body) = webhook::settings(&context, &method, &raw_body);
-            return write_json(&mut stream, status, &body, origin);
-        }
-        if let Some(trigger) = path.strip_prefix("/v1/webhook-deliveries/") {
-            if method != "POST" {
-                return write_json(&mut stream, 405, &json!({"error":"POST required."}), origin);
-            }
-            let (status, body) = webhook::accept(&context, trigger, &hook_headers, &raw_body);
             return write_json(&mut stream, status, &body, origin);
         }
         if path == "/v1/workflow" {
@@ -2818,6 +2829,7 @@ impl Workspaces {
         let context = Arc::new(Context_ {
             webhook_operation: Mutex::new(()),
             webhook_active: AtomicBool::new(false),
+            webhook_queued: AtomicBool::new(false),
             history: self.history.clone(),
             conversation_id: id.to_string(),
             omar_dir: self.settings.omar_dir.clone(),

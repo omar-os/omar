@@ -88,10 +88,13 @@ def main():
             route = base + "webhook-deliveries/" + hook
             payload = {"ref":"release-42"}
 
-            def send(delivery, body=payload, signing_key=secret, event="push"):
+            def send(delivery, body=payload, signing_key=secret, event="push", host=None):
                 tag = hmac.new(signing_key.encode(), json.dumps(body).encode(), hashlib.sha256).hexdigest()
-                return call("POST", route, body, {"X-Hub-Signature-256":"sha256="+tag,
-                            "X-GitHub-Event":event, "X-GitHub-Delivery":delivery})
+                headers = {"X-Hub-Signature-256":"sha256="+tag,
+                           "X-GitHub-Event":event, "X-GitHub-Delivery":delivery}
+                if host:
+                    headers["Host"] = host
+                return call("POST", route, body, headers)
 
             def panel(run):
                 status, value = call("GET", base+"runs/"+run+"/panel")
@@ -109,11 +112,16 @@ def main():
             assert send("mistyped", {"ref":123})[0] == 422
             assert send("missing", {})[0] == 422
             assert send("wrong-event", event="issues")[0] == 422
+            # Signed deliveries pass the local-Host check (tunnel/relay) and the 512 KB API limit.
+            assert send("relayed", signing_key="wrong", host="hooks.example.test")[0] == 401
+            assert send("large", {"ref":"release-42","pad":"x"*600_000}, event="issues")[0] == 422
             first_status, first = send("A")
             assert first_status == 202, first
             wait(lambda:panel(first["run_id"]))
             status, retry = send("A")
             assert status == 200 and retry["run_id"] == first["run_id"]
+            status, relayed = send("A", host="hooks.example.test")
+            assert status == 200 and relayed["run_id"] == first["run_id"]
             next_status, second = send("B")
             assert next_status == 202 and second["run_id"] != first["run_id"]
             assert ok("GET",base+"webhook-trigger")["deliveries"][0]["status"]=="queued"
