@@ -82,8 +82,11 @@ def main():
             workspace = ok("POST", base+"workflow", {"revision":0, "name":"Webhook review",
                 "draft":{"filename":"WebhookReview.omar","proposal_sequence":0,
                          "design":{"program":PROGRAM,"files":{},"inputs":{},"preview":checked["preview"]}}})
-            settings = {"revision":workspace["revision"], "event":"push", "secret_name":"github-test",
-                        "mapping":{"gate.candidate":"/ref"}}
+            # GitHub preset: the same fields work for any HMAC-signing sender.
+            settings = {"revision":workspace["revision"], "auth":"hmac-sha256",
+                        "auth_header":"X-Hub-Signature-256", "event_header":"X-GitHub-Event",
+                        "event":"push", "id_header":"X-GitHub-Delivery",
+                        "secret_name":"github-test", "mapping":{"gate.candidate":"/ref"}}
             hook = ok("POST", base+"webhook-trigger", settings)["trigger"]["id"]
             route = base + "webhook-deliveries/" + hook
             payload = {"ref":"release-42"}
@@ -150,7 +153,19 @@ def main():
                 command("stop", "-s", "hook-test", third["run_id"])
             answer(fourth["run_id"])
             assert len(ok("GET",base+"webhook-trigger")["deliveries"])==4
-            print("A queued delivery resumed under its original ID. Invalid signature and invalid mappings refused. A, retry A, and B produced two typed runs. Receipts survived restart.")
+            # Any other sender: shared token, no event filter, no delivery ID.
+            generic = {"revision":workspace["revision"], "auth":"token", "auth_header":"Authorization",
+                       "secret_name":"github-test", "mapping":{"gate.candidate":"/ref"}}
+            assert ok("POST",base+"webhook-trigger",generic)["trigger"]["id"] == hook
+            def post(token):
+                return call("POST", route, payload, {"Authorization":"Bearer "+token})
+            assert post("wrong")[0] == 401
+            plain_status, plain = post(secret)
+            again_status, again = post(secret)
+            assert plain_status == again_status == 202 and plain["run_id"] != again["run_id"], (plain, again)
+            answer(plain["run_id"])
+            answer(again["run_id"])
+            print("A queued delivery resumed under its original ID. Invalid signature and invalid mappings refused. A, retry A, and B produced two typed runs. Receipts survived restart. A token-authenticated generic sender started its own runs.")
         finally:
             command("down","-s","hook-test","--force")
 

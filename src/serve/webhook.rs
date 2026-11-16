@@ -1,15 +1,79 @@
 //! A saved trigger owns a pinned draft and a durable inbox. HTTP admission
 //! and dispatch never depend on whichever workflow a Studio tab has selected.
+//! Any sender works: the trigger names its auth, event and delivery-ID headers.
 use super::*;
 use anyhow::{ensure, Context};
+use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+
+/// How a delivery is recognised. GitHub is one preset of these values.
+#[derive(Clone, Serialize, Deserialize)]
+struct Source {
+    /// "hmac-sha256" (signature of the raw body) or "token" (shared secret).
+    #[serde(default = "hmac_auth")]
+    auth: String,
+    auth_header: String,
+    /// Optional: only requests whose event header equals `event` start runs.
+    #[serde(default)]
+    event_header: String,
+    #[serde(default)]
+    event: String,
+    /// Optional: repeated IDs return the first receipt instead of a new run.
+    #[serde(default)]
+    id_header: String,
+}
+
+fn hmac_auth() -> String {
+    "hmac-sha256".into()
+}
+
+fn header_name(name: &str) -> bool {
+    name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn check_source(mut src: Source) -> Result<Source> {
+    for h in [
+        &mut src.auth_header,
+        &mut src.event_header,
+        &mut src.id_header,
+    ] {
+        *h = h.trim().to_ascii_lowercase();
+        ensure!(
+            header_name(h),
+            "Header names use letters, digits and dashes."
+        );
+    }
+    ensure!(
+        matches!(src.auth.as_str(), "hmac-sha256" | "token"),
+        "Choose HMAC-SHA256 signature or shared token authentication."
+    );
+    ensure!(
+        !src.auth_header.is_empty(),
+        "Name the header that carries the signature or token."
+    );
+    if src.event_header.is_empty() {
+        src.event.clear();
+    }
+    ensure!(
+        src.event_header.is_empty()
+            || (!src.event.is_empty()
+                && src.event.len() <= 128
+                && src.event.bytes().all(|c| c.is_ascii_graphic())),
+        "Enter the event value to match."
+    );
+    Ok(src)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Trigger {
     id: String,
     revision: u64,
-    event: String,
+    #[serde(flatten)]
+    source: Source,
     secret_name: String,
     mapping: BTreeMap<String, String>,
     enabled: bool,
@@ -96,7 +160,17 @@ fn receipt(row: &Delivery) -> Value {
 }
 
 fn view(book: &Inbox) -> Value {
-    json!({"trigger":book.trigger.as_ref().map(|t| json!({"id":t.id,"event":t.event,"secret_name":t.secret_name,"mapping":t.mapping,"enabled":t.enabled,"revision":t.revision})),
+    json!({"trigger":book.trigger.as_ref().map(|t| {
+            let mut v = json!(t.source);
+            v.as_object_mut().unwrap().extend([
+                ("id".into(), json!(t.id)),
+                ("secret_name".into(), json!(t.secret_name)),
+                ("mapping".into(), json!(t.mapping)),
+                ("enabled".into(), json!(t.enabled)),
+                ("revision".into(), json!(t.revision)),
+            ]);
+            v
+        }),
         "deliveries":book.deliveries.iter().rev().take(100).map(receipt).collect::<Vec<_>>()})
 }
 
@@ -142,7 +216,8 @@ pub(super) fn resume(context: &Context_) {
 #[derive(Deserialize)]
 struct Activation {
     revision: u64,
-    event: String,
+    #[serde(flatten)]
+    source: Source,
     secret_name: String,
     mapping: BTreeMap<String, String>,
 }
@@ -173,12 +248,7 @@ pub(super) fn settings(context: &Context_, method: &str, body: &[u8]) -> (u16, V
     } else {
         let setup = (|| -> Result<Trigger> {
             let a: Activation = serde_json::from_value(value)?;
-            ensure!(
-                !a.event.is_empty()
-                    && a.event.len() <= 80
-                    && a.event.bytes().all(|c| c.is_ascii_lowercase() || c == b'_'),
-                "Choose a GitHub event name."
-            );
+            let source = check_source(a.source)?;
             signing_key(&a.secret_name).context("Create the referenced mode-0600 file in the runtime home’s webhook-secrets directory.")?;
             let ws = context
                 .history
@@ -243,7 +313,7 @@ pub(super) fn settings(context: &Context_, method: &str, body: &[u8]) -> (u16, V
                     .map(|t| t.id.clone())
                     .unwrap_or_else(|| Uuid::new_v4().to_string()),
                 revision: ws.revision,
-                event: a.event,
+                source,
                 secret_name: a.secret_name,
                 mapping: a.mapping,
                 enabled: true,
@@ -267,20 +337,19 @@ pub(super) fn settings(context: &Context_, method: &str, body: &[u8]) -> (u16, V
     (200, view(&book))
 }
 
+// Hex (GitHub, most senders) or base64 (e.g. Shopify), with an optional "sha256=" prefix.
 fn signed(secret: &[u8], bytes: &[u8], signature: &str) -> bool {
-    let Some(hex) = signature.strip_prefix("sha256=") else {
-        return false;
+    let sig = signature.strip_prefix("sha256=").unwrap_or(signature);
+    let tag = if sig.len() == 64 && sig.bytes().all(|b| b.is_ascii_hexdigit()) {
+        (0..32)
+            .map(|i| u8::from_str_radix(&sig[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
+    } else {
+        match base64::engine::general_purpose::STANDARD.decode(sig) {
+            Ok(tag) => tag,
+            Err(_) => return false,
+        }
     };
-    if hex.len() != 64 || !hex.is_ascii() {
-        return false;
-    }
-    let mut tag = [0; 32];
-    for (i, byte) in tag.iter_mut().enumerate() {
-        let Ok(v) = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) else {
-            return false;
-        };
-        *byte = v;
-    }
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret) else {
         return false;
     };
@@ -288,10 +357,24 @@ fn signed(secret: &[u8], bytes: &[u8], signature: &str) -> bool {
     mac.verify_slice(&tag).is_ok()
 }
 
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn authentic(src: &Source, secret: &[u8], bytes: &[u8], value: &str) -> bool {
+    match src.auth.as_str() {
+        "token" => same(
+            value.strip_prefix("Bearer ").unwrap_or(value).as_bytes(),
+            secret,
+        ),
+        _ => signed(secret, bytes, value),
+    }
+}
+
 pub(super) fn accept(
     context: &Context_,
     trigger: &str,
-    headers: &BTreeMap<String, String>,
+    headers: &BTreeMap<String, Option<String>>,
     bytes: &[u8],
 ) -> (u16, Value) {
     let _guard = context
@@ -305,25 +388,47 @@ pub(super) fn accept(
     let Some(t) = book.trigger.as_ref().filter(|t| t.id == trigger) else {
         return (404, json!({"error":"Unknown trigger."}));
     };
-    let header = |key: &str| headers.get(key).map(String::as_str).unwrap_or("");
+    let src = &t.source;
+    // Absent -> Ok(None). Sent more than once -> Err: ambiguous, refuse.
+    let header = |key: &str| match headers.get(key) {
+        None => Ok(None),
+        Some(None) => Err(()),
+        Some(Some(v)) => Ok(Some(v.as_str())),
+    };
     let Ok(secret) = signing_key(&t.secret_name) else {
         return (503, json!({"error":"Signing secret unavailable."}));
     };
-    if secret.is_empty() || !signed(&secret, bytes, header("x-hub-signature-256")) {
-        return (401, json!({"error":"Invalid webhook signature."}));
+    let Ok(auth) = header(&src.auth_header) else {
+        return (400, json!({"error":"Repeated authentication header."}));
+    };
+    if secret.is_empty() || !authentic(src, &secret, bytes, auth.unwrap_or("")) {
+        return (401, json!({"error":"Invalid webhook signature or token."}));
     }
-    let id = header("x-github-delivery");
-    if id.is_empty() || id.len() > 96 || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    let id = if src.id_header.is_empty() {
+        None
+    } else {
+        match header(&src.id_header) {
+            Ok(Some(id))
+                if id.len() <= 128
+                    && id
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"-_.:".contains(&c)) =>
+            {
+                Some(id.to_owned())
+            }
+            _ => return (400, json!({"error":"Missing or invalid delivery ID."})),
+        }
+    };
+    if let Some(row) = id
+        .as_ref()
+        .and_then(|id| book.deliveries.iter().find(|row| &row.id == id))
     {
-        return (400, json!({"error":"Invalid delivery ID."}));
-    }
-    if let Some(row) = book.deliveries.iter().find(|row| row.id == id) {
         return (200, receipt(row));
     }
     if !t.enabled {
         return (409, json!({"error":"Trigger paused."}));
     }
-    if header("x-github-event") != t.event {
+    if !src.event_header.is_empty() && header(&src.event_header) != Ok(Some(src.event.as_str())) {
         return (422, json!({"error":"Event does not match trigger."}));
     }
     let Ok(payload) = serde_json::from_slice::<Value>(bytes) else {
@@ -365,7 +470,7 @@ pub(super) fn accept(
         .collect();
     let request = json!({"program":t.program,"filename":t.filename,"files":t.files,"raw_inputs":raw,"conversation_id":context.conversation_id});
     let row = Delivery {
-        id: id.into(),
+        id: id.unwrap_or_else(|| Uuid::new_v4().to_string()),
         run_id: Uuid::new_v4().to_string(),
         revision: t.revision,
         team: t.team.clone(),
@@ -449,6 +554,47 @@ mod tests {
             request: queued.then(|| json!({})),
             error: None,
         }
+    }
+
+    fn source(auth: &str) -> Source {
+        Source {
+            auth: auth.into(),
+            auth_header: "x-sig".into(),
+            event_header: String::new(),
+            event: String::new(),
+            id_header: String::new(),
+        }
+    }
+
+    #[test]
+    fn any_sender_authenticates_by_hex_or_base64_signature_or_token() {
+        let body = br#"{"ref":"x"}"#;
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"k").unwrap();
+        mac.update(body);
+        let tag = mac.finalize().into_bytes();
+        let hex: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(tag);
+        let hmac = source("hmac-sha256");
+        assert!(authentic(&hmac, b"k", body, &format!("sha256={hex}")));
+        assert!(authentic(&hmac, b"k", body, &hex.to_uppercase()));
+        assert!(authentic(&hmac, b"k", body, &b64));
+        assert!(!authentic(&hmac, b"other", body, &hex));
+        assert!(!authentic(&hmac, b"k", b"tampered", &b64));
+        assert!(!authentic(&hmac, b"k", body, ""));
+        let token = source("token");
+        assert!(authentic(&token, b"s3cret", body, "s3cret"));
+        assert!(authentic(&token, b"s3cret", body, "Bearer s3cret"));
+        assert!(!authentic(&token, b"s3cret", body, "s3cre"));
+        assert!(check_source(source("basic")).is_err());
+        let mut github = source("hmac-sha256");
+        github.auth_header = "X-Hub-Signature-256".into();
+        github.event_header = "X-GitHub-Event".into();
+        github.event = "push".into();
+        let github = check_source(github).unwrap();
+        assert_eq!(github.auth_header, "x-hub-signature-256");
+        let mut bare = source("token");
+        bare.event = "ignored".into();
+        assert_eq!(check_source(bare).unwrap().event, "");
     }
 
     #[test]

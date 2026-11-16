@@ -5,13 +5,35 @@ import { normalizeRuntimeUrl } from "./lib/runtime-client";
 import { fetchWorkflow } from "./lib/workflow-state";
 import type { DiagramSnapshot } from "./lib/protocol";
 
-type Trigger = {
+type Source = {
+  auth: "hmac-sha256" | "token";
+  auth_header: string;
+  event_header: string;
+  event: string;
+  id_header: string;
+};
+type Trigger = Source & {
   id: string;
   revision: number;
   enabled: boolean;
   secret_name: string;
-  event: string;
   mapping: Record<string, string>;
+};
+
+// Any sender works. These are GitHub's header names, offered as a shortcut.
+const GITHUB: Source = {
+  auth: "hmac-sha256",
+  auth_header: "x-hub-signature-256",
+  event_header: "x-github-event",
+  event: "push",
+  id_header: "x-github-delivery",
+};
+const CUSTOM: Source = {
+  auth: "hmac-sha256",
+  auth_header: "x-signature",
+  event_header: "",
+  event: "",
+  id_header: "",
 };
 type Receipt = {
   delivery_id: string;
@@ -36,8 +58,8 @@ export function WorkflowTrigger({
 }) {
   const url = normalizeRuntimeUrl(base) + "/v1/webhook-trigger";
   const [inbox, setInbox] = useState<Inbox | null>(null);
-  const [event, setEvent] = useState("push");
-  const [secret, setSecret] = useState("github");
+  const [src, setSrc] = useState<Source>(CUSTOM);
+  const [secret, setSecret] = useState("webhook");
   const [mapping, setMapping] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -58,7 +80,14 @@ export function WorkflowTrigger({
         if (workflow.draft?.design.program === source)
           setRevision(workflow.revision);
         if (saved.trigger) {
-          setEvent(saved.trigger.event);
+          const t = saved.trigger;
+          setSrc({
+            auth: t.auth,
+            auth_header: t.auth_header,
+            event_header: t.event_header,
+            event: t.event,
+            id_header: t.id_header,
+          });
           setSecret(saved.trigger.secret_name);
           setMapping(saved.trigger.mapping);
         }
@@ -110,9 +139,10 @@ export function WorkflowTrigger({
         </button>
       </header>
       <p>
-        Run this workflow when GitHub sends a matching event. Map event fields
-        to inputs. Redelivered events do not run it twice; events that arrive
-        while it runs wait their turn.
+        Run this workflow when any service calls its webhook URL. Map JSON
+        payload fields to inputs. With a delivery ID header, a resent request
+        does not run it twice; requests that arrive while it runs wait their
+        turn.
       </p>
       {inbox?.trigger ? (
         <div className="inspector-field">
@@ -136,16 +166,71 @@ export function WorkflowTrigger({
       ) : null}
       <fieldset disabled={busy || !inbox}>
         <label className="inspector-field">
-          GitHub event
-          <input value={event} onChange={(e) => setEvent(e.target.value)} />
+          Preset
+          <select
+            aria-label="Webhook preset"
+            value=""
+            onChange={(e) => {
+              if (e.target.value === "github") setSrc(GITHUB);
+              if (e.target.value === "custom") setSrc(CUSTOM);
+            }}
+          >
+            <option value="">Fill in from…</option>
+            <option value="github">GitHub</option>
+            <option value="custom">Other service</option>
+          </select>
         </label>
         <label className="inspector-field">
-          Local signing key name
+          Authentication
+          <select
+            aria-label="Authentication"
+            value={src.auth}
+            onChange={(e) =>
+              setSrc({ ...src, auth: e.target.value as Source["auth"] })
+            }
+          >
+            <option value="hmac-sha256">HMAC-SHA256 signature of body</option>
+            <option value="token">Shared secret token</option>
+          </select>
+        </label>
+        <label className="inspector-field">
+          {src.auth === "token" ? "Token header" : "Signature header"}
+          <input
+            value={src.auth_header}
+            onChange={(e) => setSrc({ ...src, auth_header: e.target.value })}
+          />
+        </label>
+        <label className="inspector-field">
+          Event header (optional)
+          <input
+            value={src.event_header}
+            onChange={(e) => setSrc({ ...src, event_header: e.target.value })}
+          />
+        </label>
+        {src.event_header ? (
+          <label className="inspector-field">
+            Event value to match
+            <input
+              value={src.event}
+              onChange={(e) => setSrc({ ...src, event: e.target.value })}
+            />
+          </label>
+        ) : null}
+        <label className="inspector-field">
+          Delivery ID header (optional)
+          <input
+            value={src.id_header}
+            onChange={(e) => setSrc({ ...src, id_header: e.target.value })}
+          />
+        </label>
+        <label className="inspector-field">
+          Local secret name
           <input value={secret} onChange={(e) => setSecret(e.target.value)} />
         </label>
         <p>
-          Store the GitHub signing secret in a private file under the runtime
-          home’s webhook-secrets directory. Enter its file name above.
+          Store the signing secret or token in a private (0600) file under the
+          runtime home’s webhook-secrets directory. Enter its file name above.
+          Signatures may be hex or base64, with or without a sha256= prefix.
         </p>
         {inputs.map((input) => (
           <label className="inspector-field" key={input.id}>
@@ -172,7 +257,7 @@ export function WorkflowTrigger({
           onClick={() =>
             void update({
               revision,
-              event,
+              ...src,
               secret_name: secret,
               mapping: Object.fromEntries(
                 Object.entries(mapping).filter(([, value]) => value.length),

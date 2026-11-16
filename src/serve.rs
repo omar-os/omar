@@ -1485,19 +1485,14 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
             break;
         }
         let lower = line.to_ascii_lowercase();
-        if let Some((name, value)) = line.split_once(':') {
-            let key = name.to_ascii_lowercase();
-            if matches!(
-                key.as_str(),
-                "x-github-delivery" | "x-github-event" | "x-hub-signature-256"
-            ) && hook_headers.insert(key, value.trim().to_owned()).is_some()
-            {
-                return write_json(
-                    &mut stream,
-                    400,
-                    &json!({"error":"Duplicate provider header."}),
-                    None,
-                );
+        // Webhook triggers name their own auth/event/ID headers. A repeated
+        // header is kept as None so a trigger that reads it can refuse it.
+        if path.contains("/v1/webhook-deliveries/") {
+            if let Some((name, value)) = line.split_once(':') {
+                hook_headers
+                    .entry(name.trim().to_ascii_lowercase())
+                    .and_modify(|v: &mut Option<String>| *v = None)
+                    .or_insert_with(|| Some(value.trim().to_owned()));
             }
         }
         if let Some(value) = lower.strip_prefix("host:") {
