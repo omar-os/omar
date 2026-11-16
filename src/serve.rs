@@ -1649,6 +1649,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
     }
 
     if path == "/v1/webhook-trigger"
+        || path == "/v1/memory"
         || path == "/v1/workflow"
         || path == "/v1/workspaces"
         || path.starts_with("/v1/workspaces/")
@@ -1671,6 +1672,47 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         if path == "/v1/webhook-trigger" {
             let (status, body) = webhook::settings(&context, &method, &raw_body);
             return write_json(&mut stream, status, &body, origin);
+        }
+        if path == "/v1/memory" {
+            if access != Access::Full || method != "POST" {
+                return write_json(
+                    &mut stream,
+                    403,
+                    &json!({"error":"full operator access required"}),
+                    origin,
+                );
+            }
+            let Ok(body) = serde_json::from_slice::<Value>(&raw_body) else {
+                return write_json(
+                    &mut stream,
+                    400,
+                    &json!({"error":"invalid memory request"}),
+                    origin,
+                );
+            };
+            if crate::knowledge::authenticated(
+                &context.omar_dir,
+                body["key"].as_str().unwrap_or(""),
+            )
+            .is_err()
+            {
+                return write_json(
+                    &mut stream,
+                    403,
+                    &json!({"error":"operator key required"}),
+                    origin,
+                );
+            }
+            let result = serde_json::from_value(body["request"].clone())
+                .map_err(anyhow::Error::from)
+                .and_then(|action| {
+                    crate::knowledge::operator(&context.omar_dir, context.ea_id, action)
+                });
+            let (status, value) = match result {
+                Ok(value) => (200, value),
+                Err(error) => (400, json!({"error":error.to_string()})),
+            };
+            return write_json(&mut stream, status, &value, origin);
         }
         if path == "/v1/workflow" {
             let _operation = (method == "POST").then(|| {
@@ -3265,7 +3307,7 @@ fn mission_control_envelope(text: &str, selection: &[String], live: Option<&Live
          To offer a workflow, call the MCP tool `omar_propose_design` with a complete \
          OMAR program. Include companion files in `files`, keyed by their relative paths \
          (for example schemas/decision.json), so imported types compile. The entry \
-         source is program.omar. The operator approves and runs it; you do not.\n\n\
+         source is program.omar. Prefer optional // @title and // @desc comments directly above each task or reaction. The operator approves and runs it; you do not.\n\n\
          When asked how to get started, invite the operator to describe a workflow \
          they want to automate, from development to marketing and beyond. Lead with \
          concrete developer examples: a GitHub issue into a tested pull request, \

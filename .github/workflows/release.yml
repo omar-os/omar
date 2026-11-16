@@ -114,7 +114,9 @@ jobs:
       - name: Add omar-linux to the darwin tarball
         run: |
           tar xzf omar-linux-${{ matrix.arch }}/omar-linux-${{ matrix.arch }}.tar.gz
-          tar xzf omar-darwin-${{ matrix.arch }}/omar-darwin-${{ matrix.arch }}.tar.gz
+          # Out of the folder it extracts into, or the repack below packs it too.
+          mv omar-darwin-${{ matrix.arch }}/omar-darwin-${{ matrix.arch }}.tar.gz darwin.tar.gz
+          tar xzf darwin.tar.gz
           cp omar-linux-${{ matrix.arch }}/omar omar-darwin-${{ matrix.arch }}/omar-linux
           tar czf omar-darwin-${{ matrix.arch }}.tar.gz omar-darwin-${{ matrix.arch }}/
       - uses: actions/upload-artifact@v4
