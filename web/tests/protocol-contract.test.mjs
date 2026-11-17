@@ -334,7 +334,7 @@ test("automated and unknown failures do not ask for a manual handoff", () => {
   assert.match(automated.guidance, /terminal/);
   assert.doesNotMatch(automated.guidance, /manual Web/);
   const unknown = describeRunFailure("renderer exited with code 1", []);
-  assert.match(unknown.guidance, /error details/);
+  assert.match(unknown.guidance, /investigate and try to repair/);
 });
 
 test("manual workflows have time for a handoff without changing automated defaults", () => {
