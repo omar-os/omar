@@ -3,7 +3,8 @@
 
 No provider credentials or model calls. Parent uses the OpenCode HTTP contract;
 children are terminal processes driven via the same MCP tools a model uses.
-Exercises one-shot completion, process restart without duplicate notices, orphan detection, and post-compaction hooks.
+Exercises one-shot completion, process restart without duplicate notices, idle
+escalation and activity recovery, orphan detection, and post-compaction hooks.
 """
 import contextlib
 import http.server
@@ -63,8 +64,6 @@ class MCP:
 
 def main():
     server_name = "omar-supervision-" + uuid.uuid4().hex[:12]
-    backend = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Backend)
-    threading.Thread(target=backend.serve_forever, daemon=True).start()
     processes = []
     env = dict(os.environ, OMAR_TMUX_SERVER=server_name)
     # Do not inherit the invoking pane's identity into this isolated test.
@@ -73,12 +72,32 @@ def main():
     env.pop("OMAR_MCP_CONTEXT_FILE", None)
 
     def tmux(*args):
-        return subprocess.run(["tmux", "-L", server_name, *args], check=True, capture_output=True, text=True)
+        return subprocess.run(["tmux", "-L", server_name, *args], env=env, check=True, capture_output=True, text=True)
+
+    class RenderingBackend(Backend):
+        def do_POST(self):
+            target = "reg-0-idle-child" if "/ses_idle/" in self.path else "reg-ea-0"
+            tty = tmux("display-message", "-p", "-t", target, "#{pane_tty}").stdout.strip()
+            marker = "Incoming message " + uuid.uuid4().hex
+            with open(tty, "w") as pane:
+                pane.write(marker + "\r\n")
+            deadline = time.monotonic() + 5
+            while marker not in tmux("capture-pane", "-p", "-t", target).stdout:
+                assert time.monotonic() < deadline, "incoming message did not render"
+                time.sleep(0.02)
+            super().do_POST()
+
+    backend = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RenderingBackend)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
 
     try:
         with tempfile.TemporaryDirectory(prefix="omar-supervision-") as directory, contextlib.ExitStack() as cleanup:
             cleanup.callback(lambda: [process.stop() for process in processes])
             root = Path(directory)
+            home = root / "home"
+            home.mkdir()
+            env.update(HOME=str(home), OMAR_HOME=str(root))
+            (root / "config.toml").write_text("[health]\nidle_critical = 2\n")
             context = {"omar_dir": str(root), "ea_id": 0, "session_prefix": "reg-",
                        "default_command": "cat", "default_workdir": str(root), "health_idle_warning": 15,
                        "tmux_server": server_name, "topology": None, "serve": None}
@@ -159,9 +178,29 @@ def main():
             assert parent.call("coordination_state")["tasks"] == []
             print("PASS: compact/stop hooks restore obligations; full result pages survive; ack and retirement settle work", flush=True)
 
-            orphan_child = parent.call("spawn_agent", name="idle-child", project_id=project,
-                                       task="Report a result", command="cat", supervise=True)
-            idle_id = orphan_child["task_id"]
+            # The runtime keeps its startup configuration instead of re-parsing per tick.
+            (root / "config.toml").write_text("[health]\nidle_critical = 999\n")
+            idle_child = parent.call("spawn_agent", name="idle-child", project_id=project,
+                                     task="Report a result", command="cat", supervise=True)
+            idle_id = idle_child["task_id"]
+            tmux("set-environment", "-t", "reg-0-idle-child", "OMAR_BACKEND", "opencode")
+            tmux("set-environment", "-t", "reg-0-idle-child", "OMAR_DELIVERY",
+                 f"opencode:{backend.server_port}:ses_idle")
+            for cycle in range(2):
+                endpoint, body = receipts.get(timeout=20)
+                assert endpoint == "/session/ses_idle/prompt_async", endpoint
+                assert "Idle without a result: idle-child" in body["parts"][0]["text"]
+                endpoint, body = receipts.get(timeout=15)
+                assert endpoint == "/session/ses_parent/prompt_async", endpoint
+                assert "Stalled child: idle-child" in body["parts"][0]["text"]
+                try:
+                    duplicate = receipts.get(timeout=12)
+                    raise AssertionError(f"idle event repeated without activity: {duplicate}")
+                except queue.Empty:
+                    pass
+                if cycle == 0:
+                    tmux("send-keys", "-t", "reg-0-idle-child", "new activity", "Enter")
+            print("PASS: rendered reminders preserve escalation; real activity re-arms worker and parent notices", flush=True)
             tmux("kill-session", "-t", "reg-0-idle-child")
             endpoint, body = receipts.get(timeout=15)
             assert endpoint == "/session/ses_parent/prompt_async", endpoint
