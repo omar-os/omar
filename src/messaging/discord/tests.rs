@@ -50,30 +50,30 @@ fn only_verified_one_to_one_dm_messages_are_normalized() {
 async fn discord_uses_existing_listing_admission_dedup_and_delivery_policy() {
     let gateway = Gateway::new(config(), FakeRuntime::default(), FakeMessenger::default());
     gateway
-        .handle(normalize(&event("list"), "999", &channels()).unwrap())
+        .handle(normalize_interaction(&slash_event("list"), "999", &channels()).unwrap())
         .await;
     assert!(gateway.messenger.replies.lock().unwrap()[0]
         .1
         .text
         .contains("demo"));
     assert_eq!(gateway.runtime.starts.load(Ordering::SeqCst), 0);
-    let mut e = event("run demo");
+    let mut e = run_slash_event();
     e["id"] = json!("790");
     gateway
-        .handle(normalize(&e, "999", &channels()).unwrap())
+        .handle(normalize_interaction(&e, "999", &channels()).unwrap())
         .await;
     gateway
-        .handle(normalize(&e, "999", &channels()).unwrap())
+        .handle(normalize_interaction(&e, "999", &channels()).unwrap())
         .await;
     assert_eq!(gateway.runtime.starts.load(Ordering::SeqCst), 1);
     assert_eq!(gateway.messenger.replies.lock().unwrap().len(), 3);
     e["id"] = json!("791");
-    e["content"] = json!("run ../../secret");
+    e["data"]["options"][0]["value"] = json!("missing");
     gateway
-        .handle(normalize(&e, "999", &channels()).unwrap())
+        .handle(normalize_interaction(&e, "999", &channels()).unwrap())
         .await;
     assert_eq!(gateway.runtime.starts.load(Ordering::SeqCst), 1);
-    let mut unauthorized = normalize(&e, "999", &channels()).unwrap();
+    let mut unauthorized = normalize_interaction(&e, "999", &channels()).unwrap();
     unauthorized.sender_id = "111".into();
     gateway.handle(unauthorized).await;
     assert_eq!(gateway.messenger.replies.lock().unwrap().len(), 4);
@@ -86,7 +86,7 @@ async fn discord_uses_existing_listing_admission_dedup_and_delivery_policy() {
         },
     );
     gateway
-        .handle(normalize(&event("run demo"), "999", &channels()).unwrap())
+        .handle(normalize_interaction(&run_slash_event(), "999", &channels()).unwrap())
         .await;
     assert_eq!(gateway.runtime.starts.load(Ordering::SeqCst), 1);
 }
@@ -227,11 +227,12 @@ async fn gateway_heartbeats_during_work_and_resumes_without_duplicate_execution(
         },
         FakeMessenger::default(),
     ));
+    let (callback_base, callback_server) = interaction_fixture(3).await;
     let identity = Identity {
         token: "fixture-token".into(),
         bot: "999".into(),
         channels: channels(),
-        callback_base: "https://discord.com/api/v10".into(),
+        callback_base,
     };
     let mut session = Session::default();
     let mut tasks = JoinSet::new();
@@ -248,7 +249,7 @@ async fn gateway_heartbeats_during_work_and_resumes_without_duplicate_execution(
         send_event(&mut server,json!({"op":0,"s":1,"t":"READY","d":{"user":{"id":"999"},"session_id":"session","resume_gateway_url":"wss://gateway.discord.gg"}})).await;
         send_event(
             &mut server,
-            json!({"op":0,"s":2,"t":"MESSAGE_CREATE","d":event("run demo")}),
+            json!({"op":0,"s":2,"t":"INTERACTION_CREATE","d":run_slash_event()}),
         )
         .await;
         let heartbeat = read_event(&mut server).await;
@@ -276,14 +277,14 @@ async fn gateway_heartbeats_during_work_and_resumes_without_duplicate_execution(
         send_event(&mut server, json!({"op":0,"s":3,"t":"RESUMED","d":{}})).await;
         send_event(
             &mut server,
-            json!({"op":0,"s":4,"t":"MESSAGE_CREATE","d":event("run demo")}),
+            json!({"op":0,"s":4,"t":"INTERACTION_CREATE","d":run_slash_event()}),
         )
         .await;
-        let mut list = event("list");
+        let mut list = slash_event("list");
         list["id"] = json!("790");
         send_event(
             &mut server,
-            json!({"op":0,"s":5,"t":"MESSAGE_CREATE","d":list}),
+            json!({"op":0,"s":5,"t":"INTERACTION_CREATE","d":list}),
         )
         .await;
         timeout(Duration::from_secs(3), async {
@@ -330,6 +331,7 @@ async fn gateway_heartbeats_during_work_and_resumes_without_duplicate_execution(
         .text
         .contains("completed"));
     tasks.abort_all();
+    callback_server.await.unwrap();
 }
 
 #[tokio::test]
@@ -530,7 +532,7 @@ async fn discord_review_sends_graph_and_source_before_enabling_version_bound_but
 }
 
 fn slash_event(name: &str) -> Value {
-    json!({"id":"1002","application_id":"999","type":2,"channel_id":"456","user":{"id":"123"},
+    json!({"id":"1002","token":"test-token","application_id":"999","type":2,"channel_id":"456","user":{"id":"123"},
         "data":{"type":1,"name":name}})
 }
 
@@ -692,4 +694,69 @@ async fn first_connection_registers_generic_commands_without_replacing_other_com
     api.base = format!("http://{address}");
     api.register_commands("999").await.unwrap();
     assert_eq!(server.await.unwrap(), slash_commands());
+}
+
+fn run_slash_event() -> Value {
+    let mut event = slash_event("run");
+    event["id"] = json!("789");
+    event["data"]["options"] = json!([{"name":"workflow","type":3,"value":"demo"}]);
+    event
+}
+
+async fn interaction_fixture(count: usize) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for _ in 0..count {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                headers.push(byte[0]);
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["type"], 4);
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    (base, server)
+}
+
+#[tokio::test]
+async fn ordinary_dm_words_go_to_the_assistant_while_slash_help_is_a_control() {
+    let gateway = Gateway::new(config(), FakeRuntime::default(), FakeMessenger::default());
+    for (index, text) in ["help", "list", "run demo", "new chat"].iter().enumerate() {
+        let mut e = event(text);
+        e["id"] = json!((800 + index).to_string());
+        let message = normalize(&e, "999", &channels()).unwrap();
+        assert!(message.plain_text);
+        gateway.handle(message).await;
+        let replies = gateway.messenger.replies.lock().unwrap();
+        assert_eq!(
+            replies.last().unwrap().1.text,
+            format!("Answer to 123: {text}")
+        );
+    }
+    assert_eq!(gateway.runtime.starts.load(Ordering::SeqCst), 0);
+    gateway
+        .handle(normalize_interaction(&slash_event("help"), "999", &channels()).unwrap())
+        .await;
+    let replies = gateway.messenger.replies.lock().unwrap();
+    assert!(replies.last().unwrap().1.text.starts_with("Use /list"));
 }

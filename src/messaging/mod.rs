@@ -37,6 +37,8 @@ pub struct Incoming {
     pub sender_id: String,
     pub event_id: String,
     pub command: String,
+    #[serde(default)]
+    pub plain_text: bool,
     pub destination: Destination,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -142,9 +144,10 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
         }
         let conversational = c.platform == "discord"
             && !message.command.is_empty()
-            && message.command != "list"
-            && message.command != "run"
-            && !message.command.starts_with("run ");
+            && (message.plain_text
+                || (message.command != "list"
+                    && message.command != "run"
+                    && !message.command.starts_with("run ")));
         {
             let mut state = self.state.lock().unwrap();
             let now = Instant::now();
@@ -163,15 +166,17 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
             }
             state.seen.insert(key, now + self.dedup_ttl);
         }
-        if c.platform == "discord" && message.command == "help" {
+        if c.platform == "discord" && !message.plain_text && message.command == "help" {
             self.reply(d, "Use /list to see your saved workflows, /run workflow:<name> to run one, or /new-chat to start fresh. Send a regular message to talk to the assistant. Keep your local OMAR connector running.".into(), None).await;
             return;
         }
-        if c.platform == "discord" && proposal::action(&message.command) {
+        if c.platform == "discord" && !message.plain_text && proposal::action(&message.command) {
             self.review_action(&message).await;
             return;
         }
-        let approved = if message.command == "list" || message.command.starts_with("run ") {
+        let approved = if !conversational
+            && (message.command == "list" || message.command.starts_with("run "))
+        {
             match self.runtime.approved().await {
                 Ok(entries) => entries,
                 Err(_) => {
@@ -192,7 +197,7 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
             });
         let response = {
             let mut state = self.state.lock().unwrap();
-            if message.command == "list" {
+            if !conversational && message.command == "list" {
                 let mut listing = String::from("Saved workflows:");
                 for workflow in &approved {
                     listing.push_str(&format!("\n- {}", workflow.name));
@@ -227,7 +232,7 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
                 !(p.sender == message.sender_id
                     && p.destination.conversation_id == d.conversation_id)
             });
-            match self.runtime.converse(&message.sender_id, &message.command).await {
+            match self.runtime.converse(&message.sender_id, &message.command, !message.plain_text && message.command == "new chat").await {
                 Ok(text)=>match self.runtime.proposal(&message.sender_id).await {
                     Ok(Some(proposal))=>self.present_proposal(&message,proposal).await,
                     Ok(None)=>self.reply(d,text,None).await,

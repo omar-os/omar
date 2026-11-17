@@ -43,6 +43,7 @@ pub fn normalize(payload: &Value, bot: &str) -> Option<Incoming> {
     // Validate the message timestamp even for an existing thread.
     event["ts"].as_str()?;
     Some(Incoming {
+        plain_text: false,
         platform: "slack".into(),
         account_id: account_id.clone(),
         sender_id: sender.into(),

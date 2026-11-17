@@ -42,6 +42,7 @@ pub(super) fn normalize(
     }
     let message = id(&event["id"])?;
     Some(Incoming {
+        plain_text: true,
         platform: "discord".into(),
         account_id: bot.into(),
         sender_id: sender.into(),
@@ -135,6 +136,7 @@ fn normalize_slash(
         _ => return None,
     };
     Some(Incoming {
+        plain_text: false,
         platform: "discord".into(),
         account_id: bot.into(),
         sender_id: sender.into(),
@@ -185,6 +187,7 @@ fn normalize_interaction(
         return None;
     }
     Some(Incoming {
+        plain_text: false,
         platform: "discord".into(),
         account_id: bot.into(),
         sender_id: sender.into(),

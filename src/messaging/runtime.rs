@@ -52,6 +52,7 @@ pub trait Runtime: Send + Sync {
         &self,
         _sender: &str,
         _text: &str,
+        _start_new_chat: bool,
     ) -> impl std::future::Future<Output = Result<String>> + Send {
         async { bail!("Conversation is unavailable") }
     }
@@ -167,7 +168,7 @@ impl Runtime for OmarRuntime {
         )?)
     }
 
-    async fn converse(&self, sender: &str, text: &str) -> Result<String> {
+    async fn converse(&self, sender: &str, text: &str, start_new_chat: bool) -> Result<String> {
         let account = self
             .discord_account
             .as_deref()
@@ -179,7 +180,7 @@ impl Runtime for OmarRuntime {
                 .unwrap_or(&self.base)
                 .to_owned(),
         )?;
-        let fresh = text == "new chat";
+        let fresh = start_new_chat;
         let record = root.call("/v1/chats/messaging", Some(&serde_json::json!({
             "platform": "discord", "accountId": format!("assistant-{account}-{sender}"), "fresh": fresh
         }))).await?;
@@ -355,7 +356,7 @@ mod conversation_http_tests {
             let mut creations = Vec::new();
             let mut routes = Vec::new();
             let mut chats = BTreeMap::new();
-            for _ in 0..16 {
+            for _ in 0..19 {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -395,23 +396,37 @@ mod conversation_http_tests {
                 let body = value.to_string();
                 write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
             }
-            assert_eq!(creations.len(), 6);
+            assert_eq!(creations.len(), 7);
             assert_ne!(creations[0], creations[2]);
             assert_eq!(routes[0], routes[1]);
             assert_ne!(routes[0], routes[2]);
             assert_eq!(routes[0], routes[3]);
-            assert_ne!(routes[0], routes[4]);
+            assert_eq!(routes[0], routes[4]);
+            assert_ne!(routes[0], routes[5]);
         });
         let runtime = OmarRuntime::new(root.clone())
             .unwrap()
             .for_discord("999".into());
-        assert_eq!(runtime.converse("111", "hello").await.unwrap(), "hello");
-        runtime.converse("111", "follow up").await.unwrap();
-        runtime.converse("222", "different user").await.unwrap();
+        assert_eq!(
+            runtime.converse("111", "hello", false).await.unwrap(),
+            "hello"
+        );
+        runtime.converse("111", "follow up", false).await.unwrap();
+        runtime
+            .converse("222", "different user", false)
+            .await
+            .unwrap();
         let restarted = OmarRuntime::new(root).unwrap().for_discord("999".into());
-        restarted.converse("111", "after restart").await.unwrap();
-        restarted.converse("111", "new chat").await.unwrap();
-        restarted.converse("111", "fresh context").await.unwrap();
+        restarted
+            .converse("111", "after restart", false)
+            .await
+            .unwrap();
+        restarted.converse("111", "new chat", false).await.unwrap();
+        restarted.converse("111", "new chat", true).await.unwrap();
+        restarted
+            .converse("111", "fresh context", false)
+            .await
+            .unwrap();
         server.join().unwrap();
     }
 }

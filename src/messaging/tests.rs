@@ -58,7 +58,7 @@ impl Runtime for FakeRuntime {
         ])
     }
 
-    async fn converse(&self, sender: &str, text: &str) -> Result<String> {
+    async fn converse(&self, sender: &str, text: &str, _: bool) -> Result<String> {
         Ok(format!("Answer to {sender}: {text}"))
     }
 
@@ -722,7 +722,7 @@ struct ReviewRuntime {
     starts: Mutex<Vec<Value>>,
 }
 impl Runtime for ReviewRuntime {
-    async fn converse(&self, _: &str, _: &str) -> Result<String> {
+    async fn converse(&self, _: &str, _: &str, _: bool) -> Result<String> {
         Ok("draft".into())
     }
     async fn proposal(&self, _: &str) -> Result<Option<runtime::Proposal>> {
