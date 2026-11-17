@@ -3357,3 +3357,118 @@ dialog.port-panel::backdrop { background: rgba(6, 6, 9, .72); }
   color: var(--text-3);
   font-size: 0.6875rem;
 }
+
+/* `omar gateway`: the password, then the sessions on this machine. */
+.gate {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: var(--ink);
+  color: var(--text-2);
+}
+
+.gate-card {
+  width: min(420px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 24px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--panel-2);
+}
+
+.gate-card h1 {
+  font-size: 1.35rem;
+  color: var(--text);
+}
+
+.gate-form {
+  display: grid;
+  gap: 12px;
+}
+
+.gate-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--text-2);
+}
+
+.gate-form input {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+.gate-form button[type="submit"] {
+  height: 34px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--purple);
+  color: white;
+  font: inherit;
+}
+
+.gate-form button:disabled {
+  opacity: 0.5;
+}
+
+.gate-note {
+  color: var(--text-3);
+  font-size: 0.9rem;
+}
+
+.gate-error {
+  color: var(--danger);
+}
+
+.gate-sessions {
+  display: grid;
+  gap: 6px;
+  list-style: none;
+  padding: 0;
+}
+
+.gate-sessions a,
+.gate-sessions span {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.gate-sessions span {
+  color: var(--text-3);
+}
+
+.gate-sessions a:hover {
+  border-color: var(--purple);
+}
+
+.gate-sessions small {
+  color: var(--text-3);
+}
+
+.gate-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.gate-actions button {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+}

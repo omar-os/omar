@@ -11,7 +11,9 @@ mod diagram;
 mod ea;
 mod ea_lifecycle;
 mod event;
+mod gateway;
 mod knowledge;
+mod login;
 mod manager;
 mod mcp;
 mod memory;
@@ -134,6 +136,15 @@ struct Cli {
 enum Commands {
     #[command(hide = true)]
     SandboxWorker,
+    /// Set the password `omar gateway` asks for; signs every browser out
+    Passwd,
+    /// Mission Control from other machines, behind `omar passwd`'s password,
+    /// for every session here. Listens on loopback; put an HTTPS proxy such
+    /// as Caddy in front
+    Gateway {
+        #[arg(long, default_value = "127.0.0.1:8090")]
+        address: std::net::SocketAddr,
+    },
     /// Reopen the default workspace, starting its runtime only when needed
     Open {
         #[arg(long)]
@@ -568,6 +579,20 @@ fn main() -> Result<()> {
         .block_on(async_main(cli))
 }
 
+/// The gateway's password lives in the OMAR home, not in any one session.
+fn passwd() -> Result<()> {
+    let login = login::Login::at(&sessions::home_root());
+    let password = login::read_password("New password: ")?;
+    if std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && login::read_password("Again: ")? != password
+    {
+        anyhow::bail!("the passwords don't match");
+    }
+    login.set_password(&password)?;
+    println!("Password set; browsers signed in before must sign in again. Serve it: omar gateway");
+    Ok(())
+}
+
 async fn async_main(mut cli: Cli) -> Result<()> {
     if matches!(cli.command, Some(Commands::SandboxWorker)) {
         return topology::sandbox_worker();
@@ -581,6 +606,11 @@ async fn async_main(mut cli: Cli) -> Result<()> {
         false
     };
     if !internal {
+        match &cli.command {
+            Some(Commands::Passwd) => return passwd(),
+            Some(Commands::Gateway { address }) => return gateway::run(*address),
+            _ => {}
+        }
         if let Some(result) = sessions::dispatch(&cli).await {
             return result;
         }
@@ -624,7 +654,9 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Rollback { .. }
             | Commands::SessionDaemon { .. }
             | Commands::SessionExec { .. }
-            | Commands::Serve { .. },
+            | Commands::Serve { .. }
+            | Commands::Passwd
+            | Commands::Gateway { .. },
         ) => unreachable!(),
         Some(Commands::Spawn {
             name,

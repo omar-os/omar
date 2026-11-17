@@ -5240,7 +5240,7 @@ fn write_json(
 /// compressed, and this only ever answers loopback, where every client
 /// understands the encoding. `no-store` because the bundle changes whenever the
 /// binary does and the two carry no version between them.
-fn write_asset(stream: &mut TcpStream, asset: &crate::web_assets::Asset) -> Result<()> {
+pub(crate) fn write_asset(stream: &mut TcpStream, asset: &crate::web_assets::Asset) -> Result<()> {
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",

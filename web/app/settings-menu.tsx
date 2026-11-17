@@ -17,6 +17,13 @@ function applyTheme(theme: Theme) {
   }
 }
 
+/** Signed in through `omar gateway`, on one of its sessions. */
+export type Account = {
+  session: string;
+  onSwitch: () => void;
+  onSignOut: () => void;
+};
+
 /**
  * Settings for this browser, which today means the theme.
  *
@@ -27,9 +34,11 @@ function applyTheme(theme: Theme) {
  */
 export function SettingsMenu({
   onOpenBackends,
+  account,
 }: {
   /** Opens the Backends page; absent where nothing can be connected. */
   onOpenBackends?: () => void;
+  account?: Account;
 } = {}) {
   // Read off the document rather than storage: the layout script has already
   // applied the stored choice by the time this runs. Nothing visible depends
@@ -109,6 +118,24 @@ export function SettingsMenu({
               >
                 Connect backends…
               </button>
+            </>
+          ) : null}
+          {account ? (
+            <>
+              <span className="settings-heading">Session {account.session}</span>
+              {([["Switch session", account.onSwitch], ["Sign out", account.onSignOut]] as const).map(([label, action]) => (
+                <button
+                  key={label}
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setOpen(false);
+                    action();
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
             </>
           ) : null}
         </div>
