@@ -136,14 +136,17 @@ struct Cli {
 enum Commands {
     #[command(hide = true)]
     SandboxWorker,
-    /// Set the password `omar gateway` asks for; signs every browser out
+    /// Set root's password, which `omar gateway` asks for; signs every
+    /// browser out
     Passwd,
-    /// Mission Control from other machines, behind `omar passwd`'s password,
+    /// Mission Control from other machines, behind root's password,
     /// for every session here. Listens on loopback; put an HTTPS proxy such
     /// as Caddy in front
     Gateway {
-        #[arg(long, default_value = "127.0.0.1:8090")]
-        address: std::net::SocketAddr,
+        /// Port on this machine (127.0.0.1) for the HTTPS proxy to forward to.
+        /// Not the one to open in a firewall: open the proxy's
+        #[arg(long, default_value_t = 8090)]
+        port: u16,
     },
     /// Reopen the default workspace, starting its runtime only when needed
     Open {
@@ -582,14 +585,17 @@ fn main() -> Result<()> {
 /// The gateway's password lives in the OMAR home, not in any one session.
 fn passwd() -> Result<()> {
     let login = login::Login::at(&sessions::home_root());
-    let password = login::read_password("New password: ")?;
+    let password = login::read_password(&format!("New password for {}: ", login::USER))?;
     if std::io::IsTerminal::is_terminal(&std::io::stdin())
         && login::read_password("Again: ")? != password
     {
         anyhow::bail!("the passwords don't match");
     }
     login.set_password(&password)?;
-    println!("Password set; browsers signed in before must sign in again. Serve it: omar gateway");
+    println!(
+        "Password for {} set; browsers signed in before must sign in again. Serve it: omar gateway",
+        login::USER
+    );
     Ok(())
 }
 
@@ -608,7 +614,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     if !internal {
         match &cli.command {
             Some(Commands::Passwd) => return passwd(),
-            Some(Commands::Gateway { address }) => return gateway::run(*address),
+            Some(Commands::Gateway { port }) => return gateway::run(*port),
             _ => {}
         }
         if let Some(result) = sessions::dispatch(&cli).await {

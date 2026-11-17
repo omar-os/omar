@@ -7,8 +7,9 @@ import { fetchGate, sessionFromPath, sessionUrl, signIn, signOut, type Gate as G
 
 /**
  * Mission Control as the SPA serves it. From a session's own daemon this is
- * just the studio. From `omar gateway` it asks for the operator's password,
- * then lists the sessions here, each at `/s/<name>/`.
+ * just the studio. From `omar gateway` it signs the operator in, as `root`
+ * with the password `omar passwd` set, then lists the sessions here, each at
+ * `/s/<name>/`.
  */
 export function Gate({ origin, pathname }: { origin: string; pathname: string }) {
   const [gate, setGate] = useState<GateState | null>(null);
@@ -26,8 +27,9 @@ export function Gate({ origin, pathname }: { origin: string; pathname: string })
   if (gate.kind === "signed-out") return <SignIn origin={origin} onSignedIn={refresh} />;
   const session = sessionFromPath(pathname);
   const running = gate.sessions.find((candidate) => candidate.name === session && candidate.state === "ready");
-  if (!session || !running) return <Sessions origin={origin} sessions={gate.sessions} missing={session} />;
+  if (!session || !running) return <Sessions origin={origin} user={gate.user} sessions={gate.sessions} missing={session} />;
   const account = {
+    user: gate.user,
     session,
     onSwitch: () => window.location.assign("/"),
     onSignOut: () => void signOut(origin).then(() => window.location.assign("/")),
@@ -48,6 +50,7 @@ function Card({ title, children }: { title: string; children: ReactNode }) {
 }
 
 function SignIn({ origin, onSignedIn }: { origin: string; onSignedIn: () => void }) {
+  const [user, setUser] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -56,7 +59,7 @@ function SignIn({ origin, onSignedIn }: { origin: string; onSignedIn: () => void
     setBusy(true);
     setError("");
     try {
-      await signIn(origin, password);
+      await signIn(origin, user.trim(), password);
       onSignedIn();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -67,20 +70,20 @@ function SignIn({ origin, onSignedIn }: { origin: string; onSignedIn: () => void
   return (
     <Card title="Sign in">
       <form className="gate-form" onSubmit={(event) => void submit(event)}>
-        {/* For password managers, which file a password under a name. */}
-        <input type="text" name="username" autoComplete="username" value="omar" readOnly hidden />
-        <label>Password<input name="password" type="password" autoComplete="current-password" autoFocus value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        <label>Username<input name="username" autoComplete="username" autoCapitalize="none" spellCheck={false} autoFocus value={user} onChange={(event) => setUser(event.target.value)} /></label>
+        <label>Password<input name="password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
         {error ? <p role="alert" className="gate-error">{error}</p> : null}
-        <button type="submit" disabled={busy || !password}>Sign in</button>
+        <button type="submit" disabled={busy || !user || !password}>Sign in</button>
       </form>
-      <p className="gate-note">The password set on this machine with <code>omar passwd</code>.</p>
+      <p className="gate-note"><code>root</code>, with the password set on this machine by <code>omar passwd</code>.</p>
     </Card>
   );
 }
 
-function Sessions({ origin, sessions, missing }: { origin: string; sessions: GatewaySession[]; missing: string | null }) {
+function Sessions({ origin, user, sessions, missing }: { origin: string; user: string; sessions: GatewaySession[]; missing: string | null }) {
   return (
     <Card title="Sessions">
+      <p className="gate-note">Signed in as <strong>{user}</strong>.</p>
       {missing ? <p role="alert" className="gate-error">“{missing}” is not running. Start it on this machine: <code>omar up -s {missing}</code></p> : null}
       {sessions.length === 0 ? (
         <p>No session yet. Start one on this machine: <code>omar up -s NAME</code></p>

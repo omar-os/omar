@@ -11,7 +11,7 @@ export type GatewaySession = { name: string; state: string };
 export type Gate =
   | { kind: "daemon" }
   | { kind: "signed-out" }
-  | { kind: "signed-in"; sessions: GatewaySession[] };
+  | { kind: "signed-in"; user: string; sessions: GatewaySession[] };
 
 export async function fetchGate(origin: string): Promise<Gate> {
   const response = await fetch(`${normalizeRuntimeUrl(origin)}/auth/me`);
@@ -22,8 +22,8 @@ export async function fetchGate(origin: string): Promise<Gate> {
   }
   if (response.status === 401) return { kind: "signed-out" };
   if (!response.ok) throw new Error(await readError(response));
-  const { sessions } = (await response.json()) as { sessions: GatewaySession[] };
-  return { kind: "signed-in", sessions };
+  const { user, sessions } = (await response.json()) as { user: string; sessions: GatewaySession[] };
+  return { kind: "signed-in", user, sessions };
 }
 
 /** The session a gateway page is for: `/s/<name>/…`. */
@@ -36,8 +36,8 @@ export function sessionUrl(origin: string, session: string): string {
   return `${normalizeRuntimeUrl(origin)}/s/${encodeURIComponent(session)}`;
 }
 
-export async function signIn(origin: string, password: string): Promise<void> {
-  await post(`${normalizeRuntimeUrl(origin)}/auth/login`, { password });
+export async function signIn(origin: string, user: string, password: string): Promise<void> {
+  await post(`${normalizeRuntimeUrl(origin)}/auth/login`, { user, password });
 }
 
 export async function signOut(origin: string): Promise<void> {

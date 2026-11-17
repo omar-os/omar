@@ -1,6 +1,7 @@
-//! The operator's password for `omar gateway`, so Mission Control can be
-//! reached from another machine without an SSH tunnel. Like `/etc/shadow`,
-//! the store holds only an Argon2id hash: the password cannot be read back.
+//! The operator's sign-in for `omar gateway`, so Mission Control can be
+//! reached from another machine without an SSH tunnel. One user, `root`, as
+//! on a fresh Linux machine. Like `/etc/shadow`, the store holds only an
+//! Argon2id hash: the password cannot be read back.
 //!
 //! Logins are random tokens held by the browser; only their SHA-256 is stored,
 //! so the file alone cannot be replayed as a cookie.
@@ -19,7 +20,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const MIN_PASSWORD: usize = 12;
+/// The one user: the operator, who can do everything.
+pub const USER: &str = "root";
 /// How long a login lasts before the browser signs in again.
 pub const LOGIN_SECONDS: u64 = 14 * 24 * 60 * 60;
 
@@ -48,8 +50,8 @@ impl Login {
 
     /// Set or replace the password; every browser signed in must sign in again.
     pub fn set_password(&self, password: &str) -> Result<()> {
-        if password.chars().count() < MIN_PASSWORD {
-            bail!("use at least {MIN_PASSWORD} characters");
+        if password.is_empty() {
+            bail!("the password is empty");
         }
         let hash = hash(password)?;
         self.change(|store| {
@@ -63,12 +65,12 @@ impl Login {
         Ok(self.load()?.hash.is_some())
     }
 
-    pub fn verify(&self, password: &str) -> Result<bool> {
-        // Checked against a hash either way, so an unset password takes as
-        // long to refuse as a wrong one.
+    pub fn verify(&self, user: &str, password: &str) -> Result<bool> {
+        // Checked against a hash either way, so a wrong name or an unset
+        // password takes as long to refuse as a wrong password.
         let stored = self.load()?.hash;
         let matches = check(stored.as_deref().unwrap_or(DUMMY_HASH), password);
-        Ok(stored.is_some() && matches)
+        Ok(user == USER && stored.is_some() && matches)
     }
 
     /// Start a login for a browser that just proved the password; returns the
@@ -250,13 +252,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let login = Login::at(home.path());
         assert!(!login.is_set().unwrap());
-        assert!(!login.verify("").unwrap());
-        assert!(login.set_password("too short").is_err());
+        assert!(!login.verify(USER, "").unwrap());
+        assert!(login.set_password("").is_err());
 
         login.set_password("correct horse battery").unwrap();
         assert!(login.is_set().unwrap());
-        assert!(login.verify("correct horse battery").unwrap());
-        assert!(!login.verify("correct horse").unwrap());
+        assert!(login.verify(USER, "correct horse battery").unwrap());
+        assert!(!login.verify(USER, "correct horse").unwrap());
+        assert!(!login.verify("admin", "correct horse battery").unwrap());
         let stored = fs::read_to_string(&login.path).unwrap();
         assert!(stored.contains("$argon2id$"), "{stored}");
         assert!(!stored.contains("correct horse"), "{stored}");
@@ -275,7 +278,7 @@ mod tests {
 
         login.set_password("a different long one").unwrap();
         assert!(!login.resolve(&token).unwrap());
-        assert!(!login.verify("correct horse battery").unwrap());
+        assert!(!login.verify(USER, "correct horse battery").unwrap());
     }
 
     #[test]
@@ -293,5 +296,13 @@ mod tests {
             })
             .unwrap();
         assert!(!login.resolve(&token).unwrap());
+    }
+
+    #[test]
+    fn any_nonempty_password_will_do() {
+        let home = tempfile::tempdir().unwrap();
+        let login = Login::at(home.path());
+        login.set_password("x").unwrap();
+        assert!(login.verify(USER, "x").unwrap());
     }
 }

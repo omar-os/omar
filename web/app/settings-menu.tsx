@@ -19,6 +19,7 @@ function applyTheme(theme: Theme) {
 
 /** Signed in through `omar gateway`, on one of its sessions. */
 export type Account = {
+  user: string;
   session: string;
   onSwitch: () => void;
   onSignOut: () => void;
@@ -122,7 +123,7 @@ export function SettingsMenu({
           ) : null}
           {account ? (
             <>
-              <span className="settings-heading">Session {account.session}</span>
+              <span className="settings-heading">{account.user} · {account.session}</span>
               {([["Switch session", account.onSwitch], ["Sign out", account.onSignOut]] as const).map(([label, action]) => (
                 <button
                   key={label}

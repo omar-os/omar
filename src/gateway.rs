@@ -1,4 +1,4 @@
-//! `omar gateway`: Mission Control from another machine, behind the
+//! `omar gateway [--port N]`: Mission Control from another machine, behind the
 //! operator's password (see `login`) rather than an SSH tunnel. It listens on
 //! loopback behind an HTTPS proxy (Caddy), serves Mission Control, and relays
 //! `/s/<session>/…` to that session's loopback daemon, which treats a signed
@@ -34,24 +34,32 @@ struct Gateway {
 }
 
 /// Serve until killed.
-pub fn run(address: SocketAddr) -> Result<()> {
-    run_in(address, crate::sessions::home_root())
+pub fn run(port: u16) -> Result<()> {
+    run_in(port, crate::sessions::home_root())
 }
 
-fn run_in(address: SocketAddr, home: PathBuf) -> Result<()> {
+fn run_in(port: u16, home: PathBuf) -> Result<()> {
     if !Login::at(&home).is_set()? {
         bail!("set a password first: omar passwd");
     }
-    if !address.ip().is_loopback() {
-        bail!(
-            "the gateway listens on loopback; put an HTTPS proxy in front of it \
-             (its login cookie is Secure, so plain HTTP elsewhere cannot keep a login)"
-        );
-    }
-    let listener = TcpListener::bind(address)
-        .with_context(|| format!("failed to bind the gateway at {address}"))?;
-    eprintln!("Gateway on http://{}", listener.local_addr()?);
+    let listener = listen(port)?;
+    let address = listener.local_addr()?;
+    eprintln!(
+        "Gateway on http://{address}, for this machine only: give it no firewall rule.\n\
+         From elsewhere, reach it through an HTTPS proxy and open only the proxy's ports\n\
+         (443, and 80 for its certificate). For Caddy, a Caddyfile of:\n\
+         \n    omar.example.org {{\n        reverse_proxy {address}\n    }}\n"
+    );
     serve(listener, home)
+}
+
+/// Loopback only: a password over plain HTTP could be read on the way, and
+/// the login cookie is `Secure`, so only the HTTPS proxy in front reaches it.
+fn listen(port: u16) -> Result<TcpListener> {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpListener::bind(address).with_context(|| {
+        format!("cannot listen on {address}; is something else using it? Pick another: omar gateway --port N")
+    })
 }
 
 fn serve(listener: TcpListener, home: PathBuf) -> Result<()> {
@@ -167,20 +175,32 @@ fn auth(
     match (request.method.as_str(), route) {
         ("GET", "me") => match login {
             None => respond(stream, 401, &json!({"error": "sign in"}), &[]),
-            Some(_) => respond(stream, 200, &json!({"sessions": sessions(gateway)}), &[]),
+            Some(_) => respond(
+                stream,
+                200,
+                &json!({"user": crate::login::USER, "sessions": sessions(gateway)}),
+                &[],
+            ),
         },
         ("POST", "login") => {
             if let Some(wait) = gateway.locked_out() {
                 let error = format!("too many attempts; try again in {}s", wait.as_secs().max(1));
                 return respond(stream, 429, &json!({"error": error}), &[]);
             }
-            let password = serde_json::from_slice::<Value>(body)
-                .ok()
-                .and_then(|body| body.get("password")?.as_str().map(str::to_string))
-                .unwrap_or_default();
-            if !gateway.login.verify(&password)? {
+            let field = |name: &str| -> String {
+                serde_json::from_slice::<Value>(body)
+                    .ok()
+                    .and_then(|body| body.get(name)?.as_str().map(str::to_string))
+                    .unwrap_or_default()
+            };
+            if !gateway.login.verify(&field("user"), &field("password"))? {
                 gateway.failed();
-                return respond(stream, 401, &json!({"error": "wrong password"}), &[]);
+                return respond(
+                    stream,
+                    401,
+                    &json!({"error": "wrong username or password"}),
+                    &[],
+                );
             }
             *gateway.failures.lock().expect("failures poisoned") = (0, Instant::now());
             let token = gateway.login.start()?;
@@ -450,8 +470,8 @@ mod tests {
         )
     }
 
-    fn login(address: SocketAddr, password: &str) -> (u16, Option<String>) {
-        let body = json!({ "password": password }).to_string();
+    fn login(address: SocketAddr, user: &str, password: &str) -> (u16, Option<String>) {
+        let body = json!({ "user": user, "password": password }).to_string();
         let (status, head, _) = send(address, "POST", "/auth/login", &[], &body);
         let cookie = head
             .lines()
@@ -516,8 +536,9 @@ mod tests {
 
         assert_eq!(send(address, "GET", "/auth/me", &[], "").0, 401);
         assert_eq!(send(address, "GET", "/s/demo/v1/chats", &[], "").0, 401);
-        assert_eq!(login(address, "wrong").0, 401);
-        let (status, cookie) = login(address, PASSWORD);
+        assert_eq!(login(address, "root", "wrong").0, 401);
+        assert_eq!(login(address, "admin", PASSWORD).0, 401);
+        let (status, cookie) = login(address, "root", PASSWORD);
         assert_eq!(status, 200);
         let cookie = cookie.expect("login cookie");
         let header = format!("Cookie: {cookie}");
@@ -528,6 +549,8 @@ mod tests {
             me["sessions"],
             json!([{"name": "demo", "state": "ready"}, {"name": "idle", "state": "stopped"}])
         );
+        assert_eq!(me["user"], "root");
+        assert_eq!(me["sessions"].as_array().unwrap().len(), 2);
 
         // The daemon hears neither the cookie nor any OMAR header the
         // browser made up.
@@ -595,7 +618,7 @@ mod tests {
         );
 
         // A new password signs every browser out.
-        let (_, cookie) = login(address, PASSWORD);
+        let (_, cookie) = login(address, "root", PASSWORD);
         let header = format!("Cookie: {}", cookie.unwrap());
         Login::at(&harness.home)
             .set_password("another long password")
@@ -608,19 +631,20 @@ mod tests {
         let harness = start();
         Login::at(&harness.home).set_password(PASSWORD).unwrap();
         for _ in 0..ATTEMPTS {
-            assert_eq!(login(harness.address, "wrong").0, 401);
+            assert_eq!(login(harness.address, "root", "wrong").0, 401);
         }
-        assert_eq!(login(harness.address, PASSWORD).0, 429);
+        assert_eq!(login(harness.address, "root", PASSWORD).0, 429);
     }
 
     #[test]
     fn the_gateway_needs_a_password_and_listens_on_loopback_only() {
         let home = tempfile::tempdir().unwrap();
-        let local = "127.0.0.1:0".parse().unwrap();
-        let error = run_in(local, home.path().into()).unwrap_err();
+        let error = run_in(0, home.path().into()).unwrap_err();
         assert!(error.to_string().contains("omar passwd"), "{error}");
-        Login::at(home.path()).set_password(PASSWORD).unwrap();
-        let error = run_in("0.0.0.0:0".parse().unwrap(), home.path().into()).unwrap_err();
-        assert!(error.to_string().contains("HTTPS proxy"), "{error}");
+        let listener = listen(0).unwrap();
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
+        let taken = listener.local_addr().unwrap().port();
+        let error = listen(taken).unwrap_err();
+        assert!(error.to_string().contains("--port"), "{error}");
     }
 }

@@ -1,6 +1,6 @@
 /**
- * `omar gateway` in a browser: the operator signs in with the password set by
- * `omar passwd`, picks a session and gets its Mission Control, as on the
+ * `omar gateway` in a browser: the operator signs in as root, with the
+ * password set by `omar passwd`, picks a session and gets its Mission Control, as on the
  * machine itself, then signs out. Real `omar up`, real gateway.
  *
  * Needs a runtime built with the bundle in it:
@@ -64,11 +64,13 @@ async function shot(page, name) {
 describe("omar gateway", { skip: AVAILABLE ? false : "no bundled runtime" }, () => {
   let gateway;
   let browser;
+  /** The session's own address, as `omar up` prints it: local, no sign-in. */
+  let local;
 
   before(async () => {
-    omar(["up", "-s", "demo", "--no-ea"]);
+    local = /URL:\s+(\S+)/.exec(omar(["up", "-s", "demo", "--no-ea"]))[1];
     omar(["passwd"], `${PASSWORD}\n`);
-    gateway = spawn(OMAR_BIN, ["gateway", "--address", `127.0.0.1:${PORT}`], { env, stdio: "ignore" });
+    gateway = spawn(OMAR_BIN, ["gateway", "--port", String(PORT)], { env, stdio: "ignore" });
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const up = await fetch(`${ORIGIN}/auth/me`).then(() => true, () => false);
       if (up) break;
@@ -91,6 +93,15 @@ describe("omar gateway", { skip: AVAILABLE ? false : "no bundled runtime" }, () 
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("on the machine itself, a session's own address asks for no password", async () => {
+    assert.equal((await fetch(`${local}/v1/chats`)).status, 200);
+    const page = await browser.newPage();
+    await page.goto(local);
+    await page.getByRole("list", { name: "Saved chats" }).getByRole("listitem").first().waitFor({ timeout: 15_000 });
+    assert.equal(await page.getByRole("button", { name: "Sign in" }).count(), 0);
+    await page.close();
+  });
+
   test("the operator signs in, opens a session's Mission Control, and signs out", async () => {
     // Nothing behind the gateway answers before signing in.
     assert.equal((await fetch(`${ORIGIN}/s/demo/v1/chats`)).status, 401);
@@ -99,10 +110,11 @@ describe("omar gateway", { skip: AVAILABLE ? false : "no bundled runtime" }, () 
     const context = await browser.newContext({ viewport: size, ...(VIDEO ? { recordVideo: { dir: VIDEO, size } } : {}) });
     const page = await context.newPage();
     await page.goto(`${ORIGIN}/s/demo/`);
+    await page.getByLabel("Username").fill("root");
     const password = page.getByLabel("Password");
     await password.fill("not the password");
     await page.getByRole("button", { name: "Sign in" }).click();
-    await page.getByRole("alert").filter({ hasText: "wrong password" }).waitFor();
+    await page.getByRole("alert").filter({ hasText: "wrong username or password" }).waitFor();
     await shot(page, "1-wrong-password");
     await password.fill(PASSWORD);
     await page.getByRole("button", { name: "Sign in" }).click();
