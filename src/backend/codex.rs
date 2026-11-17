@@ -21,13 +21,40 @@ impl Backend for Codex {
         let socket = from_stamp(target.stamp?)?;
         let mut session = CodexSession::open(&socket).ok()?;
         let thread = session.only_thread().ok()?;
-        let state = session
-            .call(
-                // Resume subscribes this connection to the loaded thread's events.
-                "thread/resume",
-                serde_json::json!({"threadId":thread}),
-            )
-            .ok()?;
+        // Metadata-only resume subscribes before composing history cursors.
+        // Codex 0.154/0.167 can reject that final cursor on a new local thread;
+        // the subscription is already live, so keep this connection in that case.
+        let mut state = match session.call(
+            "thread/resume",
+            serde_json::json!({"threadId":thread, "excludeTurns":true}),
+        ) {
+            Ok(state) => state,
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("list_turns is not supported yet") =>
+            {
+                serde_json::json!({})
+            }
+            Err(_) => return None,
+        };
+        // A fast failure can predate subscription; recover its terminal error
+        // and any pending questions from the native snapshot as well.
+        if session.inputs.is_empty() {
+            if let Ok(snapshot) = session.call(
+                "thread/read",
+                serde_json::json!({"threadId":thread,"includeTurns":true}),
+            ) {
+                state = snapshot;
+            }
+        }
+        let error = state["thread"]["turns"]
+            .as_array()
+            .and_then(|turns| turns.last())
+            .map(|turn| &turn["error"])
+            .unwrap_or(&serde_json::Value::Null);
+        let credit_error = super::OutOfCredit::from_error(error);
+        let limit = super::UsageLimit::from_error(error);
         let ended = completed_turn(&state);
         let mut inputs: Vec<_> = session
             .inputs
@@ -62,6 +89,9 @@ impl Backend for Codex {
             socket,
             thread,
             ended,
+            credit_error,
+            limit,
+            reset: None,
             inputs,
         }))
     }
@@ -659,6 +689,7 @@ pub(crate) struct CodexSession {
     socket: tungstenite::WebSocket<UnixStream>,
     next_id: u64,
     inputs: Vec<serde_json::Value>,
+    events: std::collections::VecDeque<serde_json::Value>,
 }
 
 fn completed_turn(value: &serde_json::Value) -> Option<String> {
@@ -677,6 +708,9 @@ struct CodexTurnMonitor {
     socket: PathBuf,
     thread: String,
     ended: Option<String>,
+    credit_error: Option<super::OutOfCredit>,
+    limit: Option<super::UsageLimit>,
+    reset: Option<i64>,
     inputs: Vec<serde_json::Value>,
 }
 
@@ -689,15 +723,60 @@ fn async_question(item: &serde_json::Value) -> bool {
 }
 
 impl super::TurnMonitor for CodexTurnMonitor {
+    fn out_of_credit(&mut self) -> Option<super::OutOfCredit> {
+        self.credit_error.take()
+    }
+    fn usage_limit(&mut self) -> Option<super::UsageLimit> {
+        self.limit.take()
+    }
     fn ended_turn(&mut self) -> Option<String> {
         loop {
-            match self.session.socket.read() {
-                Ok(tungstenite::Message::Text(body)) => {
-                    let Ok(event) = serde_json::from_str::<serde_json::Value>(&body) else {
-                        continue;
-                    };
+            let event = if let Some(event) = self.session.events.pop_front() {
+                Ok(event)
+            } else {
+                match self.session.socket.read() {
+                    Ok(tungstenite::Message::Text(body)) => {
+                        match serde_json::from_str::<serde_json::Value>(&body) {
+                            Ok(event) => Ok(event),
+                            Err(_) => continue,
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(error) => Err(error),
+                }
+            };
+            match event {
+                Ok(event) => {
+                    if event["method"] == "account/rateLimits/updated" {
+                        let limits = &event["params"]["rateLimits"];
+                        self.reset = ["primary", "secondary"]
+                            .iter()
+                            .filter_map(|key| {
+                                let window = &limits[key];
+                                (window["usedPercent"].as_f64()? >= 100.0)
+                                    .then(|| window["resetsAt"].as_i64())
+                                    .flatten()
+                            })
+                            .max();
+                    }
                     if event["params"]["threadId"] != self.thread {
                         continue;
+                    }
+                    if matches!(event["method"].as_str(), Some("error" | "turn/completed")) {
+                        let error = if event["method"] == "error" {
+                            &event["params"]["error"]
+                        } else {
+                            &event["params"]["turn"]["error"]
+                        };
+                        if let Some(credit) = super::OutOfCredit::from_error(error) {
+                            self.credit_error = Some(credit);
+                        }
+                        if let Some(mut limit) = super::UsageLimit::from_error(error) {
+                            // App-server versions that expose only the formatted error
+                            // retain the precise reset in their rate-limit notification.
+                            limit.resets_at = self.reset.or(limit.resets_at);
+                            self.limit = Some(limit);
+                        }
                     }
                     match event["method"].as_str() {
                         // Nonmodal questions in Default mode still await a reply.
@@ -716,7 +795,10 @@ impl super::TurnMonitor for CodexTurnMonitor {
                             .retain(|input| input["id"] != event["params"]["requestId"]),
                         Some("turn/started") => self.ended = None,
                         Some("turn/completed")
-                            if event["params"]["turn"]["status"] == "completed" =>
+                            if matches!(
+                                event["params"]["turn"]["status"].as_str(),
+                                Some("completed" | "failed")
+                            ) =>
                         {
                             self.inputs
                                 .retain(|input| input["method"] == "item/completed");
@@ -730,7 +812,6 @@ impl super::TurnMonitor for CodexTurnMonitor {
                         _ => {}
                     }
                 }
-                Ok(_) => {}
                 Err(tungstenite::Error::Io(error))
                     if matches!(
                         error.kind(),
@@ -826,6 +907,7 @@ impl CodexSession {
             socket,
             next_id: 1,
             inputs: Vec::new(),
+            events: Default::default(),
         };
         session
             .call(

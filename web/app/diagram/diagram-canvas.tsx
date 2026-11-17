@@ -18,7 +18,7 @@ import {
   type DiagramSnapshot,
   type Lifetime,
 } from "../lib/protocol";
-import { restartText } from "../lib/attempts";
+import { restartText, usageWait, usageWaitText } from "../lib/attempts";
 
 /**
  * Runtime instances stay grouped with their boundary ports and reactions.
@@ -166,6 +166,7 @@ type ReactionView = {
   name: string;
   meta: string;
   restarts: number;
+  waiting?: string;
   contract: string;
   /** One line of what the task asks, from its prompt; the contract for a code reaction. */
   summary: string;
@@ -431,7 +432,7 @@ function flattenLayout(
   }
 }
 
-type ReactionLabels = { name: string; meta: string; restarts: number };
+type ReactionLabels = { name: string; meta: string; restarts: number; waiting?: string };
 
 /** `per tag`, or nothing for an agent that keeps one conversation for the run. */
 function lifetimeOf(lifetime: Lifetime | null | undefined): string | null {
@@ -459,6 +460,7 @@ function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> 
           name: taskCopy(reaction, owner, snapshot).title,
           meta: owner ? detail : `Code · ${reaction.status}`,
           restarts: reaction.restarts ?? 0,
+          waiting: reaction.status === "running" && usageWait(owner?.attempts ?? [], reaction.name) ? usageWaitText(usageWait(owner?.attempts ?? [], reaction.name)!) : undefined,
         },
       ];
     }),
@@ -576,7 +578,8 @@ function BackendMark({ backend }: { backend: string }) {
 function reactionWidth(labels: ReactionLabels, within: number | null): number {
   const widest = Math.max(
     textWidth(labels.name, 8.1),
-    textWidth(labels.meta, 6.4) + 22 + (labels.restarts ? textWidth(restartText(labels.restarts).badge, 6) + 20 : 0),
+    textWidth(labels.waiting ?? "", 6.7),
+    textWidth(labels.meta, 6.4) + 22 + (labels.waiting ? textWidth("usage limit", 6) + 20 : labels.restarts ? textWidth(restartText(labels.restarts).badge, 6) + 20 : 0),
   );
   // A deadline is drawn between the text and the point, so the node has to be
   // wider for it rather than the stopwatch sitting on top of the name.
@@ -944,6 +947,7 @@ function buildLayout(
       name: label.name,
       meta: label.meta,
       restarts: label.restarts,
+      waiting: label.waiting,
       contract: reaction.contract,
       summary: taskCopy(reaction, snapshot.agents.find((agent) => agent.id === reaction.agent), snapshot).description,
       backend: snapshot.agents.find((agent) => agent.id === reaction.agent)?.backend ?? "Code",
@@ -1919,16 +1923,16 @@ export function DiagramCanvas({
                     {taskTitleLines(reaction.name, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING - (reaction.within === null ? 0 : WITHIN_ROOM)).map((line, index, lines) => <tspan key={index} x={REACTION_TEXT_X} dy={index ? 18 : 0}>{line}{index < lines.length - 1 ? " " : ""}</tspan>)}
                   </text>
                   <text className="omar-reaction-description" x={REACTION_TEXT_X} y={68}>
-                    {fitText(reaction.summary, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING - (reaction.within === null ? 0 : WITHIN_ROOM), 6.7)}
+                    {fitText(reaction.waiting ?? reaction.summary, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING - (reaction.within === null ? 0 : WITHIN_ROOM), 6.7)}
                   </text>
                   <rect className="omar-model-badge" x={REACTION_TEXT_X} y={80} width={16} height={16} rx={5} />
                   <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 82) scale(0.5)`}>
                     <BackendMark backend={reaction.backend} />
                   </g>
                   <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={91}>{reaction.meta}</text>
-                  {reaction.restarts ? <g className="omar-restart-badge" transform={`translate(${REACTION_TEXT_X + 30 + textWidth(reaction.meta, 6.4)} 79)`}>
-                    <rect width={textWidth(restartText(reaction.restarts).badge, 6) + 12} height={17} rx={4} />
-                    <text x={6} y={12}>{restartText(reaction.restarts).badge}</text>
+                  {reaction.waiting || reaction.restarts ? <g className="omar-restart-badge" transform={`translate(${REACTION_TEXT_X + 30 + textWidth(reaction.meta, 6.4)} 79)`}>
+                    <rect width={textWidth(reaction.waiting ? "usage limit" : restartText(reaction.restarts).badge, 6) + 12} height={17} rx={4} />
+                    <text x={6} y={12}>{reaction.waiting ? "usage limit" : restartText(reaction.restarts).badge}</text>
                   </g> : null}
                   {/* An agent that resets its conversation says when, small and
                       apart from the backend and status it would crowd. */}
