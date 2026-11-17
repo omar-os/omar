@@ -33,6 +33,7 @@ mod sandbox;
 mod scheduler;
 mod serve;
 mod sessions;
+mod setup;
 mod stub_agent;
 mod supervision;
 mod terminal;
