@@ -426,7 +426,71 @@ pub fn backend_hook_response(
     input: &Value,
     backend: &str,
 ) -> Result<Value> {
-    if context.topology.is_some() {
+    if let Some(topology) = &context.topology {
+        let event = input["hook_event_name"].as_str().unwrap_or("");
+        let (event, session) = event.split_once(':').unwrap_or((event, ""));
+        if event == "PermissionRequest"
+            || (event == "PreToolUse"
+                && matches!(
+                    input["tool_name"].as_str(),
+                    Some("AskUserQuestion" | "ExitPlanMode")
+                ))
+        {
+            let path = crate::manager::topology_turn_file(
+                &context.omar_dir,
+                context.ea_id,
+                &topology.team,
+                &topology.agent,
+                topology.attempt.as_ref().map(|attempt| attempt.id.as_str()),
+            );
+            let id = uuid::Uuid::new_v4().to_string();
+            crate::manager::write_private_file(
+                &path,
+                &serde_json::to_vec(&json!({"input":id,"idle":false}))?,
+            )?;
+            loop {
+                if let Ok(raw) = fs::read(path.with_extension("answer.json")) {
+                    let answer: Value = serde_json::from_slice(&raw)?;
+                    if answer["id"] == id {
+                        let _ = fs::remove_file(path.with_extension("answer.json"));
+                        if event == "PermissionRequest" {
+                            return Ok(
+                                json!({"hookSpecificOutput":{"hookEventName":event,"decision":{"behavior":"deny","message":answer["text"]}}}),
+                            );
+                        }
+                        return Ok(
+                            json!({"hookSpecificOutput":{"hookEventName":event,"permissionDecision":"deny","permissionDecisionReason":answer["text"]}}),
+                        );
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        if matches!(event, "Stop" | "UserPromptSubmit" | "Busy") {
+            let mut path = crate::manager::topology_turn_file(
+                &context.omar_dir,
+                context.ea_id,
+                &topology.team,
+                &topology.agent,
+                topology.attempt.as_ref().map(|attempt| attempt.id.as_str()),
+            );
+            if !session.is_empty() {
+                // OpenCode child sessions must not end the worker's turn.
+                anyhow::ensure!(
+                    session
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                    "invalid session id"
+                );
+                path.set_extension(format!("{session}.json"));
+            }
+            crate::manager::write_private_file(
+                &path,
+                &serde_json::to_vec(&json!({
+                    "idle": event == "Stop", "turn": uuid::Uuid::new_v4().to_string(),
+                }))?,
+            )?;
+        }
         return Ok(json!({}));
     }
     let actor = context.agent_name.as_deref().unwrap_or("ea");
@@ -1120,6 +1184,44 @@ mod tests {
         assert!(acknowledge(root, 0, "pm", &child, 1).is_err());
         acknowledge(root, 0, "ea", &child, 1).unwrap();
     }
+    #[test]
+    fn topology_turn_hooks_are_idle_only_after_stop_and_scope_opencode_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = crate::manager::tests::test_mcp_context(dir.path());
+        context.topology = Some(crate::manager::TopologyMcpContext {
+            team: "T".into(),
+            agent: "a".into(),
+            endpoint: "".into(),
+            token: "".into(),
+            attempt: None,
+            resume: None,
+        });
+        crate::manager::materialize_mcp_context_file(&context).unwrap();
+        let path = crate::manager::topology_turn_file(dir.path(), context.ea_id, "T", "a", None);
+        let target = crate::backend::Target {
+            name: "a",
+            pane_pid: 0,
+            stamp: Some("opencode:1234:ses_own"),
+        };
+        let opencode = crate::backend::by_name("opencode").unwrap();
+        let hook = |event| {
+            backend_hook_response(&context, &json!({"hook_event_name":event}), "opencode").unwrap()
+        };
+        hook("Stop:ses_child");
+        assert!(opencode.ended_turn(&target, &path).is_none());
+        hook("Stop:ses_own");
+        assert!(opencode.ended_turn(&target, &path).is_some());
+        hook("Busy:ses_own");
+        assert!(opencode.ended_turn(&target, &path).is_none());
+        let claude = crate::backend::by_name("claude").unwrap();
+        hook("Stop");
+        let first = claude.ended_turn(&target, &path).unwrap();
+        hook("UserPromptSubmit");
+        assert!(claude.ended_turn(&target, &path).is_none());
+        hook("Stop");
+        assert_ne!(claude.ended_turn(&target, &path).unwrap(), first);
+    }
+
     #[test]
     fn all_backend_adapters_restore_live_state_and_preserve_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
