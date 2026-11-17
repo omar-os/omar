@@ -23,6 +23,8 @@ import {
  * without changing the topology or its connections.
  */
 
+import { taskCopy, taskTitleLines } from "../lib/task-copy";
+
 type Point = { x: number; y: number };
 
 type ElkPort = {
@@ -61,7 +63,7 @@ type ElkNode = {
 
 type Box = { x: number; y: number; width: number; height: number };
 
-const REACTION_SIZE = { width: 210, height: 88 };
+const REACTION_SIZE = { width: 300, height: 110 };
 /** Task text starts after the order badge and leaves room for the deadline. */
 const REACTION_TEXT_X = 48;
 /**
@@ -74,7 +76,7 @@ const REACTION_TEXT_X = 48;
  */
 const WITHIN_RADIUS = 7;
 const WITHIN_ROOM = 40;
-const REACTION_MAX_WIDTH = 340;
+const REACTION_MAX_WIDTH = 380;
 const ACTION_SIZE = { width: 26, height: 26 };
 /** A timer's clock face. Larger than an action: it carries two hands. */
 const CLOCK_SIZE = { width: 34, height: 34 };
@@ -433,28 +435,18 @@ function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> 
   const agents = new Map(
     snapshot.agents.map((agent) => [
       agent.id,
-      { name: agent.name, backend: agent.backend },
+      agent,
     ]),
   );
   return new Map(
     snapshot.reactions.map((reaction) => {
       const owner = agents.get(reaction.agent);
-      // The agent's own name: the instance it belongs to is the box around it.
-      const agent = localName(owner?.name ?? reaction.agent, reaction.instance);
-      // Which model is behind an agent changes how you read what it did, and
-      // the program picked it deliberately, so it belongs on the task card.
-      const detail = [owner?.backend, reaction.status]
-        .filter(Boolean)
-        .join(" \u00b7 ");
-      // The runtime names reactions `reaction.N` because OMAR prompts are
-      // anonymous, which makes a poor headline. Lead with the agent and let the
-      // contract say what it writes; honour a real name if one ever arrives.
-      const generated = /(?:^|\.)reaction\.\d+$/.test(reaction.name);
+      const detail = [owner?.backend, reaction.status].filter(Boolean).join(" · ");
       return [
         reaction.id,
         {
-          name: generated ? agent : reaction.name,
-          meta: generated ? detail : `${agent} \u00b7 ${detail}`,
+          name: taskCopy(reaction, owner, snapshot).title,
+          meta: owner ? detail : `Code · ${reaction.status}`,
         },
       ];
     }),
@@ -637,6 +629,16 @@ function containerId(instance: string, snapshot: DiagramSnapshot): string {
  * inside it repeats the prefix on every port and pushes the text into the
  * shapes beside it.
  */
+/**
+ * A sandbox's name short enough for a box's subtitle. OMAR names them
+ * `omar-team-<workspace uuid>`; the uuid's first block tells them apart, and
+ * the full name is the tooltip, which is what `sbx ls` lists.
+ */
+function shortSandbox(name: string): string {
+  const id = name.startsWith("omar-team-") ? name.slice("omar-team-".length) : name;
+  return id.split("-")[0] || id;
+}
+
 function localName(name: string, instance: string): string {
   const prefix = `${instance}.`;
   return instance && name.startsWith(prefix) ? name.slice(prefix.length) : name;
@@ -930,8 +932,8 @@ function buildLayout(
       name: label.name,
       meta: label.meta,
       contract: reaction.contract,
-      summary: reaction.prompt ? summarisePrompt(reaction.prompt) : reaction.contract,
-      backend: snapshot.agents.find((agent) => agent.id === reaction.agent)?.backend ?? "Agent",
+      summary: taskCopy(reaction, snapshot.agents.find((agent) => agent.id === reaction.agent), snapshot).description,
+      backend: snapshot.agents.find((agent) => agent.id === reaction.agent)?.backend ?? "Code",
       status: reaction.status,
       box: nodeBoxes.get(reaction.id) ?? { x: 0, y: 0, ...REACTION_SIZE },
       agent: componentName(reaction.agent),
@@ -1291,7 +1293,9 @@ function strandedPorts(node: ElkNode, into = new Set<string>()): Set<string> {
 function layoutKey(snapshot: DiagramSnapshot): string {
   return JSON.stringify({
     team: snapshot.team,
-    instances: snapshot.instances ?? [],
+    // Where an instance runs is paint, not shape: its sandbox starting must
+    // not lay the diagram out again.
+    instances: (snapshot.instances ?? []).map((instance) => ({ ...instance, sandbox: undefined })),
     agents: snapshot.agents,
     timers: snapshot.timers ?? [],
     edges: snapshot.edges,
@@ -1353,6 +1357,13 @@ export function DiagramCanvas({
   focus?: ReadonlySet<string>;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  // Read from the snapshot, not the layout: a sandbox starting repaints the
+  // box without laying it out again.
+  const sandboxOf = new Map(
+    (snapshot.instances ?? []).flatMap((instance) =>
+      instance.sandbox ? [[instance.id, instance.sandbox] as const] : [],
+    ),
+  );
   const edgeEnds = useMemo(
     () => new Map(snapshot.edges.map((edge) => [edge.id, edge] as const)),
     [snapshot.edges],
@@ -1657,10 +1668,13 @@ export function DiagramCanvas({
       >
         {layout && view ? (
           <g transform={`translate(${view.x},${view.y}) scale(${view.scale})`}>
-            {layout.containers.map((container) => (
+            {layout.containers.map((container) => {
+              const sandbox = sandboxOf.get(container.id);
+              return (
               <g
                 key={container.id}
-                className={`omar-team ${layout.status}${focusClass(container.id)}`}
+                className={`omar-team ${layout.status}${sandbox ? " sandboxed" : ""}${focusClass(container.id)}`}
+                data-sandbox={sandbox}
                 // Which box this one sits in. Nesting is structure, so it is
                 // readable from the drawing rather than only inferable from
                 // the geometry.
@@ -1684,6 +1698,24 @@ export function DiagramCanvas({
                   rx={9}
                   ry={9}
                 />
+                {sandbox ? (
+                  // A second frame outside the status border, so running,
+                  // done and failed still read on the box itself. It takes
+                  // in the title too: the whole team is in the sandbox.
+                  <rect
+                    className="omar-team-sandbox"
+                    x={container.box.x - 6}
+                    // Only 2 above the name: a nested team's title band is its
+                    // parent's top padding, just under the parent's subtitle.
+                    y={container.box.y - TITLE_BAND - 2}
+                    width={container.box.width + 12}
+                    height={container.box.height + TITLE_BAND + 8}
+                    rx={12}
+                    ry={12}
+                  >
+                    <title>{`Runs in Docker Sandbox ${sandbox}`}</title>
+                  </rect>
+                ) : null}
                 <text
                   className="omar-team-name"
                   x={container.box.x + 2}
@@ -1701,9 +1733,16 @@ export function DiagramCanvas({
                   {container.team
                     ? `${container.team} · ${layout.status}`
                     : `team · ${layout.status}`}
+                  {sandbox ? (
+                    <tspan className="omar-team-sandbox-name">
+                      {` · sandbox ${shortSandbox(sandbox)}`}
+                      <title>{sandbox}</title>
+                    </tspan>
+                  ) : null}
                 </text>
               </g>
-            ))}
+              );
+            })}
 
             <g className="omar-edges">
               {layout.edges.map((edge) => (
@@ -1822,6 +1861,8 @@ export function DiagramCanvas({
                     reaction.id,
                     `omar-reaction ${reaction.status}${reaction.web ? " web" : ""}`,
                   )}
+                  aria-label={`Inspect ${reaction.name}`}
+                  data-component={componentName(reaction.id)}
                   onDoubleClick={(event) => {
                     // The canvas resets the view on double click; a reaction
                     // opens the agent that runs it. A web agent has no pane to
@@ -1834,6 +1875,7 @@ export function DiagramCanvas({
                   }}
                   transform={`translate(${reaction.box.x},${reaction.box.y})`}
                 >
+                  <title>{`${reaction.name}: ${reaction.summary}`}</title>
                   <rect className="omar-reaction-body" width={reaction.box.width} height={reaction.box.height} rx={9} />
                   <path className="omar-reaction-accent" d={`M9 1.5 H${reaction.box.width - 9}`} />
                   <circle className="node-connection" cx={0} cy={reaction.box.height / 2} r={4} />
@@ -1860,16 +1902,16 @@ export function DiagramCanvas({
                     x={REACTION_TEXT_X}
                     y={29}
                   >
-                    {reaction.name}
+                    {taskTitleLines(reaction.name, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING - (reaction.within === null ? 0 : WITHIN_ROOM)).map((line, index, lines) => <tspan key={index} x={REACTION_TEXT_X} dy={index ? 18 : 0}>{line}{index < lines.length - 1 ? " " : ""}</tspan>)}
                   </text>
-                  <text className="omar-reaction-description" x={REACTION_TEXT_X} y={46}>
-                    {fitText(reaction.summary, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING, 6.7)}
+                  <text className="omar-reaction-description" x={REACTION_TEXT_X} y={68}>
+                    {fitText(reaction.summary, reaction.box.width - REACTION_TEXT_X - CARD_END_PADDING - (reaction.within === null ? 0 : WITHIN_ROOM), 6.7)}
                   </text>
-                  <rect className="omar-model-badge" x={REACTION_TEXT_X} y={57} width={16} height={16} rx={5} />
-                  <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 59) scale(0.5)`}>
+                  <rect className="omar-model-badge" x={REACTION_TEXT_X} y={80} width={16} height={16} rx={5} />
+                  <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 82) scale(0.5)`}>
                     <BackendMark backend={reaction.backend} />
                   </g>
-                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={68}>{reaction.meta}</text>
+                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={91}>{reaction.meta}</text>
                   {/* A deadline the program set for itself. A stopwatch rather
                       than a clock: a timer fires on its own, this counts down
                       against work already running. */}
@@ -1976,6 +2018,14 @@ export function DiagramCanvas({
           </svg>
           running
         </span>
+        {sandboxOf.size ? (
+          <span>
+            <svg viewBox="0 0 18 12" aria-hidden="true">
+              <rect className="omar-team-sandbox" x="1" y="1" width="16" height="10" rx="3" />
+            </svg>
+            sandbox
+          </span>
+        ) : null}
       </div>
     </div>
   );

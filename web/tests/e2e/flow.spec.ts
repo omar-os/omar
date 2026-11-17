@@ -148,16 +148,12 @@ test("the diagram reflects live reaction state from the run, relayed by serve", 
   await expect(reactions).toHaveCount(3);
   await expect(page.locator(".omar-reaction.completed")).toHaveCount(1);
   await expect(page.locator(".omar-reaction.idle")).toHaveCount(2);
-  // Numbered within the team instance, named by the agent alone, summarised
-  // by the prompt in one line that never widens the card.
+  // Legacy snapshots derive readable titles from their actual prompts.
   const first = reactions.first();
   await expect(first.locator(".omar-reaction-index")).toHaveText("01");
-  await expect(first.locator(".omar-reaction-name")).toHaveText("planner");
-  await expect(first.locator(".omar-reaction-description")).toHaveText(/^Draft a release plan.*…$/);
-  await expect(reactions.nth(1).locator(".omar-reaction-description")).toHaveText("Critique the plan: plan");
-  // Reactions are anonymous in OMAR, so the agent is the headline.
-  await expect(page.locator(".omar-reactions")).toContainText("planner");
-  await expect(page.locator(".omar-reactions")).toContainText("reviewer");
+  await expect(first.locator(".omar-reaction-name")).toContainText("Draft a release plan");
+  await expect(first.locator(".omar-reaction-description")).toHaveText(/^Draft a release plan/);
+  await expect(reactions.nth(1).locator(".omar-reaction-name")).toContainText("Critique the plan");
 
   // Effects written during the run mark their action ports as carrying a value.
   await expect(page.locator(".omar-action.filled")).toHaveCount(2);
@@ -233,11 +229,13 @@ test("a web component's panel opens from the diagram, and answers it", async ({
   await draftUntilProposed(page);
   await deploy(page);
 
-  const panel = page.getByRole("dialog", { name: /Port panel for/ });
+  const panel = page.locator("dialog.port-panel");
   // The handoff stays visible even when its dialog is closed.
   await expect(panel).toBeHidden();
-  await expect(page.locator(".run-waiting")).toContainText("Waiting for your response");
-  await page.getByRole("button", { name: "Open response panel" }).click();
+  const notice = page.locator(".response-notice");
+  await expect(notice).toContainText("A step needs your response");
+  await expect(notice).toContainText("Provide critique · flow.reviewer");
+  await notice.getByRole("button", { name: "Review" }).click();
   await expect(panel).toBeVisible();
   await panel.getByRole("button", { name: "Close", exact: true }).click();
   await expect(panel).toBeHidden();
@@ -247,13 +245,15 @@ test("a web component's panel opens from the diagram, and answers it", async ({
   const web = page.locator(".omar-reaction.web");
   await expect(web).toHaveCount(1, { timeout: 30_000 });
   await expect(page.locator(".omar-reaction")).toHaveCount(3);
-  await expect(web).toContainText("reviewer");
+  await expect(web.locator(".omar-reaction-name")).toContainText("Request human response");
 
   // Double-clicking a reaction opens the agent that runs it; this one has no
   // pane, so what opens is its panel.
   await web.dblclick();
 
   await expect(panel).toBeVisible();
+  await expect(panel.getByRole("heading")).toHaveText("Provide critique");
+  await panel.getByText("Technical details", { exact: true }).click();
   await expect(panel).toContainText("flow.reviewer");
   // Scoped to this component's wiring: what it reads, and what it may set.
   await expect(panel.locator(".port-list").first()).toContainText("flow.plan");
@@ -262,19 +262,73 @@ test("a web component's panel opens from the diagram, and answers it", async ({
   // Only what this invocation is allowed to write, with its declared type.
   const waiting = panel.locator(".port-waiting");
   await expect(waiting).toHaveCount(1);
-  await expect(waiting.locator(".port-field-name")).toHaveText("flow.critique");
-  await expect(waiting.locator(".port-field-type")).toHaveText("string");
-
-  await waiting.getByLabel("flow.critique (string)").fill("looks fine");
-  await waiting.getByRole("button", { name: /^Send/ }).click();
+  await expect(waiting.locator(".port-field-name")).toHaveText("Critique");
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    expect(await panel.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+  }
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await waiting.getByRole("textbox").fill("looks fine");
+  await page.route("**/v1/runs/*/panel", async route => {
+    if (route.request().method() === "POST") return route.fulfill({ status:400, json:{error:"Test rejection"} });
+    return route.continue();
+  });
+  await waiting.getByRole("button", { name: "Submit response & continue" }).click();
+  await expect(waiting.getByRole("alert")).toContainText("Test rejection");
+  await expect(waiting.getByRole("textbox")).toHaveValue("looks fine");
+  await page.unroute("**/v1/runs/*/panel");
+  await waiting.getByRole("button", { name: "Submit response & continue" }).click();
 
   // Answered, so it leaves the queue; the panel stays open on the component.
   await expect(panel.locator(".port-waiting")).toHaveCount(0);
-  await expect(panel).toContainText("Nothing is waiting on you");
+  await expect(panel).toContainText("This step is not waiting for a response");
+  // Handled, so the notice on top goes too.
+  await expect(notice).toHaveCount(0);
 
   // And it closes, rather than living beside the events forever.
   await panel.getByRole("button", { name: "Close" }).click();
   await expect(panel).toBeHidden();
+});
+
+test("every waiting step stays listed on top until answered, with a next response", async ({ page }) => {
+  // Both agents on the `Web` backend: three invocations wait at once.
+  await fake.close();
+  fake = (await startFakeServe({
+    stepMs: 30,
+    port: FAKE_SERVE_PORT,
+    snapshot: "diagram-web-two.v1.json",
+  })) as FakeServe;
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+
+  const notice = page.locator(".response-notice");
+  const panel = page.locator("dialog.port-panel");
+  await expect(notice).toContainText("3 steps need your response");
+  await expect(notice.locator("li")).toHaveCount(3);
+  // No timer: it is still there later, and after a panel is closed unanswered.
+  await notice.locator("li", { hasText: "flow.reviewer" }).getByRole("button", { name: "Review" }).click();
+  await panel.getByRole("button", { name: "Close", exact: true }).click();
+  await page.waitForTimeout(1500);
+  await expect(notice.locator("li")).toHaveCount(3);
+
+  await notice.locator("li", { hasText: "flow.reviewer" }).getByRole("button", { name: "Review" }).click();
+  await panel.locator(".port-waiting").getByRole("textbox").fill("looks fine");
+  await panel.getByRole("button", { name: "Submit response & continue" }).click();
+  await expect(notice.locator("li")).toHaveCount(2);
+  await expect(notice).not.toContainText("flow.reviewer");
+
+  // The answered panel offers the next waiting step instead of a dead end.
+  await panel.getByRole("button", { name: "Next response: Provide plan · flow.planner" }).click();
+  await expect(panel.getByRole("heading")).toHaveText("Provide plan");
+  const forms = panel.locator(".port-waiting");
+  await expect(forms).toHaveCount(2);
+  for (let i = 0; i < 2; i++) {
+    await forms.first().getByRole("textbox").fill(`answer ${i}`);
+    await forms.first().getByRole("button", { name: "Submit response & continue" }).click();
+    await expect(forms).toHaveCount(1 - i);
+  }
+  await expect(notice).toHaveCount(0);
 });
 
 test("a delayed connection is solid, with its delay in a break in the line", async ({
@@ -1065,7 +1119,7 @@ test("the confirmation chooses what the run keeps and how it checkpoints", async
   // What the daemon was asked for.
   const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
   const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
-  expect(options).toEqual({ keep_workspaces: true, checkpoint_period: "logical:2h30m" });
+  expect(options).toEqual({ keep_workspaces: true, checkpoint_period: "logical:2h30m", sandbox: false, no_sandbox: true });
 });
 
 test("checkpoints are off unless enabled", async ({ page }) => {
@@ -1078,7 +1132,7 @@ test("checkpoints are off unless enabled", async ({ page }) => {
   await expect(page.locator(".connection")).toContainText("observing");
   const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
   const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
-  expect(options).toEqual({ keep_workspaces: false, checkpoint_period: "off" });
+  expect(options).toEqual({ keep_workspaces: false, checkpoint_period: "off", sandbox: false, no_sandbox: true });
 });
 
 test("the file viewer shows the current run's instances only", async ({ page }) => {
@@ -1584,6 +1638,86 @@ test("a backend is connected from the Backends page, in a terminal that closes o
   await expect(page.getByRole("menuitem", { name: /Cursor/ })).toBeEnabled();
 });
 
+test("a backend is set up for sandboxes from the Backends page", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  // Each backend says whether sandboxed teams can use it.
+  await expect(backends.getByRole("listitem").first()).toHaveText(
+    /Claude CodeConnected · Claude MaxSandboxes · not connected/,
+  );
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(/Sandboxes · ChatGPT/);
+  await expect(backends.getByRole("button", { name: "Set up Codex for sandboxes" })).toHaveCount(0);
+
+  // `omar connect claude --sandbox`, in the same kind of terminal.
+  await backends.getByRole("button", { name: "Set up Claude Code for sandboxes" }).click();
+  const terminal = page.getByRole("dialog", { name: "Terminal for Set up Claude Code for sandboxes" });
+  await expect(terminal).toContainText("claude $");
+  await expect(terminal).toContainText("inside a sandbox");
+  await page.keyboard.press("Enter");
+
+  // `omar connect --sandbox` checks the key in a sandbox itself; when it
+  // ends, so does the terminal, and the row reads the new sign-in.
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").first()).toHaveText(
+    /Claude CodeConnected · Claude MaxSandboxes · anthropic key/,
+  );
+  await expect(backends.getByRole("button", { name: "Set up Claude Code for sandboxes" })).toHaveCount(0);
+});
+
+test("the confirmation opts a run into sandboxes", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  // Off unless the runtime turns sandboxes on.
+  const sandbox = dialog.getByRole("checkbox", { name: "Run each team in a Docker Sandbox" });
+  await expect(sandbox).not.toBeChecked();
+  await expect(dialog).toContainText("Agents run on this machine");
+  await sandbox.check();
+  await expect(dialog).toContainText("must be connected for sandboxes");
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
+  const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
+  expect(options).toMatchObject({ sandbox: true, no_sandbox: false });
+  // Each team's box says it runs in a sandbox, and which one.
+  const team = page.locator(".omar-team.sandboxed").first();
+  await expect(team).toBeVisible();
+  await expect(team.locator(".omar-team-sandbox")).toHaveCount(1);
+  await expect(team.locator(".omar-team-kind")).toContainText("sandbox");
+  await expect(team).toHaveAttribute("data-sandbox", /^omar-team-/);
+  await expect(page.getByLabel("Diagram legend")).toContainText("sandbox");
+});
+
+test("a run on the host draws no sandbox", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  await expect(page.locator(".omar-team").first()).toBeVisible();
+  await expect(page.locator(".omar-team.sandboxed")).toHaveCount(0);
+  await expect(page.getByLabel("Diagram legend")).not.toContainText("sandbox");
+});
+
+test("without Docker Sandboxes the confirmation offers none", async ({ page }) => {
+  await useFakeServe(page);
+  await page.route("**/v1/agent", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    await route.fulfill({ response, json: { ...body, sandbox: { default: false, installed: false } } });
+  });
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  await expect(dialog.getByRole("button", { name: "Confirm deploy" })).toBeVisible();
+  await expect(dialog.getByRole("checkbox", { name: "Run each team in a Docker Sandbox" })).toHaveCount(0);
+});
+
 test("a sign-in whose test prompt fails keeps its terminal open until one works", async ({
   page,
 }) => {
@@ -1635,6 +1769,55 @@ test("a backend whose test prompt failed can be connected again", async ({ page 
     /CursorSigned in, but its test prompt failed.*Connect/,
   );
   await expect(backends).toContainText("2 of 6 connected.");
+});
+
+test("a working sign-in is replaced from the Backends page", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(
+    /CodexConnected · ChatGPT.*Disconnect.*Replace/,
+  );
+
+  // `omar connect codex --replace`: signs in again although codex works,
+  // and is done when its terminal ends and the new sign-in answers.
+  await backends.getByRole("button", { name: "Replace Codex's sign-in" }).click();
+  const terminal = page.getByRole("dialog", {
+    name: "Terminal for Replace Codex's sign-in",
+  });
+  await expect(terminal).toContainText("codex $");
+  await page.keyboard.type("work");
+  await page.keyboard.press("Enter");
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(
+    /CodexConnected · work account/,
+  );
+  await expect(backends).toContainText("2 of 6 connected.");
+});
+
+test("a sign-in is disconnected from the Backends page once confirmed", async ({ page }) => {
+  await useFakeServe(page);
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await page.getByRole("menuitem", { name: "Connect more backends…" }).click();
+  const backends = page.getByRole("dialog", { name: "Backends" });
+
+  // The first click only asks.
+  await backends.getByRole("button", { name: "Disconnect Codex" }).click();
+  await backends.getByRole("button", { name: "Cancel" }).click();
+  await expect(backends.getByRole("button", { name: "Sign Codex out" })).toHaveCount(0);
+  await backends.getByRole("button", { name: "Disconnect Codex" }).click();
+  await backends.getByRole("button", { name: "Sign Codex out" }).click();
+
+  // `omar disconnect codex`, in a terminal that goes once it has run.
+  const terminal = page.getByRole("dialog", { name: "Terminal for Disconnect Codex" });
+  await expect(terminal).toContainText("codex $");
+  await page.keyboard.press("Enter");
+  await expect(terminal).toBeHidden({ timeout: 10_000 });
+  await expect(backends.getByRole("listitem").nth(1)).toHaveText(
+    /CodexNot signed in.*Connect/,
+  );
+  await expect(backends).toContainText("1 of 6 connected.");
 });
 
 test("with no backend connected, the Backends page comes first", async ({ page }) => {
@@ -1963,7 +2146,7 @@ test("an edge into a reaction actually reaches it", async ({ page }) => {
   const strays = async () => {
     const found: string[] = [];
     for (const reaction of reactions) {
-      const id = (await reaction.getAttribute("aria-label"))?.replace(/^Inspect /, "");
+      const id = await reaction.getAttribute("data-component");
       const box = (await reaction.boundingBox())!;
       const edges = page.locator(`[data-id$="${id}"]`);
       if ((await edges.count()) === 0) found.push(`${id}: no edge`);
@@ -2791,7 +2974,7 @@ test("failed manual handoffs explain the cause and can restart after reload", as
   const feedback = page.locator(".run-failure");
   await expect(feedback).toContainText("No response was submitted for flow.reviewer within 5 minutes");
   await expect(page.locator(".omar-reaction.running")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Open response panel" })).toBeHidden();
+  await expect(page.locator(".response-notice")).toBeHidden();
   await dragDivider(page, "Resize the conversation", -600);
   await expect(feedback).toBeVisible();
   const again = page.getByRole("button", { name: "Run again", exact: true });
@@ -3112,6 +3295,121 @@ test("workflow tabs support keyboard navigation and saved VS Code edits reach de
   await deploy(page);
   expect((await deployment).postDataJSON().files).toEqual(savedFiles);
 });
+
+test("workflow source and filename restore after reload without changing the transcript", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await expect(page.locator(".messages")).toContainText("It is in your queue for approval.");
+  const before = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+  await page.getByRole("button", {name:"Show the source pane"}).click();
+  const source = page.getByRole("textbox", {name:"OMAR program"});
+  const edited = "// saved edit\n" + before.messages.findLast((message: { design?: { program: string } }) => message.design)?.design.program;
+  await source.fill(edited);
+  await page.getByRole("textbox", {name:"Program file name"}).fill("edited.omar");
+  await expect(page.locator(".workflow-save")).toHaveText("Saved");
+  await page.reload();
+  await expect(page.locator(".diagram-panel")).toBeVisible();
+  await page.getByRole("button", {name:"Show the source pane"}).click();
+  await expect(source).toContainText("// saved edit");
+  await expect(page.getByRole("textbox", {name:"Program file name"})).toHaveValue("edited.omar");
+  const after = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+  expect(after.messages).toEqual(before.messages);
+});
+
+
+test("workflows can be archived, undone, and restored after reload with their saved drafts", async ({ page, context }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await expect(page.locator(".messages")).toContainText("It is in your queue for approval.");
+  const original = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+  const second = await context.newPage();
+  try {
+    await useFakeServe(second);
+    await expect(second.locator(".messages")).toContainText("Review the release plan");
+    const history = page.getByRole("complementary", {name:"Chat history"});
+    await history.locator(".workflow-row").filter({hasText:"Review the release plan"}).getByRole("button", {name:"Archive workflow",exact:true}).click();
+    await expect(history.getByRole("list", {name:"Saved chats"})).not.toContainText("Review the release plan");
+    await expect(history.getByRole("status")).toContainText("Workflow archived");
+    await expect(second.locator(".messages")).not.toContainText("Review the release plan");
+    await history.getByRole("button", {name:"Undo",exact:true}).click();
+    await expect(history.getByRole("list", {name:"Saved chats"})).toContainText("Review the release plan");
+    await history.locator(".workflow-row").filter({hasText:"Review the release plan"}).getByRole("button", {name:"Archive workflow",exact:true}).click();
+    await page.reload();
+    await history.getByRole("button", {name:"Archive",exact:true}).click();
+    await expect(history.getByRole("list", {name:"Archive"})).toContainText("Review the release plan");
+    await history.getByRole("button", {name:"Restore workflow",exact:true}).click();
+    await history.getByRole("button", {name:"Back to workflows",exact:true}).click();
+    await history.getByRole("button", {name:/Review the release plan/}).click();
+    await expect(page.locator(".messages")).toContainText("Review the release plan");
+    await expect(page.locator(".diagram-panel")).toBeVisible();
+    const restored = await (await page.request.get(`${fake.url}/v1/chat`)).json();
+    expect(restored.id).toBe(original.id);
+    expect(restored.messages).toEqual(original.messages);
+  } finally { await second.close(); }
+});
+
+test("workflow archive failures keep the row and running workflows cannot be archived", async ({page}) => {
+  await fake.close();
+  fake = (await startFakeServe({stepMs:120,port:FAKE_SERVE_PORT,snapshot:"diagram-web.v1.json"})) as FakeServe;
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  const history = page.getByRole("complementary", {name:"Chat history"});
+  await page.route("**/v1/chats/*/archive", route => route.fulfill({status:409,json:{error:"Stop this workflow before archiving it."}}));
+  await history.getByRole("button", {name:"Archive workflow",exact:true}).click();
+  await expect(history.getByRole("alert")).toContainText("Stop this workflow");
+  await expect(history.getByRole("list", {name:"Saved chats"})).toContainText("Review the release plan");
+  await page.unroute("**/v1/chats/*/archive");
+  await page.getByRole("button", {name:"Deploy",exact:true}).click();
+  await page.getByRole("button", {name:"Confirm deploy",exact:true}).click();
+  await expect(history.getByRole("button", {name:"Archive workflow",exact:true})).toBeDisabled();
+});
+
+for (const width of [1280, 390]) {
+  test(`archive separates restoration from confirmed permanent deletion at ${width}px`, async ({page}) => {
+    await page.setViewportSize({width, height: 900});
+    await useFakeServe(page);
+    await draftUntilProposed(page);
+    await expect(page.locator(".messages")).toContainText("It is in your queue for approval.");
+    if (width < 901) await page.getByRole("button", {name:"Open chat history", exact:true}).click();
+    const history = page.locator("#chat-history");
+    const archive = history.getByRole("button", {name:"Archive",exact:true});
+    await expect(archive).toHaveCSS("border-top-width", "0px");
+    await expect(archive).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+    await expect(history.getByRole("button", {name:"Delete workflow permanently"})).toHaveCount(0);
+    await history.getByRole("button", {name:"Archive workflow",exact:true}).click();
+    // Mobile selection may close the drawer after archiving the selected chat.
+    if (width < 901) {
+      await expect(history).not.toBeVisible();
+      await page.getByRole("button", {name:"Open chat history",exact:true}).click();
+    }
+    await archive.click();
+    const row = history.locator(".archived-workflow").filter({hasText:"Review the release plan"});
+    await row.getByRole("button", {name:"Delete workflow permanently"}).click();
+    const confirm = page.getByRole("dialog", {name:"Delete workflow?",exact:true});
+    await expect(confirm).toContainText("Review the release plan");
+    await expect(confirm.getByRole("button", {name:"Cancel",exact:true})).toBeFocused();
+    await confirm.getByRole("button", {name:"Cancel",exact:true}).click();
+    await expect(confirm).toHaveCount(0);
+    await expect(row).toBeVisible();
+    await row.getByRole("button", {name:"Delete workflow permanently"}).click();
+    await page.keyboard.press("Escape");
+    await expect(confirm).toHaveCount(0);
+    await row.getByRole("button", {name:"Delete workflow permanently"}).click();
+    await page.route("**/v1/chats/*/delete", route => route.fulfill({status:500,json:{error:"Could not save history."}}));
+    await confirm.getByRole("button", {name:"Delete permanently",exact:true}).click();
+    await expect(confirm.getByRole("alert")).toHaveText("Could not save history.");
+    await expect(row).toBeVisible();
+    await page.unroute("**/v1/chats/*/delete");
+    await confirm.getByRole("button", {name:"Delete permanently",exact:true}).click();
+    await expect(confirm).toHaveCount(0);
+    await expect(row).toHaveCount(0);
+    await expect(history.getByRole("button", {name:"Undo",exact:true})).toHaveCount(0);
+    await page.reload();
+    if (width < 901) await page.getByRole("button", {name:"Open chat history",exact:true}).click();
+    await archive.click();
+    await expect(history).toContainText("No archived workflows.");
+  });
+}
 
 test("a design's safety properties show their Lean proofs and single out what they are about", async ({ page }) => {
   await useFakeServe(page);

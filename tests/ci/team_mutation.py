@@ -211,6 +211,9 @@ def main():
             log = state_root / "logs" / "runtime.log"
             if log.exists():
                 print("runtime.log:", log.read_text()[-4000:])
+            # The run's own error: a run that ends on its own says why here.
+            for found in state_root.glob("ea/*/topologies/Morph/deployment.json"):
+                print("deployment.json:", found.read_text()[-4000:])
             raise
         finally:
             subprocess.run([str(BIN), "down", "-s", runtime["name"], "--force", "--timeout", "5"], env=env, capture_output=True)

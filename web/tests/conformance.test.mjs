@@ -154,7 +154,16 @@ async function startRealServe() {
     stateDir,
     sessionPrefix,
     async close() {
-      child.kill();
+      // On SIGTERM the daemon parks its runs and updates its records, all in
+      // the session directory; removing that before it exits races those
+      // writes (ENOTEMPTY).
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((done) => child.once("exit", done));
+        child.kill();
+        const forced = setTimeout(() => child.kill("SIGKILL"), 30_000);
+        await exited;
+        clearTimeout(forced);
+      }
       // A failed or finished run leaves its agent sessions behind, so the
       // harness clears its own namespace rather than accumulating panes.
       await new Promise((done) => {
@@ -385,19 +394,33 @@ describe("wire conformance between the fake and the real daemon", { skip: WIRE_S
     const token = context.serve?.token;
     assert.equal(typeof token, "string", "serve wrote its token into the context");
 
-    const response = await fetch(`${real.url}/v1/agent/proposals`, {
-      ...post({ token, program: UNRESOLVABLE, summary: "conformance", inputs: {} }),
+    const plain = await fetch(`${real.url}/v1/agent/proposals`, {
+      ...post({ token, program: UNRESOLVABLE, summary: "plain", inputs: {} }),
     });
-    assert.equal(response.status, 202, `proposal rejected: ${response.status}`);
+    assert.equal(plain.status, 202);
+
+    const title = "Echo the supplied value";
+    const description = "Copy the supplied go input into the done output.";
+    const program = UNRESOLVABLE.replace(
+      "task worker(go) -> done",
+      `// @title ${title}\n// @desc ${description}\ntask worker(go) -> done`,
+    );
+    const response = await fetch(`${real.url}/v1/agent/proposals`, {
+      ...post({ token, program, summary: "conformance", inputs: {} }),
+    });
+    const responseBody = await response.text();
+    assert.equal(response.status, 202, `proposal rejected: ${responseBody}`);
 
     const { messages } = await (await fetch(`${real.url}/v1/chat`)).json();
-    const proposal = messages.find((message) => message.design);
+    const proposal = messages.findLast((message) => message.design);
     assert.ok(proposal, "the proposal reached the conversation");
 
     // Everything the renderer resolves against, produced by the real compiler.
     const preview = proposal.design.preview;
     assert.equal(preview.protocol_version, 1);
     assert.equal(preview.team, "Conformance");
+    assert.equal(preview.reactions[0].title, title);
+    assert.equal(preview.reactions[0].description, description);
     const ids = new Set([
       ...preview.ports.map((port) => port.id),
       ...preview.reactions.map((reaction) => reaction.id),

@@ -16,6 +16,7 @@ inductive Token where
   /-- A `{= ... =}` body, captured as raw source. Rust is lexed by rustc, not
       here, so nothing inside is interpreted. -/
   | code : String -> Token
+  | annotation : Option String -> Option String -> Token
   | sym : String -> Token
   deriving Repr, BEq
 
@@ -60,6 +61,34 @@ private partial def readText (acc : List Char) : List Char -> Except String (Str
   | '\\' :: '\\' :: rest => readText ('\\' :: acc) rest
   | '"' :: rest => pure (String.ofList acc.reverse, rest)
   | c :: rest => readText (c :: acc) rest
+
+/-- `"""…"""`, read verbatim up to the closing three quotes: no escapes, so a
+    lone `"` needs none. -/
+private partial def readBlockText (acc : List Char) : List Char -> Except String (String × List Char)
+  | [] => throw "unterminated \"\"\" string"
+  | '"' :: '"' :: '"' :: rest => pure (String.ofList acc.reverse, rest)
+  | c :: rest => readBlockText (c :: acc) rest
+
+/-- A block string as the program means it, not as it is indented: a line
+    break straight after the opening quotes and the blank line before the
+    closing ones are dropped, and so is the indentation every other line
+    shares, so the text can sit indented with the code around it. -/
+def dedent (raw : String) : String :=
+  let blank (line : List Char) : Bool := line.all Char.isWhitespace
+  let lines := (raw.toList.splitOn '\n').map fun line =>
+    (line.reverse.dropWhile (· == '\r')).reverse
+  let lines := match lines with
+    | first :: rest => if blank first then rest else first :: rest
+    | [] => []
+  let lines := match lines.reverse with
+    | last :: rest => if blank last then rest.reverse else lines
+    | [] => []
+  let indent (line : List Char) : Nat := (line.takeWhile (fun c => c == ' ' || c == '\t')).length
+  let common := ((lines.filter (!blank ·)).map indent).foldl
+    (fun acc n => some (match acc with | some m => min m n | none => n)) none
+  let common := common.getD 0
+  String.intercalate "\n" (lines.map fun line =>
+    if blank line then "" else String.ofList (line.drop common))
 
 /-- The `#` count opening a raw string after `r`, and what follows the quote. -/
 private def rawOpen : List Char -> Option (Nat × List Char)
@@ -156,11 +185,53 @@ private partial def readCharLiteral (acc : List Char) :
 
 end
 
+/-- Read consecutive line comments, retaining the boundary after the block. -/
+private partial def commentBlock (rest : List Char) (lines : Array String := #[]) :
+    Array String × List Char := Id.run do
+  let (line, tail) := takeWhile (· != '\n') rest
+  let lines := lines.push (String.ofList line).trimAscii.toString
+  let (_, next) := takeWhile (fun c => c == ' ' || c == '\t' || c == '\r') (tail.drop 1)
+  match next with
+  | '/' :: '/' :: more => return commentBlock more lines
+  | _ => return (lines, next)
+
+private def annotationFields (lines : Array String) : Except String (Option String × Option String) := do
+  let mut title : Option String := none
+  let mut description : Option String := none
+  let mut continuing := false
+  for line in lines do
+    if line.startsWith "@" then
+      let (tag, rest) := takeWhile (fun c => !c.isWhitespace) line.toList
+      let value := (String.ofList rest).trimAscii.toString
+      continuing := false
+      match String.ofList tag with
+      | "@title" =>
+        if title.isSome || value.isEmpty || value.length > 80 then
+          throw "expected one @title with 1–80 characters"
+        title := some value
+      | "@desc" =>
+        if description.isSome then throw "duplicate @desc"
+        description := some value
+        continuing := true
+      | other => throw s!"unknown documentation tag '{other}'"
+    else if continuing then
+      description := some ((description.getD "" ++ " " ++ line).trimAscii.toString)
+  if let some value := description then
+    if value.isEmpty || value.length > 1200 then throw "expected 1–1200 characters in @desc"
+  return (title, description)
+
 private partial def lexChars : List Char -> Except String (List Token)
   | [] => pure []
-  | '/' :: '/' :: rest =>
-      let (_, tail) := takeWhile (fun c => c != '\n') rest
-      lexChars tail
+  | '/' :: '/' :: rest => do
+      let (lines, tail) := commentBlock rest
+      let (title, description) ← annotationFields lines
+      let tokens ← lexChars tail
+      if title.isNone && description.isNone then return tokens
+      let (keyword, _) := takeWhile isWordRest tail
+      if ["task", "reaction"].contains (String.ofList keyword) then
+        return Token.annotation title description :: tokens
+      dbg_trace "warning: documentation annotation is not followed by a task or reaction"
+      return tokens
   | '/' :: '*' :: rest => do
       lexChars (← skipBlockComment 1 rest)
   | '-' :: '>' :: rest => do
@@ -168,6 +239,9 @@ private partial def lexChars : List Char -> Except String (List Token)
   | '{' :: '=' :: rest => do
       let (raw, tail) ← readCode [] rest
       pure (Token.code raw :: (← lexChars tail))
+  | '"' :: '"' :: '"' :: rest => do
+      let (value, tail) ← readBlockText [] rest
+      pure (Token.text (dedent value) :: (← lexChars tail))
   | '"' :: rest => do
       let (value, tail) ← readText [] rest
       pure (Token.text value :: (← lexChars tail))
@@ -259,6 +333,9 @@ structure Reaction where
   effects : Array String
   contract : String
   prompt : String
+  /-- Display metadata, separate from the execution identity and prompt. -/
+  title : Option String := none
+  description : Option String := none
   /-- A Rust body, when the reaction is code rather than a prompt. The two are
       exclusive: whichever the source gave, the other is empty. -/
   body : Option String := none
@@ -305,6 +382,11 @@ structure StateVar where
   type : String
   initial : Literal
   instance_ : String := ""
+  /-- For `context name(a, b) "…"`: the agents whose tasks are handed it
+      before they run and asked to update it after. Empty for plain state. -/
+  sharedBy : Array String := #[]
+  /-- How a context should be kept, when the program says. -/
+  directive : Option String := none
   deriving Repr
 
 /-- A team parameter with the argument its instantiation bound to it. A
@@ -483,6 +565,7 @@ private def kindName : PortKind -> String
   | .action => "action"
 
 private def tokenSource : Token -> String
+  | .annotation _ _ => "<annotation>"
   | .word value => value
   | .nat value => toString value
   | .duration value => s!"{value}ns"
@@ -569,6 +652,18 @@ private def parseActionDelay : Parser (Option Nat)
       pure (some delay, rest)
   | tokens => pure (none, tokens)
 
+/-- `a, b)`: the names a `context` lists, through the closing parenthesis. -/
+private partial def parseNames (acc : Array String) : Parser (Array String)
+  | Token.sym ")" :: rest =>
+      if acc.isEmpty then throw "a context lists no agents; name the agents that share it"
+      else pure (acc, rest)
+  | tokens => do
+      let (name, rest) ← word tokens
+      match rest with
+      | Token.sym "," :: rest => parseNames (acc.push name) rest
+      | Token.sym ")" :: _ => parseNames (acc.push name) rest
+      | _ => throw s!"expected ',' or ')' after '{name}' in a context's agents"
+
 private partial def parseDeclarations
     (aliases : Array (String × String))
     (reactionIndex : Nat)
@@ -577,11 +672,14 @@ private partial def parseDeclarations
     (connections : Array Connection)
     (reactions : Array Reaction)
     (instances : Array Instance)
-    (states : Array StateVar) :
-    List Token ->
+    (states : Array StateVar) (tokens : List Token) :
       Except String
         (Array Port × Array Timer × Array Connection × Array Reaction × Array Instance ×
-          Array StateVar × List Token)
+          Array StateVar × List Token) := do
+  let (title, description, tokens) := match tokens with
+    | Token.annotation title description :: rest => (title, description, rest)
+    | _ => (none, none, tokens)
+  match tokens with
   | Token.sym "}" :: rest =>
       pure (ports, timers, connections, reactions, instances, states, rest)
   -- `a = A();` ends with an optional semicolon; it separates declarations and
@@ -630,6 +728,17 @@ private partial def parseDeclarations
       let (initial, rest) ← literal rest
       parseDeclarations aliases reactionIndex ports timers connections reactions instances
         (states.push { name, type, initial }) rest
+  -- `context notes(planner, coder) "…"`: state the listed agents' tasks are
+  -- handed before they run and asked to update after. Matched with the name
+  -- and `(` after it, so a port named `context` still connects.
+  | Token.word "context" :: Token.word name :: Token.sym "(" :: rest => do
+      let (agents, rest) ← parseNames #[] rest
+      let (directive, rest) := match rest with
+        | Token.text text :: tail => (some text, tail)
+        | _ => (none, rest)
+      parseDeclarations aliases reactionIndex ports timers connections reactions instances
+        (states.push { name, type := "string", initial := .str "", sharedBy := agents, directive })
+        rest
   | Token.word name :: Token.sym "=" :: rest => do
       let (team, rest) ← word rest
       let (_, rest) ← expectSym "(" rest
@@ -659,7 +768,7 @@ private partial def parseDeclarations
       let contract := String.intercalate " " (contractTokens.map tokenSource)
       let reaction := {
         id := s!"reaction.{reactionIndex}"
-        agent, triggers, effects, contract, prompt, within
+        agent, triggers, effects, contract, prompt, within, title, description
       }
       parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
   -- `task` asks an agent, `reaction` just runs, so a reaction names none.
@@ -684,7 +793,8 @@ private partial def parseDeclarations
       let contract := String.intercalate " " (contractTokens.map tokenSource)
       let reaction := {
         id := s!"reaction.{reactionIndex}"
-        agent := "", triggers, effects, contract, prompt := "", body := some body, within
+        agent := "", triggers, effects, contract, prompt := "", body := some body, within,
+        title, description
       }
       parseDeclarations aliases (reactionIndex + 1) ports timers connections (reactions.push reaction) instances states rest
   | Token.word first :: rest => do
@@ -728,6 +838,20 @@ private def parseTeam (aliases : Array (String × String)) : Parser TeamDecl := 
     parseDeclarations aliases 0 #[] #[] #[] #[] #[] #[] tokens
   -- `shutdown` is the runtime's, so a team cannot declare something by that
   -- name, and reacting to it is what declares it.
+  for var in states do
+    for agent in var.sharedBy do
+      match agents.find? (·.name == agent) with
+      | none =>
+          throw s!"context '{var.name}' lists '{agent}', which is not an agent of team '{name}'"
+      -- A `Web` agent is answered from Mission Control's panel, which cannot
+      -- yet show a context or set or keep one, so every completion would be
+      -- refused. Matched as the runtime matches backends: case aside.
+      | some found =>
+          if found.backend.toLower == "web" then
+            throw s!"context '{var.name}' lists '{agent}', a Web agent; \
+              Mission Control can't keep a context yet"
+    if var.sharedBy.toList.eraseDups.length != var.sharedBy.size then
+      throw s!"context '{var.name}' lists an agent twice"
   let declared := ports.map (·.name) ++ timers.map (·.name) ++ states.map (·.name)
   if declared.contains "shutdown" then
     throw s!"team '{name}' declares 'shutdown', which is the trigger the run's last tag fires"
@@ -794,6 +918,65 @@ private def ensureUnique (kind : String) (names : Array String) : Except String 
         else loop (seen.push name) rest
   loop #[] names.toList
 
+/-- The end of an interpolation's inside: the `)` that closes it, past
+    nested parentheses and comments, exactly as the runtime scans it. -/
+private partial def interpolationEnd (depth : Nat) (acc : List Char) :
+    List Char -> Option (List Char × List Char)
+  | [] => none
+  | '/' :: '/' :: rest =>
+      let (comment, rest) := rest.span (· != '\n')
+      interpolationEnd depth (acc ++ '/' :: '/' :: comment) rest
+  | '/' :: '*' :: rest =>
+      let rec skip (seen : List Char) : List Char -> List Char × List Char
+        | '*' :: '/' :: tail => (seen ++ ['*', '/'], tail)
+        | c :: tail => skip (seen ++ [c]) tail
+        | [] => (seen, [])
+      let (comment, rest) := skip [] rest
+      interpolationEnd depth (acc ++ '/' :: '*' :: comment) rest
+  | '(' :: rest => interpolationEnd (depth + 1) (acc ++ ['(']) rest
+  | ')' :: rest =>
+      if depth == 0 then some (acc, rest) else interpolationEnd (depth - 1) (acc ++ [')']) rest
+  | c :: rest => interpolationEnd depth (acc ++ [c]) rest
+
+/-- The name an interpolation reads: its first word once comments are gone,
+    the runtime's reading of `$( name /* note */ )`. -/
+private partial def interpolationName (inside : List Char) : Option String :=
+  let rec strip (acc : List Char) : List Char -> List Char
+    | '/' :: '/' :: _ => acc
+    | '/' :: '*' :: rest =>
+        let rec skip : List Char -> List Char
+          | '*' :: '/' :: tail => tail
+          | _ :: tail => skip tail
+          | [] => []
+        strip (acc ++ [' ']) (skip rest)
+    | c :: rest => strip (acc ++ [c]) rest
+    | [] => acc
+  let words := (String.ofList (strip [] inside)).split Char.isWhitespace
+  (words.toList.map (·.toString)).find? (!·.isEmpty)
+
+/-- Rewrite every `$(…)` in a prompt to `$(name')`, where `name'` is what
+    `rename` makes of the name it reads, and collect those names. The whole
+    interpolation is replaced by a value at run time, so its comments go
+    nowhere either way. -/
+private partial def rewriteInterpolations (rename : String -> String)
+    (out : String) (names : Array String) :
+    List Char -> Except String (String × Array String)
+  | '$' :: '(' :: rest =>
+      match interpolationEnd 0 [] rest with
+      | none => throw "a prompt has an unterminated $( interpolation"
+      | some (inside, rest) =>
+          match interpolationName inside with
+          | none => throw "a prompt has an empty $( ) interpolation"
+          | some name =>
+              let name := rename name
+              rewriteInterpolations rename (out ++ s!"$({name})") (names.push name) rest
+  | c :: rest => rewriteInterpolations rename (out.push c) names rest
+  | [] => pure (out, names)
+
+/-- The names a prompt interpolates, as the runtime will look them up. -/
+private def promptReads (prompt : String) : Except String (Array String) :=
+  return (← rewriteInterpolations id "" #[] prompt.toList).2
+
 private def validate (program : Program) : Except String Program := do
   let agentNames := program.agents.map (·.name)
   let portNames := program.ports.map (·.name)
@@ -811,8 +994,9 @@ private def validate (program : Program) : Except String Program := do
       throw s!"timer '{timer.name}' never fires; give it an offset, a period, or both"
   ensureUnique "state" (program.states.map (·.name))
   for var in program.states do
+    let kind := if var.sharedBy.isEmpty then "state" else "context"
     if containsName portNames var.name || containsName timerNames var.name then
-      throw s!"state '{var.name}' is also a port or timer; a name means one thing"
+      throw s!"{kind} '{var.name}' is also a port or timer; a name means one thing"
     -- OMAR's types, not the host's, so a value can be recorded and shown.
     if var.type != "int" && var.type != "bool" && var.type != "string" then
       throw s!"state '{var.name}' is {var.type}; state is int, bool, or string"
@@ -851,6 +1035,18 @@ private def validate (program : Program) : Except String Program := do
           (port.kind != .output || port.instance_ != reaction.instance_)) ||
         containsName timerNames trigger
       if !valid then throw s!"unknown input/action dependency '{trigger}'"
+    if reaction.body.isNone then
+      for name in ← promptReads reaction.prompt do
+        let ownState := program.states.any fun var =>
+          var.name == name && var.instance_ == reaction.instance_
+        if !containsName reaction.triggers name && !ownState then
+          -- As the source spelled them, not as instantiation qualified them.
+          let unqualify (qualified : String) :=
+            if qualified.startsWith s!"{reaction.instance_}." then
+              (qualified.drop (reaction.instance_.length + 1)).toString
+            else qualified
+          throw s!"{unqualify reaction.agent}'s task reads $({unqualify name}), which is \
+            neither one of its triggers nor a state of its team"
     for effect in reaction.effects do
       if containsName timerNames effect then
         throw s!"timer '{effect}' cannot be written to; a timer is a trigger"
@@ -866,6 +1062,12 @@ private def validate (program : Program) : Except String Program := do
       | none => throw s!"connection names unknown target port '{connection.target}'"
     if source.type != target.type then
       throw s!"connection type mismatch from '{connection.source}' to '{connection.target}'"
+    -- A port holds one value per tag. Two connections into it would leave
+    -- only the last value carried, and drop the other without a word.
+    let sources := program.connections.filter (·.target == connection.target) |>.map (·.source)
+    if sources.size > 1 then
+      throw s!"port '{connection.target}' has {sources.size} incoming connections \
+        ({", ".intercalate sources.toList}); a port takes one, so give each source its own port"
   pure program
 
 /-- `instance.member`. The VM has one flat namespace, so instantiating a team
@@ -886,19 +1088,15 @@ private def qualifyContract (inst : String) (ports : Array Port) (contract : Str
   String.intercalate " " ((contract.splitOn " ").map fun piece =>
     if portNames.any (· == piece) then qualify inst piece else piece)
 
-/-- Likewise for `$(port)` in a prompt: the runtime looks the name up among the
-    trigger values, which are qualified.
-
-    Only the plain spelling is rewritten. `$( port )` and `$(port /* note */)`
-    are accepted by the runtime but not matched here, so inside a team that
-    `main` instantiates, write `$(port)`. -/
+/-- Likewise for `$(port)` and `$(state)` in a prompt: the runtime looks the
+    name up among the trigger values and the instance's state, which are
+    qualified. Any spelling is rewritten, `$( port /* note */ )` included. -/
 private def qualifyPrompt
     (inst : String) (ports : Array Port) (timers : Array Timer) (reads : Array String)
-    (text : String) : String :=
+    (text : String) : Except String String := do
   let named := ports.map (·.name) ++ timers.map (·.name) ++ reads
-  named.foldl
-    (fun acc name => acc.replace s!"$({name})" s!"$({qualify inst name})")
-    text
+  let rename name := if named.contains name then qualify inst name else name
+  return (← rewriteInterpolations rename "" #[] text.toList).1
 
 private def bindArguments (decl : TeamDecl) (inst : Instance) :
     Except String (Array (String × String)) := do
@@ -972,24 +1170,28 @@ private partial def elaborateInstance
   let timers := decl.timers.map fun timer =>
     { timer with name := qualify path timer.name, instance_ := path }
   let states := decl.states.map fun var =>
-    { var with name := qualify path var.name, instance_ := path }
+    { var with
+        name := qualify path var.name, instance_ := path
+        sharedBy := var.sharedBy.map (qualify path) }
   -- An endpoint written `a.out` is already the nested instance's local name,
   -- so prefixing the path is all it takes to reach `b.a.out`.
   let connections := decl.connections.map fun connection =>
     { connection with
         source := qualify path connection.source
         target := qualify path connection.target }
-  let reactions := decl.reactions.map fun reaction =>
-    { reaction with
+  let reactions ← decl.reactions.mapM fun reaction => do
+    -- A code body has no prompt to read from.
+    let prompt ← if reaction.body.isSome then pure reaction.prompt else
+      qualifyPrompt path decl.ports decl.timers
+        (reaction.triggers ++ decl.states.map (·.name)) reaction.prompt
+    pure { reaction with
         id := qualify path reaction.id
         agent := if reaction.agent.isEmpty then "" else qualify path reaction.agent
         triggers := reaction.triggers.map (qualify path)
         effects := reaction.effects.map (qualify path)
         instance_ := path
         contract := qualifyContract path decl.ports reaction.contract
-        prompt :=
-          substitute bindings
-            (qualifyPrompt path decl.ports decl.timers reaction.triggers reaction.prompt)
+        prompt := substitute bindings prompt
         -- A body names both ports and parameters by their local names, and
         -- the generated Rust binds each. Only a prompt is text to substitute
         -- into.
@@ -1106,12 +1308,15 @@ def instructionTexts (program : Program) : Array String :=
       ("period", toJson timer.period)
     ] ++ (if timer.shutdown then [("shutdown", toJson true)] else []))
   let states := program.states.map fun var =>
-    instruction "declare_state" [
+    instruction "declare_state" ([
       ("instance", toJson var.instance_),
       ("name", toJson var.name),
       ("type", toJson var.type),
       ("initial", literalJson var.initial)
-    ]
+    ] ++ (if var.sharedBy.isEmpty then [] else [("agents", jsonStringArray var.sharedBy)])
+      ++ match var.directive with
+      | some directive => [("directive", toJson directive)]
+      | none => [])
   let params := program.params.map fun param =>
     instruction "declare_param" [
       ("instance", toJson param.instance_),
@@ -1136,7 +1341,8 @@ def instructionTexts (program : Program) : Array String :=
       ("effects", jsonStringArray reaction.effects),
       ("contract", toJson reaction.contract),
       ("prompt", toJson reaction.prompt)
-    ] ++ (match reaction.body with
+    ] ++ reaction.title.toList.map (fun t => ("title", toJson t)) ++
+      reaction.description.toList.map (fun d => ("description", toJson d)) ++ (match reaction.body with
       | some body => [("body", toJson body)]
       | none => []) ++ match reaction.within with
       | some within => [("within", toJson within)]
