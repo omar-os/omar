@@ -13,7 +13,7 @@ import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
 import { BackendsPage } from "./backends-page";
 import { MemoryManager } from "./memory-manager";
-import { SettingsMenu } from "./settings-menu";
+import { SettingsMenu, type Account } from "./settings-menu";
 import { DiagramCanvas } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
 import { PortPanel } from "./port-panel";
@@ -112,9 +112,10 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-type StudioProps = { serveUrl?: string; designAgent?: DesignAgent };
+/** `account`: signed in through `omar gateway`. */
+type StudioProps = { serveUrl?: string; designAgent?: DesignAgent; account?: Account };
 
-export function Studio({ serveUrl = "", designAgent }: StudioProps) {
+export function Studio({ serveUrl = "", designAgent, account }: StudioProps) {
   const [selected, setSelected] = useState<string | null>(null);
   const [restoredUrl, setRestoredUrl] = useState<string | null>(null);
   // Known before the workspace renders, so a view port never flashes controls.
@@ -149,10 +150,10 @@ export function Studio({ serveUrl = "", designAgent }: StudioProps) {
   const scopedUrl = selected ? `${serveUrl.replace(/\/$/, "")}/chats/${encodeURIComponent(selected)}` : serveUrl;
   return <StudioWorkspace serveUrl={scopedUrl} historyUrl={serveUrl}
     designAgent={designAgent} selectedId={selected} onSelect={select}
-    readOnly={readOnly} onReadOnly={setReadOnly} />;
+    readOnly={readOnly} onReadOnly={setReadOnly} account={account} />;
 }
 
-function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, onSelect, readOnly, onReadOnly }: StudioProps & {
+function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, onSelect, readOnly, onReadOnly, account }: StudioProps & {
   historyUrl: string;
   selectedId: string | null;
   onSelect: (conversation: ConversationSummary) => void;
@@ -1544,7 +1545,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
             <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
-            <div className="conversation-actions">{daemon.state === "live" && !readOnly && <MemoryManager key={serveUrl} url={serveUrl} />}<SettingsMenu onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+            <div className="conversation-actions">{daemon.state === "live" && !readOnly && <MemoryManager key={serveUrl} url={serveUrl} />}<SettingsMenu onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} account={account} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
           </header>
           {daemon.state === "offline" ? (
             // The one place the outage is reported: the sidebar and composer
