@@ -84,7 +84,9 @@ def main():
             return result.stdout
 
         def entries():
-            return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            # The fake may be mid-write: only newline-ended lines are whole.
+            lines = log.read_text().split("\n")[:-1] if log.exists() else []
+            return [json.loads(line) for line in lines]
 
         def delivered(url, text):
             assert post(f"{url}/v1/chat", {"text": text}) == 202
