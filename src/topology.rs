@@ -1341,6 +1341,9 @@ struct InvocationRecord {
     contexts: BTreeMap<String, Option<String>>,
     context_names: BTreeSet<String>,
     prompt: String,
+    /// The prompt as the program wrote it, its `$(...)` left in: for a client
+    /// that must tell the author's instructions from the values fed in.
+    instructions: String,
     writes: BTreeMap<String, Value>,
     completed: bool,
 }
@@ -1356,6 +1359,8 @@ struct PendingInvocation {
     reaction: String,
     contract: String,
     prompt: String,
+    #[serde(default)]
+    instructions: String,
     trigger_values: BTreeMap<String, Value>,
     allowed_effects: BTreeMap<String, String>,
     /// Its instance's state, which it may also write, and each one's type.
@@ -1587,6 +1592,7 @@ impl InvocationRegistry {
                         reaction: entry.record.reaction.clone(),
                         contract: entry.record.contract.clone(),
                         prompt: entry.record.prompt.clone(),
+                        instructions: entry.record.instructions.clone(),
                         trigger_values: entry.record.trigger_values.clone(),
                         allowed_effects: entry.record.allowed_effects.clone(),
                         state: entry.record.state_values.clone(),
@@ -2310,6 +2316,7 @@ fn invocation_record(team: &str, invocation: &InvocationSpec) -> Result<Invocati
         contexts: invocation.contexts.clone(),
         context_names: invocation.context_names.clone(),
         prompt: render_prompt(&invocation.prompt, &prompt_values(invocation))?,
+        instructions: invocation.prompt.clone(),
         writes: BTreeMap::new(),
         completed: false,
     })
