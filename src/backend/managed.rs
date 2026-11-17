@@ -63,3 +63,11 @@ pub(crate) fn unquote_single(text: &str) -> Option<String> {
         }
     }
 }
+
+/// The runner stores its native conversation beside its configuration.
+pub(crate) fn conversation_id(target: &super::Target<'_>) -> Option<String> {
+    let socket = from_stamp(target.stamp?)?;
+    let path = std::fs::read_to_string(socket.parent()?.join("inbox-path")).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    value["session"].as_str().map(str::to_owned)
+}

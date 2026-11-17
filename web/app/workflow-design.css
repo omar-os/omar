@@ -263,6 +263,12 @@ button:focus-visible, select:focus-visible { outline-offset: 3px; }
 .step-status.completed { color: #38805d; }
 .step-status.running { color: #7748ed; }
 .step-contract { padding: 12px; margin: 0; border: 1px solid #e7e2eb; border-radius: 8px; background: #faf9fc; color: #61556d; font-size: 0.875rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.step-restart-heading { color: #7643b6; font-size: 0.8125rem; }
+.step-attempts { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.step-attempts li { padding: 10px 12px; border: 1px solid #e7e2eb; border-radius: 8px; background: #faf9fc; }
+.step-attempts p { margin: 0; color: #61556d; font-size: 0.8125rem; line-height: 1.5; }
+.step-attempt-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; margin-top: 5px; color: #8c8295; font-size: 0.6875rem; }
+.step-attempt-meta code { font-size: inherit; }
 .connections-heading { display: flex; align-items: center; justify-content: space-between; padding-top: 22px; margin-top: 22px; border-top: 1px solid #eee9f2; font-size: 0.875rem; font-weight: 600; }
 .connections-heading button { display: flex; align-items: center; gap: 4px; color: #7748ed; background: transparent; border: 0; font-size: 0.75rem; }
 .step-connection { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid #e8e2ed; border-radius: 7px; font-size: 0.8125rem; overflow-wrap: anywhere; }

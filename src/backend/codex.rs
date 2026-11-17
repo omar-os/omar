@@ -122,6 +122,7 @@ impl Backend for Codex {
         target: &super::Target<'_>,
         id: &str,
         since: std::time::SystemTime,
+        _deadline: std::time::Instant,
     ) -> Result<()> {
         let socket = target
             .stamp
@@ -170,7 +171,13 @@ impl Backend for Codex {
                 })
         });
         let (tui_command, reasoning_effort) = codex_launch_reasoning_effort(base_command);
-        if !codex_refuses_to_attach(&tui_command) {
+        // Older remote TUIs reset permissions on resume. Exec can resume the
+        // same thread with the worker's explicit permissions intact.
+        let retry = mcp_context
+            .topology
+            .as_ref()
+            .is_some_and(|topology| topology.resume.is_some());
+        if !retry && !codex_refuses_to_attach(&tui_command) {
             if let Some(command) = instructions.ok().and_then(|instructions| {
                 codex_server_command(
                     mcp_context,
@@ -1136,6 +1143,7 @@ mod tests {
         std::fs::write(&prompt, "be helpful").unwrap();
         let mut attempt = test_mcp_context(dir.path());
         attempt.topology = Some(crate::manager::TopologyMcpContext {
+            resume: None,
             team: "Scoped".into(),
             agent: "t.coder".into(),
             endpoint: "localhost:1".into(),
@@ -1250,7 +1258,18 @@ mod tests {
         ] {
             let listener = UnixListener::bind(&socket).unwrap();
             let server = std::thread::spawn(move || fake_app_server(listener, threads));
-            assert_eq!(Codex.prove_fresh(&target, id, since).is_ok(), ok, "{id}");
+            assert_eq!(
+                Codex
+                    .prove_fresh(
+                        &target,
+                        id,
+                        since,
+                        std::time::Instant::now() + Duration::from_secs(60)
+                    )
+                    .is_ok(),
+                ok,
+                "{id}"
+            );
             let asked: Vec<serde_json::Value> = server
                 .join()
                 .unwrap()
@@ -1269,7 +1288,12 @@ mod tests {
             std::fs::remove_file(&socket).unwrap();
         }
         assert!(Codex
-            .prove_fresh(&target, "thread-1", since + Duration::from_secs(1))
+            .prove_fresh(
+                &target,
+                "thread-1",
+                since + Duration::from_secs(1),
+                std::time::Instant::now() + Duration::from_secs(60)
+            )
             .is_err());
     }
 

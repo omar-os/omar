@@ -91,6 +91,11 @@ impl Backend for Jev {
     fn fresh_conversation(&self) -> bool {
         true
     }
+    fn retryable_topology_error(&self, error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<Failure>()
+            .is_some_and(|failure| matches!(failure.kind, "transport" | "service"))
+    }
     fn invoke_topology(
         &self,
         invocation: &TopologyInvocation<'_>,
@@ -105,6 +110,7 @@ fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>
         triggers,
         instructions,
         timeout,
+        retries,
     } = invocation;
     let mut decision = None;
     let mut evidence = None;
@@ -158,6 +164,12 @@ fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>
     });
     let (choice, mut response) = match result {
         Ok(answer) => answer,
+        Err(error)
+            if *retries < crate::topology::MAX_TASK_RETRIES
+                && matches!(error.kind, "transport" | "service") =>
+        {
+            return Err(error.into())
+        }
         Err(error) if on_error == OnError::Defer => {
             eprintln!("Jev deferred after {}", error.kind);
             (
@@ -430,6 +442,7 @@ mod tests {
             ]),
         ] {
             let request = TopologyInvocation {
+                retries: 0,
                 effects: &effects,
                 triggers: &triggers,
                 instructions: "not sent",

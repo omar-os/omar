@@ -329,6 +329,7 @@ mod tests {
         std::fs::write(&prompt, "hello").unwrap();
         let mut context = crate::manager::tests::test_mcp_context(dir.path());
         context.topology = Some(crate::manager::TopologyMcpContext {
+            resume: None,
             team: "Scoped".into(),
             agent: "t.coder".into(),
             endpoint: "localhost:1".into(),

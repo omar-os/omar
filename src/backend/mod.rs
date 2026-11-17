@@ -244,9 +244,14 @@ pub struct TopologyInvocation<'a> {
     pub triggers: &'a BTreeMap<String, Value>,
     pub instructions: &'a str,
     pub timeout: Duration,
+    pub retries: u32,
 }
 
 pub trait Backend: Send + Sync {
+    fn retryable_topology_error(&self, _error: &anyhow::Error) -> bool {
+        false
+    }
+
     /// This backend evaluates topology prompts directly and cannot run a chat assistant.
     fn topology_only(&self) -> bool {
         false
@@ -433,12 +438,13 @@ pub trait Backend: Send + Sync {
     /// Any proof beyond the id itself that the conversation `id`, which the
     /// worker in `target` reported, is new: checked after the id passes, and
     /// before anything is delivered. `since` is when the attempt began, before
-    /// its worker was launched. An error refuses the attempt.
+    /// its worker was launched; `deadline` bounds startup probes. An error refuses the attempt.
     fn prove_fresh(
         &self,
         _target: &Target<'_>,
         _id: &str,
         _since: std::time::SystemTime,
+        _deadline: std::time::Instant,
     ) -> Result<()> {
         Ok(())
     }
@@ -459,12 +465,17 @@ pub trait Backend: Send + Sync {
     }
 }
 
-/// A worker (or topology agent) leaves no native session behind, unless the
+/// A worker or `per` topology agent leaves no native session behind, unless the
 /// operator sets `OMAR_PERSIST_WORKER_SESSIONS=1`. Backends with no
 /// `ea_launch_command` launch the EA through the worker path, so the EA is
 /// excluded here.
 pub(crate) fn ephemeral_worker(context: &McpLaunchContext) -> bool {
-    (context.agent_name.is_some() || context.topology.is_some()) && !persist_worker_sessions()
+    (context.agent_name.is_some()
+        || context
+            .topology
+            .as_ref()
+            .is_some_and(|topology| topology.attempt.is_some()))
+        && !persist_worker_sessions()
 }
 
 fn persist_worker_sessions() -> bool {
@@ -511,7 +522,14 @@ fn forget_worker(client: &crate::tmux::TmuxClient, session: &str) {
 /// Native IDs are scoped to both the EA (one per chat) and backend. Never use
 /// a backend's global "last session", which may belong to another window.
 pub(crate) fn saved_conversation(context: &McpLaunchContext, backend: &str) -> Option<String> {
-    if context.serve.is_none() || context.agent_name.is_some() || context.topology.is_some() {
+    if let Some(topology) = &context.topology {
+        return topology
+            .attempt
+            .is_none()
+            .then(|| topology.resume.clone())
+            .flatten();
+    }
+    if context.serve.is_none() || context.agent_name.is_some() {
         return None;
     }
     std::fs::read_to_string(conversation_path(&context.omar_dir, context.ea_id, backend))
@@ -832,6 +850,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn topology_retries_resume_only_their_own_native_conversation() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = crate::manager::tests::test_mcp_context(dir.path());
+        context.topology = Some(crate::manager::TopologyMcpContext {
+            team: "T".into(),
+            agent: "coder".into(),
+            endpoint: "127.0.0.1:1".into(),
+            token: "t".into(),
+            attempt: None,
+            resume: Some("own-session".into()),
+        });
+        assert_eq!(
+            saved_conversation(&context, "codex").as_deref(),
+            Some("own-session")
+        );
+        assert!(!ephemeral_worker(&context));
+        let prompt = dir.path().join("prompt");
+        std::fs::write(&prompt, "Complete the retry.").unwrap();
+        let command = crate::manager::build_agent_command("codex", &prompt, &[], &context);
+        assert!(
+            command.contains("backend-runner --backend codex"),
+            "{command}"
+        );
+        let config = std::fs::read_dir(dir.path().join("mcp/ea-0"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("protocol-")
+            })
+            .unwrap();
+        let config: crate::backend_runner::Config =
+            serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+        assert_eq!(config.initial_session.as_deref(), Some("own-session"));
+        assert!(config
+            .command
+            .contains("--dangerously-bypass-approvals-and-sandbox"));
+        let topology = context.topology.as_mut().unwrap();
+        topology.resume = None;
+        topology.attempt = Some(crate::manager::TopologyAttempt {
+            id: "new".into(),
+            key: "secret".into(),
+            native_session: "fresh".into(),
+        });
+        assert!(saved_conversation(&context, "codex").is_none());
+        assert!(ephemeral_worker(&context));
     }
 
     #[test]

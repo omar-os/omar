@@ -387,21 +387,23 @@ export function applyDiagramEvent(
       const { agent, attempt } = event.payload as { agent?: unknown; attempt?: Record<string, unknown> };
       // A window is published as it starts, serves invocations and ends:
       // the latest of each replaces the last.
-      const upsert = (attempts: Record<string, unknown>[]) => {
+      const upsert = (attempts: Record<string, unknown>[] = []) => {
         if (!attempt) return attempts;
         const at = attempts.findIndex((item) => item.attempt_id === attempt.attempt_id);
         return at < 0 ? [...attempts, attempt] : attempts.map((item, index) => index === at ? attempt : item);
       };
+      const restarted = (attempt?.invocations as { reaction?: string; invocation_id?: number }[] | undefined)?.[0];
       return {
         ...snapshot,
         agents: snapshot.agents.map((item) => item.id === agent ? { ...item, attempts: upsert(item.attempts) } : item),
+        reactions: snapshot.reactions.map((item) => Number(attempt?.retry) > 0 && restarted?.reaction === item.name && String(restarted.invocation_id) === item.invocation_id ? { ...item, restarts: Number(attempt?.retry) } : item),
       };
     }
     case "reaction_started":
       return {
         ...snapshot,
         current_tag: event.tag ?? snapshot.current_tag,
-        reactions: withReaction(reactionId, { status: "running" }),
+        reactions: withReaction(reactionId, { status: "running", invocation_id: (event.payload as { invocation_id?: string }).invocation_id ?? null, restarts: undefined }),
       };
     case "reaction_completed":
       return {
