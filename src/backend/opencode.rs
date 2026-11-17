@@ -69,6 +69,31 @@ impl Backend for Opencode {
     fn conversation_id(&self, target: &super::Target<'_>) -> Option<String> {
         from_stamp(target.stamp?).map(|(_, session)| session)
     }
+    /// The attempt's id is created over `/api/session`, which takes the id
+    /// it is given, only once the server says it has no such session, and
+    /// is used only once it holds no message.
+    fn fresh_conversation(&self) -> bool {
+        true
+    }
+    /// The form `/api/session` takes.
+    fn new_conversation_id(&self) -> String {
+        format!("ses_{}", uuid::Uuid::new_v4().simple())
+    }
+    /// Asked of the live server just before delivery, not only the stamp:
+    /// it is this worker's own, and the conversation is there, still empty.
+    fn prove_fresh(
+        &self,
+        target: &super::Target<'_>,
+        id: &str,
+        _since: std::time::SystemTime,
+    ) -> Result<()> {
+        let (port, _) = target
+            .stamp
+            .and_then(from_stamp)
+            .context("no opencode delivery channel")?;
+        served_by_worker(port, target.pane_pid)?;
+        empty_session(port, id)
+    }
     fn forget(&self, target: &super::Target<'_>) {
         if let Some((port, session)) = target.stamp.and_then(from_stamp) {
             let _ = http_json(port, "DELETE", &format!("/session/{session}"), None);
@@ -97,11 +122,25 @@ impl Backend for Opencode {
             )
         });
         let base_command = with_opencode_port(resumed.as_deref().unwrap_or(launch.base_command));
-        match opencode_config_env(launch.context) {
+        let base_command = match opencode_config_env(launch.context) {
             Some(config) => format!(
                 "OPENCODE_CONFIG_CONTENT={} {}",
                 shell_single_quote(&config),
                 base_command
+            ),
+            None => base_command,
+        };
+        // An attempt's conversation is the one `provision` creates with this
+        // id; opencode has no flag that opens a new one by id.
+        match launch
+            .context
+            .topology
+            .as_ref()
+            .and_then(|t| t.attempt.as_ref())
+        {
+            Some(attempt) => format!(
+                "{ATTEMPT_SESSION}={} {base_command}",
+                shell_single_quote(&attempt.native_session)
             ),
             None => base_command,
         }
@@ -113,6 +152,15 @@ impl Backend for Opencode {
     fn provision(&self, _session: &str, command: &str) -> Result<Option<String>> {
         if let Some(stamp) = managed::stamp(command) {
             return Ok(Some(stamp));
+        }
+        let words = shlex::split(command).unwrap_or_default();
+        if let Some(id) = words
+            .iter()
+            .find_map(|word| word.strip_prefix(&format!("{ATTEMPT_SESSION}=")))
+        {
+            let port = opencode_port(command)
+                .context("an opencode agent that resets its conversation (per lifetime) needs a port to reach")?;
+            return provision_fresh_session(port, id, PROVISION_TIMEOUT).map(Some);
         }
         match opencode_port(command) {
             Some(port) => Ok(Some(
@@ -337,6 +385,89 @@ fn provision_opencode_session(port: u16, previous: Option<String>) -> Option<Str
     None
 }
 
+/// The launch word naming the session an attempt's `provision` creates.
+const ATTEMPT_SESSION: &str = "OMAR_OPENCODE_SESSION";
+
+/// Create the attempt's session `id` on a newly started server and point its
+/// TUI at it. `/api/session` hands back an existing session of that id rather
+/// than refuse, so the id must be unknown before and the session empty after.
+/// Nothing falls back to `/session`, where opencode picks the id: an opencode
+/// without `/api/session` cannot run an attempt.
+fn provision_fresh_session(port: u16, id: &str, timeout: Duration) -> Result<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let wait = || {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "opencode on port {port} did not answer within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        Ok(())
+    };
+    loop {
+        match http_json(port, "GET", &format!("/session/{id}"), None) {
+            Ok((404, _)) => break,
+            Ok((200, _)) => anyhow::bail!("opencode already has a session {id}"),
+            // A server still booting is not yet an answer.
+            _ => wait()?,
+        }
+    }
+    let body = serde_json::json!({ "id": id }).to_string();
+    let (status, created) = http_json(port, "POST", "/api/session", Some(&body))?;
+    let created: Option<serde_json::Value> = serde_json::from_str(&created).ok();
+    let created = created.as_ref().and_then(|v| v["data"]["id"].as_str());
+    anyhow::ensure!(
+        status == 200 && created == Some(id),
+        "opencode did not create session {id} through /api/session (HTTP {status}, got {created:?}); \
+         a `per` lifetime needs an opencode that has it"
+    );
+    empty_session(port, id)?;
+    let select = serde_json::json!({ "sessionID": id }).to_string();
+    while !matches!(
+        http_json(port, "POST", "/tui/select-session", Some(&select)),
+        Ok((200, _))
+    ) {
+        wait()?;
+    }
+    Ok(format!("opencode:{port}:{id}"))
+}
+
+/// Only processes of the worker in pane `pane_pid` listen on `port`: the
+/// port was free when it was picked, not held, so another server may have
+/// taken it first, and that one's session is neither new nor stopped with
+/// the worker.
+fn served_by_worker(port: u16, pane_pid: u32) -> Result<()> {
+    let listeners = crate::process::tcp_listeners(port)?;
+    let worker: std::collections::BTreeSet<u32> = crate::process::process_tree(pane_pid)
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .collect();
+    anyhow::ensure!(
+        !listeners.is_empty() && listeners.is_subset(&worker),
+        "port {port} is served by {listeners:?}, not by this worker's opencode"
+    );
+    Ok(())
+}
+
+/// The server has session `id`, and it holds no message.
+fn empty_session(port: u16, id: &str) -> Result<()> {
+    let (status, session) = http_json(port, "GET", &format!("/session/{id}"), None)?;
+    let session: Option<serde_json::Value> = serde_json::from_str(&session).ok();
+    anyhow::ensure!(
+        status == 200 && session.as_ref().and_then(|v| v["id"].as_str()) == Some(id),
+        "opencode does not have session {id} (HTTP {status})"
+    );
+    let (status, messages) = http_json(port, "GET", &format!("/session/{id}/message"), None)?;
+    let messages: Option<Vec<serde_json::Value>> = serde_json::from_str(&messages).ok();
+    match messages {
+        Some(messages) if status == 200 && messages.is_empty() => Ok(()),
+        Some(messages) if status == 200 => anyhow::bail!(
+            "opencode session {id} already holds {} messages",
+            messages.len()
+        ),
+        _ => anyhow::bail!("opencode did not list session {id}'s messages (HTTP {status})"),
+    }
+}
+
 /// POST JSON to opencode's loopback server and return the status code.
 ///
 /// Hand-rolled rather than pulling in an HTTP stack: the server is on
@@ -539,6 +670,190 @@ mod tests {
             );
             server.join().unwrap();
         }
+    }
+
+    /// A loopback server that answers each request in turn from `script`
+    /// and hands back every request line with its body.
+    fn scripted(
+        script: Vec<(u16, &'static str)>,
+    ) -> (u16, std::thread::JoinHandle<Vec<(String, String)>>) {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (status, body) in script {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = header.strip_prefix("Content-Length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request_body = vec![0; length];
+                reader.read_exact(&mut request_body).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                seen.push((
+                    first.trim_end().to_string(),
+                    String::from_utf8(request_body).unwrap(),
+                ));
+            }
+            seen
+        });
+        (port, server)
+    }
+
+    /// An attempt's session is created with the id it was given, once the
+    /// server is up and has none of that id, and taken only empty.
+    #[test]
+    fn an_attempt_creates_its_session_by_id_and_takes_it_only_new_and_empty() {
+        let created = r#"{"data":{"id":"ses_new"}}"#;
+        let (port, server) = scripted(vec![
+            (503, "{}"),
+            (404, r#"{"name":"NotFoundError"}"#),
+            (200, created),
+            (200, r#"{"id":"ses_new"}"#),
+            (200, "[]"),
+            (200, "true"),
+        ]);
+        assert_eq!(
+            provision_fresh_session(port, "ses_new", Duration::from_secs(10)).unwrap(),
+            format!("opencode:{port}:ses_new")
+        );
+        let seen = server.join().unwrap();
+        let lines: Vec<&str> = seen.iter().map(|(line, _)| line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "GET /session/ses_new HTTP/1.1",
+                "GET /session/ses_new HTTP/1.1",
+                "POST /api/session HTTP/1.1",
+                "GET /session/ses_new HTTP/1.1",
+                "GET /session/ses_new/message HTTP/1.1",
+                "POST /tui/select-session HTTP/1.1",
+            ]
+        );
+        assert_eq!(seen[2].1, r#"{"id":"ses_new"}"#);
+
+        // Every way it could be some other conversation fails, and nothing
+        // falls back to a session opencode names.
+        for (script, expected) in [
+            (vec![(200, r#"{"id":"ses_new"}"#)], "already has a session"),
+            (
+                vec![(404, "{}"), (200, r#"{"data":{"id":"ses_old"}}"#)],
+                "did not create session",
+            ),
+            (
+                vec![(404, "{}"), (404, "Not Found")],
+                "did not create session",
+            ),
+            (
+                vec![
+                    (404, "{}"),
+                    (200, created),
+                    (200, r#"{"id":"ses_new"}"#),
+                    (200, r#"[{"info":{}}]"#),
+                ],
+                "already holds 1 messages",
+            ),
+        ] {
+            let (port, server) = scripted(script);
+            let error = provision_fresh_session(port, "ses_new", Duration::from_secs(10))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            let seen = server.join().unwrap();
+            assert!(
+                seen.iter()
+                    .all(|(line, _)| !line.starts_with("POST /session ")),
+                "{seen:?}"
+            );
+        }
+    }
+
+    /// The session is proved new only on the worker's own server: one that
+    /// some other process listens on is refused before it is asked anything.
+    #[test]
+    fn a_session_is_proved_only_on_the_workers_own_server() {
+        let (port, server) = scripted(vec![(200, r#"{"id":"ses_new"}"#), (200, "[]")]);
+        let stamp = format!("opencode:{port}:ses_new");
+        let prove = |pane_pid| {
+            Opencode.prove_fresh(
+                &super::super::Target {
+                    name: "t",
+                    pane_pid,
+                    stamp: Some(&stamp),
+                },
+                "ses_new",
+                std::time::SystemTime::now(),
+            )
+        };
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let error = prove(other.id()).unwrap_err().to_string();
+        other.kill().unwrap();
+        other.wait().unwrap();
+        assert!(error.contains("not by this worker's opencode"), "{error}");
+        // This process listens, so as its own worker it passes.
+        prove(std::process::id()).unwrap();
+        server.join().unwrap();
+    }
+
+    /// An attempt's launch names its session only to `provision`, which
+    /// creates it; it never resumes one.
+    #[test]
+    fn an_attempt_launch_names_the_session_to_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = crate::manager::tests::test_mcp_context(dir.path());
+        context.topology = Some(crate::manager::TopologyMcpContext {
+            team: "Scoped".into(),
+            agent: "t.coder".into(),
+            endpoint: "localhost:1".into(),
+            token: "t".into(),
+            attempt: Some(crate::manager::TopologyAttempt {
+                id: "attempt".into(),
+                key: "key".into(),
+                native_session: "ses_abc".into(),
+            }),
+        });
+        let line = Opencode.launch_command(&Launch {
+            base_command: "opencode",
+            prompt_file: std::path::Path::new("/tmp/system.md"),
+            substitutions: &[],
+            shell_expr: "$(cat '/tmp/system.md')",
+            context: &context,
+        });
+        assert!(
+            line.starts_with("OMAR_OPENCODE_SESSION='ses_abc' "),
+            "{line}"
+        );
+        assert!(!line.contains("--session"), "{line}");
+        assert!(opencode_port(&line).is_some(), "{line}");
+        assert!(Opencode.new_conversation_id().starts_with("ses_"));
+        context.topology.as_mut().unwrap().attempt = None;
+        let line = Opencode.launch_command(&Launch {
+            base_command: "opencode",
+            prompt_file: std::path::Path::new("/tmp/system.md"),
+            substitutions: &[],
+            shell_expr: "$(cat '/tmp/system.md')",
+            context: &context,
+        });
+        assert!(!line.contains("OMAR_OPENCODE_SESSION"), "{line}");
     }
 
     #[test]

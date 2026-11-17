@@ -20,7 +20,10 @@ export async function startDelivery(path, pi, ctx) {
       try {
         const message = JSON.parse(input.slice(0, input.indexOf("\n")));
         if (message.session === true) {
-          socket.end(JSON.stringify({ session: ctx.sessionManager.getSessionFile() }) + "\n");
+          // The file `--session` reopens, and the id, which is all a
+          // `--no-session` conversation has.
+          socket.end(JSON.stringify({ session: ctx.sessionManager.getSessionFile() ?? null,
+            id: ctx.sessionManager.getSessionId() }) + "\n");
         } else {
           if (typeof message.text !== "string" || !message.text) throw new Error("missing text");
           pi.sendMessage({ customType: "omar_event", content: message.text, display: true },
