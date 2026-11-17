@@ -450,7 +450,9 @@ function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> 
   return new Map(
     snapshot.reactions.map((reaction) => {
       const owner = agents.get(reaction.agent);
-      const detail = [owner?.backend, reaction.status].filter(Boolean).join(" · ");
+      // Which model is behind an agent changes how you read what it did, and
+      // the program picked it deliberately, so it belongs on the task card.
+      const detail = [owner?.backend, owner?.model, reaction.status].filter(Boolean).join(" · ");
       return [
         reaction.id,
         {

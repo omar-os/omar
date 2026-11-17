@@ -83,6 +83,13 @@ impl Backend for Cursor {
     // `--exclude-workspace-context`, is print-mode only and rejected for some
     // accounts. A new conversation id is not a new context, so omarc refuses
     // `Cursor per tag`.
+    /// `--model`, ahead of the `acp` the runner appends.
+    fn model_flag(&self, model: &str) -> Option<String> {
+        Some(format!(
+            "--model {}",
+            crate::manager::shell_single_quote(model)
+        ))
+    }
     /// Cursor takes no message from outside its protocol, so it runs under
     /// OMAR's protocol runner, which owns a durable inbox for it.
     fn launch_command(&self, launch: &Launch<'_>) -> String {
