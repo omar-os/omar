@@ -149,6 +149,7 @@ jobs:
           python3 tests/ci/team_checkpoints.py
           python3 tests/ci/session_upgrade.py
           python3 tests/ci/session_view_port.py
+          python3 tests/ci/muse_app_connector.py
           python3 tests/ci/claude_resume_delivery.py
           python3 tests/ci/legacy_supervision.py
           python3 tests/ci/backend_coordination_contracts.py
@@ -467,7 +468,7 @@ jobs:
 
           # `[name : Backend, other : Backend]` on a team. A port's type is
           # lowercase (`inp : string`), so naming the backends keeps ports out.
-          BACKENDS = "ClaudeCode|Claude|Codex|Cursor|OpenCode|Agy|Jev|Stub|Web"
+          BACKENDS = "ClaudeCode|Claude|Codex|Cursor|OpenCode|Agy|Jev|Stub|Web|MuseApp"
           declaration = re.compile(rf"\b(\w+)\s*:\s*({BACKENDS})\b")
 
           def declared_backends(name):

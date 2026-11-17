@@ -17,6 +17,7 @@ mod mcp;
 mod memory;
 mod memory_wizard;
 mod metrics;
+mod muse_app;
 mod mutation;
 mod panic_hook;
 mod paths;
@@ -177,6 +178,18 @@ enum Commands {
     /// Run a topology in the selected runtime, or in a new session when none is selected
     #[command(visible_alias = "start")]
     Run(sessions::StartOptions),
+    /// Let Meta's Muse App answer this session's `MuseApp` agents. It serves
+    /// only their waiting tasks, behind a token, and prints the message that
+    /// sets the Muse App up. The Muse App runs in Meta's cloud, so put this
+    /// address behind a public HTTPS tunnel and pass that as --public-url.
+    MuseApp {
+        /// Address to listen on
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        listen: std::net::SocketAddr,
+        /// The public HTTPS URL the Muse App reaches this at
+        #[arg(long)]
+        public_url: Option<String>,
+    },
     /// List topology runs in the selected runtime
     Runs {
         #[arg(long)]
@@ -615,6 +628,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Logs { .. }
             | Commands::Down { .. }
             | Commands::Rm
+            | Commands::MuseApp { .. }
             | Commands::Run(_)
             | Commands::Runs { .. }
             | Commands::Memory
