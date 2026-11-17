@@ -11,9 +11,11 @@ mod diagram;
 mod ea;
 mod ea_lifecycle;
 mod event;
+mod knowledge;
 mod manager;
 mod mcp;
 mod memory;
+mod memory_wizard;
 mod metrics;
 mod mutation;
 mod panic_hook;
@@ -34,6 +36,8 @@ mod sessions;
 mod stub_agent;
 mod supervision;
 mod terminal;
+#[cfg(test)]
+mod test_tmux;
 mod tmux;
 mod topology;
 mod ui;
@@ -183,6 +187,8 @@ enum Commands {
         #[command(subcommand)]
         action: sessions::EaAction,
     },
+    /// Open the interactive saved-memory manager for the selected assistant
+    Memory,
     #[command(hide = true)]
     SessionDaemon { directory: PathBuf },
     #[command(hide = true)]
@@ -611,6 +617,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Rm
             | Commands::Run(_)
             | Commands::Runs { .. }
+            | Commands::Memory
             | Commands::Pause { .. }
             | Commands::Resume { .. }
             | Commands::Mutate { .. }
@@ -888,7 +895,7 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "Executive assistants and agents",
-        &["ea", "spawn", "list", "kill"],
+        &["ea", "memory", "spawn", "list", "kill"],
     ),
     ("Setup", &["setup-tmux", "help"]),
     (
