@@ -242,6 +242,9 @@ pub(crate) fn ensure_codex_runtime_flags(base_command: &str) -> String {
     command
 }
 
+/// Codex tool timeout for the omar MCP server, seconds (a day: never the binding bound).
+const MCP_TOOL_TIMEOUT_SEC: u32 = 86400;
+
 pub(crate) fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> {
     let server_exe = omar_server_exe()?;
     let context_file = materialize_mcp_context_file(context)?;
@@ -254,10 +257,14 @@ pub(crate) fn codex_mcp_overrides(context: &McpLaunchContext) -> Option<String> 
     .ok()?;
     let command_arg = format!("mcp_servers.omar.command={}", command);
     let args_arg = format!("mcp_servers.omar.args={}", args);
+    // Codex aborts an MCP tool call after 60 s by default. omar_complete runs the
+    // task's check and get_task can wait up to 600 s, so Codex's bound must not
+    // cut in first: OMAR's own bound is the task's within(...) or the run timeout.
     Some(format!(
-        "-c features.scheduled_tasks=false -c {} -c {}",
+        "-c features.scheduled_tasks=false -c {} -c {} -c mcp_servers.omar.tool_timeout_sec={}",
         shell_single_quote(&command_arg),
-        shell_single_quote(&args_arg)
+        shell_single_quote(&args_arg),
+        MCP_TOOL_TIMEOUT_SEC
     ))
 }
 

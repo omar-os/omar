@@ -27,9 +27,9 @@ use ts_rs::{Config, TS};
 
 use crate::chat_history::{Conversation, ConversationSummary, WorkflowDraft, WorkflowState};
 use crate::diagram::{
-    wire_name, DiagramAgent, DiagramEdge, DiagramEvent, DiagramEventKind, DiagramInstance,
-    DiagramPort, DiagramReaction, DiagramSnapshot, DiagramStatus, DiagramTag, DiagramTimer,
-    EdgeKind, ReactionStatus,
+    wire_name, DiagramAgent, DiagramCheck, DiagramEdge, DiagramEvent, DiagramEventKind,
+    DiagramInstance, DiagramPort, DiagramReaction, DiagramSnapshot, DiagramStatus, DiagramTag,
+    DiagramTimer, EdgeKind, ReactionStatus,
 };
 use crate::properties::{ProofProblem, PropertyVerdict};
 use crate::serve::{
@@ -153,6 +153,7 @@ fn vocabularies() -> Vec<Vocabulary> {
                 DiagramEventKind::RunPaused,
                 DiagramEventKind::RunCheckpointed,
                 DiagramEventKind::ClockStarted,
+                DiagramEventKind::CheckCompleted,
                 DiagramEventKind::SandboxStarted,
             ],
         ),
@@ -200,6 +201,7 @@ pub fn generate() -> String {
         DiagramAgent::decl(&config),
         DiagramPort::decl(&config),
         DiagramTimer::decl(&config),
+        DiagramCheck::decl(&config),
         DiagramReaction::decl(&config),
         DiagramEdge::decl(&config),
         DiagramSnapshot::decl(&config),

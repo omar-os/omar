@@ -173,6 +173,7 @@ fn update_as_install(instruction: &Instruction) -> Option<(String, Instruction)>
             body,
             instance,
             within,
+            check,
             title,
             description,
         } => Some((
@@ -187,6 +188,7 @@ fn update_as_install(instruction: &Instruction) -> Option<(String, Instruction)>
                 body,
                 instance,
                 within,
+                check,
                 title,
                 description,
             },
