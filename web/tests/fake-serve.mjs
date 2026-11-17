@@ -49,6 +49,8 @@ export async function startFakeServe({
   port = 0,
   /** Which captured topology to replay; see tests/fixtures. */
   snapshot: snapshotFile = "diagram-snapshot.v1.json",
+  /** Display metadata for exercising new snapshots beside the legacy fixture. */
+  taskMetadata = /** @type {Array<{title: string, description: string}>} */ ([]),
   /** The geometry a terminal announces, as the daemon reports the agent's. */
   terminal: terminalSize = { cols: 96, rows: 28 },
   terminalReflow = false,
@@ -60,6 +62,7 @@ export async function startFakeServe({
   const golden = JSON.parse(
     await readFile(new URL(`./fixtures/${snapshotFile}`, import.meta.url), "utf8"),
   );
+  golden.reactions.forEach((reaction, index) => Object.assign(reaction, taskMetadata[index] ?? {}));
 
   /** @type {Map<string, {record: object, snapshot: object, subscribers: Set<import("node:http").ServerResponse>, sequence: number}>} */
   const runs = new Map();
@@ -381,11 +384,17 @@ export async function startFakeServe({
       return json(response, 200, {
         backend,
         available: ["claude", "codex", "cursor", "opencode", "agy"],
+        sandbox: { default: sandboxDefault, installed: true },
       });
     }
     if (request.method === "GET" && url.pathname === "/v1/agent/backends") {
       return json(response, 200, {
-        backends: Object.entries(backendStatus).map(([name, status]) => ({ name, ...status, login: `omar connect ${name}` })),
+        backends: Object.entries(backendStatus).map(([name, status]) => ({
+          name,
+          ...status,
+          login: `omar connect ${name}`,
+          sandbox: { ...sandboxStatus[name], login: `omar connect ${name} --sandbox` },
+        })),
       });
     }
     // The daemon starts `omar connect <name>` in a session; here, pressing
@@ -398,8 +407,16 @@ export async function startFakeServe({
         if (!(connect[1] in backendStatus)) {
           return json(response, 404, { error: `'${connect[1]}' is not an assistant backend` });
         }
+        // `--sandbox`: Enter in the terminal stores a key for sandboxes instead.
+        const request = JSON.parse(body || "{}");
         signInActions[connect[1]] =
-          connect[2] === "disconnect" ? "disconnect" : JSON.parse(body || "{}").replace ? "replace" : "connect";
+          connect[2] === "disconnect"
+            ? "disconnect"
+            : request.sandbox
+              ? "sandbox"
+              : request.replace
+                ? "replace"
+                : "connect";
         return json(response, 200, { terminal: `/v1/backends/${connect[1]}/terminal` });
       });
     }
@@ -607,6 +624,8 @@ export async function startFakeServe({
             const action = signInActions[agent];
             if (action === "disconnect") {
               backendStatus[agent] = { status: "signed_out" };
+            } else if (action === "sandbox") {
+              sandboxStatus[agent] = { status: "connected", via: "anthropic key" };
             } else {
               backendStatus[agent] = { status: "connected", via: typed.startsWith("work") ? "work account" : "fake sign-in" };
               rejectedKeys[agent] = typed.startsWith("bad");
@@ -627,9 +646,20 @@ export async function startFakeServe({
   viewServer?.on("upgrade", upgrade(true));
 
   let backend = "codex";
+  /** Whether a run that says nothing runs in sandboxes (`[sandbox] enabled`). */
+  const sandboxDefault = process.env.FAKE_SANDBOX_DEFAULT === "1";
+  /** Each backend's key for sandboxes. */
+  const sandboxStatus = {
+    claude: { status: "signed_out" },
+    codex: { status: "connected", via: "ChatGPT" },
+    cursor: { status: "signed_out" },
+    opencode: { status: "signed_out" },
+    pi: { status: "signed_out" },
+    agy: { status: "signed_out" },
+  };
   /** Backends signed in with a key the test prompt finds rejected. */
   const rejectedKeys = {};
-  /** What each backend's open terminal does: connect, replace or disconnect. */
+  /** What each backend's open terminal does: connect, replace, disconnect or sandbox. */
   const signInActions = {};
   /** Each backend's status; a sign-in in its terminal connects it. */
   const backendStatus = {
@@ -651,13 +681,14 @@ export async function startFakeServe({
   function historyListing() { return { active_id: activeChat.id, conversations: [...chats.values()].filter(chat => !chat.removed).map(chatSummary).sort((a, b) => b.updated_at - a.updated_at), removed_ids: [...chats.values()].filter(chat => chat.removed).map(chat => chat.id) }; }
   const agentToken = randomUUID();
 
-  function publishChat(role, text, design, progress = false, selection = [], chat = activeChat) {
+  function publishChat(role, text, design, progress = false, selection = [], chat = activeChat, runtime = false) {
     chat.sequence += 1;
     const message = {
       sequence: chat.sequence,
       role,
       text,
       progress,
+      ...(runtime ? { runtime: true } : {}),
       design: design ?? null,
       selection,
     };
@@ -665,7 +696,7 @@ export async function startFakeServe({
     chat.messages.push(message);
     chat.updated_at = Date.now();
     if (role === "operator") chat.busy = true;
-    else if (!progress) chat.busy = false;
+    else if (!progress && !runtime) chat.busy = false;
     const kind = design ? "design_proposed" : "message";
     const frame = `id: ${message.sequence}\nevent: ${kind}\ndata: ${JSON.stringify(message)}\n\n`;
     for (const subscriber of chat.subscribers) subscriber.write(frame);
@@ -938,6 +969,8 @@ export async function startFakeServe({
       options: {
         keep_workspaces: request.keep_workspaces === true,
         checkpoint_period: typeof request.checkpoint_period === "string" ? request.checkpoint_period : null,
+        sandbox: request.sandbox === true,
+        no_sandbox: request.no_sandbox === true,
       },
       // One workspace per instance, named after the run: the file viewer
       // shows a run's own, never another run's.
@@ -1045,6 +1078,14 @@ export async function startFakeServe({
     const wait = () => new Promise((resolve) => setTimeout(resolve, stepMs));
     await wait();
     publish(entry, "run_started", {});
+    // A sandboxed run's teams each come up in a sandbox named the way the
+    // runtime names them, after the instance's workspace.
+    if (entry.options.sandbox) {
+      for (const instance of entry.snapshot.instances ?? []) {
+        instance.sandbox = `omar-team-${entry.record.run_id.slice(0, 8)}-${instance.name}`;
+        publish(entry, "sandbox_started", { instance: instance.id, sandbox: instance.sandbox });
+      }
+    }
     startClock(entry);
 
     // A pause lands at a tag boundary: nothing in flight, a checkpoint
@@ -1134,6 +1175,9 @@ export async function startFakeServe({
       return viewTerminalFrames;
     },
     agentToken,
+    publishRuntime(text) {
+      return publishChat("assistant", text, null, false, [], activeChat, true);
+    },
     async close() {
       for (const client of terminals.clients) client.terminate();
       terminals.close();

@@ -7,7 +7,7 @@ rust-version = "1.89"
 
 [package]
 name = "omar"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 rust-version.workspace = true
 description = "Agent dashboard for tmux"
@@ -51,6 +51,7 @@ resvg = { version = "0.45.1", default-features = false, features = ["text", "sys
 rpassword = "7"
 
 [dev-dependencies]
+ctor = "1.0.14"
 pretty_assertions = "1"
 tempfile = "3"
 

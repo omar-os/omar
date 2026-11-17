@@ -28,7 +28,8 @@ use uuid::Uuid;
 fn runtime_environment_key(key: &std::ffi::OsStr) -> bool {
     (key.to_string_lossy().starts_with("OMAR_")
         && key != "OMAR_JEV_MODEL"
-        && key != "OMAR_JEV_ON_ERROR")
+        && key != "OMAR_JEV_ON_ERROR"
+        && key != "OMAR_SBX_BIN")
         || key == "TMUX"
         || key == "TMUX_PANE"
         || key == "OMARC_BIN"
@@ -104,6 +105,20 @@ pub struct StartOptions {
     /// go with the run; a paused run keeps them either way.
     #[arg(long)]
     pub keep_workspaces: bool,
+    /// Run each team instance in its own Docker Sandbox (a microVM that sees
+    /// only its workspace), from `[sandbox].template` or OMAR's published kit.
+    /// Each team backend must be connected for sandboxes first:
+    /// `omar connect <backend> --sandbox`. On by default under
+    /// `[sandbox] enabled = true`.
+    #[arg(long)]
+    pub sandbox: bool,
+    /// Like --sandbox, from this kit: an image pinned by digest, or a local
+    /// kit directory.
+    #[arg(long)]
+    pub sandbox_template: Option<String>,
+    /// Run the teams on the host even where the config enables sandboxes.
+    #[arg(long, conflicts_with_all = ["sandbox", "sandbox_template"])]
+    pub no_sandbox: bool,
 }
 #[derive(Subcommand, Debug)]
 pub enum EaAction {
@@ -1099,6 +1114,17 @@ fn handle_operation(
     let target = ea::resolve_ea_selector(&session.directory, Some(ea))?;
     let _admission = crate::ea_lifecycle::Admission::acquire(&session.directory, target.id)?;
     match op {
+        "memory" => {
+            crate::knowledge::authenticated(
+                &session.directory,
+                operation["key"].as_str().unwrap_or(""),
+            )?;
+            crate::knowledge::operator(
+                &session.directory,
+                target.id,
+                serde_json::from_value(operation["request"].clone())?,
+            )
+        }
         "manager_start" => server.session_start_manager(target.id),
         "start" => server.session_start(target.id, operation["request"].clone()),
         "runs" => Ok(json!(server.session_runs(
@@ -1740,9 +1766,15 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             let files = crate::topology::imported_files(&options.program, &program)?;
             // The file name names a program whose `main` does not.
             let filename = options.program.file_name().map(|name| name.to_string_lossy().into_owned());
-            let body=json!({"program":program,"filename":filename,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces});
+            // A local kit directory is named for the runtime, whose cwd differs.
+            let template = options.sandbox_template.as_ref().map(|t| match Path::new(t).is_dir() {
+                true => fs::canonicalize(t).map(|p| p.to_string_lossy().into_owned()),
+                false => Ok(t.clone()),
+            }).transpose()?;
+            let body=json!({"program":program,"filename":filename,"files":files,"raw_inputs":options.inputs,"replace":options.replace,"timeout_seconds":options.timeout_seconds,"fast":options.fast,"checkpoint_period":options.checkpoint_period,"keep_workspaces":options.keep_workspaces,"sandbox":options.sandbox,"sandbox_template":template,"no_sandbox":options.no_sandbox});
             let mut run=rpc(&s,json!({"op":"start","ea":ea,"request":body}),Duration::from_secs(120))?;
             if owned { run["session"] = json!(s.name); }
+            for note in run["notes"].as_array().into_iter().flatten().filter_map(Value::as_str) { eprintln!("{note}"); }
             // One structured result: the admission record, or with --fg the terminal record.
             if !options.fg { return print_value(run); }
             let team = run["team"].as_str().unwrap_or("").to_string();
@@ -1775,6 +1807,8 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
             for (name, value) in state["state"].as_object().into_iter().flatten() { println!("State {name} = {value}"); }
             Ok(())
         })(),
+        Some(Commands::Memory) => target(cli).and_then(|s| crate::memory_wizard::run(&s.directory, |key, request|
+            rpc(&s, json!({"op":"memory","ea":ea_selector(cli),"key":key,"request":request}), Duration::from_secs(10)))) ,
         Some(Commands::Runs { all_eas }) => target(cli).and_then(|s|rpc(&s,json!({"op":"runs","ea":ea_selector(cli),"all_eas":all_eas}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Status { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"status","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Stop { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"stop","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
@@ -1841,6 +1875,7 @@ mod tests {
             "OMAR_JEV_MODEL",
             "OMAR_JEV_ON_ERROR",
             "TYPESAFE_API_KEY",
+            "OMAR_SBX_BIN",
             "PATH",
         ] {
             assert!(

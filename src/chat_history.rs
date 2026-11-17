@@ -711,6 +711,7 @@ mod tests {
             role: ChatRole::Operator,
             text: text.into(),
             progress: false,
+            runtime: false,
             design: None,
             selection: vec!["flow.planner".into()],
         }

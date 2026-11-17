@@ -158,6 +158,7 @@ fn main() {
 /// A built crate and the reactions it answers.
 #[derive(Debug)]
 pub struct Reactions {
+    cleanup_directory: Option<PathBuf>,
     binary: PathBuf,
     reactions: BTreeSet<String>,
 }
@@ -597,6 +598,7 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
         // Another run may have published it while this one waited.
         if published.exists() {
             return Ok(Some(Reactions {
+                cleanup_directory: None,
                 binary: published,
                 reactions,
             }));
@@ -622,16 +624,7 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
             std::fs::write(&main, &source)?;
         }
 
-        let output = Command::new("cargo")
-            .arg("build")
-            .arg("--release")
-            .arg("--offline")
-            .current_dir(dir)
-            .output()
-            .context(
-                "failed to invoke cargo; reactions are compiled, so a Rust \
-                 toolchain must be installed to run a program that uses them",
-            )?;
+        let output = build_with_cargo(dir)?;
         if !output.status.success() {
             bail!(
                 "failed to compile reactions:\n{}",
@@ -656,9 +649,64 @@ pub fn build(state: &VmState, dir: &Path) -> Result<Option<Reactions>> {
             .with_context(|| format!("failed to publish {}", published.display()))?;
     }
     Ok(Some(Reactions {
+        cleanup_directory: None,
         binary: published,
         reactions,
     }))
+}
+
+/// GUI launches often omit Rust's bin directory. Recover locally before
+/// reporting a missing dependency; only a missing executable permits fallback.
+fn build_with_cargo(dir: &Path) -> Result<std::process::Output> {
+    let candidates = match std::env::var_os("OMAR_CARGO") {
+        Some(path) => vec![PathBuf::from(path)],
+        None => {
+            let mut paths = vec![PathBuf::from("cargo")];
+            if let Some(home) = std::env::var_os("CARGO_HOME") {
+                paths.push(PathBuf::from(home).join("bin/cargo"));
+            }
+            if let Some(home) = dirs::home_dir() {
+                paths.push(home.join(".cargo/bin/cargo"));
+            }
+            paths
+        }
+    };
+    run_cargo_candidates(dir, &candidates).context(
+        "failed to invoke cargo; reactions are compiled, so a Rust toolchain must be installed to run a program that uses them. OMAR checked PATH and the configured Rust installation; install Rust or set OMAR_CARGO to its cargo executable",
+    )
+}
+
+fn run_cargo_candidates(
+    dir: &Path,
+    candidates: &[PathBuf],
+) -> std::io::Result<std::process::Output> {
+    let mut missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+    for (index, cargo) in candidates.iter().enumerate() {
+        let mut command = Command::new(cargo);
+        command
+            .args(["build", "--release", "--offline", "--target-dir", "target"])
+            .current_dir(dir);
+        if cargo.is_absolute() {
+            let mut paths = vec![cargo.parent().unwrap().to_path_buf()];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            if let Ok(path) = std::env::join_paths(paths) {
+                command.env("PATH", path);
+            }
+        }
+        if index > 0 {
+            eprintln!(
+                "OMAR: Trying to solve the missing Cargo problem using {}.",
+                cargo.display()
+            );
+        }
+        match command.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = error,
+            result => return result,
+        }
+    }
+    Err(missing)
 }
 
 /// The type a name carries on the wire, which the VM's tables decide. A timer
@@ -732,6 +780,12 @@ fn decode(raw: &str, ty: &str) -> Result<Value> {
 }
 
 impl Reactions {
+    /// VM-local cleanup markers: only the worktree and temp are host mounts.
+    pub fn with_cleanup_directory(mut self, directory: PathBuf) -> Self {
+        self.cleanup_directory = Some(directory);
+        self
+    }
+
     /// Where the built body lives, which a test asserts about.
     #[cfg(test)]
     pub fn binary(&self) -> &Path {
@@ -780,10 +834,12 @@ impl Reactions {
         }
         let marker = workspace
             .map(|(worktree, _)| -> Result<PathBuf> {
-                let directory = worktree
-                    .parent()
-                    .context("workspace has no parent")?
-                    .join("reactions");
+                let directory = self.cleanup_directory.clone().unwrap_or(
+                    worktree
+                        .parent()
+                        .context("workspace has no parent")?
+                        .join("reactions"),
+                );
                 std::fs::create_dir_all(&directory)?;
                 let marker = directory.join(uuid::Uuid::new_v4().to_string());
                 std::fs::write(&marker, "Reaction cleanup has not been confirmed.\n")?;
@@ -921,6 +977,24 @@ mod tests {
     use crate::topology::{verify, Bytecode};
 
     #[test]
+    fn missing_cargo_recovers_but_a_compiler_error_is_not_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("cargo");
+        let last = dir.path().join("must-not-run");
+        std::fs::write(&cargo, "#!/bin/sh\nprintf '%s\\n' \"$*\"\nexit 7\n").unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&last, "#!/bin/sh\ntouch should-not-exist\n").unwrap();
+        std::fs::set_permissions(&last, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output =
+            run_cargo_candidates(dir.path(), &[dir.path().join("missing"), cargo, last]).unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains("build --release --offline --target-dir target"));
+        assert!(!dir.path().join("should-not-exist").exists());
+    }
+
+    #[test]
     fn reaction_descendants_stop_on_return_timeout_and_error() {
         use std::os::unix::fs::PermissionsExt;
         for mode in ["return", "timeout", "error"] {
@@ -945,6 +1019,7 @@ mod tests {
             )).unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
             let code = Reactions {
+                cleanup_directory: None,
                 binary,
                 reactions: BTreeSet::new(),
             };
