@@ -5011,7 +5011,6 @@ fn paused_runs(omar_dir: &Path, ea_id: EaId) -> BTreeMap<String, RunRecord> {
                         .join("run.json");
                     let _ = topology::write_json_atomic(&path, &record);
                 }
-                RunStatus::Failed | RunStatus::Completed => {}
                 _ => return None,
             }
             Some((record.run_id.clone(), record))
@@ -6204,6 +6203,7 @@ mod tests {
                 role: ChatRole::Operator,
                 text: "Keep this across harnesses".into(),
                 progress: false,
+                runtime: false,
                 design: None,
                 selection: vec![],
             })

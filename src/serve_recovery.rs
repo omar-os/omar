@@ -367,6 +367,7 @@ mod tests {
             diagram_address: None,
             started_at: 1,
             finished_at: Some(2),
+            activity_at: 2000,
             error: Some("failed to invoke cargo: No such file or directory".into()),
             present: Vec::new(),
             outputs: BTreeMap::new(),
