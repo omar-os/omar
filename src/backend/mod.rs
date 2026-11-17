@@ -24,6 +24,7 @@ pub(crate) mod connection;
 pub(crate) mod cursor;
 pub(crate) mod jev;
 pub(crate) mod managed;
+pub(crate) mod muse;
 pub(crate) mod opencode;
 pub(crate) mod pi;
 pub(crate) mod spool;
@@ -165,6 +166,7 @@ pub enum Kind {
     Claude,
     Codex,
     Cursor,
+    Muse,
     Opencode,
     Pi,
     Jev,
@@ -480,10 +482,11 @@ pub(crate) fn remember_conversation(
     Ok(())
 }
 
-pub const ALL: [&dyn Backend; 8] = [
+pub const ALL: [&dyn Backend; 9] = [
     &claude::Claude,
     &codex::Codex,
     &cursor::Cursor,
+    &muse::Muse,
     &opencode::Opencode,
     &pi::Pi,
     &antigravity::Antigravity,
@@ -494,10 +497,11 @@ pub const ALL: [&dyn Backend; 8] = [
 /// Backends an operator can run an assistant on.
 ///
 /// Stub and Jev are deliberately absent: neither is a conversational assistant.
-pub const ASSISTANT: [Kind; 6] = [
+pub const ASSISTANT: [Kind; 7] = [
     Kind::Claude,
     Kind::Codex,
     Kind::Cursor,
+    Kind::Muse,
     Kind::Opencode,
     Kind::Pi,
     Kind::Antigravity,
@@ -509,7 +513,7 @@ pub fn of(kind: Kind) -> &'static dyn Backend {
         .expect("every kind is registered")
 }
 
-pub fn assistant_names() -> [&'static str; 6] {
+pub fn assistant_names() -> [&'static str; 7] {
     ASSISTANT.map(Kind::name)
 }
 
@@ -526,7 +530,7 @@ pub fn resolve(name: &str) -> Result<&'static dyn Backend, String> {
     // but cannot supply a command for an executive assistant or coding pane.
     let backend = by_name(name).ok_or_else(|| {
         format!(
-            "Unknown backend '{}'. Supported: claude, codex, cursor, opencode, pi, agy, stub, web; topology-only: jev",
+            "Unknown backend '{}'. Supported: claude, codex, cursor, muse, opencode, pi, agy, stub, web; topology-only: jev",
             name
         )
     })?;
@@ -804,6 +808,7 @@ mod tests {
             Kind::Claude,
             Kind::Codex,
             Kind::Cursor,
+            Kind::Muse,
             Kind::Opencode,
             Kind::Pi,
             Kind::Jev,
@@ -819,7 +824,7 @@ mod tests {
         }
         assert_eq!(
             assistant_names(),
-            ["claude", "codex", "cursor", "opencode", "pi", "agy"]
+            ["claude", "codex", "cursor", "muse", "opencode", "pi", "agy"]
         );
     }
 

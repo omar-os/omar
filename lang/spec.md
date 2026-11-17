@@ -107,7 +107,7 @@ A parameter is read back in a prompt as `$(idx)`, the same spelling a trigger
 uses.
 
 An agent's backend names what answers its reactions: `Claude` (or
-`ClaudeCode`), `Codex`, `Cursor`, `OpenCode`, `Agy`, `Stub`, or `Web`. The
+`ClaudeCode`), `Codex`, `Cursor`, `Muse`, `OpenCode`, `Agy`, `Stub`, or `Web`. The
 compiler takes any identifier here; an unknown one compiles and fails when the
 runtime tries to start it. Case does not matter.
 

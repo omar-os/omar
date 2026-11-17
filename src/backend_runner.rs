@@ -1,4 +1,4 @@
-//! Protocol-owned Cursor, Antigravity, and Codex exec sessions. The inbox is durable and never
+//! Protocol-owned Cursor, Muse, Antigravity, and Codex exec sessions. The inbox is durable and never
 //! writes to a terminal composer. One backend turn runs at a time.
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -265,7 +265,7 @@ async fn codex_turn(
 pub async fn run(path: &Path) -> Result<()> {
     let config: Config = serde_json::from_slice(&std::fs::read(path)?)?;
     anyhow::ensure!(
-        matches!(config.backend.as_str(), "cursor" | "agy" | "codex"),
+        matches!(config.backend.as_str(), "cursor" | "muse" | "agy" | "codex"),
         "unsupported protocol backend"
     );
     let context: crate::manager::McpLaunchContext =
@@ -293,9 +293,12 @@ pub async fn run(path: &Path) -> Result<()> {
         state: Mutex::new(inbox),
         changed: Notify::new(),
     });
+    // Cursor and Muse both speak ACP; the rest of this file says "acp" for them.
+    let acp = matches!(config.backend.as_str(), "cursor" | "muse");
     let mut command = config.command.clone();
     match config.backend.as_str() {
         "cursor" => command.push_str(" acp"),
+        "muse" => command = crate::backend::muse::acp_command(&command),
         "agy" => {
             if let Some(session) = &queue.state.lock().await.session {
                 command.push_str(&format!(
@@ -337,18 +340,22 @@ pub async fn run(path: &Path) -> Result<()> {
             }
         })
     };
-    if config.backend == "cursor" {
+    if acp {
         let engine = engine.as_mut().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(45), async {
             engine.rpc("initialize", json!({"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"omar","version":env!("CARGO_PKG_VERSION")}})).await?;
-            engine.rpc("authenticate", json!({"methodId":"cursor_login"})).await?;
+            // Muse's `authenticate` starts a device login no one is here to
+            // finish; it signs in beforehand (`omar connect muse`).
+            if config.backend == "cursor" {
+                engine.rpc("authenticate", json!({"methodId":"cursor_login"})).await?;
+            }
             let previous = queue.state.lock().await.session.clone();
             let mut params = json!({"cwd":std::env::current_dir()?,"mcpServers":[{"name":"omar","command":std::env::current_exe()?,"args":["mcp-server","--context-file",config.context_file],"env":[]}]});
             let mut method = if let Some(session) = previous { params["sessionId"] = session.into(); "session/load" } else { "session/new" };
             let result = match engine.rpc(method, params.clone()).await {
                 Ok(result) => result,
                 Err(error) if method == "session/load" => {
-                    eprintln!("Could not resume Cursor session: {error:#}; restoring saved chat context.");
+                    eprintln!("Could not resume {} session: {error:#}; restoring saved chat context.", config.backend);
                     method = "session/new";
                     params.as_object_mut().unwrap().remove("sessionId");
                     engine.rpc(method, params.clone()).await?
@@ -357,7 +364,12 @@ pub async fn run(path: &Path) -> Result<()> {
             };
             let session = if method == "session/load" { params["sessionId"].as_str() } else { result["sessionId"].as_str() }.context("ACP omitted sessionId")?;
             let mut state = queue.state.lock().await;
-            crate::backend::remember_conversation(&context, "cursor", session)?;
+            crate::backend::remember_conversation(&context, &config.backend, session)?;
+            // Muse asks before tools unless the session itself allows all;
+            // only an explicitly authorized --yolo launch selects that.
+            if config.backend == "muse" && engine.allow_permissions {
+                engine.rpc("session/set_mode", json!({"sessionId":session,"modeId":"allowAll"})).await?;
+            }
             state.session = Some(session.to_owned());
             save(&queue.path, &state)?;
             Ok::<_, anyhow::Error>(())
@@ -405,11 +417,11 @@ pub async fn run(path: &Path) -> Result<()> {
             let prompt = format!("{instructions}\n\n[{origin}; message {}]\n{}\n\n{live}", message.id, message.text);
             if config.backend == "codex" {
                 codex_turn(&config, &context, &queue, &prompt).await?;
-            } else if config.backend == "cursor" {
+            } else if acp {
                 let engine = engine.as_mut().unwrap();
                 let session = queue.state.lock().await.session.clone().context("missing ACP session")?;
                 let result = engine.rpc("session/prompt", json!({"sessionId":session,"prompt":[{"type":"text","text":prompt}]})).await?;
-                anyhow::ensure!(result["stopReason"] != "cancelled", "Cursor cancelled the turn; message remains pending");
+                anyhow::ensure!(result["stopReason"] != "cancelled", "{} cancelled the turn; message remains pending", config.backend);
             } else {
                 let engine = engine.as_mut().unwrap();
                 engine.write(json!({"event":"user","message":{"content":prompt}})).await?;

@@ -236,6 +236,18 @@ jobs:
           python3 tests/ci/claude_workflow_contract.py
           python3 tests/ci/opencode_wake_contract.py
           python3 tests/ci/codex_event_wake.py
+      # Muse's installer has no version pin; it takes the stable channel.
+      # Its echo provider answers with no model and no Meta login.
+      - name: Install Muse Code
+        run: |
+          curl -fsSL https://dev.meta.ai/install.sh | MUSE_NO_MODIFY_PATH=1 bash
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+      - name: Verify Muse takes events over ACP and resumes its session
+        env:
+          MUSE_NO_AUTO_UPDATE: '1'
+        run: |
+          muse --version
+          python3 tests/ci/muse_runner.py
 
   pi-bridge:
     name: Pi Bridge
@@ -467,7 +479,7 @@ jobs:
 
           # `[name : Backend, other : Backend]` on a team. A port's type is
           # lowercase (`inp : string`), so naming the backends keeps ports out.
-          BACKENDS = "ClaudeCode|Claude|Codex|Cursor|OpenCode|Agy|Jev|Stub|Web"
+          BACKENDS = "ClaudeCode|Claude|Codex|Cursor|Muse|OpenCode|Agy|Jev|Stub|Web"
           declaration = re.compile(rf"\b(\w+)\s*:\s*({BACKENDS})\b")
 
           def declared_backends(name):

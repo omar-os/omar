@@ -108,6 +108,7 @@ fn services(backend: &str) -> Result<&'static [&'static str]> {
         Kind::Opencode | Kind::Pi => MODELS,
         Kind::Stub => &[],
         Kind::Jev => bail!("Jev agents cannot run in sandboxes yet"),
+        Kind::Muse => bail!("Muse agents cannot run in sandboxes yet"),
     })
 }
 

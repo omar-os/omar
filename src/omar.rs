@@ -272,7 +272,7 @@ enum Commands {
 
     /// Install an agent backend and sign it in
     Connect {
-        /// claude, codex, cursor, opencode, pi or agy; omit to pick from a list
+        /// claude, codex, cursor, muse, opencode, pi or agy; omit to pick from a list
         backend: Option<String>,
         /// Sign in again even if its sign-in works, to switch to another
         /// account or kind of sign-in
@@ -288,7 +288,7 @@ enum Commands {
 
     /// Sign an agent backend out
     Disconnect {
-        /// claude, codex, cursor, opencode, pi or agy
+        /// claude, codex, cursor, muse, opencode, pi or agy
         backend: String,
         /// Remove its sandbox sign-in instead, the key Docker Sandboxes holds
         #[arg(long)]
