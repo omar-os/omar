@@ -47,6 +47,16 @@ function bundled() {
 
 const AVAILABLE = bundled();
 
+/** With no backend signed in (as on CI), Mission Control opens the Backends
+    page first; it is the same page as on the machine, so close it. */
+async function closeBackends(page) {
+  const backends = page.getByRole("dialog", { name: "Backends" });
+  await backends.waitFor({ timeout: 5_000 }).then(
+    () => backends.getByRole("button", { name: "Close" }).click(),
+    () => {},
+  );
+}
+
 async function shot(page, name) {
   if (SHOTS) await page.screenshot({ path: join(SHOTS, `${name}.png`) });
 }
@@ -100,6 +110,7 @@ describe("omar gateway", { skip: AVAILABLE ? false : "no bundled runtime" }, () 
     // Straight into the session the address named, served by its daemon.
     const workflows = page.getByRole("list", { name: "Saved chats" });
     await workflows.getByRole("listitem").first().waitFor({ timeout: 15_000 });
+    await closeBackends(page);
     await shot(page, "2-mission-control");
 
     // The menu leads back to the session list, and out.
@@ -111,6 +122,7 @@ describe("omar gateway", { skip: AVAILABLE ? false : "no bundled runtime" }, () 
     await shot(page, "4-sessions");
     await sessions.getByRole("link", { name: /demo/ }).click();
     await workflows.getByRole("listitem").first().waitFor({ timeout: 15_000 });
+    await closeBackends(page);
     await page.getByRole("button", { name: "Settings" }).click();
     await page.getByRole("menuitem", { name: "Sign out" }).click();
     await page.getByRole("button", { name: "Sign in" }).waitFor();
