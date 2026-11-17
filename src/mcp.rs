@@ -3202,6 +3202,7 @@ mod tests {
                     agent: "worker".into(),
                     endpoint: "127.0.0.1:1".into(),
                     token: "test".into(),
+                    attempt: None,
                 });
             }
             assert!(!listed_tools(restricted.clone())
