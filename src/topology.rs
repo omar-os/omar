@@ -1341,6 +1341,9 @@ struct InvocationRecord {
     contexts: BTreeMap<String, Option<String>>,
     context_names: BTreeSet<String>,
     prompt: String,
+    /// The prompt as the program wrote it, its `$(...)` left in: for a client
+    /// that must tell the author's instructions from the values fed in.
+    instructions: String,
     writes: BTreeMap<String, Value>,
     completed: bool,
 }
@@ -1356,6 +1359,8 @@ struct PendingInvocation {
     reaction: String,
     contract: String,
     prompt: String,
+    #[serde(default)]
+    instructions: String,
     trigger_values: BTreeMap<String, Value>,
     allowed_effects: BTreeMap<String, String>,
     /// Its instance's state, which it may also write, and each one's type.
@@ -1587,6 +1592,7 @@ impl InvocationRegistry {
                         reaction: entry.record.reaction.clone(),
                         contract: entry.record.contract.clone(),
                         prompt: entry.record.prompt.clone(),
+                        instructions: entry.record.instructions.clone(),
                         trigger_values: entry.record.trigger_values.clone(),
                         allowed_effects: entry.record.allowed_effects.clone(),
                         state: entry.record.state_values.clone(),
@@ -1816,6 +1822,12 @@ pub fn panel_pending(access: &PanelAccess, team: &str) -> Result<Vec<Value>> {
             let mut item = item.clone();
             if let Some(object) = item.as_object_mut() {
                 object.insert("agent".to_string(), json!(agent));
+                let backend = if access.muse_app.contains(agent) {
+                    "MuseApp"
+                } else {
+                    "Web"
+                };
+                object.insert("backend".to_string(), json!(backend));
             }
             waiting.push(item);
         }
@@ -2304,6 +2316,7 @@ fn invocation_record(team: &str, invocation: &InvocationSpec) -> Result<Invocati
         contexts: invocation.contexts.clone(),
         context_names: invocation.context_names.clone(),
         prompt: render_prompt(&invocation.prompt, &prompt_values(invocation))?,
+        instructions: invocation.prompt.clone(),
         writes: BTreeMap::new(),
         completed: false,
     })
@@ -2684,6 +2697,8 @@ pub struct PanelAccess {
     /// The `web` agents in this run. Everything else answers through its own
     /// pane, and a panel has no business offering to answer for them.
     pub agents: BTreeSet<String>,
+    /// Those of them the Muse App answers; the rest are for a person.
+    pub muse_app: BTreeSet<String>,
 }
 
 /// How a run ended when it did not fail: it drained its queue, or an
@@ -3405,6 +3420,12 @@ fn launch(
                 endpoint: invocation_server.endpoint.clone(),
                 token: invocation_server.token.clone(),
                 agents: web.clone(),
+                muse_app: state
+                    .agents
+                    .iter()
+                    .filter(|(_, agent)| canonical_backend(&agent.backend) == "museapp")
+                    .map(|(name, _)| name.clone())
+                    .collect(),
             });
         }
     }
@@ -5129,14 +5150,19 @@ fn needs_agent_process(backend: &str) -> bool {
         && !crate::backend::by_name(backend).is_some_and(|backend| backend.topology_only())
 }
 
-/// Web agents are answered by a client through the invocation registry.
+/// Web agents are answered by a client through the invocation registry. A
+/// `MuseApp` agent is one too: its client is Meta's Muse App, which no one
+/// can call, so it pulls its work through `omar muse-app` (see muse_app.rs).
 fn is_web_backend(backend: &str) -> bool {
-    canonical_backend(backend) == "web"
+    matches!(canonical_backend(backend), "web" | "museapp")
 }
 
 fn canonical_backend(backend: &str) -> &str {
     if backend.eq_ignore_ascii_case("web") {
         return "web";
+    }
+    if backend.eq_ignore_ascii_case("museapp") {
+        return "museapp";
     }
     crate::backend::by_name(backend)
         .map(|backend| backend.kind().name())
@@ -6567,6 +6593,9 @@ mod tests {
         assert!(!needs_agent_process("Jev"));
         assert!(!needs_agent_process(" JeV "));
         assert!(!needs_agent_process("Web"));
+        // The Muse App answers from Meta's cloud, through the panel like Web.
+        assert!(!needs_agent_process("MuseApp"));
+        assert!(is_web_backend("museapp"));
         assert!(needs_agent_process("Codex"));
         assert!(needs_agent_process("ClaudeCode"));
         assert!(needs_agent_process("Stub"));

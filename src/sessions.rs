@@ -1801,6 +1801,7 @@ pub async fn dispatch(cli: &Cli) -> Option<Result<()>> {
         })(),
         Some(Commands::Memory) => target(cli).and_then(|s| crate::memory_wizard::run(&s.directory, |key, request|
             rpc(&s, json!({"op":"memory","ea":ea_selector(cli),"key":key,"request":request}), Duration::from_secs(10)))) ,
+        Some(Commands::MuseApp { listen, public_url }) => target(cli).and_then(|s| crate::muse_app::serve(&s, *listen, public_url.as_deref())),
         Some(Commands::Runs { all_eas }) => target(cli).and_then(|s|rpc(&s,json!({"op":"runs","ea":ea_selector(cli),"all_eas":all_eas}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Status { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"status","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
         Some(Commands::Stop { deployment }) => target(cli).and_then(|s|rpc(&s,json!({"op":"stop","ea":ea_selector(cli),"run":deployment}),Duration::from_secs(5))).and_then(print_value),
