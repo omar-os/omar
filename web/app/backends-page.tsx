@@ -19,14 +19,34 @@ const NOTE =
   "This is the backend's own install and sign-in; it closes once the backend answers a test prompt.";
 
 /** What a terminal opened here does to a backend's sign-in. */
-type Action = "connect" | "replace" | "disconnect";
+type Action = "connect" | "replace" | "disconnect" | "sandbox";
 
 const NOTES: Record<Action, string> = {
   connect: NOTE,
   replace:
     "This is the backend's own sign-in, run again; it closes once the new one answers a test prompt.",
   disconnect: "This is the backend's own sign-out; it closes once it finishes.",
+  sandbox:
+    "This reuses the backend's API key, or asks Docker Sandboxes for one; it closes once the backend answers a test prompt inside a sandbox.",
 };
+
+/** How the backend stands for sandboxed teams, or null without sbx. */
+function describeSandbox(status: BackendStatus): string | null {
+  const sandbox = status.sandbox;
+  if (!sandbox || sandbox.status === "not_installed") return null;
+  switch (sandbox.status) {
+    case "connected":
+      return sandbox.via
+        ? `Sandboxes · ${sandbox.via}`
+        : "Sandboxes · connected";
+    case "signed_out":
+      return "Sandboxes · not connected";
+    default:
+      return sandbox.reason
+        ? `Sandboxes · ${sandbox.reason}`
+        : "Sandboxes · unknown";
+  }
+}
 
 function describe(status: BackendStatus, rejected?: string): string {
   if (rejected) return "Signed in, but its test prompt failed";
@@ -50,6 +70,9 @@ function describe(status: BackendStatus, rejected?: string): string {
  * terminal closes only when that works. A working sign-in can be replaced
  * (`omar connect <backend> --replace`) or, once confirmed, signed out
  * (`omar disconnect <backend>`); both are done when their terminal ends.
+ * Where Docker Sandboxes is installed, each backend also shows its sandbox
+ * sign-in, with a Sandbox button that runs `omar connect <backend> --sandbox`,
+ * done when its terminal ends too.
  */
 export function BackendsPage({
   serveUrl,
@@ -147,7 +170,10 @@ export function BackendsPage({
       if (next === "disconnect") {
         await startDisconnect(serveUrl, backend);
       } else {
-        await startConnect(serveUrl, backend, next === "replace");
+        await startConnect(serveUrl, backend, {
+          replace: next === "replace",
+          sandbox: next === "sandbox",
+        });
       }
       setPhase("waiting");
       setAction(next);
@@ -157,7 +183,7 @@ export function BackendsPage({
     }
   }
 
-  // A replace or sign-out is done when its terminal ends.
+  // A replace, sign-out or sandbox sign-in is done when its terminal ends.
   async function ended() {
     if (!connecting || action === "connect") return;
     const list = await refresh();
@@ -202,67 +228,88 @@ export function BackendsPage({
           </p>
         ) : null}
         <ul>
-          {(statuses ?? []).map((status) => (
-            <li key={status.name} data-status={status.status}>
-              <span className="backend-name">
-                {backendLabel(status.name)}
-                <small title={rejected[status.name]}>
-                  {describe(status, rejected[status.name])}
-                </small>
-              </span>
-              <span className="backend-actions">
-                {confirming === status.name ? (
-                  <>
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      onClick={() => setConfirming(null)}
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Sign ${backendLabel(status.name)} out`}
-                      onClick={() => void connect(status.name, "disconnect")}
-                    >
-                      Sign out
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    {status.status === "connected" ? (
+          {(statuses ?? []).map((status) => {
+            const sandbox = describeSandbox(status);
+            return (
+              <li key={status.name} data-status={status.status}>
+                <span className="backend-name">
+                  {backendLabel(status.name)}
+                  <small title={rejected[status.name]}>
+                    {describe(status, rejected[status.name])}
+                  </small>
+                  {sandbox ? (
+                    <small className="backend-sandbox">
+                      {sandbox}
+                      {status.sandbox?.status !== "connected" ? (
+                        <>
+                          {" · "}
+                          <button
+                            type="button"
+                            className="link-button"
+                            aria-label={`Set up ${backendLabel(status.name)} for sandboxes`}
+                            onClick={() => void connect(status.name, "sandbox")}
+                          >
+                            Set up
+                          </button>
+                        </>
+                      ) : null}
+                    </small>
+                  ) : null}
+                </span>
+                <span className="backend-actions">
+                  {confirming === status.name ? (
+                    <>
                       <button
                         type="button"
                         className="secondary-button"
-                        aria-label={`Disconnect ${backendLabel(status.name)}`}
-                        onClick={() => setConfirming(status.name)}
+                        onClick={() => setConfirming(null)}
                       >
-                        Disconnect
+                        Cancel
                       </button>
-                    ) : null}
-                    {working(status) ? (
                       <button
                         type="button"
-                        className="secondary-button"
-                        aria-label={`Replace ${backendLabel(status.name)}'s sign-in`}
-                        onClick={() => void connect(status.name, "replace")}
+                        aria-label={`Sign ${backendLabel(status.name)} out`}
+                        onClick={() => void connect(status.name, "disconnect")}
                       >
-                        Replace
+                        Sign out
                       </button>
-                    ) : (
-                      <button
-                        type="button"
-                        aria-label={`Connect ${backendLabel(status.name)}`}
-                        onClick={() => void connect(status.name)}
-                      >
-                        Connect
-                      </button>
-                    )}
-                  </>
-                )}
-              </span>
-            </li>
-          ))}
+                    </>
+                  ) : (
+                    <>
+                      {status.status === "connected" ? (
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          aria-label={`Disconnect ${backendLabel(status.name)}`}
+                          onClick={() => setConfirming(status.name)}
+                        >
+                          Disconnect
+                        </button>
+                      ) : null}
+                      {working(status) ? (
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          aria-label={`Replace ${backendLabel(status.name)}'s sign-in`}
+                          onClick={() => void connect(status.name, "replace")}
+                        >
+                          Replace
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          aria-label={`Connect ${backendLabel(status.name)}`}
+                          onClick={() => void connect(status.name)}
+                        >
+                          Connect
+                        </button>
+                      )}
+                    </>
+                  )}
+                </span>
+              </li>
+            );
+          })}
         </ul>
       </section>
       {connecting ? (
@@ -275,7 +322,9 @@ export function BackendsPage({
               ? `Replace ${backendLabel(connecting)}'s sign-in`
               : action === "disconnect"
                 ? `Disconnect ${backendLabel(connecting)}`
-                : `Connect ${backendLabel(connecting)}`
+                : action === "sandbox"
+                  ? `Set up ${backendLabel(connecting)} for sandboxes`
+                  : `Connect ${backendLabel(connecting)}`
           }
           note={
             phase === "checking" ? (

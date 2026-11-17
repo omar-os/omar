@@ -29,7 +29,7 @@ export const PORT_KINDS = ["input", "output", "action"] as const;
 export type PortKind = (typeof PORT_KINDS)[number];
 
 /** What happened, as the event stream names it. */
-export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started"] as const;
+export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started", "sandbox_started"] as const;
 export type DiagramEventKind = (typeof DIAGRAM_EVENT_KINDS)[number];
 
 /** Who spoke. */
@@ -50,7 +50,12 @@ team: string,
  * given rather than the name so a client never has to re-derive one from
  * the other.
  */
-parent: string, };
+parent: string,
+/**
+ * The Docker Sandbox it runs in, once that sandbox is up. Absent for a
+ * team on the host, and for one whose sandbox is still starting.
+ */
+sandbox?: string, };
 
 export type DiagramAgent = { id: string, name: string, backend: string,
 /**
@@ -66,7 +71,11 @@ export type DiagramTimer = { id: string, name: string, offset: number,
  */
 period: number, last_tag: DiagramTag | null, instance: string, };
 
-export type DiagramReaction = { id: string, name: string, agent: string, order: number, triggers: Array<string>, effects: Array<string>, contract: string, status: ReactionStatus, invocation_id: string | null, instance: string,
+export type DiagramReaction = { id: string, name: string,
+/**
+ * Human-readable task copy; absent in workflows created before task metadata.
+ */
+title?: string, description?: string, agent: string, order: number, triggers: Array<string>, effects: Array<string>, contract: string, status: ReactionStatus, invocation_id: string | null, instance: string,
 /**
  * Nanoseconds this reaction gave itself, or `None` for one bounded only by
  * the run. Carried so a client can draw the bound rather than leaving the
@@ -162,7 +171,12 @@ export type ChatMessage = { sequence: number, role: ChatRole, text: string,
 /**
  * Commentary while working, rather than something awaiting an answer.
  */
-progress: boolean, design: ProposedDesign | null,
+progress: boolean,
+/**
+ * Runtime guidance does not finish or interrupt an assistant turn.
+ * An optional field keeps saved chats readable by older runtimes.
+ */
+runtime?: boolean, design: ProposedDesign | null,
 /**
  * Diagram components the operator had selected when they sent this.
  * "this one" is unresolvable in text; a selection says which.

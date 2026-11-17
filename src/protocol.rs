@@ -153,6 +153,7 @@ fn vocabularies() -> Vec<Vocabulary> {
                 DiagramEventKind::RunPaused,
                 DiagramEventKind::RunCheckpointed,
                 DiagramEventKind::ClockStarted,
+                DiagramEventKind::SandboxStarted,
             ],
         ),
         vocabulary(
