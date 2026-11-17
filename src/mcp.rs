@@ -3203,6 +3203,7 @@ mod tests {
                     endpoint: "127.0.0.1:1".into(),
                     token: "test".into(),
                     attempt: None,
+                    resume: None,
                 });
             }
             assert!(!listed_tools(restricted.clone())
