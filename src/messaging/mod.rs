@@ -163,6 +163,10 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
             }
             state.seen.insert(key, now + self.dedup_ttl);
         }
+        if c.platform == "discord" && message.command == "help" {
+            self.reply(d, "Use /list to see your saved workflows, /run workflow:<name> to run one, or /new-chat to start fresh. Send a regular message to talk to the assistant. Keep your local OMAR connector running.".into(), None).await;
+            return;
+        }
         if c.platform == "discord" && proposal::action(&message.command) {
             self.review_action(&message).await;
             return;

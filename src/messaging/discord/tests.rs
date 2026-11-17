@@ -528,3 +528,168 @@ async fn discord_review_sends_graph_and_source_before_enabling_version_bound_but
     assert_eq!(components[0]["custom_id"], format!("omar:approve:{token}"));
     assert_eq!(buttons["allowed_mentions"]["parse"], json!([]));
 }
+
+fn slash_event(name: &str) -> Value {
+    json!({"id":"1002","application_id":"999","type":2,"channel_id":"456","user":{"id":"123"},
+        "data":{"type":1,"name":name}})
+}
+
+#[test]
+fn slash_commands_are_dm_only_and_have_no_machine_specific_choices() {
+    let commands = slash_commands();
+    assert_eq!(commands.len(), 4);
+    for command in &commands {
+        assert_eq!(command["contexts"], json!([1]));
+        assert!(command_matches(command, command));
+    }
+    let run = commands
+        .iter()
+        .find(|command| command["name"] == "run")
+        .unwrap();
+    assert!(run["options"][0].get("choices").is_none());
+    let mut saved = run.clone();
+    saved["id"] = json!("1234");
+    saved["options"][0]["autocomplete"] = json!(false);
+    assert!(command_matches(&saved, run));
+    saved["contexts"] = json!([0]);
+    assert!(!command_matches(&saved, run));
+}
+
+#[test]
+fn slash_routes_only_the_verified_owner_and_valid_options() {
+    for (name, expected) in [("list", "list"), ("new-chat", "new chat"), ("help", "help")] {
+        let m = normalize_interaction(&slash_event(name), "999", &channels()).unwrap();
+        assert_eq!(m.command, expected);
+        assert!(m.destination.thread_id.is_none());
+    }
+    let mut e = slash_event("run");
+    e["data"]["options"] = json!([{"name":"workflow","type":3,"value":"web-News-1"}]);
+    assert_eq!(
+        normalize_interaction(&e, "999", &channels())
+            .unwrap()
+            .command,
+        "run web-News-1"
+    );
+    for (field, value) in [
+        ("guild_id", json!("111")),
+        ("application_id", json!("998")),
+        ("channel_id", json!("457")),
+        ("user", json!({"id":"124"})),
+        (
+            "data",
+            json!({"type":1,"name":"run","options":[{"name":"workflow","type":3,"value":"../outside"}]}),
+        ),
+        (
+            "data",
+            json!({"type":1,"name":"new-chat","options":[{"name":"extra","type":3,"value":"x"}]}),
+        ),
+    ] {
+        let mut bad = e.clone();
+        bad[field] = value;
+        assert!(normalize_interaction(&bad, "999", &channels()).is_none());
+    }
+}
+
+#[tokio::test]
+async fn slash_acknowledgement_is_a_message_and_never_uses_bot_auth() {
+    let (api, server) = fixture_http("200 OK", json!({})).await;
+    acknowledge_interaction(
+        &api.base,
+        &json!({"id":"123","token":"temporary-token","type":2}),
+    )
+    .await
+    .unwrap();
+    let wire = server.await.unwrap();
+    assert!(!wire.to_lowercase().contains("authorization:"));
+    let body: Value = serde_json::from_str(wire.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["type"], 4);
+    assert_eq!(body["data"]["allowed_mentions"]["parse"], json!([]));
+}
+
+#[tokio::test]
+async fn unchanged_slash_registration_only_reads_the_shared_bot_commands() {
+    let (api, server) = fixture_http("200 OK", json!(slash_commands())).await;
+    api.register_commands("999").await.unwrap();
+    let wire = server.await.unwrap();
+    assert!(wire.starts_with("GET /applications/999/commands "));
+}
+
+#[tokio::test]
+async fn shared_bot_slash_events_execute_only_on_the_owners_gateway() {
+    let first = Gateway::new(config(), FakeRuntime::default(), FakeMessenger::default());
+    let mut other_config = config();
+    other_config.allowed_users = vec!["124".into()];
+    other_config.allowed_conversations = vec!["457".into()];
+    let second = Gateway::new(
+        other_config,
+        FakeRuntime::default(),
+        FakeMessenger::default(),
+    );
+    let second_channels = HashMap::from([("124".into(), "457".into())]);
+    let mut e = slash_event("run");
+    e["data"]["options"] = json!([{"name":"workflow","type":3,"value":"demo"}]);
+    first
+        .handle(normalize_interaction(&e, "999", &channels()).unwrap())
+        .await;
+    assert!(normalize_interaction(&e, "999", &second_channels).is_none());
+    assert_eq!(first.runtime.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(second.runtime.starts.load(Ordering::SeqCst), 0);
+    e["id"] = json!("1003");
+    e["user"]["id"] = json!("124");
+    e["channel_id"] = json!("457");
+    assert!(normalize_interaction(&e, "999", &channels()).is_none());
+    second
+        .handle(normalize_interaction(&e, "999", &second_channels).unwrap())
+        .await;
+    assert_eq!(second.runtime.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn first_connection_registers_generic_commands_without_replacing_other_commands() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::task::spawn_blocking(move || {
+        let mut registered = Vec::new();
+        for index in 0..5 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            if index == 0 {
+                assert!(headers.starts_with("GET /applications/999/commands "));
+            } else {
+                assert!(headers.starts_with("POST /applications/999/commands "));
+                registered.push(serde_json::from_slice::<Value>(&body).unwrap());
+            }
+            let reply = if index == 0 {
+                r#"[{"name":"another-command","type":1}]"#
+            } else {
+                "{}"
+            };
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",reply.len(),reply).unwrap();
+        }
+        registered
+    });
+    let mut api = DiscordApi::new("test-token".into()).unwrap();
+    api.base = format!("http://{address}");
+    api.register_commands("999").await.unwrap();
+    assert_eq!(server.await.unwrap(), slash_commands());
+}

@@ -56,11 +56,107 @@ pub(super) fn normalize(
     })
 }
 
+fn slash_commands() -> Vec<Value> {
+    [
+        ("list", "List saved workflows from your connected local OMAR", vec![]),
+        ("new-chat", "Start a fresh OMAR assistant conversation", vec![]),
+        ("help", "Show OMAR commands and connection requirements", vec![]),
+        ("run", "Run a saved workflow on your connected local OMAR",
+            vec![json!({"name":"workflow","description":"Saved workflow name from /list","type":3,"required":true,"max_length":100})]),
+    ].into_iter().map(|(name, description, options)| {
+        json!({"name":name,"description":description,"type":1,"contexts":[1],"options":options})
+    }).collect()
+}
+
+fn command_matches(saved: &Value, desired: &Value) -> bool {
+    match desired {
+        Value::Object(fields) => fields.iter().all(|(key, value)| {
+            if key == "options" && value == &json!([]) && saved.get(key).is_none() {
+                true
+            } else {
+                saved
+                    .get(key)
+                    .is_some_and(|entry| command_matches(entry, value))
+            }
+        }),
+        Value::Array(values) => saved.as_array().is_some_and(|entries| {
+            entries.len() == values.len()
+                && entries
+                    .iter()
+                    .zip(values)
+                    .all(|(entry, value)| command_matches(entry, value))
+        }),
+        _ => saved == desired,
+    }
+}
+
+fn normalize_slash(
+    event: &Value,
+    bot: &str,
+    channels: &HashMap<String, String>,
+) -> Option<Incoming> {
+    if event.get("guild_id").is_some()
+        || event["type"] != 2
+        || event["data"]["type"] != 1
+        || event["application_id"] != bot
+        || event["user"]["bot"] == true
+    {
+        return None;
+    }
+    let sender = id(&event["user"]["id"])?;
+    let channel = id(&event["channel_id"])?;
+    if channels.get(sender).map(String::as_str) != Some(channel) {
+        return None;
+    }
+    let options = match event["data"].get("options") {
+        None => &[][..],
+        Some(value) => value.as_array()?.as_slice(),
+    };
+    let command = match event["data"]["name"].as_str()? {
+        "list" if options.is_empty() => "list".into(),
+        "new-chat" if options.is_empty() => "new chat".into(),
+        "help" if options.is_empty() => "help".into(),
+        "run"
+            if options.len() == 1
+                && options[0]["name"] == "workflow"
+                && options[0]["type"] == 3 =>
+        {
+            let name = options[0]["value"].as_str()?;
+            if name.is_empty()
+                || name.len() > 100
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return None;
+            }
+            format!("run {name}")
+        }
+        _ => return None,
+    };
+    Some(Incoming {
+        platform: "discord".into(),
+        account_id: bot.into(),
+        sender_id: sender.into(),
+        event_id: id(&event["id"])?.into(),
+        command,
+        destination: Destination {
+            platform: "discord".into(),
+            account_id: bot.into(),
+            conversation_id: channel.into(),
+            thread_id: None,
+        },
+    })
+}
+
 fn normalize_interaction(
     event: &Value,
     bot: &str,
     channels: &HashMap<String, String>,
 ) -> Option<Incoming> {
+    if event["type"] == 2 {
+        return normalize_slash(event, bot, channels);
+    }
     if event.get("guild_id").is_some()
         || event["type"] != 3
         || event["data"]["component_type"] != 2
@@ -120,7 +216,9 @@ async fn acknowledge_interaction(base: &str, event: &Value) -> Result<()> {
         .post(format!(
             "{base}/interactions/{interaction}/{token}/callback"
         ))
-        .json(&json!({"type":6}))
+        .json(&if event["type"] == 2 {
+            json!({"type":4,"data":{"content":"Sent to your local OMAR.","allowed_mentions":{"parse":[]}}})
+        } else { json!({"type":6}) })
         .timeout(Duration::from_secs(2))
         .send()
         .await
@@ -186,6 +284,19 @@ impl DiscordApi {
             next_request: Mutex::new(Instant::now()),
         })
     }
+    async fn register_commands(&self, application: &str) -> Result<()> {
+        let path = format!("/applications/{application}/commands");
+        let saved = self.call(reqwest::Method::GET, &path, None).await?;
+        let saved = saved.as_array().context("Invalid Discord command list")?;
+        for command in slash_commands() {
+            if !saved.iter().any(|entry| command_matches(entry, &command)) {
+                self.call(reqwest::Method::POST, &path, Some(command))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn call(
         &self,
         method: reqwest::Method,
@@ -581,6 +692,9 @@ pub async fn run(mut config: Config) -> Result<()> {
         identity["bot"] == true && identity["id"].as_str() == Some(&config.account_id),
         "Discord bot does not match accountId"
     );
+    api.register_commands(&config.account_id)
+        .await
+        .context("Could not register OMAR slash commands")?;
     let discovery = api.call(reqwest::Method::GET, "/gateway/bot", None).await?;
     ensure!(
         discovery["session_start_limit"]["remaining"]
