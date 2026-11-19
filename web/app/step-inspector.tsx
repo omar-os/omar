@@ -5,6 +5,7 @@ import { locateStep, replaceStep, type StepSource } from "./lib/step-source";
 import type { DiagramSnapshot } from "./lib/protocol";
 import { formatDuration, lifetimeLabel } from "./lib/protocol";
 import { componentName } from "./diagram/diagram-canvas";
+import { taskCopy } from "./lib/task-copy";
 import { WorkflowIcon } from "./workflow-icon";
 
 /** Details come from the compiled topology, never from prototype sample data. */
@@ -27,7 +28,8 @@ export function StepInspector({ component, snapshot, source, modelCatalog, runMo
   const timer = (snapshot.timers ?? []).find((item) => componentName(item.id) === component);
   const agent = snapshot.agents.find((item) => item.id === reaction?.agent);
   const configuration = useMemo(() => reaction ? locateStep(source, snapshot, reaction) : null, [source, snapshot, reaction]);
-  const name = reaction ? (/(?:^|\.)reaction\.\d+$/.test(reaction.name) ? agent?.name ?? reaction.name : reaction.name) : port?.name ?? timer?.name ?? component;
+  const copy = reaction ? taskCopy(reaction, agent, snapshot) : null;
+  const name = copy?.title ?? port?.name ?? timer?.name ?? component;
   const label = (id: string) => snapshot.ports.find((item) => item.id === id)?.name ?? (snapshot.timers ?? []).find((item) => item.id === id)?.name ?? componentName(id);
   const sameTeam = new Set(snapshot.instances.filter(instance => instance.team === configuration?.team).map(instance => instance.id.replace(/^instance::/, "")));
   const sharedRoles = new Set(snapshot.agents.filter(item => sameTeam.has(item.instance) && item.name.split(".").at(-1) === configuration?.role).map(item => item.id));
@@ -38,7 +40,7 @@ export function StepInspector({ component, snapshot, source, modelCatalog, runMo
     <aside className="step-inspector" aria-label="Step details">
       <header><span className="inspector-type">{reaction ? "TASK" : timer ? "TIMER" : port?.kind === "action" ? "ACTION" : "CONNECTION"}</span><button type="button" aria-label="Close step details" onClick={onClose}><WorkflowIcon name="close" size={16} /></button></header>
       <h3>{name}</h3>
-      <p className="inspector-description">{component}</p>
+      <p className="inspector-description">{copy?.description ?? component}</p>
       {reaction ? <>
         {!configuration ? <>
         <div className="inspector-field"><span>Execution backend</span><div className="step-model"><i>{(agent?.backend ?? "?").slice(0, 1)}</i>{agent?.backend ?? "Not specified"}<span className={`step-status ${reaction.status}`}>{reaction.status}</span></div></div>
