@@ -489,7 +489,7 @@ impl History {
         );
         chat.title = title.chars().take(80).collect();
         chat.messages = vec![
-            ChatMessage {sequence:1,role:ChatRole::Operator,text:text.into(),progress:false,design:None,selection:vec![]},
+            ChatMessage {sequence:1,role:ChatRole::Operator,text:text.into(),progress:false,runtime:false,design:None,selection:vec![]},
             ChatMessage {sequence:2,role:ChatRole::Assistant,text:"Your workflow is prepared. Review the inputs and model choices, then confirm execution. No agents have been started.".into(),progress:false,design:Some(design),selection:vec![]},
         ];
         chat.updated_at = now();
@@ -611,6 +611,7 @@ mod tests {
             role: ChatRole::Operator,
             text: text.into(),
             progress: false,
+            runtime: false,
             design: None,
             selection: vec!["flow.planner".into()],
         }
