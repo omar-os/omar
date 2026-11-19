@@ -85,7 +85,11 @@ export type DiagramTimer = { id: string, name: string, offset: number,
  */
 period: number, last_tag: DiagramTag | null, instance: string, };
 
-export type DiagramReaction = { id: string, name: string, agent: string, order: number, triggers: Array<string>, effects: Array<string>, contract: string, status: ReactionStatus, invocation_id: string | null, instance: string,
+export type DiagramReaction = { id: string, name: string,
+/**
+ * Human-readable task copy; absent in workflows created before task metadata.
+ */
+title?: string, description?: string, agent: string, order: number, triggers: Array<string>, effects: Array<string>, contract: string, status: ReactionStatus, invocation_id: string | null, instance: string,
 /**
  * Nanoseconds this reaction gave itself, or `None` for one bounded only by
  * the run. Carried so a client can draw the bound rather than leaving the
@@ -181,7 +185,12 @@ export type ChatMessage = { sequence: number, role: ChatRole, text: string,
 /**
  * Commentary while working, rather than something awaiting an answer.
  */
-progress: boolean, design: ProposedDesign | null,
+progress: boolean,
+/**
+ * Runtime guidance does not finish or interrupt an assistant turn.
+ * An optional field keeps saved chats readable by older runtimes.
+ */
+runtime?: boolean, design: ProposedDesign | null,
 /**
  * Diagram components the operator had selected when they sent this.
  * "this one" is unresolvable in text; a selection says which.
