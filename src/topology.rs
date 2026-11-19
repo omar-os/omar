@@ -2389,6 +2389,7 @@ struct DispatchExecutor<'a, E: ReactionExecutor> {
     timeout: Duration,
     agents: E,
     workspace_dirs: BTreeMap<String, (PathBuf, PathBuf)>,
+    template: Option<(&'a crate::template_library::runtime::Run, &'a Path)>,
 }
 
 impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
@@ -2449,12 +2450,27 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
                 return Ok(writes);
             }
         }
-        self.agents.invoke(invocation)
+        let reaction = invocation.reaction_id.clone();
+        let id = invocation.id;
+        let timeout = invocation.within.unwrap_or(self.timeout);
+        let started = Instant::now();
+        let writes = self.agents.invoke(invocation)?;
+        match self.template {
+            Some((template, directory)) => template.check(
+                &reaction,
+                id,
+                writes,
+                directory,
+                timeout.saturating_sub(started.elapsed()),
+            ),
+            None => Ok(writes),
+        }
     }
 }
 
 /// The host trusts only typed, contract-checked invocation results from the VM.
 struct SandboxExecutor<'a, E> {
+    template: Option<(&'a crate::template_library::runtime::Run, &'a Path)>,
     state: &'a VmState,
     workers: BTreeMap<String, crate::sandbox::Worker>,
     workspaces: &'a BTreeMap<String, crate::workspace::Workspace>,
@@ -2485,6 +2501,7 @@ impl<E: ReactionExecutor> ReactionExecutor for SandboxExecutor<'_, E> {
             .get(&reaction.instance)
             .context("missing team sandbox")?;
         let deadline = invocation.within.unwrap_or(self.timeout);
+        let started = Instant::now();
         let response = worker.request(
             serde_json::to_value(&invocation)?,
             deadline.saturating_add(Duration::from_secs(20)),
@@ -2496,6 +2513,15 @@ impl<E: ReactionExecutor> ReactionExecutor for SandboxExecutor<'_, E> {
                 .clone(),
         )?;
         validate_sandbox_writes(self.state, &invocation, &writes)?;
+        if let Some((template, directory)) = self.template {
+            return template.check(
+                &invocation.reaction_id,
+                invocation.id,
+                writes,
+                directory,
+                deadline.saturating_sub(started.elapsed()),
+            );
+        }
         Ok(writes)
     }
 }
@@ -2566,6 +2592,7 @@ pub fn sandbox_worker() -> Result<()> {
     let runtime_dir = local_root.join("runtime");
     let worktree = init.workspace.worktree(&init.root);
     let config = TopologyRunConfig {
+        template: None,
         ea_id: 0,
         omar_dir: &local_root,
         generated: &generated,
@@ -2597,11 +2624,13 @@ pub fn sandbox_worker() -> Result<()> {
             &runtime_dir,
             &server,
             &config,
+            init.template_backend.as_deref(),
             (&workspaces, &init.root),
             &mut sessions,
             init.resumed_from.as_ref(),
         )?;
         let executor = DispatchExecutor {
+            template: None,
             state: &init.state,
             code,
             timeout: init.timeout,
@@ -2639,6 +2668,7 @@ pub fn sandbox_worker() -> Result<()> {
 }
 
 pub struct TopologyRunConfig<'a> {
+    pub template: Option<crate::template_library::runtime::Run>,
     pub ea_id: crate::ea::EaId,
     pub omar_dir: &'a Path,
     /// Where this program's generated artifacts go, from `generated_dir`.
@@ -3062,8 +3092,14 @@ struct ResumePlan {
     workspaces: BTreeMap<String, crate::workspace::Workspace>,
 }
 
-pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunOutcome> {
+pub fn run_topology(bytecode: &Bytecode, mut config: TopologyRunConfig<'_>) -> Result<RunOutcome> {
     let state = verify(bytecode)?;
+    if let Some(path) = config.program_path {
+        let source = fs::read_to_string(path)?;
+        let inputs = parse_inputs(&state, config.inputs)?;
+        config.template =
+            crate::template_library::runtime::admit(&source, &inputs, config.omar_dir)?;
+    }
     if let Some(template) = config.sandbox_template {
         crate::sandbox::validate_template(template)?;
     }
@@ -3074,7 +3110,7 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
 /// else its latest checkpoint. Files come back as new workspaces restored
 /// from the captured versions; agents start fresh conversations and are
 /// told so; the clock continues where the checkpoint left it.
-pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunOutcome> {
+pub fn resume_topology(mut config: TopologyRunConfig<'_>, team: &str) -> Result<RunOutcome> {
     let runtime_dir = deploy::dir_for(config.omar_dir, config.ea_id, team);
     let record = deploy::DeploymentRecord::load(&runtime_dir)?
         .with_context(|| format!("no deployment '{team}'"))?;
@@ -3092,6 +3128,13 @@ pub fn resume_topology(config: TopologyRunConfig<'_>, team: &str) -> Result<RunO
         "deployment '{team}' is {}; only a paused run can resume",
         record.state
     );
+    let template_path = runtime_dir.join("template-run.json");
+    if template_path.exists() {
+        let template: crate::template_library::runtime::Run =
+            serde_json::from_slice(&fs::read(template_path)?)?;
+        template.validate()?;
+        config.template = Some(template);
+    }
     let store = checkpoint::Store::new(&runtime_dir);
     let point = store
         .resume_point()?
@@ -3223,6 +3266,12 @@ fn launch(
             bail!("deployment '{}' has an unconfirmed crashed run; use --replace to clean it up first", state.team);
         }
     }
+    let template_path = runtime_dir.join("template-run.json");
+    if let Some(template) = &config.template {
+        write_json_atomic(&template_path, template)?;
+    } else if template_path.exists() {
+        fs::remove_file(template_path)?;
+    }
     // A stop left over from an earlier run must not end this one.
     deploy::clear_stop(&runtime_dir)?;
     let obsolete_invocations = runtime_dir.join("invocations");
@@ -3352,6 +3401,10 @@ fn launch(
                 )?;
                 let init = crate::sandbox::Init {
                     protocol: crate::sandbox::PROTOCOL,
+                    template_backend: config
+                        .template
+                        .as_ref()
+                        .map(|template| template.backend.clone()),
                     state: sandbox_state(&state, instance),
                     workspace: workspace.clone(),
                     root: config.omar_dir.to_path_buf(),
@@ -3369,6 +3422,10 @@ fn launch(
                 &runtime_dir,
                 &invocation_server,
                 &config,
+                config
+                    .template
+                    .as_ref()
+                    .map(|template| template.backend.as_str()),
                 (&workspaces, config.omar_dir),
                 &mut spawned,
                 resumed_from.as_ref(),
@@ -3409,6 +3466,10 @@ fn launch(
         }
     }
     let executor = DispatchExecutor {
+        template: config
+            .template
+            .as_ref()
+            .map(|template| (template, runtime_dir.as_path())),
         workspace_dirs: workspaces
             .iter()
             .map(|(name, ws)| {
@@ -3430,6 +3491,7 @@ fn launch(
         },
     };
     let executor = SandboxExecutor {
+        template: executor.template,
         state: &state,
         workspaces: &workspaces,
         root: config.omar_dir,
@@ -3692,6 +3754,7 @@ fn spawn_topology_agents(
     runtime_dir: &Path,
     invocation_server: &InvocationServer,
     config: &TopologyRunConfig<'_>,
+    template_backend: Option<&str>,
     workspace_access: (&BTreeMap<String, crate::workspace::Workspace>, &Path),
     spawned: &mut BTreeMap<String, String>,
     resumed_from: Option<&checkpoint::Manifest>,
@@ -3714,7 +3777,11 @@ fn spawn_topology_agents(
             )
         })
         .unwrap_or_default();
-    let protocol = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, and omar_set_state for your team's state, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
+    let protocol = if template_backend.is_some() {
+        "You are an OMAR template agent. Only act on OMAR INVOCATION messages. Use only the supplied immutable evidence and declared port data. Do not access files, shell, web, or messaging. Write only the invocation’s allowed output ports with omar_set_port, then call omar_complete. Port writes are buffered; repeated writes use last-writer-wins semantics."
+    } else {
+        "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, and omar_set_state for your team's state, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics."
+    };
     for (name, agent) in &state.agents {
         // A web agent is not spawned. There is no command to resolve, no pane
         // to put it in, and no readiness to wait for — the agent exists as a
@@ -3744,9 +3811,12 @@ fn spawn_topology_agents(
         let workdir = worktree.to_str().context("workspace path is not UTF-8")?;
         fs::write(&prompt_file, format!("{protocol}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.{resumed}\n", temp.display()))?;
         let backend = canonical_backend(&agent.backend);
-        let base_command = crate::backend::resolve(backend)
-            .map(|backend| backend.default_command().to_string())
-            .map_err(anyhow::Error::msg)?;
+        let base_command = match template_backend {
+            Some(expected) => crate::template_library::runtime::Run::command(expected, backend)?,
+            None => crate::backend::resolve(backend)
+                .map(|backend| backend.default_command().to_string())
+                .map_err(anyhow::Error::msg)?,
+        };
         let context = McpLaunchContext {
             omar_dir: config.omar_dir.to_path_buf(),
             ea_id: config.ea_id,
@@ -9451,6 +9521,7 @@ mod tests {
             let state = verify(&bytecode).unwrap();
             let code = crate::reaction::build(&state, dir.path()).unwrap().unwrap();
             let executor = DispatchExecutor {
+                template: None,
                 workspace_dirs: BTreeMap::new(),
                 state: &state,
                 code: Some(code),
@@ -9599,6 +9670,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let outcome = DispatchExecutor {
+            template: None,
             workspace_dirs: BTreeMap::new(),
             state: &state,
             code: Some(code),
@@ -9641,6 +9713,7 @@ mod tests {
             )
             .unwrap();
             DispatchExecutor {
+                template: None,
                 workspace_dirs: BTreeMap::new(),
                 state: &state,
                 code: Some(code),

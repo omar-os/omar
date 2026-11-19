@@ -155,6 +155,22 @@ describe("omar serve --ui", { skip: AVAILABLE ? false : "no bundled runtime" }, 
       assert.ok(!body.includes("Demo topology"), "launched in demo mode");
       // Rendered only after `/v1/agent` answered, so this is the round trip.
       await page.locator(".backend-trigger").first().waitFor({ timeout: 10_000 });
+      // A fresh HOME has no authenticated backend and opens onboarding.
+      const onboarding = page.getByRole("dialog", { name: "Backends", exact: true });
+      if (await onboarding.isVisible()) await onboarding.getByRole("button", { name: "Close", exact: true }).click();
+      await page.getByRole("button", { name: "Browse templates", exact: true }).click();
+      await page.getByText("30 of 30 workflows · 7 available", { exact: true }).waitFor();
+      await page.getByRole("button", { name: "Use sample inputs", exact: true }).click();
+      assert.match(await page.getByLabel("What should this accomplish?").inputValue(), /supported answers/);
+      await page.getByLabel("Find a workflow").fill("launch campaign");
+      await page.getByRole("button", { name: /Create a launch campaign kit/ }).click();
+      assert.match(await page.getByRole("status").innerText(), /cannot be run yet/);
+      assert.equal(await page.getByRole("button", { name: "Prepare workflow", exact: true }).count(), 0);
+      await page.setViewportSize({ width: 390, height: 844 });
+      assert.ok(await page.getByRole("dialog").isVisible());
+      const dialogBox = await page.getByRole("dialog").boundingBox();
+      assert.ok(dialogBox.x >= 0 && dialogBox.x + dialogBox.width <= 390);
+      await page.getByRole("button", { name: "Close", exact: true }).click();
       assert.deepEqual(errors, []);
     } finally {
       await browser.close();

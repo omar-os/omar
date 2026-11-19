@@ -1,0 +1,1960 @@
+{
+  "schema_version": 1,
+  "templates": [
+    {
+      "id": "test",
+      "number": 1,
+      "title": "Fix a failing test",
+      "category": "Development",
+      "wave": 1,
+      "persona": "Developer; maintainer",
+      "job": "A reproducible defect needs a small verified repair.",
+      "inputs": "An operator-installed Python API verifier; pinned local Docker image; supplied defect description.",
+      "artifacts": "report.md; records.csv; sources.json; calculations.json; result.json; changes.patch; checks.json",
+      "execution": "Validate supplied input \u2192 draft from the immutable snapshot \u2192 review against original sources \u2192 host checks before delivery \u2192 one correction if needed. Run the unchanged and patched Python API against protected cases in a pinned local container.",
+      "acceptance": "Observed failure before and success after; exact exits and source digests; no acceptance-test tampering.",
+      "failure": "If setup fails or baseline passes, return blocked/could-not-reproduce; keep logs and any unverified patch.",
+      "implementation_delta": "Replace prompt-reported testing with a bounded runner, protected fixture tests and patch export.",
+      "illustrative_example": "Empty basket throws; corrected reducer returns zero with unchanged protected tests.",
+      "version": "1.1.0",
+      "publisher": "OMAR",
+      "status": "runnable",
+      "adapter": "repository_repair_v1",
+      "sample": {
+        "goal": "Fix total([]) so an empty basket returns zero and nonempty totals remain correct.",
+        "sources": [
+          {
+            "id": "defect",
+            "title": "Reproduction",
+            "text": "Calling basket.total([]) raises IndexError. Expected: 0. total([2,3]) must remain 5."
+          }
+        ],
+        "data": {
+          "repository": {
+            "files": {
+              "basket.py": "def total(items):\n    return sum(items) if items else items[0]\n"
+            },
+            "allowed_patch_paths": [
+              "basket.py"
+            ],
+            "entrypoint": "basket:total",
+            "verifier_id": "template-basket",
+            "verifier_digest": "5f483c78266a6c2f6ebddfba6e315be7fcd54f2516e41ebe5f4ee6dc4753e83b"
+          }
+        }
+      },
+      "fields": [
+        {
+          "key": "repository",
+          "label": "Installed repository snapshot (JSON)",
+          "help": "Load an installed verifier below. Uses the Python JSON API adapter, pinned local Docker image, allowed files and private regressions. Your checkout is never changed."
+        }
+      ],
+      "planned_artifacts": "changes.patch; report.md; records.csv; sources.json; calculations.json; result.json; checks.json",
+      "release_status": "Runnable adapter; independent outcome evaluation pending",
+      "example_result": {
+        "changes": [
+          {
+            "path": "basket.py",
+            "content": "def total(items):\n    return sum(items)\n"
+          }
+        ],
+        "explanation": "Use sum for empty and nonempty collections. This illustrative patch requires the installed runner\u2019s baseline and regression checks before acceptance."
+      },
+      "design": {
+        "operation": "code_repair",
+        "complexity": "complex",
+        "consequence": "high",
+        "scope_reason": "A code change can introduce regressions; protected executable checks, not model assertions, decide acceptance.",
+        "draft_instructions": "Use the defect description and permitted original files to propose the smallest fix. Preserve the API and behavior outside the defect. Explain the mechanism and remaining uncertainty without inventing execution evidence.",
+        "review_instructions": "Inspect the candidate against the original files and defect, permitted patch paths and API contract. Reject unrelated changes or altered tests. The host must reproduce the original failure and run the protected regressions; a reviewer cannot declare those checks passed."
+      }
+    },
+    {
+      "id": "understand",
+      "number": 2,
+      "title": "Understand this repository",
+      "category": "Development",
+      "wave": 3,
+      "persona": "Developer joining a team; technical lead",
+      "job": "Locate the right code and understand a change's impact.",
+      "inputs": "Repository snapshot; question; selected subdirectory and depth.",
+      "artifacts": "repository-guide.md; module-map.json; sources.json",
+      "execution": "Inventory \u2192 trace relevant paths \u2192 synthesize guide \u2192 check references",
+      "acceptance": "Entry points resolve; all cited paths exist in snapshot; important omissions disclosed; no setup execution claims without receipts.",
+      "failure": "Large/binary/unreadable files produce a coverage gap; stale README is distinguished from source.",
+      "implementation_delta": "Add a navigable source map and question-specific change locations; one synthesis agent is often enough.",
+      "illustrative_example": "Show request entry, validation service and tests, while flagging an obsolete README command.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Locate the right code and understand a change's impact.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Show request entry, validation service and tests, while flagging an obsolete README command."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "review",
+      "number": 3,
+      "title": "Review a code change",
+      "category": "Development",
+      "wave": 2,
+      "persona": "Developer; code reviewer",
+      "job": "Find consequential defects in a specific change before merging.",
+      "inputs": "Bounded diff; immutable base/head; surrounding source; acceptance criteria.",
+      "artifacts": "review.md; findings.json; check-receipts.json",
+      "execution": "Capture revision \u2192 inspect behavior \u2192 reproduce candidate findings \u2192 deduplicate",
+      "acceptance": "Every finding has changed-line location, trigger, consequence and evidence; clean changes permit no-findings.",
+      "failure": "A truncated diff or unavailable reproduction limits the review; no whole-project correctness claim.",
+      "implementation_delta": "Use revision-bound findings and actual repro checks; reviewer sees raw code instead of only a draft.",
+      "illustrative_example": "Catch a dropped last item while ignoring a formatting-only change.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Find consequential defects in a specific change before merging.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Catch a dropped last item while ignoring a formatting-only change."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "upgrade",
+      "number": 4,
+      "title": "Upgrade one dependency",
+      "category": "Development",
+      "wave": 4,
+      "persona": "Maintainer; platform engineer",
+      "job": "Complete a bounded package upgrade with compatibility evidence.",
+      "inputs": "Supported npm project; package; exact target version; official migration guidance; check commands.",
+      "artifacts": "changes.patch; upgrade-report.md; checks.json",
+      "execution": "Baseline \u2192 inspect guidance \u2192 update package/lockfile/call sites \u2192 install/check \u2192 review",
+      "acceptance": "Requested/resolved versions and lockfile agree; protected consumer checks pass; unrelated churn flagged.",
+      "failure": "Unsupported ecosystem, inaccessible registry or missing exact version blocks upgrade; baseline failures remain visible.",
+      "implementation_delta": "Add an ecosystem adapter and deterministic version/lockfile checks instead of generic migration advice.",
+      "illustrative_example": "Owned parser fixture v1\u2192v2 requires one API migration; wrong resolved version fails.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Complete a bounded package upgrade with compatibility evidence.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Owned parser fixture v1\u2192v2 requires one API migration; wrong resolved version fails."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "docs",
+      "number": 5,
+      "title": "Generate documentation grounded in code",
+      "category": "Development",
+      "wave": 3,
+      "persona": "Developer; technical writer",
+      "job": "Update a specific guide without inventing setup or APIs.",
+      "inputs": "Source snapshot; selected docs; audience; document type; supported snippet commands.",
+      "artifacts": "documentation.patch; preview.html; sources.json; checks.json",
+      "execution": "Extract actual symbols \u2192 draft \u2192 validate paths/links \u2192 review claims",
+      "acceptance": "Only selected doc paths change; references resolve; tested-snippet label requires execution receipt.",
+      "failure": "Missing environment or unsupported snippet validator is shown as not tested.",
+      "implementation_delta": "Deliver editable document preview with claim links and documentation-only diff.",
+      "illustrative_example": "Replace an obsolete API example with the exported function; state which snippet was executed.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Update a specific guide without inventing setup or APIs.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Replace an obsolete API example with the exported function; state which snippet was executed."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "issue",
+      "number": 6,
+      "title": "Implement a bounded issue",
+      "category": "Development",
+      "wave": 3,
+      "persona": "Developer; technical founder",
+      "job": "Turn clear acceptance criteria into a reviewable change.",
+      "inputs": "Repository snapshot; issue text; bounded criteria; relevant test commands.",
+      "artifacts": "changes.patch; implementation-plan.md; criteria.json; checks.json",
+      "execution": "Inspect \u2192 scope plan \u2192 implement \u2192 execute checks \u2192 assess each criterion",
+      "acceptance": "Each criterion maps to evidence or unresolved status; protected behavior cases pass; scope stays bounded.",
+      "failure": "Ambiguous acceptance criteria require focused clarification; expansion triggers a revised plan.",
+      "implementation_delta": "Add criterion-to-evidence mapping and scope control to the repair foundation.",
+      "illustrative_example": "Add a filter with matching, no-match and empty-input cases; show each criterion beside the diff.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Turn clear acceptance criteria into a reviewable change.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Add a filter with matching, no-match and empty-input cases; show each criterion beside the diff."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "security",
+      "number": 7,
+      "title": "Fix a validated security finding",
+      "category": "Security",
+      "wave": 4,
+      "persona": "Security engineer; developer",
+      "job": "Repair one evidenced weakness in an authorized local scope.",
+      "inputs": "Finding; reproduction; affected source; permitted test environment; expected safe behavior.",
+      "artifacts": "remediation.patch; remediation-report.md; checks.json",
+      "execution": "Reproduce finding \u2192 repair \u2192 run exploit and valid-behavior regressions \u2192 review",
+      "acceptance": "Observed weakness and remediation evidence; valid behavior preserved; sensitive logs redacted.",
+      "failure": "Unreproduced findings remain unverified; inaccessible test systems do not imply a fix.",
+      "implementation_delta": "Reuse executable evidence with security-specific repro scope and residual-risk fields.",
+      "illustrative_example": "A local traversal fixture rejects escape paths while still allowing a valid file.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Repair one evidenced weakness in an authorized local scope.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "A local traversal fixture rejects escape paths while still allowing a valid file."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "release",
+      "number": 8,
+      "title": "Prepare a release pack",
+      "category": "Development",
+      "wave": 3,
+      "persona": "Engineering lead; release manager",
+      "job": "Prepare accurate release communication and handoff.",
+      "inputs": "Immutable revision range; release name; audience; issue notes; operational readiness inputs.",
+      "artifacts": "changelog-draft.md; migration-notes.md; readiness.csv; sources.json",
+      "execution": "Inventory changes \u2192 classify \u2192 draft release/migration notes \u2192 verify coverage",
+      "acceptance": "Features/fixes/breaking changes trace to actual revisions; operational unknowns stay unchecked.",
+      "failure": "Missing history or incomplete deployment evidence blocks the corresponding claim, not the entire draft.",
+      "implementation_delta": "Deliver a cohesive artifact pack and evidence-linked checklist, with publication separate.",
+      "illustrative_example": "Three commits become feature, fix and breaking-rename entries with a migration step.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Prepare accurate release communication and handoff.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Three commits become feature, fix and breaking-rename entries with a migration step."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "research",
+      "number": 9,
+      "title": "Turn supplied sources into a decision brief",
+      "category": "Operations",
+      "wave": 2,
+      "persona": "Founder; analyst; consultant",
+      "job": "Answer a business question from a bounded source set.",
+      "inputs": "Text/Markdown documents; decision question; criteria; audience; source dates.",
+      "artifacts": "report.md; records.csv; sources.json; calculations.json; result.json",
+      "execution": "Validate supplied input \u2192 draft from the immutable snapshot \u2192 review against original sources \u2192 host checks before delivery \u2192 one correction if needed.",
+      "acceptance": "All material claims linked; contradictions and unknowns preserved; recommendation separates inference from fact.",
+      "failure": "Insufficient evidence returns conditional choices or no recommendation; no claimed outside research.",
+      "implementation_delta": "Connect the active grounded-research work to an evidence table and reusable deliverable contract.",
+      "illustrative_example": "Conflicting vendor documents remain visible rather than being blended into a false consensus.",
+      "version": "1.1.0",
+      "publisher": "OMAR",
+      "status": "runnable",
+      "adapter": "grounded_brief_v1",
+      "sample": {
+        "goal": "Answer a business question from a bounded source set.",
+        "sources": [
+          {
+            "id": "option-a",
+            "title": "Option A",
+            "text": "Option A supports CSV imports and costs 10 units. Its accessibility has not been evaluated."
+          },
+          {
+            "id": "option-b",
+            "title": "Option B",
+            "text": "Option B supports JSON imports and costs 12 units. Accessibility is documented but not independently tested."
+          }
+        ],
+        "data": {}
+      },
+      "fields": [],
+      "planned_artifacts": "decision-brief.md; comparison.csv; claims.json; sources.json",
+      "release_status": "Runnable adapter; independent outcome evaluation pending",
+      "sections": [
+        "options",
+        "tradeoffs",
+        "recommendation",
+        "unknowns"
+      ],
+      "example_result": {
+        "summary": "Conflicting vendor documents remain visible rather than being blended into a false consensus.",
+        "rows": [
+          {
+            "id": "options",
+            "text": "Option A imports CSV at 10 units; Option B imports JSON at 12 units.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "option-a",
+                "quote": "Option A supports CSV imports and costs 10 units. Its accessibility has not been evaluated."
+              }
+            ]
+          },
+          {
+            "id": "tradeoffs",
+            "text": "Choose based on required input format. The supplied price difference does not establish overall value.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "recommendation",
+            "text": "If CSV is mandatory, test Option A first. If JSON is mandatory, test Option B first.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "unknowns",
+            "text": "Independent accessibility testing, scale limits, contracts and total cost are not established.",
+            "status": "unknown",
+            "citations": []
+          }
+        ],
+        "limitations": [
+          "Manually authored illustration using the bundled fictional sample. Not a recorded model run or evidence of comparative quality."
+        ]
+      },
+      "design": {
+        "operation": "evidence_synthesis",
+        "complexity": "ambiguous",
+        "consequence": "medium",
+        "scope_reason": "Comparing options requires preserving conflicting evidence, uncertainty and the conditions under which a recommendation changes.",
+        "draft_instructions": "Compare the supplied options against the stated goal. Preserve material contradictions, scope limits and source dates. Explain the tradeoffs and a conditional recommendation, separating source-backed facts from inference. State which missing evidence could change the decision; do not imply external research was performed.",
+        "review_instructions": "Check each factual claim against original evidence, search for contradictory passages, and test whether the recommendation follows from the stated goal and tradeoffs. Preserve alternatives and evidence gaps; exact quotation alone does not establish support."
+      }
+    },
+    {
+      "id": "launch",
+      "number": 10,
+      "title": "Create a launch campaign kit",
+      "category": "Revenue",
+      "wave": 3,
+      "persona": "Founder; marketer; agency",
+      "job": "Turn an approved product brief into coherent channel-ready drafts.",
+      "inputs": "Brief; audience; approved facts; tone; selected channels; offer and CTA.",
+      "artifacts": "landing-copy.md; email-drafts.md; social-drafts.csv; claims.json",
+      "execution": "Extract approved claims \u2192 position offer \u2192 draft channels \u2192 check consistency \u2192 revise",
+      "acceptance": "Every factual claim supported; selected channel constraints met; CTA/offer consistent; no invented testimonials.",
+      "failure": "Missing product fact is an explicit placeholder or question, never an invented number.",
+      "implementation_delta": "Add channel-specific artifacts and a shared claims register; do not count raw copy as a deployed site.",
+      "illustrative_example": "One fictional launch yields matching page, email and social copy with unsupported claims removed.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Turn an approved product brief into coherent channel-ready drafts.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "One fictional launch yields matching page, email and social copy with unsupported claims removed."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "dependency-security",
+      "number": 11,
+      "title": "Triage vulnerable dependencies",
+      "category": "Security",
+      "wave": 4,
+      "persona": "Security engineer; maintainer",
+      "job": "Turn scanner noise into a defensible remediation queue.",
+      "inputs": "Supported lockfile/SBOM; scanner report or configured scanner; deployment context; exceptions.",
+      "artifacts": "dependency-findings.csv; remediation-queue.md; scan-receipt.json",
+      "execution": "Extract exact versions \u2192 ingest/run scanner \u2192 normalize aliases \u2192 apply explicit priority rules \u2192 review",
+      "acceptance": "Advisory/version mapping, alias deduplication and timestamps checked; reachability unknown unless tested.",
+      "failure": "Missing scanner/advisory data is blocked/stale; no fabricated CVE or fixed version.",
+      "implementation_delta": "Use scanner normalization and dependency paths; hand selected fix to #4 with explicit version.",
+      "illustrative_example": "Duplicate advisory aliases become one issue; an untested reachable path stays unknown.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Turn scanner noise into a defensible remediation queue.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Duplicate advisory aliases become one issue; an untested reachable path stays unknown."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "secrets",
+      "number": 12,
+      "title": "Screen files for exposed credentials",
+      "category": "Security",
+      "wave": 4,
+      "persona": "Developer; security operator",
+      "job": "Identify likely credential exposures without spreading the secret.",
+      "inputs": "Explicit files/text; supported detector set; ignore rules; redaction policy.",
+      "artifacts": "redacted-findings.json; screening-report.md; response-checklist.md",
+      "execution": "Local deterministic detection \u2192 redact \u2192 deduplicate \u2192 classify \u2192 export safe report",
+      "acceptance": "Raw values absent from UI telemetry, model inputs and exports; detector/version/scope recorded; false-positive fixtures checked.",
+      "failure": "Unsupported formats/patterns are disclosed; empty findings are not proof of no secrets.",
+      "implementation_delta": "Keep the current three-pattern screen as a limited utility until a maintained detector and redaction boundary are integrated; no mandatory agent.",
+      "illustrative_example": "Synthetic token yields location/type only; no live credential is needed for demonstration.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Identify likely credential exposures without spreading the secret.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Synthetic token yields location/type only; no live credential is needed for demonstration."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "permissions",
+      "number": 13,
+      "title": "Test permissions and tenant isolation",
+      "category": "Security",
+      "wave": 4,
+      "persona": "Backend developer; security engineer",
+      "job": "Check concrete allowed and forbidden access cases.",
+      "inputs": "Owned test app; policy matrix; synthetic roles/tenants; endpoints and fixture commands.",
+      "artifacts": "permissions.csv; failing-cases.json; tests.patch; checks.json",
+      "execution": "Derive policy cases \u2192 generate fixtures/tests \u2192 execute matrix \u2192 review failures",
+      "acceptance": "Allow and deny expectations match declared policy; each executed case has receipt; untested combinations visible.",
+      "failure": "Ambiguous policy requires decision; unavailable environment yields untested status.",
+      "implementation_delta": "Add a policy/matrix adapter and executable evidence, beyond narrative access-control advice.",
+      "illustrative_example": "Cross-tenant reads fail their deny test while same-tenant allowed reads pass.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Check concrete allowed and forbidden access cases.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Cross-tenant reads fail their deny test while same-tenant allowed reads pass."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "infrastructure",
+      "number": 14,
+      "title": "Review infrastructure configuration",
+      "category": "Security",
+      "wave": 4,
+      "persona": "Platform engineer; infrastructure owner",
+      "job": "Find configuration deviations and propose reviewable fixes.",
+      "inputs": "Supported IaC files; approved baseline; exception list; optional inventory snapshot.",
+      "artifacts": "infrastructure-findings.csv; proposed.patch; validation.json",
+      "execution": "Parse resources \u2192 run supported checks \u2192 map exceptions \u2192 propose patch \u2192 validate syntax",
+      "acceptance": "Finding binds to resource/rule; proposed patch parses; exception and rule versions preserved.",
+      "failure": "Unsupported resource types and absent live inventory are gaps; file review does not establish live posture.",
+      "implementation_delta": "Use actual parsers/rules and parse-tested patches; no automatic apply.",
+      "illustrative_example": "An overly broad ingress rule maps to its exact resource; approved exception stays visible.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Find configuration deviations and propose reviewable fixes.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "An overly broad ingress rule maps to its exact resource; approved exception stays visible."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "questionnaire",
+      "number": 15,
+      "title": "Complete a customer security questionnaire",
+      "category": "Revenue",
+      "wave": 1,
+      "persona": "Sales engineer; security lead; founder",
+      "job": "Unblock a deal with supported answers and clear owner questions.",
+      "inputs": "Question IDs/text; approved dated policies; product facts; answer constraints; evidence owners.",
+      "artifacts": "report.md; records.csv; sources.json; calculations.json; result.json; answers.csv",
+      "execution": "Validate supplied input \u2192 draft from the immutable snapshot \u2192 review against original sources \u2192 host checks before delivery \u2192 one correction if needed.",
+      "acceptance": "Every question represented in original order; no unsupported yes/certification; current citations resolve; status per answer.",
+      "failure": "Missing or expired evidence yields unknown/stale and an owner action; no silent yes.",
+      "implementation_delta": "Add a question/evidence matrix, freshness rules and typed answer states; reuse RFP machinery.",
+      "illustrative_example": "Ten sample questions include an unsupported certification question that remains Unknown.",
+      "version": "1.1.0",
+      "publisher": "OMAR",
+      "status": "runnable",
+      "adapter": "answer_matrix_v1",
+      "sample": {
+        "goal": "Unblock a deal with supported answers and clear owner questions.",
+        "sources": [
+          {
+            "id": "access",
+            "title": "Access",
+            "text": "Administrative access is approved by the security owner. Access reviews happen quarterly and when people leave. Access changes are recorded."
+          },
+          {
+            "id": "backup",
+            "title": "Backup",
+            "text": "The operations owner is responsible for daily backups under the approved backup policy."
+          }
+        ],
+        "data": {
+          "questions": [
+            {
+              "id": "Q-01",
+              "question": "How is admin access reviewed?",
+              "allowed_source_ids": [
+                "access"
+              ]
+            },
+            {
+              "id": "Q-02",
+              "question": "Who approves administrator access?",
+              "allowed_source_ids": [
+                "access"
+              ]
+            },
+            {
+              "id": "Q-03",
+              "question": "How often is access reviewed?",
+              "allowed_source_ids": [
+                "access"
+              ]
+            },
+            {
+              "id": "Q-04",
+              "question": "Are leavers reviewed?",
+              "allowed_source_ids": [
+                "access"
+              ]
+            },
+            {
+              "id": "Q-05",
+              "question": "Are access changes recorded?",
+              "allowed_source_ids": [
+                "access"
+              ]
+            },
+            {
+              "id": "Q-06",
+              "question": "How often are backups taken?",
+              "allowed_source_ids": [
+                "backup"
+              ]
+            },
+            {
+              "id": "Q-07",
+              "question": "Where are backup responsibilities recorded?",
+              "allowed_source_ids": [
+                "backup"
+              ]
+            },
+            {
+              "id": "Q-08",
+              "question": "Are backups part of operations policy?",
+              "allowed_source_ids": [
+                "backup"
+              ]
+            },
+            {
+              "id": "Q-09",
+              "question": "Is backup ownership assigned?",
+              "allowed_source_ids": [
+                "backup"
+              ]
+            },
+            {
+              "id": "Q-10",
+              "question": "Do you hold the requested certification?",
+              "allowed_source_ids": []
+            }
+          ]
+        }
+      },
+      "fields": [
+        {
+          "key": "questions",
+          "label": "Questions",
+          "help": "JSON rows with id, question, and optional allowed_source_ids. Preserve customer IDs."
+        }
+      ],
+      "planned_artifacts": "answers.csv; questionnaire.html; evidence-index.json; owner-questions.csv",
+      "release_status": "Runnable adapter; independent outcome evaluation pending",
+      "example_result": {
+        "summary": "Ten sample questions include an unsupported certification question that remains Unknown.",
+        "rows": [
+          {
+            "id": "Q-01",
+            "text": "The security owner approves administrative access; reviews occur quarterly and when people leave.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "access",
+                "quote": "Administrative access is approved by the security owner. Access reviews happen quarterly and when people leave. Access changes are recorded."
+              }
+            ]
+          },
+          {
+            "id": "Q-02",
+            "text": "The security owner.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "access",
+                "quote": "Administrative access is approved by the security owner. Access reviews happen quarterly and when people leave. Access changes are recorded."
+              }
+            ]
+          },
+          {
+            "id": "Q-03",
+            "text": "Quarterly and when people leave.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "access",
+                "quote": "Administrative access is approved by the security owner. Access reviews happen quarterly and when people leave. Access changes are recorded."
+              }
+            ]
+          },
+          {
+            "id": "Q-04",
+            "text": "Yes. Access is reviewed when people leave.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "access",
+                "quote": "Administrative access is approved by the security owner. Access reviews happen quarterly and when people leave. Access changes are recorded."
+              }
+            ]
+          },
+          {
+            "id": "Q-05",
+            "text": "Yes. Access changes are recorded.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "access",
+                "quote": "Administrative access is approved by the security owner. Access reviews happen quarterly and when people leave. Access changes are recorded."
+              }
+            ]
+          },
+          {
+            "id": "Q-06",
+            "text": "Daily.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "backup",
+                "quote": "The operations owner is responsible for daily backups under the approved backup policy."
+              }
+            ]
+          },
+          {
+            "id": "Q-07",
+            "text": "The approved backup policy.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "backup",
+                "quote": "The operations owner is responsible for daily backups under the approved backup policy."
+              }
+            ]
+          },
+          {
+            "id": "Q-08",
+            "text": "Daily backups are governed by the approved backup policy.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "backup",
+                "quote": "The operations owner is responsible for daily backups under the approved backup policy."
+              }
+            ]
+          },
+          {
+            "id": "Q-09",
+            "text": "Yes. The operations owner is responsible.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "backup",
+                "quote": "The operations owner is responsible for daily backups under the approved backup policy."
+              }
+            ]
+          },
+          {
+            "id": "Q-10",
+            "text": "Unknown. No approved certification evidence was supplied.",
+            "status": "unknown",
+            "citations": []
+          }
+        ],
+        "limitations": [
+          "Manually authored illustration using the bundled fictional sample. Not a recorded model run or evidence of comparative quality."
+        ]
+      },
+      "design": {
+        "operation": "structured_extraction",
+        "complexity": "ambiguous",
+        "consequence": "high",
+        "scope_reason": "Policy applicability, conflicting evidence and unsupported security assurances need careful interpretation even when the answer table has a fixed schema.",
+        "draft_instructions": "Answer each supplied question only from its explicitly approved sources. Keep the question IDs and order. An approved source must address the actual question; a related quote is insufficient. Preserve scope, exceptions and policy dates. Unsupported or conflicting answers stay unknown with a concrete evidence request.",
+        "review_instructions": "Check every question against its approved original passages, including exceptions and expiration. Reject unsupported yes/no answers, invented certifications and a quote that does not entail the answer. A truthful unknown is an acceptable partial deliverable; do not ask a stronger model to invent missing evidence."
+      }
+    },
+    {
+      "id": "pipeline",
+      "number": 16,
+      "title": "Turn pipeline data into an action queue",
+      "category": "Revenue",
+      "wave": 2,
+      "persona": "Sales manager; RevOps; founder",
+      "job": "Prepare a focused pipeline review and next actions.",
+      "inputs": "Opportunity/activity exports; stable IDs; as-of date; stage rules; aging thresholds; ownership.",
+      "artifacts": "pipeline-actions.csv; pipeline-review.html; calculation-evidence.json",
+      "execution": "Validate/deduplicate \u2192 calculate rule flags \u2192 inspect context \u2192 draft actions \u2192 verify record links",
+      "acceptance": "IDs and dates preserved; duplicate joins rejected; each flag explains its rule; no invented win probability.",
+      "failure": "Ambiguous account/deal joins stay unresolved; incomplete periods cannot support a complete forecast.",
+      "implementation_delta": "Replace narrative prioritization with deterministic rules, an inspectable queue and explicit missing data.",
+      "illustrative_example": "An overdue next step and missing owner surface with original opportunity IDs.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Prepare a focused pipeline review and next actions.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "An overdue next step and missing owner surface with original opportunity IDs."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "proposal",
+      "number": 17,
+      "title": "Turn discovery into a priced proposal",
+      "category": "Revenue",
+      "wave": 1,
+      "persona": "Founder; account executive; consultant; agency",
+      "job": "Produce a send-ready draft with correct scope and pricing.",
+      "inputs": "Discovery notes; approved service catalog/rate card; currency; discount rules; terms; required deliverables.",
+      "artifacts": "report.md; records.csv; sources.json; calculations.json; result.json; proposal-pricing.csv",
+      "execution": "Validate supplied input \u2192 draft from the immutable snapshot \u2192 review against original sources \u2192 host checks before delivery \u2192 one correction if needed.",
+      "acceptance": "Line items trace to catalog; exact decimal totals and discount rules; currency consistent; assumptions and exclusions explicit.",
+      "failure": "Unpriced work remains unpriced; missing tax/terms blocks final-commercial-ready status.",
+      "implementation_delta": "Add deterministic pricing, reusable approved clauses and a polished proposal bundle; sending is separate.",
+      "illustrative_example": "Two $1,500 workshops + 20 hours at $150 = $6,000; approved 10% discount gives $5,400 before tax.",
+      "version": "1.1.0",
+      "publisher": "OMAR",
+      "status": "runnable",
+      "adapter": "priced_proposal_v1",
+      "sample": {
+        "goal": "Produce a send-ready draft with correct scope and pricing.",
+        "sources": [
+          {
+            "id": "discovery",
+            "title": "Discovery",
+            "text": "The customer requests two discovery workshops and twenty hours of initial implementation. Tax and payment terms are not agreed."
+          }
+        ],
+        "data": {
+          "pricing": {
+            "currency": "USD",
+            "discount_bps": 1000,
+            "services": [
+              {
+                "id": "workshop",
+                "label": "Discovery workshop",
+                "unit_cents": 150000
+              },
+              {
+                "id": "implementation",
+                "label": "Implementation hour",
+                "unit_cents": 15000
+              }
+            ],
+            "lines": [
+              {
+                "id": "L1",
+                "service_id": "workshop",
+                "quantity": 2
+              },
+              {
+                "id": "L2",
+                "service_id": "implementation",
+                "quantity": 20
+              }
+            ],
+            "tax": null,
+            "terms": null,
+            "max_discount_bps": 1000
+          }
+        }
+      },
+      "fields": [
+        {
+          "key": "pricing",
+          "label": "Approved pricing",
+          "help": "JSON object: currency, discount_bps (0\u201310000), services [{id, label, unit_cents}], lines [{id, service_id, quantity}]. Unknown service IDs remain unpriced. Include max_discount_bps from your approved discount policy. All amounts are nonnegative integer minor units; quantities are whole numbers. This adapter supports currencies with two decimal places."
+        }
+      ],
+      "planned_artifacts": "proposal.html; proposal.md; pricing.csv; assumptions.csv; claims.json",
+      "release_status": "Runnable adapter; independent outcome evaluation pending",
+      "sections": [
+        "scope",
+        "deliverables",
+        "timeline",
+        "pricing",
+        "assumptions",
+        "exclusions",
+        "next-steps"
+      ],
+      "example_result": {
+        "summary": "Two $1,500 workshops + 20 hours at $150 = $6,000; approved 10% discount gives $5,400 before tax.",
+        "rows": [
+          {
+            "id": "scope",
+            "text": "Two discovery workshops and twenty hours of initial implementation.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "deliverables",
+            "text": "Workshop findings and initial implementation; acceptance criteria require agreement.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "timeline",
+            "text": "Schedule is not agreed. Confirm availability before committing dates.",
+            "status": "unknown",
+            "citations": []
+          },
+          {
+            "id": "pricing",
+            "text": "USD 6,000 subtotal. Approved 10% discount: USD 600. Priced total: USD 5,400 before tax. Tax and payment terms remain open.",
+            "status": "unknown",
+            "citations": []
+          },
+          {
+            "id": "assumptions",
+            "text": "Assumes whole-unit quantities and the supplied approved rates; confirm the implementation scope.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "exclusions",
+            "text": "Additional integration work has no supplied rate and is excluded until scoped and priced.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "next-steps",
+            "text": "Confirm scope, acceptance criteria, dates, tax and payment terms before sending the proposal.",
+            "status": "inference",
+            "citations": []
+          }
+        ],
+        "limitations": [
+          "Manually authored illustration using the bundled fictional sample. Not a recorded model run or evidence of comparative quality."
+        ]
+      },
+      "design": {
+        "operation": "writing",
+        "complexity": "ambiguous",
+        "consequence": "high",
+        "scope_reason": "Scope and commercial commitments can be consequential; exact prices are calculated by the host while proposed terms require review.",
+        "draft_instructions": "Separate confirmed requirements, proposed scope, exclusions and open questions. Describe deliverables and acceptance criteria from discovery evidence. Use only the supplied catalog and host-calculated amounts. Keep unpriced work, unknown tax and unapproved terms explicit; do not invent an owner, date or customer commitment.",
+        "review_instructions": "Check scope against discovery evidence and distinguish suggested commitments from confirmed ones. Check that narrative amounts agree with host calculations, discount limits are respected, and unknown tax, terms and unpriced work remain visible. Missing commercial information should produce a useful incomplete draft, not invented terms."
+      }
+    },
+    {
+      "id": "rfp",
+      "number": 18,
+      "title": "Build an evidence-backed RFP response",
+      "category": "Revenue",
+      "wave": 2,
+      "persona": "Bid manager; sales engineer; founder",
+      "job": "Assemble a complete bid response and expose eligibility gaps.",
+      "inputs": "RFP text/table; IDs; mandatory rules; response limits; approved capabilities and references.",
+      "artifacts": "response-matrix.csv; response-draft.html; bid-gaps.csv; sources.json",
+      "execution": "Parse requirements \u2192 assess mandatory eligibility \u2192 draft supported responses \u2192 check coverage/limits \u2192 review",
+      "acceptance": "All requirements retained; mandatory gaps prominent; citations support answers; word/character limits enforced.",
+      "failure": "Missing mandatory capability triggers a clear no-bid/review decision, not a fabricated commitment.",
+      "implementation_delta": "Reuse #15's answer engine with eligibility logic, requirement hierarchy and response constraints.",
+      "illustrative_example": "A missing mandatory capability is highlighted even when all optional questions have strong answers.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Assemble a complete bid response and expose eligibility gaps.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "A missing mandatory capability is highlighted even when all optional questions have strong answers."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "renewals",
+      "number": 19,
+      "title": "Prepare renewal and expansion plans",
+      "category": "Revenue",
+      "wave": 3,
+      "persona": "Account manager; customer success; founder",
+      "job": "Enter renewal discussions with account evidence and concrete actions.",
+      "inputs": "Account/contract IDs; renewal dates; usage/support exports; agreed periods; commercial policy.",
+      "artifacts": "renewal-briefs.html; account-actions.csv; sources.json",
+      "execution": "Join stable IDs \u2192 calculate usage/support changes \u2192 assemble account context \u2192 suggest agenda \u2192 verify",
+      "acceptance": "Comparable periods and currencies; no duplicate joins; trends reconciled; evidence distinguished from risk hypotheses.",
+      "failure": "Missing usage or contract terms yield incomplete plan; no invented churn probability.",
+      "implementation_delta": "Make account briefs actionable and repeatable with dated evidence, owners and optional expansion hypotheses.",
+      "illustrative_example": "A fictional account has falling usage plus an open blocker; agenda includes validation questions.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Enter renewal discussions with account evidence and concrete actions.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "A fictional account has falling usage plus an open blocker; agenda includes validation questions."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "cloud-cost",
+      "number": 20,
+      "title": "Find qualified cloud-cost opportunities",
+      "category": "Operations",
+      "wave": 4,
+      "persona": "FinOps; founder; infrastructure lead",
+      "job": "Identify explainable cost options worth investigating.",
+      "inputs": "Billing export; currency/period; resource IDs; utilization; commitments; pricing assumptions.",
+      "artifacts": "cost-review.html; opportunities.csv; calculations.json",
+      "execution": "Reconcile bill \u2192 join utilization/commitments \u2192 evaluate candidate changes \u2192 remove overlap \u2192 review",
+      "acceptance": "Totals reconcile; overlap excluded; utilization supports opportunity; estimates show assumptions and period.",
+      "failure": "A bill alone cannot prove idle capacity; missing utilization produces unknown savings.",
+      "implementation_delta": "Build a calculator and resource adapter; separate estimated opportunities from realized savings.",
+      "illustrative_example": "A low-use resource creates a conditional opportunity; committed spend is not double-counted.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Identify explainable cost options worth investigating.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "A low-use resource creates a conditional opportunity; committed spend is not double-counted."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "invoices",
+      "number": 21,
+      "title": "Reconcile invoices and payments",
+      "category": "Operations",
+      "wave": 4,
+      "persona": "Operations lead; bookkeeper; agency owner",
+      "job": "Produce a matched ledger and a short exception queue.",
+      "inputs": "Invoice/payment exports; stable refs; currency; period; explicit tolerances and matching policy.",
+      "artifacts": "matched-ledger.csv; exceptions.csv; reconciliation.html; calculations.json",
+      "execution": "Normalize \u2192 exact matching \u2192 partial allocation \u2192 control totals \u2192 review ambiguous cases",
+      "acceptance": "Amounts balance in each currency; payments allocated at most once; duplicates/partials preserved; exact-match policy enforced.",
+      "failure": "Ambiguous fuzzy match remains an exception; missing currency blocks allocation; no ledger posting.",
+      "implementation_delta": "Use deterministic decimal matching and reconciliation; agent explains exceptions rather than inventing matches.",
+      "illustrative_example": "One partial payment is allocated once; a duplicate reference stays in the exception queue.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Produce a matched ledger and a short exception queue.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "One partial payment is allocated once; a duplicate reference stays in the exception queue."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "support",
+      "number": 22,
+      "title": "Triage support and draft useful replies",
+      "category": "Operations",
+      "wave": 3,
+      "persona": "Support lead; customer success; founder",
+      "job": "Route a ticket batch and prepare grounded replies.",
+      "inputs": "Ticket IDs/text; routing/escalation policy; approved KB; customer context; response style.",
+      "artifacts": "triage.csv; reply-drafts.html; knowledge-gaps.csv; sources.json",
+      "execution": "Apply policy \u2192 retrieve KB \u2192 draft responses \u2192 check claims/escalations \u2192 queue for review",
+      "acceptance": "All ticket IDs covered; critical policy cases escalated; answers cite KB; no invented completed fix.",
+      "failure": "Unknown diagnosis requests clarification; contradictory KB flagged; unsupported tickets held.",
+      "implementation_delta": "Add an actionable queue, policy checks and evidence-linked replies, with publishing separate.",
+      "illustrative_example": "A known setup issue gets a cited draft; a suspected outage is escalated without claiming resolution.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Route a ticket batch and prepare grounded replies.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "A known setup issue gets a cited draft; a suspected outage is escalated without claiming resolution."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "feedback",
+      "number": 23,
+      "title": "Turn customer feedback into priorities",
+      "category": "Operations",
+      "wave": 3,
+      "persona": "Product manager; founder; agency strategist",
+      "job": "Find evidence-backed opportunities without losing dissent.",
+      "inputs": "Feedback notes/CSV; source/customer IDs; segment labels; period; explicit priority criteria.",
+      "artifacts": "opportunities.csv; priority-brief.html; evidence-map.json",
+      "execution": "Deduplicate imports \u2192 code themes \u2192 count unique sources \u2192 apply criteria \u2192 challenge ranking",
+      "acceptance": "Counts trace to unique sources; segment denominators explicit; serious minority issues retained; weights shown.",
+      "failure": "Unknown source identity limits counts; nonrepresentative samples cannot establish market prevalence.",
+      "implementation_delta": "Add source-aware deduplication, inspectable weighting and experiments tied to each opportunity.",
+      "illustrative_example": "Repeated imports count once; a low-frequency data-loss blocker remains prominent.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Find evidence-backed opportunities without losing dissent.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Repeated imports count once; a low-frequency data-loss blocker remains prominent."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "weekly-review",
+      "number": 24,
+      "title": "Prepare a weekly business review",
+      "category": "Operations",
+      "wave": 1,
+      "persona": "Founder; operations; RevOps; agency account lead",
+      "job": "Deliver an accurate recurring brief with explained changes.",
+      "inputs": "Current/prior exports; metric definitions; period/timezone; currency; owners; comparison rules.",
+      "artifacts": "report.md; records.csv; sources.json; calculations.json; result.json; weekly-metrics.csv",
+      "execution": "Validate supplied input \u2192 draft from the immutable snapshot \u2192 review against original sources \u2192 host checks before delivery \u2192 one correction if needed.",
+      "acceptance": "Every metric has formula/lineage; duplicate/date/currency rules applied; missing sources withhold affected metrics.",
+      "failure": "Undefined denominator or missing period yields incomplete metric; causal stories remain hypotheses.",
+      "implementation_delta": "Build deterministic calculation lineage and reusable metric definitions; scheduling is optional and separate.",
+      "illustrative_example": "Current/prior new leads 120/100 yields +20%; a missing revenue source leaves revenue unavailable.",
+      "version": "1.1.0",
+      "publisher": "OMAR",
+      "status": "runnable",
+      "adapter": "metrics_v1",
+      "sample": {
+        "goal": "Deliver an accurate recurring brief with explained changes.",
+        "sources": [
+          {
+            "id": "definitions",
+            "title": "Definitions",
+            "text": "New leads and held demos are event totals in the selected weekly exports. Revenue source is missing. The ratio is not a cohort conversion rate."
+          }
+        ],
+        "data": {
+          "periods": {
+            "current": "2026-10-26/2026-11-01",
+            "previous": "2026-10-19/2026-10-25",
+            "timezone": "America/New_York"
+          },
+          "metrics": [
+            {
+              "id": "leads",
+              "label": "New leads",
+              "current": [
+                {
+                  "id": "c1",
+                  "value": 120
+                }
+              ],
+              "previous": [
+                {
+                  "id": "p1",
+                  "value": 100
+                }
+              ]
+            },
+            {
+              "id": "demos",
+              "label": "Held demos",
+              "current": [
+                {
+                  "id": "c1",
+                  "value": 24
+                }
+              ],
+              "previous": [
+                {
+                  "id": "p1",
+                  "value": 20
+                }
+              ]
+            },
+            {
+              "id": "revenue",
+              "label": "Recognized revenue",
+              "current": null,
+              "previous": null
+            }
+          ]
+        }
+      },
+      "fields": [
+        {
+          "key": "metrics",
+          "label": "Metric definitions and observations",
+          "help": "JSON rows with id, label, current and previous arrays of {id, value}, or null for a missing source. Values are integer units; periods and timezone are required."
+        },
+        {
+          "key": "periods",
+          "label": "Reporting periods",
+          "help": "JSON object: current, previous, timezone. Use comparable periods."
+        }
+      ],
+      "planned_artifacts": "weekly-review.html; metrics.csv; calculation-evidence.json; actions.csv",
+      "release_status": "Runnable adapter; independent outcome evaluation pending",
+      "example_result": {
+        "summary": "Current/prior new leads 120/100 yields +20%; a missing revenue source leaves revenue unavailable.",
+        "rows": [
+          {
+            "id": "leads",
+            "text": "Leads: 120 versus 100, an increase of 20 (20%). This comparison does not establish a cause.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "demos",
+            "text": "Demos: 24 versus 20, an increase of 4 (20%). Validate conversion definitions before drawing conclusions.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "revenue",
+            "text": "Revenue is unavailable because a reporting-period source is missing. Do not treat missing data as zero.",
+            "status": "unknown",
+            "citations": []
+          }
+        ],
+        "limitations": [
+          "Manually authored illustration using the bundled fictional sample. Not a recorded model run or evidence of comparative quality."
+        ]
+      },
+      "design": {
+        "operation": "evidence_synthesis",
+        "complexity": "ambiguous",
+        "consequence": "medium",
+        "scope_reason": "Explaining a metric change requires interpretation; arithmetic alone cannot establish its cause.",
+        "draft_instructions": "Explain the host-calculated current and previous snapshots using their supplied period and timezone labels. Distinguish observations from causal hypotheses and recommended actions. Keep missing measurements, absent denominators and data limitations explicit. Do not recompute authoritative metrics or imply timestamp filtering occurred.",
+        "review_instructions": "Check every narrative number against the host calculation and its period. Reject invented causes, a missing measurement presented as zero, or a percentage with no valid denominator. Label proposed actions as recommendations and identify evidence needed to test each causal hypothesis."
+      }
+    },
+    {
+      "id": "target-accounts",
+      "number": 25,
+      "title": "Prioritize accounts that fit your ICP",
+      "category": "Revenue",
+      "wave": 1,
+      "persona": "Founder; SDR lead; RevOps; agency",
+      "job": "Choose which supplied companies deserve attention and why.",
+      "inputs": "Candidate-account CSV; stable IDs; ICP rules/weights; exclusion rules; permitted evidence; shortlist size.",
+      "artifacts": "report.md; records.csv; sources.json; calculations.json; result.json; target-accounts.csv",
+      "execution": "Validate supplied input \u2192 draft from the immutable snapshot \u2192 review against original sources \u2192 host checks before delivery \u2192 one correction if needed.",
+      "acceptance": "Scores reproduce from declared rules; exclusions enforced; unknowns separate from negatives; each fact has source.",
+      "failure": "No supplied candidate list means blocked until provided or a supported research adapter is configured; no invented leads.",
+      "implementation_delta": "New job; prioritize owned/exported accounts first, add permissioned enrichment later; fit is not purchase probability.",
+      "illustrative_example": "25 fictional accounts become an explained shortlist; unknown headcount and excluded sectors stay explicit.",
+      "version": "1.1.0",
+      "publisher": "OMAR",
+      "status": "runnable",
+      "adapter": "account_scoring_v1",
+      "sample": {
+        "goal": "Choose which supplied companies deserve attention and why.",
+        "sources": [
+          {
+            "id": "icp",
+            "title": "Icp",
+            "text": "Target matching industry, verified company size and documented integration need. Exclude direct competitors. Supplied rows are fictional observations for an example."
+          }
+        ],
+        "data": {
+          "weights": {
+            "industry": 40,
+            "size": 30,
+            "need": 30
+          },
+          "accounts": [
+            {
+              "id": "A01",
+              "name": "Harbor Labs",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": true
+              }
+            },
+            {
+              "id": "A02",
+              "name": "Linden Works",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": null,
+                "need": true
+              }
+            },
+            {
+              "id": "A03",
+              "name": "Sample account 3",
+              "excluded": true,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": false
+              }
+            },
+            {
+              "id": "A04",
+              "name": "Sample account 4",
+              "excluded": false,
+              "criteria": {
+                "industry": false,
+                "size": null,
+                "need": true
+              }
+            },
+            {
+              "id": "A05",
+              "name": "Sample account 5",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": true
+              }
+            },
+            {
+              "id": "A06",
+              "name": "Sample account 6",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": null,
+                "need": false
+              }
+            },
+            {
+              "id": "A07",
+              "name": "Sample account 7",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": true
+              }
+            },
+            {
+              "id": "A08",
+              "name": "Sample account 8",
+              "excluded": false,
+              "criteria": {
+                "industry": false,
+                "size": null,
+                "need": true
+              }
+            },
+            {
+              "id": "A09",
+              "name": "Sample account 9",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": false
+              }
+            },
+            {
+              "id": "A10",
+              "name": "Sample account 10",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": null,
+                "need": true
+              }
+            },
+            {
+              "id": "A11",
+              "name": "Sample account 11",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": true
+              }
+            },
+            {
+              "id": "A12",
+              "name": "Sample account 12",
+              "excluded": false,
+              "criteria": {
+                "industry": false,
+                "size": null,
+                "need": false
+              }
+            },
+            {
+              "id": "A13",
+              "name": "Sample account 13",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": true
+              }
+            },
+            {
+              "id": "A14",
+              "name": "Sample account 14",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": null,
+                "need": true
+              }
+            },
+            {
+              "id": "A15",
+              "name": "Sample account 15",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": false
+              }
+            },
+            {
+              "id": "A16",
+              "name": "Sample account 16",
+              "excluded": false,
+              "criteria": {
+                "industry": false,
+                "size": null,
+                "need": true
+              }
+            },
+            {
+              "id": "A17",
+              "name": "Sample account 17",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": true
+              }
+            },
+            {
+              "id": "A18",
+              "name": "Sample account 18",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": null,
+                "need": false
+              }
+            },
+            {
+              "id": "A19",
+              "name": "Sample account 19",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": true
+              }
+            },
+            {
+              "id": "A20",
+              "name": "Sample account 20",
+              "excluded": false,
+              "criteria": {
+                "industry": false,
+                "size": null,
+                "need": true
+              }
+            },
+            {
+              "id": "A21",
+              "name": "Sample account 21",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": false
+              }
+            },
+            {
+              "id": "A22",
+              "name": "Sample account 22",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": null,
+                "need": true
+              }
+            },
+            {
+              "id": "A23",
+              "name": "Sample account 23",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": true
+              }
+            },
+            {
+              "id": "A24",
+              "name": "Sample account 24",
+              "excluded": false,
+              "criteria": {
+                "industry": false,
+                "size": null,
+                "need": false
+              }
+            },
+            {
+              "id": "A25",
+              "name": "Sample account 25",
+              "excluded": false,
+              "criteria": {
+                "industry": true,
+                "size": true,
+                "need": true
+              }
+            }
+          ]
+        }
+      },
+      "fields": [
+        {
+          "key": "accounts",
+          "label": "Candidate accounts",
+          "help": "JSON rows with id, name, excluded, and criteria: object of true / false / null observations."
+        },
+        {
+          "key": "weights",
+          "label": "ICP criterion weights",
+          "help": "JSON object mapping criterion IDs to nonnegative integer weights. These are rule scores, not purchase probabilities."
+        }
+      ],
+      "planned_artifacts": "account-shortlist.csv; icp-rationale.html; source-gaps.csv; score-evidence.json",
+      "release_status": "Runnable adapter; independent outcome evaluation pending",
+      "example_result": {
+        "summary": "25 fictional accounts become an explained shortlist; unknown headcount and excluded sectors stay explicit.",
+        "rows": [
+          {
+            "id": "A01",
+            "text": "Harbor Labs: review candidate; confirmed score 100, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A02",
+            "text": "Linden Works: review candidate; confirmed score 70, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A03",
+            "text": "Sample account 3: excluded from outreach; confirmed score 70, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A04",
+            "text": "Sample account 4: review candidate; confirmed score 30, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A05",
+            "text": "Sample account 5: review candidate; confirmed score 100, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A06",
+            "text": "Sample account 6: review candidate; confirmed score 40, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A07",
+            "text": "Sample account 7: review candidate; confirmed score 100, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A08",
+            "text": "Sample account 8: review candidate; confirmed score 30, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A09",
+            "text": "Sample account 9: review candidate; confirmed score 70, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A10",
+            "text": "Sample account 10: review candidate; confirmed score 70, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A11",
+            "text": "Sample account 11: review candidate; confirmed score 100, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A12",
+            "text": "Sample account 12: review candidate; confirmed score 0, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A13",
+            "text": "Sample account 13: review candidate; confirmed score 100, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A14",
+            "text": "Sample account 14: review candidate; confirmed score 70, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A15",
+            "text": "Sample account 15: review candidate; confirmed score 70, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A16",
+            "text": "Sample account 16: review candidate; confirmed score 30, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A17",
+            "text": "Sample account 17: review candidate; confirmed score 100, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A18",
+            "text": "Sample account 18: review candidate; confirmed score 40, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A19",
+            "text": "Sample account 19: review candidate; confirmed score 100, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A20",
+            "text": "Sample account 20: review candidate; confirmed score 30, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A21",
+            "text": "Sample account 21: review candidate; confirmed score 70, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A22",
+            "text": "Sample account 22: review candidate; confirmed score 70, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A23",
+            "text": "Sample account 23: review candidate; confirmed score 100, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A24",
+            "text": "Sample account 24: review candidate; confirmed score 0, unresolved weight 30. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          },
+          {
+            "id": "A25",
+            "text": "Sample account 25: review candidate; confirmed score 100, unresolved weight 0. Validate evidence before outreach.",
+            "status": "inference",
+            "citations": []
+          }
+        ],
+        "limitations": [
+          "Manually authored illustration using the bundled fictional sample. Not a recorded model run or evidence of comparative quality."
+        ]
+      },
+      "design": {
+        "operation": "evidence_synthesis",
+        "complexity": "ambiguous",
+        "consequence": "medium",
+        "scope_reason": "The host ranks supplied candidates exactly; fit explanations must distinguish verified criteria from unresolved information.",
+        "draft_instructions": "Explain the supplied accounts using the host scores, explicit weights and exclusions. Preserve every candidate ID and exclusion. Separate confirmed fit from unknown criteria and identify a useful next research question for unresolved fit. Do not fabricate accounts, contacts, buying intent or win probabilities.",
+        "review_instructions": "Check explanations against each original account and the host ranking. Excluded candidates must not be recommended, unknown criteria must not become confirmed fit, and a score must not be presented as a buying probability. Preserve missing information without requesting speculative enrichment."
+      }
+    },
+    {
+      "id": "account-brief",
+      "number": 26,
+      "title": "Research an account before a meeting",
+      "category": "Revenue",
+      "wave": 2,
+      "persona": "Account executive; founder; partner manager",
+      "job": "Enter a customer conversation with verified context and useful questions.",
+      "inputs": "Company identity; supplied company/CRM notes; attendees and meeting goal; source dates; optional verified read adapter.",
+      "artifacts": "account-brief.html; stakeholder-map.csv; discovery-questions.md; sources.json",
+      "execution": "Resolve company \u2192 collect bounded evidence \u2192 map known people/context \u2192 synthesize meeting brief \u2192 verify",
+      "acceptance": "Company identity unambiguous; facts dated/cited; unknown roles explicit; discussion hypotheses labeled.",
+      "failure": "Paywall/unavailable source is a gap; stale research cannot masquerade as current news; no invented personal details.",
+      "implementation_delta": "New job; a one-page briefing plus source-backed stakeholder context, not an unbounded web essay.",
+      "illustrative_example": "Supplied notes show open integration questions; brief includes the exact unanswered decision criteria.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Enter a customer conversation with verified context and useful questions.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Supplied notes show open integration questions; brief includes the exact unanswered decision criteria."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "outreach",
+      "number": 27,
+      "title": "Build a grounded outreach campaign",
+      "category": "Revenue",
+      "wave": 2,
+      "persona": "SDR; founder; agency marketer",
+      "job": "Prepare relevant outreach variants from approved account evidence.",
+      "inputs": "Approved target list; offer and factual claims; audience; tone; channel constraints; exclusions/contact permissions.",
+      "artifacts": "outreach-drafts.csv; campaign-brief.md; claim-evidence.json; review-queue.csv",
+      "execution": "Check eligibility \u2192 map account evidence to offer \u2192 draft sequence \u2192 verify claims/constraints \u2192 queue",
+      "acceptance": "Every personalization supported; exclusions honored; no fabricated familiarity; channel limits and CTA checked.",
+      "failure": "Insufficient account evidence yields a generic clearly labeled variant or a held row; no invented emails.",
+      "implementation_delta": "New job; evidence-backed batch drafts with human review and explicit no-send default; delivery is a separate adapter.",
+      "illustrative_example": "One account's documented integration need informs a draft; an unsupported funding claim is omitted.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Prepare relevant outreach variants from approved account evidence.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "One account's documented integration need informs a draft; an unsupported funding claim is omitted."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "discovery-plan",
+      "number": 28,
+      "title": "Turn discovery notes into a deal plan",
+      "category": "Revenue",
+      "wave": 1,
+      "persona": "Founder; account executive; consultant",
+      "job": "Convert a call into confirmed needs, missing decisions and next actions.",
+      "inputs": "Transcript/notes; account ID; meeting date; sales process; approved product facts; follow-up format.",
+      "artifacts": "report.md; records.csv; sources.json; calculations.json; result.json",
+      "execution": "Validate supplied input \u2192 draft from the immutable snapshot \u2192 review against original sources \u2192 host checks before delivery \u2192 one correction if needed.",
+      "acceptance": "Commitments quote/link to source; owners/dates not invented; proposals distinguished from agreements; all critical unknowns shown.",
+      "failure": "Unclear speaker/budget/timeline stays unknown; unsupported promise blocks ready-to-send status.",
+      "implementation_delta": "New job; structured deal knowledge and an actionable follow-up bundle, not just a call summary.",
+      "illustrative_example": "A suggested $20k budget is marked unconfirmed; a promised technical follow-up becomes a sourced action.",
+      "version": "1.1.0",
+      "publisher": "OMAR",
+      "status": "runnable",
+      "adapter": "discovery_plan_v1",
+      "sample": {
+        "goal": "Convert a call into confirmed needs, missing decisions and next actions.",
+        "sources": [
+          {
+            "id": "transcript",
+            "title": "Transcript",
+            "text": "Buyer: We need to understand CRM integration. Seller: Would a $20,000 budget work? Buyer: The budget is not agreed. Seller: I will send technical questions. No deadline was agreed."
+          }
+        ],
+        "data": {}
+      },
+      "fields": [],
+      "planned_artifacts": "deal-plan.html; action-items.csv; qualification.json; follow-up-draft.md; sources.json",
+      "release_status": "Runnable adapter; independent outcome evaluation pending",
+      "sections": [
+        "confirmed-needs",
+        "open-questions",
+        "stakeholders",
+        "next-actions"
+      ],
+      "example_result": {
+        "summary": "A suggested $20k budget is marked unconfirmed; a promised technical follow-up becomes a sourced action.",
+        "rows": [
+          {
+            "id": "confirmed-needs",
+            "text": "The buyer wants to understand CRM integration.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "transcript",
+                "quote": "Buyer: We need to understand CRM integration."
+              }
+            ]
+          },
+          {
+            "id": "open-questions",
+            "text": "Which CRM, objects, volume and success criteria? Budget is not agreed; the seller\u2019s $20,000 suggestion is not a commitment.",
+            "status": "unknown",
+            "citations": []
+          },
+          {
+            "id": "stakeholders",
+            "text": "Identify the technical owner, buyer and budget approver; no named contacts were supplied.",
+            "status": "unknown",
+            "citations": []
+          },
+          {
+            "id": "next-actions",
+            "text": "Seller will send technical questions. Agree an owner for answers and a date; no deadline was agreed.",
+            "status": "cited",
+            "citations": [
+              {
+                "source_id": "transcript",
+                "quote": "Seller: I will send technical questions. No deadline was agreed."
+              }
+            ]
+          }
+        ],
+        "limitations": [
+          "Manually authored illustration using the bundled fictional sample. Not a recorded model run or evidence of comparative quality."
+        ]
+      },
+      "design": {
+        "operation": "planning",
+        "complexity": "ambiguous",
+        "consequence": "medium",
+        "scope_reason": "Follow-up planning must distinguish transcript facts from suggestions and avoid manufacturing commitments.",
+        "draft_instructions": "Extract confirmed needs, open questions and known stakeholders from the supplied notes, then propose a short actionable follow-up plan. Tie confirmed statements to original passages. Distinguish an explicit commitment from a suggestion; unknown budget, owner and date stay unknown. Make proposed next actions clearly provisional.",
+        "review_instructions": "Check needs, stakeholder roles and commitments against the original notes. Reject inferred approval, invented budget, or a proposed owner/date presented as confirmed. Check that next actions address the unresolved questions and are labeled as suggestions when no agreement exists."
+      }
+    },
+    {
+      "id": "partners",
+      "number": 29,
+      "title": "Find and qualify business partners",
+      "category": "Revenue",
+      "wave": 3,
+      "persona": "Business development lead; founder; agency owner",
+      "job": "Select candidate partners with an explicit mutual-value thesis.",
+      "inputs": "Candidate organizations/evidence; partner type; objectives; exclusions; capability requirements; scoring criteria.",
+      "artifacts": "partner-shortlist.csv; partner-briefs.html; co-sell-plan.md; questions.csv",
+      "execution": "Normalize candidates \u2192 map complementarity \u2192 apply eligibility rules \u2192 develop mutual-value cases \u2192 challenge ranking",
+      "acceptance": "Partner claims sourced; conflicts/exclusions checked; score components visible; commercial assumptions labeled.",
+      "failure": "Missing candidate evidence yields research gaps; unknown willingness to partner is never asserted.",
+      "implementation_delta": "New job; supplied candidates first, optional bounded sourcing later; resellers/integrators/referral partners are presets.",
+      "illustrative_example": "An integrator fits capability coverage but overlapping territory appears as a negotiation question.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Select candidate partners with an explicit mutual-value thesis.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "An integrator fits capability coverage but overlapping territory appears as a negotiation question."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    },
+    {
+      "id": "market-entry",
+      "number": 30,
+      "title": "Build a market-entry decision pack",
+      "category": "Revenue",
+      "wave": 3,
+      "persona": "Founder; strategy/BD lead; consultant",
+      "job": "Choose a segment, positioning and testable entry plan from evidence.",
+      "inputs": "Decision question; candidate markets; criteria; constraints; dated sources; competitor evidence; assumptions.",
+      "artifacts": "market-decision.html; competitor-matrix.csv; assumptions.csv; experiment-plan.md; sources.json",
+      "execution": "Frame alternatives \u2192 extract comparable evidence \u2192 score explicit criteria \u2192 challenge assumptions \u2192 propose entry experiment",
+      "acceptance": "Comparable units/periods; cited competitor claims; uncertainty visible; scenario arithmetic exact; no unsupported market-size total.",
+      "failure": "Insufficient market evidence produces a research/experiment plan; unsupported live-market claims withheld.",
+      "implementation_delta": "New job; decision criteria, scenario table and an actionable experiment distinguish it from general source research #9.",
+      "illustrative_example": "Two fictional segments are compared on distribution access and fit; an uncertain demand assumption becomes an experiment.",
+      "version": "1.0.0",
+      "publisher": "OMAR",
+      "status": "preview",
+      "adapter": "supplied_documents_v1",
+      "sample": {
+        "goal": "Choose a segment, positioning and testable entry plan from evidence.",
+        "sources": [
+          {
+            "id": "brief",
+            "title": "Example brief",
+            "text": "Two fictional segments are compared on distribution access and fit; an uncertain demand assumption becomes an experiment."
+          }
+        ],
+        "data": {}
+      },
+      "fields": []
+    }
+  ]
+}

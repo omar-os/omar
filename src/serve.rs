@@ -29,6 +29,7 @@ use crate::topology::{self, PortKind, TopologyRunConfig, VmState};
 
 #[path = "serve_recovery.rs"]
 mod recovery;
+mod templates;
 use recovery::WorkflowFollowup;
 
 pub const SERVE_PROTOCOL_VERSION: u32 = 1;
@@ -1123,7 +1124,14 @@ impl Serve {
         ));
         // The context was written by `start`, before the address was announced,
         // so an assistant launched here reads one that already names us.
-        if !launch {
+        if !launch
+            || context
+                .history
+                .lock()
+                .expect("history poisoned")
+                .conversation(&context.conversation_id)
+                .defer_assistant_start
+        {
             return Ok(AttachEa::Attached("(not launched)".to_string()));
         }
 
@@ -1825,7 +1833,14 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
                 .connect()?;
         }
         let _connection = WindowConnection(workspaces.clone());
-        if workspaces.launch_ea.load(Ordering::Relaxed) {
+        if workspaces.launch_ea.load(Ordering::Relaxed)
+            && !context
+                .history
+                .lock()
+                .expect("history poisoned")
+                .conversation(&context.conversation_id)
+                .defer_assistant_start
+        {
             let context = context.clone();
             thread::spawn(move || {
                 let _operation = context
@@ -1888,6 +1903,15 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
     }
 
     let (status, body) = match (method.as_str(), path.as_str()) {
+        ("POST", path) if path.starts_with("/v1/templates/") && content_length > MAX_BODY_BYTES => {
+            (413, json!({"error":"template request too large"}))
+        }
+        ("GET", "/v1/templates") => templates::catalog(&context),
+        ("POST", "/v1/templates/prepare") => templates::prepare(&workspaces, &context, &raw_body),
+        ("POST", "/v1/templates/repository") => templates::repository(&context, &raw_body),
+        ("POST", "/v1/templates/plan") => templates::plan(&context, &raw_body),
+        ("POST", "/v1/templates/result") => templates::result(&context, &raw_body),
+        ("POST", "/v1/templates/copy") => templates::copy(&context, &raw_body),
         ("GET", "/health") => (
             200,
             json!({
@@ -3604,6 +3628,20 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": "The request belongs to another chat."}),
         );
     }
+    let template = match crate::template_library::runtime::admit(
+        &request.program,
+        &request.inputs,
+        &context.omar_dir,
+    ) {
+        Ok(template) => template,
+        Err(error) => return (400, json!({"error":format!("{error:#}")})),
+    };
+    if template.is_some() && !request.raw_inputs.is_empty() {
+        return (
+            400,
+            json!({"error":"template inputs must be supplied through its reviewed configuration"}),
+        );
+    }
     let run_id = Uuid::new_v4().to_string();
     let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
         .join("serve")
@@ -3628,6 +3666,13 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         return (400, json!({"error": message}));
     }
 
+    if let Some(template) = &template {
+        if let Err(error) =
+            topology::write_json_atomic(&run_dir.join("template-run.json"), template)
+        {
+            return (500, json!({"error":error.to_string()}));
+        }
+    }
     // Compile and validate synchronously so a bad program is a 400 rather than
     // a 201 followed by an asynchronous failure the caller has to poll for.
     let bytecode = match topology::load_staged_program(&program_path) {
@@ -4110,6 +4155,7 @@ fn spawn_run_thread(
         let outcome = topology::run_topology(
             &bytecode,
             TopologyRunConfig {
+                template: None,
                 ea_id: context.ea_id,
                 omar_dir: &context.omar_dir,
                 generated: &topology::generated_dir(&program_path),
@@ -4133,7 +4179,7 @@ fn spawn_run_thread(
 }
 
 /// `parse_inputs` takes `NAME=VALUE`, where a `path` port wants a bare
-/// filesystem path and every other type wants JSON. Mirror that asymmetry.
+/// filesystem path; string-like ports want bare text and other types want JSON.
 fn encode_inputs(state: &VmState, inputs: &BTreeMap<String, Value>) -> Result<Vec<String>> {
     let mut encoded = Vec::with_capacity(inputs.len());
     for (name, value) in inputs {
@@ -4146,7 +4192,7 @@ fn encode_inputs(state: &VmState, inputs: &BTreeMap<String, Value>) -> Result<Ve
             "port '{name}' is not an input"
         );
         let raw = match (port.ty.as_str(), value) {
-            ("path", Value::String(path)) => path.clone(),
+            ("path" | "string" | "bytes", Value::String(text)) => text.clone(),
             // An enum string is typed bare on the command line and taken as
             // it comes, so quoting it here would make the quotes part of the
             // value and no value the port admits.
@@ -5120,6 +5166,10 @@ fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::R
                 record.error = Some(format!("{error:#}"));
             }
         }
+        if let Err(error) = templates::finish(context, record) {
+            record.status = RunStatus::Failed;
+            record.error = Some(format!("template deliverable was withheld: {error:#}"));
+        }
         persist_run(context, record);
     }
     let finished = runs.get(run_id).cloned();
@@ -5174,6 +5224,7 @@ fn spawn_resume_thread(
         let generated = topology::generated_dir(&program_path);
         let outcome = topology::resume_topology(
             TopologyRunConfig {
+                template: None,
                 ea_id: context.ea_id,
                 omar_dir: &context.omar_dir,
                 generated: &generated,
@@ -6858,7 +6909,7 @@ while True:
     }
 
     #[test]
-    fn encodes_paths_bare_and_everything_else_as_json() {
+    fn encodes_paths_and_strings_as_bare_text() {
         let encoded = encode_inputs(
             &sample_state(),
             &BTreeMap::from([
@@ -6867,9 +6918,8 @@ while True:
             ]),
         )
         .expect("inputs encode");
-        // `parse_inputs` canonicalises a bare path but JSON-decodes everything
-        // else, so quoting has to differ by port type.
-        assert!(encoded.contains(&"request=\"Review this plan\"".to_string()));
+        // String ports and paths both use bare text at the CLI boundary.
+        assert!(encoded.contains(&"request=Review this plan".to_string()));
         assert!(encoded.contains(&"resume=/tmp/resume.txt".to_string()));
     }
 

@@ -35,6 +35,7 @@ mod serve;
 mod sessions;
 mod stub_agent;
 mod supervision;
+mod template_library;
 mod terminal;
 #[cfg(test)]
 mod test_tmux;

@@ -1141,6 +1141,8 @@ impl Drop for Process {
 #[derive(Serialize, Deserialize)]
 pub struct Init {
     pub protocol: u32,
+    #[serde(default)]
+    pub template_backend: Option<String>,
     pub state: crate::topology::VmState,
     pub workspace: crate::workspace::Workspace,
     pub root: PathBuf,

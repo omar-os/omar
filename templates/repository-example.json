@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "template-basket",
+  "description": "Owned empty-basket example",
+  "reviewed_by": "OMAR fixture authors; diagnostic only",
+  "reviewed_at": 1,
+  "adapter": "python_json_api_v1",
+  "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "entrypoint": "basket:total",
+  "files": {
+    "basket.py": "def total(items):\n    return sum(items) if items else items[0]\n"
+  },
+  "allowed_patch_paths": [
+    "basket.py"
+  ],
+  "timeout_ms": 5000,
+  "protected_tests": [
+    {
+      "id": "empty",
+      "request": [],
+      "expected": 0
+    },
+    {
+      "id": "sum",
+      "request": [
+        2,
+        3
+      ],
+      "expected": 5
+    }
+  ]
+}
