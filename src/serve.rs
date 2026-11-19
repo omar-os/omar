@@ -29,6 +29,7 @@ use crate::topology::{self, PortKind, TopologyRunConfig, VmState};
 
 #[path = "serve_recovery.rs"]
 mod recovery;
+mod task_integrations;
 use recovery::WorkflowFollowup;
 
 pub const SERVE_PROTOCOL_VERSION: u32 = 1;
@@ -340,6 +341,8 @@ struct AgentReply {
 #[derive(Debug, Deserialize)]
 struct AgentProposal {
     token: String,
+    #[serde(default)]
+    task_integrations: task_integrations::Bindings,
     program: String,
     #[serde(default)]
     files: BTreeMap<String, String>,
@@ -388,6 +391,7 @@ struct Chat {
 
 /// A chat owns one EA; only the durable archive is shared between workspaces.
 struct Workspaces {
+    integration_catalog: Mutex<()>,
     history: Arc<Mutex<History>>,
     contexts: Mutex<BTreeMap<String, Arc<Context_>>>,
     settings: Settings,
@@ -959,6 +963,7 @@ impl Serve {
             shutdown: shutdown.clone(),
         });
         let workspaces = Arc::new(Workspaces {
+            integration_catalog: Mutex::new(()),
             history,
             contexts: Mutex::new(BTreeMap::from([(conversation_id, context.clone())])),
             settings: Settings {
@@ -1524,6 +1529,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
     let context = if path == "/v1/agent/reply"
         || path == "/v1/agent/proposals"
         || path == "/v1/agent/properties"
+        || path == "/v1/agent/integrations"
     {
         let body: Value = match serde_json::from_slice(&raw_body) {
             Ok(body) => body,
@@ -1540,7 +1546,9 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         let found = contexts
             .values()
             .find(|context| {
-                body.get("token").and_then(Value::as_str)
+                body.get("token")
+                    .and_then(Value::as_str)
+                    .filter(|token| !token.is_empty())
                     == Some(context.agent_token.lock().expect("token poisoned").as_str())
             })
             .cloned();
@@ -1615,6 +1623,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         || path == "/v1/workflow"
         || path == "/v1/workspaces"
         || path.starts_with("/v1/workspaces/")
+        || path == task_integrations::ROUTE
     {
         // Workspace reads expose host files; editor launch grants shell access.
         // Reject cross-site requests, including simple POSTs, rather than only
@@ -1630,6 +1639,16 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         if method == "OPTIONS" {
             return write_json(&mut stream, 204, &Value::Null, origin);
+        }
+        if path == task_integrations::ROUTE {
+            let (status, body) = {
+                let _guard = workspaces
+                    .integration_catalog
+                    .lock()
+                    .expect("integration catalog poisoned");
+                task_integrations::request(&workspaces.settings.omar_dir, &method, &raw_body)
+            };
+            return write_json(&mut stream, status, &body, origin);
         }
         if path == "/v1/memory" {
             if access != Access::Full || method != "POST" {
@@ -2023,6 +2042,9 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         // EA-only, authenticated with the token handed to its MCP sidecar.
         ("POST", "/v1/agent/reply") => agent_reply(&context, &read_body(content_length)?),
+        ("POST", "/v1/agent/integrations") => {
+            task_integrations::search(&context.omar_dir, &read_body(content_length)?)
+        }
         ("POST", "/v1/agent/proposals") => {
             if content_length > MAX_BODY_BYTES {
                 (413, json!({"error": "program too large"}))
@@ -2271,7 +2293,8 @@ fn view_refusal(method: &str, path: &str) -> Option<&'static str> {
     let route = path.split_once('?').map_or(path, |(route, _)| route);
     let panel = route.starts_with("/v1/runs/") && route.ends_with("/panel");
     let workspaces = route == "/v1/workspaces" || route.starts_with("/v1/workspaces/");
-    (method != "GET" || panel || workspaces).then_some("read-only view")
+    (method != "GET" || panel || workspaces || route == task_integrations::ROUTE)
+        .then_some("read-only view")
 }
 
 /// Forward one read to a run's diagram server, which binds loopback only, and
@@ -3268,6 +3291,9 @@ fn mission_control_envelope(text: &str, selection: &[String], live: Option<&Live
          OMAR program. Include companion files in `files`, keyed by their relative paths \
          (for example schemas/decision.json), so imported types compile. The entry \
          source is program.omar. Prefer optional // @title and // @desc comments directly above each task or reaction. The operator approves and runs it; you do not.\n\n\
+         For an external integration, search Settings with `omar_find_integrations`. Use the saved ID \
+         on the task that needs it via `omar_propose_design`'s `task_integrations`. If the intended \
+         connection is ambiguous, ask the operator. Never request a secret value.\n\n\
          When asked how to get started, invite the operator to describe a workflow \
          they want to automate, from development to marketing and beyond. Lead with \
          concrete developer examples: a GitHub issue into a tested pull request, \
@@ -3388,9 +3414,14 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     // Compile before publishing. The operator never sees an unbuildable
     // program, and the EA gets the compiler's diagnostic back as its tool
     // result, so it can correct the program itself.
-    let state = match compile_preview(&proposal.program, &proposal.files) {
-        Ok(state) => state,
-        Err(error) => return (400, json!({"error": format!("{error:#}")})),
+    let (program, state) = match task_integrations::compile_design(
+        &context.omar_dir,
+        proposal.program,
+        &proposal.files,
+        &proposal.task_integrations,
+    ) {
+        Ok(compiled) => compiled,
+        Err(error) => return (400, json!({"error":format!("{error:#}")})),
     };
     // Proved here rather than taken on trust: the operator is shown Lean's
     // verdict on this program, whatever the assistant believed.
@@ -3398,7 +3429,7 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Vec::new()
     } else {
         match prove_properties(
-            &proposal.program,
+            &program,
             &proposal.files,
             &proposal.lemmas,
             &proposal.properties,
@@ -3412,7 +3443,7 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         proposal.summary,
         false,
         Some(ProposedDesign {
-            program: proposal.program,
+            program,
             files: proposal.files,
             inputs: proposal.inputs,
             preview: crate::diagram::DiagramSnapshot::from_vm_state(&state),
@@ -7598,6 +7629,8 @@ while True:
             ("POST", "/v1/agent/backend"),
             ("DELETE", "/v1/runs/r"),
             ("GET", "/v1/workspaces"),
+            ("GET", "/v1/task-integrations"),
+            ("POST", "/v1/task-integrations"),
             ("GET", "/v1/workspaces/w/preview"),
             ("GET", "/v1/runs/r/panel"),
         ] {
