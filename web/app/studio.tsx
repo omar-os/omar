@@ -69,6 +69,7 @@ import {
   subscribeToDiagram,
   fetchConversations,
   fetchBackendStatus,
+  fetchBackends,
   checkProperties,
   openProofEditor,
   describeError,
@@ -260,6 +261,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [selection, setSelection] = useState<string[]>([]);
   /** The agent whose terminal is open, if any. */
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
+  const [modelCatalog, setModelCatalog] = useState<Record<string, string[]>>({});
   const [backendsOpen, setBackendsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -1203,6 +1205,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   useEffect(() => {
     if (!canRun || readOnly || isDemo) return;
     let cancelled = false;
+    void fetchBackends(serveUrl).then(info => { if (!cancelled) setModelCatalog(info.models); }).catch(() => {});
     fetchBackendStatus(serveUrl)
       .then((list) => {
         if (!cancelled && list && !list.some((status) => status.status === "connected")) setBackendsOpen(true);
@@ -1768,7 +1771,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             // answered through instead, which is the only thing there is.
             onOpenPanel={run ? setPanelAgent : undefined}
           />
-          {inspected ? <StepInspector key={`${serveUrl}:${inspected}`} component={inspected} snapshot={snapshot} source={source} readOnly={readOnly} editable={canRun && !readOnly && !switchingChat && (!run || isRunFinished(run.status))} onApply={applyStepConfiguration} onClose={() => setInspected(null)} onEdit={editSource} onAsk={askAboutStep} /> : null}
+          {inspected ? <StepInspector key={`${serveUrl}:${inspected}`} component={inspected} modelCatalog={modelCatalog} runModels={run?.role_models} snapshot={snapshot} source={source} readOnly={readOnly} editable={canRun && !readOnly && !switchingChat && (!run || isRunFinished(run.status))} onApply={applyStepConfiguration} onClose={() => setInspected(null)} onEdit={editSource} onAsk={askAboutStep} /> : null}
           </div>
           {timelineOpen ? (
             <Timeline

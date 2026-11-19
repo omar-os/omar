@@ -59,6 +59,17 @@ test('an agent model is kept when its step backend is edited', () => {
  assert.match(changed, /planner:Codex\(model = "claude-haiku-5-5"\) per 5 tasks/);
 });
 
+test('selecting and clearing a shared role model preserves other roles and lifetimes', () => {
+ const source = program.replace('planner:Codex', 'planner:Codex per 5 tasks');
+ const role = locateStep(source, snapshot, snapshot.reactions[0]);
+ const changed = replaceStep(source, role, {...role, model:'provider/model-v2'});
+ assert.equal(locateStep(changed, snapshot, snapshot.reactions[2]).model, 'provider/model-v2');
+ assert.equal(locateStep(changed, snapshot, snapshot.reactions[1]).model, '');
+ assert.ok(changed.includes('per 5 tasks'));
+ assert.equal(replaceStep(changed, locateStep(changed, snapshot, snapshot.reactions[0]), {...role, model:''}), source);
+ assert.throws(() => replaceStep(source, role, {...role, model:'--bad'}), /valid backend model/);
+});
+
 test('editing task configuration preserves metadata and the other steps', () => {
  const metadata = '// @title Review campaign script\n // @desc Inspect the prompt, identify gaps, and return a critique.';
  for (const deadline of ['', 'within(30s)']) {

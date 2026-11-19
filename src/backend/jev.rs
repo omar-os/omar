@@ -104,6 +104,11 @@ impl Backend for Jev {
     }
 }
 
+/// The exact default passed in the provider request when a role omits a model.
+pub(crate) fn default_model() -> String {
+    std::env::var("OMAR_JEV_MODEL").unwrap_or_else(|_| "jev-1.13.0".into())
+}
+
 fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>> {
     let TopologyInvocation {
         effects,
@@ -143,7 +148,7 @@ fn invoke(invocation: &TopologyInvocation<'_>) -> Result<BTreeMap<String, Value>
     // The agent's own model wins over the run-wide default.
     let model = match agent_model {
         Some(model) => model.to_string(),
-        None => std::env::var("OMAR_JEV_MODEL").unwrap_or_else(|_| "jev-1.13.0".into()),
+        None => default_model(),
     };
     ensure!(!model.trim().is_empty(), "OMAR_JEV_MODEL must not be empty");
     let criteria: BTreeMap<_, _> = options

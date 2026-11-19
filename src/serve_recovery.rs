@@ -361,6 +361,7 @@ mod tests {
 
     fn failure(context: &Arc<Context_>) -> RunRecord {
         let record = RunRecord {
+            role_models: BTreeMap::new(),
             run_id: "failed-run".into(),
             team: "ReleaseReport".into(),
             status: RunStatus::Failed,

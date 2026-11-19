@@ -10,6 +10,9 @@ export type StepSource = {
   declarationStart: number;
   team: string;
   backend: string;
+  model: string;
+  role: string;
+  bindingEnd: number;
   prompt: string;
   triggers: string[];
   contract: string;
@@ -104,6 +107,14 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
     const agent = all.findIndex((token, i) => i > begin && i < open && token.text === owner && all[i + 1]?.text === ":");
     if (agent < 0) return null;
     const backend = all[agent + 2];
+    let bindingEnd = backend.end;
+    let model = "";
+    if (all[agent + 3]?.text === "(") {
+      const option = all.slice(agent + 4, agent + 8);
+      if (option.length !== 4 || option[0].text !== "model" || option[1].text !== "=" || !option[2].string || option[3].text !== ")") return null;
+      model = option[2].text;
+      bindingEnd = option[3].end;
+    }
     const close = all.findIndex((token, i) => i > position + 2 && !token.string && token.text === ")");
     if (close < 0 || all[close + 1]?.text !== "->") return null;
     const firstString = all.findIndex((token, i) => i > close + 1 && token.string);
@@ -119,7 +130,7 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
       description: declaration.annotations?.description,
       metadataSpans: declaration.annotations?.spans ?? [],
       declarationStart: declaration.start,
-      team, backend: backend.text, prompt: all[body].text,
+      team, role: owner, model, bindingEnd, backend: backend.text, prompt: all[body].text,
       triggers: source.slice(triggersSpan.start, triggersSpan.end).split(",").map((s) => s.trim()).filter(Boolean),
       contract: source.slice(contractSpan.start, contractSpan.end),
       backendSpan: backend, promptSpan: all[body], triggersSpan, contractSpan,
@@ -127,10 +138,13 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
   } catch { return null; }
 }
 
-export function replaceStep(source: string, step: StepSource, changes: { backend: string; prompt: string; triggers: string[]; contract: string; title?: string; description?: string }): string {
+export function replaceStep(source: string, step: StepSource, changes: { backend: string; model?: string; prompt: string; triggers: string[]; contract: string; title?: string; description?: string }): string {
   if (!/^[A-Za-z_][A-Za-z_0-9]*$/.test(changes.backend)) throw new Error("Choose a supported execution backend.");
+  const model = changes.model ?? step.model;
+  if (model && (!/^[a-zA-Z0-9._:/@+\[\]-]+$/.test(model) || model.startsWith("-"))) throw new Error("Choose a valid backend model ID.");
+  const binding = model ? `${changes.backend}(model = "${model}")` : changes.backend;
   const replacements = [
-    { ...step.backendSpan, value: changes.backend },
+    model === step.model ? { ...step.backendSpan, value: changes.backend } : { start: step.backendSpan.start, end: step.bindingEnd, value: binding },
     { ...step.promptSpan, value: `"${changes.prompt.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` },
     { ...step.triggersSpan, value: changes.triggers.join(", ") },
     { ...step.contractSpan, value: changes.contract },

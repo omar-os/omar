@@ -132,6 +132,11 @@ pub struct RunRecord {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[ts(optional, type = "Record<string, unknown>")]
     pub state: BTreeMap<String, Value>,
+    /// Model passed to each model-capable role at admission. Null means
+    /// the backend chose its default without reporting a model ID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(optional, type = "Record<string, string | null>")]
+    pub role_models: BTreeMap<String, Option<String>>,
     /// The last mutation asked of the run, and how it went.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -407,6 +412,7 @@ struct Settings {
     command: String,
     address: SocketAddr,
     sandbox: crate::sandbox::Config,
+    models: BTreeMap<String, Vec<String>>,
 }
 
 struct Context_ {
@@ -418,6 +424,7 @@ struct Context_ {
     default_workdir: String,
     health_idle_warning: i64,
     sandbox: crate::sandbox::Config,
+    models: BTreeMap<String, Vec<String>>,
     runs: Runs,
     /// Where each run's web-backed invocations are answered. Absent for a run
     /// whose program has no `Web` agent, which is what makes the panel routes
@@ -935,6 +942,7 @@ impl Serve {
             default_workdir: config.agent.default_workdir.clone(),
             health_idle_warning: config.health.idle_warning,
             sandbox: config.sandbox.clone(),
+            models: config.agent.models.clone(),
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             mutations: Mutex::default(),
@@ -969,6 +977,7 @@ impl Serve {
                 command: config.agent.default_command.clone(),
                 address,
                 sandbox: config.sandbox.clone(),
+                models: config.agent.models.clone(),
             },
             selection: Mutex::new(()),
             editors: Mutex::new(crate::editor::Editors::default()),
@@ -2425,6 +2434,11 @@ fn describe_agent(context: &Arc<Context_>) -> Value {
             .find(|kind| crate::backend::of(*kind).default_command() == command)
             .map(crate::backend::Kind::name),
         "available": crate::backend::assistant_names(),
+        "models": crate::backend::model_backends().into_iter().flat_map(|name| {
+            let models = context.models.get(name).cloned().unwrap_or_default();
+            crate::backend::by_name(name).unwrap().aliases().iter()
+                .map(move |alias| ((*alias).to_owned(), models.clone()))
+        }).collect::<BTreeMap<_,_>>(),
         // What a run that says nothing does, so Mission Control's deploy
         // dialog starts from it, and whether sbx is here to offer at all.
         "sandbox": {
@@ -2827,6 +2841,7 @@ impl Workspaces {
             default_workdir: self.settings.default_workdir.clone(),
             health_idle_warning: self.settings.health_idle_warning,
             sandbox: self.settings.sandbox.clone(),
+            models: self.settings.models.clone(),
             runs: Arc::new(Mutex::new(parked)),
             panels: Panels::default(),
             mutations: Mutex::default(),
@@ -3569,6 +3584,31 @@ fn write_chat_event(stream: &mut TcpStream, message: &ChatMessage) -> Result<()>
     Ok(())
 }
 
+fn admitted_role_models(
+    state: &topology::VmState,
+    catalog: &BTreeMap<String, Vec<String>>,
+) -> Result<BTreeMap<String, Option<String>>> {
+    let mut choices = BTreeMap::new();
+    for (name, agent) in &state.agents {
+        let Some(backend) = crate::backend::by_name(&agent.backend) else {
+            continue;
+        };
+        if backend.model_flag("m").is_none() {
+            continue;
+        }
+        if let (Some(allowed), Some(model)) = (catalog.get(backend.kind().name()), &agent.model) {
+            if !allowed.contains(model) {
+                anyhow::bail!("Model '{model}' is unavailable for role '{name}' in this runtime's model catalog.");
+            }
+        }
+        choices.insert(
+            name.clone(),
+            crate::backend::resolved_model(backend.kind(), agent.model.as_deref()),
+        );
+    }
+    Ok(choices)
+}
+
 fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     let _admission = match context.admit() {
         Ok(admission) => admission,
@@ -3638,6 +3678,10 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
+    let role_models = match admitted_role_models(&state, &context.models) {
+        Ok(models) => models,
+        Err(error) => return (400, json!({"error":error.to_string()})),
+    };
     let mut inputs = match encode_inputs(&state, &request.inputs) {
         Ok(inputs) => inputs,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
@@ -3698,6 +3742,7 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             .collect(),
         outputs: BTreeMap::new(),
         state: BTreeMap::new(),
+        role_models,
         mutation: None,
     };
     persist_run(context, &record);
@@ -5496,6 +5541,22 @@ mod tests {
     }
     use crate::topology::{AgentState, PortState};
 
+    #[test]
+    fn role_model_history_keeps_defaults_and_validates_explicit_catalog_choices() {
+        let mut vm = sample_state();
+        let catalog = BTreeMap::from([("codex".into(), vec!["local-a".into()])]);
+        assert_eq!(admitted_role_models(&vm, &catalog).unwrap()["worker"], None);
+        vm.agents.get_mut("worker").unwrap().model = Some("local-a".into());
+        let mut saved = record("Sample", RunStatus::Completed);
+        saved.role_models = admitted_role_models(&vm, &catalog).unwrap();
+        let restored: RunRecord = serde_json::from_value(json!(saved)).unwrap();
+        vm.agents.get_mut("worker").unwrap().model = Some("local-b".into());
+        assert!(admitted_role_models(&vm, &catalog).is_err());
+        assert_eq!(restored.role_models["worker"].as_deref(), Some("local-a"));
+        vm.agents.get_mut("worker").unwrap().backend = "Web".into();
+        assert!(admitted_role_models(&vm, &catalog).unwrap().is_empty());
+    }
+
     fn sample_state() -> VmState {
         VmState {
             version: 1,
@@ -5564,6 +5625,7 @@ mod tests {
             present: Vec::new(),
             outputs: BTreeMap::new(),
             state: BTreeMap::new(),
+            role_models: BTreeMap::new(),
             mutation: None,
         }
     }
@@ -6270,6 +6332,7 @@ mod tests {
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    role_models: BTreeMap::new(),
                     mutation: None,
                 },
             );
@@ -6573,6 +6636,7 @@ while True:
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    role_models: BTreeMap::new(),
                     mutation: None,
                 },
             );
@@ -6644,6 +6708,7 @@ while True:
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    role_models: BTreeMap::new(),
                     mutation: None,
                 },
             );
@@ -6800,6 +6865,7 @@ while True:
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    role_models: BTreeMap::new(),
                     mutation: None,
                 },
             );
@@ -6938,6 +7004,7 @@ while True:
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    role_models: BTreeMap::new(),
                     mutation: None,
                 },
             );
@@ -6983,6 +7050,7 @@ while True:
                 present: Vec::new(),
                 outputs: BTreeMap::new(),
                 state: BTreeMap::new(),
+                role_models: BTreeMap::new(),
                 mutation: None,
             },
         );
@@ -7024,6 +7092,7 @@ while True:
                     present: Vec::new(),
                     outputs: BTreeMap::new(),
                     state: BTreeMap::new(),
+                    role_models: BTreeMap::new(),
                     mutation: None,
                 },
             );
