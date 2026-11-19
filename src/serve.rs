@@ -29,6 +29,7 @@ use crate::topology::{self, PortKind, TopologyRunConfig, VmState};
 
 #[path = "serve_recovery.rs"]
 mod recovery;
+mod workflow_design;
 use recovery::WorkflowFollowup;
 
 pub const SERVE_PROTOCOL_VERSION: u32 = 1;
@@ -168,6 +169,10 @@ pub enum MutationStatus {
 
 #[derive(Debug, Deserialize)]
 struct StartRunRequest {
+    #[serde(default)]
+    design_sequence: Option<u64>,
+    #[serde(skip)]
+    execution_profiles: BTreeMap<String, crate::workflow_design::ModelProfile>,
     program: String,
     /// The source's file name, which names a program without a named `main`.
     /// Must be a plain name ending in `.omar`; default `program.omar`.
@@ -308,6 +313,9 @@ pub struct ChatMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct ProposedDesign {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workflow: Option<crate::workflow_design::WorkflowPlan>,
     pub program: String,
     /// Companion files relative to program.omar.
     #[serde(default)]
@@ -339,6 +347,8 @@ struct AgentReply {
 
 #[derive(Debug, Deserialize)]
 struct AgentProposal {
+    #[serde(default)]
+    workflow: Option<crate::workflow_design::WorkflowPlan>,
     token: String,
     program: String,
     #[serde(default)]
@@ -1524,6 +1534,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
     let context = if path == "/v1/agent/reply"
         || path == "/v1/agent/proposals"
         || path == "/v1/agent/properties"
+        || path == "/v1/agent/model-catalog"
     {
         let body: Value = match serde_json::from_slice(&raw_body) {
             Ok(body) => body,
@@ -2023,6 +2034,13 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         // EA-only, authenticated with the token handed to its MCP sidecar.
         ("POST", "/v1/agent/reply") => agent_reply(&context, &read_body(content_length)?),
+        ("GET", "/v1/workflow/catalog") => workflow_design::catalog(&context, None),
+        ("POST", "/v1/agent/model-catalog") => {
+            workflow_design::catalog(&context, Some(&read_body(content_length)?))
+        }
+        ("POST", "/v1/workflow/review") => {
+            workflow_design::review(&context, &read_body(content_length)?)
+        }
         ("POST", "/v1/agent/proposals") => {
             if content_length > MAX_BODY_BYTES {
                 (413, json!({"error": "program too large"}))
@@ -3378,7 +3396,7 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         .chat_operation
         .lock()
         .expect("chat operation poisoned");
-    let proposal: AgentProposal = match serde_json::from_slice(body) {
+    let mut proposal: AgentProposal = match serde_json::from_slice(body) {
         Ok(proposal) => proposal,
         Err(error) => return (400, json!({"error": format!("invalid request: {error}")})),
     };
@@ -3392,6 +3410,36 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
+    // A revision cannot silently discard saved questions or model choices.
+    // Live edits use the existing mutation path and retain checkpoint profiles.
+    if proposal.workflow.is_none()
+        && workflow_design::latest(context)
+            .and_then(|m| m.design)
+            .is_some_and(|d| d.workflow.is_some())
+        && !context
+            .runs
+            .lock()
+            .expect("runs poisoned")
+            .values()
+            .any(|r| r.team == state.team && r.status.holds_team())
+    {
+        return (
+            400,
+            json!({"error":"include workflow metadata when revising this draft"}),
+        );
+    }
+    if let Some(plan) = &mut proposal.workflow {
+        if let Err(error) = workflow_design::prepare(
+            context,
+            plan,
+            &proposal.program,
+            &proposal.files,
+            &proposal.inputs,
+            &state,
+        ) {
+            return (400, json!({"error":format!("{error:#}")}));
+        }
+    }
     // Proved here rather than taken on trust: the operator is shown Lean's
     // verdict on this program, whatever the assistant believed.
     let properties = if proposal.properties.is_empty() {
@@ -3412,6 +3460,7 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         proposal.summary,
         false,
         Some(ProposedDesign {
+            workflow: proposal.workflow,
             program: proposal.program,
             files: proposal.files,
             inputs: proposal.inputs,
@@ -3604,6 +3653,10 @@ fn start_run(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
             json!({"error": "The request belongs to another chat."}),
         );
     }
+    request.execution_profiles = match workflow_design::admitted_profiles(context, &request) {
+        Ok(profiles) => profiles,
+        Err(error) => return (409, json!({"error":format!("{error:#}")})),
+    };
     let run_id = Uuid::new_v4().to_string();
     let run_dir = crate::ea::ea_state_dir(context.ea_id, &context.omar_dir)
         .join("serve")
@@ -4104,12 +4157,14 @@ fn spawn_run_thread(
         .as_deref()
         .and_then(|period| crate::checkpoint::parse_policy(period).ok());
     let keep_workspaces = request.keep_workspaces;
+    let execution_profiles = request.execution_profiles.clone();
     let sandbox_template = request.sandbox_template.clone();
     thread::spawn(move || {
         let diagram_address: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
         let outcome = topology::run_topology(
             &bytecode,
             TopologyRunConfig {
+                execution_profiles,
                 ea_id: context.ea_id,
                 omar_dir: &context.omar_dir,
                 generated: &topology::generated_dir(&program_path),
@@ -5174,6 +5229,7 @@ fn spawn_resume_thread(
         let generated = topology::generated_dir(&program_path);
         let outcome = topology::resume_topology(
             TopologyRunConfig {
+                execution_profiles: BTreeMap::new(),
                 ea_id: context.ea_id,
                 omar_dir: &context.omar_dir,
                 generated: &generated,
@@ -5566,7 +5622,7 @@ mod tests {
         }
     }
 
-    fn test_server() -> Serve {
+    pub(super) fn test_server() -> Serve {
         let omar_dir = std::env::temp_dir().join(format!("omar-serve-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&omar_dir).expect("temp omar dir");
         Serve::start(
@@ -6475,6 +6531,7 @@ while True:
             )
             .unwrap();
         let proposal = ProposedDesign {
+            workflow: None,
             files: BTreeMap::from([(
                 "schemas/decision.json".into(),
                 "{\"type\":\"string\"}".into(),

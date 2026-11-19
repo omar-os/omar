@@ -1,0 +1,54 @@
+{
+  "profiles": [
+    {
+      "id": "codex-quality",
+      "backend": "codex",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
+      "tier": "quality"
+    },
+    {
+      "id": "codex-economy",
+      "backend": "codex",
+      "model": "gpt-6-luna",
+      "effort": "medium",
+      "tier": "economy"
+    },
+    {
+      "id": "claude-quality",
+      "backend": "claude",
+      "model": "claude-sonnet-5-5",
+      "effort": "high",
+      "tier": "quality"
+    },
+    {
+      "id": "claude-economy",
+      "backend": "claude",
+      "model": "claude-haiku-5-5",
+      "effort": null,
+      "tier": "economy"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "anthropic-20261101-extraction",
+      "profile_id": "claude-economy",
+      "task": "structured_extraction",
+      "finding": "Provider positions Haiku for high-volume extraction. This is candidate-selection evidence only.",
+      "source": "https://platform.claude.com/docs/en/models/overview",
+      "observed_at": 1793491200,
+      "expires_at": 1796083200,
+      "limitations": "No local quality or account-access measurement. Does not qualify an economical route."
+    },
+    {
+      "id": "openai-20261102-luna-extraction-guidance",
+      "profile_id": "codex-economy",
+      "task": "structured_extraction",
+      "finding": "OpenAI recommends low effort for routine extraction and lists GPT-6 Luna among supported reasoning models. Luna is a candidate for a local extraction trial.",
+      "source": "https://developers.openai.com/api/docs/guides/deployment-checklist#set-up-reasoningeffort",
+      "observed_at": 1793658854,
+      "expires_at": 1796250854,
+      "limitations": "Provider guidance checked by Codex, not independent quality evidence. The configured candidate remains medium effort; this source does not measure that setting. No reliable economical route, subscription cost, native tool access or local acceptance rate is established. This published evidence does not qualify local routing or prove a workflow advantage."
+    }
+  ]
+}

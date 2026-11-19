@@ -801,6 +801,7 @@ mod tests {
         .unwrap();
         let draft = WorkflowDraft {
             design: crate::serve::ProposedDesign {
+                workflow: None,
                 lemmas: String::new(),
                 properties: Vec::new(),
                 program: "edited workflow".into(),
@@ -888,6 +889,7 @@ mod tests {
             let id = legacy.active_id.clone();
             let draft = WorkflowDraft {
                 design: crate::serve::ProposedDesign {
+                    workflow: None,
                     lemmas: String::new(),
                     properties: Vec::new(),
                     program: format!("saved edits from {backend}"),

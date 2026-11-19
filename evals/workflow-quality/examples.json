@@ -1,0 +1,55 @@
+[
+  {
+    "id": "approved",
+    "instruction": "Return JSON with decision (proceed, hold, or insufficient_evidence), recommendation, claims [{text, source_ids}], and limitations. Base every claim on the supplied sources.",
+    "sources": [
+      {
+        "id": "policy",
+        "text": "Proceed only with score >= 90 and final approval. A known failed requirement means hold. Missing or contradictory evidence means insufficient_evidence."
+      },
+      {
+        "id": "measurement",
+        "text": "Measured score: 92."
+      },
+      {
+        "id": "review",
+        "text": "Final review: approved."
+      }
+    ],
+    "expected_decision": "proceed"
+  },
+  {
+    "id": "below-threshold",
+    "instruction": "Return JSON with decision (proceed, hold, or insufficient_evidence), recommendation, claims [{text, source_ids}], and limitations. Base every claim on the supplied sources.",
+    "sources": [
+      {
+        "id": "policy",
+        "text": "Proceed only with score >= 90 and final approval. A known failed requirement means hold. Missing or contradictory evidence means insufficient_evidence."
+      },
+      {
+        "id": "measurement",
+        "text": "Measured score: 82."
+      },
+      {
+        "id": "review",
+        "text": "Final review: approved."
+      }
+    ],
+    "expected_decision": "hold"
+  },
+  {
+    "id": "missing-approval",
+    "instruction": "Return JSON with decision (proceed, hold, or insufficient_evidence), recommendation, claims [{text, source_ids}], and limitations. Base every claim on the supplied sources.",
+    "sources": [
+      {
+        "id": "policy",
+        "text": "Proceed only with score >= 90 and final approval. A known failed requirement means hold. Missing or contradictory evidence means insufficient_evidence."
+      },
+      {
+        "id": "measurement",
+        "text": "Measured score: 92."
+      }
+    ],
+    "expected_decision": "insufficient_evidence"
+  }
+]

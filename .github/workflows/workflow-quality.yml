@@ -1,0 +1,19 @@
+name: Document workflow smoke evaluation
+on:
+  pull_request:
+    paths: ['evals/workflow-quality/**', '.github/workflows/workflow-quality.yml']
+  push:
+    branches: [main]
+    paths: ['evals/workflow-quality/**', '.github/workflows/workflow-quality.yml']
+permissions:
+  contents: read
+jobs:
+  comparison:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python3 -m unittest discover -s evals/workflow-quality -p 'test_*.py'

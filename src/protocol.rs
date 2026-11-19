@@ -36,6 +36,7 @@ use crate::serve::{
     ChatMessage, ChatRole, MutationRecord, MutationStatus, ProposedDesign, RunRecord, RunStatus,
 };
 use crate::topology::PortKind;
+use crate::workflow_design::*;
 
 /// Where the generated file lives, relative to the repository root.
 pub const GENERATED_PATH: &str = "web/app/lib/protocol-generated.ts";
@@ -206,6 +207,16 @@ pub fn generate() -> String {
         DiagramEvent::decl(&config),
         ProofProblem::decl(&config),
         PropertyVerdict::decl(&config),
+        ModelProfile::decl(&config),
+        ModelEvidence::decl(&config),
+        ModelCatalog::decl(&config),
+        DesignAssumption::decl(&config),
+        DesignQuestion::decl(&config),
+        DesignStep::decl(&config),
+        DesignSource::decl(&config),
+        ModelChoice::decl(&config),
+        DesignReview::decl(&config),
+        WorkflowPlan::decl(&config),
         ProposedDesign::decl(&config),
         ChatMessage::decl(&config),
         WorkflowDraft::decl(&config),

@@ -42,6 +42,7 @@ mod tmux;
 mod topology;
 mod ui;
 mod web_assets;
+mod workflow_design;
 mod workspace;
 
 use std::io;
