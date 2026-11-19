@@ -19,6 +19,34 @@ export type StepSource = {
   contractSpan: Span;
 };
 
+// The compiler treats Rust as opaque. A terminator in a comment, raw string
+// or quoted literal belongs to Rust and cannot begin another OMAR declaration.
+function codeEnd(source: string, start: number): number {
+  const literal = /\/\/[^\n]*|\/\*|\b(?:br|cr|r)(#*)"|'(?:\\.|[^'\\])'|"(?:\\[\s\S]|[^"\\])*"|=}/gy;
+  let i = start + 2;
+  while (i < source.length) {
+    literal.lastIndex = i;
+    const match = literal.exec(source);
+    if (!match) { i++; continue; }
+    i = literal.lastIndex;
+    if (match[0] === "=}") return i;
+    if (match[1] !== undefined) {
+      const delimiter = '"' + match[1];
+      const end = source.indexOf(delimiter, i);
+      if (end < 0) break;
+      i = end + delimiter.length;
+    } else if (match[0] === "/*") {
+      let depth = 1;
+      while (depth && i < source.length) {
+        if (source.startsWith("/*", i)) { depth++; i += 2; }
+        else if (source.startsWith("*/", i)) { depth--; i += 2; }
+        else i++;
+      }
+    }
+  }
+  throw new Error("Unclosed code reaction");
+}
+
 /** Locate editable spans, never decide whether a workflow is valid. The runtime
  * compiler validates every replacement before it becomes the current draft. */
 function tokens(source: string): Token[] {
@@ -60,10 +88,20 @@ function tokens(source: string): Token[] {
       if (depth) throw new Error("Unclosed comment");
       continue;
     }
-    // Rust code has its own lexer. Leave these programs to the source editor.
-    if (source.startsWith("{=", i)) throw new Error("Code reaction");
     const start = i;
-    if (source[i] === '"') {
+    if (source.startsWith("{=", i)) {
+      i = codeEnd(source, i);
+      result.push({ text: "{=…=}", start, end: i, string: false });
+    } else if (source.startsWith('"""', i)) {
+      const close = source.indexOf('"""', i + 3);
+      if (close < 0) throw new Error("Unclosed block prompt");
+      const lines = source.slice(i + 3, close).replace(/\r+$/gm, "").split("\n");
+      if (!lines[0]?.trim()) lines.shift();
+      if (!lines.at(-1)?.trim()) lines.pop();
+      const indent = Math.min(...lines.filter(line => line.trim()).map(line => /^[ \t]*/.exec(line)![0].length));
+      i = close + 3;
+      result.push({ text: lines.map(line => line.trim() ? line.slice(indent) : "").join("\n"), start, end: i, string: true });
+    } else if (source[i] === '"') {
       i++;
       while (i < source.length && source[i] !== '"') {
         if (source[i] === "\\" && /["\\]/.test(source[i + 1] ?? "")) i += 2;
@@ -94,9 +132,9 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
     if (open < 0) return null;
     const end = all.findIndex((token, i) => i > open && !token.string && token.text === "}");
     if (end < 0) return null;
-    const prompts = all.slice(open + 1, end).filter((token) => !token.string && token.text === "task");
+    const prompts = all.slice(open + 1, end).filter((token) => !token.string && (token.text === "task" || token.text === "reaction"));
     const declaration = prompts[index];
-    if (!declaration) return null;
+    if (!declaration || declaration.text !== "task") return null;
     const position = all.indexOf(declaration);
     const owner = all[position + 1]?.text;
     const actualOwner = snapshot.agents.find((agent) => agent.id === reaction.agent)?.name.split(".").at(-1);
@@ -108,8 +146,9 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
     if (close < 0 || all[close + 1]?.text !== "->") return null;
     const firstString = all.findIndex((token, i) => i > close + 1 && token.string);
     // Constant strings in output contracts are deliberately left to source editing.
-    if (firstString < 0 || all[firstString - 1]?.text === "=" || firstString >= end) return null;
     const body = firstString;
+    if (body < 0 || all[body - 1]?.text === "=" || body >= end ||
+        all.slice(close + 2, body).some(token => ["task", "reaction", "{=…=}"].includes(token.text))) return null;
     const deadline = all.findIndex((token, i) => i > close + 1 && i < body && !token.string && token.text === "within");
     const contractEnd = deadline < 0 ? body : deadline;
     const triggersSpan = { start: all[position + 2].end, end: all[close].start };
@@ -127,11 +166,24 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
   } catch { return null; }
 }
 
+function quotedPrompt(prompt: string): string {
+  return '"' + prompt.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+
+export function replacePrompt(source: string, step: StepSource, prompt: string): string {
+  const replacements = [{ ...step.promptSpan, value: quotedPrompt(prompt) }];
+  if (prompt !== step.prompt) {
+    for (const span of step.metadataSpans) replacements.push({ ...span, value: "" });
+  }
+  replacements.sort((a, b) => b.start - a.start);
+  return replacements.reduce((text, edit) => text.slice(0, edit.start) + edit.value + text.slice(edit.end), source);
+}
+
 export function replaceStep(source: string, step: StepSource, changes: { backend: string; prompt: string; triggers: string[]; contract: string; title?: string; description?: string }): string {
   if (!/^[A-Za-z_][A-Za-z_0-9]*$/.test(changes.backend)) throw new Error("Choose a supported execution backend.");
   const replacements = [
     { ...step.backendSpan, value: changes.backend },
-    { ...step.promptSpan, value: `"${changes.prompt.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` },
+    { ...step.promptSpan, value: quotedPrompt(changes.prompt) },
     { ...step.triggersSpan, value: changes.triggers.join(", ") },
     { ...step.contractSpan, value: changes.contract },
   ];

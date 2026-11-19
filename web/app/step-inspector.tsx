@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { locateStep, replaceStep, type StepSource } from "./lib/step-source";
+import { useMemo, useRef, useState } from "react";
+import { locateStep, replacePrompt, replaceStep, type StepSource } from "./lib/step-source";
 import type { DiagramSnapshot } from "./lib/protocol";
 import { formatDuration } from "./lib/protocol";
 import { componentName } from "./diagram/diagram-canvas";
@@ -37,6 +37,8 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
       <h3>{name}</h3>
       <p className="inspector-description">{copy?.description ?? component}</p>
       {reaction ? <>
+        {configuration && !readOnly ? <PromptEditor step={configuration} source={source} enabled={editable} onApply={onApply} /> : null}
+        {readOnly ? null : <button type="button" className="step-edit" onClick={onEdit}>Open source <WorkflowIcon name="arrow" size={14} /></button>}
         {!configuration ? <>
         <div className="inspector-field"><span>Execution backend</span><div className="step-model"><i>{(agent?.backend ?? "?").slice(0, 1)}</i>{agent?.backend ?? "Not specified"}<span className={`step-status ${reaction.status}`}>{reaction.status}</span></div></div>
         <div className="inspector-field"><span>Output contract</span><div className="step-contract">{reaction.contract || "No contract declared"}</div></div>
@@ -47,7 +49,6 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
         </> : null}
         {configuration ? <StepEditor key={`${component}:${source}`} source={source} step={configuration} enabled={editable} readOnly={readOnly} onApply={onApply} ports={snapshot.ports.filter((item) => item.instance === reaction.instance && item.kind !== "output").map((item) => item.name.startsWith(`${reaction.instance}.`) ? item.name.slice(reaction.instance.length + 1) : item.name)} /> : <p className="step-empty">Use the source editor for this step’s configuration.</p>}
         {readOnly ? null : <>
-        <button type="button" className="step-edit" onClick={onEdit}>Edit prompt & backend in source <WorkflowIcon name="arrow" size={14} /></button>
         <button type="button" className="step-ask" onClick={() => onAsk(`Update the prompt or execution backend for ${component}: `)}>Edit with OMAR</button>
         </>}
       </> : null}
@@ -61,11 +62,45 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
   );
 }
 
+function PromptEditor({ source, step, enabled, onApply }: {
+  source: string; step: StepSource; enabled: boolean; onApply: (source: string) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState<{ original: string; prompt: string } | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const entry = useRef<HTMLButtonElement>(null);
+  function close() {
+    setDraft(null);
+    setError("");
+    requestAnimationFrame(() => entry.current?.focus());
+  }
+  async function save() {
+    if (!draft || busy || draft.original !== source) return;
+    setBusy(true);
+    setError("");
+    try {
+      await onApply(replacePrompt(source, step, draft.prompt));
+      close();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setBusy(false); }
+  }
+  if (!draft) return <button ref={entry} className="step-edit" type="button" disabled={!enabled} onClick={() => setDraft({ original: source, prompt: step.prompt })}>Edit prompt</button>;
+  const stale = draft.original !== source;
+  return <div className="step-editor" role="group" aria-label="Edit prompt">
+    <label className="inspector-field"><span>{step.backend === "Web" ? "Instructions for the reviewer" : "Prompt"}</span>
+      <textarea autoFocus aria-label="Step prompt" rows={7} value={draft.prompt} disabled={busy} onChange={event => setDraft({ ...draft, prompt: event.target.value })} />
+    </label>
+    {step.triggers.length ? <p className="step-edit-note">Available inputs: {step.triggers.map(name => `$(${name})`).join(", ")}</p> : null}
+    {stale || error ? <p role="alert">{stale ? "This workflow changed. Copy your edits and reopen the prompt to use the latest version." : error}</p> : null}
+    <button type="button" className="step-save" disabled={!enabled || busy || stale || draft.prompt === step.prompt} onClick={() => void save()}>{busy ? "Validating…" : "Save"}</button>
+    <button type="button" className="step-ask" disabled={busy} onClick={close}>Cancel</button>
+  </div>;
+}
+
 function StepEditor({ source, step, ports, enabled, readOnly, onApply }: {
   source: string; step: StepSource; ports: string[]; enabled: boolean; readOnly: boolean; onApply: (source: string) => Promise<void>;
 }) {
   const [backend, setBackend] = useState(step.backend);
-  const [prompt, setPrompt] = useState(step.prompt);
   const [contract, setContract] = useState(step.contract);
   const [triggers, setTriggers] = useState(step.triggers);
   const [adding, setAdding] = useState(false);
@@ -73,11 +108,11 @@ function StepEditor({ source, step, ports, enabled, readOnly, onApply }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
-  const changed = backend !== step.backend || prompt !== step.prompt || contract !== step.contract || triggers.join(",") !== step.triggers.join(",");
+  const changed = backend !== step.backend || contract !== step.contract || triggers.join(",") !== step.triggers.join(",");
   const backends = Array.from(new Set([step.backend, "ClaudeCode", "Codex", "Cursor", "OpenCode", "Pi", "Agy", "Web"]));
   async function apply() {
     setBusy(true); setError(""); setSaved(false);
-    try { await onApply(replaceStep(source, step, { backend, prompt, triggers, contract })); setSaved(true); }
+    try { await onApply(replaceStep(source, step, { backend, prompt: step.prompt, triggers, contract })); setSaved(true); }
     catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setBusy(false); }
   }
@@ -88,7 +123,7 @@ function StepEditor({ source, step, ports, enabled, readOnly, onApply }: {
     <fieldset disabled={!enabled || busy}>
       <label className="inspector-field"><span>Execution agent</span><select aria-label="Step execution agent" value={backend} onChange={(event) => setBackend(event.target.value)}>{backends.map((value) => <option key={value} value={value}>{value === "ClaudeCode" ? "Claude Code" : value === "OpenCode" ? "opencode" : value === "Pi" ? "pi" : value === "Agy" ? "agy" : value}</option>)}</select></label>
       <p className="step-edit-note">Uses the model configured for this agent.</p>
-      <label className="inspector-field"><span>Prompt</span><textarea aria-label="Step prompt" rows={7} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
+      {readOnly ? <div className="inspector-field"><span>Prompt</span><p>{step.prompt}</p></div> : null}
       <label className="inspector-field"><span>Output connection / contract</span><input aria-label="Step output contract" value={contract} onChange={(event) => setContract(event.target.value)} /></label>
       <div className="inspector-field"><span>Input connections</span>{triggers.length ? triggers.map((name) => <div className="step-input-row" key={name}><span>{name}</span><button type="button" aria-label={`Remove input ${name}`} onClick={() => setTriggers((current) => current.filter((item) => item !== name))}>×</button></div>) : <small>No inputs selected</small>}</div>
       {readOnly ? null : <button className="step-ask" type="button" aria-expanded={adding} onClick={() => setAdding((current) => !current)}>Add connection</button>}

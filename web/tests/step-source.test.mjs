@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { locateStep, replaceStep } from '../app/lib/step-source.ts';
+import { locateStep, replacePrompt, replaceStep } from '../app/lib/step-source.ts';
 import { taskCopy, shortTaskText } from '../app/lib/task-copy.ts';
 const snapshot = JSON.parse(readFileSync(new URL('./fixtures/diagram-snapshot.v1.json', import.meta.url)));
 const program = `team ReviewFlow[planner:Codex, reviewer:Codex] {
@@ -39,9 +39,22 @@ test('qualified reaction names select the correct team definition', () => {
 });
 
 test('unsupported or ambiguous source remains for the source editor', () => {
- assert.equal(locateStep(program.replace('"Inspect $(plan)."','{= println!("hi"); =}'), snapshot, snapshot.reactions[0]), null);
+ assert.equal(locateStep(program.replace('"Inspect $(plan)."','{= println!("hi"); =}'), snapshot, snapshot.reactions[1]), null);
  assert.equal(locateStep(program, snapshot, {...snapshot.reactions[0], name:'reaction.99'}), null);
  assert.equal(locateStep(program, snapshot, {...snapshot.reactions[0], agent:'agent::unknown'}), null);
+});
+
+test('prompt-only save preserves adjacent Rust and the other role configuration', () => {
+ const body = 'reaction(plan) -> critique {= /* nested /* =} */ */ let s = r#"=}"#; critique = Some(s.into()); =}';
+ const mixed = program.replace('task reviewer(plan) -> critique within(30s) "Inspect $(plan)."', body)
+   .replace('"Return $(critique)."', '"""\n    Return $(critique).\n    Add a "quote".\n    """');
+ assert.equal(locateStep(mixed, snapshot, snapshot.reactions[1]), null);
+ const last = locateStep(mixed, snapshot, snapshot.reactions[2]);
+ assert.equal(last.prompt, 'Return $(critique).\nAdd a "quote".');
+ const edited = replacePrompt(mixed, last, 'Use $(critique).\nReview "again".');
+ assert.equal(edited.slice(0, last.promptSpan.start), mixed.slice(0, last.promptSpan.start));
+ assert.equal(locateStep(edited, snapshot, snapshot.reactions[2]).prompt, 'Use $(critique).\nReview "again".');
+ assert.ok(edited.includes(body));
 });
 
 test('editing task configuration preserves metadata and the other steps', () => {
@@ -94,4 +107,16 @@ test('editing instructions clears stale copy while backend-only changes preserve
  const changed = replaceStep(source, step, {...backendOnly, prompt:'Translate the plan into French.'});
  assert.doesNotMatch(changed, /@title|@desc/);
  assert.equal(locateStep(changed, snapshot, snapshot.reactions[1]).prompt, 'Translate the plan into French.');
+});
+
+test('prompt-only edits invalidate stale annotations without changing wiring', () => {
+ const source = program.replace('task reviewer', '// @title Review the plan\n // @desc Review the plan for missing requirements.\n task reviewer');
+ const step = locateStep(source, snapshot, snapshot.reactions[1]);
+ const changed = replacePrompt(source, step, 'Translate $(plan) into French.');
+ assert.doesNotMatch(changed, /@title|@desc/);
+ const edited = locateStep(changed, snapshot, snapshot.reactions[1]);
+ assert.equal(edited.prompt, 'Translate $(plan) into French.');
+ assert.deepEqual(edited.triggers, step.triggers);
+ assert.equal(edited.contract, step.contract);
+ assert.equal(replacePrompt(source, step, step.prompt), source);
 });
