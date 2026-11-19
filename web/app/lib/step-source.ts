@@ -1,11 +1,13 @@
 import type { DiagramReaction, DiagramSnapshot } from "./protocol";
 
-type Token = { text: string; start: number; end: number; string: boolean };
+type Annotations = { title?: string; description?: string; spans: Span[] };
+type Token = { text: string; start: number; end: number; string: boolean; annotations?: Annotations };
 type Span = { start: number; end: number };
 export type StepSource = {
   title?: string;
   description?: string;
-  metadataSpan?: Span;
+  metadataSpans: Span[];
+  declarationStart: number;
   team: string;
   backend: string;
   prompt: string;
@@ -24,7 +26,30 @@ function tokens(source: string): Token[] {
   let i = 0;
   while (i < source.length) {
     if (/\s/.test(source[i])) { i++; continue; }
-    if (source.startsWith("//", i)) { const end = source.indexOf("\n", i); i = end < 0 ? source.length : end; continue; }
+    if (source.startsWith("//", i)) {
+      const annotations: Annotations = { spans: [] };
+      let continuing = false;
+      while (source.startsWith("//", i)) {
+        const newline = source.indexOf("\n", i);
+        const end = newline < 0 ? source.length : newline;
+        const line = source.slice(i + 2, end).trim();
+        const tag = /^@(title|desc)\s+(.*)$/.exec(line);
+        if (tag) {
+          continuing = tag[1] === "desc";
+          annotations[continuing ? "description" : "title"] = tag[2];
+        } else if (continuing) {
+          annotations.description = (annotations.description + " " + line).trim();
+        }
+        if (tag || continuing) annotations.spans.push({ start: i, end });
+        i = Math.min(source.length, end + 1);
+        while (i < source.length && /[ \t\r]/.test(source[i])) i++;
+      }
+      if (annotations.spans.length && /^task\b/.test(source.slice(i))) {
+        result.push({ text: "task", start: i, end: i + 4, string: false, annotations });
+        i += 4;
+      }
+      continue;
+    }
     if (source.startsWith("/*", i)) {
       let depth = 1; i += 2;
       while (depth && i < source.length) {
@@ -84,19 +109,16 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
     const firstString = all.findIndex((token, i) => i > close + 1 && token.string);
     // Constant strings in output contracts are deliberately left to source editing.
     if (firstString < 0 || all[firstString - 1]?.text === "=" || firstString >= end) return null;
-    const hasTask = all[firstString - 2]?.text === "display" && all[firstString - 1]?.text === "(";
-    // Display strings must never be edited as the agent's execution prompt.
-    const body = hasTask ? firstString + 4 : firstString;
-    if (hasTask && (all[firstString + 1]?.text !== "," || !all[firstString + 2]?.string || all[firstString + 3]?.text !== ")")) return null;
-    if (!all[body]?.string || body >= end) return null;
+    const body = firstString;
     const deadline = all.findIndex((token, i) => i > close + 1 && i < body && !token.string && token.text === "within");
-    const contractEnd = deadline < 0 ? (hasTask ? firstString - 2 : body) : deadline;
+    const contractEnd = deadline < 0 ? body : deadline;
     const triggersSpan = { start: all[position + 2].end, end: all[close].start };
     const contractSpan = { start: all[close + 2].start, end: all[contractEnd - 1].end };
     return {
-      title: hasTask ? all[firstString].text : undefined,
-      description: hasTask ? all[firstString + 2].text : undefined,
-      metadataSpan: hasTask ? {start: all[firstString - 2].start, end: all[firstString + 3].end} : undefined,
+      title: declaration.annotations?.title,
+      description: declaration.annotations?.description,
+      metadataSpans: declaration.annotations?.spans ?? [],
+      declarationStart: declaration.start,
       team, backend: backend.text, prompt: all[body].text,
       triggers: source.slice(triggersSpan.start, triggersSpan.end).split(",").map((s) => s.trim()).filter(Boolean),
       contract: source.slice(contractSpan.start, contractSpan.end),
@@ -117,11 +139,15 @@ export function replaceStep(source: string, step: StepSource, changes: { backend
   // supplies a revised title and description. Backend-only edits preserve it.
   const explicitCopy = changes.title !== undefined && changes.description !== undefined;
   const changedInstructions = changes.prompt !== step.prompt || changes.contract !== step.contract || changes.triggers.join(",") !== step.triggers.join(",");
-  if (explicitCopy || (step.metadataSpan && changedInstructions)) {
-    const quote = (value: string) => `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-    const value = explicitCopy && changes.title?.trim() && changes.description?.trim()
-      ? `display(${quote(changes.title.trim())}, ${quote(changes.description.trim())}) ` : "";
-    replacements.push({ ...(step.metadataSpan ?? {start: step.promptSpan.start, end: step.promptSpan.start}), value });
+  if (explicitCopy || changedInstructions) {
+    for (const span of step.metadataSpans) replacements.push({ ...span, value: "" });
+    if (explicitCopy) {
+      const indent = source.slice(source.lastIndexOf("\n", step.declarationStart - 1) + 1, step.declarationStart).match(/^[ \t]*/)?.[0] ?? "";
+      const lines = [["title", changes.title], ["desc", changes.description]]
+        .filter(([, value]) => value?.trim())
+        .map(([tag, value]) => "// @" + tag + " " + value!.trim().replace(/[\r\n]+/g, " ") + "\n" + indent);
+      replacements.push({start: step.declarationStart, end: step.declarationStart, value: lines.join("")});
+    }
   }
   replacements.sort((a, b) => b.start - a.start || b.end - a.end);
   return replacements.reduce((text, edit) => text.slice(0, edit.start) + edit.value + text.slice(edit.end), source);

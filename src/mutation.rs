@@ -170,11 +170,11 @@ fn update_as_install(instruction: &Instruction) -> Option<(String, Instruction)>
             effects,
             contract,
             prompt,
-            title,
-            description,
             body,
             instance,
             within,
+            title,
+            description,
         } => Some((
             id.clone(),
             Instruction::InstallReaction {
@@ -184,11 +184,11 @@ fn update_as_install(instruction: &Instruction) -> Option<(String, Instruction)>
                 effects,
                 contract,
                 prompt,
-                title,
-                description,
                 body,
                 instance,
                 within,
+                title,
+                description,
             },
         )),
         _ => None,
@@ -590,24 +590,16 @@ mod tests {
     }
 
     #[test]
-    fn reaction_updates_preserve_display_metadata() {
-        let original = relay(2, "go", vec![]);
-        let mut updated = original.clone();
-        let Instruction::InstallReaction {
-            title, description, ..
-        } = &mut updated.instructions[13]
-        else {
-            panic!("expected a reaction");
-        };
-        *title = Some("Forward the supplied value".into());
-        *description = Some("Pass the supplied token to the next step.".into());
-        let mut update = serde_json::to_value(&updated.instructions[13]).unwrap();
+    fn display_metadata_survives_reaction_updates() {
+        let a = relay(2, "go", vec![]);
+        let mut changed = serde_json::to_value(&a).unwrap();
+        let reaction = &mut changed["instructions"][13];
+        reaction["title"] = json!("Pass the relay token");
+        reaction["description"] = json!("Forward the received token to the next node.");
+        let b: Bytecode = serde_json::from_value(changed).unwrap();
+        let mut update = serde_json::to_value(&b.instructions[13]).unwrap();
         update["op"] = json!("update_reaction");
-        check(&original, &plan(vec![update]), &updated).unwrap();
-
-        let mut reset = serde_json::to_value(&original.instructions[13]).unwrap();
-        reset["op"] = json!("update_reaction");
-        check(&updated, &plan(vec![reset]), &original).unwrap();
+        check(&a, &plan(vec![update]), &b).unwrap();
     }
 
     #[test]

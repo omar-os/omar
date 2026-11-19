@@ -45,9 +45,9 @@ test('unsupported or ambiguous source remains for the source editor', () => {
 });
 
 test('editing task configuration preserves metadata and the other steps', () => {
- const metadata = 'display("Review campaign script", "Inspect the prompt, identify gaps, and return a critique.")';
+ const metadata = '// @title Review campaign script\n // @desc Inspect the prompt, identify gaps, and return a critique.';
  for (const deadline of ['', 'within(30s)']) {
-  const source = program.replace('within(30s)', `${deadline} ${metadata}`);
+  const source = program.replace('within(30s)', deadline).replace('task reviewer', `${metadata}\n task reviewer`);
   const step = locateStep(source, snapshot, snapshot.reactions[1]);
   assert.equal(step.prompt, 'Inspect $(plan).');
   assert.equal(step.contract, 'critique');
@@ -87,11 +87,11 @@ test('legacy code and manual steps describe known behavior without agent placeho
 });
 
 test('editing instructions clears stale copy while backend-only changes preserve it', () => {
- const source = program.replace('within(30s)', 'within(30s) display("Review campaign script", "Inspect the draft and return a critique.")');
+ const source = program.replace('task reviewer', '// @title Review campaign script\n // @desc Inspect the draft and return a critique.\n task reviewer');
  const step = locateStep(source, snapshot, snapshot.reactions[1]);
  const backendOnly = {backend:'ClaudeCode', prompt:step.prompt, contract:step.contract, triggers:step.triggers};
- assert.match(replaceStep(source, step, backendOnly), /display\("Review campaign script"/);
+ assert.match(replaceStep(source, step, backendOnly), /@title Review campaign script/);
  const changed = replaceStep(source, step, {...backendOnly, prompt:'Translate the plan into French.'});
- assert.doesNotMatch(changed, /display\(/);
+ assert.doesNotMatch(changed, /@title|@desc/);
  assert.equal(locateStep(changed, snapshot, snapshot.reactions[1]).prompt, 'Translate the plan into French.');
 });

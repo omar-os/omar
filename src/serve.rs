@@ -5,7 +5,7 @@
 //! accepts source, compiles it, supervises the run on a worker thread, and
 //! reports the per-run diagram address back to the caller.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -26,6 +26,10 @@ use crate::config::Config;
 use crate::ea::EaId;
 use crate::tmux::{DeliveryOptions, TmuxClient};
 use crate::topology::{self, PortKind, TopologyRunConfig, VmState};
+
+#[path = "serve_recovery.rs"]
+mod recovery;
+use recovery::WorkflowFollowup;
 
 pub const SERVE_PROTOCOL_VERSION: u32 = 1;
 
@@ -230,6 +234,7 @@ type Panels = Arc<Mutex<BTreeMap<String, topology::PanelAccess>>>;
 #[serde(rename_all = "snake_case")]
 pub enum ChatRole {
     Operator,
+    #[serde(alias = "runtime")]
     Assistant,
 }
 
@@ -289,6 +294,11 @@ pub struct ChatMessage {
     pub text: String,
     /// Commentary while working, rather than something awaiting an answer.
     pub progress: bool,
+    /// Runtime guidance does not finish or interrupt an assistant turn.
+    /// An optional field keeps saved chats readable by older runtimes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional, type = "boolean")]
+    pub runtime: bool,
     pub design: Option<ProposedDesign>,
     /// Diagram components the operator had selected when they sent this.
     /// "this one" is unresolvable in text; a selection says which.
@@ -372,6 +382,8 @@ struct Chat {
     needs_context: bool,
     needs_relaunch: bool,
     owned: bool,
+    pending_followup: Option<WorkflowFollowup>,
+    announced: BTreeSet<String>,
 }
 
 /// A chat owns one EA; only the durable archive is shared between workspaces.
@@ -450,20 +462,38 @@ impl Context_ {
         design: Option<ProposedDesign>,
         selection: Vec<String>,
     ) -> Result<ChatMessage> {
+        self.publish_message(ChatMessage {
+            sequence: 0,
+            role,
+            text,
+            progress,
+            runtime: false,
+            design,
+            selection,
+        })
+    }
+
+    fn publish_runtime(&self, text: String) -> Result<ChatMessage> {
+        self.publish_message(ChatMessage {
+            sequence: 0,
+            role: ChatRole::Assistant,
+            text,
+            progress: false,
+            runtime: true,
+            design: None,
+            selection: Vec::new(),
+        })
+    }
+
+    fn publish_message(&self, draft: ChatMessage) -> Result<ChatMessage> {
         let _admission = self.admit()?;
         let mut chat = self.chat.lock().expect("serve chat poisoned");
-        let message = self.history.lock().expect("history poisoned").append_to(
-            &self.conversation_id,
-            ChatMessage {
-                sequence: 0,
-                role,
-                text,
-                progress,
-                design,
-                selection,
-            },
-        )?;
-        if role == ChatRole::Assistant && !progress {
+        let message = self
+            .history
+            .lock()
+            .expect("history poisoned")
+            .append_to(&self.conversation_id, draft)?;
+        if message.role == ChatRole::Assistant && !message.progress && !message.runtime {
             chat.busy = false;
         }
         chat.subscribers
@@ -915,6 +945,8 @@ impl Serve {
                 needs_context: has_history,
                 needs_relaunch: has_history,
                 owned: false,
+                pending_followup: None,
+                announced: BTreeSet::new(),
             })),
             agent_token: Mutex::new(agent_token.clone()),
             chat_operation: Mutex::new(()),
@@ -1128,7 +1160,10 @@ impl Serve {
             chat.needs_relaunch = false;
         }
         match self.verify_ea_context(omar_dir, ea_id) {
-            Ok(()) => Ok(AttachEa::Attached(session)),
+            Ok(()) => {
+                recovery::revisit(context);
+                Ok(AttachEa::Attached(session))
+            }
             Err(reason) => Ok(AttachEa::LaunchedWithoutServe {
                 session,
                 reason: reason.to_string(),
@@ -1576,7 +1611,11 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
     }
 
-    if path == "/v1/workflow" || path == "/v1/workspaces" || path.starts_with("/v1/workspaces/") {
+    if path == "/v1/memory"
+        || path == "/v1/workflow"
+        || path == "/v1/workspaces"
+        || path.starts_with("/v1/workspaces/")
+    {
         // Workspace reads expose host files; editor launch grants shell access.
         // Reject cross-site requests, including simple POSTs, rather than only
         // withholding CORS headers after executing the operation.
@@ -1591,6 +1630,47 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         if method == "OPTIONS" {
             return write_json(&mut stream, 204, &Value::Null, origin);
+        }
+        if path == "/v1/memory" {
+            if access != Access::Full || method != "POST" {
+                return write_json(
+                    &mut stream,
+                    403,
+                    &json!({"error":"full operator access required"}),
+                    origin,
+                );
+            }
+            let Ok(body) = serde_json::from_slice::<Value>(&raw_body) else {
+                return write_json(
+                    &mut stream,
+                    400,
+                    &json!({"error":"invalid memory request"}),
+                    origin,
+                );
+            };
+            if crate::knowledge::authenticated(
+                &context.omar_dir,
+                body["key"].as_str().unwrap_or(""),
+            )
+            .is_err()
+            {
+                return write_json(
+                    &mut stream,
+                    403,
+                    &json!({"error":"operator key required"}),
+                    origin,
+                );
+            }
+            let result = serde_json::from_value(body["request"].clone())
+                .map_err(anyhow::Error::from)
+                .and_then(|action| {
+                    crate::knowledge::operator(&context.omar_dir, context.ea_id, action)
+                });
+            let (status, value) = match result {
+                Ok(value) => (200, value),
+                Err(error) => (400, json!({"error":error.to_string()})),
+            };
+            return write_json(&mut stream, status, &value, origin);
         }
         if path == "/v1/workflow" {
             let _operation = (method == "POST").then(|| {
@@ -1758,7 +1838,10 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
                 if context.chat.lock().expect("chat poisoned").needs_relaunch {
                     let command = context.command.lock().expect("command poisoned").clone();
                     match relaunch_ea(&context, &command) {
-                        Ok(_) => context.chat.lock().expect("chat poisoned").needs_relaunch = false,
+                        Ok(_) => {
+                            context.chat.lock().expect("chat poisoned").needs_relaunch = false;
+                            recovery::revisit(&context);
+                        }
                         Err(error) => eprintln!("Could not resume assistant: {error:#}"),
                     }
                 }
@@ -2754,6 +2837,8 @@ impl Workspaces {
                 needs_context: has_history,
                 needs_relaunch: true,
                 owned: false,
+                pending_followup: None,
+                announced: BTreeSet::new(),
             })),
             agent_token: Mutex::new(Uuid::new_v4().to_string()),
             chat_operation: Mutex::new(()),
@@ -3169,18 +3254,20 @@ fn mission_control_envelope(text: &str, selection: &[String], live: Option<&Live
          Your backend may list it as `omar__omar_reply` or `mcp__omar__omar_reply`. \
          It is an MCP tool call, NOT a shell command: there is no `omar_reply` \
          executable, and the `omar` CLI cannot send it. Do not search your PATH for it.\n\
-         The operator is in Mission Control and cannot see this terminal, so text you \
-         print here reaches nobody. Every question, status update, and answer must go \
-         through `omar_reply`.\n\
+         The operator is in Mission Control and can inspect this terminal. Every \
+         question, status update, and answer must also go through `omar_reply`. \
+         Be proactive: explain the next action, expected output and manual handoffs. \
+         For a runtime failure, announce that you are trying to solve it, inspect \
+         the evidence, attempt safe repairs, and report verified results and next steps. \
+         For setup guidance, distinguish what is verified fixed from the current blocker. \
+         Give one primary action, its exact location, and the check that proves it worked. \
+         Use only available controls; do not invent setup buttons or ask for secrets in chat. \
+         If terminal setup is necessary, identify the actual shell and runtime session, \
+         give concrete instructions, and explain persistence and restart effects.\n\
          To offer a workflow, call the MCP tool `omar_propose_design` with a complete \
          OMAR program. Include companion files in `files`, keyed by their relative paths \
          (for example schemas/decision.json), so imported types compile. The entry \
-         source is program.omar. The operator approves and runs it; you do not.\n\
-         Every step must include display(\"Short action title\", \"What it does and produces.\") \
-         after its output contract and optional within(...) deadline, before its prompt \
-         string or code body. Use a specific 3–6 word action title and 1–3 plain-language \
-         sentences explaining the work, result, and any manual handoff. Keep technical \
-         IDs and backend names out of titles; preserve the actual execution behavior.\n\n\
+         source is program.omar. Prefer optional // @title and // @desc comments directly above each task or reaction. The operator approves and runs it; you do not.\n\n\
          When asked how to get started, invite the operator to describe a workflow \
          they want to automate, from development to marketing and beyond. Lead with \
          concrete developer examples: a GitHub issue into a tested pull request, \
@@ -3274,7 +3361,12 @@ fn agent_reply(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         return (403, json!({"error": "forbidden"}));
     }
     match context.publish(ChatRole::Assistant, reply.text, reply.progress, None) {
-        Ok(_) => (202, json!({"status": "delivered"})),
+        Ok(_) => {
+            if !reply.progress {
+                recovery::kick(context);
+            }
+            (202, json!({"status": "delivered"}))
+        }
         Err(error) => (500, json!({"error": format!("{error:#}")})),
     }
 }
@@ -3300,9 +3392,6 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
         Ok(state) => state,
         Err(error) => return (400, json!({"error": format!("{error:#}")})),
     };
-    if let Err(error) = validate_task_metadata(&state) {
-        return (400, json!({"error": error}));
-    }
     // Proved here rather than taken on trust: the operator is shown Lean's
     // verdict on this program, whatever the assistant believed.
     let properties = if proposal.properties.is_empty() {
@@ -3333,83 +3422,8 @@ fn agent_proposal(context: &Arc<Context_>, body: &[u8]) -> (u16, Value) {
     ) {
         return (500, json!({"error": format!("{error:#}")}));
     }
+    recovery::kick(context);
     (202, json!({"status": "proposed"}))
-}
-
-/// Only assistant proposals require task copy. Older source and saved runs
-/// remain loadable, and display metadata never changes execution identity.
-fn validate_task_metadata(state: &VmState) -> std::result::Result<(), String> {
-    let invalid: Vec<_> = state
-        .reactions
-        .iter()
-        .filter_map(|(id, reaction)| {
-            let valid = |value: &Option<String>, max: usize| {
-                value.as_deref().is_some_and(|s| {
-                    let s = s.trim();
-                    !s.is_empty() && s.chars().count() <= max
-                })
-            };
-            (!valid(&reaction.title, 80)
-                || !valid(&reaction.description, 1200)
-                || reaction.title.as_deref().is_some_and(|title| {
-                    let title = title.trim().to_lowercase();
-                    let role_words = [
-                        "agent",
-                        "reviewer",
-                        "review",
-                        "reasoner",
-                        "reasoning",
-                        "worker",
-                        "step",
-                        "task",
-                        "node",
-                        "runner",
-                        "assistant",
-                        "run",
-                        "code",
-                        "the",
-                        "a",
-                        "an",
-                        "jev",
-                        "codex",
-                        "claude",
-                        "claudecode",
-                    ];
-                    title.split_whitespace().count() < 2
-                        || title
-                            .split(|c: char| !c.is_alphanumeric())
-                            .filter(|word| !word.is_empty())
-                            .all(|word| {
-                                role_words.contains(&word) || word.chars().all(|c| c.is_numeric())
-                            })
-                        || title.contains("::")
-                        || title.contains("reaction.")
-                        || title == reaction.agent.to_lowercase()
-                        || [
-                            "review step",
-                            "run agent",
-                            "run task",
-                            "process data",
-                            "short action title",
-                            "task title",
-                        ]
-                        .contains(&title.as_str())
-                })
-                || reaction.description.as_deref().is_some_and(|description| {
-                    description.split_whitespace().count() < 5
-                        || Some(description.trim()) == reaction.title.as_deref().map(str::trim)
-                }))
-            .then_some(id.as_str())
-        })
-        .collect();
-    if invalid.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Every proposed step needs a specific action-and-object title (2 or more words, at most 80 characters) and an explanation of its work and result (5 or more words, at most 1200 characters). Generic role names and placeholders are not task titles. Add display(\"Short action title\", \"What this step does and produces, including any manual handoff.\") after the output contract and optional within(...) deadline, before the prompt string or code body. Missing or invalid task metadata: {}. Preserve existing IDs, prompts, agents and connections.",
-            invalid.join(", ")
-        ))
-    }
 }
 
 /// Lean's verdict on each property of `program`.
@@ -3983,10 +3997,13 @@ fn panel_status(context: &Arc<Context_>, run_id: &str) -> (u16, Value) {
         Err(response) => return response,
     };
     match topology::panel_pending(&access, &team) {
-        Ok(pending) => (
-            200,
-            json!({"run_id": run_id, "team": team, "pending": pending}),
-        ),
+        Ok(pending) => {
+            recovery::manual_steps(context, run_id, &pending);
+            (
+                200,
+                json!({"run_id": run_id, "team": team, "pending": pending}),
+            )
+        }
         Err(error) => (502, json!({"error": format!("{error:#}")})),
     }
 }
@@ -4057,16 +4074,18 @@ fn spawn_run_thread(
     // The panel's credentials arrive on their own channel, and only for a run
     // that has a web agent. Stored as they come rather than waited for: a run
     // with none would otherwise hold up admission for nothing.
-    let (panel_sender, panel_receiver) = mpsc::channel();
+    let (panel_sender, panel_receiver) = mpsc::channel::<topology::PanelAccess>();
     {
         let panels = context.panels.clone();
+        let context = context.clone();
         let id = run_id.to_string();
         thread::spawn(move || {
             if let Ok(access) = panel_receiver.recv() {
                 panels
                     .lock()
                     .expect("serve panels poisoned")
-                    .insert(id, access);
+                    .insert(id.clone(), access.clone());
+                recovery::watch_panel(context, id, access);
             }
         });
     }
@@ -4958,6 +4977,10 @@ fn paused_runs(omar_dir: &Path, ea_id: EaId) -> BTreeMap<String, RunRecord> {
             let parked = state == Some(crate::deploy::DeploymentState::Paused);
             let unfinished = state.is_some_and(|state| !state.is_terminal());
             match record.status {
+                RunStatus::Failed | RunStatus::Completed => {
+                    // Finished runs can still owe their assistant a result handoff.
+                    record.diagram_address = None;
+                }
                 RunStatus::Paused if deployment.is_none() || parked => {}
                 RunStatus::Starting | RunStatus::Running | RunStatus::Pausing if parked => {
                     record.status = RunStatus::Paused;
@@ -4988,7 +5011,6 @@ fn paused_runs(omar_dir: &Path, ea_id: EaId) -> BTreeMap<String, RunRecord> {
                         .join("run.json");
                     let _ = topology::write_json_atomic(&path, &record);
                 }
-                RunStatus::Failed | RunStatus::Completed => {}
                 _ => return None,
             }
             Some((record.run_id.clone(), record))
@@ -5100,8 +5122,24 @@ fn finish_run(context: &Arc<Context_>, run_id: &str, outcome: Result<topology::R
         }
         persist_run(context, record);
     }
+    let finished = runs.get(run_id).cloned();
     drop(runs);
     complete_mutation(context, run_id);
+    if let Some(record) = finished {
+        // A mutation owns its pause and immediately resumes it; do not tell
+        // the operator to resume a run that is already continuing.
+        if record.status == RunStatus::Paused
+            && context
+                .runs
+                .lock()
+                .expect("serve runs poisoned")
+                .get(run_id)
+                .is_some_and(|current| current.status != RunStatus::Paused)
+        {
+            return;
+        }
+        recovery::finished(context, &record);
+    }
 }
 
 fn spawn_resume_thread(
@@ -5113,16 +5151,18 @@ fn spawn_resume_thread(
 ) {
     // A resumed run answers web agents through the panel too: its credentials
     // arrive on their own channel, stored as they come, as on a fresh start.
-    let (panel_sender, panel_receiver) = mpsc::channel();
+    let (panel_sender, panel_receiver) = mpsc::channel::<topology::PanelAccess>();
     {
         let panels = context.panels.clone();
+        let context = context.clone();
         let id = run_id.to_string();
         thread::spawn(move || {
             if let Ok(access) = panel_receiver.recv() {
                 panels
                     .lock()
                     .expect("serve panels poisoned")
-                    .insert(id, access);
+                    .insert(id.clone(), access.clone());
+                recovery::watch_panel(context, id, access);
             }
         });
     }
@@ -5309,9 +5349,7 @@ mod tests {
             team Review[reviewer : Stub] {
                 input request : string
                 output decision : Decision
-                task reviewer(request) -> decision
-                  display("Review the supplied request", "Assess the supplied request and return a review decision.")
-                  "Review $(request)"
+                task reviewer(request) -> decision "Review $(request)"
             }
             main { review = Review() }
         "#;
@@ -5617,47 +5655,13 @@ mod tests {
     #[ignore = "requires omarc"]
     fn builder_proposals_compile_and_preserve_imported_schema_files() {
         let server = test_server();
-        let program = "type Decision from \"./schemas/decision.json\"\nteam Review[reviewer : Jev] { input request : string output out : Decision task reviewer(request) -> out display(\"Assess the supplied request\", \"Choose an outcome using the supplied request.\") \"Choose.\" }\nmain SchemaProposal { review = Review() }";
+        let program = "type Decision from \"./schemas/decision.json\"\nteam Review[reviewer : Jev] { input request : string output out : Decision task reviewer(request) -> out \"Choose.\" }\nmain SchemaProposal { review = Review() }";
         let files = BTreeMap::from([(
             "schemas/decision.json".to_string(),
             "{\"type\":\"string\",\"enum\":[\"continue\",\"stop\",\"defer\"]}".to_string(),
         )]);
         let token = server.context.agent_token.lock().unwrap().clone();
         let proposal = json!({"token": token, "program": program, "files": files, "inputs":{"review.request":"Complete input"}, "summary":"Schema flow"});
-        let before = server
-            .context
-            .history
-            .lock()
-            .unwrap()
-            .conversation(&server.context.conversation_id)
-            .messages
-            .len();
-        for annotation in [
-            "",
-            "display(\"reviewer\", \"Choose an outcome using the supplied request.\")",
-        ] {
-            let mut invalid = proposal.clone();
-            invalid["program"] = json!(program.replace(
-                "display(\"Assess the supplied request\", \"Choose an outcome using the supplied request.\")", annotation));
-            let (status, error) =
-                agent_proposal(&server.context, &serde_json::to_vec(&invalid).unwrap());
-            assert_eq!(status, 400, "{error}");
-            assert!(error["error"]
-                .as_str()
-                .unwrap()
-                .contains("review.reaction.0"));
-            assert_eq!(
-                server
-                    .context
-                    .history
-                    .lock()
-                    .unwrap()
-                    .conversation(&server.context.conversation_id)
-                    .messages
-                    .len(),
-                before
-            );
-        }
         let (status, response) =
             agent_proposal(&server.context, &serde_json::to_vec(&proposal).unwrap());
         assert_eq!(status, 202, "{response}");
@@ -6199,6 +6203,7 @@ mod tests {
                 role: ChatRole::Operator,
                 text: "Keep this across harnesses".into(),
                 progress: false,
+                runtime: false,
                 design: None,
                 selection: vec![],
             })
@@ -7160,65 +7165,6 @@ while True:
         }
         // Nothing reached the conversation.
         assert!(request(server.address(), "GET", "/v1/chat", None).contains("\"messages\":[]"));
-    }
-
-    #[test]
-    fn proposed_tasks_require_titles_and_descriptions_for_every_step() {
-        let mut state = sample_state();
-        let reaction: topology::ReactionState = serde_json::from_value(json!({
-            "order": 0, "agent": "worker", "triggers": ["request"],
-            "effects": ["answer"], "contract": "answer", "prompt": "Answer the request"
-        }))
-        .unwrap();
-        state
-            .reactions
-            .insert("reaction.0".into(), reaction.clone());
-        state.reactions.insert("nested.reaction.0".into(), reaction);
-        let error = validate_task_metadata(&state).unwrap_err();
-        assert!(error.contains("reaction.0") && error.contains("nested.reaction.0"));
-        for reaction in state.reactions.values_mut() {
-            reaction.title = Some("Answer the request".into());
-            reaction.description = Some("Read the request and return an answer.".into());
-        }
-        assert!(validate_task_metadata(&state).is_ok());
-        for title in [
-            "reviewer",
-            "agent",
-            "reasoner",
-            "review step",
-            "run task",
-            "short action title",
-            "Reviewer agent",
-            "Agent 1",
-            "Jev reviewer",
-            "Run code",
-        ] {
-            state.reactions.get_mut("nested.reaction.0").unwrap().title = Some(title.into());
-            assert!(
-                validate_task_metadata(&state).is_err(),
-                "accepted generic title {title}"
-            );
-        }
-        state.reactions.get_mut("nested.reaction.0").unwrap().title =
-            Some("Answer the request".into());
-        let reaction = state.reactions.get_mut("nested.reaction.0").unwrap();
-        reaction.description = Some("  \n ".into());
-        assert!(validate_task_metadata(&state)
-            .unwrap_err()
-            .ends_with("Preserve existing IDs, prompts, agents and connections."));
-        state
-            .reactions
-            .get_mut("nested.reaction.0")
-            .unwrap()
-            .description = Some("x".repeat(1201));
-        assert!(validate_task_metadata(&state).is_err());
-        state
-            .reactions
-            .get_mut("nested.reaction.0")
-            .unwrap()
-            .description = Some("Read the request and return an answer.".into());
-        state.reactions.get_mut("nested.reaction.0").unwrap().title = Some("x".repeat(81));
-        assert!(validate_task_metadata(&state).is_err());
     }
 
     #[test]

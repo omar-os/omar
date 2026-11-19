@@ -292,6 +292,48 @@ test("a manual task is answered inside its workflow step and retains rejected dr
   await expect(panel).toBeHidden();
 });
 
+test("every waiting step remains selectable until answered inside its step", async ({ page }) => {
+  // Both agents on the `Web` backend: three invocations wait at once.
+  await fake.close();
+  fake = (await startFakeServe({
+    stepMs: 30,
+    port: FAKE_SERVE_PORT,
+    snapshot: "diagram-web-two.v1.json",
+  })) as FakeServe;
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await deploy(page);
+
+  const notice = page.locator(".run-waiting");
+  const panel = page.getByRole("complementary", { name: "Step details" });
+  const choices = notice.getByRole("combobox", { name: "Waiting steps" });
+  await expect(choices.locator("option")).toHaveCount(3);
+  await choices.selectOption({ label: "Provide critique" });
+  await expect(panel).toBeVisible();
+  await panel.getByRole("button", { name: "Close step details" }).click();
+  // Closing an unanswered step does not remove it from the queue.
+  await page.waitForTimeout(1500);
+  await expect(choices.locator("option")).toHaveCount(3);
+
+  await choices.selectOption({ label: "Provide critique" });
+  await notice.getByRole("button", { name: "Open task" }).click();
+  await panel.locator(".port-waiting").getByRole("textbox").fill("looks fine");
+  await panel.getByRole("button", { name: "Submit result and continue" }).click();
+  await expect(choices.locator("option")).toHaveCount(2);
+  await expect(choices).not.toContainText("Provide critique");
+
+  // The notice opens the next invocation, even when it shares an agent.
+  for (let i = 0; i < 2; i++) {
+    await notice.getByRole("button", { name: "Open task" }).click();
+    const form = panel.locator(".port-waiting");
+    await expect(form).toHaveCount(1);
+    await form.getByRole("textbox").fill(`answer ${i}`);
+    await form.getByRole("button", { name: "Submit result and continue" }).click();
+    await expect(form).toHaveCount(0);
+  }
+  await expect(notice).toHaveCount(0);
+});
+
 test("a delayed connection is solid, with its delay in a break in the line", async ({
   page,
 }) => {

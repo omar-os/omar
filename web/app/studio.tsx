@@ -12,6 +12,7 @@ import { AgentTerminal } from "./agent-terminal";
 import { Timeline } from "./timeline";
 import { BackendMenu } from "./backend-menu";
 import { BackendsPage } from "./backends-page";
+import { MemoryManager } from "./memory-manager";
 import { SettingsMenu } from "./settings-menu";
 import { DiagramCanvas, componentName } from "./diagram/diagram-canvas";
 import { OmarEditor } from "./omar-source";
@@ -554,7 +555,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     values: Record<string, unknown>,
     receipt: string,
   ) {
-    if (readOnly) throw new Error("This view is read-only.");
+    if (readOnly) throw new Error("This view cannot submit responses.");
     if (!run) throw new Error("This run is no longer waiting for a response.");
     setAnswering(true);
     const scope = scopeRef.current;
@@ -740,14 +741,14 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           ? current
           : [...current, message],
       );
-      if (message.role === "assistant" && !message.progress) setAssistantBusy(false);
+      if (message.role === "assistant" && !message.runtime) setAssistantBusy(message.progress);
       if (!message.design) {
         // Only an assistant reply ends the wait — the operator's own message
         // echoes back off the same stream, and commentary while it works is
         // the opposite of finishing. And a reply must not withdraw a pending
         // proposal: assistants routinely comment straight after proposing
         // ("…is in your queue"), which was retracting the gate.
-        if (message.role === "assistant" && !message.progress) {
+        if (message.role === "assistant" && !message.progress && !message.runtime) {
           setPhase((current) => (current === "drafting" ? "idle" : current));
         }
         return;
@@ -1563,7 +1564,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           <header className="conversation-header">
             {!isDemo && historyDrawer ? <button type="button" ref={historyButtonRef} className="history-button" onClick={() => setDrawerOpen((open) => !open)} aria-expanded={historyVisible} aria-controls="chat-history" aria-haspopup="dialog" aria-label="Open chat history"><SidebarIcon direction="open" /></button> : null}
             <div className="conversation-crumb"><WorkflowIcon name="workflow" size={16} /><span>Workflow builder</span><i>/</i><strong>{workflowNames[conversationId]?.name ?? snapshot?.team ?? (messages.length ? conversationTitle : "New workflow")}</strong></div>
-            <div className="conversation-actions"><SettingsMenu onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
+            <div className="conversation-actions">{daemon.state === "live" && !readOnly && <MemoryManager key={serveUrl} url={serveUrl} />}<SettingsMenu onOpenBackends={daemon.state === "live" && !readOnly ? () => setBackendsOpen(true) : undefined} />{snapshot ? <button type="button" className="conversation-fold" onClick={() => setBuilder(0)} aria-label="Hide conversation"><WorkflowIcon name="chevron" size={16} /></button> : null}</div>
           </header>
           {daemon.state === "offline" ? (
             // The one place the outage is reported: the sidebar and composer
@@ -1588,7 +1589,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             {messages.map((message) => (
               <ChatMessageView key={message.sequence} message={message} />
             ))}
-            {assistantBusy ? <Waiting /> : null}
+            {assistantBusy ? <Waiting key={run?.status} label={run?.status === "failed" ? "Investigating workflow" : run?.status === "completed" ? "Reviewing results" : undefined} /> : null}
             {phase === "spawning" ? <Waiting label="Starting the run" /> : null}
           </div>
           {readOnly ? null : <QuoteSelection threadRef={threadRef} onQuote={(text) => { setQuote(text); composerRef.current?.focus(); }} />}
