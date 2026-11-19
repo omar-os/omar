@@ -46,7 +46,18 @@ test("activity fixtures: concurrent agents, long tool, settings, diff, reconnect
     await expect(page).toHaveTitle("OMAR Mission Control");
     await expect(page.getByLabel("Agent activity summary")).toContainText("2 active agents");
     await expect(page.getByLabel("Agent activity summary")).toContainText("1 with no recent");
-    await page.getByLabel("Inspect agent", {exact:true}).selectOption("flow.planner");
+    const canvas = page.locator(".topology-body");
+    const reaction = page.locator(".omar-reaction").first();
+    await expect(reaction).toBeVisible();
+    const inspectSelected = page.getByRole("button", { name: "View selected agent activity" });
+    await expect(inspectSelected).toBeDisabled();
+    const beforeSelection = await canvas.boundingBox();
+    await reaction.locator(".omar-reaction-body").click();
+    await expect(reaction).toHaveAttribute("aria-pressed", "true");
+    // Selecting a step must not move the graph between clicks of a double-click.
+    expect(await canvas.boundingBox()).toEqual(beforeSelection);
+    await expect(inspectSelected).toBeEnabled();
+    await inspectSelected.click();
     const panel = page.getByLabel("flow.planner activity", {exact:true});
     await expect(panel).toContainText("Running a tool");
     await expect(panel).toContainText("Fixture validation command");

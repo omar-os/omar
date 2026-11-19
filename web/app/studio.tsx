@@ -259,6 +259,9 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [quote, setQuote] = useState("");
   /** Diagram components the operator has highlighted for the next message. */
   const [selection, setSelection] = useState<string[]>([]);
+  const selectedComponent = selection.at(-1);
+  const selectedReaction = snapshot?.reactions.find((reaction) => reaction.id === `reaction::${selectedComponent}`);
+  const selectedActivityAgent = snapshot?.agents.find((agent) => agent.id === selectedReaction?.agent || agent.name === selectedComponent);
   /** The agent whose terminal is open, if any. */
   const [activityAgent, setActivityAgent] = useState<string | null>(null);
   const activity = useActivity(serveUrl, run?.run_id);
@@ -1754,11 +1757,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
               <option value="">Choose an agent…</option>
               {snapshot.agents.map((agent) => <option key={agent.id} value={agent.name}>{agent.name}</option>)}
             </select></label>
-            {selection.slice(-1).flatMap((name) => {
-              const reaction = snapshot.reactions.find((r) => r.id === `reaction::${name}`);
-              const agent = snapshot.agents.find((a) => a.id === reaction?.agent || a.name === name);
-              return agent ? [<button key={agent.id} className="secondary-button" type="button" onClick={() => setActivityAgent(agent.name)}>View {agent.name} activity</button>] : [];
-            })}
+            {/* Keep this control's size stable: adding it on the first click
+                moves the graph before a double-click can open the agent. */}
+            <button className="secondary-button" type="button" disabled={!selectedActivityAgent}
+              title={selectedActivityAgent?.name ?? "Select a step to inspect its agent"}
+              onClick={() => { if (selectedActivityAgent) setActivityAgent(selectedActivityAgent.name); }}>
+              View selected agent activity
+            </button>
           </div>
           {failure ? (
             <div className="run-feedback run-failure" role="alert">
