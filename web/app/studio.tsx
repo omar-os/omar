@@ -22,6 +22,7 @@ import { PropertiesPanel } from "./properties";
 import { Resizer } from "./resizer";
 import { useWorkflowNames } from "./lib/workflow-names";
 import { WorkflowIcon } from "./workflow-icon";
+import { WorkflowTrigger } from "./workflow-trigger";
 import { StepInspector } from "./step-inspector";
 import { Waiting } from "./waiting";
 import {
@@ -265,6 +266,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [historyRevision, setHistoryRevision] = useState(0);
   const [filesOpen, setFilesOpen] = useState(false);
+  const [showTrigger,setShowTrigger] = useState(false);
   const [inspected, setInspected] = useState<string | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const historyButtonRef = useRef<HTMLButtonElement>(null);
@@ -1753,12 +1755,14 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           {!isDemo && design ? <div className="workflow-save" role="status">{saveStatus}
             {saveStatus !== "Saved" && !saveStatus.startsWith("Saving") ? <><button onClick={() => void draftStore.flush().catch(() => {})}>Retry save</button><button onClick={() => void restoreSavedDraft()}>Use saved version</button></> : null}
           </div> : null}
+          {!readOnly && canRun && design ? <button type="button" aria-expanded={showTrigger} onClick={()=>{setShowTrigger(!showTrigger);setInspected(null);}}>Webhook trigger</button> : null}
           <div className="topology-body">
+          {showTrigger && !readOnly && design ? <WorkflowTrigger key={serveUrl} base={serveUrl} source={source} snapshot={snapshot} onClose={()=>setShowTrigger(false)} /> : null}
           <DiagramCanvas
             snapshot={snapshot}
             selection={selection}
             onToggleComponent={toggleComponent}
-            onInspectComponent={(component) => setInspected((current) => current === component ? null : component)}
+            onInspectComponent={(component) => {setShowTrigger(false);setInspected((current) => current === component ? null : component);}}
             // Agents outlive the run that spawned them, so a finished run can
             // still be opened; before a run there is nothing behind the node.
             highlight={timelineOpen ? highlighted : undefined}
