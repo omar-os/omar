@@ -249,7 +249,7 @@ test("a web component's panel opens from the diagram, and answers it", async ({
 
   // Double-clicking a reaction opens the agent that runs it; this one has no
   // pane, so what opens is its panel.
-  await web.dblclick();
+  await web.locator(".omar-reaction-body").dblclick();
 
   await expect(panel).toBeVisible();
   await expect(panel.getByRole("heading")).toHaveText("Provide critique");
@@ -1402,7 +1402,7 @@ test("a finished run leaves nothing running and still opens a terminal", async (
   // Completed is a fact about the tag a task ran at: the last tag's task
   // reads completed, the earlier ones read idle again.
   await expect(reactions.last()).toContainText("completed");
-  await expect(reactions.first()).toContainText("idle");
+  await expect(reactions.first()).toHaveClass(/idle/);
 
   // The agents outlive the run, so their terminals are still reachable.
   await page.locator(".omar-reaction .omar-reaction-body").first().dblclick();

@@ -9,6 +9,8 @@ import {
   useRef,
   useState,
 } from "react";
+import type { ActivitySnapshot } from "../lib/protocol-generated";
+import { activityState, elapsedLabel, latestInvocation } from "../lib/activity";
 import {
   formatCountdown,
   formatDuration,
@@ -565,6 +567,7 @@ function reactionWidth(labels: ReactionLabels, within: number | null): number {
   const widest = Math.max(
     textWidth(labels.name, 8.1),
     textWidth(labels.meta, 6.4) + 22,
+    textWidth("Waiting for dependencies", 6.4) + 22,
   );
   // A deadline is drawn between the text and the point, so the node has to be
   // wider for it rather than the stopwatch sitting on top of the name.
@@ -1328,6 +1331,8 @@ function countdownLabel(remaining: number): string {
 
 export function DiagramCanvas({
   snapshot,
+  activity,
+  activityNow = 0,
   selection = [],
   onToggleComponent,
   onInspectComponent,
@@ -1337,6 +1342,8 @@ export function DiagramCanvas({
   focus,
 }: {
   snapshot: DiagramSnapshot;
+  activity?: ActivitySnapshot | null;
+  activityNow?: number;
   selection?: string[];
   onToggleComponent?: (component: string) => void;
   onInspectComponent?: (component: string) => void;
@@ -1859,7 +1866,7 @@ export function DiagramCanvas({
                   key={reaction.id}
                   {...selectable(
                     reaction.id,
-                    `omar-reaction ${reaction.status}${reaction.web ? " web" : ""}`,
+                    `omar-reaction ${latestInvocation(activity ?? null, reaction.id)?.execution ?? reaction.status}${reaction.web ? " web" : ""}`,
                   )}
                   aria-label={`Inspect ${reaction.name}`}
                   data-component={componentName(reaction.id)}
@@ -1911,7 +1918,11 @@ export function DiagramCanvas({
                   <g className="omar-model-mark" transform={`translate(${REACTION_TEXT_X + 2} 82) scale(0.5)`}>
                     <BackendMark backend={reaction.backend} />
                   </g>
-                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={91}>{reaction.meta}</text>
+                  <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={91}>{(() => {
+                    const invocation = latestInvocation(activity ?? null, reaction.id);
+                    return invocation ? `${activityState(invocation)} · ${elapsedLabel(invocation.started_at, invocation.finished_at ?? activityNow)}`
+                      : reaction.status === "idle" && snapshot.status !== "ready" ? (snapshot.status === "running" ? "Waiting for dependencies" : "Not invoked") : reaction.meta;
+                  })()}</text>
                   {/* A deadline the program set for itself. A stopwatch rather
                       than a clock: a timer fires on its own, this counts down
                       against work already running. */}

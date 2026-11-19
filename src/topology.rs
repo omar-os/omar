@@ -2310,6 +2310,7 @@ fn invocation_record(team: &str, invocation: &InvocationSpec) -> Result<Invocati
 }
 
 struct AgentReactionExecutor {
+    activity: Option<crate::activity::ActivityRun>,
     client: TmuxClient,
     team: String,
     registry: InvocationRegistry,
@@ -2322,10 +2323,33 @@ struct AgentReactionExecutor {
 
 impl ReactionExecutor for AgentReactionExecutor {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+        if let Some(activity) = &self.activity {
+            activity.start(
+                &invocation.id.to_string(),
+                &invocation.reaction_id,
+                &invocation.agent,
+            );
+        }
+        let id = invocation.id.to_string();
+        let result = self.invoke_observed(invocation);
+        if let Some(activity) = &self.activity {
+            activity.finish(
+                &id,
+                result.is_ok(),
+                result.as_ref().map(|w| w.len()).unwrap_or(0),
+            );
+        }
+        result
+    }
+}
+impl AgentReactionExecutor {
+    fn invoke_observed(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
         let task_id = invocation.id;
+        let invocation_id = task_id.to_string();
         let record = invocation_record(&self.team, &invocation)?;
         let rendered = record.prompt.clone();
         let completion = self.registry.register(record)?;
+        let mut monitor_guard = None;
 
         // A web agent has no pane to deliver to: nothing was spawned for it,
         // and the registration above is the work item a panel asks for. What
@@ -2333,16 +2357,36 @@ impl ReactionExecutor for AgentReactionExecutor {
         // and the registry does not care which kind it is waiting on.
         if !self.web.contains(&invocation.agent) {
             let message = invocation_message(&invocation, &rendered)?;
+            let mut configured = false;
+            if let Some(activity) = &self.activity {
+                let mut monitor = crate::activity::InvocationMonitor::prepare(
+                    activity.clone(),
+                    &invocation_id,
+                    &self.client,
+                    &invocation.agent,
+                );
+                match monitor.deliver_configured(&message) {
+                    Ok(sent) => configured = sent,
+                    Err(_) => {
+                        activity.application(&invocation_id, "Requested settings could not be applied; invocation was not retried. Inspect terminal before retrying.");
+                        self.registry.remove(&task_id);
+                        bail!("requested role settings could not be applied; invocation was not retried");
+                    }
+                }
+                monitor_guard = Some(monitor.spawn());
+            }
             let session = self.client.session_for(&invocation.agent);
-            if let Err(error) = self
-                .client
-                .deliver_prompt_until(&session, &message, &DeliveryOptions::default(), &|| {
-                    self.registry.answered(&task_id)
-                })
-                .with_context(|| format!("failed to deliver {}", invocation.reaction_id))
-            {
-                self.registry.remove(&task_id);
-                return Err(error);
+            if !configured {
+                if let Err(error) = self
+                    .client
+                    .deliver_prompt_until(&session, &message, &DeliveryOptions::default(), &|| {
+                        self.registry.answered(&task_id)
+                    })
+                    .with_context(|| format!("failed to deliver {}", invocation.reaction_id))
+                {
+                    self.registry.remove(&task_id);
+                    return Err(error);
+                }
             }
         }
 
@@ -2355,6 +2399,16 @@ impl ReactionExecutor for AgentReactionExecutor {
             )),
         };
         self.registry.remove(&task_id);
+        let ended_at = crate::activity::now_ms();
+        drop(monitor_guard);
+        if let Some(activity) = &self.activity {
+            activity.finish_at(
+                &invocation_id,
+                result.is_ok(),
+                result.as_ref().map(|w| w.len()).unwrap_or(0),
+                ended_at,
+            );
+        }
         result
     }
 }
@@ -2455,6 +2509,7 @@ impl<E: ReactionExecutor> ReactionExecutor for DispatchExecutor<'_, E> {
 
 /// The host trusts only typed, contract-checked invocation results from the VM.
 struct SandboxExecutor<'a, E> {
+    activity: Option<crate::activity::ActivityRun>,
     state: &'a VmState,
     workers: BTreeMap<String, crate::sandbox::Worker>,
     workspaces: &'a BTreeMap<String, crate::workspace::Workspace>,
@@ -2463,7 +2518,7 @@ struct SandboxExecutor<'a, E> {
     host: E,
 }
 impl<E: ReactionExecutor> ReactionExecutor for SandboxExecutor<'_, E> {
-    fn invoke(&self, mut invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+    fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
         let reaction = &self.state.reactions[&invocation.reaction_id];
         if self.workers.is_empty()
             || self
@@ -2474,16 +2529,39 @@ impl<E: ReactionExecutor> ReactionExecutor for SandboxExecutor<'_, E> {
         {
             return self.host.invoke(invocation);
         }
-        let workspace = &self.workspaces[&reaction.instance];
+        let id = invocation.id.to_string();
+        if let Some(activity) = &self.activity {
+            activity.start(&id, &invocation.reaction_id, &invocation.agent);
+            activity.connection(&id, crate::activity::ActivityConnection::Unsupported);
+            activity.application(
+                &id,
+                "Native session details and role settings are unavailable in a sandbox.",
+            );
+        }
+        let result = self.invoke_worker(invocation, &reaction.instance);
+        if let Some(activity) = &self.activity {
+            activity.finish(
+                &id,
+                result.is_ok(),
+                result.as_ref().map_or(0, |writes| writes.len()),
+            );
+        }
+        result
+    }
+}
+impl<E> SandboxExecutor<'_, E> {
+    fn invoke_worker(
+        &self,
+        mut invocation: InvocationSpec,
+        instance: &str,
+    ) -> Result<BTreeMap<String, Value>> {
+        let workspace = &self.workspaces[instance];
         for (name, value) in &mut invocation.trigger_values {
             if let Some(port) = self.state.ports.get(name) {
                 crate::sandbox::map_input_paths(value, &port.ty, workspace, self.root)?;
             }
         }
-        let worker = self
-            .workers
-            .get(&reaction.instance)
-            .context("missing team sandbox")?;
+        let worker = self.workers.get(instance).context("missing team sandbox")?;
         let deadline = invocation.within.unwrap_or(self.timeout);
         let response = worker.request(
             serde_json::to_value(&invocation)?,
@@ -2566,6 +2644,7 @@ pub fn sandbox_worker() -> Result<()> {
     let runtime_dir = local_root.join("runtime");
     let worktree = init.workspace.worktree(&init.root);
     let config = TopologyRunConfig {
+        activity: None,
         ea_id: 0,
         omar_dir: &local_root,
         generated: &generated,
@@ -2610,6 +2689,7 @@ pub fn sandbox_worker() -> Result<()> {
                 (worktree.clone(), init.workspace.temp(&init.root)),
             )]),
             agents: AgentReactionExecutor {
+                activity: None,
                 client: client.clone(),
                 team: init.state.team.clone(),
                 registry: server.registry.clone(),
@@ -2639,6 +2719,7 @@ pub fn sandbox_worker() -> Result<()> {
 }
 
 pub struct TopologyRunConfig<'a> {
+    pub activity: Option<crate::activity::ActivityRun>,
     pub ea_id: crate::ea::EaId,
     pub omar_dir: &'a Path,
     /// Where this program's generated artifacts go, from `generated_dir`.
@@ -3422,6 +3503,7 @@ fn launch(
         code: reactions,
         timeout: config.timeout,
         agents: AgentReactionExecutor {
+            activity: config.activity.clone(),
             client,
             team: state.team.clone(),
             registry: invocation_server.registry.clone(),
@@ -3430,6 +3512,7 @@ fn launch(
         },
     };
     let executor = SandboxExecutor {
+        activity: config.activity.clone(),
         state: &state,
         workspaces: &workspaces,
         root: config.omar_dir,
@@ -5134,7 +5217,7 @@ fn is_web_backend(backend: &str) -> bool {
     canonical_backend(backend) == "web"
 }
 
-fn canonical_backend(backend: &str) -> &str {
+pub(crate) fn canonical_backend(backend: &str) -> &str {
     if backend.eq_ignore_ascii_case("web") {
         return "web";
     }
@@ -6605,6 +6688,7 @@ mod tests {
         .unwrap();
         let state = verify(&bytecode).unwrap();
         let executor = AgentReactionExecutor {
+            activity: None,
             client: TmuxClient::new("omar-test"),
             team: state.team.clone(),
             registry: server.registry.clone(),
@@ -8661,6 +8745,100 @@ mod tests {
             LoopEnd::Stopped(_) | LoopEnd::Paused(_) => panic!("nothing requested a stop"),
         }
         assert_eq!(*executor.calls.lock().unwrap(), 2);
+    }
+    #[test]
+    fn activity_records_each_concurrent_completion_before_the_layer_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let activity = crate::activity::ActivityRun::new(
+            "run".into(),
+            "Team".into(),
+            BTreeMap::from([("one".into(), "web".into()), ("two".into(), "web".into())]),
+            crate::activity::RoleSettings::load(dir.path().join("roles.json")),
+            dir.path().into(),
+        );
+        let server = InvocationServer::start().unwrap();
+        let executor = AgentReactionExecutor {
+            activity: Some(activity.clone()),
+            client: TmuxClient::new("unused"),
+            team: "Team".into(),
+            registry: server.registry.clone(),
+            timeout: Duration::from_secs(10),
+            web: BTreeSet::from(["one".into(), "two".into()]),
+        };
+        thread::scope(|scope| {
+            let invoke = |id: u64, agent: &str| {
+                executor.invoke(InvocationSpec {
+                    id,
+                    reaction_id: format!("r-{id}"),
+                    agent: agent.into(),
+                    trigger_values: BTreeMap::new(),
+                    allowed_effects: BTreeMap::new(),
+                    effect_names: BTreeMap::new(),
+                    types: BTreeMap::new(),
+                    state_values: BTreeMap::new(),
+                    state_types: BTreeMap::new(),
+                    contexts: BTreeMap::new(),
+                    context_names: BTreeSet::new(),
+                    contract: String::new(),
+                    prompt: "fixture".into(),
+                    within: None,
+                })
+            };
+            let one = scope.spawn(move || invoke(1, "one"));
+            let two = scope.spawn(move || invoke(2, "two"));
+            for _ in 0..200 {
+                if server.registry.entries.lock().unwrap().len() == 2 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(server.registry.entries.lock().unwrap().len(), 2);
+            // Complete through the actual scoped invocation registry. Empty
+            // writes satisfy this fixture's empty contract.
+            server
+                .registry
+                .execute(
+                    "Team",
+                    "one",
+                    InvocationCommand::Complete(CompleteArgs {
+                        task_id: 1,
+                        keep: Vec::new(),
+                    }),
+                )
+                .unwrap();
+            one.join().unwrap().unwrap();
+            let snapshot = activity.snapshot();
+            assert_eq!(
+                snapshot
+                    .invocations
+                    .iter()
+                    .find(|i| i.invocation_id == "1")
+                    .unwrap()
+                    .execution,
+                crate::activity::ActivityExecution::Completed
+            );
+            assert_eq!(
+                snapshot
+                    .invocations
+                    .iter()
+                    .find(|i| i.invocation_id == "2")
+                    .unwrap()
+                    .execution,
+                crate::activity::ActivityExecution::Running
+            );
+            server
+                .registry
+                .execute(
+                    "Team",
+                    "two",
+                    InvocationCommand::Complete(CompleteArgs {
+                        task_id: 2,
+                        keep: Vec::new(),
+                    }),
+                )
+                .unwrap();
+            two.join().unwrap().unwrap();
+        });
     }
 
     /// A program of one instance whose reaction keeps a count in state. It

@@ -2,6 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ChatMessage as ChatMessageView } from "./chat-message";
+import { AgentActivity, ActivitySummary, RoleSettings, useActivity, useInactivityThreshold } from "./agent-activity";
 import { QuoteSelection, withQuote } from "./quote-selection";
 import { ChatHistory, OmarLogo, SidebarIcon, useHistoryDrawer } from "./chat-history";
 import { Artifacts } from "./artifacts";
@@ -258,7 +259,13 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
   const [quote, setQuote] = useState("");
   /** Diagram components the operator has highlighted for the next message. */
   const [selection, setSelection] = useState<string[]>([]);
+  const selectedComponent = selection.at(-1);
+  const selectedReaction = snapshot?.reactions.find((reaction) => reaction.id === `reaction::${selectedComponent}`);
+  const selectedActivityAgent = snapshot?.agents.find((agent) => agent.id === selectedReaction?.agent || agent.name === selectedComponent);
   /** The agent whose terminal is open, if any. */
+  const [activityAgent, setActivityAgent] = useState<string | null>(null);
+  const activity = useActivity(serveUrl, run?.run_id);
+  const [inactivitySeconds, setInactivitySeconds] = useInactivityThreshold();
   const [terminalAgent, setTerminalAgent] = useState<string | null>(null);
   const [backendsOpen, setBackendsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(true);
@@ -497,6 +504,7 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
     setQuote("");
     setError("");
     setTerminalAgent(null);
+    setActivityAgent(null);
     setPanelAgent(null);
     setSteps([]);
     setStepIndex(0);
@@ -1742,6 +1750,21 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
             </div>
             ) : null}
           </div>
+          {run ? <ActivitySummary snapshot={activity.snapshot} now={activity.now} connected={activity.connection === "connected"} seconds={inactivitySeconds} /> : null}
+          {!isDemo && !readOnly ? <RoleSettings serveUrl={serveUrl} snapshot={snapshot} /> : null}
+          <div className="activity-summary" aria-label="Inspect agents">
+            <label>Inspect agent <select aria-label="Inspect agent" value={activityAgent ?? ""} onChange={(event) => setActivityAgent(event.target.value || null)}>
+              <option value="">Choose an agent…</option>
+              {snapshot.agents.map((agent) => <option key={agent.id} value={agent.name}>{agent.name}</option>)}
+            </select></label>
+            {/* Keep this control's size stable: adding it on the first click
+                moves the graph before a double-click can open the agent. */}
+            <button className="secondary-button" type="button" disabled={!selectedActivityAgent}
+              title={selectedActivityAgent?.name ?? "Select a step to inspect its agent"}
+              onClick={() => { if (selectedActivityAgent) setActivityAgent(selectedActivityAgent.name); }}>
+              View selected agent activity
+            </button>
+          </div>
           {failure ? (
             <div className="run-feedback run-failure" role="alert">
               <strong>Last run failed</strong>
@@ -1755,6 +1778,8 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
           </div> : null}
           <div className="topology-body">
           <DiagramCanvas
+            activity={activity.snapshot}
+            activityNow={activity.now}
             snapshot={snapshot}
             selection={selection}
             onToggleComponent={toggleComponent}
@@ -1950,6 +1975,10 @@ function StudioWorkspace({ serveUrl = "", historyUrl, designAgent, selectedId, o
         />
       ) : null}
 
+      {activityAgent ? <AgentActivity key={activityAgent} agent={activityAgent} activity={activity.snapshot} connection={activity.connection}
+        now={activity.now} seconds={inactivitySeconds} onThreshold={setInactivitySeconds}
+        onOpenTerminal={canRun && run && snapshot?.agents.find((a) => a.name === activityAgent)?.backend.toLowerCase() !== "web" ? () => setTerminalAgent(activityAgent) : undefined}
+        onClose={() => setActivityAgent(null)} /> : null}
       {/* Stays on top until every waiting step is answered; each row leaves once handled. */}
       {waiting.length ? (
         <aside className="response-notice" role="status" aria-label="Responses needed">
