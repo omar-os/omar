@@ -480,3 +480,7 @@ button:focus-visible, select:focus-visible { outline-offset: 3px; }
 .chat-history .delete-workflow-actions button { padding: 10px 14px; }
 .chat-history .delete-workflow-actions .confirm-workflow-delete { color: #fff; background: #a62e3c; border-color: #a62e3c; }
 .chat-history .delete-workflow-actions .confirm-workflow-delete:hover:not(:disabled) { background: #be3545; border-color: #be3545; }
+
+.edge-hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
+.edge-hit:focus-visible { stroke: var(--purple); opacity: .45; outline: none; }
+.edge-hit ~ .omar-edge { pointer-events: none; }

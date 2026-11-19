@@ -57,6 +57,33 @@ test('prompt-only save preserves adjacent Rust and the other role configuration'
  assert.ok(edited.includes(body));
 });
 
+import { graphChange, splitConnection } from '../app/lib/graph-edits.ts';
+const insert = {position:'before',name:'checked',role:'planner',prompt:'Check the value',repairs:{},port:'port::flow.request'};
+test('inserting and removing graph steps preserves typed ports and downstream branches', () => {
+ const first=snapshot.reactions[0];
+ const before=graphChange(program,snapshot,first,insert);
+ assert.match(before,/task planner\(request\) -> checked "Check the value"/);
+ assert.match(before,/task planner\(checked\) -> plan "Use \$\(checked\)/);
+ const after=graphChange(program,snapshot,first,{...insert,position:'after',port:first.effects[0]});
+ assert.match(after,/task planner\(request\) -> checked/);
+ assert.match(after,/task planner\(checked\) -> plan/);
+ assert.match(after,/task reviewer\(plan\) -> critique/);
+ const remove={...insert,position:'remove'};
+ assert.throws(()=>graphChange(program,snapshot,first,remove),/compatible replacement/);
+ const repaired=graphChange(program,snapshot,first,{...remove,repairs:{[first.effects[0]]:first.triggers[0]}});
+ assert.match(repaired,/request -> plan/);
+ assert.match(repaired,/task reviewer\(plan\) -> critique/);
+ assert.throws(()=>graphChange(program,snapshot,first,{...insert,name:'plan'}),/unique identifier/);
+});
+test('an inter-instance connection is split in its enclosing block and keeps its delay',()=>{
+ const workflow=program.replace('flow = ReviewFlow()','flow = ReviewFlow()\nother = ReviewFlow()\nflow.result -> other.request after 2s');
+ const port={...snapshot.ports.find(p=>p.name==='flow.request'),id:'port::other.request',name:'other.request',instance:'other'};
+ const snap={...snapshot,ports:[...snapshot.ports,port],instances:[...snapshot.instances,{id:'instance::other',name:'other',team:'ReviewFlow'}]};
+ const graph=splitConnection(workflow,snap,{kind:'connection',source:'port::flow.result',target:port.id},{...insert,name:'audit',role:'Web'});
+ assert.match(graph,/team auditStep\[worker : Web\]/);
+ assert.match(graph,/flow.result -> audit.value\s+audit.result -> other.request after 2s/);
+});
+
 test('editing task configuration preserves metadata and the other steps', () => {
  const metadata = '// @title Review campaign script\n // @desc Inspect the prompt, identify gaps, and return a critique.';
  for (const deadline of ['', 'within(30s)']) {
@@ -119,4 +146,18 @@ test('prompt-only edits invalidate stale annotations without changing wiring', (
  assert.deepEqual(edited.triggers, step.triggers);
  assert.equal(edited.contract, step.contract);
  assert.equal(replacePrompt(source, step, step.prompt), source);
+});
+
+test('graph edits keep task annotations with their declaration and remove them with it', () => {
+ const metadata = '// @title Draft a release plan\n // @desc Draft the release plan from the request.\n ';
+ for (const code of [false, true]) {
+  let source = program.replace('task planner(request)', metadata + 'task planner(request)');
+  if (code) source = source.replace(/task planner\(request\) -> plan "(?:\\.|[^"\\])*"/, 'reaction(request) -> plan {= plan = request; =}');
+  const changed = graphChange(source, snapshot, snapshot.reactions[0], insert);
+  assert.ok(changed.indexOf('task planner(request) -> checked') < changed.indexOf(metadata));
+  assert.match(changed, new RegExp(code ? '@desc[^\\n]+\\n reaction\\(checked\\)' : '@desc[^\\n]+\\n task planner\\(checked\\)'));
+  const removed = graphChange(source, snapshot, snapshot.reactions[0], {...insert,position:'remove',repairs:{[snapshot.reactions[0].effects[0]]:snapshot.reactions[0].triggers[0]}});
+  assert.doesNotMatch(removed, /@title|@desc/);
+  assert.match(removed, /task reviewer\(plan\)/);
+ }
 });

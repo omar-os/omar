@@ -49,7 +49,7 @@ function codeEnd(source: string, start: number): number {
 
 /** Locate editable spans, never decide whether a workflow is valid. The runtime
  * compiler validates every replacement before it becomes the current draft. */
-function tokens(source: string): Token[] {
+export function tokens(source: string): Token[] {
   const result: Token[] = [];
   let i = 0;
   while (i < source.length) {
@@ -72,9 +72,10 @@ function tokens(source: string): Token[] {
         i = Math.min(source.length, end + 1);
         while (i < source.length && /[ \t\r]/.test(source[i])) i++;
       }
-      if (annotations.spans.length && /^task\b/.test(source.slice(i))) {
-        result.push({ text: "task", start: i, end: i + 4, string: false, annotations });
-        i += 4;
+      const declaration = /^(task|reaction)\b/.exec(source.slice(i))?.[0];
+      if (annotations.spans.length && declaration) {
+        result.push({ text: declaration, start: i, end: i + declaration.length, string: false, annotations });
+        i += declaration.length;
       }
       continue;
     }
@@ -166,7 +167,7 @@ export function locateStep(source: string, snapshot: DiagramSnapshot, reaction: 
   } catch { return null; }
 }
 
-function quotedPrompt(prompt: string): string {
+export function quotedPrompt(prompt: string): string {
   return '"' + prompt.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 }
 
