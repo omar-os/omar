@@ -83,7 +83,7 @@ function declaration(
     open: all[open],
     headerTokens: all.slice(header + 2, open),
     declarationTokens: all.slice(start, end),
-    span: { start: all[start].start, end: last },
+    span: { start: all[start].annotations?.spans[0]?.start ?? all[start].start, end: last },
   };
 }
 

@@ -6,6 +6,7 @@ import type { DiagramSnapshot } from "./lib/protocol";
 import { formatDuration } from "./lib/protocol";
 import { componentName } from "./diagram/diagram-canvas";
 import { GraphStepEditor } from "./graph-step-editor";
+import { taskCopy } from "./lib/task-copy";
 import { WorkflowIcon } from "./workflow-icon";
 
 /** Details come from the compiled topology, never from prototype sample data. */
@@ -28,7 +29,8 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
   const timer = (snapshot.timers ?? []).find((item) => componentName(item.id) === component);
   const agent = snapshot.agents.find((item) => item.id === reaction?.agent);
   const configuration = useMemo(() => reaction ? locateStep(source, snapshot, reaction) : null, [source, snapshot, reaction]);
-  const name = reaction ? (/(?:^|\.)reaction\.\d+$/.test(reaction.name) ? agent?.name ?? reaction.name : reaction.name) : port?.name ?? timer?.name ?? component;
+  const copy = reaction ? taskCopy(reaction, agent, snapshot) : null;
+  const name = copy?.title ?? port?.name ?? timer?.name ?? component;
   const label = (id: string) => snapshot.ports.find((item) => item.id === id)?.name ?? (snapshot.timers ?? []).find((item) => item.id === id)?.name ?? componentName(id);
   const connectionNames = (ids: string[]) => ids.length ? ids.map((id) => <span className="step-connection" key={id}><i />{label(id)}</span>) : <span className="step-empty">None declared</span>;
 
@@ -36,7 +38,7 @@ export function StepInspector({ component, snapshot, source, editable, readOnly 
     <aside className="step-inspector" aria-label="Step details">
       <header><span className="inspector-type">{reaction ? "TASK" : timer ? "TIMER" : port?.kind === "action" ? "ACTION" : "CONNECTION"}</span><button type="button" aria-label="Close step details" onClick={onClose}><WorkflowIcon name="close" size={16} /></button></header>
       <h3>{name}</h3>
-      <p className="inspector-description">{component}</p>
+      <p className="inspector-description">{copy?.description ?? component}</p>
       {editable && !readOnly && (reaction || edge) ? <GraphStepEditor source={source} snapshot={snapshot} reaction={reaction} edge={edge} onApply={onGraph} onClose={onClose} /> : null}
       {reaction && !edge ? <>
         {configuration && !readOnly ? <PromptEditor step={configuration} source={source} enabled={editable} onApply={onApply} /> : null}

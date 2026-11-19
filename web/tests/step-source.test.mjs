@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { locateStep, replacePrompt, replaceStep } from '../app/lib/step-source.ts';
+import { taskCopy, shortTaskText } from '../app/lib/task-copy.ts';
 const snapshot = JSON.parse(readFileSync(new URL('./fixtures/diagram-snapshot.v1.json', import.meta.url)));
 const program = `team ReviewFlow[planner:Codex, reviewer:Codex] {
  input request:string
@@ -81,4 +82,82 @@ test('an inter-instance connection is split in its enclosing block and keeps its
  const graph=splitConnection(workflow,snap,{kind:'connection',source:'port::flow.result',target:port.id},{...insert,name:'audit',role:'Web'});
  assert.match(graph,/team auditStep\[worker : Web\]/);
  assert.match(graph,/flow.result -> audit.value\s+audit.result -> other.request after 2s/);
+});
+
+test('editing task configuration preserves metadata and the other steps', () => {
+ const metadata = '// @title Review campaign script\n // @desc Inspect the prompt, identify gaps, and return a critique.';
+ for (const deadline of ['', 'within(30s)']) {
+  const source = program.replace('within(30s)', deadline).replace('task reviewer', `${metadata}\n task reviewer`);
+  const step = locateStep(source, snapshot, snapshot.reactions[1]);
+  assert.equal(step.prompt, 'Inspect $(plan).');
+  assert.equal(step.contract, 'critique');
+  const changed = replaceStep(source, step, {...step, prompt:'Review $(plan) carefully.', contract:'critique?'});
+  assert.ok(changed.includes(metadata));
+  const edited = locateStep(changed, snapshot, snapshot.reactions[1]);
+  assert.equal(edited.prompt, 'Review $(plan) carefully.');
+  assert.equal(edited.contract, 'critique?');
+  assert.equal(locateStep(changed, snapshot, snapshot.reactions[0]).prompt, locateStep(program, snapshot, snapshot.reactions[0]).prompt);
+ }
+});
+
+test('task copy is shared without exposing identifiers as descriptions', () => {
+ const reaction = snapshot.reactions[0];
+ const agent = snapshot.agents.find(agent => agent.id === reaction.agent);
+ assert.deepEqual(taskCopy({...reaction, title:' Prepare reel content ', description:' Research, write and narrate the story. '}, agent), {
+  title:'Prepare reel content', description:'Research, write and narrate the story.'
+ });
+ assert.equal(taskCopy(reaction, agent).title, 'Draft a release plan for request');
+ assert.match(taskCopy(reaction, agent).description, /five numbered steps/);
+ assert.equal(shortTaskText('Render and review reel', 12), 'Render and…');
+ assert.equal(shortTaskText('Render\n  reel', 20), 'Render reel');
+ assert.equal(shortTaskText('🎬🎬🎬', 2), '🎬…');
+});
+
+
+test('legacy code and manual steps describe known behavior without agent placeholders', () => {
+ const code = {...snapshot.reactions[0], prompt:undefined, agent:'agent::', triggers:['port::route.evidence'], effects:['port::route.approved','port::route.rejected']};
+ const copy = taskCopy(code);
+ assert.equal(copy.title, 'Produce approved and rejected');
+ assert.match(copy.description, /Uses evidence/);
+ assert.match(copy.description, /May produce approved and rejected/);
+ assert.doesNotMatch(copy.description, /confidence|0.95|automatically approves/);
+ const manual = taskCopy({...code, prompt:'Review the draft.'}, {backend:'Web'});
+ assert.match(manual.title, /Request human response/);
+ assert.match(manual.description, /Waits for a person/);
+});
+
+test('editing instructions clears stale copy while backend-only changes preserve it', () => {
+ const source = program.replace('task reviewer', '// @title Review campaign script\n // @desc Inspect the draft and return a critique.\n task reviewer');
+ const step = locateStep(source, snapshot, snapshot.reactions[1]);
+ const backendOnly = {backend:'ClaudeCode', prompt:step.prompt, contract:step.contract, triggers:step.triggers};
+ assert.match(replaceStep(source, step, backendOnly), /@title Review campaign script/);
+ const changed = replaceStep(source, step, {...backendOnly, prompt:'Translate the plan into French.'});
+ assert.doesNotMatch(changed, /@title|@desc/);
+ assert.equal(locateStep(changed, snapshot, snapshot.reactions[1]).prompt, 'Translate the plan into French.');
+});
+
+test('prompt-only edits invalidate stale annotations without changing wiring', () => {
+ const source = program.replace('task reviewer', '// @title Review the plan\n // @desc Review the plan for missing requirements.\n task reviewer');
+ const step = locateStep(source, snapshot, snapshot.reactions[1]);
+ const changed = replacePrompt(source, step, 'Translate $(plan) into French.');
+ assert.doesNotMatch(changed, /@title|@desc/);
+ const edited = locateStep(changed, snapshot, snapshot.reactions[1]);
+ assert.equal(edited.prompt, 'Translate $(plan) into French.');
+ assert.deepEqual(edited.triggers, step.triggers);
+ assert.equal(edited.contract, step.contract);
+ assert.equal(replacePrompt(source, step, step.prompt), source);
+});
+
+test('graph edits keep task annotations with their declaration and remove them with it', () => {
+ const metadata = '// @title Draft a release plan\n // @desc Draft the release plan from the request.\n ';
+ for (const code of [false, true]) {
+  let source = program.replace('task planner(request)', metadata + 'task planner(request)');
+  if (code) source = source.replace(/task planner\(request\) -> plan "(?:\\.|[^"\\])*"/, 'reaction(request) -> plan {= plan = request; =}');
+  const changed = graphChange(source, snapshot, snapshot.reactions[0], insert);
+  assert.ok(changed.indexOf('task planner(request) -> checked') < changed.indexOf(metadata));
+  assert.match(changed, new RegExp(code ? '@desc[^\\n]+\\n reaction\\(checked\\)' : '@desc[^\\n]+\\n task planner\\(checked\\)'));
+  const removed = graphChange(source, snapshot, snapshot.reactions[0], {...insert,position:'remove',repairs:{[snapshot.reactions[0].effects[0]]:snapshot.reactions[0].triggers[0]}});
+  assert.doesNotMatch(removed, /@title|@desc/);
+  assert.match(removed, /task reviewer\(plan\)/);
+ }
 });
