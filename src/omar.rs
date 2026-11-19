@@ -1,4 +1,5 @@
 mod app;
+mod approvals;
 mod backend;
 mod backend_probe;
 mod backend_runner;

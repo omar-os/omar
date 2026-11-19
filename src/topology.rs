@@ -2318,11 +2318,17 @@ struct AgentReactionExecutor {
     /// no pane to deliver a prompt to — the registration is the work item, and
     /// a web client picks it up from there.
     web: BTreeSet<String>,
+    approvals: Option<crate::approvals::ApprovalRun>,
 }
 
 impl ReactionExecutor for AgentReactionExecutor {
     fn invoke(&self, invocation: InvocationSpec) -> Result<BTreeMap<String, Value>> {
         let task_id = invocation.id;
+        let invocation_id = invocation.id.to_string();
+        let _approval_invocation = self
+            .approvals
+            .as_ref()
+            .map(|run| run.invocation(&invocation.agent, &invocation_id));
         let record = invocation_record(&self.team, &invocation)?;
         let rendered = record.prompt.clone();
         let completion = self.registry.register(record)?;
@@ -2566,6 +2572,7 @@ pub fn sandbox_worker() -> Result<()> {
     let runtime_dir = local_root.join("runtime");
     let worktree = init.workspace.worktree(&init.root);
     let config = TopologyRunConfig {
+        approvals: None,
         ea_id: 0,
         omar_dir: &local_root,
         generated: &generated,
@@ -2610,6 +2617,7 @@ pub fn sandbox_worker() -> Result<()> {
                 (worktree.clone(), init.workspace.temp(&init.root)),
             )]),
             agents: AgentReactionExecutor {
+                approvals: None,
                 client: client.clone(),
                 team: init.state.team.clone(),
                 registry: server.registry.clone(),
@@ -2662,6 +2670,7 @@ pub struct TopologyRunConfig<'a> {
     /// this the daemon cannot answer on a client's behalf, and a web-backed
     /// reaction would always sit until its deadline.
     pub panel_ready: Option<mpsc::Sender<PanelAccess>>,
+    pub approvals: Option<crate::approvals::ApprovalRun>,
     /// How often the run checkpoints on its own; `None` is the default hour.
     pub checkpoint_policy: Option<checkpoint::Policy>,
     /// Keep the instances' workspaces when the run ends; otherwise they go
@@ -3359,6 +3368,13 @@ fn launch(
                     resumed_from: resumed_from.clone(),
                 };
                 worker.request(serde_json::to_value(init)?, Duration::from_secs(180))?;
+                if let Some(approvals) = &config.approvals {
+                    for (id, agent) in &state.agents {
+                        if agent.instance == *instance && needs_agent_process(&agent.backend) {
+                            approvals.watch_sandbox(id);
+                        }
+                    }
+                }
                 observer.sandbox_started(instance, &name);
                 workers.insert(instance.clone(), worker);
             }
@@ -3427,6 +3443,7 @@ fn launch(
             registry: invocation_server.registry.clone(),
             timeout: config.timeout,
             web,
+            approvals: config.approvals.clone(),
         },
     };
     let executor = SandboxExecutor {
@@ -3778,6 +3795,9 @@ fn spawn_topology_agents(
                 ("TMPDIR".into(), temp.to_string_lossy().into_owned()),
             ],
         )?;
+        if let Some(approvals) = &config.approvals {
+            approvals.watch(&session, name, &command, canonical_backend(&agent.backend));
+        }
         spawned.insert(name.clone(), session);
         launched.insert(name.clone(), command);
     }
@@ -6610,6 +6630,7 @@ mod tests {
             registry: server.registry.clone(),
             timeout: Duration::from_secs(10),
             web: BTreeSet::from(["panel".to_string()]),
+            approvals: None,
         };
         let context = TopologyMcpContext {
             team: state.team.clone(),

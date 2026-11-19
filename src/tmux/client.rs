@@ -308,6 +308,11 @@ impl TmuxClient {
         Ok(tail_pane_lines(output, lines))
     }
 
+    /// Visible terminal rows only. A cleared permission prompt may still exist in scrollback.
+    pub fn visible_pane(&self, session: &str) -> Result<String> {
+        self.run(&["capture-pane", "-p", "-t", &exact_pane_target(session)])
+    }
+
     /// Get the name of the command currently running in a pane.
     ///
     /// Returns the executable name (e.g. "opencode", "claude", "zsh").
