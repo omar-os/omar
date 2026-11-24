@@ -56,6 +56,7 @@ pub fn normalize(payload: &Value, bot: &str) -> Option<Incoming> {
         return None;
     }
     Some(Incoming {
+        server_context: None,
         plain_text: command.is_none(),
         platform: "slack".into(),
         account_id: payload["team_id"].as_str()?.into(),
@@ -115,6 +116,7 @@ fn normalize_interaction(payload: &Value, event_id: &str) -> Option<Incoming> {
         .as_str()
         .or_else(|| payload["user_id"].as_str())?;
     Some(Incoming {
+        server_context: None,
         plain_text: false,
         platform: "slack".into(),
         account_id: account.into(),

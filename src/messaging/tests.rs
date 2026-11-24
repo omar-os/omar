@@ -377,7 +377,7 @@ fn config_rejects_empty_user_and_channel_allowlists() {
 #[test]
 fn cli_preserves_config_argument_and_supports_login_logout() {
     use clap::Parser;
-    for platform in ["slack"] {
+    for platform in ["slack", "discord"] {
         for action in ["config.json", "login", "logout", "connect"] {
             assert!(crate::Cli::try_parse_from(["omar", "messaging", platform, action]).is_ok());
         }
@@ -807,6 +807,107 @@ async fn discord_cancel_revision_expiry_and_new_messages_never_execute_old_propo
             .await;
         assert!(g.runtime.starts.lock().unwrap().is_empty(), "{action}");
     }
+}
+
+fn server_message(sender: &str, channel: &str, event: &str, text: &str) -> Incoming {
+    serde_json::from_value(json!({"platform":"discord","accountId":"account","senderId":sender,
+        "eventId":event,"command":text,"plainText":true,"serverContext":{"guildId":"111","parentId":"456"},
+        "destination":{"platform":"discord","accountId":"account","conversationId":channel}})).unwrap()
+}
+fn server_config() -> Config {
+    let mut c = fixture();
+    c.platform = "discord".into();
+    c.allowed_users = vec!["dan".into(), "ferit".into()];
+    c.discord_server = Some(config::DiscordServer {
+        guild_id: "111".into(),
+        channels: vec!["456".into()],
+    });
+    c
+}
+#[tokio::test]
+async fn server_thread_shares_context_across_people_but_not_other_threads_or_dms() {
+    let g = Gateway::new(
+        server_config(),
+        FakeRuntime::default(),
+        FakeMessenger::default(),
+    );
+    g.handle(server_message("dan", "789", "1", "Remember this result"))
+        .await;
+    g.handle(server_message("ferit", "789", "2", "Explain Dan's result"))
+        .await;
+    g.handle(server_message("ferit", "790", "3", "Other topic"))
+        .await;
+    let replies = g.messenger.replies.lock().unwrap().clone();
+    assert!(replies[0]
+        .1
+        .text
+        .contains("Answer to guild-111-channel-789:"));
+    assert!(replies[1]
+        .1
+        .text
+        .contains("Answer to guild-111-channel-789:"));
+    assert!(replies[1].1.text.contains("Discord sender ID: ferit"));
+    assert!(replies[2]
+        .1
+        .text
+        .contains("Answer to guild-111-channel-790:"));
+    assert_eq!(replies[1].0.conversation_id, "789");
+    for mut m in [
+        server_message("outsider", "789", "4", "hello"),
+        server_message("dan", "789", "5", "hello"),
+    ] {
+        if m.sender_id == "dan" {
+            m.server_context.as_mut().unwrap().guild_id = "222".into();
+        }
+        g.handle(m).await;
+    }
+    assert_eq!(g.messenger.replies.lock().unwrap().len(), 3);
+}
+#[tokio::test]
+async fn shared_thread_only_requester_can_approve_and_any_new_turn_invalidates_old_review() {
+    let g = Gateway::new(
+        server_config(),
+        ReviewRuntime {
+            starts: Mutex::new(vec![]),
+        },
+        FakeMessenger::default(),
+    );
+    let m = server_message("dan", "789", "1", "Propose a workflow");
+    g.handle(m).await;
+    let token = g
+        .state
+        .lock()
+        .unwrap()
+        .pending
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let mut action = server_message("ferit", "789", "2", &format!("approve {token}"));
+    action.plain_text = false;
+    g.handle(action).await;
+    assert!(g.runtime.starts.lock().unwrap().is_empty());
+    assert!(g.state.lock().unwrap().pending.contains_key(&token));
+    g.handle(server_message("ferit", "789", "3", "Change the input"))
+        .await;
+    assert!(!g.state.lock().unwrap().pending.contains_key(&token));
+    let mut old = server_message("dan", "789", "4", &format!("approve {token}"));
+    old.plain_text = false;
+    g.handle(old).await;
+    assert!(g.runtime.starts.lock().unwrap().is_empty());
+    let fresh = g
+        .state
+        .lock()
+        .unwrap()
+        .pending
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let mut approved = server_message("ferit", "789", "5", &format!("approve {fresh}"));
+    approved.plain_text = false;
+    g.handle(approved).await;
+    assert_eq!(g.runtime.starts.lock().unwrap().len(), 1);
 }
 
 fn slack_message(sender: &str, thread: &str, event: &str, text: &str, plain: bool) -> Incoming {
