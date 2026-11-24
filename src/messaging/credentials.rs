@@ -91,19 +91,6 @@ pub fn logout() -> Result<()> {
     Ok(())
 }
 
-pub(super) fn ensure(platform: &str) -> Result<()> {
-    ensure!(platform == "slack", "Unsupported messaging platform");
-    use std::io::IsTerminal;
-    match load() {
-        Ok(_) => Ok(()),
-        Err(error) if !std::io::stdin().is_terminal() => Err(error),
-        Err(_) => {
-            login()?;
-            load().map(|_| ())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +225,119 @@ mod tests {
         remove(&path).unwrap();
         assert!(!path.exists());
         assert!(other.exists());
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct DiscordCredentials {
+    token: String,
+}
+fn discord_path() -> Result<PathBuf> {
+    Ok(dirs::config_dir()
+        .context("Cannot locate user configuration directory")?
+        .join("omar/credentials/discord.json"))
+}
+fn validate_discord(token: &str) -> Result<()> {
+    ensure!(
+        !token.is_empty()
+            && token.len() <= 4096
+            && token.is_ascii()
+            && !token
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
+        "Invalid Discord token format; run `omar messaging discord login`"
+    );
+    Ok(())
+}
+pub(super) fn discord_load() -> Result<String> {
+    let token = match std::env::var("DISCORD_BOT_TOKEN") {
+        Ok(token) => token,
+        Err(std::env::VarError::NotPresent) => {
+            let saved: DiscordCredentials = super::credential_store::read(&discord_path()?)
+                .context(
+                "Configure Discord with `omar messaging discord login`, or set DISCORD_BOT_TOKEN",
+            )?;
+            saved.token
+        }
+        Err(_) => anyhow::bail!("Invalid DISCORD_BOT_TOKEN"),
+    };
+    validate_discord(&token)?;
+    Ok(token)
+}
+pub(super) fn discord_login() -> Result<()> {
+    eprintln!("Save Discord bot token locally (hidden input; protected by Unix file permissions).");
+    let token = rpassword::prompt_password("Discord bot token: ")?;
+    validate_discord(&token)?;
+    super::credential_store::save(&discord_path()?, &DiscordCredentials { token })?;
+    println!("Saved Discord credentials. Discord validates the token at connector startup. DISCORD_BOT_TOKEN overrides the saved token.");
+    Ok(())
+}
+pub(super) fn discord_logout() -> Result<()> {
+    super::credential_store::remove(&discord_path()?)?;
+    println!("Removed saved Discord credentials. Environment tokens and running connectors are unchanged; the token is not revoked.");
+    Ok(())
+}
+
+#[cfg(test)]
+mod discord_tests {
+    use super::*;
+    #[test]
+    fn discord_store_is_private_and_does_not_overwrite_slack() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let slack = dir.path().join("credentials/slack.json");
+        let discord = dir.path().join("credentials/discord.json");
+        save(
+            &slack,
+            &Credentials {
+                bot_token: "xoxb-fixture".into(),
+                app_token: "xapp-fixture".into(),
+            },
+        )
+        .unwrap();
+        let original = std::fs::read(&slack).unwrap();
+        super::super::credential_store::save(
+            &discord,
+            &DiscordCredentials {
+                token: "fixture-discord-token".into(),
+            },
+        )
+        .unwrap();
+        let saved: DiscordCredentials = super::super::credential_store::read(&discord).unwrap();
+        assert_eq!(saved.token, "fixture-discord-token");
+        assert_eq!(
+            std::fs::metadata(&discord).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        super::super::credential_store::remove(&discord).unwrap();
+        assert_eq!(std::fs::read(&slack).unwrap(), original);
+        for token in ["", "private token", "private\nsecret"] {
+            let error = validate_discord(token).unwrap_err();
+            if !token.is_empty() {
+                assert!(!error.to_string().contains(token));
+            }
+        }
+    }
+}
+
+pub(super) fn ensure(platform: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    let result = if platform == "slack" {
+        load().map(|_| ())
+    } else {
+        discord_load().map(|_| ())
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if !std::io::stdin().is_terminal() => Err(error),
+        Err(_) => {
+            if platform == "slack" {
+                login()?;
+                load().map(|_| ())
+            } else {
+                discord_login()?;
+                discord_load().map(|_| ())
+            }
+        }
     }
 }

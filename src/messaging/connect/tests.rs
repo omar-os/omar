@@ -161,3 +161,76 @@ fn connector_exit_unlocks_even_when_a_child_inherits_the_descriptor() {
     }
     assert!(replacement.is_ok());
 }
+
+fn discord_setup_value() -> Value {
+    json!({"platform":"discord","accountId":"999","allowedUsers":["123"],
+        "runtimeUrl":RUNTIME_URL,"autoChat":true})
+}
+#[test]
+fn discord_upgrade_prompts_for_server_and_additional_users_once_then_saves() {
+    let mut value = discord_setup_value();
+    let mut answers = ["yes", "111", "456, 457,456", "124,123"].into_iter();
+    configure_discord(&mut value, |_| {
+        Ok(answers.next().expect("unexpected prompt").into())
+    })
+    .unwrap();
+    assert!(answers.next().is_none());
+    assert_eq!(
+        value["discordServer"],
+        json!({"guildId":"111","channels":["456","457"]})
+    );
+    assert_eq!(value["allowedUsers"], json!(["123", "124"]));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("discord.json");
+    credential_store::save(&path, &value).unwrap();
+    let mut saved: Value = credential_store::read(&path).unwrap();
+    configure_discord(&mut saved, |_| {
+        panic!("saved setup must reconnect without prompts")
+    })
+    .unwrap();
+    assert_eq!(saved, value);
+    assert!(Config::load(&path).unwrap().discord_server.is_some());
+}
+#[test]
+fn discord_dm_only_choice_is_remembered_and_slack_never_prompts() {
+    let mut value = discord_setup_value();
+    configure_discord(&mut value, |_| Ok("no".into())).unwrap();
+    assert!(value["discordServer"].is_null());
+    let config: Config = serde_json::from_value(value).unwrap();
+    let mut saved = serde_json::to_value(config).unwrap();
+    configure_discord(&mut saved, |_| panic!("DM-only choice was already saved")).unwrap();
+    let mut slack = json!({"platform":"slack"});
+    configure_discord(&mut slack, |_| panic!("Slack setup must not change")).unwrap();
+}
+#[test]
+fn discord_partial_server_setup_only_asks_for_missing_values_and_preserves_ids() {
+    let mut value = discord_setup_value();
+    value["discordServer"] = json!({"guildId":"111"});
+    let mut answers = ["456", ""].into_iter();
+    configure_discord(&mut value, |label| {
+        assert!(!label.contains("server ID"));
+        Ok(answers.next().unwrap().into())
+    })
+    .unwrap();
+    assert_eq!(value["discordServer"]["guildId"], "111");
+    assert_eq!(value["allowedUsers"], json!(["123"]));
+    assert!(answers.next().is_none());
+}
+#[test]
+fn discord_cancelled_or_invalid_setup_never_changes_saved_candidate() {
+    for inputs in [
+        vec!["yes", "invalid"],
+        vec!["yes", "111", ""],
+        vec!["yes", "111", "456", "invalid"],
+    ] {
+        let mut value = discord_setup_value();
+        let before = value.clone();
+        let mut answers = inputs.into_iter();
+        assert!(configure_discord(&mut value, |_| Ok(answers.next().unwrap().into())).is_err());
+        assert_eq!(value, before);
+    }
+    let mut value = discord_setup_value();
+    let before = value.clone();
+    assert!(configure_discord(&mut value, |_| anyhow::bail!("cancelled")).is_err());
+    assert_eq!(value, before);
+}

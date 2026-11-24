@@ -7,6 +7,10 @@ use std::path::Path;
 #[serde(rename_all = "camelCase")]
 pub struct Config {
     pub runtime_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_server: Option<DiscordServer>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub discord_server_setup_complete: bool,
     #[serde(default)]
     pub auto_chat: bool,
     #[serde(default = "slack")]
@@ -17,6 +21,16 @@ pub struct Config {
     #[serde(alias = "allowedChannels")]
     #[serde(default)]
     pub allowed_conversations: Vec<String>,
+}
+/// Opt-in server access. Channel IDs name text channels, not categories.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordServer {
+    pub guild_id: String,
+    pub channels: Vec<String>,
+}
+fn is_false(value: &bool) -> bool {
+    !value
 }
 fn slack() -> String {
     "slack".into()
@@ -64,6 +78,17 @@ impl Config {
             else { !self.allowed_conversations.is_empty() && self.allowed_conversations.iter().all(|id| !id.is_empty()) },
             "Discord DM channels are resolved from allowedUsers; Slack channel IDs must be nonempty when supplied; other platforms require allowedConversations"
         );
+        if let Some(server) = &self.discord_server {
+            let numeric =
+                |v: &str| !v.is_empty() && v.len() <= 20 && v.bytes().all(|b| b.is_ascii_digit());
+            ensure!(
+                self.platform == "discord"
+                    && numeric(&server.guild_id)
+                    && !server.channels.is_empty()
+                    && server.channels.iter().all(|v| numeric(v)),
+                "discordServer requires a numeric guildId and approved text channel IDs"
+            );
+        }
         self.runtime_url = url.as_str().trim_end_matches('/').to_string();
         Ok(())
     }

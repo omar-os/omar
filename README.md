@@ -168,10 +168,11 @@ for more commands and `omar <command> --help` for options.
 
 ## Messaging
 
-Connect OMAR to Slack from Linux or WSL:
+Connect OMAR to Slack or Discord from Linux or WSL:
 
 ```sh
 omar messaging slack connect
+omar messaging discord connect
 ```
 
 Prerequisites: `omar` and `omarc`, tmux, a signed-in agent backend, and a system font for graph previews (for example, `fonts-dejavu-core` on Ubuntu). For source builds, build the compiler with `(cd lang && lake build Omar.Verify omarc)` before building OMAR.
@@ -180,15 +181,17 @@ On first use, the command asks for provider credentials and approved user IDs, s
 
 For Slack, create your app using `integrations/slack/app-manifest.json`, enable Socket Mode, install it, and create an app token with `connections:write`. Use `/omar help`, `/omar list`, `/omar run NAME`, and `/omar new-chat` in a DM. Regular messages go to the assistant. In approved Slack channels, mention `@Omar` for questions or controls; replies stay in the originating thread. Slack slash commands cannot be invoked inside threads, so use mentions there.
 
-The connector lists workflows approved and saved in OMAR. Review a proposed workflow's graph and source files, then choose Run workflow, Revise, or Cancel. Only the requester can approve that version.
+Discord requires a bot token. Use `/help`, `/list`, `/run workflow:NAME`, and `/new-chat` in a DM. Optional server setup asks for approved server/channel IDs; mention Omar to start a thread or ask a follow-up. Only approved users can interact with OMAR. Regular server messages, including follow-ups, require a bot mention; ordinary channel messages are ignored.
+
+Both connectors list workflows approved and saved in OMAR. Review a proposed workflow's graph and source files, then choose Run workflow, Revise, or Cancel. Only the requester can approve that version.
 
 Treat approved users as trusted operators: they can direct agents using the host's files, tools and configured harness credentials. Separate chats do not isolate files or persistent agent memory. Never distribute a shared bot token to untrusted users; it permits bot impersonation and access to the bot's permitted traffic. Saved tokens use private Unix file permissions, not encryption.
 
-Use `omar messaging slack logout` to remove saved credentials. Logout does not revoke provider tokens, clear environment variables, or stop a running connector.
+Use `omar messaging slack logout` or `omar messaging discord logout` to remove saved credentials. Logout does not revoke provider tokens, clear environment variables, or stop a running connector.
 
-Queues, event deduplication and busy state are in memory. Restarting a connector during a run can lose result delivery; there is no durable outbox. Starting a new chat resets the conversation, not harness memory. Each connector process has its own queue.
+Queues, event deduplication and busy state are in memory. Restarting a connector during a run can lose result delivery; there is no durable outbox. Starting a new chat resets the conversation, not harness memory. Slack and Discord have separate connector queues.
 
-Run `omar messaging slack --help` for provider requirements. User documentation lives on [omar.rs](https://omar.rs/docs/).
+Run `omar messaging slack --help` or `omar messaging discord --help` for provider requirements. User documentation lives on [omar.rs](https://omar.rs/docs/).
 
 ## Supported Agent Backends
 

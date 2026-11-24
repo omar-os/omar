@@ -2,6 +2,7 @@ pub mod config;
 mod connect;
 mod credential_store;
 mod credentials;
+pub mod discord;
 mod graph_preview;
 mod proposal;
 pub mod runtime;
@@ -68,6 +69,8 @@ pub struct Destination {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Incoming {
+    #[serde(default)]
+    pub server_context: Option<ServerContext>,
     pub platform: String,
     pub account_id: String,
     pub sender_id: String,
@@ -76,6 +79,13 @@ pub struct Incoming {
     #[serde(default)]
     pub plain_text: bool,
     pub destination: Destination,
+}
+/// Filled only after the Discord adapter verifies channel metadata with Discord.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerContext {
+    pub guild_id: String,
+    pub parent_id: String,
 }
 impl Incoming {
     fn assistant_scope(&self) -> String {
@@ -90,7 +100,13 @@ impl Incoming {
                     .replace('.', "-")
             );
         }
-        self.sender_id.clone()
+        match &self.server_context {
+            Some(server) => format!(
+                "guild-{}-channel-{}",
+                server.guild_id, self.destination.conversation_id
+            ),
+            None => self.sender_id.clone(),
+        }
     }
 }
 #[derive(Clone, Debug, Serialize)]
@@ -199,7 +215,16 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
             || !c.allowed_users.contains(&message.sender_id)
             || d.platform != c.platform
             || d.account_id != c.account_id
-            || !c.allowed_conversations.contains(&d.conversation_id))
+            || match &message.server_context {
+                Some(context) => {
+                    c.platform != "discord"
+                        || !c.discord_server.as_ref().is_some_and(|server| {
+                            server.guild_id == context.guild_id
+                                && server.channels.contains(&context.parent_id)
+                        })
+                }
+                None => !c.allowed_conversations.contains(&d.conversation_id),
+            })
     }
     pub async fn handle_queued(&self, message: Incoming) {
         if !self.authorized(&message) {
@@ -338,7 +363,7 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
                 .pending
                 .retain(|_, p| p.scope != message.assistant_scope());
             let scope = message.assistant_scope();
-            let text = if c.platform == "slack" {
+            let text = if message.server_context.is_some() || c.platform == "slack" {
                 format!(
                     "{} sender ID: {}\n{}",
                     if c.platform == "discord" {
@@ -363,7 +388,7 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
             return;
         }
         let selected = selected.expect("run admitted only for a registered workflow");
-        if c.platform == "slack" {
+        if message.server_context.is_some() || c.platform == "slack" {
             match self.runtime.prepare_request(&message.assistant_scope(), selected.request).await {
                 Ok(request) => self.execute(d, config::Selected { request: &request, ..selected }).await,
                 Err(_) => self.reply(d, "Could not prepare this thread's OMAR conversation. No workflow was started.".into(), None).await,
@@ -468,6 +493,22 @@ pub async fn run(command: &Command) -> Result<()> {
             action: Some(CredentialAction::Connect),
             ..
         } => connect::run("slack").await,
+        Command::Discord {
+            action: Some(CredentialAction::Connect),
+            ..
+        } => connect::run("discord").await,
+        Command::Discord {
+            action: Some(CredentialAction::Login),
+            ..
+        } => credentials::discord_login(),
+        Command::Discord {
+            action: Some(CredentialAction::Logout),
+            ..
+        } => credentials::discord_logout(),
+        Command::Discord {
+            config: Some(path),
+            action: None,
+        } => discord::run(Config::load(path)?).await,
         Command::Slack {
             action: Some(CredentialAction::Login),
             ..
@@ -486,6 +527,22 @@ pub async fn run(command: &Command) -> Result<()> {
 
 #[derive(clap::Subcommand)]
 pub enum Command {
+    /// Connect approved Discord DMs and optional server channels; manage credentials
+    ///
+    /// Server access is opt-in in the JSON config: discordServer contains guildId
+    /// and channels (approved text channel IDs). allowedUsers applies to DMs and
+    /// server messages. Mention the bot to start a thread or ask a follow-up;
+    /// /list, /run, /help and /new-chat also work in servers. The bot needs View
+    /// Channel, Send Messages, Create Public Threads, Send Messages in Threads,
+    /// Embed Links and Attach Files. Only the requester can approve a proposal.
+    /// All server threads share this runtime's workspace and agent credentials.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Discord {
+        #[arg(required = true)]
+        config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: Option<CredentialAction>,
+    },
     /// Connect Slack DMs and approved channel threads; manage credentials
     ///
     /// Install integrations/slack/app-manifest.json in your Slack app, enable

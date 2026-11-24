@@ -102,10 +102,107 @@ fn import(path: &Path, platform: &str) -> Result<Value> {
     Ok(value)
 }
 
+// Keep the wizard independent of stdin so upgrades and partial setups can be tested.
+// Only commit the candidate after every answer validates; cancellation preserves disk state.
+fn configure_discord(value: &mut Value, mut ask: impl FnMut(&str) -> Result<String>) -> Result<()> {
+    if value["platform"] != "discord" {
+        return Ok(());
+    }
+    let mut candidate = value.clone();
+    let numeric = |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit());
+    let server = &candidate["discordServer"];
+    ensure!(
+        server.is_null() || server.is_object(),
+        "Invalid Discord server configuration; setup was not saved"
+    );
+    let complete = server["guildId"].as_str().is_some_and(numeric)
+        && server["channels"].as_array().is_some_and(|ids| {
+            !ids.is_empty() && ids.iter().all(|v| v.as_str().is_some_and(numeric))
+        });
+    if complete || (server.is_null() && candidate["discordServerSetupComplete"] == true) {
+        return Ok(());
+    }
+    if server.is_null() {
+        let answer = ask("Enable Discord server channels as well as DMs? [y/N]")?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "n" | "no" => {
+                candidate["discordServerSetupComplete"] = json!(true);
+                *value = candidate;
+                return Ok(());
+            }
+            "y" | "yes" => {}
+            _ => anyhow::bail!("Answer yes or no; setup was not saved"),
+        }
+    }
+    if !candidate["discordServer"]["guildId"]
+        .as_str()
+        .is_some_and(numeric)
+    {
+        let guild = ask("Discord server ID (Developer Mode: right-click server, Copy Server ID)")?;
+        ensure!(
+            numeric(guild.trim()),
+            "Discord server ID must be numeric; setup was not saved"
+        );
+        candidate["discordServer"]["guildId"] = json!(guild.trim());
+    }
+    let parse_ids = |input: &str| -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+        for id in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            ensure!(
+                numeric(id),
+                "Discord IDs must be numeric; setup was not saved"
+            );
+            if !ids.iter().any(|v| v == id) {
+                ids.push(id.to_owned());
+            }
+        }
+        Ok(ids)
+    };
+    if !candidate["discordServer"]["channels"]
+        .as_array()
+        .is_some_and(|ids| !ids.is_empty() && ids.iter().all(|v| v.as_str().is_some_and(numeric)))
+    {
+        let channels = parse_ids(&ask(
+            "Approved text channel IDs (comma-separated; right-click channel, Copy Channel ID)",
+        )?)?;
+        ensure!(
+            !channels.is_empty(),
+            "At least one approved channel ID is required; setup was not saved"
+        );
+        candidate["discordServer"]["channels"] = json!(channels);
+    }
+    let mut users = candidate["allowedUsers"]
+        .as_array()
+        .context("Missing approved users")?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .context("Invalid approved user ID")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let extra = parse_ids(&ask(&format!(
+        "Additional approved user IDs (comma-separated; Enter keeps {})",
+        users.join(", ")
+    ))?)?;
+    for user in extra {
+        if !users.contains(&user) {
+            users.push(user);
+        }
+    }
+    candidate["allowedUsers"] = json!(users);
+    candidate["discordServerSetupComplete"] = json!(true);
+    let mut config: Config = serde_json::from_value(candidate.clone())?;
+    config.validate()?;
+    *value = candidate;
+    Ok(())
+}
+
 async fn setup(platform: &str, path: &Path) -> Result<Config> {
     if path.exists() {
         // Validate protection before loading any saved setup.
-        let value: Value = credential_store::read(path)?;
+        let mut value: Value = credential_store::read(path)?;
+        configure_discord(&mut value, prompt)?;
         let mut config: Config =
             serde_json::from_value(value).context("Invalid messaging configuration")?;
         config.validate()?;
@@ -117,7 +214,7 @@ async fn setup(platform: &str, path: &Path) -> Result<Config> {
         return Ok(config);
     }
     let cwd = std::env::current_dir()?;
-    let value = if let Some(existing) = legacy(&cwd, platform) {
+    let mut value = if let Some(existing) = legacy(&cwd, platform) {
         eprintln!(
             "Reusing existing {platform} settings from {}.",
             existing.display()
@@ -126,6 +223,7 @@ async fn setup(platform: &str, path: &Path) -> Result<Config> {
     } else {
         let account = match platform {
             "slack" => super::slack::account_id().await?,
+            "discord" => super::discord::account_id().await?,
             _ => anyhow::bail!("Unsupported messaging platform"),
         };
         let users = ids("Approved user IDs (comma-separated)")?;
@@ -142,6 +240,7 @@ async fn setup(platform: &str, path: &Path) -> Result<Config> {
         json!({"platform":platform,"accountId":account,"allowedUsers":users,
             "allowedConversations":channels,"runtimeUrl":RUNTIME_URL,"autoChat":true})
     };
+    configure_discord(&mut value, prompt)?;
     // Validate before saving a setup that subsequent launches would trust.
     let mut config: Config =
         serde_json::from_value(value).context("Invalid messaging configuration")?;
@@ -285,7 +384,10 @@ fn connector_lock(folder: &Path, platform: &str) -> Result<ConnectorLock> {
 }
 
 pub async fn run(platform: &str) -> Result<()> {
-    ensure!(platform == "slack", "Unsupported messaging platform");
+    ensure!(
+        matches!(platform, "slack" | "discord"),
+        "Unsupported messaging platform"
+    );
     let folder = directory()?;
     let _connection = connector_lock(&folder, platform)?;
     credentials::ensure(platform)?;
@@ -294,6 +396,7 @@ pub async fn run(platform: &str) -> Result<()> {
     ensure_runtime().await?;
     match platform {
         "slack" => super::slack::run(config).await,
+        "discord" => super::discord::run(config).await,
         _ => unreachable!(),
     }
 }
