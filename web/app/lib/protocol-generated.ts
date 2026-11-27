@@ -28,8 +28,12 @@ export type EdgeKind = (typeof EDGE_KINDS)[number];
 export const PORT_KINDS = ["input", "output", "action"] as const;
 export type PortKind = (typeof PORT_KINDS)[number];
 
+/** What an agent's `per` lifetime counts. */
+export const LIFETIME_UNITS = ["task", "tag"] as const;
+export type LifetimeUnit = (typeof LIFETIME_UNITS)[number];
+
 /** What happened, as the event stream names it. */
-export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started", "sandbox_started"] as const;
+export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started", "agent_attempt", "sandbox_started"] as const;
 export type DiagramEventKind = (typeof DIAGRAM_EVENT_KINDS)[number];
 
 /** Who spoke. */
@@ -57,11 +61,25 @@ parent: string,
  */
 sandbox?: string, };
 
+export type Lifetime = { unit: LifetimeUnit, count: number, };
+
 export type DiagramAgent = { id: string, name: string, backend: string,
 /**
  * The container it is drawn inside.
  */
-instance: string, };
+instance: string,
+/**
+ * How long its conversation lives, when it says: `per tag`. Absent for
+ * the whole run.
+ */
+lifetime: Lifetime | null,
+/**
+ * A `per` agent's conversation windows, oldest first, each as of its
+ * latest change: `invocations` (each with its `reaction`), `attempt_id`,
+ * `native_session_id`, `outcome`, `cleanup_status` and the rest of the
+ * record the run keeps in `attempts.jsonl`.
+ */
+attempts: Record<string, unknown>[], };
 
 export type DiagramPort = { id: string, name: string, kind: PortKind, type: string, delay: number | null, value: unknown | null, last_tag: DiagramTag | null, instance: string, };
 

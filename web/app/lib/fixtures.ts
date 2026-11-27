@@ -23,12 +23,16 @@ export const reviewWorkflow: DiagramSnapshot = {
       name: "flow.planner",
       backend: "Codex",
       instance: "flow",
+      lifetime: null,
+      attempts: [],
     },
     {
       id: "agent::flow.reviewer",
       name: "flow.reviewer",
       backend: "Codex",
       instance: "flow",
+      lifetime: null,
+      attempts: [],
     },
   ],
   ports: [

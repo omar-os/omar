@@ -38,7 +38,9 @@ for url in ["https://api.github.com/gists", "https://pypi.org/simple/", "https:/
         for key in ("TMUX", "TMUX_PANE", "OMAR_TMUX_SERVER", "OMAR_SESSION_ID", "OMAR_STATE_DIR", "OMAR_HOME", "OMAR_EA_ID"):
             env.pop(key, None)
         compiler = shims / "omarc"
-        compiler.write_text("#!/usr/bin/env python3\nimport shutil,sys\nshutil.copyfile("+repr(str(root / "program.json"))+", sys.argv[-1])\n")
+        # omarc [options] <input> <output>: copy the bytecode named after the input.
+        compiler.write_text("#!/usr/bin/env python3\nimport shutil,sys\nfrom pathlib import Path\n" +
+            "shutil.copyfile(Path("+repr(str(root))+")/(Path(sys.argv[-2]).stem+'.json'), sys.argv[-1])\n")
         compiler.chmod(0o700)
         # The runtime's state directory, under the dedicated HOME.
         state_root = home / ".omar" / "sessions" / "real-sandboxes"
@@ -75,11 +77,21 @@ out = Some("isolated".to_string());
         bytecode.write_text(json.dumps(dict(version=1, team="IsolationSmoke", instructions=instructions)))
         program = source / "program.omar"
         program.write_text("// runtime isolation fixture\n")
+        # A `per` agent's windows are run by the host: refused in a sandbox.
+        scoped = [{"op": "begin_plan", "team": "SandboxScoped"},
+                  {"op": "declare_instance", "name": "s", "team": "Writer", "parent": ""},
+                  {"op": "spawn_agent", "instance": "s", "name": "s.agent", "backend": "stub",
+                   "lifetime": {"unit": "tag", "count": 1}},
+                  {"op": "commit_plan"}]
+        (root / "scoped.json").write_text(json.dumps(dict(version=2, team="SandboxScoped", instructions=scoped)))
+        (source / "scoped.omar").write_text("// runtime isolation fixture\n")
+        calls = root / "sbx-calls"
         # Keep sbx's real HOME for its Docker login and daemon. OMAR uses a
         # dedicated HOME; this adapter restores only sbx's host environment.
         adapter = root / "sbx"
         adapter.write_text("#!/usr/bin/env python3\n" +
             "import json,os,sys\nfrom pathlib import Path\n" +
+            "with open("+repr(str(calls))+", 'a') as log: log.write(json.dumps(sys.argv[1:])+'\\n')\n" +
             "state_root=Path(os.environ['OMAR_STATE_DIR'])\n" +
             "if len(sys.argv)>1 and sys.argv[1]=='exec' and '--workdir' in sys.argv:\n" +
             "    record=json.loads(next(state_root.rglob('deployment.json')).read_text())\n" +
@@ -112,7 +124,13 @@ out = Some("isolated".to_string());
                 assert (tree/"boundary-probe").read_text() == "untouched"
                 assert (tree/"artifact").read_text() == "inside sandbox"
                 assert len(list((state_root/"workspace-history"/ws/"snapshots").glob("*.json"))) == 2
-            print("PASS: real Docker Sandbox execution, parent/child separation, denied host/history access, native backend, snapshots, egress")
+            creates = lambda: [c for c in map(json.loads, calls.read_text().splitlines()) if c[:1] == ["create"]]
+            before = len(creates())
+            refused = subprocess.run([str(BIN), "-s", runtime["name"], "run", str(source / "scoped.omar"), "--sandbox-template", template,
+                "--fast", "--fg"], cwd=source, env=env, text=True, capture_output=True, timeout=120)
+            assert refused.returncode != 0 and "`per` lifetime, which does not run in a sandbox yet" in refused.stdout + refused.stderr, refused
+            assert len(creates()) == before, creates()
+            print("PASS: real Docker Sandbox execution, parent/child separation, denied host/history access, native backend, snapshots, egress; `per` agent refused before any VM")
         finally:
             subprocess.run([str(BIN), "down", "-s", runtime["name"], "--force", "--timeout", "5"], env=env, capture_output=True)
             subprocess.run(["tmux", "-L", runtime["tmux_server"], "kill-server"], capture_output=True)

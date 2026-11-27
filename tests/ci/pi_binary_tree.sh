@@ -312,8 +312,9 @@ def check_leaves():
         client.connect(stamp.split("=pi:", 1)[1])
         client.sendall(b'{"session":true}\n')
         native = json.loads(client.makefile().readline())
-    # Workers run with --no-session, so Pi keeps no session file to list or resume.
-    assert "session" not in native, native
+    # Workers run with --no-session, so Pi keeps no session file to list or
+    # resume; the conversation is known only by its in-memory id.
+    assert native.get("session") is None and native.get("id"), native
     print("PASS: idle Pi receives an OMAR event without submitting its draft; worker session is not persisted", flush=True)
 
 
