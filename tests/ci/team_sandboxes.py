@@ -195,6 +195,14 @@ total = Some(self.count);
                                  ("claude", "SandboxClaude", claude), ("codex", "SandboxCodex", codex)]:
             (root / (name + ".json")).write_text(json.dumps(dict(version=1, team=team, instructions=plan)))
             (source / (name + ".omar")).write_text("// Compiler-fixture input\n")
+        # A `per` agent's windows are run by the host: refused in a sandbox.
+        scoped = [{"op": "begin_plan", "team": "SandboxScoped"},
+                  {"op": "declare_instance", "name": "s", "team": "Writer", "parent": ""},
+                  {"op": "spawn_agent", "instance": "s", "name": "s.agent", "backend": "stub",
+                   "lifetime": {"unit": "tag", "count": 1}},
+                  {"op": "commit_plan"}]
+        (root / "scoped.json").write_text(json.dumps(dict(version=2, team="SandboxScoped", instructions=scoped)))
+        (source / "scoped.omar").write_text("// Compiler-fixture input\n")
         program, ticker_program = source / "program.omar", source / "ticker.omar"
         compiler = shims / "omarc"
         # omarc [options] <input> <output>: copy the bytecode named after the input.
@@ -303,6 +311,11 @@ total = Some(self.count);
             failed_setup = record()
             assert failed_setup["error"] == "setup for instance 'b' exited 7: echo sandbox-setup-tail >&2; exit 7\nsandbox-setup-tail", failed_setup
             assert failed_setup["state"] == "FAILED" and failed_setup["sessions_cleaned"], failed_setup
+            before = len(entries())
+            refused = omar("run", str(source/"scoped.omar"), "--sandbox-template", TEMPLATE, "--fast", "--fg")
+            said = refused.stdout + refused.stderr
+            assert refused.returncode != 0 and "`per` lifetime, which does not run in a sandbox yet" in said, refused
+            assert not [e for e in entries(before) if e[0] == "create"], entries(before)
             # Cleanup failure blocks final and manual snapshots.
             fault(FAIL_STOP=1)
             omar(*args, "--replace")

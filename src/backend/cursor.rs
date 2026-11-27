@@ -76,6 +76,13 @@ impl Backend for Cursor {
     fn readiness_markers(&self) -> &'static [&'static str] {
         &["Cursor Agent"]
     }
+    // No `fresh_conversation`: cursor-agent saves every chat under
+    // `~/.cursor/projects/<workspace>/agent-transcripts/` and names that
+    // folder in each new chat's context, where the agent greps it and finds
+    // what an earlier chat said. The only switch,
+    // `--exclude-workspace-context`, is print-mode only and rejected for some
+    // accounts. A new conversation id is not a new context, so omarc refuses
+    // `Cursor per tag`.
     /// Cursor takes no message from outside its protocol, so it runs under
     /// OMAR's protocol runner, which owns a durable inbox for it.
     fn launch_command(&self, launch: &Launch<'_>) -> String {

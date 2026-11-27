@@ -13,6 +13,7 @@ use crate::manager::{
 };
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub struct Codex;
 
@@ -104,6 +105,38 @@ impl Backend for Codex {
         let socket = from_stamp(target.stamp?)?;
         CodexSession::open(&socket).ok()?.only_thread().ok()
     }
+    /// Codex mints a thread's id and takes none, so the id is reported, not
+    /// chosen. An attempt's launch starts an app-server of its own, never
+    /// resumes or uses the exec runner, and its TUI opens one thread as it
+    /// attaches: `conversation_id` takes it only while it is the only one.
+    fn fresh_conversation(&self) -> bool {
+        true
+    }
+    fn freshness(&self) -> super::Freshness {
+        super::Freshness::Reported
+    }
+    /// Asked of the live app-server: the thread is still its only one, was
+    /// not forked, is no subagent's, holds no user message, and was created
+    /// once the attempt began.
+    fn prove_fresh(
+        &self,
+        target: &super::Target<'_>,
+        id: &str,
+        since: std::time::SystemTime,
+    ) -> Result<()> {
+        let socket = target
+            .stamp
+            .and_then(from_stamp)
+            .context("no Codex delivery channel")?;
+        let mut session = CodexSession::open(&socket)?;
+        let only = session.only_thread()?;
+        anyhow::ensure!(only == id, "the app-server now shows thread {only}");
+        let read = session.call(
+            "thread/read",
+            serde_json::json!({ "threadId": id, "includeTurns": false }),
+        )?;
+        new_thread(&read["thread"], id, since)
+    }
     fn forget(&self, target: &super::Target<'_>) {
         let Some(socket) = target.stamp.and_then(from_stamp) else {
             return;
@@ -150,6 +183,13 @@ impl Backend for Codex {
                 return command;
             }
         }
+        // The exec runner resumes one conversation turn after turn, which is
+        // what a per-lifetime attempt must never do.
+        if is_attempt(mcp_context) {
+            return failed_launch(
+                "an agent that resets its conversation (per lifetime) needs an app-server of its own, which could not be set up",
+            );
+        }
         let rendered = materialize_prompt_file(launch.prompt_file, launch.substitutions);
         let protocol = (|| -> Result<String> {
             let (mut command, initial_session) = codex_exec_command(launch.base_command)?;
@@ -159,12 +199,7 @@ impl Backend for Codex {
             command.push_str(&overrides);
             managed_agent_command("codex", &command, &rendered, mcp_context, initial_session)
         })();
-        protocol.unwrap_or_else(|error| {
-            format!(
-                "printf '%s\n' {} >&2; exit 1",
-                shell_single_quote(&format!("OMAR Codex protocol launch failed: {error:#}"))
-            )
-        })
+        protocol.unwrap_or_else(|error| failed_launch(&format!("{error:#}")))
     }
 
     /// Detached panes have no client to answer OSC 10/11 palette queries.
@@ -349,6 +384,63 @@ impl Drop for TrustedProjects {
             );
         }
     }
+}
+
+/// A pane command that says why the launch failed, and exits.
+fn failed_launch(why: &str) -> String {
+    format!(
+        "printf '%s\n' {} >&2; exit 1",
+        shell_single_quote(&format!("OMAR Codex protocol launch failed: {why}"))
+    )
+}
+
+/// Whether this launch is a per-lifetime attempt's.
+fn is_attempt(context: &McpLaunchContext) -> bool {
+    context
+        .topology
+        .as_ref()
+        .is_some_and(|topology| topology.attempt.is_some())
+}
+
+/// Codex memories carry notes from one conversation into the next. Off for
+/// an attempt's app-server, whatever the operator's config says. Codex 0.154
+/// knows all three (tests/ci/codex_event_wake.py, under `--strict-config`).
+const NO_MEMORIES: &str =
+    " -c features.memories=false -c memories.use_memories=false -c memories.generate_memories=false";
+
+/// Whether `thread`, as `thread/read` gives it, is the new thread `id` that an
+/// attempt begun at `since` opened, and nothing older or derived.
+fn new_thread(thread: &serde_json::Value, id: &str, since: std::time::SystemTime) -> Result<()> {
+    anyhow::ensure!(
+        thread["id"] == id,
+        "thread/read answered for {} instead",
+        thread["id"]
+    );
+    // Optional in the schema: absent is not forked, and no subagent's.
+    for (field, what) in [
+        ("forkedFromId", "forked from"),
+        ("parentThreadId", "a subagent of"),
+    ] {
+        if let Some(other) = thread.get(field).filter(|value| !value.is_null()) {
+            anyhow::bail!("it is {what} thread {other}");
+        }
+    }
+    let preview = thread["preview"]
+        .as_str()
+        .context("thread/read gave no preview")?;
+    anyhow::ensure!(
+        preview.is_empty(),
+        "it already holds a message: {preview:?}"
+    );
+    let created = thread["createdAt"]
+        .as_u64()
+        .context("thread/read gave no createdAt")?;
+    let since = since.duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    anyhow::ensure!(
+        created >= since,
+        "it was created at {created}, before the attempt began at {since}"
+    );
+    Ok(())
 }
 
 fn resume_command(command: &str, id: &str) -> String {
@@ -611,7 +703,7 @@ pub(crate) fn codex_server_command(
     }
     Some(format!(
         "export OMAR_CODEX_SOCKET={socket}; \
-         {server_command}{hook_trust} app-server --listen {endpoint} {overrides}{effort} \
+         {server_command}{hook_trust} app-server --listen {endpoint} {overrides}{effort}{memories} \
          -c \"developer_instructions=$(cat {prompt_file})\" >{log} 2>&1 & \
          omar_srv=$!; omar_waited=0; \
          while [ ! -S \"$OMAR_CODEX_SOCKET\" ] && [ \"$omar_waited\" -lt 100 ] \
@@ -623,6 +715,7 @@ pub(crate) fn codex_server_command(
         socket = shell_single_quote(&socket.display().to_string()),
         prompt_file = shell_single_quote(&prompt_file.display().to_string()),
         log = shell_single_quote(&runtime.join("server.log").display().to_string()),
+        memories = if is_attempt(context) { NO_MEMORIES } else { "" },
     ))
 }
 
@@ -666,6 +759,11 @@ pub(crate) struct CodexSession {
     next_id: u64,
 }
 
+/// How long to wait for an app-server answer once the session is up. Answers
+/// wait on the server, busy for seconds when several agents start at once; the
+/// upgrade keeps `WRITE_TIMEOUT`, since provisioning retries `open` until it listens.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl CodexSession {
     /// Connect, upgrade, and complete the app-server's opening handshake.
     pub(crate) fn open(path: &Path) -> Result<CodexSession> {
@@ -689,6 +787,8 @@ impl CodexSession {
                 }
             }
         })?;
+        // Requests from here on wait on the server, not on the socket.
+        socket.get_ref().set_read_timeout(Some(REPLY_TIMEOUT))?;
 
         let mut session = CodexSession { socket, next_id: 1 };
         session
@@ -1211,13 +1311,16 @@ mod tests {
             serde_json::json!({
                 "result": { "turn": { "id": "new-turn", "status": "inProgress", "items": [], "error": null } }
             }),
+            Duration::ZERO,
         )
     }
 
+    /// `initialize_delay` stands in for a busy server: it holds the first answer.
     fn fake_app_server_reply(
         listener: UnixListener,
         threads: Vec<&'static str>,
         turn_reply: serde_json::Value,
+        initialize_delay: Duration,
     ) -> Vec<String> {
         let (stream, _) = listener.accept().unwrap();
         // `tungstenite::accept` answers the upgrade, so the test exercises the
@@ -1245,6 +1348,7 @@ mod tests {
             let request: serde_json::Value = serde_json::from_str(&body).unwrap();
             match request["method"].as_str().unwrap_or_default() {
                 "initialize" => {
+                    std::thread::sleep(initialize_delay);
                     // The server talks unprompted; a reply is found by id, not
                     // by being the next thing to arrive.
                     socket
@@ -1266,6 +1370,18 @@ mod tests {
                     &mut socket,
                     &request,
                     serde_json::json!({ "data": threads, "nextCursor": null }),
+                ),
+                // A thread as a TUI opens it: no fork, no parent, no message.
+                "thread/read" => answer(
+                    &mut socket,
+                    &request,
+                    serde_json::json!({ "thread": {
+                        "id": request["params"]["threadId"],
+                        "forkedFromId": null,
+                        "parentThreadId": null,
+                        "preview": "",
+                        "createdAt": 1_800_000_000,
+                    } }),
                 ),
                 "thread/delete" => {
                     answer(&mut socket, &request, serde_json::json!({}));
@@ -1365,6 +1481,153 @@ mod tests {
         assert_eq!(last["params"], serde_json::json!({"threadId": "thread-1"}));
     }
 
+    /// An attempt's own app-server runs with memories off, which nothing
+    /// else's does, and an attempt never falls back to the exec runner,
+    /// which resumes a conversation.
+    #[test]
+    fn an_attempt_starts_its_own_app_server_without_memories_or_falls_through_to_nothing() {
+        let dir = short_tempdir();
+        let prompt = dir.path().join("prompt.md");
+        std::fs::write(&prompt, "be helpful").unwrap();
+        let mut attempt = test_mcp_context(dir.path());
+        attempt.topology = Some(crate::manager::TopologyMcpContext {
+            team: "Scoped".into(),
+            agent: "t.coder".into(),
+            endpoint: "localhost:1".into(),
+            token: "t".into(),
+            attempt: Some(crate::manager::TopologyAttempt {
+                id: "attempt".into(),
+                key: "key".into(),
+                native_session: "unused".into(),
+            }),
+        });
+        let line = build_agent_command(Codex.default_command(), &prompt, &[], &attempt);
+        let server = line
+            .split(" app-server ")
+            .nth(1)
+            .and_then(|rest| rest.split(" & ").next())
+            .unwrap_or_else(|| panic!("no app-server in {line}"));
+        assert!(server.contains(NO_MEMORIES.trim()), "{line}");
+        let tui = line.rsplit("; ").next().unwrap();
+        assert!(tui.contains("--remote "), "{line}");
+        assert!(!tui.contains("memories"), "{line}");
+        assert!(
+            !line.contains("resume") && !line.contains(" exec "),
+            "{line}"
+        );
+        let agent = build_agent_command(
+            Codex.default_command(),
+            &prompt,
+            &[],
+            &test_mcp_context(dir.path()),
+        );
+        assert!(!agent.contains("memories"), "{agent}");
+
+        // No prompt to give the server: an agent's launch takes the exec
+        // runner, an attempt's fails.
+        let missing = dir.path().join("missing.md");
+        let agent = build_agent_command(
+            Codex.default_command(),
+            &missing,
+            &[],
+            &test_mcp_context(dir.path()),
+        );
+        assert!(
+            agent.contains(" backend-runner --backend codex "),
+            "{agent}"
+        );
+        let line = build_agent_command(Codex.default_command(), &missing, &[], &attempt);
+        assert!(line.starts_with("printf "), "{line}");
+        assert!(line.ends_with("exit 1"), "{line}");
+        assert!(
+            line.contains("resets its conversation (per lifetime)"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("backend-runner") && !line.contains("--listen"),
+            "{line}"
+        );
+        assert!(Codex.fresh_conversation());
+        assert_eq!(Codex.freshness(), super::super::Freshness::Reported);
+    }
+
+    /// The thread a new TUI opened: none older, forked, a subagent's, or
+    /// already holding a message is taken for it.
+    #[test]
+    fn only_a_thread_opened_since_the_attempt_began_is_new() {
+        let since = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let fresh = serde_json::json!({
+            "id": "t", "forkedFromId": null, "parentThreadId": null, "preview": "",
+            "createdAt": 1_800_000_000,
+        });
+        new_thread(&fresh, "t", since).unwrap();
+        let mut bare = fresh.clone();
+        bare.as_object_mut().unwrap().remove("forkedFromId");
+        bare.as_object_mut().unwrap().remove("parentThreadId");
+        new_thread(&bare, "t", since).unwrap();
+        for (field, value, says) in [
+            ("id", serde_json::json!("other"), "instead"),
+            ("forkedFromId", serde_json::json!("old"), "forked from"),
+            ("parentThreadId", serde_json::json!("lead"), "subagent"),
+            ("preview", serde_json::json!("Step one"), "already holds"),
+            ("preview", serde_json::Value::Null, "no preview"),
+            (
+                "createdAt",
+                serde_json::json!(1_799_999_999),
+                "before the attempt",
+            ),
+            ("createdAt", serde_json::Value::Null, "no createdAt"),
+        ] {
+            let mut thread = fresh.clone();
+            thread[field] = value;
+            let error = new_thread(&thread, "t", since).unwrap_err().to_string();
+            assert!(error.contains(says), "{field}: {error}");
+        }
+    }
+
+    /// Asked of the live app-server, metadata only: Codex refuses the turns
+    /// of a paginated thread.
+    #[test]
+    fn freshness_is_read_back_from_the_app_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fresh.sock");
+        let stamp = format!("codex:{}", socket.display());
+        let target = super::super::Target {
+            name: "pane",
+            pane_pid: 0,
+            stamp: Some(&stamp),
+        };
+        let since = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        for (threads, id, ok) in [
+            (vec!["thread-1"], "thread-1", true),
+            (vec!["thread-2"], "thread-1", false),
+            (vec!["thread-1", "thread-2"], "thread-1", false),
+        ] {
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || fake_app_server(listener, threads));
+            assert_eq!(Codex.prove_fresh(&target, id, since).is_ok(), ok, "{id}");
+            let asked: Vec<serde_json::Value> = server
+                .join()
+                .unwrap()
+                .iter()
+                .map(|body| serde_json::from_str(body).unwrap())
+                .collect();
+            let read = asked.iter().find(|r| r["method"] == "thread/read");
+            if ok {
+                assert_eq!(
+                    read.unwrap()["params"],
+                    serde_json::json!({"threadId": "thread-1", "includeTurns": false})
+                );
+            } else {
+                assert!(read.is_none(), "{asked:?}");
+            }
+            std::fs::remove_file(&socket).unwrap();
+        }
+        assert!(Codex
+            .prove_fresh(&target, "thread-1", since + Duration::from_secs(1))
+            .is_err());
+    }
+
     #[test]
     fn an_active_turn_accepts_one_event_without_injection_or_interrupt() {
         let dir = tempfile::tempdir().unwrap();
@@ -1375,6 +1638,7 @@ mod tests {
                 listener,
                 vec!["thread"],
                 serde_json::json!({"result": {"turn": {"id": "already-active", "status": "inProgress", "items": [], "error": null}}}),
+                Duration::ZERO,
             )
         });
         deliver_via_app_server(&socket, "event during a tool call").unwrap();
@@ -1411,6 +1675,7 @@ mod tests {
                 listener,
                 vec!["thread"],
                 serde_json::json!({"error": {"code": -32602, "message": "tool output rejected"}}),
+                Duration::ZERO,
             )
         });
         let error = deliver_via_app_server(&socket, "event").unwrap_err();
@@ -1420,6 +1685,26 @@ mod tests {
             4,
             "do not inject after a rejected wake"
         );
+    }
+
+    /// A busy app-server can take longer to answer than a write may take: the
+    /// delivery waits for the answer instead of failing at `WRITE_TIMEOUT`.
+    #[test]
+    fn a_slow_app_server_still_takes_the_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slow.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            fake_app_server_reply(
+                listener,
+                vec!["thread"],
+                serde_json::json!({"result": {"turn": {"id": "new-turn", "status": "inProgress", "items": [], "error": null}}}),
+                WRITE_TIMEOUT + Duration::from_secs(2),
+            )
+        });
+
+        deliver_via_app_server(&socket, "standup in 5").expect("a slow answer is still an answer");
+        server.join().unwrap();
     }
 
     #[test]

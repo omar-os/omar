@@ -16,6 +16,7 @@ mod manager;
 mod mcp;
 mod memory;
 mod memory_wizard;
+mod messaging;
 mod metrics;
 mod mutation;
 mod panic_hook;
@@ -133,6 +134,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Connect an external messaging platform to approved saved workflows
+    Messaging {
+        #[command(subcommand)]
+        command: messaging::Command,
+    },
     #[command(hide = true)]
     SandboxWorker,
     /// Reopen the default workspace, starting its runtime only when needed
@@ -570,6 +576,9 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(mut cli: Cli) -> Result<()> {
+    if let Some(Commands::Messaging { command }) = &cli.command {
+        return messaging::run(command).await;
+    }
     if matches!(cli.command, Some(Commands::SandboxWorker)) {
         return topology::sandbox_worker();
     }
@@ -608,7 +617,8 @@ async fn async_main(mut cli: Cli) -> Result<()> {
     let omar_dir = omar_dir();
     match cli.command {
         Some(
-            Commands::Open { .. }
+            Commands::Messaging { .. }
+            | Commands::Open { .. }
             | Commands::Up(_)
             | Commands::Ls
             | Commands::Info
