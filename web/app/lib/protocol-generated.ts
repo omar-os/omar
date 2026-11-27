@@ -33,7 +33,7 @@ export const LIFETIME_UNITS = ["task", "tag"] as const;
 export type LifetimeUnit = (typeof LIFETIME_UNITS)[number];
 
 /** What happened, as the event stream names it. */
-export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started", "agent_attempt", "sandbox_started"] as const;
+export const DIAGRAM_EVENT_KINDS = ["run_started", "tag_advanced", "reaction_started", "reaction_completed", "run_completed", "run_failed", "run_paused", "run_checkpointed", "clock_started", "check_completed", "agent_attempt", "sandbox_started"] as const;
 export type DiagramEventKind = (typeof DIAGRAM_EVENT_KINDS)[number];
 
 /** Who spoke. */
@@ -89,6 +89,12 @@ export type DiagramTimer = { id: string, name: string, offset: number,
  */
 period: number, last_tag: DiagramTag | null, instance: string, };
 
+export type DiagramCheck = { passed: boolean,
+/**
+ * `None` when the check was killed at the deadline.
+ */
+exit_code: number | null, };
+
 export type DiagramReaction = { id: string, name: string,
 /**
  * Human-readable task copy; absent in workflows created before task metadata.
@@ -104,7 +110,11 @@ within: number | null,
  * The task's prompt, for a one-line summary on its card. `None` for a
  * code reaction.
  */
-prompt?: string, };
+prompt?: string,
+/**
+ * The latest completion check run, for a task that has one.
+ */
+check?: DiagramCheck, };
 
 export type DiagramEdge = { id: string, kind: EdgeKind, source: string, target: string,
 /**
