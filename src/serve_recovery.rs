@@ -253,12 +253,7 @@ fn drain_with(
 /// A successful transport delivery is not proof the provider accepted a turn.
 /// Match only an explicit, latest Claude status, never mere terminal inactivity.
 fn terminal_blocker(screen: &str) -> Option<&'static str> {
-    let latest = screen
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find_map(|line| line.strip_prefix("⏺ "))?;
-    if latest.starts_with("Login expired") && latest.contains("/login") {
+    if super::sign_in::login_expired(screen) {
         Some("Automatic investigation is blocked because the Claude login has expired. Open Inspect terminal and run /login, then send a message here to continue. You can also choose another connected assistant from the backend menu.")
     } else {
         None
