@@ -39,6 +39,23 @@ pub struct TopologyMcpContext {
     pub agent: String,
     pub endpoint: String,
     pub token: String,
+    /// Set for a worker of an agent with a `per` lifetime, which exists for
+    /// one window. Its calls carry the attempt, so a worker from an earlier
+    /// attempt cannot answer for a later one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<TopologyAttempt>,
+}
+
+/// One `per`-lifetime worker: the attempt OMAR started it for, and the
+/// native conversation it was told to open, which no earlier worker used.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TopologyAttempt {
+    pub id: String,
+    /// What the worker's calls carry, and the only thing that tells them from
+    /// an earlier attempt's. Unlike `id`, which `attempts.jsonl` records, it
+    /// is written only to the attempt's own files, removed when it stops.
+    pub key: String,
+    pub native_session: String,
 }
 
 /// Lets the EA talk back to whoever is driving `omar serve` — replies and
@@ -58,7 +75,7 @@ pub struct ManagerRuntimeOptions {
 }
 
 // Embed prompt files at compile time so they work regardless of CWD.
-const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
+pub(crate) const PROMPT_EA: &str = include_str!("../../prompts/executive-assistant.md");
 const PROMPT_AGENT: &str = include_str!("../../prompts/agent.md");
 
 // Backend-native wake/reminder tools bypass OMAR's durable, EA-scoped scheduler.
@@ -214,12 +231,29 @@ pub fn ea_mcp_context_path(omar_dir: &Path, ea_id: EaId) -> PathBuf {
 }
 
 pub(crate) fn mcp_ea_dir(context: &McpLaunchContext) -> Option<PathBuf> {
-    let dir = context
-        .omar_dir
-        .join("mcp")
-        .join(format!("ea-{}", context.ea_id));
+    let attempt = context
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.attempt.as_ref());
+    let dir = match attempt {
+        Some(attempt) => attempt_mcp_dir(&context.omar_dir, context.ea_id, &attempt.id),
+        None => context
+            .omar_dir
+            .join("mcp")
+            .join(format!("ea-{}", context.ea_id)),
+    };
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// Where a `per`-lifetime attempt's launch writes its context and
+/// configs: its own, so a process left from an earlier attempt that rereads
+/// its paths finds nothing of a later one's. Removed once the attempt stops.
+pub(crate) fn attempt_mcp_dir(omar_dir: &Path, ea_id: EaId, attempt: &str) -> PathBuf {
+    omar_dir
+        .join("mcp")
+        .join(format!("ea-{ea_id}"))
+        .join(format!("attempt-{attempt}"))
 }
 
 /// Atomically write `bytes` to `path` with mode 0600 on Unix.
@@ -301,9 +335,12 @@ pub(crate) fn actor_file(actor: Option<&str>, stem: &str) -> String {
 pub(crate) fn materialize_shared_mcp_context_file(context: &McpLaunchContext) -> Option<PathBuf> {
     // User-global backend configs must not overwrite the EA's private context.
     // Each launched pane supplies its own full context through the environment.
+    // Nor carry a topology agent's: every MCP server reading this file would
+    // act as whichever agent, or attempt, launched last.
     let mut shared = context.clone();
     shared.agent_name = None;
     shared.serve = None;
+    shared.topology = None;
     let path = mcp_ea_dir(context)?.join("context-shared.json");
     write_private_file(&path, &serde_json::to_vec(&shared).ok()?).ok()?;
     Some(path)
@@ -497,7 +534,7 @@ pub fn build_ea_command(
     let combined_path = state_dir.join("ea_prompt_combined.md");
     std::fs::create_dir_all(&state_dir).ok();
 
-    let combined = match (mem.is_empty(), notes.is_empty()) {
+    let mut combined = match (mem.is_empty(), notes.is_empty()) {
         (true, true) => prompt_content,
         (false, true) => format!(
             "{}\n\n---\n\n## Current OMAR State (from previous session)\n\n{}",
@@ -512,6 +549,10 @@ pub fn build_ea_command(
             prompt_content, mem, notes
         ),
     };
+    if mcp_context.topology.is_none() && mcp_context.agent_name.as_deref().is_none_or(|a| a == "ea")
+    {
+        combined.push_str(&crate::knowledge::startup_context(omar_dir, ea_id));
+    }
     // For claude (file flag) we resolve `{{EA_ID}}` / `{{EA_NAME}}` on
     // disk. The other backends still go through `build_agent_command`,
     // which pipes the file through sed at launch time, so we leave the
@@ -670,6 +711,23 @@ pub(crate) mod tests {
         assert_eq!(read(a_path).agent_name.as_deref(), Some("worker/a"));
         assert_eq!(read(b_path).agent_name.as_deref(), Some("worker-b"));
         assert!(read(shared_path).serve.is_none());
+        // A topology agent's identity, and its attempt's, stay in its own file.
+        let mut scoped = a.clone();
+        scoped.topology = Some(TopologyMcpContext {
+            team: "Scoped".into(),
+            agent: "t.coder".into(),
+            endpoint: "localhost:1".into(),
+            token: "t".into(),
+            attempt: Some(TopologyAttempt {
+                id: "attempt".into(),
+                key: "key".into(),
+                native_session: "unused".into(),
+            }),
+        });
+        let shared_path = materialize_shared_mcp_context_file(&scoped).unwrap();
+        assert!(read(shared_path).topology.is_none());
+        let scoped_path = materialize_mcp_context_file(&scoped).unwrap();
+        assert_eq!(read(scoped_path).topology.unwrap().agent, "t.coder");
     }
 
     // Exercise the real manager lifecycle: worktree/backend launchers can keep
@@ -686,6 +744,10 @@ pub(crate) mod tests {
             eprintln!("Skipping test: tmux not available");
             return;
         }
+        // Other tests point OMAR_TMUX_SERVER at their own servers while they
+        // hold this lock; without it this test's tmux calls, teardown
+        // included, can land on theirs. Declared first, so it drops last.
+        let _env = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let prefix = format!("omar-test-pi-switch-{}-", Uuid::new_v4());
         let session = ea::ea_manager_session(0, &prefix);
@@ -1219,20 +1281,33 @@ pub(crate) mod tests {
         // 200 KB of notes — well past MAX_ARG_STRLEN.
         let huge_notes: String = "x".repeat(200 * 1024);
 
-        for backend in [
-            "claude",
-            "codex --dangerously-bypass-approvals-and-sandbox",
-            "opencode",
-            "agy --dangerously-skip-permissions",
-        ] {
+        for kind in crate::backend::ASSISTANT {
+            let backend = crate::backend::of(kind).default_command();
             let dir = tempfile::tempdir().unwrap();
             let omar_dir = dir.path();
             let state_dir = ea::ea_state_dir(7, omar_dir);
             std::fs::create_dir_all(&state_dir).unwrap();
             std::fs::write(memory::manager_notes_path(omar_dir, 7), &huge_notes).unwrap();
+            std::fs::write(state_dir.join("memory.md"), &huge_notes).unwrap();
+            for n in 0..20 {
+                let action = serde_json::from_value(serde_json::json!({
+                    "action":"save","scope":"ea","key":format!("format-{n}"),"kind":"preference",
+                    "text":"K".repeat(500),"source":"operator request"
+                }))
+                .unwrap();
+                crate::knowledge::operator(omar_dir, 7, action).unwrap();
+            }
 
             let (cmd, _ws) =
                 build_ea_command(backend, 7, "Big", omar_dir, &test_mcp_context(omar_dir));
+            let combined =
+                std::fs::read_to_string(state_dir.join("ea_prompt_combined.md")).unwrap();
+            assert!(combined.contains("## Saved knowledge"));
+            assert!(
+                combined.len() < 124 * 1024,
+                "combined prompt has {} bytes",
+                combined.len()
+            );
 
             // No single argv element (whitespace-separated token) may exceed
             // a safe ceiling — 96 KB leaves comfortable headroom under the
@@ -1245,6 +1320,38 @@ pub(crate) mod tests {
                      exec(3) E2BIG (MAX_ARG_STRLEN ≈ 128 KB): {}",
                     tok.len(),
                     &tok[..tok.len().min(120)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saved_knowledge_startup_is_backend_portable_and_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let action = serde_json::from_value(serde_json::json!({
+            "action":"save","scope":"ea","key":"format","kind":"preference",
+            "text":"PORTABLE_MEMORY_SENTINEL","source":"operator request"
+        }))
+        .unwrap();
+        crate::knowledge::operator(dir.path(), 7, action).unwrap();
+        for kind in crate::backend::ASSISTANT {
+            let backend = crate::backend::of(kind).default_command();
+            for ea in [7, 8] {
+                build_ea_command(
+                    backend,
+                    ea,
+                    "Test",
+                    dir.path(),
+                    &test_mcp_context(dir.path()),
+                );
+                let combined = std::fs::read_to_string(
+                    ea::ea_state_dir(ea, dir.path()).join("ea_prompt_combined.md"),
+                )
+                .unwrap();
+                assert_eq!(
+                    combined.contains("PORTABLE_MEMORY_SENTINEL"),
+                    ea == 7,
+                    "{backend}"
                 );
             }
         }

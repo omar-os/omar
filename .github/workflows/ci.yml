@@ -111,8 +111,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install tmux
-        run: .github/scripts/install-packages.sh tmux
+      - name: Install tmux and graph preview fonts
+        run: .github/scripts/install-packages.sh tmux fonts-dejavu-core
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -140,7 +140,9 @@ jobs:
       - name: Verify legacy supervision through MCP and tmux
         run: |
           cargo build -p omar
+          python3 tests/ci/scoped_memory.py
           python3 tests/ci/independent_sessions.py
+          python3 tests/ci/slack_credentials.py
           python3 tests/ci/workspace_restore.py
           python3 tests/ci/ea_deletion.py
           python3 tests/ci/team_workspaces.py
@@ -304,6 +306,24 @@ jobs:
           sudo apt-get update && sudo apt-get install -y tmux
           cargo build --bin omar
           python3 tests/ci/team_mutation.py
+      - name: Verify a per-lifetime agent gets a fresh worker per window
+        run: |
+          cargo build --bin omar
+          python3 tests/ci/invocation_scope.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Real pinned Pi, with a local deterministic provider: no credentials.
+      - name: Verify real Pi runs a per-task agent in a new conversation each time
+        run: |
+          cargo build --bin omar
+          python3 tests/ci/pi_invocation_scope.py
+      # Real pinned Codex, with a local deterministic provider: no credentials.
+      - name: Verify real Codex runs a per-task agent in a new thread each time
+        run: |
+          npm install -g @openai/codex@0.154.0
+          cargo build --bin omar
+          python3 tests/ci/codex_invocation_scope.py
       - name: Verify safety properties are proved through serve
         run: |
           cargo build --bin omar

@@ -1,0 +1,10 @@
+{
+  "display_information": {"name": "OMAR", "description": "Chat with OMAR and review and run saved workflows"},
+  "features": {
+    "bot_user": {"display_name": "Omar", "always_online": false},
+    "app_home": {"messages_tab_enabled": true, "messages_tab_read_only_enabled": false},
+    "slash_commands": [{"command": "/omar", "description": "OMAR workflows and conversations", "usage_hint": "list | run NAME | new-chat | help", "should_escape": false}]
+  },
+  "oauth_config": {"scopes": {"bot": ["chat:write", "app_mentions:read", "im:history", "im:write", "files:write", "commands"]}},
+  "settings": {"socket_mode_enabled": true, "interactivity": {"is_enabled": true}, "event_subscriptions": {"bot_events": ["app_mention", "message.im"]}}
+}

@@ -86,6 +86,9 @@ pub enum DiagramEventKind {
     ClockStarted,
     /// A task's completion check finished; the payload carries the run.
     CheckCompleted,
+    /// A window of a `per` agent's conversation changed: the payload is the
+    /// agent's id and the attempt as `DiagramAgent::attempts` holds it.
+    AgentAttempt,
     /// A team instance's Docker Sandbox is up: the payload names the
     /// `instance` and the `sandbox`.
     SandboxStarted,
@@ -104,6 +107,17 @@ pub struct DiagramAgent {
     pub backend: String,
     /// The container it is drawn inside.
     pub instance: String,
+    /// How long its conversation lives, when it says: `per tag`. Absent for
+    /// the whole run.
+    #[serde(default)]
+    pub lifetime: Option<crate::topology::Lifetime>,
+    /// A `per` agent's conversation windows, oldest first, each as of its
+    /// latest change: `invocations` (each with its `reaction`), `attempt_id`,
+    /// `native_session_id`, `outcome`, `cleanup_status` and the rest of the
+    /// record the run keeps in `attempts.jsonl`.
+    #[serde(default)]
+    #[ts(type = "Record<string, unknown>[]")]
+    pub attempts: Vec<Value>,
 }
 
 /// A team `main` instantiated: one container in the drawing.
@@ -281,6 +295,8 @@ impl DiagramSnapshot {
                 name: name.clone(),
                 backend: agent.backend.clone(),
                 instance: agent.instance.clone(),
+                lifetime: agent.lifetime,
+                attempts: Vec::new(),
             })
             .collect();
         let ports = state
@@ -509,6 +525,31 @@ impl DiagramPublisher {
         self.publish_with(kind, None, payload, |snapshot| {
             snapshot.status = status;
         });
+    }
+}
+
+impl DiagramPublisher {
+    /// A window of a `per` agent's conversation started, served an
+    /// invocation, or ended; the snapshot keeps the latest of each.
+    pub fn agent_attempt(&self, agent: &str, attempt: &Value) {
+        let id = agent_id(agent);
+        self.publish_with(
+            DiagramEventKind::AgentAttempt,
+            None,
+            json!({ "agent": id, "attempt": attempt }),
+            |snapshot| {
+                if let Some(item) = snapshot.agents.iter_mut().find(|item| item.id == id) {
+                    match item
+                        .attempts
+                        .iter_mut()
+                        .find(|known| known["attempt_id"] == attempt["attempt_id"])
+                    {
+                        Some(known) => *known = attempt.clone(),
+                        None => item.attempts.push(attempt.clone()),
+                    }
+                }
+            },
+        );
     }
 }
 
@@ -987,6 +1028,7 @@ mod tests {
                 AgentState {
                     backend: "codex".to_string(),
                     instance: String::new(),
+                    lifetime: None,
                 },
             )]),
             ports: BTreeMap::from([
@@ -1073,6 +1115,7 @@ mod tests {
                 AgentState {
                     backend: "codex".to_string(),
                     instance: "writer".to_string(),
+                    lifetime: None,
                 },
             )]),
             ports: BTreeMap::from([

@@ -128,8 +128,27 @@ impl Backend for Claude {
             .all(|marker| screen.contains(marker))
             || resolve_peer(pane_pid).is_some()
     }
+    /// `--session-id` names the conversation a launch opens, and Claude Code
+    /// refuses one it already has, so a new id is a new conversation. Auto
+    /// memory would hand it what an earlier one saved, so an attempt runs
+    /// with it off.
+    fn fresh_conversation(&self) -> bool {
+        true
+    }
     fn launch_command(&self, launch: &Launch<'_>) -> String {
         let base_command = with_coordination_hooks(launch.base_command, launch.context);
+        let attempt = launch
+            .context
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.attempt.as_ref());
+        let base_command = match attempt {
+            Some(attempt) => format!(
+                "{base_command} --session-id {}",
+                shell_single_quote(&attempt.native_session)
+            ),
+            None => base_command,
+        };
         let command = match materialize_claude_mcp_config(launch.context) {
             Some(mcp_config) => format!(
                 "{} --append-system-prompt \"{}\" --mcp-config {} --disallowedTools {}",
@@ -154,7 +173,17 @@ impl Backend for Claude {
         } else {
             ""
         };
-        format!("{skip_history}{command}")
+        // Auto memory (with the team and subagent memory it gates) lives
+        // outside the workspace and outlives the run, and org memory stores
+        // are shared by every conversation that syncs them: either would
+        // carry one attempt's notes into the next. Env vars, since Claude
+        // keeps only the last `--settings`, which the hooks may use.
+        let no_memory = if attempt.is_some() {
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_ORG_MEMORY=1 "
+        } else {
+            ""
+        };
+        format!("{no_memory}{skip_history}{command}")
     }
     /// The prompt goes in by file, so it never touches argv and is unbounded;
     /// the placeholders are resolved on disk since nothing pipes it through
@@ -753,6 +782,54 @@ mod tests {
         }
     }
 
+    /// A worker of a `per` lifetime opens the conversation its attempt names;
+    /// every other worker opens one of Claude's choosing, as before.
+    #[test]
+    fn an_attempt_names_the_conversation_its_worker_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_mcp_context(dir.path());
+        let topology = TopologyMcpContext {
+            team: "Scoped".into(),
+            agent: "t.coder".into(),
+            endpoint: "localhost:1".into(),
+            token: "t".into(),
+            attempt: None,
+        };
+        context.topology = Some(topology.clone());
+        let launch = |context: &McpLaunchContext| {
+            Claude.launch_command(&Launch {
+                base_command: "claude --dangerously-skip-permissions",
+                prompt_file: Path::new("/tmp/system.md"),
+                substitutions: &[],
+                shell_expr: "$(cat '/tmp/system.md')",
+                context,
+            })
+        };
+        assert!(!launch(&context).contains("--session-id"));
+        assert!(!launch(&context).contains("CLAUDE_CODE_DISABLE_AUTO_MEMORY"));
+        assert!(!launch(&context).contains("CLAUDE_CODE_DISABLE_ORG_MEMORY"));
+        context.topology = Some(TopologyMcpContext {
+            attempt: Some(crate::manager::TopologyAttempt {
+                id: "attempt".into(),
+                key: "key".into(),
+                native_session: "11111111-1111-4111-8111-111111111111".into(),
+            }),
+            ..topology
+        });
+        let line = launch(&context);
+        assert!(line.contains("--session-id '11111111-1111-4111-8111-111111111111'"));
+        assert!(
+            line.starts_with("CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_ORG_MEMORY=1 "),
+            "an attempt must not read an earlier one's memory: {line}"
+        );
+        assert!(!line.contains("--resume"));
+        assert!(Claude.fresh_conversation());
+        assert_eq!(
+            super::super::fresh_conversation_backends(),
+            ["claude", "codex", "opencode", "pi", "jev", "stub"]
+        );
+    }
+
     #[test]
     fn coordination_hooks_preserve_explicit_settings_and_skip_topology() {
         let dir = tempfile::tempdir().unwrap();
@@ -769,6 +846,7 @@ mod tests {
             agent: "a".into(),
             endpoint: "localhost:1".into(),
             token: "t".into(),
+            attempt: None,
         });
         assert_eq!(with_coordination_hooks("claude", &topology), "claude");
     }

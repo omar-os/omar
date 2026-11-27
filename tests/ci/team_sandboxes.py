@@ -194,6 +194,14 @@ total = Some(self.count);
                                  ("web_check", "SandboxWebCheck", web_check)]:
             (root / (name + ".json")).write_text(json.dumps(dict(version=1, team=team, instructions=plan)))
             (source / (name + ".omar")).write_text("// Compiler-fixture input\n")
+        # A `per` agent's windows are run by the host: refused in a sandbox.
+        scoped = [{"op": "begin_plan", "team": "SandboxScoped"},
+                  {"op": "declare_instance", "name": "s", "team": "Writer", "parent": ""},
+                  {"op": "spawn_agent", "instance": "s", "name": "s.agent", "backend": "stub",
+                   "lifetime": {"unit": "tag", "count": 1}},
+                  {"op": "commit_plan"}]
+        (root / "scoped.json").write_text(json.dumps(dict(version=2, team="SandboxScoped", instructions=scoped)))
+        (source / "scoped.omar").write_text("// Compiler-fixture input\n")
         program, ticker_program = source / "program.omar", source / "ticker.omar"
         compiler = shims / "omarc"
         # omarc [options] <input> <output>: copy the bytecode named after the input.
@@ -284,6 +292,11 @@ total = Some(self.count);
                 assert len(list((state_root/"workspace-history"/ws/"snapshots").glob("*.json"))) == 2
             # No host compilation of untrusted reaction bodies.
             assert not list(state_root.rglob("src-gen/**/main.rs"))
+            before = len(entries())
+            refused = omar("run", str(source/"scoped.omar"), "--sandbox-template", TEMPLATE, "--fast", "--fg")
+            said = refused.stdout + refused.stderr
+            assert refused.returncode != 0 and "`per` lifetime, which does not run in a sandbox yet" in said, refused
+            assert not [e for e in entries(before) if e[0] == "create"], entries(before)
             # Cleanup failure blocks final and manual snapshots.
             fault(FAIL_STOP=1)
             omar(*args, "--replace")
@@ -476,10 +489,14 @@ total = Some(self.count);
             (home / ".codex").mkdir(exist_ok=True)
             (home / ".codex" / "auth.json").write_text('{"OPENAI_API_KEY": "sk-codex"}')
             host_cli("codex", '[ "$1 $2" = "login status" ] && echo "Logged in using an API key - sk-***" && exit 0')
+            ran = len(entries())
             started = omar("run", str(source / "codex.omar"), "--sandbox")
             assert started.returncode == 0, started
             assert "Using codex's API key from this machine (codex's API key sign-in) for sandboxes." in started.stderr, started
             assert stored() == {"openai": "sk-codex"}
+            # The run creates its sandbox in the background; stopped first, that
+            # create can land after `before` below and count against the refusal.
+            wait_until(lambda: creates_since(ran), "the codex run's sandbox")
             ok("stop", json.loads(started.stdout)["run_id"])
             (home / ".codex" / "auth.json").unlink()
             (shims / "codex").unlink()
@@ -489,7 +506,7 @@ total = Some(self.count);
             fault(SIGNED_OUT=1)
             refused = omar(*plain, "--sandbox-template", TEMPLATE)
             assert refused.returncode != 0 and "not signed in" in refused.stdout + refused.stderr, refused
-            assert not creates_since(before)
+            assert not creates_since(before), creates_since(before)
             fault()
             # `[sandbox] enabled = true`: the published kit, no flag needed.
             (home / ".omar").mkdir(exist_ok=True)

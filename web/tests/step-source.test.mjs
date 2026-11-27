@@ -63,6 +63,14 @@ test('a check_completed event sets the latest check on its reaction', () => {
  assert.deepEqual(passed.reactions[1].check, { passed: true, exit_code: 0 });
 });
 
+test('an agent lifetime is kept when its step backend is edited', () => {
+ const timed = program.replace('planner:Codex', 'planner:Claude per 5 tasks');
+ const step = locateStep(timed, snapshot, snapshot.reactions[0]);
+ assert.equal(step.backend, 'Claude');
+ const changed = replaceStep(timed, step, { backend:'ClaudeCode', prompt:step.prompt, triggers:step.triggers, contract:step.contract });
+ assert.match(changed, /planner:ClaudeCode per 5 tasks/);
+});
+
 test('editing task configuration preserves metadata and the other steps', () => {
  const metadata = '// @title Review campaign script\n // @desc Inspect the prompt, identify gaps, and return a critique.';
  for (const deadline of ['', 'within(30s)']) {
