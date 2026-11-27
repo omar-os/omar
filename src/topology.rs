@@ -43,6 +43,10 @@ pub enum Instruction {
         /// The instance that declared it, empty for one `main` declared.
         #[serde(default)]
         parent: String,
+        /// The team's `setup` command, run in this instance's workspace
+        /// before any agent launches. Absent when the team declares none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        setup: Option<String>,
     },
     SpawnAgent {
         name: String,
@@ -270,6 +274,10 @@ pub struct InstanceState {
     /// that predates teams being able to instantiate teams.
     #[serde(default)]
     pub parent: String,
+    /// The team's `setup` command, run once in this instance's workspace
+    /// before any agent of the run launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -740,10 +748,18 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
         match instruction {
             Instruction::BeginPlan { .. } if index == 0 => {}
             Instruction::BeginPlan { .. } => bail!("duplicate begin_plan at instruction {index}"),
-            Instruction::DeclareInstance { name, team, parent } => {
+            Instruction::DeclareInstance {
+                name,
+                team,
+                parent,
+                setup,
+            } => {
                 require_identifier("instance", name)?;
                 if team.trim().is_empty() {
                     bail!("instance '{name}' names no team");
+                }
+                if setup.as_deref().is_some_and(|s| s.trim().is_empty()) {
+                    bail!("instance '{name}' has an empty setup command");
                 }
                 // A parent is declared before its children, so this also
                 // rejects a cycle: neither end could be declared first.
@@ -757,6 +773,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                         InstanceState {
                             team: team.clone(),
                             parent: parent.clone(),
+                            setup: setup.clone(),
                         },
                     )
                     .is_some()
@@ -3408,6 +3425,16 @@ fn sandbox_state(state: &VmState, instance: &str) -> VmState {
     local
 }
 
+fn sandbox_init_timeout(init: &crate::sandbox::Init) -> Duration {
+    let setup = init.resumed_from.is_none()
+        && init
+            .state
+            .instances
+            .values()
+            .any(|instance| instance.setup.is_some());
+    Duration::from_secs(180).saturating_add(if setup { init.timeout } else { Duration::ZERO })
+}
+
 /// Internal VM-side service. No host paths other than the two mounts are used.
 /// stdout is reserved for bounded protocol frames; backend panes/logs stay in VM.
 pub fn sandbox_worker() -> Result<()> {
@@ -3448,9 +3475,30 @@ pub fn sandbox_worker() -> Result<()> {
     let client = TmuxClient::new("omar-team-");
     let workspaces = BTreeMap::from([(init.workspace.instance.clone(), init.workspace.clone())]);
     let mut sessions = BTreeMap::new();
+    let trusted = Arc::new(Mutex::new(crate::backend::codex::TrustedProjects::new()));
     let result = (|| -> Result<()> {
         let code = crate::reaction::build(&init.state, &generated)?
             .map(|code| code.with_cleanup_directory(local_root.join("reactions")));
+        if init.resumed_from.is_none() {
+            run_setups(
+                &init.state,
+                &workspaces,
+                &init.root,
+                init.timeout,
+                &runtime_dir,
+            )?;
+        }
+        crate::sandbox::write_frame(
+            &mut std::io::stdout(),
+            &json!({"protocol": crate::sandbox::PROTOCOL}),
+        )?;
+        // The host releases this barrier only after every VM's setup succeeds.
+        let launch: Value = serde_json::from_slice(&crate::sandbox::read_frame(&mut input)?)?;
+        anyhow::ensure!(
+            launch.get("protocol").and_then(Value::as_u64) == Some(crate::sandbox::PROTOCOL as u64)
+                && launch.get("launch").and_then(Value::as_bool) == Some(true),
+            "expected sandbox launch after setup"
+        );
         let launcher = AgentLauncher::new(
             &init.state,
             &client,
@@ -3458,6 +3506,7 @@ pub fn sandbox_worker() -> Result<()> {
             &server,
             &config,
             (&workspaces, &init.root),
+            trusted.clone(),
             init.resumed_from.as_ref(),
         );
         spawn_topology_agents(&init.state, &launcher, config.replace, &mut sessions)?;
@@ -3496,6 +3545,12 @@ pub fn sandbox_worker() -> Result<()> {
             crate::sandbox::write_frame(&mut std::io::stdout(), &reply)?;
         }
     })();
+    if let Err(error) = &result {
+        let _ = crate::sandbox::write_frame(
+            &mut std::io::stdout(),
+            &json!({"protocol": crate::sandbox::PROTOCOL, "error": format!("{error:#}")}),
+        );
+    }
     let _ = deploy::teardown_sessions(&client, &sessions, &deploy::logs_dir(&runtime_dir));
     result
 }
@@ -4158,6 +4213,8 @@ fn launch(
     // Only what this run spawned. A failure must not tear down a session it
     // refused to replace.
     let mut spawned: BTreeMap<String, String> = BTreeMap::new();
+    // Codex project trust this run added; removed when the run function returns.
+    let trusted = Arc::new(Mutex::new(crate::backend::codex::TrustedProjects::new()));
     type Prepared = (
         InvocationServer,
         BTreeMap<String, Value>,
@@ -4200,6 +4257,18 @@ fn launch(
                 .collect();
             guard.save(&runtime_dir)?;
         }
+        // Before any agent launches, so what a setup writes is there when
+        // the first one starts. A resume's files are already restored. A
+        // sandboxed team's setup runs in its VM, like the rest of its program.
+        if resumed_from.is_none() && config.sandbox_template.is_none() {
+            run_setups(
+                &state,
+                &workspaces,
+                config.omar_dir,
+                config.timeout,
+                &runtime_dir,
+            )?;
+        }
         let invocation_server = InvocationServer::start()?;
         let launcher = AgentLauncher::new(
             &state,
@@ -4208,6 +4277,7 @@ fn launch(
             &invocation_server,
             &config,
             (&workspaces, config.omar_dir),
+            trusted.clone(),
             resumed_from.as_ref(),
         );
         let mut workers = BTreeMap::new();
@@ -4245,9 +4315,16 @@ fn launch(
                     timeout: config.timeout,
                     resumed_from: resumed_from.clone(),
                 };
-                worker.request(serde_json::to_value(init)?, Duration::from_secs(180))?;
+                let timeout = sandbox_init_timeout(&init);
+                worker.request(serde_json::to_value(init)?, timeout)?;
                 observer.sandbox_started(instance, &name);
                 workers.insert(instance.clone(), worker);
+            }
+            for worker in workers.values() {
+                worker.request(
+                    json!({"protocol": crate::sandbox::PROTOCOL, "launch": true}),
+                    Duration::from_secs(180),
+                )?;
             }
         } else {
             spawn_topology_agents(&state, &launcher, config.replace, &mut spawned)?;
@@ -4584,6 +4661,31 @@ fn launch(
     })
 }
 
+/// Run each instance's `setup` in its workspace, one after another, before
+/// anything launches. The first failure fails the run.
+fn run_setups(
+    state: &VmState,
+    workspaces: &BTreeMap<String, crate::workspace::Workspace>,
+    omar_dir: &Path,
+    timeout: Duration,
+    runtime_dir: &Path,
+) -> Result<()> {
+    for (name, instance) in &state.instances {
+        let (Some(command), Some(workspace)) = (&instance.setup, workspaces.get(name)) else {
+            continue;
+        };
+        crate::setup::run(
+            name,
+            command,
+            &workspace.worktree(omar_dir),
+            &workspace.temp(omar_dir),
+            timeout,
+            &runtime_dir.join("setup"),
+        )?;
+    }
+    Ok(())
+}
+
 const AGENT_PROTOCOL: &str = "You are an OMAR topology agent. Only act on OMAR INVOCATION messages. You cannot message other agents. For each invocation, you may use your normal tools to inspect, create, and edit files and run commands needed for the task. For topology communication, use omar_set_port only for the invocation's allowed output ports, and omar_set_state for your team's state, then call omar_complete to finish. Files and artifacts belong in your team instance workspace as described below. Port writes are buffered and repeated writes use last-writer-wins semantics.";
 
 /// What it takes to start one topology agent's worker. Kept for the whole
@@ -4604,9 +4706,14 @@ struct AgentLauncher {
     workspaces: BTreeMap<String, (PathBuf, PathBuf)>,
     /// What every agent of a resumed run is told; empty for a fresh run.
     resumed: String,
+    /// Instances with a `setup`, whose workspace may hold Codex hooks.
+    setups: BTreeSet<String>,
+    /// Codex project trust this run added, removed when the run ends.
+    trusted: Arc<Mutex<crate::backend::codex::TrustedProjects>>,
 }
 
 impl AgentLauncher {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         state: &VmState,
         client: &TmuxClient,
@@ -4614,6 +4721,7 @@ impl AgentLauncher {
         invocation_server: &InvocationServer,
         config: &TopologyRunConfig<'_>,
         workspace_access: (&BTreeMap<String, crate::workspace::Workspace>, &Path),
+        trusted: Arc<Mutex<crate::backend::codex::TrustedProjects>>,
         resumed_from: Option<&checkpoint::Manifest>,
     ) -> Self {
         let (workspaces, workspace_root) = workspace_access;
@@ -4651,6 +4759,13 @@ impl AgentLauncher {
                 })
                 .collect(),
             resumed,
+            setups: state
+                .instances
+                .iter()
+                .filter(|(_, instance)| instance.setup.is_some())
+                .map(|(name, _)| name.clone())
+                .collect(),
+            trusted,
         }
     }
 
@@ -4683,9 +4798,17 @@ impl AgentLauncher {
         };
         fs::write(&prompt_file, format!("{AGENT_PROTOCOL}\n\nYour team instance workspace is {workdir}. Put all persistent files and artifacts in this worktree. Use {} only for disposable files; temp is excluded from snapshots. Agents in your instance share this worktree; other instances have separate workspaces. File snapshots do not undo external actions.{}{scoped}\n", temp.display(), self.resumed))?;
         let backend = canonical_backend(&agent.backend);
-        let base_command = crate::backend::resolve(backend)
-            .map(|backend| backend.default_command().to_string())
-            .map_err(anyhow::Error::msg)?;
+        let resolved = crate::backend::resolve(backend).map_err(anyhow::Error::msg)?;
+        let mut base_command = resolved.default_command().to_string();
+        // A workspace a setup populated may hold Codex hooks, which Codex runs
+        // only from a trusted project with trusted hooks.
+        if self.setups.contains(&agent.instance) && resolved.kind() == crate::backend::Kind::Codex {
+            self.trusted
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Codex trust lock poisoned"))?
+                .trust(worktree)?;
+            base_command = crate::backend::codex::trust_project_hooks(&base_command);
+        }
         let context = McpLaunchContext {
             omar_dir: self.omar_dir.clone(),
             ea_id: self.ea_id,
@@ -9746,6 +9869,93 @@ mod tests {
         .unwrap()
     }
 
+    /// `setup` is an optional field of `declare_instance`: bytecode without one
+    /// round-trips unchanged, and an empty command is not a command.
+    #[test]
+    fn an_instance_setup_is_optional_and_never_empty() {
+        let with = |setup: &str| {
+            let mut bytecode = counter_bytecode("");
+            let state = format!(
+                r#"{{"op":"declare_instance","name":"c","parent":"","team":"Counter"{setup}}}"#
+            );
+            bytecode.instructions[1] = serde_json::from_str(&state).unwrap();
+            bytecode
+        };
+        let plain = with("");
+        assert!(!serde_json::to_string(&plain).unwrap().contains("setup"));
+        assert_eq!(verify(&plain).unwrap().instances["c"].setup, None);
+
+        let seeded = with(r#","setup":"sh install.sh .""#);
+        assert_eq!(
+            verify(&seeded).unwrap().instances["c"].setup.as_deref(),
+            Some("sh install.sh .")
+        );
+        let error = verify(&with(r#","setup":"  ""#)).unwrap_err().to_string();
+        assert!(error.contains("empty setup"), "{error}");
+    }
+
+    #[test]
+    fn sandbox_init_deadline_includes_the_setup_budget() {
+        let bytecode: Bytecode = serde_json::from_value(json!({
+            "version": 1, "team": "T", "instructions": [
+                {"op": "begin_plan", "team": "T"},
+                {"op": "declare_instance", "name": "a", "parent": "", "team": "T", "setup": "sleep 240"},
+                {"op": "commit_plan"}
+            ]
+        })).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = verify(&bytecode).unwrap();
+        let mut workspaces =
+            crate::workspace::for_topology(root.path(), 0, "test", &state).unwrap();
+        let mut init = crate::sandbox::Init {
+            protocol: crate::sandbox::PROTOCOL,
+            state,
+            workspace: workspaces.remove("a").unwrap(),
+            root: root.path().into(),
+            timeout: Duration::from_secs(300),
+            resumed_from: None,
+        };
+        assert_eq!(sandbox_init_timeout(&init), Duration::from_secs(480));
+        init.state.instances.get_mut("a").unwrap().setup = None;
+        assert_eq!(sandbox_init_timeout(&init), Duration::from_secs(180));
+    }
+
+    /// Setups run in instance order and the first failure ends the step, so
+    /// nothing after it has run and the caller launches nothing.
+    #[test]
+    fn a_failed_setup_stops_the_ones_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let omar_dir = dir.path();
+        let declare = |name: &str, setup: &str| {
+            format!(
+                r#"{{"op":"declare_instance","name":"{name}","parent":"","team":"T","setup":"{setup}"}}"#
+            )
+        };
+        let bytecode: Bytecode = serde_json::from_str(&format!(
+            r#"{{"version":1,"team":"T","instructions":[{{"op":"begin_plan","team":"T"}},{},{},{{"op":"commit_plan"}}]}}"#,
+            declare("a", "echo ran > ran.txt; exit 1"),
+            declare("b", "echo ran > ran.txt"),
+        ))
+        .unwrap();
+        let state = verify(&bytecode).unwrap();
+        let workspaces = crate::workspace::for_topology(omar_dir, 0, "setup-test", &state).unwrap();
+        let error = format!(
+            "{:#}",
+            run_setups(
+                &state,
+                &workspaces,
+                omar_dir,
+                Duration::from_secs(10),
+                &dir.path().join("run")
+            )
+            .unwrap_err()
+        );
+        assert!(error.contains("instance 'a' exited 1"), "{error}");
+        assert!(workspaces["a"].worktree(omar_dir).join("ran.txt").exists());
+        assert!(!workspaces["b"].worktree(omar_dir).join("ran.txt").exists());
+        assert!(dir.path().join("run/setup/a.json").exists());
+    }
+
     /// Counts invocations; pauses the run from inside the first one, the way
     /// an operator's request lands while a tag is in flight.
     struct PausingCounter {
@@ -10899,6 +11109,8 @@ mod tests {
             token: String::new(),
             workspaces: BTreeMap::new(),
             resumed: String::new(),
+            setups: BTreeSet::new(),
+            trusted: Arc::new(Mutex::new(crate::backend::codex::TrustedProjects::at(None))),
         };
         let deployment = Arc::new(Mutex::new(deploy::DeploymentRecord::create(
             &state.team,

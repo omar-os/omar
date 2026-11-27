@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::backend::Connection;
 
 pub const FRAME_LIMIT: usize = 8 * 1024 * 1024;
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// The published OMAR kit (`sandbox/omar-sandbox`), used by `enabled = true`
 /// and `--sandbox` unless a run or `[sandbox].template` names another. To
@@ -1122,7 +1122,7 @@ impl Worker {
         }
         let response = result?;
         if let Some(error) = response.get("error") {
-            bail!("sandbox worker: {error}");
+            bail!("{}", error.as_str().context("invalid sandbox error")?);
         }
         anyhow::ensure!(
             response.get("protocol").and_then(Value::as_u64) == Some(PROTOCOL as u64),
@@ -1325,6 +1325,33 @@ mod tests {
         assert!(validate_template("/nonexistent/kit").is_err());
         assert!(validate_template(DEFAULT_TEMPLATE).is_ok());
     }
+    #[test]
+    fn worker_setup_errors_preserve_the_instance_exit_code_and_output_tail() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let (send, receive) = mpsc::channel::<Request>();
+        let worker = Worker {
+            process: Mutex::new(Process {
+                child,
+                requests: send,
+                failed: false,
+            }),
+        };
+        let message = "setup for instance 'b' exited 7: echo boom >&2; exit 7\nboom";
+        let reply = std::thread::spawn(move || {
+            let (_, response) = receive.recv().unwrap();
+            response
+                .send(Ok(
+                    serde_json::json!({"protocol": PROTOCOL, "error": message}),
+                ))
+                .unwrap();
+        });
+        let error = worker
+            .request(Value::Null, Duration::from_secs(5))
+            .unwrap_err();
+        reply.join().unwrap();
+        assert_eq!(error.to_string(), message);
+    }
+
     #[test]
     fn worker_timeout_disables_further_requests() {
         let child = Command::new("sleep").arg("30").spawn().unwrap();
