@@ -13,6 +13,7 @@ use crate::manager::{
 };
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub struct Codex;
 
@@ -499,6 +500,11 @@ pub(crate) struct CodexSession {
     next_id: u64,
 }
 
+/// How long to wait for an app-server answer once the session is up. Answers
+/// wait on the server, busy for seconds when several agents start at once; the
+/// upgrade keeps `WRITE_TIMEOUT`, since provisioning retries `open` until it listens.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl CodexSession {
     /// Connect, upgrade, and complete the app-server's opening handshake.
     pub(crate) fn open(path: &Path) -> Result<CodexSession> {
@@ -522,6 +528,8 @@ impl CodexSession {
                 }
             }
         })?;
+        // Requests from here on wait on the server, not on the socket.
+        socket.get_ref().set_read_timeout(Some(REPLY_TIMEOUT))?;
 
         let mut session = CodexSession { socket, next_id: 1 };
         session
@@ -868,13 +876,16 @@ mod tests {
             serde_json::json!({
                 "result": { "turn": { "id": "new-turn", "status": "inProgress", "items": [], "error": null } }
             }),
+            Duration::ZERO,
         )
     }
 
+    /// `initialize_delay` stands in for a busy server: it holds the first answer.
     fn fake_app_server_reply(
         listener: UnixListener,
         threads: Vec<&'static str>,
         turn_reply: serde_json::Value,
+        initialize_delay: Duration,
     ) -> Vec<String> {
         let (stream, _) = listener.accept().unwrap();
         // `tungstenite::accept` answers the upgrade, so the test exercises the
@@ -902,6 +913,7 @@ mod tests {
             let request: serde_json::Value = serde_json::from_str(&body).unwrap();
             match request["method"].as_str().unwrap_or_default() {
                 "initialize" => {
+                    std::thread::sleep(initialize_delay);
                     // The server talks unprompted; a reply is found by id, not
                     // by being the next thing to arrive.
                     socket
@@ -1032,6 +1044,7 @@ mod tests {
                 listener,
                 vec!["thread"],
                 serde_json::json!({"result": {"turn": {"id": "already-active", "status": "inProgress", "items": [], "error": null}}}),
+                Duration::ZERO,
             )
         });
         deliver_via_app_server(&socket, "event during a tool call").unwrap();
@@ -1068,6 +1081,7 @@ mod tests {
                 listener,
                 vec!["thread"],
                 serde_json::json!({"error": {"code": -32602, "message": "tool output rejected"}}),
+                Duration::ZERO,
             )
         });
         let error = deliver_via_app_server(&socket, "event").unwrap_err();
@@ -1077,6 +1091,26 @@ mod tests {
             4,
             "do not inject after a rejected wake"
         );
+    }
+
+    /// A busy app-server can take longer to answer than a write may take: the
+    /// delivery waits for the answer instead of failing at `WRITE_TIMEOUT`.
+    #[test]
+    fn a_slow_app_server_still_takes_the_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slow.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            fake_app_server_reply(
+                listener,
+                vec!["thread"],
+                serde_json::json!({"result": {"turn": {"id": "new-turn", "status": "inProgress", "items": [], "error": null}}}),
+                WRITE_TIMEOUT + Duration::from_secs(2),
+            )
+        });
+
+        deliver_via_app_server(&socket, "standup in 5").expect("a slow answer is still an answer");
+        server.join().unwrap();
     }
 
     #[test]
