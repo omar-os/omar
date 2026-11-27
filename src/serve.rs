@@ -29,6 +29,8 @@ use crate::topology::{self, PortKind, TopologyRunConfig, VmState};
 
 #[path = "serve_recovery.rs"]
 mod recovery;
+#[path = "serve_sign_in.rs"]
+mod sign_in;
 use recovery::WorkflowFollowup;
 
 pub const SERVE_PROTOCOL_VERSION: u32 = 1;
@@ -976,6 +978,7 @@ impl Serve {
             launch_ea: AtomicBool::new(false),
             shutdown,
         });
+        sign_in::watch(context.clone());
         let shared_workspaces = workspaces.clone();
         listener.set_nonblocking(true)?;
         let running = Arc::new(AtomicBool::new(true));
