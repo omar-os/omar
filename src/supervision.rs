@@ -429,6 +429,11 @@ pub fn backend_hook_response(
     if let Some(topology) = &context.topology {
         let event = input["hook_event_name"].as_str().unwrap_or("");
         let (event, session) = event.split_once(':').unwrap_or((event, ""));
+        let (session, error) = if event == "UsageLimit" {
+            session.split_once(':').unwrap_or((session, ""))
+        } else {
+            (session, "")
+        };
         if event == "PermissionRequest"
             || (event == "PreToolUse"
                 && matches!(
@@ -466,7 +471,7 @@ pub fn backend_hook_response(
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
         }
-        if matches!(event, "Stop" | "UserPromptSubmit" | "Busy") {
+        if matches!(event, "Stop" | "UserPromptSubmit" | "Busy" | "UsageLimit") {
             let mut path = crate::manager::topology_turn_file(
                 &context.omar_dir,
                 context.ea_id,
@@ -484,12 +489,25 @@ pub fn backend_hook_response(
                 );
                 path.set_extension(format!("{session}.json"));
             }
-            crate::manager::write_private_file(
-                &path,
-                &serde_json::to_vec(&json!({
-                    "idle": event == "Stop", "turn": uuid::Uuid::new_v4().to_string(),
-                }))?,
-            )?;
+            let mut state: Value = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_else(|| json!({}));
+            if event != "UsageLimit" {
+                state["input"] = Value::Null;
+            }
+            state["idle"] = json!(event == "Stop");
+            state["turn"] = json!(uuid::Uuid::new_v4().to_string());
+            if event == "UsageLimit" {
+                let error: Value =
+                    serde_json::from_str(error).unwrap_or_else(|_| input["error"].clone());
+                state["credit_error"] = json!(crate::backend::OutOfCredit::from_error(&error));
+                state["usage_limit"] = json!(crate::backend::UsageLimit::from_error(&error));
+            } else if event != "Stop" {
+                state["usage_limit"] = Value::Null;
+                state["credit_error"] = Value::Null;
+            }
+            crate::manager::write_private_file(&path, &serde_json::to_vec(&state)?)?;
         }
         return Ok(json!({}));
     }

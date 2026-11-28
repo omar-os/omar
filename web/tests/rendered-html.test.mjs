@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { restartRows, restartText } from "../app/lib/attempts.ts";
+import { restartRows, restartText, usageWait, usageWaitText } from "../app/lib/attempts.ts";
 
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -168,4 +168,18 @@ test("the inspector and diagram render the restart rows and badge with id toolti
   assert.match(inspector, /title=\{attempt.session\}.*attempt.session.slice\(0, 8\)/);
   assert.match(diagram, /className="omar-restart-badge"/);
   assert.match(diagram, /restartText\(reaction.restarts\).badge/);
+});
+
+
+test("usage waits show their reset and clear on the same attempt", () => {
+  const wait = { reaction: "b.reaction.0", task_id: 8, started_at: "2026-11-12T12:30:00Z", resets_at: 1900000000 };
+  const record = { attempt_id: "limited", invocations: [{ reaction: wait.reaction, invocation_id: 8 }], outcome: "open", usage_waits: [wait] };
+  assert.equal(usageWait([record], wait.reaction), wait);
+  assert.equal(usageWait([record], "b.reaction.1"), undefined);
+  assert.match(usageWaitText(wait), /^waiting for usage limit until \d\d:\d\d$/);
+  assert.match(restartRows([record], wait.reaction)[0].summary, /waiting for usage limit until/);
+  assert.equal(usageWaitText({}), "waiting for usage limit; checking periodically");
+  wait.ended_at = "2026-11-12T12:31:00Z";
+  assert.equal(usageWait([record], wait.reaction), undefined);
+  assert.match(restartRows([record], wait.reaction)[0].summary, /waited for usage limit/);
 });
