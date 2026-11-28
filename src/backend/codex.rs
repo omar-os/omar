@@ -152,6 +152,10 @@ impl Backend for Codex {
     fn normalize_command(&self, command: &str) -> String {
         ensure_codex_runtime_flags(command)
     }
+    /// `-m`, on the TUI that attaches to the app-server and on the exec fallback.
+    fn model_flag(&self, model: &str) -> Option<String> {
+        Some(format!("-m {}", crate::manager::shell_single_quote(model)))
+    }
     /// Conversations stay in the operator's normal home. A dedicated
     /// app-server owns the per-agent overrides and a socket the TUI connects
     /// to explicitly; custom flags that the TUI refuses to attach with use a
