@@ -5518,6 +5518,7 @@ mod tests {
                     backend: "codex".to_string(),
                     instance: String::new(),
                     lifetime: None,
+                    model: None,
                 },
             )]),
             ports: BTreeMap::from([

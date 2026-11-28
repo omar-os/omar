@@ -109,6 +109,9 @@ pub struct DiagramAgent {
     /// the whole run.
     #[serde(default)]
     pub lifetime: Option<crate::topology::Lifetime>,
+    /// The model it was told to run, when the program named one.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Conversation windows and worker retries, oldest first, each as of its
     /// latest change: `invocations` (each with its `reaction`), `attempt_id`,
     /// `native_session_id`, `outcome`, `cleanup_status` and the rest of the
@@ -286,6 +289,7 @@ impl DiagramSnapshot {
                 backend: agent.backend.clone(),
                 instance: agent.instance.clone(),
                 lifetime: agent.lifetime,
+                model: agent.model.clone(),
                 attempts: Vec::new(),
             })
             .collect();
@@ -999,6 +1003,7 @@ mod tests {
                     backend: "codex".to_string(),
                     instance: String::new(),
                     lifetime: None,
+                    model: None,
                 },
             )]),
             ports: BTreeMap::from([
@@ -1085,6 +1090,7 @@ mod tests {
                     backend: "codex".to_string(),
                     instance: "writer".to_string(),
                     lifetime: None,
+                    model: None,
                 },
             )]),
             ports: BTreeMap::from([
