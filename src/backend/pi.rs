@@ -68,6 +68,13 @@ impl Backend for Pi {
     fn readiness(&self, _command: &str) -> Readiness {
         Readiness::Channel
     }
+    /// `--model`, which also takes `provider/model`.
+    fn model_flag(&self, model: &str) -> Option<String> {
+        Some(format!(
+            "--model {}",
+            crate::manager::shell_single_quote(model)
+        ))
+    }
     fn launch_command(&self, launch: &Launch<'_>) -> String {
         launch_command(launch).unwrap_or_else(|error| {
             format!(
