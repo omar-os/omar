@@ -52,6 +52,13 @@ test('an agent lifetime is kept when its step backend is edited', () => {
  assert.match(changed, /planner:ClaudeCode per 5 tasks/);
 });
 
+test('an agent model is kept when its step backend is edited', () => {
+ const modelled = program.replace('planner:Codex', 'planner:Claude(model = "claude-haiku-5-5") per 5 tasks');
+ const step = locateStep(modelled, snapshot, snapshot.reactions[0]);
+ const changed = replaceStep(modelled, step, { backend:'Codex', prompt:step.prompt, triggers:step.triggers, contract:step.contract });
+ assert.match(changed, /planner:Codex\(model = "claude-haiku-5-5"\) per 5 tasks/);
+});
+
 test('editing task configuration preserves metadata and the other steps', () => {
  const metadata = '// @title Review campaign script\n // @desc Inspect the prompt, identify gaps, and return a critique.';
  for (const deadline of ['', 'within(30s)']) {

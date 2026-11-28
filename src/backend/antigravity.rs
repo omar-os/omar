@@ -61,6 +61,13 @@ impl Backend for Antigravity {
     // refuses `Antigravity per tag`.
     // No readiness banner is pinned: `agy` is not available in CI or local
     // discovery, so a marker would be an unverified guess.
+    /// `--model`.
+    fn model_flag(&self, model: &str) -> Option<String> {
+        Some(format!(
+            "--model {}",
+            crate::manager::shell_single_quote(model)
+        ))
+    }
     /// Workflows use session-scoped ACP servers; operator sessions use a plugin.
     fn launch_command(&self, launch: &Launch<'_>) -> String {
         let rendered = materialize_prompt_file(launch.prompt_file, launch.substitutions);
