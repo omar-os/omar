@@ -25,7 +25,7 @@ export function describeRunFailure(error: string, agents: DiagramAgent[]): {
     const manual = agents.some((agent) => agent.name === name && agent.backend.toLowerCase() === "web");
     return manual ? {
       summary: `No response was submitted for ${name} within ${duration}.`,
-      guidance: "This is a manual Web step. Complete its task outside OMAR, then submit the result through the response panel. Run again with enough time for that handoff.",
+      guidance: "This is a manual Web step. Open its step in the workflow and follow the instructions there. Run again with enough time for that handoff.",
     } : {
       summary: `${name} did not respond within ${duration}.`,
       guidance: "OMAR will investigate the failed step and report its next steps in chat. You can follow the investigation with Inspect terminal. A deadline declared in the workflow still takes precedence.",

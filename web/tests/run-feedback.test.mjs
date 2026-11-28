@@ -13,7 +13,7 @@ test("manual timeouts explain the handoff instead of suggesting an agent repair"
     { name: "prepare.chatgpt", backend: "Web" },
   ]);
   assert.match(feedback.summary, /60 minutes/);
-  assert.match(feedback.guidance, /submit the result through the response panel/);
+  assert.match(feedback.guidance, /Open its step in the workflow and follow the instructions there/);
 });
 
 test("unknown failures point to automatic investigation and its visible progress", () => {

@@ -213,7 +213,7 @@ test("a reaction's deadline is drawn as a stopwatch on its chevron", async ({
   expect(markedBox.width).toBeGreaterThan(plainBox.width);
 });
 
-test("a web component's panel opens from the diagram, and answers it", async ({
+test("a manual task is answered inside its workflow step and retains rejected drafts", async ({
   page,
 }) => {
   // Its own topology: one reaction on the `Web` backend. Kept apart from the
@@ -229,15 +229,13 @@ test("a web component's panel opens from the diagram, and answers it", async ({
   await draftUntilProposed(page);
   await deploy(page);
 
-  const panel = page.locator("dialog.port-panel");
-  // The handoff stays visible even when its dialog is closed.
+  const panel = page.getByRole("complementary", { name: "Step details" });
+  // The compact notice stays visible while the step inspector is closed.
   await expect(panel).toBeHidden();
-  const notice = page.locator(".response-notice");
-  await expect(notice).toContainText("A step needs your response");
-  await expect(notice).toContainText("Provide critique · flow.reviewer");
-  await notice.getByRole("button", { name: "Review" }).click();
+  await expect(page.locator(".run-waiting")).toContainText("Provide critique");
+  await page.getByRole("button", { name: "Open task" }).click();
   await expect(panel).toBeVisible();
-  await panel.getByRole("button", { name: "Close", exact: true }).click();
+  await panel.getByRole("button", { name: "Close step details", exact: true }).click();
   await expect(panel).toBeHidden();
 
   // Drawn as reachable before it is touched: exactly one reaction on the
@@ -252,12 +250,13 @@ test("a web component's panel opens from the diagram, and answers it", async ({
   await web.dblclick();
 
   await expect(panel).toBeVisible();
-  await expect(panel.getByRole("heading")).toHaveText("Provide critique");
+  await expect(panel.getByRole("region", {name:"Manual task"})).toBeVisible();
+  await expect(page.locator("dialog[open]")).toHaveCount(0);
   await panel.getByText("Technical details", { exact: true }).click();
   await expect(panel).toContainText("flow.reviewer");
-  // Scoped to this component's wiring: what it reads, and what it may set.
-  await expect(panel.locator(".port-list").first()).toContainText("flow.plan");
-  await expect(panel).toContainText("flow.critique");
+  // Technical details retain the input and the declared output contract.
+  await expect(panel.locator(".step-response")).toContainText("flow.plan");
+  await expect(panel.locator(".port-waiting-contract")).toHaveText("critique");
 
   // Only what this invocation is allowed to write, with its declared type.
   const waiting = panel.locator(".port-waiting");
@@ -266,6 +265,7 @@ test("a web component's panel opens from the diagram, and answers it", async ({
   for (const width of [1280, 390]) {
     await page.setViewportSize({ width, height: 844 });
     expect(await panel.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    if (width === 390) expect((await panel.boundingBox())!.height).toBeGreaterThan(300);
   }
   await page.setViewportSize({ width: 1280, height: 900 });
   await waiting.getByRole("textbox").fill("looks fine");
@@ -273,24 +273,26 @@ test("a web component's panel opens from the diagram, and answers it", async ({
     if (route.request().method() === "POST") return route.fulfill({ status:400, json:{error:"Test rejection"} });
     return route.continue();
   });
-  await waiting.getByRole("button", { name: "Submit response & continue" }).click();
+  await waiting.getByRole("button", { name: "Submit result and continue" }).click();
   await expect(waiting.getByRole("alert")).toContainText("Test rejection");
   await expect(waiting.getByRole("textbox")).toHaveValue("looks fine");
   await page.unroute("**/v1/runs/*/panel");
-  await waiting.getByRole("button", { name: "Submit response & continue" }).click();
+  const response = page.waitForRequest(request =>
+    request.method() === "POST" && /\/v1\/runs\/[^/]+\/panel$/.test(new URL(request.url()).pathname));
+  await waiting.getByRole("button", { name: "Submit result and continue" }).click();
+  // Friendly labels still submit to the exact qualified runtime output.
+  expect((await response).postDataJSON().values).toEqual({ "flow.critique": "looks fine" });
 
   // Answered, so it leaves the queue; the panel stays open on the component.
   await expect(panel.locator(".port-waiting")).toHaveCount(0);
-  await expect(panel).toContainText("This step is not waiting for a response");
-  // Handled, so the notice on top goes too.
-  await expect(notice).toHaveCount(0);
+  await expect(panel).toContainText("Response accepted");
 
-  // And it closes, rather than living beside the events forever.
-  await panel.getByRole("button", { name: "Close" }).click();
+  // Closing the inspector returns to the full canvas.
+  await panel.getByRole("button", { name: "Close step details" }).click();
   await expect(panel).toBeHidden();
 });
 
-test("every waiting step stays listed on top until answered, with a next response", async ({ page }) => {
+test("every waiting step remains selectable until answered inside its step", async ({ page }) => {
   // Both agents on the `Web` backend: three invocations wait at once.
   await fake.close();
   fake = (await startFakeServe({
@@ -302,31 +304,32 @@ test("every waiting step stays listed on top until answered, with a next respons
   await draftUntilProposed(page);
   await deploy(page);
 
-  const notice = page.locator(".response-notice");
-  const panel = page.locator("dialog.port-panel");
-  await expect(notice).toContainText("3 steps need your response");
-  await expect(notice.locator("li")).toHaveCount(3);
-  // No timer: it is still there later, and after a panel is closed unanswered.
-  await notice.locator("li", { hasText: "flow.reviewer" }).getByRole("button", { name: "Review" }).click();
-  await panel.getByRole("button", { name: "Close", exact: true }).click();
+  const notice = page.locator(".run-waiting");
+  const panel = page.getByRole("complementary", { name: "Step details" });
+  const choices = notice.getByRole("combobox", { name: "Waiting steps" });
+  await expect(choices.locator("option")).toHaveCount(3);
+  await choices.selectOption({ label: "Provide critique" });
+  await expect(panel).toBeVisible();
+  await panel.getByRole("button", { name: "Close step details" }).click();
+  // Closing an unanswered step does not remove it from the queue.
   await page.waitForTimeout(1500);
-  await expect(notice.locator("li")).toHaveCount(3);
+  await expect(choices.locator("option")).toHaveCount(3);
 
-  await notice.locator("li", { hasText: "flow.reviewer" }).getByRole("button", { name: "Review" }).click();
+  await choices.selectOption({ label: "Provide critique" });
+  await notice.getByRole("button", { name: "Open task" }).click();
   await panel.locator(".port-waiting").getByRole("textbox").fill("looks fine");
-  await panel.getByRole("button", { name: "Submit response & continue" }).click();
-  await expect(notice.locator("li")).toHaveCount(2);
-  await expect(notice).not.toContainText("flow.reviewer");
+  await panel.getByRole("button", { name: "Submit result and continue" }).click();
+  await expect(choices.locator("option")).toHaveCount(2);
+  await expect(choices).not.toContainText("Provide critique");
 
-  // The answered panel offers the next waiting step instead of a dead end.
-  await panel.getByRole("button", { name: "Next response: Provide plan · flow.planner" }).click();
-  await expect(panel.getByRole("heading")).toHaveText("Provide plan");
-  const forms = panel.locator(".port-waiting");
-  await expect(forms).toHaveCount(2);
+  // The notice opens the next invocation, even when it shares an agent.
   for (let i = 0; i < 2; i++) {
-    await forms.first().getByRole("textbox").fill(`answer ${i}`);
-    await forms.first().getByRole("button", { name: "Submit response & continue" }).click();
-    await expect(forms).toHaveCount(1 - i);
+    await notice.getByRole("button", { name: "Open task" }).click();
+    const form = panel.locator(".port-waiting");
+    await expect(form).toHaveCount(1);
+    await form.getByRole("textbox").fill(`answer ${i}`);
+    await form.getByRole("button", { name: "Submit result and continue" }).click();
+    await expect(form).toHaveCount(0);
   }
   await expect(notice).toHaveCount(0);
 });
@@ -2974,7 +2977,7 @@ test("failed manual handoffs explain the cause and can restart after reload", as
   const feedback = page.locator(".run-failure");
   await expect(feedback).toContainText("No response was submitted for flow.reviewer within 5 minutes");
   await expect(page.locator(".omar-reaction.running")).toHaveCount(0);
-  await expect(page.locator(".response-notice")).toBeHidden();
+  await expect(page.getByRole("button", { name: "Open task" })).toBeHidden();
   await dragDivider(page, "Resize the conversation", -600);
   await expect(feedback).toBeVisible();
   const again = page.getByRole("button", { name: "Run again", exact: true });

@@ -125,7 +125,7 @@ export function DeployConfirmation({ serveUrl, team, disabled, retry = false, ma
         </select>
       </label>
       <p>Applies to steps without a deadline in the workflow.</p>
-      {manual ? <p>This workflow includes manual Web steps. They wait for you to submit a result in the response panel; OMAR does not contact ChatGPT automatically.</p> : null}
+      {manual ? <p>This workflow includes steps that need your input. Open a waiting step to review its result or provide what is needed.</p> : null}
       <fieldset className="deploy-options">
         <legend>Workspaces</legend>
         <label className="deploy-check">

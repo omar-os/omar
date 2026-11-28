@@ -324,7 +324,7 @@ test("a manual handoff timeout explains the missing operator response", () => {
   const feedback = describeRunFailure(error, agents);
   assert.match(feedback.summary, /No response was submitted for prepare.chatgpt within 5 minutes/);
   assert.match(feedback.guidance, /manual Web step/);
-  assert.match(feedback.guidance, /response panel/);
+  assert.match(feedback.guidance, /step in the workflow/);
   assert.doesNotMatch(feedback.summary, /invocation|contract/);
 });
 
