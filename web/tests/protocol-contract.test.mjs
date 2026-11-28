@@ -380,3 +380,43 @@ test("an agent attempt lands on the agent it names and no other", () => {
     assert.equal(next.agents[index + 1], other);
   }
 });
+
+
+test("worker retries update only their step and keep the death reason", () => {
+  const agent = { ...golden.agents[0], attempts: [] };
+  const base = { ...golden, agents: [agent, ...golden.agents.slice(1)] };
+  const reaction = golden.reactions.find((item) => item.agent === agent.id);
+  const attempt = { attempt_id: "retry", retry: 2, outcome: "died", death_reason: "pane exited",
+    invocations: [{ reaction: reaction.name, invocation_id: 7 }] };
+  base.reactions = golden.reactions.map((item) => item.id === reaction.id ? { ...item, invocation_id: "7" } : item);
+  const next = applyDiagramEvent(base, { protocol_version: 1, sequence: golden.sequence + 1,
+    team: golden.team, tag: null, kind: "agent_attempt", payload: { agent: agent.id, attempt } });
+  assert.equal(next.reactions.find((item) => item.id === reaction.id).restarts, 2);
+  assert.equal(next.agents[0].attempts.at(-1).death_reason, "pane exited");
+  for (const other of golden.reactions.filter((item) => item.id !== reaction.id)) {
+    assert.deepEqual(next.reactions.find((item) => item.id === other.id), other);
+  }
+});
+
+
+test("an old window cannot put its restart count on a later task of the same step", () => {
+  const reaction = golden.reactions[0];
+  const base = { ...golden, agents: golden.agents.map((agent) => ({ ...agent, attempts: [] })) };
+  const started = applyDiagramEvent(base, { protocol_version: 1, sequence: golden.sequence + 1,
+    team: golden.team, tag: null, kind: "reaction_started", payload: { reaction: reaction.id, invocation_id: "8" } });
+  const later = applyDiagramEvent(started, { protocol_version: 1, sequence: started.sequence + 1,
+    team: golden.team, tag: null, kind: "agent_attempt", payload: { agent: reaction.agent,
+      attempt: { attempt_id: "old", retry: 2, invocations: [{ reaction: reaction.name, invocation_id: 7 }] } } });
+  assert.equal(later.reactions.find((item) => item.id === reaction.id).restarts, undefined);
+});
+
+
+test("attempt updates accept snapshots from before attempt history was added", () => {
+  const agent = { ...golden.agents[0] };
+  delete agent.attempts;
+  const base = { ...golden, agents: [agent] };
+  const attempt = { attempt_id: "first", outcome: "started" };
+  const next = applyDiagramEvent(base, { protocol_version: 1, sequence: golden.sequence + 1,
+    team: golden.team, tag: null, kind: "agent_attempt", payload: { agent: agent.id, attempt } });
+  assert.deepEqual(next.agents[0].attempts, [attempt]);
+});

@@ -154,7 +154,10 @@ impl Backend for Claude {
                 "{base_command} --session-id {}",
                 shell_single_quote(&attempt.native_session)
             ),
-            None => base_command,
+            None => match super::saved_conversation(launch.context, "claude") {
+                Some(id) => format!("{base_command} --resume {}", shell_single_quote(&id)),
+                None => base_command,
+            },
         };
         let command = match materialize_claude_mcp_config(launch.context) {
             Some(mcp_config) => format!(
@@ -796,6 +799,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut context = test_mcp_context(dir.path());
         let topology = TopologyMcpContext {
+            resume: None,
             team: "Scoped".into(),
             agent: "t.coder".into(),
             endpoint: "localhost:1".into(),
@@ -816,6 +820,7 @@ mod tests {
         assert!(!launch(&context).contains("CLAUDE_CODE_DISABLE_AUTO_MEMORY"));
         assert!(!launch(&context).contains("CLAUDE_CODE_DISABLE_ORG_MEMORY"));
         context.topology = Some(TopologyMcpContext {
+            resume: None,
             attempt: Some(crate::manager::TopologyAttempt {
                 id: "attempt".into(),
                 key: "key".into(),
@@ -849,6 +854,7 @@ mod tests {
         }
         let mut topology = context;
         topology.topology = Some(TopologyMcpContext {
+            resume: None,
             team: "t".into(),
             agent: "a".into(),
             endpoint: "localhost:1".into(),

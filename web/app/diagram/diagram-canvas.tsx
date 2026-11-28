@@ -18,6 +18,7 @@ import {
   type DiagramSnapshot,
   type Lifetime,
 } from "../lib/protocol";
+import { restartText } from "../lib/attempts";
 
 /**
  * Runtime instances stay grouped with their boundary ports and reactions.
@@ -164,6 +165,7 @@ type ReactionView = {
   localOrder: number;
   name: string;
   meta: string;
+  restarts: number;
   contract: string;
   /** One line of what the task asks, from its prompt; the contract for a code reaction. */
   summary: string;
@@ -429,7 +431,7 @@ function flattenLayout(
   }
 }
 
-type ReactionLabels = { name: string; meta: string };
+type ReactionLabels = { name: string; meta: string; restarts: number };
 
 /** `per tag`, or nothing for an agent that keeps one conversation for the run. */
 function lifetimeOf(lifetime: Lifetime | null | undefined): string | null {
@@ -458,6 +460,7 @@ function reactionLabels(snapshot: DiagramSnapshot): Map<string, ReactionLabels> 
         {
           name: taskCopy(reaction, owner, snapshot).title,
           meta: owner ? detail : `Code · ${reaction.status}`,
+          restarts: reaction.restarts ?? 0,
         },
       ];
     }),
@@ -575,7 +578,7 @@ function BackendMark({ backend }: { backend: string }) {
 function reactionWidth(labels: ReactionLabels, within: number | null): number {
   const widest = Math.max(
     textWidth(labels.name, 8.1),
-    textWidth(labels.meta, 6.4) + 22,
+    textWidth(labels.meta, 6.4) + 22 + (labels.restarts ? textWidth(restartText(labels.restarts).badge, 6) + 20 : 0),
   );
   // A deadline is drawn between the text and the point, so the node has to be
   // wider for it rather than the stopwatch sitting on top of the name.
@@ -824,7 +827,7 @@ async function runElk(
           ...reactions.map((reaction) => ({
             id: reaction.id,
             width: reactionWidth(
-              labels.get(reaction.id) ?? { name: reaction.name, meta: "" },
+              labels.get(reaction.id) ?? { name: reaction.name, meta: "", restarts: 0 },
               reaction.within,
             ),
             height: REACTION_SIZE.height,
@@ -935,13 +938,14 @@ function buildLayout(
     perInstance.set(reaction.instance, seen + 1);
   }
   const reactions: ReactionView[] = snapshot.reactions.map((reaction) => {
-    const label = labels.get(reaction.id) ?? { name: reaction.name, meta: "" };
+    const label = labels.get(reaction.id) ?? { name: reaction.name, meta: "", restarts: 0 };
     return {
       id: reaction.id,
       order: reaction.order,
       localOrder: localOrders.get(reaction.id) ?? reaction.order,
       name: label.name,
       meta: label.meta,
+      restarts: label.restarts,
       contract: reaction.contract,
       summary: taskCopy(reaction, snapshot.agents.find((agent) => agent.id === reaction.agent), snapshot).description,
       backend: snapshot.agents.find((agent) => agent.id === reaction.agent)?.backend ?? "Code",
@@ -1924,6 +1928,10 @@ export function DiagramCanvas({
                     <BackendMark backend={reaction.backend} />
                   </g>
                   <text className="omar-reaction-meta" x={REACTION_TEXT_X + 22} y={91}>{reaction.meta}</text>
+                  {reaction.restarts ? <g className="omar-restart-badge" transform={`translate(${REACTION_TEXT_X + 30 + textWidth(reaction.meta, 6.4)} 79)`}>
+                    <rect width={textWidth(restartText(reaction.restarts).badge, 6) + 12} height={17} rx={4} />
+                    <text x={6} y={12}>{restartText(reaction.restarts).badge}</text>
+                  </g> : null}
                   {/* An agent that resets its conversation says when, small and
                       apart from the backend and status it would crowd. */}
                   {reaction.lifetime ? (
