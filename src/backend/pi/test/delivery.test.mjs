@@ -44,6 +44,34 @@ test("a conversation with no file reports its in-memory id", async () => {
   } finally { await stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
+test("workflow UI requests are answered or declined through the private socket", async () => {
+  const dir = await mkdtemp("/tmp/omar-pi-");
+  const path = `${dir}/in.sock`;
+  const previous = process.env.OMAR_PI_TOPOLOGY;
+  process.env.OMAR_PI_TOPOLOGY = "1";
+  const sent = [];
+  const ui = {};
+  const stop = await startDelivery(path, { sendMessage: (...args) => sent.push(args) }, { ui });
+  try {
+    for (const method of ["select", "confirm", "input", "editor", "custom"]) {
+      const pending = ui[method]("Audience?");
+      const { blocked } = await request(path, { input: true });
+      assert.equal(typeof blocked, "string");
+      assert.deepEqual(await request(path, { answer_input: "earlier-request", text: "wrong" }), { answered: false });
+      assert.deepEqual(await request(path, { answer_input: blocked, text: "OMAR REMINDER" }), { answered: true });
+      assert.equal(await pending, method === "confirm" ? false : ["input", "editor"].includes(method) ? "OMAR REMINDER" : undefined);
+      assert.deepEqual(await request(path, { input: true }), { blocked: null });
+    }
+    assert.equal(sent.length, 5);
+    assert.ok(sent.every(([, options]) => options.deliverAs === "steer"));
+  } finally {
+    await stop();
+    if (previous === undefined) delete process.env.OMAR_PI_TOPOLOGY;
+    else process.env.OMAR_PI_TOPOLOGY = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("failed tool discovery never publishes delivery; retry and shutdown manage the socket", async () => {
   const dir = await mkdtemp("/tmp/omar-pi-");
   const path = `${dir}/in.sock`;
@@ -59,7 +87,16 @@ test("failed tool discovery never publishes delivery; retry and shutdown manage 
     await handlers.session_start({}, {});
     await assert.rejects(stat(path));
     await handlers.session_start({}, {});
+    assert.deepEqual(await request(path, { turn: true }), { ended: null });
+    await handlers.agent_end();
+    const first = (await request(path, { turn: true })).ended;
+    assert.equal(typeof first, "string");
+    await handlers.agent_start();
+    assert.deepEqual(await request(path, { turn: true }), { ended: null });
+    await handlers.agent_end();
+    assert.notEqual((await request(path, { turn: true })).ended, first);
     assert.deepEqual(await request(path, { text: "ready" }), { accepted: true });
+    assert.deepEqual(await request(path, { turn: true }), { ended: null });
     await handlers.session_shutdown();
     await assert.rejects(stat(path));
     assert.equal(closed, 2);

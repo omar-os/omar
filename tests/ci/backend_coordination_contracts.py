@@ -65,7 +65,7 @@ def main():
         print('PASS: Cursor continuation is bounded; Antigravity reads live state even with an empty spool', flush=True)
 
         plugin = root / 'plugin.mjs'
-        plugin.write_text(f'const exe={json.dumps(str(BIN))};\nconst contextFile={json.dumps(str(context))};\n' +
+        plugin.write_text(f'const exe={json.dumps(str(BIN))};\nconst contextFile={json.dumps(str(context))};\nconst topology=false;\n' +
                           (REPO / 'src/backend/opencode/plugin.mjs').read_text())
         harness = root / 'check.mjs'
         harness.write_text('''
